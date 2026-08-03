@@ -1,0 +1,125 @@
+;; Native TypeScript AST ABI. This is the only Coil module that declares these C
+;; symbols; extern declarations are not deduplicated across Coil modules.
+(module typescriptnative)
+
+(import "coil.str" :use *)
+(import "coil.slice" :use *)
+
+(extern aot_ts_parse :cc c [(ptr u8) i32] (-> u64))
+(extern aot_ts_parse_delete :cc c [u64] (-> void))
+(extern aot_ts_root :cc c [u64] (-> i32))
+(extern aot_ts_node_count :cc c [u64] (-> i32))
+(extern aot_ts_node_kind :cc c [u64 i32] (-> i32))
+(extern aot_ts_node_start :cc c [u64 i32] (-> i32))
+(extern aot_ts_node_end :cc c [u64 i32] (-> i32))
+(extern aot_ts_node_child_count :cc c [u64 i32] (-> i32))
+(extern aot_ts_node_child :cc c [u64 i32 i32] (-> i32))
+(extern aot_ts_diagnostic_count :cc c [u64] (-> i32))
+(extern aot_ts_diagnostic_code :cc c [u64 i32] (-> i32))
+(extern aot_ts_diagnostic_start :cc c [u64 i32] (-> i32))
+(extern aot_ts_diagnostic_length :cc c [u64 i32] (-> i32))
+
+;; Values from the pinned upstream ast.Kind. They are intentionally centralized
+;; here; no lowering module depends on Microsoft's numeric enum directly.
+(const TSK-END-OF-FILE i64 1)
+(const TSK-NUMERIC-LITERAL i64 8)
+(const TSK-IDENTIFIER i64 79)
+(const TSK-FALSE i64 96)
+(const TSK-NEW i64 104)
+(const TSK-NULL i64 105)
+(const TSK-TRUE i64 111)
+(const TSK-VOID i64 115)
+(const TSK-ANY i64 132)
+(const TSK-BOOLEAN i64 135)
+(const TSK-NUMBER i64 150)
+(const TSK-STRING i64 154)
+(const TSK-UNKNOWN i64 159)
+(const TSK-PARAMETER i64 170)
+(const TSK-PROPERTY-SIGNATURE i64 172)
+(const TSK-TYPE-REFERENCE i64 184)
+(const TSK-TYPE-LITERAL i64 188)
+(const TSK-UNION-TYPE i64 193)
+(const TSK-LITERAL-TYPE i64 202)
+(const TSK-OBJECT-LITERAL i64 211)
+(const TSK-PROPERTY-ACCESS i64 212)
+(const TSK-CALL i64 214)
+(const TSK-NEW-EXPRESSION i64 215)
+(const TSK-PARENTHESIZED-EXPRESSION i64 218)
+(const TSK-PREFIX-UNARY i64 225)
+(const TSK-BINARY i64 227)
+(const TSK-BLOCK i64 242)
+(const TSK-VARIABLE-STATEMENT i64 244)
+(const TSK-EXPRESSION-STATEMENT i64 245)
+(const TSK-IF i64 246)
+(const TSK-WHILE i64 248)
+(const TSK-FOR i64 249)
+(const TSK-RETURN i64 254)
+(const TSK-VARIABLE-DECLARATION i64 261)
+(const TSK-VARIABLE-DECLARATION-LIST i64 262)
+(const TSK-FUNCTION-DECLARATION i64 263)
+(const TSK-INTERFACE-DECLARATION i64 265)
+(const TSK-TYPE-ALIAS-DECLARATION i64 266)
+(const TSK-PROPERTY-ASSIGNMENT i64 303)
+(const TSK-SOURCE-FILE i64 307)
+
+(defstruct TsAst [(handle u64) (source (slice u8))])
+
+(defn ts-open [(source (slice u8))] (-> TsAst)
+  (let [(mut ast) (zeroed TsAst)]
+    (store! (field ast handle) (aot_ts_parse (slice-data source) (cast i32 (slice-len source))))
+    (store! (field ast source) source)
+    (load ast)))
+
+(defn ts-close! [(ast (mut TsAst))] (-> i64)
+  (if (= (load (field ast handle)) (cast u64 0))
+      0
+      (do
+        (aot_ts_parse_delete (load (field ast handle)))
+        (store! (field ast handle) (cast u64 0))
+        0)))
+
+(defn ts-root [(ast TsAst)] (-> i64)
+  (cast i64 (aot_ts_root (load (field ast handle)))))
+
+(defn ts-node-count [(ast TsAst)] (-> i64)
+  (cast i64 (aot_ts_node_count (load (field ast handle)))))
+
+(defn ts-kind [(ast TsAst) (node i64)] (-> i64)
+  (cast i64 (aot_ts_node_kind (load (field ast handle)) (cast i32 node))))
+
+(defn ts-start [(ast TsAst) (node i64)] (-> i64)
+  (cast i64 (aot_ts_node_start (load (field ast handle)) (cast i32 node))))
+
+(defn ts-end [(ast TsAst) (node i64)] (-> i64)
+  (cast i64 (aot_ts_node_end (load (field ast handle)) (cast i32 node))))
+
+(defn ts-child-count [(ast TsAst) (node i64)] (-> i64)
+  (cast i64 (aot_ts_node_child_count (load (field ast handle)) (cast i32 node))))
+
+(defn ts-child [(ast TsAst) (node i64) (index i64)] (-> i64)
+  (cast i64 (aot_ts_node_child (load (field ast handle)) (cast i32 node) (cast i32 index))))
+
+(defn ts-text [(ast TsAst) (node i64)] (-> (slice u8))
+  (substr (load (field ast source)) (ts-start ast node) (ts-end ast node)))
+
+(defn ts-child-of-kind [(ast TsAst) (node i64) (kind i64)] (-> i64)
+  (let [(mut index) 0
+        (mut answer) -1]
+    (loop (if (or (>= (load index) (ts-child-count ast node)) (!= (load answer) -1))
+              (break)
+              (let [child (ts-child ast node (load index))]
+                (if (= (ts-kind ast child) kind) (store! answer child) 0)
+                (store! index (+ (load index) 1)))))
+    (load answer)))
+
+(defn ts-diagnostic-count [(ast TsAst)] (-> i64)
+  (cast i64 (aot_ts_diagnostic_count (load (field ast handle)))))
+
+(defn ts-diagnostic-code [(ast TsAst) (index i64)] (-> i64)
+  (cast i64 (aot_ts_diagnostic_code (load (field ast handle)) (cast i32 index))))
+
+(defn ts-diagnostic-start [(ast TsAst) (index i64)] (-> i64)
+  (cast i64 (aot_ts_diagnostic_start (load (field ast handle)) (cast i32 index))))
+
+(defn ts-diagnostic-length [(ast TsAst) (index i64)] (-> i64)
+  (cast i64 (aot_ts_diagnostic_length (load (field ast handle)) (cast i32 index))))

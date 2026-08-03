@@ -1,0 +1,916 @@
+;; Direct ideal-graph construction from the Coil-owned native TypeScript frontend.
+;; Node creation order intentionally mirrors frontend_coil_codegen.mjs. Exact
+;; g-render equality, not merely execution equivalence, is the acceptance test.
+(module frontendnativegraph)
+
+(import "frontendnative" :use *)
+(import "typescriptnative" :use *)
+(import "ty" :use *)
+(import "node" :use *)
+(import "shape" :use *)
+(import "coil.alloc" :use *)
+(import "coil.arraylist" :use *)
+(import "coil.slice" :use *)
+(import "coil.str" :use *)
+
+(const FNG-DYNAMIC i64 -1)
+(const FNG-NUMBER i64 -2)
+(const FNG-BOOLEAN i64 -3)
+(const FNG-NULL i64 -4)
+(const FNG-VOID i64 -5)
+
+(defstruct FngContext
+  [(frontend (ptr NativeFrontend))
+   (values (ptr (ArrayList i64)))
+   (value-types (ptr (ArrayList i64)))
+   (functions (ptr (ArrayList i64)))
+   (shapes (ptr (ArrayList i64)))
+   (aliases (ptr (ArrayList i64)))
+   (effects (ptr (ArrayList bool)))
+   (type-count i64)
+   (ctrl (ptr i64))
+   (memory (ptr i64))
+   (first-return (ptr i64))
+   (owner i64)
+   (fun i64)
+   (top-level bool)])
+
+(defn fng-context [(frontend (ptr NativeFrontend))
+                   (values (ptr (ArrayList i64)))
+                   (value-types (ptr (ArrayList i64)))
+                   (functions (ptr (ArrayList i64)))
+                   (shapes (ptr (ArrayList i64)))
+                   (aliases (ptr (ArrayList i64)))
+                   (effects (ptr (ArrayList bool)))
+                   (type-count i64)
+                   (ctrl (ptr i64))
+                   (memory (ptr i64))
+                   (first-return (ptr i64))
+                   (owner i64)
+                   (fun i64)
+                   (top-level bool)] (-> FngContext)
+  (let [(mut context) (zeroed FngContext)]
+    (store! (field context frontend) frontend)
+    (store! (field context values) values)
+    (store! (field context value-types) value-types)
+    (store! (field context functions) functions)
+    (store! (field context shapes) shapes)
+    (store! (field context aliases) aliases)
+    (store! (field context effects) effects)
+    (store! (field context type-count) type-count)
+    (store! (field context ctrl) ctrl)
+    (store! (field context memory) memory)
+    (store! (field context first-return) first-return)
+    (store! (field context owner) owner)
+    (store! (field context fun) fun)
+    (store! (field context top-level) top-level)
+    (load context)))
+
+(defn fng-optimize-ptr [] (-> (ptr bool))
+  (let [enabled (static bool)] enabled))
+
+(defn fng-peep [(node i64)] (-> i64)
+  (if (load (fng-optimize-ptr)) (n-peephole node) node))
+
+(defn fng-const [(value i64)] (-> i64)
+  (n-new1 OP-CONST (t-int-con value) (g-start)))
+
+(defn fng-null [] (-> i64)
+  (n-new1 OP-CONST (t-null) (g-start)))
+
+(defn fng-bin [(op i64) (left i64) (right i64)] (-> i64)
+  (fng-peep (n-new3 op 0 NO-NODE left right)))
+
+(defn fng-type-tag [(frontend (ptr NativeFrontend)) (type-node i64)] (-> i64)
+  (if (= type-node -1)
+      FNG-DYNAMIC
+      (let [ast (field frontend ast)
+            kind (ts-kind ast type-node)
+            named (fe-type-index-for-node frontend type-node)]
+        (cond (!= named -1) named
+              (= kind TSK-NUMBER) FNG-NUMBER
+              (= kind TSK-BOOLEAN) FNG-BOOLEAN
+              (= kind TSK-NULL) FNG-NULL
+              (= kind TSK-VOID) FNG-VOID
+              :else FNG-DYNAMIC))))
+
+(defn fng-coil-type [(frontend (ptr NativeFrontend))
+                     (shapes (ptr (ArrayList i64)))
+                     (type-node i64)] (-> i64)
+  (let [tag (fng-type-tag frontend type-node)
+        kind (if (= type-node -1) -1 (ts-kind (field frontend ast) type-node))]
+    (cond (= tag FNG-NUMBER) (t-int)
+          (= tag FNG-BOOLEAN) (t-bool)
+          (= tag FNG-NULL) (t-null)
+          (>= tag 0) (t-obj-shape (al-get [i64] (load shapes) tag))
+          (or (= kind TSK-TYPE-LITERAL) (= kind TSK-UNION-TYPE)) (t-obj)
+          :else (t-int))))
+
+(defn fng-field-index [(frontend (ptr NativeFrontend)) (owner i64) (name-node i64)] (-> i64)
+  (let [name (ts-text (field frontend ast) name-node)
+        (mut index) 0
+        (mut answer) -1]
+    (loop (if (or (>= (load index) (al-len [FeField] (load (field frontend fields)))) (!= (load answer) -1))
+              (break)
+              (let [field-value (al-get [FeField] (load (field frontend fields)) (load index))]
+                (if (and (= (load (field field-value owner)) owner)
+                         (str-eq name (fe-field-name frontend (load index))))
+                    (store! answer (load index))
+                    0)
+                (store! index (+ (load index) 1)))))
+    (load answer)))
+
+(defn fng-field-local-index [(frontend (ptr NativeFrontend)) (field-index i64)] (-> i64)
+  (let [field-value (al-get [FeField] (load (field frontend fields)) field-index)
+        owner (load (field field-value owner))
+        type (al-get [FeTypeDecl] (load (field frontend types)) owner)]
+    (- field-index (load (field type field-start)))))
+
+(defn fng-memory [(ctrl i64) (alias i64)] (-> i64)
+  (n-new1 OP-ARG (t-mem-alias alias (t-undef)) ctrl))
+
+(defn fng-merge [(memories (ptr (ArrayList i64)))] (-> i64)
+  (let [merge (n-new OP-MEMMERGE 0)
+        (mut index) 0]
+    (n-add-def! merge NO-NODE)
+    (loop (if (>= (load index) (al-len [i64] (load memories)))
+              (break)
+              (do
+                (n-add-def! merge (al-get [i64] (load memories) (load index)))
+                (store! index (+ (load index) 1)))))
+    (fng-peep merge)))
+
+(defn fng-effect? [(context FngContext) (owner i64)] (-> bool)
+  (let [function-id (load (field context owner))
+        type-count (load (field context type-count))]
+    (al-get [bool] (load (load (field context effects))) (+ (* function-id type-count) owner))))
+
+(defn fng-active-memory! [(context FngContext) (out (mut (ArrayList i64)))] (-> i64)
+  (let [frontend (load (field context frontend))
+        (mut index) 0]
+    (loop (if (>= (load index) (al-len [FeField] (load (field frontend fields))))
+              (break)
+              (let [field-value (al-get [FeField] (load (field frontend fields)) (load index))]
+                (if (fng-effect? context (load (field field-value owner)))
+                    (al-push! [i64] (mut out) (load index))
+                    0)
+                (store! index (+ (load index) 1)))))
+    0))
+
+(defn fng-main-index [(frontend (ptr NativeFrontend))] (-> i64)
+  (let [(mut index) 0
+        (mut answer) -1]
+    (loop (if (or (>= (load index) (al-len [FeFunction] (load (field frontend functions)))) (!= (load answer) -1))
+              (break)
+              (if (str-eq (fe-function-name frontend (load index)) "main")
+                  (store! answer (load index))
+                  (store! index (+ (load index) 1)))))
+    (load answer)))
+
+(defn fng-function-index [(frontend (ptr NativeFrontend)) (id i64)] (-> i64)
+  (let [(mut index) 0
+        (mut answer) -1]
+    (loop (if (or (>= (load index) (al-len [FeFunction] (load (field frontend functions)))) (!= (load answer) -1))
+              (break)
+              (let [fn (al-get [FeFunction] (load (field frontend functions)) (load index))]
+                (if (= (load (field fn id)) id) (store! answer (load index)) 0)
+                (store! index (+ (load index) 1)))))
+    (load answer)))
+
+(defn fng-symbol-node [(context FngContext) (symbol i64)] (-> i64)
+  (al-get [i64] (load (load (field context values))) symbol))
+
+(defn fng-set-symbol! [(context FngContext) (symbol i64) (node i64)] (-> i64)
+  (al-set! [i64] (mut (load (field context values))) symbol node))
+
+(defn fng-symbol-type [(context FngContext) (symbol i64)] (-> i64)
+  (al-get [i64] (load (load (field context value-types))) symbol))
+
+(defn fng-set-symbol-type! [(context FngContext) (symbol i64) (type i64)] (-> i64)
+  (al-set! [i64] (mut (load (field context value-types))) symbol type))
+
+(defn fng-declared-symbol-type [(frontend (ptr NativeFrontend)) (symbol-id i64)] (-> i64)
+  (let [(mut index) 0
+        (mut answer) FNG-DYNAMIC]
+    (loop (if (or (>= (load index) (al-len [FeSymbol] (load (field frontend symbols))))
+                  (!= (load answer) FNG-DYNAMIC))
+              (break)
+              (let [symbol (al-get [FeSymbol] (load (field frontend symbols)) (load index))]
+                (if (= (load (field symbol id)) symbol-id)
+                    (store! answer (fng-type-tag frontend (load (field symbol type-node))))
+                    0)
+                (store! index (+ (load index) 1)))))
+    (load answer)))
+
+(defn fng-infer [(context FngContext) (node i64) (expected i64)] (-> i64)
+  (if (!= expected FNG-DYNAMIC)
+      expected
+      (let [frontend (load (field context frontend))
+            ast (field frontend ast)
+            kind (ts-kind ast node)]
+        (cond (= kind TSK-IDENTIFIER) (fng-symbol-type context (fe-resolution-symbol frontend node))
+              (= kind TSK-NUMERIC-LITERAL) FNG-NUMBER
+              (or (= kind TSK-TRUE) (= kind TSK-FALSE)) FNG-BOOLEAN
+              (= kind TSK-NULL) FNG-NULL
+              (or (= kind TSK-CALL) (= kind TSK-NEW-EXPRESSION))
+                (let [callee (fe-resolution-symbol frontend (ts-child ast node 0))
+                      fn
+                        (al-get [FeFunction]
+                                (load (field frontend functions))
+                                (fng-function-index frontend callee))]
+                  (fng-type-tag frontend (load (field fn result-node))))
+              (= kind TSK-PROPERTY-ACCESS)
+                (let [owner (fng-infer context (ts-child ast node 0) FNG-DYNAMIC)
+                      field-index (fng-field-index frontend owner (ts-child ast node 1))
+                      field-value (al-get [FeField] (load (field frontend fields)) field-index)]
+                  (fng-type-tag frontend (load (field field-value type-node))))
+              (= kind TSK-PREFIX-UNARY) (if (str-eq (ts-text ast (ts-child ast node 0)) "!") FNG-BOOLEAN FNG-NUMBER)
+              (= kind TSK-BINARY)
+                (let [operator (ts-text ast (ts-child ast node 1))]
+                  (if (or (str-eq operator "<")
+                          (str-eq operator "<=")
+                          (str-eq operator ">")
+                          (str-eq operator ">=")
+                          (str-eq operator "===")
+                          (str-eq operator "!=="))
+                      FNG-BOOLEAN
+                      (fng-infer context (ts-child ast node 0) FNG-DYNAMIC)))
+              :else FNG-DYNAMIC))))
+
+(defn fng-expression [(context FngContext) (node i64)] (-> i64)
+  (fng-expression-expected context node FNG-DYNAMIC))
+
+(defn fng-call [(context FngContext) (node i64)] (-> i64)
+  (let [frontend (load (field context frontend))
+        ast (field frontend ast)
+        callee-node (ts-child ast node 0)
+        callee (fe-resolution-symbol frontend callee-node)
+        target (al-get [i64] (load (load (field context functions))) callee)
+        (mut args) (al-new [i64] (malloc-allocator))
+        (mut index) 1]
+    (loop (if (>= (load index) (ts-child-count ast node))
+              (break)
+              (do
+                (al-push! [i64] (mut args) (fng-expression context (ts-child ast node (load index))))
+                (store! index (+ (load index) 1)))))
+    (let [call (n-call! (load (load (field context ctrl))) target (al-slice [i64] (load args)))
+          value (call-value call)]
+      (store! (load (field context ctrl)) (call-end call))
+      (al-free! [i64] (mut args))
+      value)))
+
+(defn fng-object [(context FngContext) (node i64) (owner i64)] (-> i64)
+  (let [frontend (load (field context frontend))
+        ast (field frontend ast)
+        type (al-get [FeTypeDecl] (load (field frontend types)) owner)
+        field-start (load (field type field-start))
+        field-count (load (field type field-count))
+        shape (al-get [i64] (load (load (field context shapes))) owner)
+        (mut field-values) (al-new [i64] (malloc-allocator))
+        (mut incoming) (al-new [i64] (malloc-allocator))
+        (mut active) (al-new [i64] (malloc-allocator))
+        (mut stores) (al-new [i64] (malloc-allocator))
+        (mut index) 0]
+    (loop (if (>= (load index) field-count)
+              (break)
+              (let [property (ts-child ast node (load index))
+                    value-node (ts-child ast property (- (ts-child-count ast property) 1))
+                    field-value (al-get [FeField] (load (field frontend fields)) (+ field-start (load index)))
+                    expected (fng-type-tag frontend (load (field field-value type-node)))]
+                (al-push! [i64] (mut field-values) (fng-expression-expected context value-node expected))
+                (store! index (+ (load index) 1)))))
+    (store! index 0)
+    (loop (if (>= (load index) field-count)
+              (break)
+              (let [global-field (+ field-start (load index))
+                    alias (al-get [i64] (load (load (field context aliases))) global-field)]
+                (al-push! [i64] (mut incoming) (fng-memory (load (load (field context ctrl))) alias))
+                (store! index (+ (load index) 1)))))
+    (fng-active-memory! context (mut active))
+    (let [nw (n-new-obj! (load (load (field context ctrl))) shape (al-slice [i64] (load incoming)))
+          object (n-obj-ptr nw)]
+      (store! index 0)
+      (loop (if (>= (load index) (al-len [i64] (load active)))
+                (break)
+                (let [global-field (al-get [i64] (load active) (load index))
+                      active-field (al-get [FeField] (load (field frontend fields)) global-field)
+                      alias (al-get [i64] (load (load (field context aliases))) global-field)]
+                  (if (= (load (field active-field owner)) owner)
+                      (let [local (fng-field-local-index frontend global-field)]
+                        (al-push! [i64]
+                                  (mut stores)
+                                  (n-store! (n-obj-mem nw local) object (al-get [i64] (load field-values) local) alias)))
+                      (al-push! [i64] (mut stores) (fng-memory (load (load (field context ctrl))) alias)))
+                  (store! index (+ (load index) 1)))))
+      (store! (load (field context memory)) (fng-merge stores))
+      (al-free! [i64] (mut field-values))
+      (al-free! [i64] (mut incoming))
+      (al-free! [i64] (mut active))
+      (al-free! [i64] (mut stores))
+      object)))
+
+(defn fng-field-load [(context FngContext) (node i64)] (-> i64)
+  (let [frontend (load (field context frontend))
+        ast (field frontend ast)
+        object-node (ts-child ast node 0)
+        name-node (ts-child ast node 1)
+        owner (fng-infer context object-node FNG-DYNAMIC)
+        object (fng-expression context object-node)
+        field-index (fng-field-index frontend owner name-node)
+        alias (al-get [i64] (load (load (field context aliases))) field-index)
+        shape (al-get [i64] (load (load (field context shapes))) owner)
+        cast-node (n-new2 OP-CAST (t-obj-shape shape) (load (load (field context ctrl))) object)]
+    (n-load! (fng-memory (load (load (field context ctrl))) alias) cast-node alias)))
+
+(defn fng-expression-expected [(context FngContext) (node i64) (expected i64)] (-> i64)
+  (let [frontend (load (field context frontend))
+        ast (field frontend ast)
+        kind (ts-kind ast node)]
+    (cond (= kind TSK-IDENTIFIER) (fng-symbol-node context (fe-resolution-symbol frontend node))
+          (= kind TSK-NUMERIC-LITERAL)
+            (match (str-parse-int (ts-text ast node))
+              (Some [value] (fng-const value))
+              (None [] NO-NODE))
+          (= kind TSK-NULL) (fng-null)
+          (= kind TSK-TRUE) (fng-const 1)
+          (= kind TSK-FALSE) (fng-const 0)
+          (= kind TSK-PARENTHESIZED-EXPRESSION) (fng-expression-expected context (ts-child ast node 0) expected)
+          (= kind TSK-PREFIX-UNARY)
+            (let [operator (ts-text ast (ts-child ast node 0))
+                  value (fng-expression context (ts-child ast node 1))]
+              (cond (str-eq operator "+") value
+                    (str-eq operator "!") (fng-bin OP-EQ value (fng-const 0))
+                    (str-eq operator "-") (fng-bin OP-SUB (fng-const 0) value)
+                    :else NO-NODE))
+          (= kind TSK-BINARY)
+            (let [left-node (ts-child ast node 0)
+                  operator (ts-text ast (ts-child ast node 1))
+                  right-node (ts-child ast node 2)]
+              (if (or (str-eq operator "=") (str-eq operator "+=") (str-eq operator "-="))
+                  (let [symbol (fe-resolution-symbol frontend left-node)
+                        right (fng-expression context right-node)
+                        value
+                          (cond (str-eq operator "=") right
+                                (str-eq operator "+=") (fng-bin OP-ADD (fng-symbol-node context symbol) right)
+                                :else (fng-bin OP-SUB (fng-symbol-node context symbol) right))]
+                    (fng-set-symbol! context symbol value)
+                    value)
+                  (let [left (fng-expression context left-node)
+                        right (fng-expression context right-node)]
+                    (cond (str-eq operator "+") (fng-bin OP-ADD left right)
+                          (str-eq operator "-") (fng-bin OP-SUB left right)
+                          (str-eq operator "*") (fng-bin OP-MUL left right)
+                          (str-eq operator "/") (fng-bin OP-DIV left right)
+                          (str-eq operator "<") (fng-bin OP-LT left right)
+                          (str-eq operator "<=") (fng-bin OP-LE left right)
+                          (str-eq operator ">") (fng-bin OP-LT right left)
+                          (str-eq operator ">=") (fng-bin OP-LE right left)
+                          (str-eq operator "===") (fng-bin OP-EQ left right)
+                          (str-eq operator "!==") (fng-bin OP-EQ (fng-bin OP-EQ left right) (fng-const 0))
+                          :else NO-NODE))))
+          (or (= kind TSK-CALL) (= kind TSK-NEW-EXPRESSION)) (fng-call context node)
+          (= kind TSK-OBJECT-LITERAL) (fng-object context node expected)
+          (= kind TSK-PROPERTY-ACCESS) (fng-field-load context node)
+          :else NO-NODE)))
+
+(defn fng-ensure-memory! [(context FngContext)] (-> i64)
+  (if (!= (load (load (field context memory))) NO-NODE)
+      0
+      (let [(mut active) (al-new [i64] (malloc-allocator))
+            (mut memories) (al-new [i64] (malloc-allocator))
+            (mut index) 0]
+        (fng-active-memory! context (mut active))
+        (loop (if (>= (load index) (al-len [i64] (load active)))
+                  (break)
+                  (let [field-index (al-get [i64] (load active) (load index))
+                        alias (al-get [i64] (load (load (field context aliases))) field-index)]
+                    (al-push! [i64] (mut memories) (fng-memory (load (load (field context ctrl))) alias))
+                    (store! index (+ (load index) 1)))))
+        (if (> (al-len [i64] (load memories)) 0)
+            (store! (load (field context memory)) (fng-merge memories))
+            0)
+        (al-free! [i64] (mut active))
+        (al-free! [i64] (mut memories))
+        0)))
+
+(defn fng-add-return! [(context FngContext) (value i64)] (-> i64)
+  (fng-ensure-memory! context)
+  (let [ctrl (load (load (field context ctrl)))
+        memory (load (load (field context memory)))]
+    (if (load (field context top-level))
+        (let [ret
+                (if (= memory NO-NODE)
+                    (n-new2 OP-RETURN 0 ctrl value)
+                    (n-new3 OP-RETURN 0 ctrl value memory))]
+          (n-add-def! (g-stop) ret)
+          ret)
+        (let [ret
+                (if (= memory NO-NODE)
+                    (n-new2 OP-RETURN 0 ctrl value)
+                    (n-new3 OP-RETURN 0 ctrl value memory))
+              first (load (field context first-return))
+              fun (load (field context fun))]
+          (if (= (load first) NO-NODE)
+              (do (n-fun-close! fun ret) (store! first ret))
+              (n-fun-add-return! fun ret))
+          ret))))
+
+(defn fng-list-has [(values (ptr (ArrayList i64))) (value i64)] (-> bool)
+  (let [(mut index) 0
+        (mut found) false]
+    (loop (if (or (>= (load index) (al-len [i64] (load values))) (load found))
+              (break)
+              (do
+                (if (= (al-get [i64] (load values) (load index)) value) (store! found true) 0)
+                (store! index (+ (load index) 1)))))
+    (load found)))
+
+(defn fng-assigned! [(frontend (ptr NativeFrontend))
+                     (node i64)
+                     (assigned (mut (ArrayList i64)))] (-> i64)
+  (let [ast (field frontend ast)
+        kind (ts-kind ast node)]
+    (if (= kind TSK-BINARY)
+        (let [operator (ts-text ast (ts-child ast node 1))
+              left (ts-child ast node 0)]
+          (if (and (or (str-eq operator "=") (str-eq operator "+=") (str-eq operator "-="))
+                   (= (ts-kind ast left) TSK-IDENTIFIER))
+              (let [symbol (fe-resolution-symbol frontend left)]
+                (if (fng-list-has assigned symbol) 0 (al-push! [i64] (mut assigned) symbol)))
+              0))
+        0)
+    (let [(mut index) 0]
+      (loop (if (>= (load index) (ts-child-count ast node))
+                (break)
+                (do
+                  (fng-assigned! frontend (ts-child ast node (load index)) (mut assigned))
+                  (store! index (+ (load index) 1))))))
+    0))
+
+(defn fng-restore-values! [(context FngContext)
+                           (symbols (ptr (ArrayList i64)))
+                           (saved (ptr (ArrayList i64)))] (-> i64)
+  (let [(mut index) 0]
+    (loop (if (>= (load index) (al-len [i64] (load symbols)))
+              (break)
+              (do
+                (fng-set-symbol! context
+                                 (al-get [i64] (load symbols) (load index))
+                                 (al-get [i64] (load saved) (load index)))
+                (store! index (+ (load index) 1)))))
+    0))
+
+(defn fng-if [(context FngContext) (node i64)] (-> bool)
+  (let [frontend (load (field context frontend))
+        ast (field frontend ast)
+        condition-node (ts-child ast node 0)
+        then-node (ts-child ast node 1)
+        else-node (if (> (ts-child-count ast node) 2) (ts-child ast node 2) -1)
+        (mut changed) (al-new [i64] (malloc-allocator))
+        (mut saved-values) (al-new [i64] (malloc-allocator))
+        (mut then-values) (al-new [i64] (malloc-allocator))
+        saved-ctrl (load (load (field context ctrl)))
+        saved-memory (load (load (field context memory)))
+        (mut index) 0
+        (mut answer) true]
+    (fng-assigned! frontend then-node (mut changed))
+    (if (!= else-node -1) (fng-assigned! frontend else-node (mut changed)) 0)
+    (loop (if (>= (load index) (al-len [i64] (load changed)))
+              (break)
+              (do
+                (al-push! [i64]
+                          (mut saved-values)
+                          (fng-symbol-node context (al-get [i64] (load changed) (load index))))
+                (store! index (+ (load index) 1)))))
+    (store! answer
+            (let [condition (fng-expression context condition-node)
+                  arms (n-if-arms! (fng-peep (n-new2 OP-IF 0 saved-ctrl condition)))]
+              (store! (load (field context ctrl)) (arms-t arms))
+              (let [then-continues (fng-statement context then-node)
+                    then-ctrl (load (load (field context ctrl)))]
+                (store! index 0)
+                (loop (if (>= (load index) (al-len [i64] (load changed)))
+                          (break)
+                          (do
+                            (al-push! [i64]
+                                      (mut then-values)
+                                      (fng-symbol-node context (al-get [i64] (load changed) (load index))))
+                            (store! index (+ (load index) 1)))))
+                (store! (load (field context memory)) saved-memory)
+                (store! (load (field context ctrl)) (arms-f arms))
+                (fng-restore-values! context changed saved-values)
+                (let [else-continues (if (= else-node -1) true (fng-statement context else-node))
+                      else-ctrl (load (load (field context ctrl)))]
+                  (cond (and (not then-continues) (not else-continues)) false
+                        (not then-continues) true
+                        (not else-continues)
+                          (do
+                            (store! (load (field context ctrl)) then-ctrl)
+                            (fng-restore-values! context changed then-values)
+                            true)
+                        :else
+                          (let [region (n-new OP-REGION 0)
+                                (mut phis) (al-new [i64] (malloc-allocator))]
+                            (n-add-def! region NO-NODE)
+                            (n-add-def! region then-ctrl)
+                            (n-add-def! region else-ctrl)
+                            ;; Allocate every Phi before filling any inputs, matching generated let bindings.
+                            (store! index 0)
+                            (loop (if (>= (load index) (al-len [i64] (load changed)))
+                                      (break)
+                                      (do
+                                        (al-push! [i64] (mut phis) (n-new OP-PHI (t-int)))
+                                        (store! index (+ (load index) 1)))))
+                            (store! index 0)
+                            (loop (if (>= (load index) (al-len [i64] (load changed)))
+                                      (break)
+                                      (let [phi (al-get [i64] (load phis) (load index))]
+                                        (n-add-def! phi region)
+                                        (n-add-def! phi (al-get [i64] (load then-values) (load index)))
+                                        (n-add-def! phi
+                                                    (fng-symbol-node context (al-get [i64] (load changed) (load index))))
+                                        (fng-set-symbol! context (al-get [i64] (load changed) (load index)) phi)
+                                        (store! index (+ (load index) 1)))))
+                            (store! (load (field context memory)) saved-memory)
+                            (store! (load (field context ctrl)) region)
+                            (al-free! [i64] (mut phis))
+                            true))))))
+    (al-free! [i64] (mut changed))
+    (al-free! [i64] (mut saved-values))
+    (al-free! [i64] (mut then-values))
+    (load answer)))
+
+(defn fng-loop [(context FngContext) (condition-node i64) (body-node i64) (increment-node i64)] (-> bool)
+  (let [frontend (load (field context frontend))
+        ast (field frontend ast)
+        (mut carried) (al-new [i64] (malloc-allocator))
+        (mut phis) (al-new [i64] (malloc-allocator))
+        loop-node (n-new OP-LOOP 0)
+        (mut index) 0]
+    (fng-assigned! frontend body-node (mut carried))
+    (if (!= increment-node -1) (fng-assigned! frontend increment-node (mut carried)) 0)
+    (n-add-def! loop-node NO-NODE)
+    (n-add-def! loop-node (load (load (field context ctrl))))
+    (n-add-def! loop-node NO-NODE)
+    ;; Phi nodes are allocated first, then initialized in source assignment order.
+    (loop (if (>= (load index) (al-len [i64] (load carried)))
+              (break)
+              (do
+                (al-push! [i64] (mut phis) (n-new OP-PHI (t-int)))
+                (store! index (+ (load index) 1)))))
+    (store! index 0)
+    (loop (if (>= (load index) (al-len [i64] (load carried)))
+              (break)
+              (let [symbol (al-get [i64] (load carried) (load index))
+                    phi (al-get [i64] (load phis) (load index))]
+                (n-add-def! phi loop-node)
+                (n-add-def! phi (fng-symbol-node context symbol))
+                (n-add-def! phi NO-NODE)
+                (fng-set-symbol! context symbol phi)
+                (store! index (+ (load index) 1)))))
+    (store! (load (field context ctrl)) loop-node)
+    (let [condition (fng-expression context condition-node)
+          arms (n-if-arms! (fng-peep (n-new2 OP-IF 0 loop-node condition)))]
+      (store! (load (field context ctrl)) (arms-t arms))
+      (fng-statement context body-node)
+      (if (!= increment-node -1) (fng-expression context increment-node) 0)
+      (store! index 0)
+      (loop (if (>= (load index) (al-len [i64] (load carried)))
+                (break)
+                (let [symbol (al-get [i64] (load carried) (load index))
+                      phi (al-get [i64] (load phis) (load index))]
+                  (n-set-def! phi 2 (fng-symbol-node context symbol))
+                  (store! index (+ (load index) 1)))))
+      (n-set-def! loop-node 2 (load (load (field context ctrl))))
+      (store! index 0)
+      (loop (if (>= (load index) (al-len [i64] (load carried)))
+                (break)
+                (do
+                  (fng-set-symbol! context
+                                   (al-get [i64] (load carried) (load index))
+                                   (al-get [i64] (load phis) (load index)))
+                  (store! index (+ (load index) 1)))))
+      (store! (load (field context ctrl)) (arms-f arms)))
+    (al-free! [i64] (mut carried))
+    (al-free! [i64] (mut phis))
+    true))
+
+(defn fng-statement [(context FngContext) (node i64)] (-> bool)
+  (let [frontend (load (field context frontend))
+        ast (field frontend ast)
+        kind (ts-kind ast node)]
+    (cond (= kind TSK-BLOCK)
+            (let [(mut index) 0
+                  (mut continues) true]
+              (loop (if (or (>= (load index) (ts-child-count ast node)) (not (load continues)))
+                        (break)
+                        (do
+                          (store! continues (fng-statement context (ts-child ast node (load index))))
+                          (store! index (+ (load index) 1)))))
+              (load continues))
+          (= kind TSK-VARIABLE-STATEMENT)
+            (let [list (ts-child ast node 0)
+                  declaration (ts-child ast list 0)
+                  count (ts-child-count ast declaration)
+                  value-node (ts-child ast declaration (- count 1))
+                  symbol (fe-symbol-for-declaration frontend declaration (load (field context owner)))
+                  declared (fng-declared-symbol-type frontend symbol)
+                  value (fng-expression-expected context value-node declared)
+                  inferred (fng-infer context value-node declared)]
+              (fng-set-symbol! context symbol value)
+              (fng-set-symbol-type! context symbol inferred)
+              true)
+          (= kind TSK-EXPRESSION-STATEMENT) (do (fng-expression context (ts-child ast node 0)) true)
+          (= kind TSK-IF) (fng-if context node)
+          (= kind TSK-WHILE) (fng-loop context (ts-child ast node 0) (ts-child ast node 1) -1)
+          (= kind TSK-FOR)
+            (let [count (ts-child-count ast node)
+                  initialize (ts-child ast node 0)
+                  condition (ts-child ast node 1)
+                  increment (ts-child ast node 2)
+                  body (ts-child ast node (- count 1))]
+              (fng-statement context initialize)
+              (fng-loop context condition body increment))
+          (= kind TSK-VARIABLE-DECLARATION-LIST) (do (fng-statement context (ts-child ast node 0)) true)
+          (= kind TSK-VARIABLE-DECLARATION)
+            (let [count (ts-child-count ast node)
+                  value-node (ts-child ast node (- count 1))
+                  symbol (fe-symbol-for-declaration frontend node (load (field context owner)))
+                  declared (fng-declared-symbol-type frontend symbol)
+                  value (fng-expression-expected context value-node declared)
+                  inferred (fng-infer context value-node declared)]
+              (fng-set-symbol! context symbol value)
+              (fng-set-symbol-type! context symbol inferred)
+              true)
+          (= kind TSK-RETURN)
+            (let [fn
+                    (al-get [FeFunction]
+                            (load (field frontend functions))
+                            (fng-function-index frontend (load (field context owner))))
+                  expected (fng-type-tag frontend (load (field fn result-node)))]
+              (fng-add-return! context (fng-expression-expected context (ts-child ast node 0) expected))
+              false)
+          :else false)))
+
+(defn fng-node-has-kind [(frontend (ptr NativeFrontend)) (node i64) (wanted i64)] (-> bool)
+  (let [ast (field frontend ast)
+        (mut index) 0
+        (mut found) (= (ts-kind ast node) wanted)]
+    (loop (if (or (load found) (>= (load index) (ts-child-count ast node)))
+              (break)
+              (do
+                (store! found (fng-node-has-kind frontend (ts-child ast node (load index)) wanted))
+                (store! index (+ (load index) 1)))))
+    (load found)))
+
+(defn fng-node-calls-effect [(frontend (ptr NativeFrontend))
+                             (effects (ptr (ArrayList bool)))
+                             (type-count i64)
+                             (node i64)
+                             (owner i64)] (-> bool)
+  (let [ast (field frontend ast)
+        kind (ts-kind ast node)
+        (mut found) false
+        (mut index) 0]
+    (if (or (= kind TSK-CALL) (= kind TSK-NEW-EXPRESSION))
+        (let [callee (fe-resolution-symbol frontend (ts-child ast node 0))]
+          (if (>= callee 0)
+              (store! found (al-get [bool] (load effects) (+ (* callee type-count) owner)))
+              0))
+        0)
+    (loop (if (or (load found) (>= (load index) (ts-child-count ast node)))
+              (break)
+              (do
+                (store! found
+                        (fng-node-calls-effect frontend
+                                               effects
+                                               type-count
+                                               (ts-child ast node (load index))
+                                               owner))
+                (store! index (+ (load index) 1)))))
+    (load found)))
+
+(defn fng-compute-effects! [(frontend (ptr NativeFrontend)) (effects (mut (ArrayList bool)))] (-> i64)
+  (let [function-count (al-len [FeFunction] (load (field frontend functions)))
+        type-count (al-len [FeTypeDecl] (load (field frontend types)))
+        (mut fi) 0
+        (mut ti) 0
+        (mut changed) true]
+    (loop (if (>= (load fi) function-count)
+              (break)
+              (let [fn (al-get [FeFunction] (load (field frontend functions)) (load fi))
+                    result-owner (fe-type-index-for-node frontend (load (field fn result-node)))]
+                (if (and (>= result-owner 0)
+                         (fng-node-has-kind frontend (load (field fn body-node)) TSK-OBJECT-LITERAL))
+                    (al-set! [bool] (mut effects) (+ (* (load (field fn id)) type-count) result-owner) true)
+                    0)
+                (store! fi (+ (load fi) 1)))))
+    (loop (if (not (load changed))
+              (break)
+              (do
+                (store! changed false)
+                (store! fi 0)
+                (loop (if (>= (load fi) function-count)
+                          (break)
+                          (let [fn (al-get [FeFunction] (load (field frontend functions)) (load fi))]
+                            (store! ti 0)
+                            (loop (if (>= (load ti) type-count)
+                                      (break)
+                                      (let [slot (+ (* (load (field fn id)) type-count) (load ti))]
+                                        (if (and (not (al-get [bool] (load effects) slot))
+                                                 (fng-node-calls-effect frontend
+                                                                        effects
+                                                                        type-count
+                                                                        (load (field fn body-node))
+                                                                        (load ti)))
+                                            (do (al-set! [bool] (mut effects) slot true) (store! changed true))
+                                            0)
+                                        (store! ti (+ (load ti) 1)))))
+                            (store! fi (+ (load fi) 1)))))))
+      0)))
+
+  (defn fng-build-layouts! [(frontend (ptr NativeFrontend))
+                            (shapes (mut (ArrayList i64)))
+                            (aliases (mut (ArrayList i64)))] (-> i64)
+    (let [(mut ti) 0
+          (mut fi) 0]
+      (loop (if (>= (load ti) (al-len [FeTypeDecl] (load (field frontend types))))
+                (break)
+                (let [type (al-get [FeTypeDecl] (load (field frontend types)) (load ti))
+                      (mut shape) SHAPE-ROOT]
+                  (store! fi 0)
+                  (loop (if (>= (load fi) (load (field type field-count)))
+                            (break)
+                            (let [field-index (+ (load (field type field-start)) (load fi))
+                                  field-value (al-get [FeField] (load (field frontend fields)) field-index)]
+                              (store! shape
+                                      (shape-transition (load shape)
+                                                        (fe-field-name frontend field-index)
+                                                        (fng-coil-type frontend
+                                                                       shapes
+                                                                       (load (field field-value type-node)))))
+                              (store! fi (+ (load fi) 1)))))
+                  (al-push! [i64] (mut shapes) (load shape))
+                  (store! fi 0)
+                  (loop (if (>= (load fi) (load (field type field-count)))
+                            (break)
+                            (do
+                              (al-push! [i64] (mut aliases) (shape-field-alias (load shape) (load fi)))
+                              (store! fi (+ (load fi) 1)))))
+                  (store! ti (+ (load ti) 1)))))
+      0))
+
+  (defn fng-compile-function! [(frontend (ptr NativeFrontend))
+                               (values (mut (ArrayList i64)))
+                               (value-types (mut (ArrayList i64)))
+                               (functions (mut (ArrayList i64)))
+                               (shapes (mut (ArrayList i64)))
+                               (aliases (mut (ArrayList i64)))
+                               (effects (mut (ArrayList bool)))
+                               (type-count i64)
+                               (function-index i64)
+                               (top-level bool)] (-> i64)
+    (let [fn (al-get [FeFunction] (load (field frontend functions)) function-index)
+          fun-id (load (field fn id))
+          fun (if top-level NO-NODE (al-get [i64] (load functions) fun-id))
+          (mut ctrl) (if top-level (g-start) (n-fun-entry fun))
+          (mut memory) NO-NODE
+          (mut first-return) NO-NODE
+          (mut index) 0]
+      (if top-level
+          0
+          (loop (if (>= (load index) (load (field fn parameter-count)))
+                    (break)
+                    (let [symbol
+                            (al-get [FeSymbol]
+                                    (load (field frontend symbols))
+                                    (+ (load (field fn parameter-start)) (load index)))]
+                      (al-set! [i64] (mut values) (load (field symbol id)) (n-parm! fun (load index)))
+                      (store! index (+ (load index) 1))))))
+      (let [context
+              (fng-context frontend
+                           values
+                           value-types
+                           functions
+                           shapes
+                           aliases
+                           effects
+                           type-count
+                           ctrl
+                           memory
+                           first-return
+                           fun-id
+                           fun
+                           top-level)]
+        (fng-statement context (load (field fn body-node))))
+      0))
+
+  (defn frontend-native-build! [(frontend (mut NativeFrontend)) (seed i64) (optimize bool)] (-> i64)
+    (graph-reset! seed)
+    (shape-reset!)
+    (store! (fng-optimize-ptr) optimize)
+    (let [main-index (fng-main-index frontend)
+          main (al-get [FeFunction] (load (field frontend functions)) main-index)
+          main-id (load (field main id))
+          function-count (al-len [FeFunction] (load (field frontend functions)))
+          type-count (al-len [FeTypeDecl] (load (field frontend types)))
+          symbol-count (+ function-count (al-len [FeSymbol] (load (field frontend symbols))))
+          (mut values) (al-new [i64] (malloc-allocator))
+          (mut value-types) (al-new [i64] (malloc-allocator))
+          (mut functions) (al-new [i64] (malloc-allocator))
+          (mut shapes) (al-new [i64] (malloc-allocator))
+          (mut aliases) (al-new [i64] (malloc-allocator))
+          (mut effects) (al-new [bool] (malloc-allocator))
+          (mut index) 0]
+      (loop (if (>= (load index) symbol-count)
+                (break)
+                (do
+                  (al-push! [i64] (mut values) NO-NODE)
+                  (al-push! [i64] (mut value-types) FNG-DYNAMIC)
+                  (store! index (+ (load index) 1)))))
+      ;; Install declared parameter/local types without creating graph nodes.
+      (store! index 0)
+      (loop (if (>= (load index) (al-len [FeSymbol] (load (field frontend symbols))))
+                (break)
+                (let [symbol (al-get [FeSymbol] (load (field frontend symbols)) (load index))]
+                  (al-set! [i64]
+                           (mut value-types)
+                           (load (field symbol id))
+                           (fng-type-tag frontend (load (field symbol type-node))))
+                  (store! index (+ (load index) 1)))))
+      (store! index 0)
+      (loop (if (>= (load index) function-count)
+                (break)
+                (do (al-push! [i64] (mut functions) NO-NODE) (store! index (+ (load index) 1)))))
+      (store! index 0)
+      (loop (if (>= (load index) (* function-count type-count))
+                (break)
+                (do (al-push! [bool] (mut effects) false) (store! index (+ (load index) 1)))))
+      (fng-compute-effects! frontend (mut effects))
+      ;; Shapes and aliases precede every graph function binding.
+      (fng-build-layouts! frontend (mut shapes) (mut aliases))
+      ;; All non-main function roots are opened before main Args and before bodies.
+      (store! index 0)
+      (loop (if (>= (load index) function-count)
+                (break)
+                (let [fn (al-get [FeFunction] (load (field frontend functions)) (load index))]
+                  (if (!= (load (field fn id)) main-id)
+                      (al-set! [i64] (mut functions) (load (field fn id)) (n-fun-open! (load (field fn id))))
+                      0)
+                  (store! index (+ (load index) 1)))))
+      ;; Main Args are created immediately after the function roots.
+      (store! index 0)
+      (loop (if (>= (load index) (load (field main parameter-count)))
+                (break)
+                (let [symbol
+                        (al-get [FeSymbol]
+                                (load (field frontend symbols))
+                                (+ (load (field main parameter-start)) (load index)))]
+                  (al-set! [i64]
+                           (mut values)
+                           (load (field symbol id))
+                           (n-new1 OP-ARG
+                                   (fng-coil-type frontend shapes (load (field symbol type-node)))
+                                   (g-start)))
+                  (store! index (+ (load index) 1)))))
+      ;; Bodies retain source declaration order, excluding main until the end.
+      (store! index 0)
+      (loop (if (>= (load index) function-count)
+                (break)
+                (let [fn (al-get [FeFunction] (load (field frontend functions)) (load index))]
+                  (if (!= (load (field fn id)) main-id)
+                      (fng-compile-function! frontend
+                                             (mut values)
+                                             (mut value-types)
+                                             (mut functions)
+                                             (mut shapes)
+                                             (mut aliases)
+                                             (mut effects)
+                                             type-count
+                                             (load index)
+                                             false)
+                      0)
+                  (store! index (+ (load index) 1)))))
+      (fng-compile-function! frontend
+                             (mut values)
+                             (mut value-types)
+                             (mut functions)
+                             (mut shapes)
+                             (mut aliases)
+                             (mut effects)
+                             type-count
+                             main-index
+                             true)
+      (g-analyze!)
+      (let [first (al-get [FeSymbol] (load (field frontend symbols)) (load (field main parameter-start)))
+            answer
+              (if (> (load (field main parameter-count)) 0)
+                  (al-get [i64] (load values) (load (field first id)))
+                  NO-NODE)]
+        (al-free! [i64] (mut values))
+        (al-free! [i64] (mut value-types))
+        (al-free! [i64] (mut functions))
+        (al-free! [i64] (mut shapes))
+        (al-free! [i64] (mut aliases))
+        (al-free! [bool] (mut effects))
+        answer)))

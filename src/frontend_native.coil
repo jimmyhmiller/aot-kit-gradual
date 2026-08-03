@@ -1,0 +1,421 @@
+;; Coil-owned TypeScript frontend state. The native Go compiler supplies only the
+;; immutable syntax tree; declaration ordering and symbol identities live here.
+(module frontendnative)
+
+(import "typescriptnative" :use *)
+(import "coil.alloc" :use *)
+(import "coil.arraylist" :use *)
+(import "coil.str" :use *)
+
+(const FE-ROLE-FUNCTION i64 1)
+(const FE-ROLE-PARAMETER i64 2)
+(const FE-ROLE-LOCAL i64 3)
+(const FE-OK i64 0)
+(const FE-PARSE i64 1)
+(const FE-UNBOUND i64 2)
+
+(defstruct FeFunction
+  [(id i64)
+   (node i64)
+   (name-node i64)
+   (body-node i64)
+   (result-node i64)
+   (parameter-start i64)
+   (parameter-count i64)])
+
+(defstruct FeSymbol
+  [(id i64) (node i64) (name-node i64) (owner i64) (role i64) (type-node i64)])
+
+(defstruct FeResolution [(node i64) (symbol i64)])
+(defstruct FeBinding [(name-node i64) (symbol i64) (depth i64)])
+(defstruct FeTypeDecl [(node i64) (name-node i64) (field-start i64) (field-count i64)])
+(defstruct FeField [(owner i64) (node i64) (name-node i64) (type-node i64)])
+
+(defstruct NativeFrontend
+  [(ast TsAst)
+   (functions (ArrayList FeFunction))
+   (symbols (ArrayList FeSymbol))
+   (resolutions (ArrayList FeResolution))
+   (types (ArrayList FeTypeDecl))
+   (fields (ArrayList FeField))
+   (status i64)
+   (error-node i64)])
+
+(defn fe-function-make [(id i64)
+                        (node i64)
+                        (name i64)
+                        (body i64)
+                        (result i64)
+                        (parameter-start i64)
+                        (parameter-count i64)] (-> FeFunction)
+  (let [(mut fn) (zeroed FeFunction)]
+    (store! (field fn id) id)
+    (store! (field fn node) node)
+    (store! (field fn name-node) name)
+    (store! (field fn body-node) body)
+    (store! (field fn result-node) result)
+    (store! (field fn parameter-start) parameter-start)
+    (store! (field fn parameter-count) parameter-count)
+    (load fn)))
+
+(defn fe-symbol-make [(id i64) (node i64) (name i64) (owner i64) (role i64) (type-node i64)] (-> FeSymbol)
+  (let [(mut symbol) (zeroed FeSymbol)]
+    (store! (field symbol id) id)
+    (store! (field symbol node) node)
+    (store! (field symbol name-node) name)
+    (store! (field symbol owner) owner)
+    (store! (field symbol role) role)
+    (store! (field symbol type-node) type-node)
+    (load symbol)))
+
+(defn fe-resolution-make [(node i64) (symbol i64)] (-> FeResolution)
+  (let [(mut resolution) (zeroed FeResolution)]
+    (store! (field resolution node) node)
+    (store! (field resolution symbol) symbol)
+    (load resolution)))
+
+(defn fe-binding-make [(name-node i64) (symbol i64) (depth i64)] (-> FeBinding)
+  (let [(mut binding) (zeroed FeBinding)]
+    (store! (field binding name-node) name-node)
+    (store! (field binding symbol) symbol)
+    (store! (field binding depth) depth)
+    (load binding)))
+
+(defn fe-type-make [(node i64) (name-node i64) (field-start i64) (field-count i64)] (-> FeTypeDecl)
+  (let [(mut type) (zeroed FeTypeDecl)]
+    (store! (field type node) node)
+    (store! (field type name-node) name-node)
+    (store! (field type field-start) field-start)
+    (store! (field type field-count) field-count)
+    (load type)))
+
+(defn fe-field-make [(owner i64) (node i64) (name-node i64) (type-node i64)] (-> FeField)
+  (let [(mut field-value) (zeroed FeField)]
+    (store! (field field-value owner) owner)
+    (store! (field field-value node) node)
+    (store! (field field-value name-node) name-node)
+    (store! (field field-value type-node) type-node)
+    (load field-value)))
+
+(defn fe-native-new [(source (slice u8))] (-> NativeFrontend)
+  (let [a (malloc-allocator)
+        (mut frontend) (zeroed NativeFrontend)]
+    (store! (field frontend ast) (ts-open source))
+    (store! (field frontend functions) (al-new [FeFunction] a))
+    (store! (field frontend symbols) (al-new [FeSymbol] a))
+    (store! (field frontend resolutions) (al-new [FeResolution] a))
+    (store! (field frontend types) (al-new [FeTypeDecl] a))
+    (store! (field frontend fields) (al-new [FeField] a))
+    (store! (field frontend status) 0)
+    (store! (field frontend error-node) -1)
+    (load frontend)))
+
+(defn fe-type-name [(frontend (ptr NativeFrontend)) (index i64)] (-> (slice u8))
+  (let [type (al-get [FeTypeDecl] (load (field frontend types)) index)]
+    (ts-text (field frontend ast) (load (field type name-node)))))
+
+(defn fe-field-name [(frontend (ptr NativeFrontend)) (index i64)] (-> (slice u8))
+  (let [field-value (al-get [FeField] (load (field frontend fields)) index)]
+    (ts-text (field frontend ast) (load (field field-value name-node)))))
+
+(defn fe-type-index-for-name-node [(frontend (ptr NativeFrontend)) (name-node i64)] (-> i64)
+  (let [name (ts-text (field frontend ast) name-node)
+        (mut index) 0
+        (mut answer) -1]
+    (loop (if (or (>= (load index) (al-len [FeTypeDecl] (load (field frontend types)))) (!= (load answer) -1))
+              (break)
+              (if (str-eq name (fe-type-name frontend (load index)))
+                  (store! answer (load index))
+                  (store! index (+ (load index) 1)))))
+    (load answer)))
+
+(defn fe-type-index-for-node [(frontend (ptr NativeFrontend)) (type-node i64)] (-> i64)
+  (if (= type-node -1)
+      -1
+      (let [ast (field frontend ast)
+            kind (ts-kind ast type-node)]
+        (if (= kind TSK-TYPE-REFERENCE)
+            (fe-type-index-for-name-node frontend (ts-child-of-kind ast type-node TSK-IDENTIFIER))
+            -1))))
+
+(defn fe-index-type! [(frontend (mut NativeFrontend)) (node i64)] (-> i64)
+  (let [ast (field frontend ast)
+        owner (al-len [FeTypeDecl] (load (field frontend types)))
+        name (ts-child-of-kind ast node TSK-IDENTIFIER)
+        start (al-len [FeField] (load (field frontend fields)))
+        kind (ts-kind ast node)
+        layout (if (= kind TSK-TYPE-ALIAS-DECLARATION) (ts-child-of-kind ast node TSK-TYPE-LITERAL) node)
+        (mut index) 0
+        (mut count) 0]
+    (loop (if (or (= layout -1) (>= (load index) (ts-child-count ast layout)))
+              (break)
+              (let [member (ts-child ast layout (load index))]
+                (if (= (ts-kind ast member) TSK-PROPERTY-SIGNATURE)
+                    (let [field-name (ts-child-of-kind ast member TSK-IDENTIFIER)
+                          type-node (if (> (ts-child-count ast member) 1) (ts-child ast member 1) -1)]
+                      (al-push! [FeField]
+                                (mut (field frontend fields))
+                                (fe-field-make owner member field-name type-node))
+                      (store! count (+ (load count) 1)))
+                    0)
+                (store! index (+ (load index) 1)))))
+    (al-push! [FeTypeDecl]
+              (mut (field frontend types))
+              (fe-type-make node name start (load count)))
+    0))
+
+(defn fe-resolution-symbol [(frontend (ptr NativeFrontend)) (node i64)] (-> i64)
+  (let [(mut index) 0
+        (mut answer) -1]
+    (loop (if (or (>= (load index) (al-len [FeResolution] (load (field frontend resolutions))))
+                  (!= (load answer) -1))
+              (break)
+              (let [resolution (al-get [FeResolution] (load (field frontend resolutions)) (load index))]
+                (if (= (load (field resolution node)) node) (store! answer (load (field resolution symbol))) 0)
+                (store! index (+ (load index) 1)))))
+    (load answer)))
+
+(defn fe-function-name [(frontend (ptr NativeFrontend)) (index i64)] (-> (slice u8))
+  (let [fn (al-get [FeFunction] (load (field frontend functions)) index)]
+    (ts-text (field frontend ast) (load (field fn name-node)))))
+
+(defn fe-symbol-name [(frontend (ptr NativeFrontend)) (index i64)] (-> (slice u8))
+  (let [symbol (al-get [FeSymbol] (load (field frontend symbols)) index)]
+    (ts-text (field frontend ast) (load (field symbol name-node)))))
+
+(defn fe-find-function-parts! [(frontend (mut NativeFrontend)) (node i64) (id i64)] (-> i64)
+  (let [ast (field frontend ast)
+        (mut name) -1
+        (mut body) -1
+        (mut result) -1
+        (mut parameter-start) (al-len [FeSymbol] (load (field frontend symbols)))
+        (mut parameter-count) 0
+        (mut index) 0]
+    (loop (if (>= (load index) (ts-child-count ast node))
+              (break)
+              (let [child (ts-child ast node (load index))
+                    kind (ts-kind ast child)]
+                (if (and (= (load name) -1) (= kind TSK-IDENTIFIER)) (store! name child) 0)
+                (if (= kind TSK-PARAMETER)
+                    (let [parameter-name (ts-child-of-kind ast child TSK-IDENTIFIER)
+                          type-node (if (> (ts-child-count ast child) 1) (ts-child ast child 1) -1)
+                          sid (al-len [FeSymbol] (load (field frontend symbols)))]
+                      (al-push! [FeSymbol]
+                                (mut (field frontend symbols))
+                                (fe-symbol-make sid child parameter-name id FE-ROLE-PARAMETER type-node))
+                      (store! parameter-count (+ (load parameter-count) 1)))
+                    0)
+                (if (= kind TSK-BLOCK)
+                    (store! body child)
+                    (if (and (!= kind TSK-IDENTIFIER) (!= kind TSK-PARAMETER)) (store! result child) 0))
+                (store! index (+ (load index) 1)))))
+    (al-push! [FeFunction]
+              (mut (field frontend functions))
+              (fe-function-make id
+                                node
+                                (load name)
+                                (load body)
+                                (load result)
+                                (load parameter-start)
+                                (load parameter-count)))
+    0))
+
+(defn fe-scan-locals! [(frontend (mut NativeFrontend)) (node i64) (owner i64) (symbol-base i64)] (-> i64)
+  (let [ast (field frontend ast)]
+    (if (= (ts-kind ast node) TSK-VARIABLE-DECLARATION)
+        (let [name (ts-child-of-kind ast node TSK-IDENTIFIER)
+              count (ts-child-count ast node)
+              maybe-type (if (> count 2) (ts-child ast node 1) -1)
+              sid (+ symbol-base (al-len [FeSymbol] (load (field frontend symbols))))]
+          (al-push! [FeSymbol]
+                    (mut (field frontend symbols))
+                    (fe-symbol-make sid node name owner FE-ROLE-LOCAL maybe-type)))
+        0)
+    (let [(mut index) 0]
+      (loop (if (>= (load index) (ts-child-count ast node))
+                (break)
+                (do
+                  (fe-scan-locals! (mut frontend) (ts-child ast node (load index)) owner symbol-base)
+                  (store! index (+ (load index) 1))))))
+    0))
+
+(defn fe-symbol-for-declaration [(frontend (ptr NativeFrontend)) (node i64) (owner i64)] (-> i64)
+  (let [(mut index) 0
+        (mut answer) -1]
+    (loop (if (or (>= (load index) (al-len [FeSymbol] (load (field frontend symbols)))) (!= (load answer) -1))
+              (break)
+              (let [symbol (al-get [FeSymbol] (load (field frontend symbols)) (load index))]
+                (if (and (= (load (field symbol node)) node) (= (load (field symbol owner)) owner))
+                    (store! answer (load (field symbol id)))
+                    0)
+                (store! index (+ (load index) 1)))))
+    (load answer)))
+
+(defn fe-find-function-name [(frontend (ptr NativeFrontend)) (name-node i64)] (-> i64)
+  (let [(mut index) 0
+        (mut answer) -1
+        name (ts-text (field frontend ast) name-node)]
+    (loop (if (or (>= (load index) (al-len [FeFunction] (load (field frontend functions)))) (!= (load answer) -1))
+              (break)
+              (let [fn (al-get [FeFunction] (load (field frontend functions)) (load index))]
+                (if (str-eq name (ts-text (field frontend ast) (load (field fn name-node))))
+                    (store! answer (load (field fn id)))
+                    0)
+                (store! index (+ (load index) 1)))))
+    (load answer)))
+
+(defn fe-resolve-name! [(frontend (mut NativeFrontend)) (bindings (ptr (ArrayList FeBinding))) (node i64)] (-> i64)
+  (let [name (ts-text (field frontend ast) node)
+        (mut index) (- (al-len [FeBinding] (load bindings)) 1)
+        (mut answer) -1]
+    (loop (if (or (< (load index) 0) (!= (load answer) -1))
+              (break)
+              (let [binding (al-get [FeBinding] (load bindings) (load index))]
+                (if (str-eq name (ts-text (field frontend ast) (load (field binding name-node))))
+                    (store! answer (load (field binding symbol)))
+                    0)
+                (store! index (- (load index) 1)))))
+    (if (= (load answer) -1) (store! answer (fe-find-function-name frontend node)) 0)
+    (if (= (load answer) -1)
+        (do (store! (field frontend status) FE-UNBOUND) (store! (field frontend error-node) node) -1)
+        (do
+          (al-push! [FeResolution]
+                    (mut (field frontend resolutions))
+                    (fe-resolution-make node (load answer)))
+          (load answer)))))
+
+(defn fe-resolve-node! [(frontend (mut NativeFrontend))
+                        (bindings (mut (ArrayList FeBinding)))
+                        (node i64)
+                        (owner i64)
+                        (depth i64)] (-> i64)
+  (let [ast (field frontend ast)
+        kind (ts-kind ast node)]
+    (cond (= (load (field frontend status)) FE-UNBOUND) 0
+          (= kind TSK-IDENTIFIER) (do (fe-resolve-name! (mut frontend) bindings node) 0)
+          (= kind TSK-VARIABLE-DECLARATION)
+            (let [count (ts-child-count ast node)
+                  name (ts-child-of-kind ast node TSK-IDENTIFIER)
+                  value (if (> count 1) (ts-child ast node (- count 1)) -1)
+                  symbol (fe-symbol-for-declaration frontend node owner)]
+              ;; Initializers are resolved before the declaration enters scope.
+              (if (and (!= value -1) (!= value name))
+                  (fe-resolve-node! (mut frontend) (mut bindings) value owner depth)
+                  0)
+              (al-push! [FeBinding] (mut bindings) (fe-binding-make name symbol depth))
+              0)
+          (= kind TSK-BLOCK)
+            (let [saved (al-len [FeBinding] (load bindings))
+                  (mut index) 0]
+              (loop (if (>= (load index) (ts-child-count ast node))
+                        (break)
+                        (do
+                          (fe-resolve-node! (mut frontend)
+                                            (mut bindings)
+                                            (ts-child ast node (load index))
+                                            owner
+                                            (+ depth 1))
+                          (store! index (+ (load index) 1)))))
+              (store! (field bindings len) saved)
+              0)
+          (= kind TSK-PROPERTY-ACCESS)
+            (fe-resolve-node! (mut frontend) (mut bindings) (ts-child ast node 0) owner depth)
+          (= kind TSK-PROPERTY-ASSIGNMENT)
+            (fe-resolve-node! (mut frontend)
+                              (mut bindings)
+                              (ts-child ast node (- (ts-child-count ast node) 1))
+                              owner
+                              depth)
+          :else
+            (let [(mut index) 0]
+              (loop (if (>= (load index) (ts-child-count ast node))
+                        (break)
+                        (do
+                          (fe-resolve-node! (mut frontend)
+                                            (mut bindings)
+                                            (ts-child ast node (load index))
+                                            owner
+                                            depth)
+                          (store! index (+ (load index) 1)))))
+              0))))
+
+(defn fe-resolve-function! [(frontend (mut NativeFrontend)) (function-index i64)] (-> i64)
+  (let [fn (al-get [FeFunction] (load (field frontend functions)) function-index)
+        owner (load (field fn id))
+        (mut bindings) (al-new [FeBinding] (malloc-allocator))
+        start (load (field fn parameter-start))
+        count (load (field fn parameter-count))
+        (mut index) 0]
+    (loop (if (>= (load index) count)
+              (break)
+              (let [symbol (al-get [FeSymbol] (load (field frontend symbols)) (+ start (load index)))]
+                (al-push! [FeBinding]
+                          (mut bindings)
+                          (fe-binding-make (load (field symbol name-node)) (load (field symbol id)) 0))
+                (store! index (+ (load index) 1)))))
+    (fe-resolve-node! (mut frontend) (mut bindings) (load (field fn body-node)) owner 0)
+    (al-free! [FeBinding] (mut bindings))
+    0))
+
+(defn fe-native-index! [(frontend (mut NativeFrontend))] (-> i64)
+  (let [ast (field frontend ast)]
+    (if (> (ts-diagnostic-count ast) 0)
+        (do (store! (field frontend status) 1) (store! (field frontend error-node) 0) 1)
+        (let [root (ts-root ast)
+              (mut index) 0
+              (mut function-count) 0]
+          ;; Type layouts are indexed by source declaration order. They do not
+          ;; consume symbol ids, matching the legacy normalized IR.
+          (loop (if (>= (load index) (ts-child-count ast root))
+                    (break)
+                    (let [node (ts-child ast root (load index))
+                          kind (ts-kind ast node)]
+                      (if (or (= kind TSK-TYPE-ALIAS-DECLARATION) (= kind TSK-INTERFACE-DECLARATION))
+                          (fe-index-type! (mut frontend) node)
+                          0)
+                      (store! index (+ (load index) 1)))))
+          ;; Function ids are allocated globally before any parameter/local id.
+          (store! index 0)
+          (loop (if (>= (load index) (ts-child-count ast root))
+                    (break)
+                    (let [node (ts-child ast root (load index))]
+                      (if (= (ts-kind ast node) TSK-FUNCTION-DECLARATION)
+                          (do
+                            (fe-find-function-parts! (mut frontend) node (load function-count))
+                            (store! function-count (+ (load function-count) 1)))
+                          0)
+                      (store! index (+ (load index) 1)))))
+          ;; fe-find-function-parts! appended parameters too early. Rebase them after
+          ;; all function ids, matching frontend_ir.mjs's nextSymbol order.
+          (let [(mut si) 0]
+            (loop (if (>= (load si) (al-len [FeSymbol] (load (field frontend symbols))))
+                      (break)
+                      (do
+                        (store! (field (index (load (field (field frontend symbols) data)) (load si)) id)
+                                (+ (load function-count) (load si)))
+                        (store! si (+ (load si) 1))))))
+          (let [(mut fi) 0]
+            (loop (if (>= (load fi) (al-len [FeFunction] (load (field frontend functions))))
+                      (break)
+                      (let [fn (al-get [FeFunction] (load (field frontend functions)) (load fi))]
+                        (fe-scan-locals! (mut frontend)
+                                         (load (field fn body-node))
+                                         (load (field fn id))
+                                         (load function-count))
+                        (store! fi (+ (load fi) 1))))))
+          (let [(mut fi) 0]
+            (loop (if (>= (load fi) (al-len [FeFunction] (load (field frontend functions))))
+                      (break)
+                      (do
+                        (fe-resolve-function! (mut frontend) (load fi))
+                        (store! fi (+ (load fi) 1)))))
+            (load (field frontend status)))))))
+
+(defn fe-native-free! [(frontend (mut NativeFrontend))] (-> i64)
+  (al-free! [FeFunction] (mut (field frontend functions)))
+  (al-free! [FeSymbol] (mut (field frontend symbols)))
+  (al-free! [FeResolution] (mut (field frontend resolutions)))
+  (al-free! [FeTypeDecl] (mut (field frontend types)))
+  (al-free! [FeField] (mut (field frontend fields)))
+  (ts-close! (mut (field frontend ast)))
+  0)
