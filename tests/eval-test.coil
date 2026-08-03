@@ -11,18 +11,19 @@
 ;;   coil test tests/eval-test.coil
 (module evaltest)
 
-(import "../src/ty.coil"     :use *)
-(import "../src/shape.coil"  :use *)
-(import "../src/node.coil"   :use *)
-(import "../src/corpus.coil" :use *)
-(import "../src/eval.coil"   :use *)
-(import "assert.coil"        :use *)
-(import "control.coil"       :use *)
-(import "io.coil"            :use *)
-(import "fmt.coil"           :use *)
-(import "alloc.coil"         :use *)
-(import "arraylist.coil"     :use *)
-(import "slice.coil"         :use *)
+(import "ty"     :use *)
+(import "shape"  :use *)
+(import "node"   :use *)
+(import "verify" :use *)
+(import "corpus" :use *)
+(import "eval"   :use *)
+(import "coil.assert"        :use *)
+(import "coil.control"       :use *)
+(import "coil.io"            :use *)
+(import "coil.fmt"           :use *)
+(import "coil.alloc"         :use *)
+(import "coil.arraylist"     :use *)
+(import "coil.slice"         :use *)
 
 (const BUDGET i64 100000)
 
@@ -251,6 +252,233 @@
     (ev-reset!) (ev-bind! a (RNull)) (ev-run-nobind BUDGET)
     (assert (= (ev-status) EV-CAST))))
 
+(deftest box_and_unbox_preserve_values_and_reject_the_wrong_tag
+  (graph-reset! 1)
+  (let [a (a-arg (t-dyn))
+        u (n-unbox! (n-box! a) (t-int))]
+    (a-ret u)
+    (assert (= (g-verify) 0))
+    (ev-reset!) (ev-bind! a (RInt 17)) (ev-run-nobind BUDGET)
+    (assert (= (ev-status) EV-OK))
+    (assert (rt-eq? (ev-result) (RInt 17)))
+    (ev-reset!) (ev-bind! a (RBool true)) (ev-run-nobind BUDGET)
+    (assert (= (ev-status) EV-UNBOX))))
+
+(deftest typetest_drives_the_runtime_tag_question
+  (graph-reset! 1)
+  (let [a (a-arg (t-dyn))
+        q (n-typetest! a (t-int))]
+    (a-ret q)
+    (ev-reset!) (ev-bind! a (RInt 9)) (ev-run-nobind BUDGET)
+    (assert (= (ev-status) EV-OK))
+    (assert (rt-eq? (ev-result) (RBool true)))
+    (ev-reset!) (ev-bind! a (RNull)) (ev-run-nobind BUDGET)
+    (assert (= (ev-status) EV-OK))
+    (assert (rt-eq? (ev-result) (RBool false)))))
+
+(defn m5-count-op [(op i64)] (-> i64)
+  (let [n (n-count) (mut i) 0 (mut k) 0]
+    (loop
+      (if (>= (load i) n) (break)
+        (do (if (and (not (n-dead? (load i))) (= (n-op (load i)) op))
+                (store! k (+ (load k) 1)) 0)
+            (store! i (+ (load i) 1)) 0)))
+    (load k)))
+
+;; The first complete dynamic arithmetic shape: two tag tests select an unboxed integer fast path;
+;; either failed test reaches the generic Add. The generic operation is still the same semantic
+;; node, so both paths are checked by one interpreter rather than by a hand-written stand-in.
+(deftest dynamic_add_has_a_guarded_unboxed_fast_path_and_a_generic_fallback
+  (graph-reset! 1)
+  (let [a (a-arg (t-dyn)) b (a-arg (t-dyn))
+        aa (n-if-arms! (n-peephole (n-new2 OP-IF 0 (g-start) (n-typetest! a (t-int)))))]
+    (let [ba (n-if-arms! (n-peephole (n-new2 OP-IF 0 (arms-t aa) (n-typetest! b (t-int)))))
+          fast (a-bin OP-ADD (n-unbox! a (t-int)) (n-unbox! b (t-int)))
+          slow (a-bin OP-ADD a b)]
+      (let [ri (new-region2 (arms-t ba) (arms-f ba))]
+        (let [pi (new-phi2 ri (t-dyn) fast slow)
+              ro (new-region2 ri (arms-f aa))]
+          (let [po (new-phi2 ro (t-dyn) pi slow)
+                ret (n-new2 OP-RETURN 0 ro po)]
+            (n-add-def! (g-stop) ret)
+            (iterate!)
+            (assert (= (g-verify) 0))
+            (assert (= (m5-count-op OP-TYPETEST) 2))
+            (assert (= (m5-count-op OP-UNBOX) 2))
+            (assert (= (m5-count-op OP-BOX) 0))
+            ; Both integers take the specialised arm.
+            (ev-reset!) (ev-bind! a (RInt 4)) (ev-bind! b (RInt 3))
+            (ev-run-nobind BUDGET)
+            (assert (= (ev-status) EV-OK))
+            (assert (rt-eq? (ev-result) (RInt 7)))
+            ; A non-integer takes the generic arm and retains its honest typed failure.
+            (ev-reset!) (ev-bind! a (RBool true)) (ev-bind! b (RInt 3))
+            (ev-run-nobind BUDGET)
+            (assert (= (ev-status) EV-TYPE)))))))
+
+  ; The statically inferred version is exactly one unboxed Add: no representation node or branch.
+  (graph-reset! 1)
+  (let [a (a-arg (t-int)) b (a-arg (t-int))]
+    (a-ret (a-bin OP-ADD a b))
+    (assert (= (m5-count-op OP-ADD) 1))
+    (assert (= (m5-count-op OP-BOX) 0))
+    (assert (= (m5-count-op OP-UNBOX) 0))
+    (assert (= (m5-count-op OP-TYPETEST) 0))
+    (assert (= (m5-count-op OP-IF) 0))))
+
+(deftest nan_boxed_words_round_trip_the_runtime_value_domain
+  (assert (rt-eq? (dyn-decode (dyn-encode (RUndef))) (RUndef)))
+  (assert (rt-eq? (dyn-decode (dyn-encode (RNull))) (RNull)))
+  (assert (rt-eq? (dyn-decode (dyn-encode (RBool false))) (RBool false)))
+  (assert (rt-eq? (dyn-decode (dyn-encode (RBool true))) (RBool true)))
+  (assert (rt-eq? (dyn-decode (dyn-encode (RInt 0))) (RInt 0)))
+  (assert (rt-eq? (dyn-decode (dyn-encode (RInt -1))) (RInt -1)))
+  (assert (rt-eq? (dyn-decode (dyn-encode (RInt DYN-INT-MIN))) (RInt DYN-INT-MIN)))
+  (assert (rt-eq? (dyn-decode (dyn-encode (RInt DYN-INT-MAX))) (RInt DYN-INT-MAX)))
+  (assert (rt-eq? (dyn-decode (dyn-encode (RFlt (f64-bits 3.5))))
+                  (RFlt (f64-bits 3.5))))
+  (assert (rt-eq? (dyn-decode (dyn-encode (RObj 12345))) (RObj 12345)))
+  (assert (rt-eq? (dyn-decode (dyn-encode (RStr 7))) (RStr 7)))
+  (assert (rt-eq? (dyn-decode (dyn-encode (RSym 11))) (RSym 11)))
+  (assert (rt-eq? (dyn-decode (dyn-encode (RBig -99))) (RBig -99)))
+  (assert (rt-eq? (dyn-decode (dyn-encode (RFun 3))) (RFun 3)))
+  ; Every NaN payload has one dynamic spelling; ordinary doubles retain every bit.
+  (assert (= (dyn-encode (RFlt 9221120237041090561)) DYN-NAN))
+  (assert (rt-eq? (dyn-decode DYN-NAN) (RFlt DYN-NAN)))
+  ; An integer too wide for the immediate payload remains the same JS number as a direct double.
+  (let [wide 140737488355328]
+    (assert (rt-eq? (dyn-decode (dyn-encode (RInt wide)))
+                    (RFlt (f64-bits (cast f64 wide)))))))
+
+(deftest a_direct_function_call_uses_a_real_parameter_frame
+  (graph-reset! 1)
+  (let [fun (n-fun-open! 0)]
+    (let [a (n-parm! fun 0) b (n-parm! fun 1)
+          sum (a-bin OP-ADD a b)
+          body (n-new2 OP-RETURN 0 (n-fun-entry fun) sum)]
+      (n-fun-close! fun body)
+      (let [site (n-call2! (g-start) fun (a-int 20) (a-int 22))]
+        (let [ret (n-new2 OP-RETURN 0 (call-end site) (call-value site))]
+          (n-add-def! (g-stop) ret)
+          (iterate!)
+          (assert (= (g-verify) 0))
+          (assert (= (m5-count-op OP-FUN) 1))
+          (assert (= (m5-count-op OP-PARM) 2))
+          (assert (= (m5-count-op OP-CALL) 1))
+          (assert (= (m5-count-op OP-CALLEND) 1))
+          (assert (= (ev-run BUDGET) EV-OK))
+          (assert (rt-eq? (ev-result) (RInt 42))))))))
+
+(deftest recursive_calls_execute_the_function_cfg_and_restore_frames
+  (graph-reset! 1)
+  (let [fun (n-fun-open! 0)
+        n (n-parm! fun 0)
+        small (a-bin OP-LT n (a-int 2))
+        iff (n-peephole (n-new2 OP-IF 0 (n-fun-entry fun) small))
+        arms (n-if-arms! iff)
+        base (n-new2 OP-RETURN 0 (arms-t arms) (a-int 1))
+        dec (a-bin OP-SUB n (a-int 1))
+        recur (n-call1! (arms-f arms) fun dec)
+        product (a-bin OP-MUL n (call-value recur))
+        step (n-new2 OP-RETURN 0 (call-end recur) product)]
+    (n-fun-close! fun base)
+    (n-fun-add-return! fun step)
+    (let [site (n-call1! (g-start) fun (a-int 5))
+          ret (n-new2 OP-RETURN 0 (call-end site) (call-value site))]
+      (n-add-def! (g-stop) ret)
+      (iterate!)
+      (assert (= (g-verify) 0))
+      (assert (= (ev-run BUDGET) EV-OK))
+      (assert (rt-eq? (ev-result) (RInt 120))))))
+
+(deftest mutual_recursion_resolves_closed_world_function_values
+  (graph-reset! 1)
+  (let [even (n-fun-open! 0) odd (n-fun-open! 1)
+        en (n-parm! even 0) on (n-parm! odd 0)
+        ei (n-peephole (n-new2 OP-IF 0 (n-fun-entry even) (a-bin OP-EQ en (a-int 0))))
+        ea (n-if-arms! ei)
+        er (n-call1! (arms-f ea) odd (a-bin OP-SUB en (a-int 1)))
+        eb (n-new2 OP-RETURN 0 (arms-t ea) (a-int 1))
+        es (n-new2 OP-RETURN 0 (call-end er) (call-value er))
+        oi (n-peephole (n-new2 OP-IF 0 (n-fun-entry odd) (a-bin OP-EQ on (a-int 0))))
+        oa (n-if-arms! oi)
+        orc (n-call1! (arms-f oa) even (a-bin OP-SUB on (a-int 1)))
+        ob (n-new2 OP-RETURN 0 (arms-t oa) (a-int 0))
+        os (n-new2 OP-RETURN 0 (call-end orc) (call-value orc))]
+    (n-fun-close! even eb) (n-fun-add-return! even es)
+    (n-fun-close! odd ob) (n-fun-add-return! odd os)
+    (let [site (n-call1! (g-start) even (a-int 10))
+          ret (n-new2 OP-RETURN 0 (call-end site) (call-value site))]
+      (n-add-def! (g-stop) ret) (iterate!)
+      (assert (= (g-verify) 0))
+      (assert (= (ev-run BUDGET) EV-OK))
+      (assert (rt-eq? (ev-result) (RInt 1))))))
+
+(deftest a_function_value_can_flow_through_a_parameter_and_be_called
+  (graph-reset! 1)
+  (let [inc (n-fun-open! 0) x (n-parm! inc 0)
+        ir (n-new2 OP-RETURN 0 (n-fun-entry inc) (a-bin OP-ADD x (a-int 1)))
+        apply (n-fun-open! 1) f (n-parm! apply 0) y (n-parm! apply 1)
+        inner (n-call1! (n-fun-entry apply) f y)
+        ar (n-new2 OP-RETURN 0 (call-end inner) (call-value inner))]
+    (n-fun-close! inc ir) (n-fun-close! apply ar)
+    (let [site (n-call2! (g-start) apply inc (a-int 41))
+          ret (n-new2 OP-RETURN 0 (call-end site) (call-value site))]
+      (n-add-def! (g-stop) ret) (iterate!)
+      (assert (= (g-verify) 0))
+      (assert (= (ev-run BUDGET) EV-OK))
+      (assert (rt-eq? (ev-result) (RInt 42))))))
+
+(deftest a_closure_binds_captures_before_explicit_arguments
+  (graph-reset! 1)
+  (let [add (n-fun-open! 0) captured (n-parm! add 0) arg (n-parm! add 1)
+        body (n-new2 OP-RETURN 0 (n-fun-entry add) (a-bin OP-ADD captured arg))]
+    (n-fun-close! add body)
+    (let [clos (n-closure1! add (a-int 40))
+          site (n-call1! (g-start) clos (a-int 2))
+          ret (n-new2 OP-RETURN 0 (call-end site) (call-value site))]
+      (n-add-def! (g-stop) ret) (iterate!)
+      (assert (= (g-verify) 0))
+      (assert (= (m5-count-op OP-CLOSURE) 1))
+      (assert (= (ev-run BUDGET) EV-OK))
+      (assert (rt-eq? (ev-result) (RInt 42))))))
+
+(deftest a_singleton_indirect_call_is_devirtualized
+  (graph-reset! 1)
+  (let [fun (n-fun-open! 0) x (n-parm! fun 0)
+        body (n-new2 OP-RETURN 0 (n-fun-entry fun) (a-bin OP-ADD x (a-int 1)))]
+    (n-fun-close! fun body)
+    (let [indirect (n-new1 OP-ARG (t-fun-con 0) (g-start))
+          site (n-call1! (g-start) indirect (a-int 41))
+          ret (n-new2 OP-RETURN 0 (call-end site) (call-value site))]
+      (n-add-def! (g-stop) ret) (iterate!)
+      (assert (= (n-in (call-value site) 1) fun))
+      (assert (= (g-verify) 0))
+      (assert (= (ev-run BUDGET) EV-OK))
+      (assert (rt-eq? (ev-result) (RInt 42))))))
+
+(deftest conservative_inlining_removes_a_straight_line_call_and_its_control
+  (graph-reset! 1)
+  (let [fun (n-fun-open! 0) a (n-parm! fun 0) b (n-parm! fun 1)
+        body (n-new2 OP-RETURN 0 (n-fun-entry fun) (a-bin OP-ADD a b))]
+    (n-fun-close! fun body)
+    (let [direct (n-call2! (g-start) fun (a-int 40) (a-int 2))
+          clos (n-closure1! fun (a-int 40))
+          retained (n-call1! (call-end direct) clos (a-int 2))
+          ret (n-new2 OP-RETURN 0 (call-end retained) (call-value retained))]
+      (n-add-def! (g-stop) ret) (iterate!)
+      (assert (= (g-verify) 0))
+      (assert (= (ev-run BUDGET) EV-OK))
+      (assert (rt-eq? (ev-result) (RInt 42)))
+      (assert (= (m5-count-op OP-CALL) 2))
+      (assert (= (g-inline-small!) 1))
+      (iterate!)
+      (assert (= (g-verify) 0))
+      (assert (= (m5-count-op OP-CALL) 1))
+      (assert (= (m5-count-op OP-CALLEND) 1))
+      (assert (= (ev-run BUDGET) EV-OK))
+      (assert (rt-eq? (ev-result) (RInt 42))))))
+
 ;; The live node with this op, or a hard error. Structural lookups read better than node ids,
 ;; which shift whenever a builder gains a node.
 (defn find-live-op [(op i64)] (-> i64)
@@ -455,8 +683,8 @@
       (load same))))
 
 (defn diff-pair [(raw i64) (opt i64) (label (slice u8))] (-> i64)
-  (let [ba (alloc-stack (array u8 8192))
-        bb (alloc-stack (array u8 8192))
+  (let [ba (stack (array u8 8192))
+        bb (stack (array u8 8192))
         (mut seed) 1]
     (loop
       (if (> (load seed) 12) (break)
@@ -514,8 +742,8 @@
 
 (deftest the_oracle_can_tell_two_different_objects_apart
   (let [w (stdout)
-        ba (alloc-stack (array u8 8192))
-        bb (alloc-stack (array u8 8192))]
+        ba (stack (array u8 8192))
+        bb (stack (array u8 8192))]
     (ps w "\n--- two results, both the first allocation of their run ---\n")
     (build-ret-obj! "x" 5)
     (assert (= (ev-run-bound 1 BUDGET) EV-OK))
@@ -1032,4 +1260,3 @@
             0)))
     ; and it really did range over the optimised half of the corpus
     (assert (>= (load checked) 12))))
-

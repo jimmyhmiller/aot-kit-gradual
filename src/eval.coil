@@ -27,15 +27,15 @@
 ;; gets its own status and its own test.
 (module eval)
 
-(import "alloc.coil"     :use *)
-(import "arraylist.coil" :use *)
-(import "control.coil"   :use *)
-(import "io.coil"        :use *)
-(import "fmt.coil"       :use *)
-(import "slice.coil"     :use *)
-(import "ty.coil"        :use *)
-(import "shape.coil"     :use *)
-(import "node.coil"      :use *)
+(import "coil.alloc"     :use *)
+(import "coil.arraylist" :use *)
+(import "coil.control"   :use *)
+(import "coil.io"        :use *)
+(import "coil.fmt"       :use *)
+(import "coil.slice"     :use *)
+(import "ty"        :use *)
+(import "shape"     :use *)
+(import "node"      :use *)
 
 ; ============================================================================
 ; Runtime values
@@ -55,6 +55,10 @@
   (RInt  [(n i64)])
   (RFlt  [(bits i64)])
   (RObj  [(id i64)])      ; an object's identity; its shape is in the object table
+  (RStr  [(id i64)])      ; interned string identity (content table arrives with the front end)
+  (RSym  [(id i64)])
+  (RBig  [(n i64)])       ; immediate bigint subset; large limbs arrive with the runtime
+  (RFun  [(fidx i64)])
   (RMem  [(ver i64)]))    ; a memory state, as a version in the heap arena
 
 ;; The tag and the payload, so that the questions "is this the same value" and "is this a memory
@@ -72,17 +76,94 @@
 (const RT-INT   i64 3)
 (const RT-FLT   i64 4)
 (const RT-OBJ   i64 5)
-(const RT-MEM   i64 6)
+(const RT-STR   i64 6)
+(const RT-SYM   i64 7)
+(const RT-BIG   i64 8)
+(const RT-FUN   i64 9)
+(const RT-MEM   i64 10)
 
 (defn rt-tag [(v RtVal)] (-> i64)
   (match v
     (RUndef [] RT-UNDEF) (RNull [] RT-NULL) (RBool [b] RT-BOOL)
-    (RInt [n] RT-INT) (RFlt [bits] RT-FLT) (RObj [id] RT-OBJ) (RMem [ver] RT-MEM)))
+    (RInt [n] RT-INT) (RFlt [bits] RT-FLT) (RObj [id] RT-OBJ)
+    (RStr [id] RT-STR) (RSym [id] RT-SYM) (RBig [n] RT-BIG) (RFun [f] RT-FUN)
+    (RMem [ver] RT-MEM)))
 
 (defn rt-payload [(v RtVal)] (-> i64)
   (match v
     (RUndef [] 0) (RNull [] 0) (RBool [b] (if b 1 0))
-    (RInt [n] n) (RFlt [bits] bits) (RObj [id] id) (RMem [ver] ver)))
+    (RInt [n] n) (RFlt [bits] bits) (RObj [id] id)
+    (RStr [id] id) (RSym [id] id) (RBig [n] n) (RFun [f] f) (RMem [ver] ver)))
+
+; ---------------------------------------------------------------------------
+; The generated-code dynamic word (D3)
+; ---------------------------------------------------------------------------
+;; Doubles are their IEEE bits. Positive quiet-NaN space above the canonical NaN carries tags;
+;; consequently all source NaNs canonicalise to DYN-NAN. Preserving every NaN payload and also
+;; adding non-double values to one 64-bit set is mathematically impossible, so this policy is part
+;; of the representation contract rather than an accidental encoder detail.
+(const DYN-NAN   i64 9221120237041090560)
+(const DYN-UNDEF i64 9221401712017801216)
+(const DYN-NULL  i64 9221683186994511872)
+(const DYN-BOOL  i64 9221964661971222528)
+(const DYN-INT   i64 9222246136947933184)
+(const DYN-OBJ   i64 9222527611924643840)
+(const DYN-STR   i64 9222809086901354496)
+(const DYN-REF   i64 9223090561878065152)
+(const DYN-TAG-MASK i64 -281474976710656)
+(const DYN-PAYLOAD-MASK i64 281474976710655)
+(const DYN-INT-MIN i64 -140737488355328)
+(const DYN-INT-MAX i64 140737488355327)
+(const DYN-REF-ID-MASK i64 70368744177663)
+(const DYN-REF-SYM i64 0)
+(const DYN-REF-BIG i64 1)
+(const DYN-REF-FUN i64 2)
+
+(defn dyn-encode [(v RtVal)] (-> i64)
+  (match v
+    (RUndef [] DYN-UNDEF)
+    (RNull [] DYN-NULL)
+    (RBool [b] (| DYN-BOOL (if b 1 0)))
+    ; Integers outside the signed 48-bit payload become direct doubles. This preserves their JS
+    ; numeric value; the `int`/`flt` distinction is an optimiser refinement, not a source tag.
+    (RInt [n] (if (and (>= n DYN-INT-MIN) (<= n DYN-INT-MAX))
+                  (| DYN-INT (& n DYN-PAYLOAD-MASK))
+                (f64-bits (cast f64 n))))
+    (RFlt [bits] (if (f64-nan-bits? bits) DYN-NAN bits))
+    (RObj [id] (if (and (>= id 0) (<= id DYN-PAYLOAD-MASK))
+                   (| DYN-OBJ id)
+                 (do (panic-corrupt "dyn-encode: object id does not fit the NaN payload") 0)))
+    (RStr [id] (if (and (>= id 0) (<= id DYN-PAYLOAD-MASK)) (| DYN-STR id)
+                 (do (panic-corrupt "dyn-encode: string id does not fit the NaN payload") 0)))
+    (RSym [id] (if (and (>= id 0) (<= id DYN-REF-ID-MASK)) (| DYN-REF id)
+                 (do (panic-corrupt "dyn-encode: symbol id does not fit the NaN payload") 0)))
+    (RBig [n] (if (and (>= n -35184372088832) (<= n 35184372088831))
+                 (| DYN-REF (| (<< DYN-REF-BIG 46) (& n DYN-REF-ID-MASK)))
+               (do (panic-corrupt "dyn-encode: bigint needs the future limb table") 0)))
+    (RFun [f] (if (and (>= f 0) (<= f DYN-REF-ID-MASK))
+                 (| DYN-REF (| (<< DYN-REF-FUN 46) f))
+               (do (panic-corrupt "dyn-encode: function index does not fit the NaN payload") 0)))
+    (RMem [ver] (do (panic-corrupt "dyn-encode: a memory state is not a dynamic value") 0))))
+
+(defn dyn-decode [(word i64)] (-> RtVal)
+  (let [tag (& word DYN-TAG-MASK) payload (& word DYN-PAYLOAD-MASK)]
+    (case tag
+      DYN-UNDEF (RUndef)
+      DYN-NULL  (RNull)
+      DYN-BOOL  (RBool (!= payload 0))
+      DYN-INT   (RInt (if (!= (& payload 140737488355328) 0)
+                           (| payload DYN-TAG-MASK)
+                         payload))
+      DYN-OBJ   (RObj payload)
+      DYN-STR   (RStr payload)
+      DYN-REF   (let [kind (>> payload 46) id (& payload DYN-REF-ID-MASK)]
+                  (case kind
+                    DYN-REF-SYM (RSym id)
+                    DYN-REF-BIG (RBig (if (!= (& id 35184372088832) 0)
+                                           (| id -70368744177664) id))
+                    DYN-REF-FUN (RFun id)
+                    (do (panic-corrupt "dyn-decode: reserved reference subtype") (RUndef))))
+      (RFlt word))))
 
 ; ============================================================================
 ; Statuses
@@ -110,6 +191,8 @@
 ;;             and answering `undefined` would hide exactly the guard D4 exists to require.
 (const EV-MEM       i64 8)
 (const EV-SHAPE     i64 9)
+(const EV-UNBOX     i64 10)  ; a dynamic word did not contain the representation requested
+(const EV-CALL      i64 11)  ; malformed callee, arity, or function body
 
 (defn ev-status-name [(s i64)] (-> (slice u8))
   (case s
@@ -120,6 +203,8 @@
     EV-DEAD "control reached a dead node"
     EV-MEM "a memory edge does not describe the alias class being touched"
     EV-SHAPE "an object's shape does not carry that field: the shape was not guarded"
+    EV-UNBOX "an Unbox input did not satisfy its requested type"
+    EV-CALL "a Call did not match a closed-world function definition"
     "?"))
 
 ; ============================================================================
@@ -311,16 +396,21 @@
    (hv     (ArrayList HvEnt))   ; the heap: every memory state this run has produced
    (hvk    (ArrayList i64))     ; a MemMerge's children, addressed by (koff, klen)
    (objs   (ArrayList i64))     ; object id -> its shape
+   (cfun   (ArrayList i64))     ; closure id -> closed-world function index
+   (coff   (ArrayList i64))     ; closure id -> first captured value
+   (clen   (ArrayList i64))     ; closure id -> captured value count
+   (cvals  (ArrayList RtVal))   ; flattened immutable closure environments
    (seen   (ArrayList i64))     ; `ev-render-outcome`'s walk: object id, in DISCOVERY order
    (status i64)
    (steps  i64)
+   (depth  i64)                 ; active call frames; bounds recursive malformed programs
    (result RtVal)
    (resmem i64)                 ; the memory version the Return carried, or -1
    (at     i64)                 ; the node a non-OK status happened at
    (inited bool)])
 
 (defn ev [] (-> (ptr Ev))
-  (let [p (alloc-static Ev)]
+  (let [p (static Ev)]
     (if (load (field p inited)) 0
       (do (store! (field p inited) true)
           (store! (field p bound)  (al-new [bool]  (malloc-allocator)))
@@ -330,6 +420,10 @@
           (store! (field p hv)     (al-new [HvEnt] (malloc-allocator)))
           (store! (field p hvk)    (al-new [i64]   (malloc-allocator)))
           (store! (field p objs)   (al-new [i64]   (malloc-allocator)))
+          (store! (field p cfun)   (al-new [i64]   (malloc-allocator)))
+          (store! (field p coff)   (al-new [i64]   (malloc-allocator)))
+          (store! (field p clen)   (al-new [i64]   (malloc-allocator)))
+          (store! (field p cvals)  (al-new [RtVal] (malloc-allocator)))
           (store! (field p seen)   (al-new [i64]   (malloc-allocator)))
           0))
     p))
@@ -348,6 +442,10 @@
     (al-clear! [HvEnt] (field p hv))
     (al-clear! [i64]   (field p hvk))
     (al-clear! [i64]   (field p objs))
+    (al-clear! [i64]   (field p cfun))
+    (al-clear! [i64]   (field p coff))
+    (al-clear! [i64]   (field p clen))
+    (al-clear! [RtVal] (field p cvals))
     (loop
       (if (>= (load i) n) (break)
         (do (al-push! [bool]  (field p bound)  false)
@@ -359,6 +457,7 @@
     (al-clear! [i64]   (field p seen))
     (store! (field p status) EV-OK)
     (store! (field p steps) 0)
+    (store! (field p depth) 0)
     (store! (field p result) (RUndef))
     (store! (field p resmem) -1)
     (store! (field p at) NO-NODE)
@@ -397,6 +496,12 @@
 ;; A runtime value's most specific type. This is how a Cast is checked and how the interpreter and
 ;; the lattice are held to the same story: membership is `ty-isa` against the same lattice the
 ;; optimiser reasoned with, not a second hand-written notion of what an int is.
+(defn ev-fun-fidx [(token i64)] (-> i64)
+  (if (>= token 0) token
+    (al-get (load (field (ev) cfun)) (- (- 0 token) 1))))
+(defn ev-fun-closure-id [(token i64)] (-> i64)
+  (if (>= token 0) -1 (- (- 0 token) 1)))
+
 (defn rt-ty [(v RtVal)] (-> i64)
   (match v
     (RUndef  [] (t-undef))
@@ -408,6 +513,10 @@
     ; type is an over-approximation of, so a Cast to `obj#{s}` on an object of shape s passes and
     ; one on an object of another shape does not, which is exactly what a shape guard must mean.
     (RObj  [id] (t-obj-shape (ev-obj-shape id)))
+    (RStr  [id] (t-str))
+    (RSym  [id] (t-kinds VK-SYM))
+    (RBig  [n] (t-kinds VK-BIG))
+    (RFun  [f] (t-fun-con (ev-fun-fidx f)))
     (RMem  [ver] (t-mem (hv-mask ver) (hv-contents ver)))))
 
 (defn rt-print [(w (ptr Writer)) (v RtVal)] (-> i64)
@@ -420,6 +529,10 @@
     ; the IDENTITY is in the print, because "two objects" and "one object twice" is the whole
     ; difference a fixture about allocation is asserting
     (RObj  [id] (do (fmt w "obj{d}#{d}" id (ev-obj-shape id)) 0))
+    (RStr  [id] (do (fmt w "str#{d}" id) 0))
+    (RSym  [id] (do (fmt w "sym#{d}" id) 0))
+    (RBig  [n] (do (fmt w "{d}n" n) 0))
+    (RFun  [f] (do (fmt w "fun#{d}" f) 0))
     (RMem  [ver] (do (fmt w "mem#{d}@{d}" (hv-mask ver) ver) 0))))
 
 ;; Identity of runtime values, WITHIN ONE RUN. This is JavaScript `===` and it is what OP-EQ is
@@ -447,6 +560,10 @@
     (RInt  [n] (!= n 0))
     (RFlt  [bits] (not (fbits-falsey? bits)))
     (RObj  [id] true)          ; every object is truthy: `ty-can-be-truthy?`'s VK-ALWAYS-TRUTHY
+    (RStr  [id] (!= id 0))     ; string id 0 is the interned empty string
+    (RSym  [id] true)
+    (RBig  [n] (!= n 0))
+    (RFun  [f] true)
     ; A memory state is not a condition. `ty-can-be-falsey?` and `ty-can-be-truthy?` both answer
     ; false for one, so the lattice says an If on it takes NEITHER arm; this answer is never the
     ; one used, because every caller asks `rt-condition?` first and reports EV-TYPE.
@@ -475,6 +592,13 @@
           OP-ARG   (ev-arg n)
           OP-PHI   (ev-phi n)
           OP-CAST  (ev-cast n)
+          OP-BOX   (ev-box n)
+          OP-UNBOX (ev-unbox n)
+          OP-TYPETEST (ev-typetest n)
+          OP-FUN   (RFun (n-aux n))
+          OP-CLOSURE (ev-closure n)
+          OP-PARM  (ev-parm n)
+          OP-CALL  (ev-call n)
           OP-ADD   (ev-arith n OP-ADD)
           OP-SUB   (ev-arith n OP-SUB)
           OP-MUL   (ev-arith n OP-MUL)
@@ -488,6 +612,7 @@
           OP-LOAD  (ev-load n)
           OP-STORE (ev-store n)
           OP-MEMMERGE (ev-memmerge n)
+          OP-BARRIER (ev-data (n-in n 1))
           ; A New is a MULTI node and has no single value: its object and each of its fields'
           ; memory states are read through its projections, exactly as an If's arms are.
           OP-NEW   (ev-fail! EV-STUCK n)
@@ -571,17 +696,20 @@
     (if (= m NO-NODE) (ev-fail! EV-STUCK n)
       ; a projection of an If or a Return carries no runtime value: control took the arm, and
       ; nothing reads the tuple itself
-      (if (!= (n-op m) OP-NEW) (ev-fail! EV-STUCK n)
-        (if (not (al-get (load (field p hasenv)) m)) (ev-fail! EV-STUCK n)
-          (let [ov (al-get (load (field p env)) m)]
-            (if (= slot 0) ov
-              (if (or (< slot 1) (>= slot (n-nins m))) (ev-fail! EV-STUCK n)
-                (let [alias (shape-field-alias (n-aux m) (- slot 1))
-                      inm   (ev-data (n-in m slot))]
-                  (if (ev-failed?) inm
-                    (let [ver (rt-need-mem inm n)]
-                      (if (ev-failed?) (RUndef)
-                        (RMem (hv-write! ver (rt-payload ov) alias (RUndef)))))))))))))))
+      (if (= (n-op m) OP-SAFEPOINT)
+          (if (or (< slot 1) (>= slot (n-nins m))) (ev-fail! EV-STUCK n)
+            (ev-data (n-in m slot)))
+        (if (!= (n-op m) OP-NEW) (ev-fail! EV-STUCK n)
+          (if (not (al-get (load (field p hasenv)) m)) (ev-fail! EV-STUCK n)
+            (let [ov (al-get (load (field p env)) m)]
+              (if (= slot 0) ov
+                (if (or (< slot 1) (>= slot (n-nins m))) (ev-fail! EV-STUCK n)
+                  (let [alias (shape-field-alias (n-aux m) (- slot 1))
+                        inm   (ev-data (n-in m slot))]
+                    (if (ev-failed?) inm
+                      (let [ver (rt-need-mem inm n)]
+                        (if (ev-failed?) (RUndef)
+                          (RMem (hv-write! ver (rt-payload ov) alias (RUndef))))))))))))))))
 
 (defn ev-load [(n i64)] (-> RtVal)
   (let [mv (ev-data (n-in n 1))]
@@ -688,6 +816,173 @@
     (if (ev-failed?) v
       (if (ty-isa (rt-ty v) (n-aux n)) v (ev-fail! EV-CAST n)))))
 
+(defn ev-box [(n i64)] (-> RtVal) (ev-data (n-in n 1)))
+
+(defn ev-unbox [(n i64)] (-> RtVal)
+  (let [v (ev-data (n-in n 1))]
+    (if (ev-failed?) v
+      (if (ty-isa (rt-ty v) (n-aux n)) v (ev-fail! EV-UNBOX n)))))
+
+(defn ev-typetest [(n i64)] (-> RtVal)
+  (let [v (ev-data (n-in n 1))]
+    (if (ev-failed?) v (RBool (ty-isa (rt-ty v) (n-aux n))))))
+
+; ---------------------------------------------------------------------------
+; Direct calls
+; ---------------------------------------------------------------------------
+(defn ev-parm [(n i64)] (-> RtVal)
+  (let [p (ev)]
+    (if (al-get (load (field p hasenv)) n) (al-get (load (field p env)) n)
+      (ev-fail! EV-CALL n))))
+
+(defn ev-find-fun [(fidx i64)] (-> i64)
+  (let [n (n-count) (mut i) 0 (mut found) NO-NODE]
+    (loop
+      (if (or (>= (load i) n) (!= (load found) NO-NODE)) (break)
+        (do (if (and (and (not (n-dead? (load i))) (= (n-op (load i)) OP-FUN))
+                     (= (n-aux (load i)) fidx))
+                (store! found (load i)) 0)
+            (store! i (+ (load i) 1)) 0)))
+    (load found)))
+
+(defn ev-closure [(n i64)] (-> RtVal)
+  (let [p (ev)]
+    (if (al-get (load (field p hasenv)) n) (al-get (load (field p env)) n)
+      (let [fv (ev-data (n-in n 0))]
+        (if (or (ev-failed?) (!= (rt-tag fv) RT-FUN)) (ev-fail! EV-CALL n)
+          (let [id (al-len [i64] (load (field p cfun))) (mut i) 1]
+            (al-push! [i64] (field p cfun) (ev-fun-fidx (rt-payload fv)))
+            (al-push! [i64] (field p coff) (al-len [RtVal] (load (field p cvals))))
+            (al-push! [i64] (field p clen) (- (n-nins n) 1))
+            (loop
+              (if (>= (load i) (n-nins n)) (break)
+                (do (al-push! [RtVal] (field p cvals) (ev-data (n-in n (load i))))
+                    (store! i (+ (load i) 1)) 0)))
+            (let [v (RFun (- 0 (+ id 1)))]
+              (al-set! [bool] (field p hasenv) n true)
+              (al-set! [RtVal] (field p env) n v)
+              v)))))))
+
+(const EV-CALL-DEPTH-MAX i64 512)
+
+;; Execute one function's private CFG. A Fun owns its entry in slot 0 and every Return in the
+;; remaining slots, so none of these controls can accidentally become a successor of Start.
+(defn ev-exec-fun [(fun i64)] (-> RtVal)
+  (let [p (ev) (mut cur) (n-in fun 0) (mut prev) NO-NODE
+        (mut ans) (RUndef) (mut done) false]
+    (loop
+      (if (or (load done) (ev-failed?)) (break)
+        (do (let [c (load cur)]
+              (store! (field p steps) (+ (load (field p steps)) 1))
+              (if (or (= c NO-NODE) (> (load (field p steps)) 1000000))
+                  (do (ev-fail! EV-STEPS c) 0)
+                (do (ev-enter-ctrl! c)
+                    (if (ev-failed?) 0
+                      (case (n-op c)
+                        OP-RETURN
+                          (do (store! ans (ev-data (n-in c 1)))
+                              (store! done true) 0)
+                        OP-IF
+                          (let [pred (ev-data (n-in c 1))]
+                            (if (ev-failed?) 0
+                              (if (not (rt-condition? pred)) (do (ev-fail! EV-TYPE c) 0)
+                                (let [arm (ev-if-arm c (if (rt-truthy? pred) 0 1))]
+                                  (if (= arm NO-NODE) (do (ev-fail! EV-STUCK c) 0)
+                                    (do (store! prev c) (store! cur arm) 0))))))
+                        OP-REGION
+                          (do (ev-enter-merge! c (load prev))
+                              (if (ev-failed?) 0
+                                (let [nx (ev-ctrl-succ-mode c true)]
+                                  (if (= nx NO-NODE) (do (ev-fail! EV-STUCK c) 0)
+                                    (do (store! prev c) (store! cur nx) 0)))))
+                        OP-LOOP
+                          (do (ev-enter-merge! c (load prev))
+                              (if (ev-failed?) 0
+                                (let [nx (ev-ctrl-succ-mode c true)]
+                                  (if (= nx NO-NODE) (do (ev-fail! EV-STUCK c) 0)
+                                    (do (store! prev c) (store! cur nx) 0)))))
+                        OP-CALLEND
+                          (let [call (n-in c 1)]
+                            (al-set! [bool] (field p hasenv) call false)
+                            (ev-call call)
+                            (if (ev-failed?) 0
+                              (let [nx (ev-ctrl-succ-mode c true)]
+                                (if (= nx NO-NODE) (do (ev-fail! EV-STUCK c) 0)
+                                  (do (store! prev c) (store! cur nx) 0)))))
+                        (let [nx (ev-ctrl-succ-mode c true)]
+                          (if (= nx NO-NODE) (do (ev-fail! EV-STUCK c) 0)
+                            (do (store! prev c) (store! cur nx) 0))))))) 0)
+            0)))
+    (load ans)))
+
+(defn ev-call [(n i64)] (-> RtVal)
+  (let [p (ev)]
+    (if (al-get (load (field p hasenv)) n) (al-get (load (field p env)) n)
+      (let [cv (ev-data (n-in n 1))]
+        (if (or (ev-failed?) (!= (rt-tag cv) RT-FUN)) (ev-fail! EV-CALL n)
+          (let [token (rt-payload cv)
+                cid (ev-fun-closure-id token)
+                capc (if (< cid 0) 0 (al-get (load (field p clen)) cid))
+                fun (ev-find-fun (ev-fun-fidx token))]
+            (if (= fun NO-NODE) (ev-fail! EV-CALL n)
+              (let [(mut parms) (al-new [i64] (malloc-allocator))
+                    len (n-nouts fun) (mut i) 0]
+                ; Gather parameters by their explicit index. Holes and duplicates are rejected.
+                (loop
+                  (if (>= (load i) (+ capc (- (n-nins n) 2))) (break)
+                    (do (al-push! [i64] (mut parms) NO-NODE)
+                        (store! i (+ (load i) 1)) 0)))
+                (store! i 0)
+                (loop
+                  (if (>= (load i) len) (break)
+                    (do (let [u (n-out fun (load i))]
+                          (if (and (not (n-dead? u)) (= (n-op u) OP-PARM))
+                              (let [idx (n-aux u)]
+                                (if (or (or (< idx 0) (>= idx (al-len [i64] (load parms))))
+                                        (!= (al-get (load parms) idx) NO-NODE))
+                                    (do (ev-fail! EV-CALL n) 0)
+                                  (al-set! [i64] (mut parms) idx u))) 0))
+                        (store! i (+ (load i) 1)) 0)))
+                (let [argc (al-len [i64] (load parms))
+                      (mut oldh) (al-new [bool] (malloc-allocator))
+                      (mut oldv) (al-new [RtVal] (malloc-allocator))]
+                  (store! i 0)
+                  (loop
+                    (if (>= (load i) argc) (break)
+                      (do (let [pm (al-get (load parms) (load i))]
+                            (if (= pm NO-NODE) (do (ev-fail! EV-CALL n) 0)
+                              (do (al-push! [bool] (mut oldh) (al-get (load (field p hasenv)) pm))
+                                  (al-push! [RtVal] (mut oldv) (al-get (load (field p env)) pm))
+                                  (let [av (if (< (load i) capc)
+                                               (al-get (load (field p cvals))
+                                                 (+ (al-get (load (field p coff)) cid) (load i)))
+                                             (ev-data (n-in n (+ 2 (- (load i) capc)))))]
+                                    (al-set! [bool] (field p hasenv) pm true)
+                                    (al-set! [RtVal] (field p env) pm av))))
+                          (store! i (+ (load i) 1)) 0))))
+                  (let [ans (if (ev-failed?) (RUndef)
+                              (if (>= (load (field p depth)) EV-CALL-DEPTH-MAX)
+                                  (ev-fail! EV-CALL n)
+                                (do (store! (field p depth) (+ (load (field p depth)) 1))
+                                    (let [v (ev-exec-fun fun)]
+                                      (store! (field p depth) (- (load (field p depth)) 1))
+                                      v))))]
+                    ; Restore the caller frame even on failure.
+                    (store! i 0)
+                    (loop
+                      (if (>= (load i) argc) (break)
+                        (do (let [pm (al-get (load parms) (load i))]
+                              (if (= pm NO-NODE) 0
+                                (do (al-set! [bool] (field p hasenv) pm (al-get (load oldh) (load i)))
+                                    (al-set! [RtVal] (field p env) pm (al-get (load oldv) (load i)))))
+                            (store! i (+ (load i) 1)) 0))))
+                    (al-free! [bool] (mut oldh)) (al-free! [RtVal] (mut oldv))
+                    (al-free! [i64] (mut parms))
+                    (if (ev-failed?) ans
+                      (do (al-set! [bool] (field p hasenv) n true)
+                          (al-set! [RtVal] (field p env) n ans)
+                          ans))))))))))))
+
 ; ---------------------------------------------------------------------------
 ; Arithmetic
 ; ---------------------------------------------------------------------------
@@ -704,10 +999,12 @@
   (match v
     (RInt [n] (cast f64 n))
     (RFlt [b] (bits-f64 b))
-    (RUndef [] 0.0) (RNull [] 0.0) (RBool [b] 0.0) (RObj [id] 0.0) (RMem [ver] 0.0)))
+    (RUndef [] 0.0) (RNull [] 0.0) (RBool [b] 0.0) (RObj [id] 0.0)
+    (RStr [id] 0.0) (RSym [id] 0.0) (RBig [n] 0.0) (RFun [f] 0.0) (RMem [ver] 0.0)))
 (defn rt-as-int [(v RtVal)] (-> i64)
   (match v (RInt [n] n) (RFlt [b] 0) (RUndef [] 0) (RNull [] 0) (RBool [b] 0)
-           (RObj [id] 0) (RMem [ver] 0)))
+           (RObj [id] 0) (RStr [id] 0) (RSym [id] 0) (RBig [n] 0) (RFun [f] 0)
+           (RMem [ver] 0)))
 
 (defn ev-arith [(n i64) (op i64)] (-> RtVal)
   (let [a (ev-data (n-in n 1))]
@@ -777,7 +1074,7 @@
 ; ============================================================================
 ;; The unique live control successor. There is no schedule, so this is found by looking at the
 ;; def-use edges: exactly one live control node should read this one as its control input.
-(defn ev-ctrl-succ [(n i64)] (-> i64)
+(defn ev-ctrl-succ-mode [(n i64) (include-fun-returns bool)] (-> i64)
   (let [len (n-nouts n) (mut found) NO-NODE (mut count) 0 (mut i) 0]
     (loop
       (if (>= (load i) len) (break)
@@ -786,7 +1083,8 @@
               ; control edge but not a forward step, and counting it made every such loop look
               ; ambiguous and therefore stuck.
               (if (or (or (= u NO-NODE) (n-dead? u)) (= u n)) 0
-                (if (and (op-control? (n-op u)) (ev-reads-ctrl? u n))
+                (if (and (and (op-control? (n-op u)) (ev-reads-ctrl? u n))
+                         (or include-fun-returns (not (ev-function-body-return? u))))
                     (do (store! count (+ (load count) 1))
                         (if (= (load found) NO-NODE) (store! found u) 0)
                         0)
@@ -795,6 +1093,18 @@
             0)))
     ; Stop is not a successor to step into: a Return ends the run
     (if (= (load count) 1) (load found) NO-NODE)))
+
+(defn ev-ctrl-succ [(n i64)] (-> i64) (ev-ctrl-succ-mode n false))
+
+(defn ev-function-body-return? [(n i64)] (-> bool)
+  (if (!= (n-op n) OP-RETURN) false
+    (let [len (n-nouts n) (mut i) 0 (mut yes) false]
+      (loop
+        (if (or (>= (load i) len) (load yes)) (break)
+          (do (let [u (n-out n (load i))]
+                (if (and (not (n-dead? u)) (= (n-op u) OP-FUN)) (store! yes true) 0))
+              (store! i (+ (load i) 1)) 0)))
+      (load yes))))
 
 ;; Does `u` read `n` as CONTROL (as opposed to as a value)? For a merge that means any path slot;
 ;; for everything else it means slot 0.
@@ -912,6 +1222,17 @@
                               (let [nx (ev-ctrl-succ c)]
                                 (if (= nx NO-NODE) (do (ev-fail! EV-STUCK c) 0)
                                   (do (store! prev c) (store! cur nx) 0)))))
+                      OP-CALLEND
+                        (let [call (n-in c 1)]
+                          ; A Call node is one dynamic execution per arrival at CallEnd. Clear a
+                          ; prior loop iteration's cached result, evaluate now, and leave the new
+                          ; value cached for the Return or data users immediately downstream.
+                          (al-set! [bool] (field p hasenv) call false)
+                          (ev-call call)
+                          (if (ev-failed?) 0
+                            (let [nx (ev-ctrl-succ c)]
+                              (if (= nx NO-NODE) (do (ev-fail! EV-STUCK c) 0)
+                                (do (store! prev c) (store! cur nx) 0)))))
                       OP-STOP (do (ev-fail! EV-STUCK c) 0)
                       ; Start and CProj just pass control along
                       (let [nx (ev-ctrl-succ c)]
@@ -1133,6 +1454,10 @@
     (RBool [b] (rt-print w v))
     (RInt  [n] (rt-print w v))
     (RFlt  [bits] (rt-print w v))
+    (RStr [id] (rt-print w v))
+    (RSym [id] (rt-print w v))
+    (RBig [n] (rt-print w v))
+    (RFun [f] (rt-print w v))
     ; a memory state is never a program's result; if one ever is, saying so beats printing a
     ; version number that means nothing outside this run
     (RMem [ver] (ps w "<memory>"))))
@@ -1148,8 +1473,8 @@
 ;; than truncating for the reason `g-render` does: a truncated outcome compares equal to another
 ;; truncated outcome, which is a differential oracle that stops noticing.
 (defn ev-outcome [(buf (ptr i8)) (cap i64)] (-> (slice u8))
-  (let [fb (alloc-stack FixBuf)
-        w  (alloc-stack Writer)]
+  (let [fb (stack FixBuf)
+        w  (stack Writer)]
     (store! (field fb data) buf)
     (store! (field fb cap)  cap)
     (store! (field fb len)  0)

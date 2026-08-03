@@ -9,15 +9,15 @@
 ;;   coil test tests/node-test.coil
 (module nodetest)
 
-(import "../src/ty.coil"   :use *)
-(import "../src/node.coil" :use *)
-(import "assert.coil"      :use *)
-(import "control.coil"     :use *)
-(import "io.coil"          :use *)
-(import "fmt.coil"         :use *)
-(import "alloc.coil"       :use *)
-(import "str.coil"         :use *)
-(import "slice.coil"       :use *)
+(import "ty"   :use *)
+(import "node" :use *)
+(import "coil.assert"      :use *)
+(import "coil.control"     :use *)
+(import "coil.io"          :use *)
+(import "coil.fmt"         :use *)
+(import "coil.alloc"       :use *)
+(import "coil.str"         :use *)
+(import "coil.slice"       :use *)
 
 ; ---------------------------------------------------------------------------
 ; Building programs
@@ -44,7 +44,7 @@
 (defn render-stop [(buf (ptr i8))] (-> (slice u8)) (n-render (g-stop) buf 1024))
 
 (defn check-ir [(name (slice u8)) (expect (slice u8))] (-> i64)
-  (let [bufa (alloc-stack (array u8 1024))
+  (let [bufa (stack (array u8 1024))
         got  (render-stop (cast (ptr i8) bufa))]
     (if (str-eq got expect) 0
       (do (let [w (stderr)]
@@ -448,8 +448,8 @@
   0)
 
 (deftest deferred_peepholing_reaches_the_eager_result
-  (let [bufa (alloc-stack (array u8 1024))
-        bufb (alloc-stack (array u8 1024))]
+  (let [bufa (stack (array u8 1024))
+        bufb (stack (array u8 1024))]
     (build-fixture 1)
     (let [eager (render-stop (cast (ptr i8) bufa))]
       (build-fixture-raw 1)
@@ -482,8 +482,8 @@
       0)))
 
 (deftest same_graph_under_every_seed
-  (let [bufa (alloc-stack (array u8 1024))
-        bufb (alloc-stack (array u8 1024))
+  (let [bufa (stack (array u8 1024))
+        bufb (stack (array u8 1024))
         (mut live0) 0
         (mut nodes0) 0]
     (build-fixture 1)
@@ -860,3 +860,48 @@
         ; the dead path is gone, and the Phi lost the matching arm in the same operation
         (assert (= (n-nins r) 2))
         (assert (= (n-nins ph) 2))))))
+
+; ---------------------------------------------------------------------------
+; M5: representation nodes
+; ---------------------------------------------------------------------------
+(deftest box_then_unbox_cancels_only_with_a_proven_target
+  (graph-reset! 1)
+  (let [v (mk-int 42)
+        b (n-box! v)
+        u (n-unbox! b (t-int))]
+    (assert (= u v))
+    (assert (n-dead? b))
+    (assert (= (count-live-op OP-BOX) 0))
+    (assert (= (count-live-op OP-UNBOX) 0))
+    (mk-ret u)
+    (check-prog "box/unbox cancellation" "return int=42;"))
+
+  ; A generic dynamic input is not proof that the word contains an integer. Both nodes remain,
+  ; and the interpreter gate names the failed Unbox rather than inventing a value.
+  (graph-reset! 1)
+  (let [a (mk-arg (t-dyn))
+        b (n-box! a)
+        u (n-unbox! b (t-int))]
+    (mk-ret u)
+    (assert (= (count-live-op OP-BOX) 1))
+    (assert (= (count-live-op OP-UNBOX) 1))
+    (assert (= (n-ty b) (t-dyn)))
+    (assert (= (n-ty u) (t-int)))
+    (assert (= (g-leaked-count) 0))))
+
+(deftest typetest_folds_for_proof_and_stays_for_dynamic_input
+  (graph-reset! 1)
+  (let [a (mk-arg (t-int))
+        q (n-typetest! a (t-int))]
+    (assert (= (n-op q) OP-CONST))
+    (assert (= (n-ty q) (t-bool-con true)))
+    (mk-ret q)
+    (assert (= (count-live-op OP-TYPETEST) 0)))
+
+  (graph-reset! 1)
+  (let [a (mk-arg (t-dyn))
+        q (n-typetest! a (t-int))]
+    (mk-ret q)
+    (assert (= (n-op q) OP-TYPETEST))
+    (assert (= (n-ty q) (t-bool)))
+    (assert (= (g-leaked-count) 0))))

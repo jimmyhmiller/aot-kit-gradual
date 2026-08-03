@@ -17,18 +17,18 @@
 ;; near-minimal instead of building garbage and sweeping later.
 (module node)
 
-(import "alloc.coil"     :use *)
-(import "arraylist.coil" :use *)
-(import "hashmap.coil"   :use *)
-(import "control.coil"   :use *)
-(import "io.coil"        :use *)
-(import "fmt.coil"       :use *)
-(import "slice.coil"     :use *)
-(import "ty.coil"        :use *)
+(import "coil.alloc"     :use *)
+(import "coil.arraylist" :use *)
+(import "coil.hashmap"   :use *)
+(import "coil.control"   :use *)
+(import "coil.io"        :use *)
+(import "coil.fmt"       :use *)
+(import "coil.slice"     :use *)
+(import "ty"        :use *)
 ;; The shape table, for `New`'s field count and its per-field aliases. The dependency runs one
 ;; way only (shape.coil imports ty.coil and nothing else), and it is what lets a memory op carry
 ;; an alias number instead of a shape and an offset.
-(import "shape.coil"     :use *)
+(import "shape"     :use *)
 
 ;; A node id is a plain `i64` index into the arena, for the same reason a type id is: a
 ;; one-field struct would be passed by reference in Coil. `nid`/`n` for node ids, `t` for
@@ -84,7 +84,18 @@
 (const OP-LOAD     i64 23)
 (const OP-STORE    i64 24)
 (const OP-MEMMERGE i64 25)
-(const OP-COUNT    i64 26)
+(const OP-BOX      i64 26)   ; (_, value) -> one dynamically represented word
+(const OP-UNBOX    i64 27)   ; (_, boxed value), aux = required unboxed type
+(const OP-TYPETEST i64 28)   ; (_, dynamic value), aux = tested type
+(const OP-CALLEND  i64 29)   ; (ctrl, call) control after a completed call
+(const OP-FUN      i64 30)   ; (FunStart, body Returns...), aux = closed-world function index
+(const OP-PARM     i64 31)   ; (Fun), aux = zero-based parameter index
+(const OP-CALL     i64 32)   ; (ctrl, callee, args...) -> value
+(const OP-FUNSTART i64 33)   ; (Fun) control entry for one dynamic invocation
+(const OP-CLOSURE  i64 34)   ; (Fun, captures...) -> callable environment
+(const OP-SAFEPOINT i64 35)   ; (ctrl, live refs...) -> (ctrl, relocated refs...)
+(const OP-BARRIER   i64 36)   ; (ctrl, mem, object, stored ref) -> mem
+(const OP-COUNT    i64 37)
 
 ;; Case keys are the NAMED constants throughout, never the numbers. Literal keys are how a
 ;; renumbering silently rewires every dispatch table in the file at once.
@@ -96,6 +107,11 @@
     OP-ADD "Add" OP-SUB "Sub" OP-MUL "Mul" OP-DIV "Div" OP-MINUS "Minus"
     OP-NOT "Not" OP-EQ "Eq" OP-LT "Lt" OP-LE "Le"
     OP-NEW "New" OP-LOAD "Load" OP-STORE "Store" OP-MEMMERGE "MemMerge"
+    OP-BOX "Box" OP-UNBOX "Unbox" OP-TYPETEST "TypeTest"
+    OP-CALLEND "CallEnd" OP-FUN "Fun" OP-PARM "Parm" OP-CALL "Call"
+    OP-FUNSTART "FunStart"
+    OP-CLOSURE "Closure"
+    OP-SAFEPOINT "Safepoint" OP-BARRIER "Barrier"
     "?"))
 
 ;; ---------------------------------------------------------------------------
@@ -103,12 +119,16 @@
 ;; first, then value ops, and within the value ops the ones that may fold to a constant come
 ;; after the two that already are their own value.
 ;; ---------------------------------------------------------------------------
-(defn op-control? [(op i64)] (-> bool) (<= op OP-CTRL-END))
-(defn op-value?   [(op i64)] (-> bool) (>= op OP-CONST))
+(defn op-control? [(op i64)] (-> bool)
+  (or (<= op OP-CTRL-END)
+      (or (= op OP-CALLEND) (or (= op OP-FUNSTART) (= op OP-SAFEPOINT)))))
+(defn op-value?   [(op i64)] (-> bool)
+  (and (>= op OP-CONST)
+       (and (!= op OP-CALLEND) (and (!= op OP-FUNSTART) (!= op OP-SAFEPOINT)))))
 (defn op-phi?     [(op i64)] (-> bool) (= op OP-PHI))
 (defn op-merge?   [(op i64)] (-> bool) (or (= op OP-REGION) (= op OP-LOOP)))
 (defn op-multi?   [(op i64)] (-> bool)
-  (or (= op OP-IF) (or (= op OP-RETURN) (= op OP-NEW))))
+  (or (= op OP-IF) (or (= op OP-RETURN) (or (= op OP-NEW) (= op OP-SAFEPOINT)))))
 
 ;; DOES THIS NODE PRODUCE A MEMORY STATE. It is a question about the NODE and not about its op,
 ;; which is why the `op-memory?` predicate this replaces could never have been implemented: a
@@ -128,11 +148,25 @@
 ;; allocates two objects allocates one. It is the same reason `Arg` is excluded, and the same
 ;; reason Simple gives `NewNode` its own `_alias` identity rather than letting GVN see it.
 (defn op-gvn? [(op i64)] (-> bool)
-  (and (> op OP-STOP) (and (!= op OP-ARG) (!= op OP-NEW))))
+  (and (> op OP-STOP)
+       (and (!= op OP-ARG)
+            (and (!= op OP-NEW)
+                 (and (!= op OP-FUN)
+                      (and (!= op OP-CALL)
+                           (and (!= op OP-CALLEND)
+                                (and (!= op OP-CLOSURE)
+                                     (and (!= op OP-SAFEPOINT) (!= op OP-BARRIER))))))))))
 
 ;; May be replaced by a constant when its type says the value is known. Control cannot (a
 ;; control edge is not a value), `Const` already is one, and `Arg` is opaque by construction.
-(defn op-foldable? [(op i64)] (-> bool) (>= op OP-PROJ))
+(defn op-foldable? [(op i64)] (-> bool)
+  (and (>= op OP-PROJ)
+       (and (!= op OP-CALLEND)
+            (and (!= op OP-FUN)
+                 (and (!= op OP-FUNSTART)
+                      (and (!= op OP-CLOSURE)
+                           (and (!= op OP-CALL)
+                                (and (!= op OP-SAFEPOINT) (!= op OP-BARRIER)))))))))
 
 ;; A loop's input 2 is its back edge. Everything else flows forwards.
 (defn n-back-edge? [(n i64) (i i64)] (-> bool)
@@ -160,6 +194,8 @@
    (outs  (ArrayList i64))     ; def-use, unordered
    (deps  (ArrayList i64))     ; nodes to revisit when this node's type changes
    (dead  bool)
+   (cold  bool)                 ; scheduler hint for guarded generic fallbacks (M9)
+   (observed bool)             ; an allocation pointer has had a non-write use (4c-3)
    (keeps i64)                 ; pins against the kill cascade; see n-keep!
    (hash  i64)])               ; cached structural hash; 0 means "not computed"
 
@@ -180,6 +216,7 @@
    (domver i64)                ; the cfgver the tables above were built at; -1 = never
    (verifying bool)            ; a checker is walking the graph; see n-add-dep!
    (achecks i64)               ; falling-type checks the last g-analyze! performed
+   (infer bool)                 ; explicit whole-world interprocedural inference mode (M7)
    (pmark  (ArrayList i64))    ; id -> generation stamp, for n-ty-proven?'s input-cone walk
    (pstack (ArrayList i64))    ; its DFS stack; both are reused rather than reallocated
    (pgen   i64)                ; the current generation
@@ -194,10 +231,11 @@
    ;; the rewrite, so a gate can assert an EQUALITY rather than "more than zero".
    (nfwd   i64)                ; load-after-store forwardings performed (4c-1)
    (nselim i64)                ; store-after-store eliminations performed (4c-2)
+   (ndalloc i64)               ; allocations removed after their object did not escape (4c-3)
    (inited bool)])
 
 (defn graph [] (-> (ptr Graph))
-  (let [p (alloc-static Graph)]
+  (let [p (static Graph)]
     (if (load (field p inited)) 0
       (do (store! (field p inited) true)
           (store! (field p nodes) (al-new [i64] (malloc-allocator)))
@@ -213,6 +251,7 @@
           (store! (field p domver) -1)
           (store! (field p verifying) false)
           (store! (field p achecks) 0)
+          (store! (field p infer) false)
           (store! (field p pmark)  (al-new [i64] (malloc-allocator)))
           (store! (field p pstack) (al-new [i64] (malloc-allocator)))
           (store! (field p pgen)   0)
@@ -220,6 +259,7 @@
           (store! (field p nchg)   0)
           (store! (field p nfwd)   0)
           (store! (field p nselim) 0)
+          (store! (field p ndalloc) 0)
           0))
     p))
 
@@ -241,10 +281,12 @@
     ; the corpus in a loop reads the count for the fixture it just built and not a running total.
     (store! (field p nfwd) 0)
     (store! (field p nselim) 0)
+    (store! (field p ndalloc) 0)
     (store! (field p cfgver) 0)
     (store! (field p domver) -1)
     (store! (field p verifying) false)
     (store! (field p achecks) 0)
+    (store! (field p infer) false)
     (store! (field p seed) seed)
     (store! (field p start) (n-new OP-START 0))
     (store! (field p stop)  (n-new OP-STOP 0))
@@ -286,6 +328,7 @@
 (defn n-ty    [(n i64)] (-> i64)  (load (field (nd n) ty)))
 (defn n-aux   [(n i64)] (-> i64)  (load (field (nd n) aux)))
 (defn n-dead? [(n i64)] (-> bool) (load (field (nd n) dead)))
+(defn n-observed? [(n i64)] (-> bool) (load (field (nd n) observed)))
 (defn n-nins  [(n i64)] (-> i64)  (al-len [i64] (load (field (nd n) ins))))
 (defn n-nouts [(n i64)] (-> i64)  (al-len [i64] (load (field (nd n) outs))))
 ;; BOUNDS ARE CHECKED, and this is not defensive programming for its own sake. `al-get` is an
@@ -305,6 +348,8 @@
     (al-get (load (field (nd n) outs)) i)))
 
 (defn n-set-ty! [(n i64) (t i64)] (-> i64) (store! (field (nd n) ty) t) 0)
+(defn n-cold? [(n i64)] (-> bool) (load (field (nd n) cold)))
+(defn n-mark-cold! [(n i64)] (-> i64) (store! (field (nd n) cold) true) 0)
 
 ; ============================================================================
 ; Creating nodes and maintaining edges
@@ -321,6 +366,8 @@
     (store! (field np outs) (al-new [i64] (malloc-allocator)))
     (store! (field np deps) (al-new [i64] (malloc-allocator)))
     (store! (field np dead) false)
+    (store! (field np cold) false)
+    (store! (field np observed) false)
     (store! (field np keeps) 0)
     (store! (field np hash) 0)
     (al-push! [i64]  (field p nodes) (cast i64 np))
@@ -335,8 +382,16 @@
       (do (store! (field (graph) cfgver) (+ (load (field (graph) cfgver)) 1)) 0)
     0))
 
+(defn n-record-object-use! [(n i64) (slot i64) (d i64)] (-> i64)
+  (if (or (= d NO-NODE) (n-dead? d)) 0
+    (if (and (= (n-op d) OP-PROJ) (= (n-aux d) 0))
+        (if (and (= (n-op n) OP-STORE) (= slot 2)) 0
+          (do (store! (field (nd d) observed) true) 0))
+      0)))
+
 (defn n-add-def! [(n i64) (d i64)] (-> i64)
   (n-bump-cfg! n)
+  (n-record-object-use! n (n-nins n) d)
   (al-push! [i64] (field (nd n) ins) d)
   (if (!= d NO-NODE) (do (al-push! [i64] (field (nd d) outs) n) 0) 0)
   (store! (field (nd n) hash) 0)
@@ -401,6 +456,7 @@
   (let [old (n-in n i)]
     (if (= old d) 0
       (do
+        (n-record-object-use! n i d)
         ; add the new use BEFORE dropping the old one: dropping it may kill a subtree that
         ; the new def is part of.
         (if (!= d NO-NODE) (do (al-push! [i64] (field (nd d) outs) n) 0) 0)
@@ -570,7 +626,7 @@
 (defn gvn-keyeq [(ka (ptr i8)) (kb (ptr i8)) (n i64)] (-> bool)
   (node-eq (load (cast (ptr i64) ka)) (load (cast (ptr i64) kb))))
 (defn gvn-keyops [] (-> (ptr KeyOps))
-  (let [o (alloc-static KeyOps)]
+  (let [o (static KeyOps)]
     (store! (field o hash) (fnptr-of gvn-keyhash))
     (store! (field o eq)   (fnptr-of gvn-keyeq))
     (store! (field o size) (sizeof i64))
@@ -590,6 +646,69 @@
 ; ============================================================================
 ; compute: the type of a node from its inputs
 ; ============================================================================
+(defn infer-call-targets [(call i64)] (-> i64)
+  (let [callee (n-in call 1)]
+    (n-add-dep! callee call)
+    (ty-fun-targets (n-ty callee))))
+
+(defn infer-parm-source [(call i64) (fun i64) (idx i64)] (-> i64)
+  (let [callee (n-in call 1)]
+    (if (= (n-op callee) OP-CLOSURE)
+        (let [capc (- (n-nins callee) 1)]
+          (if (< idx capc) (n-in callee (+ idx 1))
+            (let [at (+ 2 (- idx capc))]
+              (if (< at (n-nins call)) (n-in call at) NO-NODE))))
+      (let [at (+ 2 idx)] (if (< at (n-nins call)) (n-in call at) NO-NODE)))))
+
+(defn infer-parm-compute [(parm i64)] (-> i64)
+  (let [fun (n-in parm 0) fidx (n-aux fun) idx (n-aux parm)
+        lim (n-count) (mut i) 0 (mut acc) (t-top) (mut seen) false]
+    (loop
+      (if (>= (load i) lim) (break)
+        (do (let [call (load i)]
+              (if (or (n-dead? call) (!= (n-op call) OP-CALL)) 0
+                (if (= (& (infer-call-targets call) (<< 1 fidx)) 0) 0
+                  (let [src (infer-parm-source call fun idx)]
+                    (if (= src NO-NODE) (store! acc (t-dyn))
+                      (do (n-add-dep! src parm)
+                          (store! acc (ty-meet (load acc) (n-ty src)))))
+                    (store! seen true) 0))))
+            (store! i (+ (load i) 1)) 0)))
+    (if (load seen) (load acc) (t-top))))
+
+(defn infer-meet-fun-returns! [(fun i64) (call i64) (acc (ptr i64)) (seen (ptr bool))] (-> i64)
+  (let [(mut ri) 1]
+    (loop
+      (if (>= (load ri) (n-nins fun)) (break)
+        (do (let [ret (n-in fun (load ri))]
+              (if (or (n-dead? ret) (!= (n-op ret) OP-RETURN)) 0
+                (let [v (n-in ret 1)]
+                  (n-add-dep! v call)
+                  (store! acc (ty-meet (load acc) (n-ty v)))
+                  (store! seen true) 0)))
+            (store! ri (+ (load ri) 1)) 0)))
+    0))
+
+(defn infer-call-compute [(call i64)] (-> i64)
+  (let [targets (infer-call-targets call) (mut fidx) 0
+        (mut acc) (t-top) (mut seen) false]
+    (loop
+      (if (>= (load fidx) 64) (break)
+        (do (if (= (& targets (<< 1 (load fidx))) 0) 0
+              (let [fun (n-find-fun-index (load fidx))]
+                (if (= fun NO-NODE) 0 (infer-meet-fun-returns! fun call (mut acc) (mut seen)))))
+            (store! fidx (+ (load fidx) 1)) 0)))
+    (if (load seen) (load acc) (t-top))))
+
+(defn safepoint-compute [(n i64)] (-> i64)
+  (let [len (n-nins n) b (ty-tuple-open len) (mut i) 1]
+    (ty-tuple-put! b 0 (if (ty-high? (n-in-ty n 0)) (t-top) (t-ctrl)))
+    (loop
+      (if (>= (load i) len) (break)
+        (do (ty-tuple-put! b (load i) (n-in-ty n (load i)))
+            (store! i (+ (load i) 1)) 0)))
+    (ty-tuple-close b)))
+
 (defn n-compute [(n i64)] (-> i64)
   (case (n-op n)
     OP-START  (t-ctrl)
@@ -618,6 +737,17 @@
     OP-LOAD     (load-compute n)
     OP-STORE    (store-compute n)
     OP-MEMMERGE (memmerge-compute n)
+    OP-BOX      (box-compute n)
+    OP-UNBOX    (unbox-compute n)
+    OP-TYPETEST (typetest-compute n)
+    OP-CALLEND (if (ty-high? (n-in-ty n 0)) (t-top) (n-in-ty n 0))
+    OP-FUN     (t-fun-con (n-aux n))
+    OP-PARM    (if (load (field (graph) infer)) (infer-parm-compute n) (t-dyn))
+    OP-CALL    (if (load (field (graph) infer)) (infer-call-compute n) (t-dyn))
+    OP-FUNSTART (t-ctrl)
+    OP-CLOSURE (n-in-ty n 0)
+    OP-SAFEPOINT (safepoint-compute n)
+    OP-BARRIER (n-in-ty n 1)
     (t-bot)))
 
 ;; An absent input contributes ANY (nothing known yet), which keeps compute monotone while a
@@ -927,17 +1057,17 @@
 ;; buffer, and each refuses a shape of the wrong width by name rather than silently allocating an
 ;; object whose other fields nothing initialises.
 (defn n-new-obj0! [(ctrl i64) (shape i64)] (-> i64)
-  (let [buf (alloc-stack (array i64 1))]
+  (let [buf (stack (array i64 1))]
     (n-new-obj! ctrl shape (slice-new [i64] (cast (ptr i64) buf) 0))))
 
 (defn n-new-obj1! [(ctrl i64) (shape i64) (m0 i64)] (-> i64)
-  (let [buf (alloc-stack (array i64 1))
+  (let [buf (stack (array i64 1))
         p   (cast (ptr i64) buf)]
     (store! (index p 0) m0)
     (n-new-obj! ctrl shape (slice-new [i64] p 1))))
 
 (defn n-new-obj2! [(ctrl i64) (shape i64) (m0 i64) (m1 i64)] (-> i64)
-  (let [buf (alloc-stack (array i64 2))
+  (let [buf (stack (array i64 2))
         p   (cast (ptr i64) buf)]
     (store! (index p 0) m0)
     (store! (index p 1) m1)
@@ -977,6 +1107,124 @@
 
 (defn n-memmerge2! [(a i64) (b i64)] (-> i64)
   (n-peephole (n-new3 OP-MEMMERGE 0 NO-NODE a b)))
+
+(defn n-box! [(v i64)] (-> i64)
+  (n-peephole (n-new2 OP-BOX 0 NO-NODE v)))
+
+(defn n-unbox! [(v i64) (target i64)] (-> i64)
+  (n-peephole (n-new2 OP-UNBOX target NO-NODE v)))
+
+(defn n-typetest! [(v i64) (target i64)] (-> i64)
+  (n-peephole (n-new2 OP-TYPETEST target NO-NODE v)))
+
+;; Function definitions are cyclic by construction: Parm -> Fun -> body Return -> expression ->
+;; Parm. The open/close API makes that cycle explicit and prevents a caller from pretending a
+;; half-built function is ready to call.
+(defn n-fun-open! [(fidx i64)] (-> i64)
+  (let [fun (n-new OP-FUN fidx) entry (n-new1 OP-FUNSTART 0 fun)]
+    (n-add-def! fun entry)
+    fun))
+(defn n-fun-entry [(fun i64)] (-> i64)
+  (if (and (= (n-op fun) OP-FUN) (> (n-nins fun) 0)) (n-in fun 0) NO-NODE))
+(defn n-parm! [(fun i64) (idx i64)] (-> i64)
+  (n-peephole (n-new1 OP-PARM idx fun)))
+(defn n-closure! [(fun i64) (captures (slice i64))] (-> i64)
+  (let [n (n-new OP-CLOSURE 0) (mut i) 0]
+    (n-add-def! n fun)
+    (loop
+      (if (>= (load i) (slice-len captures)) (break)
+        (do (n-add-def! n (slice-get captures (load i)))
+            (store! i (+ (load i) 1)) 0)))
+    (n-peephole n)))
+(defn n-closure1! [(fun i64) (capture i64)] (-> i64)
+  (let [buf (stack (array i64 1)) p (cast (ptr i64) buf)]
+    (store! (index p 0) capture)
+    (n-closure! fun (slice-new [i64] p 1))))
+
+(defn n-safepoint! [(ctrl i64) (refs (slice i64))] (-> i64)
+  (let [sp (n-new OP-SAFEPOINT 0) (mut i) 0]
+    (n-add-def! sp ctrl)
+    (loop
+      (if (>= (load i) (slice-len refs)) (break)
+        (do (n-add-def! sp (slice-get refs (load i)))
+            (store! i (+ (load i) 1)) 0)))
+    (n-peephole sp)))
+(defn n-safepoint0! [(ctrl i64)] (-> i64)
+  (n-peephole (n-new1 OP-SAFEPOINT 0 ctrl)))
+(defn n-safepoint1! [(ctrl i64) (ref i64)] (-> i64)
+  (let [buf (stack (array i64 1)) p (cast (ptr i64) buf)]
+    (store! (index p 0) ref)
+    (n-safepoint! ctrl (slice-new [i64] p 1))))
+(defn n-safepoint-ctrl! [(sp i64)] (-> i64)
+  (n-peephole (n-new1 OP-CPROJ 0 sp)))
+(defn n-safepoint-ref! [(sp i64) (idx i64)] (-> i64)
+  (n-peephole (n-new1 OP-PROJ (+ idx 1) sp)))
+(defn n-barrier! [(ctrl i64) (mem i64) (obj i64) (value i64)] (-> i64)
+  (n-peephole (n-new4 OP-BARRIER 0 ctrl mem obj value)))
+
+(defn safepoint-control? [(ctrl i64)] (-> bool)
+  (and (!= ctrl NO-NODE)
+       (and (= (n-op ctrl) OP-CPROJ)
+            (= (n-op (n-in ctrl 0)) OP-SAFEPOINT))))
+
+(defn place-safepoint-before! [(n i64) (slot i64)] (-> bool)
+  (let [old (n-in n slot)]
+    (if (or (= old NO-NODE) (safepoint-control? old)) false
+      (let [sp (n-safepoint0! old) ctrl (n-safepoint-ctrl! sp)]
+        (n-set-def! n slot ctrl) true))))
+
+(defn g-place-safepoints! [] (-> i64)
+  (let [lim (n-count) (mut i) 0 (mut count) 0]
+    (loop
+      (if (>= (load i) lim) (break)
+        (do (if (n-dead? (load i)) 0
+              (let [op (n-op (load i))]
+                (if (or (= op OP-NEW) (= op OP-CALL))
+                    (if (place-safepoint-before! (load i) 0)
+                        (store! count (+ (load count) 1)) 0)
+                  (if (= op OP-LOOP)
+                      (if (place-safepoint-before! (load i) 2)
+                          (store! count (+ (load count) 1)) 0)
+                    0))))
+            (store! i (+ (load i) 1)) 0)))
+    (load count)))
+(defn n-fun-close! [(fun i64) (body-ret i64)] (-> i64)
+  (if (or (!= (n-op fun) OP-FUN) (!= (n-nins fun) 1))
+      (do (panic-corrupt "n-fun-close!: function is not an open Fun") 0)
+    (do (if (= (n-op body-ret) OP-RETURN) 0
+          (do (panic-corrupt "n-fun-close!: body root is not a Return") 0))
+        (n-add-def! fun body-ret)
+        (n-peephole fun)
+        fun)))
+
+(defn n-fun-add-return! [(fun i64) (body-ret i64)] (-> i64)
+  (if (or (!= (n-op fun) OP-FUN) (!= (n-op body-ret) OP-RETURN))
+      (do (panic-corrupt "n-fun-add-return!: expected a Fun and a Return") 0)
+    (do (n-add-def! fun body-ret) (n-peephole fun) fun)))
+
+(defstruct CallSite [(value i64) (end i64)])
+(defn call-value [(c CallSite)] (-> i64) (load (field c value)))
+(defn call-end   [(c CallSite)] (-> i64) (load (field c end)))
+
+(defn n-call! [(ctrl i64) (callee i64) (args (slice i64))] (-> CallSite)
+  (let [call (n-new OP-CALL 0) (mut i) 0 (mut r) (zeroed CallSite)]
+    (n-add-def! call ctrl) (n-add-def! call callee)
+    (loop
+      (if (>= (load i) (slice-len args)) (break)
+        (do (n-add-def! call (slice-get args (load i)))
+            (store! i (+ (load i) 1)) 0)))
+    (store! (field r value) (n-peephole call))
+    (store! (field r end) (n-peephole (n-new2 OP-CALLEND 0 ctrl (load (field r value)))))
+    (load r)))
+
+(defn n-call1! [(ctrl i64) (callee i64) (a i64)] (-> CallSite)
+  (let [buf (stack (array i64 1)) p (cast (ptr i64) buf)]
+    (store! (index p 0) a) (n-call! ctrl callee (slice-new [i64] p 1))))
+
+(defn n-call2! [(ctrl i64) (callee i64) (a i64) (b i64)] (-> CallSite)
+  (let [buf (stack (array i64 2)) p (cast (ptr i64) buf)]
+    (store! (index p 0) a) (store! (index p 1) b)
+    (n-call! ctrl callee (slice-new [i64] p 2))))
 
 ; ============================================================================
 ; JavaScript truthiness
@@ -1174,6 +1422,23 @@
         (if (= (n-ty n) (t-top)) target (n-ty n))
       j)))
 
+;; Representation changes do not change the runtime value observed by the interpreter. `Box`
+;; deliberately forgets the unboxed refinement and publishes `dyn`: downstream generic code may
+;; inspect the tag but may not use the source representation as proof. `Unbox` reintroduces its
+;; declared target; a failing runtime check is a compiler error unless a TypeTest arm proved it.
+(defn box-compute [(n i64)] (-> i64)
+  (let [t (n-in-ty n 1)]
+    (if (ty-high? t) (t-top) (t-dyn))))
+
+(defn unbox-compute [(n i64)] (-> i64)
+  (if (ty-high? (n-in-ty n 1)) (t-top) (n-aux n)))
+
+(defn typetest-compute [(n i64)] (-> i64)
+  (let [t (n-in-ty n 1) target (n-aux n)]
+    (if (ty-high? t) (t-top)
+      (if (ty-isa t target) (t-bool-con true)
+        (if (ty-high? (ty-join t target)) (t-bool-con false) (t-bool))))))
+
 ; ============================================================================
 ; Memory compute
 ; ============================================================================
@@ -1287,7 +1552,7 @@
     (if (shape-defined? s) 0
       (do (panic-corrupt "new-compute: a New whose aux is not a defined shape id") 0))
     (let [k   (shape-field-count s)
-          buf (alloc-stack (array i64 65))
+          buf (stack (array i64 65))
           p   (cast (ptr i64) buf)
           (mut i) 0]
       (if (< (+ k 1) NEW-TUPLE-MAX) 0
@@ -1553,6 +1818,19 @@
       (n-in n 1)
     NO-NODE))
 
+;; Unbox<T>(Box(x)) is x when x is proven to satisfy T. The proof requirement matters even though
+;; the nodes are adjacent: deleting the pair on a provisional Phi would silently discharge the
+;; representation check in exactly the way an early Cast deletion discharges a type guard.
+(defn unbox-idealize [(n i64)] (-> i64)
+  (let [b (n-in n 1)]
+    (if (and (and (!= b NO-NODE) (not (n-dead? b))) (= (n-op b) OP-BOX))
+        (let [v (n-in b 1)]
+          (if (and (!= v NO-NODE)
+                   (and (n-ty-proven? v) (ty-isa (n-ty v) (n-aux n))))
+              v
+            NO-NODE))
+      NO-NODE)))
+
 ;; THE SAME WORD OF THE SAME OBJECT, decided without reading a single type.
 ;;
 ;; Two conditions, and each of them is one half of "the same word". The alias class is the FIELD:
@@ -1702,6 +1980,44 @@
             0)))
     (and (= (load others) 0) (= (n-keeps inner) 0))))
 
+;; An allocation escapes as soon as its object projection is used for anything except writing one
+;; of its own fields. Stores do not expose identity and, if no Load or value consumer can observe
+;; the object, every one of those writes is dead. This is deliberately a use-def question: two
+;; allocations may have the same shape and type and are still different objects.
+(defn store-ptr-is-local-allocation? [(st i64) (p i64)] (-> bool)
+  (if (or (or (n-dead? p) (or (n-observed? p) (> (n-keeps p) 0)))
+          (or (!= (n-op p) OP-PROJ) (!= (n-aux p) 0))) false
+    (let [nw (n-in p 0)]
+      (if (or (n-dead? nw) (!= (n-op nw) OP-NEW)) false
+        (let [len (n-nouts p) (mut i) 0 (mut local) true]
+          (loop
+            (if (or (>= (load i) len) (not (load local))) (break)
+              (do (let [u (n-out p (load i))]
+                    (if (and (and (and (not (n-dead? u)) (= (n-op u) OP-STORE))
+                                  (= (n-in u 2) p))
+                             (not (access-refused? u)))
+                        0
+                      (store! local false)))
+                  (store! i (+ (load i) 1))
+                  0)))
+          (and (load local) (> len 0)))))))
+
+;; Once the object projection of a New is gone, its memory projections are transparent: an
+;; allocation whose identity cannot be observed has made no change to the incoming memory. The
+;; projection slot and New input slot deliberately line up (slot 0 is the object; slot 1+i is
+;; field i on both sides). Count only the final projection, because that substitution is the one
+;; whose kill cascade actually removes the New.
+(defn proj-dead-allocation-idealize [(pr i64)] (-> i64)
+  (if (<= (n-aux pr) 0) NO-NODE
+    (let [nw (n-in pr 0)]
+      (if (or (n-dead? nw) (!= (n-op nw) OP-NEW)) NO-NODE
+        (if (!= (n-multi-proj nw 0) NO-NODE) NO-NODE
+          (if (not (n-ty-proven? pr)) (do (n-add-dep! nw pr) NO-NODE)
+            (let [m (n-in nw (n-aux pr))]
+              (if (or (= m NO-NODE) (n-dead? m)) NO-NODE
+                (do (if (= (n-nouts nw) 1) (g-dead-allocation!) 0)
+                    m)))))))))
+
 ;; STORE AFTER STORE. `Store(p, v2, mem=Store(p, v1, m))` becomes `Store(p, v2, mem=m)`: the inner
 ;; write is overwritten before anything can read it, so it never happened.
 ;;
@@ -1772,7 +2088,15 @@
       ; reading `ins` out of a killed node returns a stale id: `n-kill!` clears the list. Same
       ; stance, and the same reason, as `load-idealize`.
       (if (n-dead? m) NO-NODE
-        (if (not (store-store-same-word? n m p)) (do (n-add-dep! m n) NO-NODE)
+        ;; A Store with no user is commonly still under construction: the Return or next memory
+        ;; op that roots it is built on the following line. Wait until it has a real consumer, and
+        ;; treat a pin as the same promise of a future consumer that the rest of this file does.
+        (if (and (and (> (n-nouts n) 0) (= (n-keeps n) 0))
+                 (store-ptr-is-local-allocation? n p))
+            (if (not (n-ty-proven? n)) (do (n-add-dep! m n) NO-NODE)
+              (if (access-refused? n) (do (n-add-dep! m n) NO-NODE)
+                m))
+          (if (not (store-store-same-word? n m p)) (do (n-add-dep! m n) NO-NODE)
           ; The inner store's own memory is what this store inherits. A store still being wired
           ; has none yet, and rewiring to NO-NODE would leave a Store with a null memory edge,
           ; which is a malformed node rather than an optimisation.
@@ -1786,7 +2110,7 @@
                         (n-set-def! n 1 mm)
                         (g-store-elim!)
                         (g-changed!)
-                        n)))))))))))
+                        n))))))))))))
 
 ; ============================================================================
 ; idealize: local rewrites
@@ -1799,6 +2123,11 @@
     OP-CPROJ  (cproj-idealize n)
     OP-PHI    (phi-idealize n)
     OP-CAST   (cast-idealize n)
+    OP-UNBOX  (unbox-idealize n)
+    OP-CALL   (call-idealize n)
+    OP-CALLEND (callend-idealize n)
+    OP-BARRIER (barrier-idealize n)
+    OP-PROJ   (proj-dead-allocation-idealize n)
     OP-ADD    (add-idealize n)
     OP-SUB    (sub-idealize n)
     OP-MUL    (mul-idealize n)
@@ -1809,6 +2138,192 @@
     OP-LOAD   (load-idealize n)
     OP-STORE  (store-idealize n)
     NO-NODE))
+
+(defn callend-idealize [(n i64)] (-> i64)
+  (let [ctrl (n-in n 0)]
+    (if (= (n-op ctrl) OP-XCTRL) ctrl NO-NODE)))
+
+(defn barrier-idealize [(n i64)] (-> i64)
+  (let [prior (n-in n 1)]
+    (if (and (= (n-op prior) OP-BARRIER)
+             (and (= (n-in prior 2) (n-in n 2)) (= (n-in prior 3) (n-in n 3))))
+        prior
+      NO-NODE)))
+
+(defn n-find-fun-index [(fidx i64)] (-> i64)
+  (let [lim (n-count) (mut i) 0 (mut found) NO-NODE]
+    (loop
+      (if (or (>= (load i) lim) (!= (load found) NO-NODE)) (break)
+        (do (if (and (and (not (n-dead? (load i))) (= (n-op (load i)) OP-FUN))
+                     (= (n-aux (load i)) fidx))
+                (store! found (load i)) 0)
+            (store! i (+ (load i) 1)) 0)))
+    (load found)))
+
+(defn call-idealize [(n i64)] (-> i64)
+  (let [callee (n-in n 1)]
+    (if (or (= (n-op callee) OP-FUN) (= (n-op callee) OP-CLOSURE)) NO-NODE
+      (if (not (n-ty-proven? callee)) NO-NODE
+        (let [fidx (ty-fun-singleton (n-ty callee))]
+          (if (< fidx 0) NO-NODE
+            (let [fun (n-find-fun-index fidx)]
+              (if (= fun NO-NODE) NO-NODE
+                (do (gvn-remove! n) (n-set-def! n 1 fun) (g-changed!) n)))))))))
+
+;; M6's deliberately conservative first inliner. It admits only a single Return directly owned by
+;; FunStart and a pure expression tree. Branches, memory, calls (including recursion), and closures
+;; stay as calls. The preflight makes cloning atomic: an unsupported leaf is discovered before any
+;; new node is allocated.
+(defn inline-clonable? [(x i64) (fun i64) (call i64) (fuel i64)] (-> bool)
+  (if (<= fuel 0) false
+    (case (n-op x)
+      OP-CONST true
+      OP-PARM (and (= (n-in x 0) fun) (< (n-aux x) (- (n-nins call) 2)))
+      OP-CAST (inline-clonable? (n-in x 1) fun call (- fuel 1))
+      OP-BOX (inline-clonable? (n-in x 1) fun call (- fuel 1))
+      OP-UNBOX (inline-clonable? (n-in x 1) fun call (- fuel 1))
+      OP-TYPETEST (inline-clonable? (n-in x 1) fun call (- fuel 1))
+      OP-MINUS (inline-clonable? (n-in x 1) fun call (- fuel 1))
+      OP-NOT (inline-clonable? (n-in x 1) fun call (- fuel 1))
+      OP-ADD (and (inline-clonable? (n-in x 1) fun call (- fuel 1))
+                  (inline-clonable? (n-in x 2) fun call (- fuel 1)))
+      OP-SUB (and (inline-clonable? (n-in x 1) fun call (- fuel 1))
+                  (inline-clonable? (n-in x 2) fun call (- fuel 1)))
+      OP-MUL (and (inline-clonable? (n-in x 1) fun call (- fuel 1))
+                  (inline-clonable? (n-in x 2) fun call (- fuel 1)))
+      OP-DIV (and (inline-clonable? (n-in x 1) fun call (- fuel 1))
+                  (inline-clonable? (n-in x 2) fun call (- fuel 1)))
+      OP-EQ (and (inline-clonable? (n-in x 1) fun call (- fuel 1))
+                 (inline-clonable? (n-in x 2) fun call (- fuel 1)))
+      OP-LT (and (inline-clonable? (n-in x 1) fun call (- fuel 1))
+                 (inline-clonable? (n-in x 2) fun call (- fuel 1)))
+      OP-LE (and (inline-clonable? (n-in x 1) fun call (- fuel 1))
+                 (inline-clonable? (n-in x 2) fun call (- fuel 1)))
+      false)))
+
+(defn inline-clone! [(x i64) (fun i64) (call i64)] (-> i64)
+  (case (n-op x)
+    OP-CONST x
+    OP-PARM (n-in call (+ 2 (n-aux x)))
+    OP-CAST (n-peephole (n-new2 OP-CAST (n-aux x) NO-NODE (inline-clone! (n-in x 1) fun call)))
+    OP-BOX (n-peephole (n-new2 OP-BOX 0 NO-NODE (inline-clone! (n-in x 1) fun call)))
+    OP-UNBOX (n-peephole (n-new2 OP-UNBOX (n-aux x) NO-NODE (inline-clone! (n-in x 1) fun call)))
+    OP-TYPETEST (n-peephole (n-new2 OP-TYPETEST (n-aux x) NO-NODE (inline-clone! (n-in x 1) fun call)))
+    OP-MINUS (n-peephole (n-new2 OP-MINUS 0 NO-NODE (inline-clone! (n-in x 1) fun call)))
+    OP-NOT (n-peephole (n-new2 OP-NOT 0 NO-NODE (inline-clone! (n-in x 1) fun call)))
+    OP-ADD (n-peephole (n-new3 OP-ADD 0 NO-NODE (inline-clone! (n-in x 1) fun call) (inline-clone! (n-in x 2) fun call)))
+    OP-SUB (n-peephole (n-new3 OP-SUB 0 NO-NODE (inline-clone! (n-in x 1) fun call) (inline-clone! (n-in x 2) fun call)))
+    OP-MUL (n-peephole (n-new3 OP-MUL 0 NO-NODE (inline-clone! (n-in x 1) fun call) (inline-clone! (n-in x 2) fun call)))
+    OP-DIV (n-peephole (n-new3 OP-DIV 0 NO-NODE (inline-clone! (n-in x 1) fun call) (inline-clone! (n-in x 2) fun call)))
+    OP-EQ (n-peephole (n-new3 OP-EQ 0 NO-NODE (inline-clone! (n-in x 1) fun call) (inline-clone! (n-in x 2) fun call)))
+    OP-LT (n-peephole (n-new3 OP-LT 0 NO-NODE (inline-clone! (n-in x 1) fun call) (inline-clone! (n-in x 2) fun call)))
+    OP-LE (n-peephole (n-new3 OP-LE 0 NO-NODE (inline-clone! (n-in x 1) fun call) (inline-clone! (n-in x 2) fun call)))
+    NO-NODE))
+
+(defn call-callend [(call i64)] (-> i64)
+  (let [len (n-nouts call) (mut i) 0 (mut found) NO-NODE (mut many) false]
+    (loop
+      (if (>= (load i) len) (break)
+        (do (let [u (n-out call (load i))]
+              (if (and (not (n-dead? u)) (= (n-op u) OP-CALLEND))
+                  (if (= (load found) NO-NODE) (store! found u) (store! many true)) 0))
+            (store! i (+ (load i) 1)) 0)))
+    (if (load many) NO-NODE (load found))))
+
+(defn inline-one-call! [(call i64)] (-> bool)
+  (if (or (n-dead? call) (!= (n-op call) OP-CALL)) false
+    (let [fun (n-in call 1)]
+      (if (or (!= (n-op fun) OP-FUN) (!= (n-nins fun) 2)) false
+        (let [ret (n-in fun 1) end (call-callend call)]
+          (if (or (= end NO-NODE)
+                  (or (!= (n-op ret) OP-RETURN)
+                      (or (!= (n-in ret 0) (n-fun-entry fun))
+                          (not (inline-clonable? (n-in ret 1) fun call 32))))) false
+            (let [ctrl (n-in call 0) value (inline-clone! (n-in ret 1) fun call)]
+              (n-keep! ctrl) (n-keep! value)
+              (n-subsume! end ctrl)
+              (n-subsume! call value)
+              (n-unkeep! value) (n-unkeep! ctrl)
+              (if (and (not (n-dead? value)) (= (n-nouts value) 0)) (n-kill! value) 0)
+              (g-changed!) true)))))))
+
+(defn g-inline-small! [] (-> i64)
+  (let [lim (n-count) (mut i) 0 (mut count) 0]
+    (loop
+      (if (>= (load i) lim) (break)
+        (do (if (inline-one-call! (load i)) (store! count (+ (load count) 1)) 0)
+            (store! i (+ (load i) 1)) 0)))
+    (load count)))
+
+(defn fun-parm-count [(fun i64)] (-> i64)
+  (let [len (n-nouts fun) (mut i) 0 (mut count) 0]
+    (loop
+      (if (>= (load i) len) (break)
+        (do (let [u (n-out fun (load i))]
+              (if (and (not (n-dead? u)) (= (n-op u) OP-PARM))
+                  (if (> (+ (n-aux u) 1) (load count)) (store! count (+ (n-aux u) 1)) 0) 0))
+            (store! i (+ (load i) 1)) 0)))
+    (load count)))
+
+;; Clone one small straight-line function. The temporary Call is only a substitution map consumed
+;; by the already-gated inliner; it is killed before this function returns and never reaches IR.
+(defn n-specialize-fun! [(fun i64) (new-fidx i64)] (-> i64)
+  (if (or (!= (n-op fun) OP-FUN) (!= (n-nins fun) 2)) NO-NODE
+    (let [ret (n-in fun 1)]
+      (if (or (!= (n-op ret) OP-RETURN) (!= (n-in ret 0) (n-fun-entry fun))) NO-NODE
+        (let [clone (n-fun-open! new-fidx) fake (n-new OP-CALL 0)
+              argc (fun-parm-count fun) (mut i) 0]
+          (n-add-def! fake (n-fun-entry clone)) (n-add-def! fake fun)
+          (loop
+            (if (>= (load i) argc) (break)
+              (do (n-add-def! fake (n-parm! clone (load i)))
+                  (store! i (+ (load i) 1)) 0)))
+          (if (not (inline-clonable? (n-in ret 1) fun fake 32))
+              (do (n-kill! fake) NO-NODE)
+            (let [value (inline-clone! (n-in ret 1) fun fake)]
+              (n-keep! value) (n-kill! fake) (n-unkeep! value)
+              (n-fun-close! clone (n-new2 OP-RETURN 0 (n-fun-entry clone) value))
+              clone)))))))
+
+(defstruct SpecSite [(value i64) (end i64) (fast i64) (fallback i64) (clone i64)])
+(defn spec-value [(s SpecSite)] (-> i64) (load (field s value)))
+(defn spec-end [(s SpecSite)] (-> i64) (load (field s end)))
+(defn spec-fast [(s SpecSite)] (-> i64) (load (field s fast)))
+(defn spec-fallback [(s SpecSite)] (-> i64) (load (field s fallback)))
+(defn spec-clone [(s SpecSite)] (-> i64) (load (field s clone)))
+
+;; Profile input to M9's specialization cost model.
+(defn n-profile-specialize? [(samples i64) (target-hits i64) (clone-cost i64)] (-> bool)
+  (and (and (>= samples 32) (>= (* target-hits 100) (* samples 80))) (<= clone-cost 32)))
+
+(defn n-specialize-call1! [(ctrl i64) (generic i64) (arg i64) (target i64) (new-fidx i64)] (-> SpecSite)
+  (let [clone (n-specialize-fun! generic new-fidx) (mut out) (zeroed SpecSite)]
+    (if (= clone NO-NODE) (do (panic-corrupt "n-specialize-call1!: function exceeds the cost model") 0) 0)
+    (n-keep! arg)
+    (let [test (n-typetest! arg target)
+          iff (n-peephole (n-new2 OP-IF 0 ctrl test))
+          arms (n-if-arms! iff)
+          narrowed (n-peephole (n-new2 OP-CAST target (arms-t arms) arg))
+          fast (n-call1! (arms-t arms) clone narrowed)
+          slow (n-call1! (arms-f arms) generic arg)
+          region (n-new OP-REGION 0)]
+      (n-mark-cold! (arms-f arms))
+      (n-unkeep! arg)
+      (n-add-def! region NO-NODE)
+      (n-add-def! region (call-end fast))
+      (n-add-def! region (call-end slow))
+      (let [phi (n-new OP-PHI (t-dyn))]
+        (n-add-def! phi region)
+        (n-add-def! phi (call-value fast))
+        (n-add-def! phi (call-value slow))
+        ; Return the raw merge pair. The caller has not attached its consumer yet, so eager
+        ; simplification here can collect a proven arm before that consumer exists.
+        (store! (field out value) phi)
+        (store! (field out end) region)
+        (store! (field out fast) (call-value fast))
+        (store! (field out fallback) (call-value slow))
+        (store! (field out clone) clone)
+        (load out)))))
 
 ;; "This operand IS the integer k", which every identity rule below asks about the operand it is
 ;; about to discard. IT IS A CLAIM ABOUT A TYPE, so it needs the proven answer too: a Phi
@@ -2076,10 +2591,13 @@
 ;; either. The only producer is `n-peephole`.
 (defn g-forwards    [] (-> i64) (load (field (graph) nfwd)))
 (defn g-store-elims [] (-> i64) (load (field (graph) nselim)))
+(defn g-dead-allocations [] (-> i64) (load (field (graph) ndalloc)))
 (defn g-forwarded!  [] (-> i64)
   (store! (field (graph) nfwd) (+ (load (field (graph) nfwd)) 1)) 0)
 (defn g-store-elim! [] (-> i64)
   (store! (field (graph) nselim) (+ (load (field (graph) nselim)) 1)) 0)
+(defn g-dead-allocation! [] (-> i64)
+  (store! (field (graph) ndalloc) (+ (load (field (graph) ndalloc)) 1)) 0)
 
 (defn wl-push-live! [] (-> i64)
   (let [n (n-count) (mut i) 0]
@@ -2196,6 +2714,31 @@
               0))))
     (load steps)))
 
+;; Whole-world optimistic inference. Resetting every live node to lattice TOP is intentional: the
+;; pass discovers only flows that originate in this compilation unit. `infer-parm-compute` and
+;; `infer-call-compute` register the non-local dependencies they inspect, so changing a target,
+;; argument, capture, or return value requeues the affected interprocedural node.
+(defn g-infer! [] (-> i64)
+  (let [p (graph) lim (n-count) (mut i) 0]
+    (store! (field p infer) true)
+    (loop
+      (if (>= (load i) lim) (break)
+        (do (if (n-dead? (load i)) 0 (n-set-ty! (load i) (t-top)))
+            (store! i (+ (load i) 1)) 0)))
+    (g-analyze!)))
+
+(defn g-inference-mode? [] (-> bool) (load (field (graph) infer)))
+
+(defn g-call-graph-edges [] (-> i64)
+  (let [lim (n-count) (mut i) 0 (mut edges) 0]
+    (loop
+      (if (>= (load i) lim) (break)
+        (do (let [call (load i)]
+              (if (or (n-dead? call) (!= (n-op call) OP-CALL)) 0
+                (store! edges (+ (load edges) (popcount64 (ty-fun-targets (n-in-ty call 1)))))))
+            (store! i (+ (load i) 1)) 0)))
+    (load edges)))
+
 ; ============================================================================
 ; Reachability, for the leak check
 ; ============================================================================
@@ -2221,6 +2764,15 @@
             (do (al-push! [bool] (mut seen) false) (store! i (+ (load i) 1)) 0)))
     (n-reachable-mark (g-stop)  (mut seen))
     (n-reachable-mark (g-start) (mut seen))
+    ; Closed-world function definitions are linker roots. A specialization may prove every local
+    ; call takes its clone while the generic version must still be emitted as the fallback entry
+    ; for other compilation-unit callers.
+    (store! i 0)
+    (loop
+      (if (>= (load i) n) (break)
+        (do (if (and (not (n-dead? (load i))) (= (n-op (load i)) OP-FUN))
+                (n-reachable-mark (load i) (mut seen)) 0)
+            (store! i (+ (load i) 1)) 0)))
     (let [(mut j) 0 (mut leaked) 0]
       (loop
         (if (>= (load j) n) (break)
@@ -2270,6 +2822,22 @@
         OP-PROJ   (do (fmt w "n{d}.{d}" (n-in n 0) (n-aux n)) 0)
         OP-CAST   (do (ps w "(") (ty-print w (n-aux n)) (ps w ")")
                       (n-print w (n-in n 1)) 0)
+        OP-BOX    (do (ps w "box(") (n-print w (n-in n 1)) (ps w ")") 0)
+        OP-UNBOX  (do (ps w "unbox<") (ty-print w (n-aux n)) (ps w ">(")
+                      (n-print w (n-in n 1)) (ps w ")") 0)
+        OP-TYPETEST (do (ps w "is<") (ty-print w (n-aux n)) (ps w ">(")
+                        (n-print w (n-in n 1)) (ps w ")") 0)
+        OP-FUN    (do (fmt w "fun#{d}" (n-aux n)) 0)
+        OP-PARM   (do (fmt w "parm{d}" (n-aux n)) 0)
+        OP-CALL   (do (n-print w (n-in n 1)) (ps w "(")
+                      (let [(mut i) 2]
+                        (loop
+                          (if (>= (load i) (n-nins n)) (break)
+                            (do (if (> (load i) 2) (ps w ",") 0)
+                                (n-print w (n-in n (load i)))
+                                (store! i (+ (load i) 1)) 0))))
+                      (ps w ")") 0)
+        OP-CALLEND (do (ps w "CallEnd") (fmt w "{d}" n) 0)
         OP-CONST  (ty-print w (n-ty n))
         OP-ARG    (ps w "arg")
         OP-ADD    (binop-print w n "+")
@@ -2357,8 +2925,8 @@
 
 ;; Render a node to a caller-owned buffer, so tests can compare printed IR as a string.
 (defn n-render [(n i64) (buf (ptr i8)) (cap i64)] (-> (slice u8))
-  (let [fb (alloc-stack FixBuf)
-        w  (alloc-stack Writer)]
+  (let [fb (stack FixBuf)
+        w  (stack Writer)]
     (store! (field fb data) buf)
     (store! (field fb cap)  cap)
     (store! (field fb len)  0)

@@ -1,0 +1,165 @@
+;; M11 runtime collector: bump allocation into two moving semispaces.
+(module gc)
+
+(import "coil.control" :use *)
+(import "coil.io" :use *)
+(import "coil.alloc" :use *)
+
+(const GC-CAP i64 256)
+(const GC-FIELDS i64 8)
+(const GC-ROOTS i64 64)
+
+(defstruct Collector
+  [(age0 (array i64 256)) (age1 (array i64 256))
+   (gen0 (array i64 256)) (gen1 (array i64 256))
+   (nfield0 (array i64 256)) (nfield1 (array i64 256))
+   (mask0 (array i64 256)) (mask1 (array i64 256))
+   (forward0 (array i64 256)) (forward1 (array i64 256))
+   (field0 (array i64 2048)) (field1 (array i64 2048))
+   (roots (array i64 64))
+   (space i64) (bump i64) (nroots i64) (collections i64)
+   (promotions i64) (slowpaths i64) (stress bool)])
+
+(defn gc [] (-> (ptr Collector)) (static Collector))
+(defn gc-arr-get [(space i64) (which i64) (i i64)] (-> i64)
+  (let [p (gc)]
+    (case which
+      0 (load (index (if (= space 0) (field p age0) (field p age1)) i))
+      1 (load (index (if (= space 0) (field p gen0) (field p gen1)) i))
+      2 (load (index (if (= space 0) (field p nfield0) (field p nfield1)) i))
+      3 (load (index (if (= space 0) (field p mask0) (field p mask1)) i))
+      4 (load (index (if (= space 0) (field p forward0) (field p forward1)) i))
+      0)))
+(defn gc-arr-set! [(space i64) (which i64) (i i64) (v i64)] (-> i64)
+  (let [p (gc)]
+    (case which
+      0 (store! (index (if (= space 0) (field p age0) (field p age1)) i) v)
+      1 (store! (index (if (= space 0) (field p gen0) (field p gen1)) i) v)
+      2 (store! (index (if (= space 0) (field p nfield0) (field p nfield1)) i) v)
+      3 (store! (index (if (= space 0) (field p mask0) (field p mask1)) i) v)
+      4 (store! (index (if (= space 0) (field p forward0) (field p forward1)) i) v)
+      0) 0))
+(defn gc-field-get [(space i64) (obj i64) (slot i64)] (-> i64)
+  (let [p (gc) i (+ (* obj GC-FIELDS) slot)]
+    (load (index (if (= space 0) (field p field0) (field p field1)) i))))
+(defn gc-field-set-at! [(space i64) (obj i64) (slot i64) (v i64)] (-> i64)
+  (let [p (gc) i (+ (* obj GC-FIELDS) slot)]
+    (store! (index (if (= space 0) (field p field0) (field p field1)) i) v) 0))
+
+(defn gc-space-of [(addr i64)] (-> i64) (/ (- addr 1) GC-CAP))
+(defn gc-index-of [(addr i64)] (-> i64) (% (- addr 1) GC-CAP))
+(defn gc-addr [(space i64) (idx i64)] (-> i64) (+ 1 (+ (* space GC-CAP) idx)))
+
+(defn gc-reset! [] (-> i64)
+  (let [p (gc) (mut i) 0]
+    (store! (field p space) 0) (store! (field p bump) 0) (store! (field p nroots) 0)
+    (store! (field p collections) 0) (store! (field p promotions) 0)
+    (store! (field p slowpaths) 0) (store! (field p stress) false)
+    (loop
+      (if (>= (load i) GC-ROOTS) (break)
+        (do (store! (index (field p roots) (load i)) 0)
+            (store! i (+ (load i) 1)) 0))) 0))
+(defn gc-stress! [(on bool)] (-> i64) (store! (field (gc) stress) on) 0)
+(defn gc-root-new! [(addr i64)] (-> i64)
+  (let [p (gc) n (load (field p nroots))]
+    (if (>= n GC-ROOTS) (oom) 0)
+    (store! (index (field p roots) n) addr)
+    (store! (field p nroots) (+ n 1)) n))
+(defn gc-root-get [(r i64)] (-> i64) (load (index (field (gc) roots) r)))
+(defn gc-root-set! [(r i64) (addr i64)] (-> i64)
+  (store! (index (field (gc) roots) r) addr) 0)
+
+(defn gc-copy! [(addr i64) (from i64) (to i64) (to-bump (ptr i64))] (-> i64)
+  (if (= addr 0) 0
+    (if (!= (gc-space-of addr) from) addr
+      (let [old (gc-index-of addr) prior (gc-arr-get from 4 old)]
+        (if (>= prior 0) prior
+          (let [dst (load to-bump) age (+ (gc-arr-get from 0 old) 1)
+                gen (if (>= age 2) 1 (gc-arr-get from 1 old))
+                n (gc-arr-get from 2 old) mask (gc-arr-get from 3 old) (mut j) 0
+                fresh (gc-addr to dst)]
+            (if (>= dst GC-CAP) (oom) 0)
+            (store! to-bump (+ dst 1)) (gc-arr-set! from 4 old fresh)
+            (gc-arr-set! to 0 dst age) (gc-arr-set! to 1 dst gen)
+            (gc-arr-set! to 2 dst n) (gc-arr-set! to 3 dst mask)
+            (if (and (= gen 1) (= (gc-arr-get from 1 old) 0))
+                (store! (field (gc) promotions) (+ (load (field (gc) promotions)) 1)) 0)
+            (loop
+              (if (>= (load j) n) (break)
+                (do (gc-field-set-at! to dst (load j) (gc-field-get from old (load j)))
+                    (store! j (+ (load j) 1)) 0)))
+            fresh))))))
+
+(defn gc-collect! [] (-> i64)
+  (let [p (gc) from (load (field p space)) to (^ from 1) oldn (load (field p bump))
+        (mut to-bump) 0 (mut i) 0]
+    (store! (field p slowpaths) (+ (load (field p slowpaths)) 1))
+    (loop
+      (if (>= (load i) oldn) (break)
+        (do (gc-arr-set! from 4 (load i) -1) (store! i (+ (load i) 1)) 0)))
+    (store! i 0)
+    (loop
+      (if (>= (load i) (load (field p nroots))) (break)
+        (do (let [a (load (index (field p roots) (load i)))]
+              (store! (index (field p roots) (load i)) (gc-copy! a from to (mut to-bump))))
+            (store! i (+ (load i) 1)) 0)))
+    (store! i 0)
+    (loop
+      (if (>= (load i) (load to-bump)) (break)
+        (do (let [n (gc-arr-get to 2 (load i)) mask (gc-arr-get to 3 (load i)) (mut j) 0]
+              (loop
+                (if (>= (load j) n) (break)
+                  (do (if (= (& mask (<< 1 (load j))) 0) 0
+                        (gc-field-set-at! to (load i) (load j)
+                          (gc-copy! (gc-field-get to (load i) (load j)) from to (mut to-bump))))
+                      (store! j (+ (load j) 1)) 0))))
+            (store! i (+ (load i) 1)) 0)))
+    (store! (field p space) to) (store! (field p bump) (load to-bump))
+    (store! (field p collections) (+ (load (field p collections)) 1))
+    (if (gc-verify) 0 (oom))
+    (load to-bump)))
+
+(defn gc-alloc! [(nfields i64) (refmask i64)] (-> i64)
+  (let [p (gc)]
+    (if (or (load (field p stress)) (>= (load (field p bump)) GC-CAP)) (gc-collect!) 0)
+    (if (>= (load (field p bump)) GC-CAP) (oom) 0)
+    (let [idx (load (field p bump)) space (load (field p space)) (mut j) 0]
+      (store! (field p bump) (+ idx 1))
+      (gc-arr-set! space 0 idx 0) (gc-arr-set! space 1 idx 0)
+      (gc-arr-set! space 2 idx nfields) (gc-arr-set! space 3 idx refmask)
+      (loop
+        (if (>= (load j) nfields) (break)
+          (do (gc-field-set-at! space idx (load j) 0) (store! j (+ (load j) 1)) 0)))
+      (gc-addr space idx))))
+(defn gc-field-set! [(addr i64) (slot i64) (v i64)] (-> i64)
+  (gc-field-set-at! (gc-space-of addr) (gc-index-of addr) slot v))
+(defn gc-field [(addr i64) (slot i64)] (-> i64)
+  (gc-field-get (gc-space-of addr) (gc-index-of addr) slot))
+(defn gc-generation [(addr i64)] (-> i64)
+  (gc-arr-get (gc-space-of addr) 1 (gc-index-of addr)))
+(defn gc-collections [] (-> i64) (load (field (gc) collections)))
+(defn gc-promotions [] (-> i64) (load (field (gc) promotions)))
+(defn gc-slowpaths [] (-> i64) (load (field (gc) slowpaths)))
+
+(defn gc-verify [] (-> bool)
+  (let [p (gc) space (load (field p space)) n (load (field p bump))
+        (mut i) 0 (mut ok) true]
+    (loop
+      (if (or (>= (load i) (load (field p nroots))) (not (load ok))) (break)
+        (do (let [a (gc-root-get (load i))]
+              (if (or (= a 0) (and (= (gc-space-of a) space) (< (gc-index-of a) n))) 0
+                (store! ok false)))
+            (store! i (+ (load i) 1)) 0)))
+    (store! i 0)
+    (loop
+      (if (or (>= (load i) n) (not (load ok))) (break)
+        (do (let [nf (gc-arr-get space 2 (load i)) mask (gc-arr-get space 3 (load i)) (mut j) 0]
+              (loop
+                (if (or (>= (load j) nf) (not (load ok))) (break)
+                  (do (if (= (& mask (<< 1 (load j))) 0) 0
+                        (let [a (gc-field-get space (load i) (load j))]
+                          (if (or (= a 0) (and (= (gc-space-of a) space) (< (gc-index-of a) n))) 0
+                            (store! ok false))))
+                      (store! j (+ (load j) 1)) 0))))
+            (store! i (+ (load i) 1)) 0)))
+    (load ok)))

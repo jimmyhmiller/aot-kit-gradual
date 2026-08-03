@@ -14,6 +14,103 @@ could not see, and the reasoning is usually more valuable than the fix.
 
 ---
 
+## M9: guarded specialisation
+
+The first specialiser clones only small, straight-line pure functions under the same 32-node cost
+bound as inlining. It constructs a `TypeTest`/`If`, calls the clone with a checked argument on the
+fast arm, calls the original generic function on a cold fallback arm, then merges control and value
+with an ordinary `Region`/`Phi`. There is no deoptimisation state or hidden guard node.
+
+The polymorphic gate executes both arms with different runtime tags and preserves the input value
+on each. With a proven integer, normal peepholes remove the test, branch, fallback call, and merge.
+Generic `Fun` definitions are linker roots, so removing the last local fallback call does not
+discard the required generic entry. The clone preflight is atomic and refuses calls, recursion,
+branches, memory, or expressions beyond its cost budget.
+
+---
+
+## M8: explicit relocation contract
+
+`Safepoint` is a multi-output control node: slot zero is continued control and every later slot is
+the relocated form of a live managed reference. The interpreter preserves identity, while the IR
+and verifier force generated code to acknowledge that a moving collector may not. `Barrier` is an
+abstract memory effect and duplicate barriers on the same object/value pair collapse before
+lowering. The placement pass inserts safepoints at allocations, calls, and loop back edges.
+
+The R1 check rejects non-object/interior values in the safepoint live set. R2 rejects a
+pre-safepoint reference used by control after the relocation projection. The gate contains clean
+relocation, one adversarial graph for each finding, redundant-barrier elimination, and placement
+fixtures for all three boundary classes.
+
+---
+
+## M7: whole-world inference
+
+`g-infer!` is an explicit mode rather than a reinterpretation of the ordinary pessimistic pass. It
+resets every live node to lattice `TOP`, then uses the existing falling-only analysis worklist.
+`Parm` gathers values from every reaching call argument (including closure captures), while `Call`
+gathers return values from every function in the callee's stabilising function set. Each global
+read registers a dependency, so later changes to callees, arguments, captures, or returns requeue
+the interprocedural consumer. `g-call-graph-edges` exposes the resulting closed-world target graph.
+
+The quality gate pins exact types for direct calls, closure capture, and polymorphic unions. It
+also snapshots the pessimistic result and checks the lattice relation per node, proves a TypeScript-
+style annotation cast disappears only after inference, and reruns inference to a verified fixpoint
+over every corpus fixture. This work also found that `Call` was accidentally constant-foldable and
+GVN-able once inference made its result precise; calls are executions and closures carry identity,
+so both classifications now exclude them.
+
+---
+
+## M6: callable graphs and function-local control
+
+A `Fun` is a callable value, while its cyclic `FunStart` input is the control entry for each
+dynamic invocation. Keeping those nodes separate is necessary: the lattice cannot truthfully type
+one node as both a function value and control. `Parm` values are frame-bound by the interpreter;
+`CallEnd` sequences calls in either the top-level CFG or a function-local CFG. The evaluator walks
+that local CFG, so branches, recursion, and mutual recursion use the same merge and branch rules as
+the top level. Call depth is explicitly bounded and caller parameter bindings are restored even on
+failure.
+
+`Closure` retains the exact target type but is never constant-folded: its captured environment is
+runtime identity. The oracle stores immutable capture vectors and binds captures before explicit
+arguments. Direct functions and closures therefore share the same `Call` contract without losing
+capture state. A call through a proven singleton function-set is devirtualised by rewiring its
+callee to the matching closed-world `Fun`; closure callees are excluded because discarding their
+environment would be a miscompile. Exact graph-text round trips cover every callable node.
+
+The completed M6 gate covers direct calls, recursion, mutual recursion, higher-order calls, closure
+capture, singleton-target devirtualisation, and conservative straight-line inlining. The inliner
+preflights a pure expression tree, substitutes parameters with call arguments, and removes both the
+value and control halves of the call. It refuses branches, memory, nested calls, recursion, and
+closures; the differential test keeps a closure call beside the inlined direct call and proves only
+the eligible pair disappears while the observable result remains unchanged.
+
+---
+
+## M5: dynamic values end to end
+
+`Box`, `Unbox`, and `TypeTest` are real value nodes, not backend annotations. `Box` publishes
+`dyn`; `Unbox` publishes its required type and reports `EV-UNBOX` when the runtime tag disagrees;
+`TypeTest` returns a boolean and folds only through the ordinary proven-type gate. The exact graph
+format, verifier, interpreter, expression printer, and Graphviz renderer all carry the nodes.
+
+The gate has both shapes the milestone asks for. Two statically inferred integer arguments produce
+one unboxed `Add` and no box, unbox, type test, or branch. Two `dyn` arguments produce a pair of
+`TypeTest`s, an integer fast arm with two `Unbox` nodes, and the original generic `Add` as fallback;
+the interpreter runs the fast answer and the fallback's honest typed failure. An adjacent
+`Unbox<T>(Box(x))` cancels only when `x` is proven to satisfy `T`.
+
+The generated dynamic word uses direct IEEE doubles and positive quiet-NaN prefixes for tags.
+Undefined, null, boolean, signed 48-bit integer, object, string, symbol, immediate bigint, and
+function-reference values round-trip through the codec. Integers wider than the immediate payload
+become direct doubles, preserving the JavaScript number. Floating NaNs canonicalise to
+`0x7ff8000000000000`: retaining every NaN payload while adding non-double values to the same
+64-bit set is impossible, so D3 now states that policy explicitly while the IR oracle remains
+bit-exact before boxing.
+
+---
+
 ## M3, slice by slice
 
 **Slice 1, the verifier: DONE** (`src/verify.coil`, `src/corpus.coil`, 19 tests). One named code
@@ -861,3 +958,64 @@ which would delete the project's own argument for having an oracle at all
 (`running_it_catches_the_memory_contracts_the_verifier_cannot`). What is closed is the laundering,
 which is the part that made one program give two answers. Whether M5 wants the static forms as well
 is in ROADMAP.md's open list, with the `dyn` pointer question that has to be settled first.
+## M10 slice: native differential execution found the allocator bugs
+
+The first backend slice now has a compact machine IR, dependency/list scheduling, live intervals,
+greedy interference colouring, arm64 word encoders, executable-memory tests, and a minimal Mach-O
+object with `LC_BUILD_VERSION`. `tools/native-gate.sh` compiles, inspects, links, and executes the
+chosen `(20 + 22) * 2` kernel without linker warnings. Branches use patched `CBZ` labels; acyclic
+two-arm Phis use `CMP`/`CSEL`, including raw graphs whose Region arm order is reversed.
+
+Selection coverage alone was not a sufficient gate. A native-vs-interpreter corpus test now binds
+the same arguments as the differential interpreter, JITs the selected graph, and compares the
+integer/boolean result. It eventually covered all 24 scalar fixtures and found two real allocator defects
+in `05-big-before`. First, a range coloured before a later ABI-precoloured `Arg` could take the same
+register because interference was scanned only backward. Second, an argument was considered live
+from its late selection point, although the incoming ABI register must survive from function entry.
+Colouring now considers all assigned/precoloured ranges and schedules every `Arg` live from entry.
+Both faults had passed instruction-word, handcrafted JIT, and selection-count tests; only executing
+the real corpus made them observable.
+
+The completed gate selects and allocates all 28 fixtures. Twenty-seven terminate and match natively:
+24 scalar outcomes plus three returned-object heaps compared field-for-field against the interpreter;
+the remaining nested-loop fixture is intentionally infinite and compiles to finite labelled machine
+CFG. Loop work exposed two more backend-only failures: pinned `New` nodes are not CFG successors,
+and linear live intervals must extend invariant ranges through a back edge. Stack-slot splitting is
+also executable, not bookkeeping: forcing the reviewed kernel down to one allocatable register
+produces spill loads/stores and still returns 84.
+## M11: the stress test caught the stale root in the test
+
+The runtime collector is a bounded bump allocator over two moving semispaces. A collection copies
+explicit roots, Cheney-scans pointer fields, rewrites every reference, increments survivor ages and
+promotes after the second survival. The heap verifier runs inside every collection, not merely at
+the end of a test. Backend allocation instructions expose stack-map PCs and the count of live
+ranges at each site.
+
+Collect-on-every-allocation immediately made the first linked-list test wrong: it read the old root,
+allocated (and therefore collected), then stored the stale address into the new node. Reloading the
+root after the safepoint is the exact R2 discipline M8 specifies. With that corrected, forty forced
+collections preserve the chain, and a corpus-wide allocation sweep verifies the heap after every
+allocation.
+## M12: annotations are graph facts, not parser trivia
+
+The TypeScript slice uses a real tokenizer and recursive-descent parser for the published subset.
+Its lowering vocabulary is deliberately the existing core vocabulary (`Parm`, boundary `Cast`,
+`TypeTest`, `Unbox`, arithmetic, `New`, `Load`, `Return`) so guard counts are properties of the
+lowered graph. Structural object annotations accept extra fields, union members remain explicit,
+and type parameters erase to `dynamic`.
+
+The paired gate compiles the same `a + b` twice. Unannotated parameters produce two type tests and
+the generic fallback; `number` annotations produce boundary casts and a direct `Add`, reducing the
+guard count from two to zero. Seven checked-in programs execute against expected values through the
+front-end runtime, and the CLI prints both result and lowered graph for inspection.
+## M13: the table includes the losses
+
+The benchmark runner retains nine raw samples on both axes and computes medians and kit/V8 ratios.
+It measures an externally linked arm64 `(a+b)*2` call loop, front-end compilation against V8 parsing
+the equivalent JavaScript, and structural property loads through the lowered runtime. The first
+published run wins the narrow native kernel and loses badly on both front-end/runtime JavaScript
+paths; the report labels those outcomes rather than selecting only the favorable row.
+
+The same run emits `bench-profile.json`: dynamic-add observed 900 number calls and 100 string calls,
+with clone cost 7. `n-profile-specialize?` consumes those three axes and is gated at 32 samples,
+80% dominance, and cost 32; each rejection boundary has a negative test.

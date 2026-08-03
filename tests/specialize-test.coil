@@ -1,0 +1,65 @@
+;; M9: clone + guard + retained generic fallback.
+(module specializetest)
+
+(import "ty" :use *)
+(import "node" :use *)
+(import "verify" :use *)
+(import "eval" :use *)
+(import "coil.assert" :use *)
+(import "coil.control" :use *)
+
+(const SBUDGET i64 100000)
+
+(defn s-count [(op i64)] (-> i64)
+  (let [lim (n-count) (mut i) 0 (mut count) 0]
+    (loop
+      (if (>= (load i) lim) (break)
+        (do (if (and (not (n-dead? (load i))) (= (n-op (load i)) op))
+                (store! count (+ (load count) 1)) 0)
+            (store! i (+ (load i) 1)) 0)))
+    (load count)))
+
+(defn identity-fun [(fidx i64)] (-> i64)
+  (let [fun (n-fun-open! fidx) x (n-parm! fun 0)]
+    (n-fun-close! fun (n-new2 OP-RETURN 0 (n-fun-entry fun) x)) fun))
+
+(deftest polymorphic_specialization_keeps_fast_and_generic_paths_reachable
+  (graph-reset! 1)
+  (let [generic (identity-fun 0) arg (n-new1 OP-ARG (t-dyn) (g-start))
+        site (n-specialize-call1! (g-start) generic arg (t-int) 1)
+        ret (n-new2 OP-RETURN 0 (spec-end site) (spec-value site))]
+    (n-add-def! (g-stop) ret) (iterate!)
+    (assert (= (g-verify) 0))
+    (assert (= (s-count OP-FUN) 2))
+    (assert (= (s-count OP-CALL) 2))
+    (assert (= (s-count OP-TYPETEST) 1))
+    (assert (= (s-count OP-IF) 1))
+    (assert (n-cold? (n-in (spec-fallback site) 0)))
+    ; Fast integer arm.
+    (ev-reset!) (ev-bind! arg (RInt 7))
+    (assert (= (ev-run-nobind SBUDGET) EV-OK))
+    (assert (rt-eq? (ev-result) (RInt 7)))
+    ; Generic fallback arm.
+    (ev-reset!) (ev-bind! arg (RBool true))
+    (assert (= (ev-run-nobind SBUDGET) EV-OK))
+    (assert (rt-eq? (ev-result) (RBool true)))))
+
+(deftest a_proved_argument_folds_the_specialization_guard_away
+  (graph-reset! 2)
+  (let [generic (identity-fun 0) arg (n-const (t-int-con 9))
+        site (n-specialize-call1! (g-start) generic arg (t-int) 1)
+        ret (n-new2 OP-RETURN 0 (spec-end site) (spec-value site))]
+    (n-add-def! (g-stop) ret) (iterate!)
+    (assert (= (g-verify) 0))
+    (assert (= (s-count OP-TYPETEST) 0))
+    (assert (= (s-count OP-IF) 0))
+    (assert (= (s-count OP-CALL) 1))
+    (assert (= (ev-run SBUDGET) EV-OK))
+    (assert (rt-eq? (ev-result) (RInt 9)))))
+
+(deftest measured_profiles_drive_the_specialization_cost_model
+  ; bench-profile.json's dynamic-add site: 1,000 samples, 900 dominant, clone cost 7.
+  (assert (n-profile-specialize? 1000 900 7))
+  (assert (not (n-profile-specialize? 31 31 7)))
+  (assert (not (n-profile-specialize? 1000 799 7)))
+  (assert (not (n-profile-specialize? 1000 900 33))))

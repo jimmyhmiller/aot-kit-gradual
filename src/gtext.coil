@@ -94,16 +94,16 @@
 ;; surfaces three passes later with nothing to say about where it came from.
 (module gtext)
 
-(import "alloc.coil"     :use *)
-(import "arraylist.coil" :use *)
-(import "control.coil"   :use *)
-(import "io.coil"        :use *)
-(import "fmt.coil"       :use *)
-(import "slice.coil"     :use *)
-(import "ty.coil"        :use *)
-(import "shape.coil"     :use *)   ; a parsed shape id or alias number is checked against it
-(import "node.coil"      :use *)
-(import "text.coil"      :use *)
+(import "coil.alloc"     :use *)
+(import "coil.arraylist" :use *)
+(import "coil.control"   :use *)
+(import "coil.io"        :use *)
+(import "coil.fmt"       :use *)
+(import "coil.slice"     :use *)
+(import "ty"        :use *)
+(import "shape"     :use *)   ; a parsed shape id or alias number is checked against it
+(import "node"      :use *)
+(import "text"      :use *)
 
 ; ============================================================================
 ; The grammar
@@ -112,7 +112,8 @@
 ;;   line   := "n" udec ": " op aux " <-" inputs " : " type "\n"
 ;;   op     := "Start" | "Stop" | "Return" | "If" | "Region" | "Loop" | "CProj" | "XCtrl"
 ;;           | "Const" | "Arg" | "Proj" | "Phi" | "Cast" | "Add" | "Sub" | "Mul" | "Div"
-;;           | "Minus" | "Not" | "Eq" | "Lt" | "Le"
+;;           | "Minus" | "Not" | "Eq" | "Lt" | "Le" | "Box" | "Unbox" | "TypeTest"
+;;           | "CallEnd" | "Fun" | "Parm" | "Call"
 ;;   aux    := ""              ; AUXK-NONE
 ;;           | "." udec        ; AUXK-SLOT: a projection's slot
 ;;           | " " type        ; AUXK-TYPE: Const's value, Arg's and Cast's target, Phi's declared
@@ -201,6 +202,17 @@
     OP-PROJ   AUXK-SLOT
     OP-PHI    AUXK-TYPE     ; the DECLARED type, which `phi-compute` joins its live paths with
     OP-CAST   AUXK-TYPE     ; the target of the upcast; deleting it deletes D4's guard
+    OP-BOX    AUXK-NONE
+    OP-UNBOX  AUXK-TYPE
+    OP-TYPETEST AUXK-TYPE
+    OP-CALLEND AUXK-NONE
+    OP-FUN     AUXK-SLOT
+    OP-PARM    AUXK-SLOT
+    OP-CALL    AUXK-NONE
+    OP-FUNSTART AUXK-NONE
+    OP-CLOSURE AUXK-NONE
+    OP-SAFEPOINT AUXK-NONE
+    OP-BARRIER AUXK-NONE
     OP-ADD    AUXK-NONE
     OP-SUB    AUXK-NONE
     OP-MUL    AUXK-NONE
@@ -331,7 +343,7 @@
    (inited  bool)])
 
 (defn gtext [] (-> (ptr GText))
-  (let [p (alloc-static GText)]
+  (let [p (static GText)]
     (if (load (field p inited)) 0
       (do (store! (field p inited) true)
           (store! (field p ids)    (al-new [i64] (malloc-allocator)))
@@ -574,8 +586,8 @@
 ;; truncated text compares EQUAL to another truncated text: the identity clause would then pass
 ;; on nothing at all. tests/text-test.coil already paid for that lesson once.
 (defn g-render [(buf (ptr i8)) (cap i64)] (-> (slice u8))
-  (let [fb (alloc-stack FixBuf)
-        w  (alloc-stack Writer)]
+  (let [fb (stack FixBuf)
+        w  (stack Writer)]
     (store! (field fb data) buf)
     (store! (field fb cap)  cap)
     (store! (field fb len)  0)
@@ -720,7 +732,7 @@
   (let [p    (gtext)
         data (slice-data s)
         len  (slice-len s)
-        c    (alloc-stack GCur)      ; hoisted: an alloca inside the line loop leaks the C stack
+        c    (stack GCur)      ; hoisted: an alloca inside the line loop leaks the C stack
         (mut off) 0
         (mut k)   0]
     (loop
@@ -764,7 +776,7 @@
 
 (defn gpass2! [(s (slice u8))] (-> i64)
   (let [p (gtext)
-        c (alloc-stack GCur)
+        c (stack GCur)
         n (load (field p lines))
         (mut k) 0]
     (loop
@@ -875,7 +887,7 @@
 ;; stack is a frame no test should need.
 (const GTEXT-SCRATCH i64 65536)
 (defstruct GTextScratch [(a (array i8 65536)) (b (array i8 65536))])
-(defn gtext-scratch [] (-> (ptr GTextScratch)) (alloc-static GTextScratch))
+(defn gtext-scratch [] (-> (ptr GTextScratch)) (static GTextScratch))
 
 ;; WHY THE ROUND TRIP REPORTS A CAUSE AND NOT A BOOL, the same three-cause design
 ;; `ty-round-trip-check` uses: the three bugs live in three different files, and a bare `false`

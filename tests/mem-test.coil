@@ -97,20 +97,20 @@
 ;;   coil test tests/mem-test.coil
 (module memtest)
 
-(import "../src/ty.coil"     :use *)
-(import "../src/shape.coil"  :use *)
-(import "../src/node.coil"   :use *)
-(import "../src/verify.coil" :use *)
-(import "../src/eval.coil"   :use *)
-(import "../src/gtext.coil"  :use *)
-(import "../src/corpus.coil" :use *)
-(import "assert.coil"    :use *)
-(import "control.coil"   :use *)
-(import "io.coil"        :use *)
-(import "fmt.coil"       :use *)
-(import "alloc.coil"     :use *)
-(import "arraylist.coil" :use *)
-(import "slice.coil"     :use *)
+(import "ty"     :use *)
+(import "shape"  :use *)
+(import "node"   :use *)
+(import "verify" :use *)
+(import "eval"   :use *)
+(import "gtext"  :use *)
+(import "corpus" :use *)
+(import "coil.assert"    :use *)
+(import "coil.control"   :use *)
+(import "coil.io"        :use *)
+(import "coil.fmt"       :use *)
+(import "coil.alloc"     :use *)
+(import "coil.arraylist" :use *)
+(import "coil.slice"     :use *)
 
 ; ---------------------------------------------------------------------------
 ; Pins. A number here fails loudly when the thing it measures shrinks.
@@ -473,7 +473,7 @@
 ;; also the argument that 4c-1 could not have been done in the lattice: on a graph where nothing
 ;; is rewritten, the best available type is still the union, for ever.
 (deftest a_load_reports_its_whole_alias_class_and_not_the_pointer
-  (let [w (stdout) ba (alloc-stack (array u8 256))]
+  (let [w (stdout) ba (stack (array u8 256))]
     (corpus-build! CX-OBJECT-RAW)
     (let [ld (find-op OP-LOAD)
           st (find-op OP-STORE)]
@@ -579,32 +579,14 @@
     (ps w "\n--- a = {x}; a.x = 1; b = {x}; b.x = 2; return a.x ---\n")
     (g-print-flat w)
     (assert (= (g-verify) 0))
-    (assert (= (count-op OP-NEW) 2))
-    (assert (= (count-op OP-STORE) 2))
-    ; ONE alias class between the two stores, and ONE shape between the two allocations: there is
-    ; nothing here for a class-based or a shape-based rule to separate.
-    (assert (= (popcount64 (aux-bits OP-STORE)) 1))
-    (assert (= (popcount64 (aux-bits OP-NEW)) 1))
-
-    ; THE LOAD SURVIVES THE WHOLE OF iterate!
-    (assert (= (count-op OP-LOAD) 1))
-    (assert (= (count-dead-op OP-LOAD) 0))
-    (let [ld (find-op OP-LOAD)]
-      (let [st (n-in ld 1)]
-        ; its memory input IS a Store of the SAME class, so every non-pointer half of the rule
-        ; holds and the refusal can only have come from the pointer comparison
-        (assert (= (n-op st) OP-STORE))
-        (assert (not (n-dead? st)))
-        (assert (= (n-aux st) (n-aux ld)))
-        (assert (!= (n-in st 2) (n-in ld 2)))
-        ; and the two pointers are indistinguishable BY TYPE
-        (assert (= (n-ty (n-in st 2)) (n-ty (n-in ld 2))))
-        (assert (not (forwardable? ld)))
-        (fmt w "  the load reads n{d} and the store writes n{d}: same class {d}, same type\n"
-             (n-in ld 2) (n-in st 2) (n-aux ld))
-        (ps w "  both pointers are ") (ty-print w (n-ty (n-in ld 2))) (ps w "\n"))
-      ; nor did it fold: the load's own type is still the class union
-      (assert (not (ty-const? (n-ty ld)))))
+    ; The write to b is itself dead in 4c-3, after which the load can see a's store directly.
+    ; This composition is still a pointer-identity gate: forwarding through b before removing it
+    ; returns 2, while removing b first and forwarding from a returns 1.
+    (assert (= (count-op OP-NEW) 1))
+    (assert (= (count-op OP-STORE) 1))
+    (assert (= (count-op OP-LOAD) 0))
+    (expect-counter "23-object-two" "g-dead-allocations" (g-dead-allocations) 1)
+    (expect-counter "23-object-two" "g-forwards" (g-forwards) 1)
 
     ; AND THE ANSWER IS a.x, WHICH IS 1
     (assert (= (ev-run-bound 1 BUDGET) EV-OK))
@@ -915,8 +897,8 @@
 ;; seed 1 with seed 1.
 (deftest a_refused_forwarding_is_deferred_and_lands_under_every_seed
   (let [w (stdout)
-        ba (alloc-stack (array u8 4096))
-        bb (alloc-stack (array u8 4096))
+        ba (stack (array u8 4096))
+        bb (stack (array u8 4096))
         (mut checked) 0 (mut refused) 0]
     (ps w "\n--- deferred forwarding: unrewritten, then iterate!, under every seed ---\n")
     (build-object-eager! 1)
@@ -1105,6 +1087,9 @@
       (let [ax (shape-field-alias sx 0)]
         (let [na (n-new-obj1! (g-start) sx (mk-mem-in ax))]
           (let [oa (n-obj-ptr na)]
+            ; Keep the deliberately unobserved first allocation in place while this test measures
+            ; GVN on the two Loads; 4c-3 is independently gated below.
+            (n-keep! oa)
             (let [ma (n-store! (n-obj-mem na 0) oa (mk-int 3) ax)]
               (let [nb (n-new-obj1! (g-start) sx ma)]
                 (let [ob (n-obj-ptr nb)
@@ -1120,6 +1105,7 @@
                     (assert (not (ty-const? (n-ty l1))))
                     (ret-to-mem (g-start) l1 mb)
                     (iterate!)
+                    (n-unkeep! oa)
                     (g-print-flat w)
                     (assert (= (count-op OP-LOAD) 1))
                     (assert (= (g-verify) 0))
@@ -1195,7 +1181,7 @@
     ;; read out of the state the MemMerge produced, and the two seeds below take different arms.
     ;; With either phi's arms swapped the word comes back as `?` -- the merged state does not
     ;; describe that write -- and this clause is red.
-    (let [ba (alloc-stack (array u8 4096))]
+    (let [ba (stack (array u8 4096))]
       ; seed 1 is truthy: the true arm allocated {x} and stored 1
       (assert (= (ev-run-bound 1 BUDGET) EV-OK))
       (let [o1 (ev-outcome (cast (ptr i8) ba) 4096)]
@@ -1608,8 +1594,8 @@
 ;; otherwise is the point: an assertion that cannot fail is worse than no assertion.
 (deftest every_seed_builds_the_same_memory_graph
   (let [w (stdout)
-        ba (alloc-stack (array u8 4096))
-        bb (alloc-stack (array u8 4096))
+        ba (stack (array u8 4096))
+        bb (stack (array u8 4096))
         (mut checked) 0]
     (ps w "\n--- the memory fixtures, rebuilt from a dirty arena ---\n")
     (let [(mut f) 0]
@@ -1814,7 +1800,7 @@
 ;; entirely would round-trip perfectly while meaning something else, so the reparse is asserted to
 ;; still contain the memory ops with the same aux.
 (deftest a_memory_graph_survives_print_and_reparse
-  (let [w (stdout) ba (alloc-stack (array u8 4096)) bb (alloc-stack (array u8 4096))
+  (let [w (stdout) ba (stack (array u8 4096)) bb (stack (array u8 4096))
         (mut checked) 0 (mut loads-seen) 0]
     (ps w "\n--- print, parse, print ---\n")
     (let [(mut f) 0]
@@ -1872,8 +1858,8 @@
 ;; A's answer outlives the `ev-reset!` run B needs. Returns how many bindings it compared, and the
 ;; caller asserts that number: a loop that ran zero times agrees about everything.
 (defn mdiff-pair [(raw i64) (opt i64) (label (slice u8))] (-> i64)
-  (let [ba (alloc-stack (array u8 8192))
-        bb (alloc-stack (array u8 8192))
+  (let [ba (stack (array u8 8192))
+        bb (stack (array u8 8192))
         (mut seed) 1
         (mut checked) 0]
     (loop
@@ -2314,8 +2300,8 @@
 ;; outcomes: what the proof gate reads is the only thing that changed.
 (deftest a_refused_store_elimination_is_deferred_and_lands_under_every_seed
   (let [w (stdout)
-        ba (alloc-stack (array u8 4096))
-        bb (alloc-stack (array u8 4096))
+        ba (stack (array u8 4096))
+        bb (stack (array u8 4096))
         (mut checked) 0 (mut refused) 0]
     (ps w "\n--- deferred store elimination: unanalysed, then iterate!, under every seed ---\n")
     ; THE PLACE EVERY SEED HAS TO REACH, built once at seed 1 and rendered into a buffer nothing
@@ -2403,3 +2389,22 @@
       (assert (= (ev-run-bound 1 BUDGET) EV-OK))
       (assert (rt-eq? (ev-result) (RInt 2)))
       (ps w "  and the analysed twin fires at the first peephole, which is the attribution\n"))))
+
+;; 4c-3: the scratch object has no observable reader. Its Store first becomes the incoming memory
+;; of the returned object's New; removing that write makes the pointer projection dead, after which
+;; the allocation's memory projection is the incoming state and the New itself is collected.
+(deftest a_dead_scratch_allocation_is_removed
+  (let [w (stdout)]
+    (corpus-build! CX-OBJECT-RET-SCRATCH)
+    (ps w "\n--- dead scratch allocation removed ---\n")
+    (g-print-flat w)
+    (assert (= (g-verify) 0))
+    (assert (= (g-leaked-count) 0))
+    (expect-counter "25-object-returned-scratch" "g-dead-allocations"
+                    (g-dead-allocations) 1)
+    ; only the object that is returned remains, along with its observable write
+    (assert (= (count-op OP-NEW) 1))
+    (assert (= (count-op OP-STORE) 1))
+    (assert (= (ev-run-bound 1 BUDGET) EV-OK))
+    (assert (= (mdiff-pair CX-OBJECT-RET-SCRATCH CX-OBJECT-RET
+                           "dead scratch allocation") DIFF-SEEDS))))

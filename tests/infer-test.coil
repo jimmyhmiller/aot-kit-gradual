@@ -1,0 +1,130 @@
+;; M7: closed-world interprocedural inference.
+(module infertest)
+
+(import "ty" :use *)
+(import "node" :use *)
+(import "verify" :use *)
+(import "corpus" :use *)
+(import "coil.assert" :use *)
+(import "coil.control" :use *)
+
+(defn i-int [(v i64)] (-> i64) (n-const (t-int-con v)))
+(defn i-bin [(op i64) (a i64) (b i64)] (-> i64)
+  (n-peephole (n-new3 op 0 NO-NODE a b)))
+
+(defn live-op-count [(op i64)] (-> i64)
+  (let [lim (n-count) (mut i) 0 (mut count) 0]
+    (loop
+      (if (>= (load i) lim) (break)
+        (do (if (and (not (n-dead? (load i))) (= (n-op (load i)) op))
+                (store! count (+ (load count) 1)) 0)
+            (store! i (+ (load i) 1)) 0)))
+    (load count)))
+
+(defn expect-inferred [(n i64) (want i64)] (-> i64)
+  (assert (= (n-ty n) want)) 0)
+
+(deftest direct_call_inference_is_more_precise_than_the_pessimistic_pass
+  (graph-reset! 1)
+  (let [fun (n-fun-open! 0) a (n-parm! fun 0) b (n-parm! fun 1)
+        sum (i-bin OP-ADD a b)
+        body (n-new2 OP-RETURN 0 (n-fun-entry fun) sum)]
+    (n-fun-close! fun body)
+    (let [site (n-call2! (g-start) fun (i-int 20) (i-int 22))
+          call (call-value site)
+          ret (n-new2 OP-RETURN 0 (call-end site) call)]
+      (n-add-def! (g-stop) ret)
+      (g-analyze!)
+      (let [pa (n-ty a) pb (n-ty b) pc (n-ty call)]
+        (assert (= pa (t-dyn))) (assert (= pb (t-dyn))) (assert (= pc (t-dyn)))
+        (assert (> (g-infer!) 0))
+        (assert (g-inference-mode?))
+        (expect-inferred a (t-int-con 20))
+        (expect-inferred b (t-int-con 22))
+        (expect-inferred sum (t-int-con 42))
+        (expect-inferred call (t-int-con 42))
+        ; Pessimistic types are reachable by falling from the optimistic answers, never vice versa.
+        (assert (ty-falls? (n-ty a) pa))
+        (assert (ty-falls? (n-ty b) pb))
+        (assert (ty-falls? (n-ty call) pc))
+        (assert (= (g-call-graph-edges) 1))
+        (assert (> (g-analyze-checks) 0))
+        (assert (= (g-verify) 0))))))
+
+(deftest closure_captures_and_arguments_have_explicit_expected_types
+  (graph-reset! 2)
+  (let [fun (n-fun-open! 0) cap (n-parm! fun 0) arg (n-parm! fun 1)
+        sum (i-bin OP-ADD cap arg)
+        body (n-new2 OP-RETURN 0 (n-fun-entry fun) sum)]
+    (n-fun-close! fun body)
+    (let [clos (n-closure1! fun (i-int 40))
+          site (n-call1! (g-start) clos (i-int 2))
+          call (call-value site)
+          ret (n-new2 OP-RETURN 0 (call-end site) call)]
+      (n-add-def! (g-stop) ret)
+      (g-infer!)
+      (expect-inferred cap (t-int-con 40))
+      (expect-inferred arg (t-int-con 2))
+      (expect-inferred sum (t-int-con 42))
+      (expect-inferred call (t-int-con 42))
+      (assert (= (g-call-graph-edges) 1))
+      (assert (= (g-verify) 0)))))
+
+(deftest polymorphic_reaching_arguments_form_the_expected_union
+  (graph-reset! 3)
+  (let [fun (n-fun-open! 0) x (n-parm! fun 0)
+        body (n-new2 OP-RETURN 0 (n-fun-entry fun) x)]
+    (n-fun-close! fun body)
+    (let [one (n-call1! (g-start) fun (i-int 1))
+          two (n-call1! (call-end one) fun (n-const (t-bool-con true)))
+          ret (n-new2 OP-RETURN 0 (call-end two) (call-value two))
+          want (ty-meet (t-int-con 1) (t-bool-con true))]
+      (n-add-def! (g-stop) ret)
+      (g-infer!)
+      (expect-inferred x want)
+      (expect-inferred (call-value one) want)
+      (expect-inferred (call-value two) want)
+      (assert (= (g-call-graph-edges) 2))
+      (assert (= (g-verify) 0)))))
+
+(deftest a_proved_annotation_cast_disappears_after_whole_world_inference
+  (graph-reset! 4)
+  (let [fun (n-fun-open! 0) x (n-parm! fun 0)
+        annotation (n-peephole (n-new2 OP-CAST (t-int) NO-NODE x))
+        body (n-new2 OP-RETURN 0 (n-fun-entry fun) annotation)]
+    (n-fun-close! fun body)
+    (let [site (n-call1! (g-start) fun (i-int 7))
+          ret (n-new2 OP-RETURN 0 (call-end site) (call-value site))]
+      (n-add-def! (g-stop) ret)
+      (g-infer!)
+      (assert (= (live-op-count OP-CAST) 1))
+      (assert (n-ty-proven? x))
+      (assert (ty-isa (n-ty x) (t-int)))
+      (iterate!)
+      (assert (= (live-op-count OP-CAST) 0))
+      (assert (= (g-verify) 0)))))
+
+(deftest optimistic_inference_reaches_a_bounded_fixpoint_on_the_whole_corpus
+  (let [saved (stack (array i64 1024)) p (cast (ptr i64) saved)
+        total (corpus-count) (mut fixture) 0 (mut compared) 0]
+    (loop
+      (if (>= (load fixture) total) (break)
+        (do (corpus-build! (load fixture))
+            (let [lim (n-count) (mut i) 0]
+              (assert (< lim 1024))
+              (loop
+                (if (>= (load i) lim) (break)
+                  (do (store! (index p (load i)) (n-ty (load i)))
+                      (store! i (+ (load i) 1)) 0)))
+              (assert (< (g-infer!) 10000000))
+              (store! i 0)
+              (loop
+                (if (>= (load i) lim) (break)
+                  (do (if (n-dead? (load i)) 0
+                        (do (assert (ty-falls? (n-ty (load i)) (load (index p (load i)))))
+                            (store! compared (+ (load compared) 1)) 0))
+                      (store! i (+ (load i) 1)) 0)))
+              (assert (= (g-verify) 0)))
+            (store! fixture (+ (load fixture) 1)) 0)))
+    (assert (= (load fixture) total))
+    (assert (> (load compared) 300))))

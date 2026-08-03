@@ -72,6 +72,13 @@ everything else lives in the NaN payload space. The IR keeps **unboxed** `int`, 
 `ref` as distinct types, and `Box`/`Unbox` are ordinary nodes that the optimiser cancels in
 pairs.
 
+**NaN policy.** All floating NaNs canonicalise to the positive quiet-NaN word
+`0x7ff8000000000000` when boxed. The adjacent positive quiet-NaN prefixes carry the non-double
+tags. This loss of NaN payload is necessary: the full set of 64-bit double patterns already uses
+all 64-bit words, so preserving every NaN payload while adding more values to the same word is
+impossible. The IR interpreter remains bit-exact before boxing, which keeps the optimiser oracle
+strict; the generated dynamic ABI promises canonical NaN.
+
 **Why.** JavaScript and TypeScript numbers are doubles. Any representation that heap-boxes a
 non-small double loses numeric code outright, which is where the V8 comparison is won or
 lost.

@@ -18,13 +18,13 @@
 ;; widening counter; after a few widenings it falls straight to the axis bottom.
 (module ty)
 
-(import "alloc.coil"     :use *)
-(import "arraylist.coil" :use *)
-(import "hashmap.coil"   :use *)
-(import "control.coil"   :use *)
-(import "io.coil"        :use *)
-(import "fmt.coil"       :use *)
-(import "slice.coil"     :use *)
+(import "coil.alloc"     :use *)
+(import "coil.arraylist" :use *)
+(import "coil.hashmap"   :use *)
+(import "coil.control"   :use *)
+(import "coil.io"        :use *)
+(import "coil.fmt"       :use *)
+(import "coil.slice"     :use *)
 
 ; ============================================================================
 ; Ids
@@ -349,7 +349,7 @@
 ;; The one global. Coil has no top-level mutable binding; `alloc-static` in a zero-arg
 ;; accessor returns the same cell every call, which is the idiom for a singleton.
 (defn types [] (-> (ptr Types))
-  (let [p (alloc-static Types)]
+  (let [p (static Types)]
     (if (load (field p inited)) 0
       (do (store! (field p inited) true)   ; set FIRST: seeding re-enters through `types`
           (store! (field p tab)    (al-new [Ty] (malloc-allocator)))
@@ -540,7 +540,7 @@
 (defn ty-keyeq [(ka (ptr i8)) (kb (ptr i8)) (n i64)] (-> bool)
   (ty-eq (load (cast (ptr Ty) ka)) (load (cast (ptr Ty) kb))))
 (defn ty-keyops [] (-> (ptr KeyOps))
-  (let [o (alloc-static KeyOps)]
+  (let [o (static KeyOps)]
     (store! (field o hash) (fnptr-of ty-keyhash))
     (store! (field o eq)   (fnptr-of ty-keyeq))
     (store! (field o size) (sizeof Ty))
@@ -808,6 +808,27 @@
   (ty-intern (TVal (val-make VK-FUN TY-IMIN TY-IMAX TY-WIDEN-MAX FSZ-LOW 0 fidxs -1))))
 (defn t-fun-con [(fidx i64)] (-> i64) (t-fun-set (<< 1 fidx)))
 
+;; The concrete target of an exact singleton function-set, or -1 when the type is not one.
+(defn ty-fun-singleton [(t i64)] (-> i64)
+  (match (ty-get t)
+    (TVal [v]
+      (let [bits (val-fidxs v)]
+        (if (or (!= (val-kinds v) VK-FUN) (!= (popcount64 bits) 1)) -1
+          (let [(mut i) 0]
+            (loop
+              (if (!= (& bits (<< 1 (load i))) 0) (break)
+                (store! i (+ (load i) 1))))
+            (load i)))))
+    (TBot [] -1) (TTop [] -1) (TCtrl [] -1) (TXCtrl [] -1)
+    (TTuple [o l] -1) (TMem [a c] -1)))
+
+;; Exact closed-world target bitset, or zero when the type is not exclusively callable.
+(defn ty-fun-targets [(t i64)] (-> i64)
+  (match (ty-get t)
+    (TVal [v] (if (= (val-kinds v) VK-FUN) (val-fidxs v) 0))
+    (TBot [] 0) (TTop [] 0) (TCtrl [] 0) (TXCtrl [] 0)
+    (TTuple [o l] 0) (TMem [a c] 0)))
+
 (defn t-obj-shapes [(shapes i64)] (-> i64)
   (ty-intern (TVal (val-make VK-OBJ TY-IMIN TY-IMAX TY-WIDEN-MAX FSZ-LOW 0 -1 shapes))))
 
@@ -1051,9 +1072,9 @@
 ;; A numeric `cast` between f64 and i64 converts the VALUE; a bit pattern needs a round
 ;; trip through memory, which LLVM folds to a register move.
 (defn f64-bits [(x f64)] (-> i64)
-  (let [p (alloc-stack f64)] (store! p x) (load (cast (ptr i64) p))))
+  (let [p (stack f64)] (store! p x) (load (cast (ptr i64) p))))
 (defn bits-f64 [(b i64)] (-> f64)
-  (let [p (alloc-stack i64)] (store! p b) (load (cast (ptr f64) p))))
+  (let [p (stack i64)] (store! p b) (load (cast (ptr f64) p))))
 
 ; ============================================================================
 ; Printing
@@ -1072,7 +1093,7 @@
 ;; divided with the UNSIGNED ops, which is exactly the right answer for every other magnitude
 ;; too.
 (defn dec-print [(w (ptr Writer)) (n i64)] (-> i64)
-  (let [buf (alloc-stack (array u8 24))
+  (let [buf (stack (array u8 24))
         neg (< n 0)
         (mut k) 24
         (mut m) (if neg (- 0 n) n)]

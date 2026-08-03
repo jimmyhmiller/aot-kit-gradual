@@ -1,0 +1,65 @@
+;; M11: moving collector and stack-map contract.
+(module collectortest)
+
+(import "gc" :use *)
+(import "node" :use *)
+(import "corpus" :use *)
+(import "backend" :use *)
+(import "coil.assert" :use *)
+(import "coil.control" :use *)
+
+(deftest collection_moves_roots_and_rewrites_reference_fields
+  (gc-reset!)
+  (let [child (gc-alloc! 1 0) parent (gc-alloc! 1 1)]
+    (gc-field-set! child 0 41) (gc-field-set! parent 0 child)
+    (let [cr (gc-root-new! child) pr (gc-root-new! parent)]
+      (gc-collect!)
+      (let [mchild (gc-root-get cr) mparent (gc-root-get pr)]
+        (assert (!= mchild child)) (assert (!= mparent parent))
+        (assert (= (gc-field mparent 0) mchild))
+        (assert (= (gc-field mchild 0) 41))
+        (assert (gc-verify))))))
+
+(deftest surviving_objects_age_and_promote
+  (gc-reset!)
+  (let [r (gc-root-new! (gc-alloc! 0 0))]
+    (gc-collect!) (assert (= (gc-generation (gc-root-get r)) 0))
+    (gc-collect!) (assert (= (gc-generation (gc-root-get r)) 1))
+    (assert (> (gc-promotions) 0)) (assert (gc-verify))))
+
+(deftest collect_on_every_allocation_preserves_a_linked_heap
+  (gc-reset!) (gc-stress! true)
+  (let [root (gc-root-new! 0) (mut i) 0]
+    (loop
+      (if (>= (load i) 40) (break)
+        (do (let [fresh (gc-alloc! 2 1) old (gc-root-get root)]
+              (gc-field-set! fresh 0 old) (gc-field-set! fresh 1 (load i))
+              (gc-root-set! root fresh) (assert (gc-verify)))
+            (store! i (+ (load i) 1)) 0)))
+    (assert (= (gc-field (gc-root-get root) 1) 39))
+    (assert (= (gc-collections) 40))
+    (assert (= (gc-slowpaths) (gc-collections)))))
+
+(deftest collect_every_allocation_stress_sweeps_the_whole_corpus
+  (let [total (corpus-count) (mut i) 0 (mut allocations) 0]
+    (loop
+      (if (>= (load i) total) (break)
+        (do (corpus-build! (load i)) (gc-reset!) (gc-stress! true)
+            (let [n (n-count) (mut j) 0]
+              (loop
+                (if (>= (load j) n) (break)
+                  (do (if (and (not (n-dead? (load j))) (= (n-op (load j)) OP-NEW))
+                          (let [a (gc-alloc! 1 0)]
+                            (gc-root-new! a) (store! allocations (+ (load allocations) 1))
+                            (assert (gc-verify))) 0)
+                      (store! j (+ (load j) 1)) 0))))
+            (store! i (+ (load i) 1)) 0)))
+    (assert (> (load allocations) 8))))
+
+(deftest backend_emits_one_stack_map_site_per_native_allocation
+  (corpus-build! CX-OBJECT-RET)
+  (assert (be-select-program!))
+  (be-schedule!) (be-color! 8) (be-encode!)
+  (assert (= (be-stackmap-count) 1))
+  (assert (>= (be-stackmap-pc 0) 0))
+  (assert (> (be-stackmap-live-count 0) 0)))

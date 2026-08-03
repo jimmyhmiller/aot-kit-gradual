@@ -40,20 +40,20 @@
 ;;   coil test tests/gtext-test.coil
 (module gtexttest)
 
-(import "../src/ty.coil"     :use *)
-(import "../src/text.coil"   :use *)
-(import "../src/node.coil"   :use *)
-(import "../src/verify.coil" :use *)
-(import "../src/eval.coil"   :use *)
-(import "../src/corpus.coil" :use *)
-(import "../src/gtext.coil"  :use *)
-(import "assert.coil"    :use *)
-(import "control.coil"   :use *)
-(import "io.coil"        :use *)
-(import "fmt.coil"       :use *)
-(import "alloc.coil"     :use *)
-(import "str.coil"       :use *)
-(import "slice.coil"     :use *)
+(import "ty"     :use *)
+(import "text"   :use *)
+(import "node"   :use *)
+(import "verify" :use *)
+(import "eval"   :use *)
+(import "corpus" :use *)
+(import "gtext"  :use *)
+(import "coil.assert"    :use *)
+(import "coil.control"   :use *)
+(import "coil.io"        :use *)
+(import "coil.fmt"       :use *)
+(import "coil.alloc"     :use *)
+(import "coil.str"       :use *)
+(import "coil.slice"     :use *)
 
 ;; A HARD ERROR CAN ONLY BE TESTED FROM ANOTHER PROCESS. `abort` takes the whole program with it,
 ;; so the child does the thing that must abort and `_exit(0)` if it survives; the parent asserts on
@@ -122,6 +122,50 @@
               0)))
       (fmt w "  first differing byte: {d}\n" (load at)))
     0))
+
+(deftest dynamic_representation_nodes_round_trip_exactly
+  (let [ba (stack (array u8 8192)) bb (stack (array u8 8192))]
+    (graph-reset! 1)
+    (let [a (n-new1 OP-ARG (t-dyn) (g-start))
+          b (n-new2 OP-BOX 0 NO-NODE a)
+          u (n-new2 OP-UNBOX (t-int) NO-NODE b)
+          q (n-new2 OP-TYPETEST (t-int) NO-NODE a)
+          r1 (n-new2 OP-RETURN 0 (g-start) u)
+          r2 (n-new2 OP-RETURN 0 (g-start) q)]
+      (n-add-def! (g-stop) r1) (n-add-def! (g-stop) r2) (g-analyze!)
+      (assert (= (g-verify) 0))
+      (assert (= (count-live-op OP-BOX) 1))
+      (assert (= (count-live-op OP-UNBOX) 1))
+      (assert (= (count-live-op OP-TYPETEST) 1))
+      (let [ta (g-render (cast (ptr i8) ba) 8192)]
+        (assert (= (g-try-parse ta) GERR-NONE))
+        (let [tb (g-render (cast (ptr i8) bb) 8192)] (assert (str-eq ta tb)))
+        (assert (= (g-verify) 0))
+        (assert (= (count-live-op OP-BOX) 1))
+        (assert (= (count-live-op OP-UNBOX) 1))
+        (assert (= (count-live-op OP-TYPETEST) 1))))))
+
+(deftest function_and_closure_nodes_round_trip_exactly
+  (let [ba (stack (array u8 8192)) bb (stack (array u8 8192))]
+    (graph-reset! 1)
+    (let [fun (n-fun-open! 3) cap (n-parm! fun 0) arg (n-parm! fun 1)
+          body (n-new2 OP-RETURN 0 (n-fun-entry fun)
+                  (n-peephole (n-new3 OP-ADD 0 NO-NODE cap arg)))]
+      (n-fun-close! fun body)
+      (let [clos (n-closure1! fun (n-const (t-int-con 40)))
+            call (n-call1! (g-start) clos (n-const (t-int-con 2)))
+            ret (n-new2 OP-RETURN 0 (call-end call) (call-value call))]
+        (n-add-def! (g-stop) ret) (iterate!)
+        (assert (= (g-verify) 0))
+        (let [ta (g-render (cast (ptr i8) ba) 8192)]
+          (assert (= (g-try-parse ta) GERR-NONE))
+          (let [tb (g-render (cast (ptr i8) bb) 8192)] (assert (str-eq ta tb)))
+          (assert (= (g-verify) 0))
+          (assert (= (count-live-op OP-FUN) 1))
+          (assert (= (count-live-op OP-FUNSTART) 1))
+          (assert (= (count-live-op OP-CLOSURE) 1))
+          (assert (= (count-live-op OP-CALL) 1))
+          (assert (= (count-live-op OP-CALLEND) 1)))))))
 
 (defn show-gerr [] (-> i64)
   (let [w (stderr)]
@@ -240,8 +284,8 @@
 ;; test does not compile. With half the feature present it fails as soon as either half drops a
 ;; field the other needs, because B then differs from A.
 (defn rt-corpus-fixture [(i i64)] (-> i64)
-  (let [ba (alloc-stack (array u8 32768))
-        bb (alloc-stack (array u8 32768))]
+  (let [ba (stack (array u8 32768))
+        bb (stack (array u8 32768))]
     (corpus-build! i)
     (let [live0 (g-live-count)
           ta    (g-render (cast (ptr i8) ba) 32768)
@@ -327,9 +371,9 @@
       (load same))))
 
 (defn diff-across-reparse [(i i64)] (-> i64)
-  (let [ba (alloc-stack (array u8 32768))
-        bo (alloc-stack (array u8 8192))
-        bp (alloc-stack (array u8 8192))
+  (let [ba (stack (array u8 32768))
+        bo (stack (array u8 8192))
+        bp (stack (array u8 8192))
         (mut seed) 1
         (mut checked) 0]
     ; the bindings are keyed by declared type and position, so the sequence of Arg types is what
@@ -495,7 +539,7 @@
 ;; differs in is only carried in one direction. These graphs include a null slot (`_`), an
 ;; unanalysed ANY type and an unreachable node, none of which the corpus prints.
 (defn expect-text-round-trips [(label (slice u8)) (t (slice u8))] (-> i64)
-  (let [bc (alloc-stack (array u8 32768))]
+  (let [bc (stack (array u8 32768))]
     (if (= (g-try-parse t) GERR-NONE) 0
       (do (gfail-head label)
           (ps (stderr) "  this hand-shaped graph's own text does not parse\n")
@@ -508,8 +552,8 @@
     1))
 
 (defn expect-field-differs [(label (slice u8)) (va i64) (vb i64)] (-> i64)
-  (let [ba (alloc-stack (array u8 8192))
-        bb (alloc-stack (array u8 8192))]
+  (let [ba (stack (array u8 8192))
+        bb (stack (array u8 8192))]
     (variant-build! va)
     (let [ta (g-render (cast (ptr i8) ba) 8192)]
       (variant-build! vb)
@@ -533,8 +577,8 @@
 ;; The control. Two builds of the SAME variant must print the SAME text, or the table above is
 ;; measuring build noise rather than the field it names.
 (defn expect-field-same [(label (slice u8)) (v i64)] (-> i64)
-  (let [ba (alloc-stack (array u8 8192))
-        bb (alloc-stack (array u8 8192))]
+  (let [ba (stack (array u8 8192))
+        bb (stack (array u8 8192))]
     (variant-build! v)
     (let [ta (g-render (cast (ptr i8) ba) 8192)]
       (variant-build! v)
@@ -568,7 +612,7 @@
     ; rather than to whichever variant happened to be built first: every one of these hand-shaped
     ; graphs survives its own round trip. They carry a null slot (`_`), an unanalysed ANY type and
     ; an unreachable node, none of which the corpus prints.
-    (let [bd (alloc-stack (array u8 8192))       ; hoisted: an alloca in the loop leaks the C stack
+    (let [bd (stack (array u8 8192))       ; hoisted: an alloca in the loop leaks the C stack
           (mut v) 0
           (mut rt) 0]
       (loop
@@ -702,7 +746,7 @@
         (do (g-parse "n0: Start <- : ctrl\nn1: Stop <- n9 : ALL\n")
             (_exit 0)
             0)
-      (let [st (alloc-stack i32)]
+      (let [st (stack i32)]
         (store! st 0)
         (waitpid pid st 0)
         (let [status (cast i64 (load st))
@@ -732,7 +776,7 @@
   "n0: Start <- : ctrl\nn1: Stop <- n5 : ALL\nn2: Arg int <- n0 : int\nn3: Const int=0 <- n0 : int=0\nn4: Add <- _ n2 n3 : int w0\nn5: Return <- n0 n4 : [ctrl,int w0]\n")
 
 (deftest the_parser_peepholes_nothing
-  (let [w (stdout) bc (alloc-stack (array u8 8192))]
+  (let [w (stdout) bc (stack (array u8 8192))]
     (ps w "\n--- a text holding a node an eager peephole would delete ---\n")
     (if (= (g-try-parse (raw-add-text)) GERR-NONE) 0
       (do (gfail-head "the raw Add text") (show-gerr) (abort) 0))
@@ -844,7 +888,7 @@
     (load loops)))
 
 (defn rt-loop-fixture [(i i64) (want-depth i64)] (-> i64)
-  (let [ba (alloc-stack (array u8 32768))]
+  (let [ba (stack (array u8 32768))]
     (corpus-build! i)
     (let [phis0 (check-phi-lockstep (corpus-name i))
           loops0 (check-loops (corpus-name i))
@@ -892,7 +936,7 @@
 (const PHI-FLOOR i64 3)
 
 (defn sweep-phi-lockstep [] (-> i64)
-  (let [ba (alloc-stack (array u8 32768))       ; hoisted out of the loop
+  (let [ba (stack (array u8 32768))       ; hoisted out of the loop
         n (corpus-count)
         (mut i) 0
         (mut phis) 0]

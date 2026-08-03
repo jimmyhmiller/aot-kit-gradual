@@ -1,0 +1,326 @@
+;; M10 backend foundations.
+(module backendtest)
+
+(import "ty" :use *)
+(import "node" :use *)
+(import "shape" :use *)
+(import "backend" :use *)
+(import "corpus" :use *)
+(import "eval" :use *)
+(import "coil.assert" :use *)
+(import "coil.control" :use *)
+(import "coil.io" :use *)
+(import "coil.fmt" :use *)
+(import "coil.primitive" :as primitive)
+
+(extern mmap :cc c [(ptr u8) i64 i32 i32 i32 i64] (-> (ptr u8)))
+(extern mprotect :cc c [(ptr u8) i64 i32] (-> i32))
+(extern munmap :cc c [(ptr u8) i64] (-> i32))
+(extern sys_icache_invalidate :cc c [(ptr u8) i64] (-> void))
+
+(defn raw-const [(v i64)] (-> i64) (n-new1 OP-CONST (t-int-con v) (g-start)))
+(defn raw-bin [(op i64) (a i64) (b i64)] (-> i64) (n-new3 op 0 NO-NODE a b))
+
+(defn native-arg-word [(arg i64) (seed i64)] (-> i64)
+  (let [t (n-aux arg) (mut i) 0 (mut same) 0]
+    (loop
+      (if (>= (load i) arg) (break)
+        (do (if (and (not (n-dead? (load i)))
+                     (and (= (n-op (load i)) OP-ARG) (= (n-aux (load i)) t)))
+                (store! same (+ (load same) 1)) 0)
+            (store! i (+ (load i) 1)) 0)))
+    (rt-payload (ev-value-in t (+ (* seed 31) (* (load same) 7919))))))
+
+(defn native-arg-at [(idx i64) (seed i64)] (-> i64)
+  (let [n (n-count) (mut i) 0 (mut seen) 0 (mut word) 0]
+    (loop
+      (if (>= (load i) n) (break)
+        (do (if (and (not (n-dead? (load i))) (= (n-op (load i)) OP-ARG))
+                (if (= (load seen) idx) (do (store! word (native-arg-word (load i) seed)) (break))
+                  (store! seen (+ (load seen) 1))) 0)
+            (store! i (+ (load i) 1)) 0)))
+    (load word)))
+
+(defn native-call3 [(a i64) (b i64) (c i64)] (-> i64)
+  (let [mem (mmap (cast (ptr u8) 0) 4096 3 4098 -1 0)
+        heap (mmap (cast (ptr u8) 0) 4096 3 4098 -1 0)]
+    (assert (!= (cast i64 mem) -1))
+    (assert (!= (cast i64 heap) -1))
+    (let [n (be-code-len) (mut i) 0]
+      (loop
+        (if (>= (load i) n) (break)
+          (do (store! (index mem (load i)) (cast u8 (be-code-byte (load i))))
+              (store! i (+ (load i) 1)) 0)))
+      (assert (= (mprotect mem 4096 5) 0)) (sys_icache_invalidate mem n)
+      (let [fp (cast (fnptr c [i64 i64 i64 i64] i64) mem)
+            got (primitive/call-ptr fp a b c (cast i64 heap))]
+        (assert (= (munmap heap 4096) 0))
+        (assert (= (munmap mem 4096) 0)) got))))
+
+(defn native-call-object-field [(a i64) (b i64) (c i64) (off i64)] (-> i64)
+  (let [mem (mmap (cast (ptr u8) 0) 4096 3 4098 -1 0)
+        heap (mmap (cast (ptr u8) 0) 4096 3 4098 -1 0)]
+    (assert (!= (cast i64 mem) -1)) (assert (!= (cast i64 heap) -1))
+    (let [n (be-code-len) (mut i) 0]
+      (loop
+        (if (>= (load i) n) (break)
+          (do (store! (index mem (load i)) (cast u8 (be-code-byte (load i))))
+              (store! i (+ (load i) 1)) 0)))
+      (assert (= (mprotect mem 4096 5) 0)) (sys_icache_invalidate mem n)
+      (let [fp (cast (fnptr c [i64 i64 i64 i64] i64) mem)
+            obj (primitive/call-ptr fp a b c (cast i64 heap))
+            got (load (cast (ptr i64) (+ obj off)))]
+        (assert (= (munmap heap 4096) 0)) (assert (= (munmap mem 4096) 0)) got))))
+
+(defn build-kernel [] (-> i64)
+  (graph-reset! 1)
+  (let [sum (raw-bin OP-ADD (raw-const 20) (raw-const 22))
+        product (raw-bin OP-MUL sum (raw-const 2))
+        ret (n-new2 OP-RETURN 0 (g-start) product)]
+    (n-add-def! (g-stop) ret) (g-analyze!) ret))
+
+(deftest arm64_encoders_match_reviewed_instruction_words
+  (assert (= (a64-movz 0 42 0) 3531605312)) ; d2800540  mov x0,#42
+  (assert (= (a64-add-reg 0 1 2) 2332164128)) ; 8b020020  add x0,x1,x2
+  (assert (= (a64-ret) 3596551104)))           ; d65f03c0  ret
+
+(deftest selection_scheduling_coloring_and_encoding_form_one_pipeline
+  (let [ret (build-kernel)]
+    (assert (be-select-return! ret))
+    (assert (= (be-inst-count) 6))
+    (assert (= (be-schedule!) 6))
+    ; One register forces real split/spill decisions; eight registers color the kernel fully.
+    (assert (> (be-color! 1) 0))
+    (assert (= (be-color! 8) 0))
+    (assert (= (be-spills) 0))
+    (let [n (be-inst-count) (mut i) 0]
+      (loop
+        (if (>= (load i) n) (break)
+          (do (let [m (be-inst (load i))]
+                (if (< (load (field m dst)) 0) 0
+                  (assert (or (>= (load (field m reg)) 0)
+                              (>= (load (field m spill)) 0)))))
+              (store! i (+ (load i) 1)) 0))))
+    (be-encode!)
+    (assert (> (be-code-len) 12))
+    ; Every arm64 instruction is four bytes and the function ends in RET.
+    (assert (= (% (be-code-len) 4) 0))
+    (let [n (be-code-len)]
+      (assert (= (be-code-byte (- n 4)) 192))
+      (assert (= (be-code-byte (- n 3)) 3))
+      (assert (= (be-code-byte (- n 2)) 95))
+      (assert (= (be-code-byte (- n 1)) 214)))))
+
+(deftest emitted_arm64_is_executable_and_returns_the_ir_value
+  (let [ret (build-kernel)]
+    (assert (be-select-return! ret))
+    (be-schedule!) (assert (= (be-color! 8) 0)) (be-encode!)
+    (let [mem (mmap (cast (ptr u8) 0) 4096 3 4098 -1 0)]
+      (assert (!= (cast i64 mem) -1))
+      (let [dst (cast (ptr u8) mem) n (be-code-len) (mut i) 0]
+        (loop
+          (if (>= (load i) n) (break)
+            (do (store! (index dst (load i)) (cast u8 (be-code-byte (load i))))
+                (store! i (+ (load i) 1)) 0)))
+        (assert (= (mprotect mem 4096 5) 0))
+        (sys_icache_invalidate mem n)
+        (let [fp (cast (fnptr c [] i64) mem)]
+          (assert (= (primitive/call-ptr fp) 84)))
+        (assert (= (munmap mem 4096) 0))))))
+
+(deftest forced_spills_split_ranges_through_stack_slots_and_execute
+  (let [ret (build-kernel)]
+    (assert (be-select-return! ret))
+    (be-schedule!) (assert (> (be-color! 1) 0)) (be-encode!)
+    (assert (> (be-code-len) 0))
+    (assert (= (native-call3 0 0 0) 84))))
+
+(deftest emitted_code_is_wrapped_in_a_valid_arm64_macho_object
+  (let [ret (build-kernel)]
+    (assert (be-select-return! ret))
+    (be-schedule!) (assert (= (be-color! 8) 0)) (be-encode!)
+    (assert (> (be-macho!) (be-code-len)))
+    ; MH_MAGIC_64, little endian.
+    (assert (= (be-object-byte 0) 207))
+    (assert (= (be-object-byte 1) 250))
+    (assert (= (be-object-byte 2) 237))
+    (assert (= (be-object-byte 3) 254))))
+
+(deftest generated_functions_obey_the_arm64_integer_argument_abi
+  (graph-reset! 2)
+  (let [fun (n-fun-open! 0) a (n-parm! fun 0) b (n-parm! fun 1)
+        sum (n-new3 OP-ADD 0 NO-NODE a b)
+        product (n-new3 OP-MUL 0 NO-NODE sum (raw-const 2))
+        ret (n-new2 OP-RETURN 0 (n-fun-entry fun) product)]
+    (n-fun-close! fun ret) (g-analyze!)
+    (assert (be-select-fun! fun))
+    (be-schedule!) (assert (= (be-color! 8) 0)) (be-encode!)
+    (let [mem (mmap (cast (ptr u8) 0) 4096 3 4098 -1 0)]
+      (assert (!= (cast i64 mem) -1))
+      (let [n (be-code-len) (mut i) 0]
+        (loop
+          (if (>= (load i) n) (break)
+            (do (store! (index mem (load i)) (cast u8 (be-code-byte (load i))))
+                (store! i (+ (load i) 1)) 0)))
+        (assert (= (mprotect mem 4096 5) 0)) (sys_icache_invalidate mem n)
+        (let [fp (cast (fnptr c [i64 i64] i64) mem)]
+          (assert (= (primitive/call-ptr fp 20 22) 84))
+          (assert (= (primitive/call-ptr fp -5 8) 6)))
+        (assert (= (munmap mem 4096) 0))))))
+
+(deftest backend_coverage_is_measured_over_the_real_corpus
+  (let [total (corpus-count) (mut i) 0 (mut selected) 0]
+    (loop
+      (if (>= (load i) total) (break)
+        (do (corpus-build! (load i))
+            (if (= (n-nins (g-stop)) 1)
+                (if (be-select-return! (n-in (g-stop) 0))
+                    (do (be-schedule!) (be-color! 8)
+                        (let [n (be-inst-count) (mut j) 0]
+                          (loop
+                            (if (>= (load j) n) (break)
+                              (do (let [m (be-inst (load j))]
+                                    (if (< (load (field m dst)) 0) 0
+                                      (assert (or (>= (load (field m reg)) 0)
+                                                  (>= (load (field m spill)) 0)))))
+                                  (store! j (+ (load j) 1)) 0))))
+                        (store! selected (+ (load selected) 1)))
+                  (if (be-select-program!)
+                      (do (be-schedule!) (be-color! 8)
+                          (store! selected (+ (load selected) 1)))
+                    (do (fmt (stderr) "backend did not select {s}\n" (corpus-name (load i))) 0)))
+              (if (be-select-program!)
+                  (do (be-schedule!) (be-color! 8)
+                      (store! selected (+ (load selected) 1)))
+                (do (fmt (stderr) "backend did not select {s}\n" (corpus-name (load i))) 0)))
+            (store! i (+ (load i) 1)) 0)))
+    ; This floor rises as CFG, dynamic, and heap lowering land. It prevents backend coverage from
+    ; silently shrinking while M10 is in progress.
+    (assert (= (load selected) total))))
+
+(deftest branch_cfg_is_lowered_with_patched_arm64_control_flow
+  (graph-reset! 3)
+  (let [arg (n-new1 OP-ARG (t-bool) (g-start))
+        iff (n-peephole (n-new2 OP-IF 0 (g-start) arg))
+        arms (n-if-arms! iff)
+        yes (n-new2 OP-RETURN 0 (arms-t arms) (raw-const 11))
+        no (n-new2 OP-RETURN 0 (arms-f arms) (raw-const 22))]
+    (n-add-def! (g-stop) yes) (n-add-def! (g-stop) no) (iterate!)
+    (assert (be-select-program!))
+    (be-schedule!) (assert (= (be-color! 8) 0)) (be-encode!)
+    (let [mem (mmap (cast (ptr u8) 0) 4096 3 4098 -1 0)]
+      (assert (!= (cast i64 mem) -1))
+      (let [n (be-code-len) (mut i) 0]
+        (loop
+          (if (>= (load i) n) (break)
+            (do (store! (index mem (load i)) (cast u8 (be-code-byte (load i))))
+                (store! i (+ (load i) 1)) 0)))
+        (assert (= (mprotect mem 4096 5) 0)) (sys_icache_invalidate mem n)
+        (let [fp (cast (fnptr c [i64] i64) mem)]
+          (assert (= (primitive/call-ptr fp 1) 11))
+          (assert (= (primitive/call-ptr fp 0) 22)))
+        (assert (= (munmap mem 4096) 0))))))
+
+(deftest diamond_phis_execute_as_arm64_conditional_selects
+  (graph-reset! 4)
+  (let [arg (n-new1 OP-ARG (t-bool) (g-start))
+        iff (n-peephole (n-new2 OP-IF 0 (g-start) arg))
+        arms (n-if-arms! iff)
+        r (n-new OP-REGION 0)]
+    (n-add-def! r NO-NODE) (n-add-def! r (arms-t arms)) (n-add-def! r (arms-f arms))
+    (let [phi (n-new OP-PHI (t-int))]
+      (n-add-def! phi r) (n-add-def! phi (raw-const 11)) (n-add-def! phi (raw-const 22))
+      (let [ret (n-new2 OP-RETURN 0 r phi)]
+        (n-add-def! (g-stop) ret) (g-analyze!)
+        (assert (be-select-return! ret))
+        (be-schedule!) (assert (= (be-color! 8) 0)) (be-encode!)
+        (let [mem (mmap (cast (ptr u8) 0) 4096 3 4098 -1 0)]
+          (assert (!= (cast i64 mem) -1))
+          (let [n (be-code-len) (mut i) 0]
+            (loop
+              (if (>= (load i) n) (break)
+                (do (store! (index mem (load i)) (cast u8 (be-code-byte (load i))))
+                    (store! i (+ (load i) 1)) 0)))
+            (assert (= (mprotect mem 4096 5) 0)) (sys_icache_invalidate mem n)
+            (let [fp (cast (fnptr c [i64] i64) mem)]
+              (assert (= (primitive/call-ptr fp 1) 11))
+              (assert (= (primitive/call-ptr fp 0) 22)))
+            (assert (= (munmap mem 4096) 0))))))))
+
+(deftest selected_integer_corpus_programs_match_the_ir_interpreter_natively
+  (let [total (corpus-count) (mut i) 0 (mut compared) 0]
+    (loop
+      (if (>= (load i) total) (break)
+        (do (corpus-build! (load i))
+            (let [ok (if (= (n-nins (g-stop)) 1)
+                         (if (be-select-return! (n-in (g-stop) 0)) true
+                           (be-select-program!))
+                       (be-select-program!))]
+              (if (not ok) 0
+                (do (be-schedule!) (be-color! 8)
+                    (if (or (> (be-spills) 0) (< (be-encode!) 0)) 0
+                      (let [a (native-arg-at 0 5) b (native-arg-at 1 5) c (native-arg-at 2 5)]
+                        (if (!= (ev-run-bound 5 100000) EV-OK) 0
+                          (if (or (= (rt-tag (ev-result)) RT-INT)
+                                  (= (rt-tag (ev-result)) RT-BOOL))
+                              (do (let [got (native-call3 a b c) want (rt-payload (ev-result))]
+                                    (if (= got want) 0
+                                      (do (fmt (stderr) "native mismatch corpus {d}: args {d},{d},{d}; got {d}, want {d}\n"
+                                               (load i) a b c got want)
+                                          (let [nn (be-inst-count) (mut jj) 0]
+                                            (loop
+                                              (if (>= (load jj) nn) (break)
+                                                (do (let [mm (be-inst (load jj))]
+                                                      (fmt (stderr) "  mi {d}: op={d} d={d} a={d} b={d} r={d} [{d},{d}]\n"
+                                                           (load jj) (load (field mm op)) (load (field mm dst))
+                                                           (load (field mm a)) (load (field mm b))
+                                                           (load (field mm reg)) (load (field mm first))
+                                                           (load (field mm last))))
+                                                    (store! jj (+ (load jj) 1)) 0))) 0)
+                                          (assert false))))
+                                  (store! compared (+ (load compared) 1))) 0)))))))
+            (store! i (+ (load i) 1)) 0)))
+    (assert (>= (load compared) 24))))
+
+(deftest canonical_loop_executes_native_backedge_and_phi_move
+  (corpus-build! CX-LOOP)
+  (assert (be-select-program!))
+  (be-schedule!) (assert (= (be-color! 8) 0))
+  (be-encode!) (assert (> (be-code-len) 0))
+  (assert (= (native-call3 0 0 0) 5)))
+
+(deftest object_loop_executes_ordered_native_store_chain
+  (corpus-build! CX-OBJECT-LOOP)
+  (assert (be-select-program!))
+  (be-schedule!) (assert (= (be-color! 8) 0))
+  (be-encode!) (assert (> (be-code-len) 0))
+  (assert (= (native-call3 0 0 0) 2)))
+
+(deftest nested_loops_compile_to_finite_machine_cfg
+  (corpus-build! CX-NESTED)
+  (assert (be-select-program!))
+  (be-schedule!) (assert (= (be-color! 8) 0))
+  (be-encode!) (assert (> (be-code-len) 0)))
+
+(deftest returned_object_fields_match_the_interpreter_heap
+  (let [total (corpus-count) (mut i) 0 (mut compared) 0]
+    (loop
+      (if (>= (load i) total) (break)
+        (do (corpus-build! (load i))
+            (let [ok (if (= (n-nins (g-stop)) 1)
+                         (if (be-select-return! (n-in (g-stop) 0)) true (be-select-program!))
+                       (be-select-program!))]
+              (if (not ok) 0
+                (do (be-schedule!) (be-color! 8) (be-encode!)
+                    (let [a (native-arg-at 0 5) b (native-arg-at 1 5) c (native-arg-at 2 5)]
+                      (if (!= (ev-run-bound 5 100000) EV-OK) 0
+                        (if (!= (rt-tag (ev-result)) RT-OBJ) 0
+                          (let [obj (rt-payload (ev-result))
+                                alias (shape-field-alias (ev-obj-shape obj) 0)
+                                ver (hv-find (ev-result-mem) obj alias)]
+                            (assert (>= ver 0))
+                            (assert (= (native-call-object-field a b c (be-field-off alias))
+                                       (rt-payload (hve-val (hv-ent ver)))))
+                            (store! compared (+ (load compared) 1)))))))))
+            (store! i (+ (load i) 1)) 0)))
+    (assert (>= (load compared) 3))))

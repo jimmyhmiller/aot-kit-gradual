@@ -1,0 +1,776 @@
+;; M10 arm64 backend: machine IR, scheduling, register allocation, and encoding.
+(module backend)
+
+(import "node" :use *)
+(import "ty" :use *)
+(import "coil.alloc" :use *)
+(import "coil.arraylist" :use *)
+(import "coil.control" :use *)
+(import "coil.slice" :use *)
+
+(const MI-MOVI i64 0)
+(const MI-ADD  i64 1)
+(const MI-SUB  i64 2)
+(const MI-MUL  i64 3)
+(const MI-SDIV i64 4)
+(const MI-NEG  i64 5)
+(const MI-RET  i64 6)
+(const MI-ARG  i64 7)
+(const MI-EQ   i64 8)
+(const MI-LT   i64 9)
+(const MI-LE   i64 10)
+(const MI-LABEL i64 11)
+(const MI-CBZ   i64 12)
+(const MI-CSEL  i64 13)
+(const MI-MOV   i64 14)
+(const MI-B     i64 15)
+(const MI-NEW   i64 16)
+(const MI-LOAD  i64 17)
+(const MI-STORE i64 18)
+
+(defstruct MInst
+  [(op i64) (dst i64) (a i64) (b i64) (imm i64) (node i64)
+   (reg i64) (spill i64) (first i64) (last i64)])
+
+(defstruct Backend
+  [(ins (ArrayList MInst))
+   (nval (ArrayList i64))       ; graph node -> virtual register, -1 when unselected
+   (mseen (ArrayList i64))
+   (clabel (ArrayList i64))
+   (code (ArrayList u8))
+   (obj (ArrayList u8))
+   (spills i64)
+   (inloop bool)
+   (inited bool)])
+
+(defn backend [] (-> (ptr Backend))
+  (let [p (static Backend)]
+    (if (load (field p inited)) 0
+      (do (store! (field p inited) true)
+          (store! (field p ins) (al-new [MInst] (malloc-allocator)))
+          (store! (field p nval) (al-new [i64] (malloc-allocator)))
+          (store! (field p mseen) (al-new [i64] (malloc-allocator)))
+          (store! (field p clabel) (al-new [i64] (malloc-allocator)))
+          (store! (field p code) (al-new [u8] (malloc-allocator)))
+          (store! (field p obj) (al-new [u8] (malloc-allocator))) 0))
+    p))
+
+(defn be-reset! [] (-> i64)
+  (let [p (backend) (mut i) 0]
+    (al-clear! [MInst] (field p ins))
+    (al-clear! [i64] (field p nval))
+    (al-clear! [i64] (field p mseen))
+    (al-clear! [i64] (field p clabel))
+    (al-clear! [u8] (field p code))
+    (al-clear! [u8] (field p obj))
+    (loop
+      (if (>= (load i) (n-count)) (break)
+        (do (al-push! [i64] (field p nval) -1)
+            (al-push! [i64] (field p mseen) 0)
+            (al-push! [i64] (field p clabel) -1)
+            (store! i (+ (load i) 1)) 0)))
+    (store! (field p spills) 0) (store! (field p inloop) false) 0))
+
+(defn mi-new [(op i64) (dst i64) (a i64) (b i64) (imm i64) (node i64)] (-> MInst)
+  (let [p (stack MInst)]
+    (store! (field p op) op) (store! (field p dst) dst)
+    (store! (field p a) a) (store! (field p b) b) (store! (field p imm) imm)
+    (store! (field p node) node) (store! (field p reg) -1) (store! (field p spill) -1)
+    (store! (field p first) -1) (store! (field p last) -1) (load p)))
+
+(defn be-emit! [(m MInst)] (-> i64)
+  (let [p (backend) id (al-len [MInst] (load (field p ins)))]
+    (al-push! [MInst] (field p ins) m) id))
+
+(defn be-al-elem [T] [(p (ptr (ArrayList T))) (i i64)] (-> (ptr T))
+  (index (load (field p data)) i))
+
+(defn be-vreg-count [] (-> i64)
+  (let [len (al-len [MInst] (load (field (backend) ins))) (mut i) 0 (mut n) 0]
+    (loop
+      (if (>= (load i) len) (break)
+        (do (let [d (load (field (be-al-elem [MInst] (field (backend) ins) (load i)) dst))]
+              (if (>= d (load n)) (store! n (+ d 1)) 0))
+            (store! i (+ (load i) 1)) 0)))
+    (load n)))
+
+(defn select-binary! [(n i64) (mop i64)] (-> i64)
+  (let [a (select-value! (n-in n 1)) b (select-value! (n-in n 2))]
+    (if (or (< a 0) (< b 0)) -1
+      (let [vr (be-vreg-count)]
+        (be-emit! (mi-new mop vr a b 0 n)) vr))))
+
+(defn graph-arg-index [(n i64)] (-> i64)
+  (let [(mut i) 0 (mut idx) 0]
+    (loop
+      (if (>= (load i) n) (break)
+        (do (if (and (not (n-dead? (load i))) (= (n-op (load i)) OP-ARG))
+                (store! idx (+ (load idx) 1)) 0)
+            (store! i (+ (load i) 1)) 0)))
+    (load idx)))
+
+(defn graph-new-index [(n i64)] (-> i64)
+  (let [(mut i) 0 (mut idx) 0]
+    (loop
+      (if (>= (load i) n) (break)
+        (do (if (and (not (n-dead? (load i))) (= (n-op (load i)) OP-NEW))
+                (store! idx (+ (load idx) 1)) 0)
+            (store! i (+ (load i) 1)) 0)))
+    (load idx)))
+
+(defn be-field-off [(alias i64)] (-> i64) (* (% alias 16) 8))
+
+(defn select-memory-new! [(n i64)] (-> bool)
+  (case (n-op n)
+    OP-STORE
+      (if (not (select-memory! (n-in n 1))) false
+        (let [ptr (select-value! (n-in n 2)) val (select-value! (n-in n 3))]
+          (if (or (< ptr 0) (< val 0)) false
+            (do (be-emit! (mi-new MI-STORE -1 ptr val (be-field-off (n-aux n)) n)) true))))
+    OP-PROJ
+      (if (= (n-op (n-in n 0)) OP-NEW)
+          (do (select-value! (n-in n 0)) true) false)
+    OP-ARG true
+    ; Memory phis/merges need edge-specific lowering; accepting them here would read an
+    ; uninitialised stack slot and turn selector coverage into a miscompile.
+    OP-PHI
+      (if (= (n-op (n-in n 0)) OP-LOOP) (load (field (backend) inloop))
+        (let [len (n-nins n) (mut i) 1 (mut ok) true]
+          (loop
+            (if (or (>= (load i) len) (not (load ok))) (break)
+              (do (if (select-memory! (n-in n (load i))) 0 (store! ok false))
+                  (store! i (+ (load i) 1)) 0)))
+          (load ok)))
+    OP-MEMMERGE
+      (let [len (n-nins n) (mut i) 1 (mut ok) true]
+        (loop
+          (if (or (>= (load i) len) (not (load ok))) (break)
+            (do (if (select-memory! (n-in n (load i))) 0 (store! ok false))
+                (store! i (+ (load i) 1)) 0)))
+        (load ok))
+    true))
+
+(defn select-memory! [(n i64)] (-> bool)
+  (if (!= (al-get (load (field (backend) mseen)) n) 0) true
+    (let [ok (select-memory-new! n)]
+      (if ok (al-set! [i64] (field (backend) mseen) n 1) 0)
+      ok)))
+
+(defn select-reaching-store-value! [(mem i64) (ptr-node i64) (alias i64)] (-> i64)
+  (case (n-op mem)
+    OP-STORE
+      (if (and (= (n-aux mem) alias) (= (n-in mem 2) ptr-node))
+          (select-value! (n-in mem 3))
+        (select-reaching-store-value! (n-in mem 1) ptr-node alias))
+    -1))
+
+(defn ctrl-entry-proj [(ctrl i64)] (-> i64)
+  (case (n-op ctrl)
+    OP-CPROJ ctrl
+    OP-REGION
+      (if (< (n-nins ctrl) 2) NO-NODE
+        (let [first (n-in ctrl 1)]
+          (if (!= (n-op first) OP-CPROJ) NO-NODE
+            (let [iff (n-in first 0)]
+              (if (!= (n-op iff) OP-IF) NO-NODE
+                ; A nested merge is entered through the control that dominates its inner If.
+                (ctrl-entry-proj (n-in iff 0)))))))
+    NO-NODE))
+
+(defn phi-diamond-if [(phi i64)] (-> i64)
+  (let [r (n-in phi 0)]
+    (if (or (!= (n-op r) OP-REGION) (!= (n-nins r) 3)) NO-NODE
+      (let [a (ctrl-entry-proj (n-in r 1)) b (ctrl-entry-proj (n-in r 2))]
+        (if (and (and (!= a NO-NODE) (!= b NO-NODE))
+                 (and (= (n-in a 0) (n-in b 0)) (= (n-op (n-in a 0)) OP-IF)))
+            (n-in a 0) NO-NODE)))))
+
+(defn select-value! [(n i64)] (-> i64)
+  (let [p (backend) prior (al-get (load (field p nval)) n)]
+    (if (>= prior 0) prior
+      (let [op (n-op n) (mut vr) -1]
+        (case op
+          OP-CONST
+            (if (and (ty-int-only? (n-ty n)) (ty-const? (n-ty n)))
+                (let [fresh (be-vreg-count)]
+                  (be-emit! (mi-new MI-MOVI fresh -1 -1 (ty-int-lo (n-ty n)) n))
+                  (store! vr fresh) 0) 0)
+          OP-PARM
+            (let [fresh (be-vreg-count)]
+              (be-emit! (mi-new MI-ARG fresh -1 -1 (n-aux n) n))
+              (store! vr fresh) 0)
+          OP-ARG
+            (let [fresh (be-vreg-count)]
+              (be-emit! (mi-new MI-ARG fresh -1 -1 (graph-arg-index n) n))
+              (store! vr fresh) 0)
+          OP-NEW
+            (let [fresh (be-vreg-count)]
+              (be-emit! (mi-new MI-NEW fresh -1 -1 (* (graph-new-index n) 128) n))
+              (store! vr fresh) 0)
+          OP-PROJ
+            (if (and (= (n-aux n) 0) (= (n-op (n-in n 0)) OP-NEW))
+                (store! vr (select-value! (n-in n 0))) 0)
+          OP-LOAD
+            (let [mem (n-in n 1)]
+              (if (and (= (n-op mem) OP-PHI) (!= (phi-diamond-if mem) NO-NODE))
+                  (let [pred (select-value! (n-in (phi-diamond-if mem) 1))
+                        av (select-reaching-store-value! (n-in mem 1) (n-in n 2) (n-aux n))
+                        bv (select-reaching-store-value! (n-in mem 2) (n-in n 2) (n-aux n))]
+                    (if (or (< pred 0) (or (< av 0) (< bv 0))) 0
+                      (let [fresh (be-vreg-count)]
+                        (if (= (n-aux (ctrl-entry-proj (n-in (n-in mem 0) 1))) 0)
+                            (be-emit! (mi-new MI-CSEL fresh av bv pred n))
+                          (be-emit! (mi-new MI-CSEL fresh bv av pred n)))
+                        (store! vr fresh) 0)))
+                (if (not (select-memory! mem)) 0
+                  (let [ptr (select-value! (n-in n 2))]
+                    (if (< ptr 0) 0
+                      (let [fresh (be-vreg-count)]
+                        (be-emit! (mi-new MI-LOAD fresh ptr -1 (be-field-off (n-aux n)) n))
+                        (store! vr fresh) 0))))))
+          OP-ADD (store! vr (select-binary! n MI-ADD))
+          OP-SUB (store! vr (select-binary! n MI-SUB))
+          OP-MUL (store! vr (select-binary! n MI-MUL))
+          OP-DIV (store! vr (select-binary! n MI-SDIV))
+          OP-EQ (store! vr (select-binary! n MI-EQ))
+          OP-LT (store! vr (select-binary! n MI-LT))
+          OP-LE (store! vr (select-binary! n MI-LE))
+          OP-CAST (store! vr (select-value! (n-in n 1)))
+          OP-BOX (store! vr (select-value! (n-in n 1)))
+          OP-UNBOX (store! vr (select-value! (n-in n 1)))
+          OP-PHI
+            (let [iff (phi-diamond-if n)]
+              (if (= iff NO-NODE) 0
+                (let [pred (select-value! (n-in iff 1))
+                      av (select-value! (n-in n 1)) bv (select-value! (n-in n 2))]
+                  (if (or (< pred 0) (or (< av 0) (< bv 0))) 0
+                    (let [fresh (be-vreg-count)]
+                      ; imm carries the predicate vreg; a/b follow Region input order. CProj 0 is
+                      ; the true edge, but raw graphs are allowed to list the Region arms either way.
+                      (if (= (n-aux (ctrl-entry-proj (n-in (n-in n 0) 1))) 0)
+                          (be-emit! (mi-new MI-CSEL fresh av bv pred n))
+                        (be-emit! (mi-new MI-CSEL fresh bv av pred n)))
+                      (store! vr fresh) 0)))))
+          OP-MINUS
+            (let [a (select-value! (n-in n 1))]
+              (if (< a 0) 0
+                (let [fresh (be-vreg-count)]
+                  (be-emit! (mi-new MI-NEG fresh a -1 0 n)) (store! vr fresh) 0)))
+          0)
+        (if (< (load vr) 0) -1
+          (do (al-set! [i64] (field p nval) n (load vr)) (load vr)))))))
+
+(defn be-select-return! [(ret i64)] (-> bool)
+  (be-reset!)
+  (if (!= (n-op ret) OP-RETURN) false
+    (let [mem-ok (if (and (> (n-nins ret) 2) (ty-only-obj? (n-ty (n-in ret 1))))
+                     (select-memory! (n-in ret 2)) true)
+          v (if mem-ok (select-value! (n-in ret 1)) -1)]
+      (if (< v 0) false
+        (do (be-emit! (mi-new MI-RET -1 v -1 0 ret)) true)))))
+
+(defn be-select-fun! [(fun i64)] (-> bool)
+  (if (or (!= (n-op fun) OP-FUN) (!= (n-nins fun) 2)) false
+    (be-select-return! (n-in fun 1))))
+
+(defn be-has-input? [(n i64) (want i64)] (-> bool)
+  (let [len (n-nins n) (mut i) 0 (mut yes) false]
+    (loop
+      (if (or (>= (load i) len) (load yes)) (break)
+        (do (if (= (n-in n (load i)) want) (store! yes true) 0)
+            (store! i (+ (load i) 1)) 0)))
+    (load yes)))
+
+(defn be-cfg-control? [(op i64)] (-> bool)
+  (or (or (= op OP-IF) (= op OP-RETURN))
+      (or (or (= op OP-LOOP) (= op OP-REGION)) (= op OP-CPROJ))))
+
+(defn be-ctrl-succ [(ctrl i64)] (-> i64)
+  (let [len (n-nouts ctrl) (mut i) 0 (mut found) NO-NODE (mut count) 0]
+    (loop
+      (if (>= (load i) len) (break)
+        (do (let [u (n-out ctrl (load i))]
+              (if (and (not (n-dead? u))
+                       (and (be-cfg-control? (n-op u)) (> (n-nins u) 0)))
+                  (if (be-has-input? u ctrl)
+                      (do (store! found u) (store! count (+ (load count) 1)) 0) 0) 0))
+            (store! i (+ (load i) 1)) 0)))
+    (if (= (load count) 1) (load found) NO-NODE)))
+
+(defn be-if-arm [(iff i64) (slot i64)] (-> i64)
+  (let [len (n-nouts iff) (mut i) 0 (mut found) NO-NODE]
+    (loop
+      (if (>= (load i) len) (break)
+        (do (let [u (n-out iff (load i))]
+              (if (and (not (n-dead? u))
+                       (and (= (n-op u) OP-CPROJ) (= (n-aux u) slot)))
+                  (store! found u) 0))
+            (store! i (+ (load i) 1)) 0)))
+    (load found)))
+
+(defn be-loop-phi [(lp i64)] (-> i64)
+  (let [len (n-nouts lp) (mut i) 0 (mut found) NO-NODE]
+    (loop
+      (if (>= (load i) len) (break)
+        (do (let [u (n-out lp (load i))]
+              (if (and (not (n-dead? u))
+                       (and (and (= (n-op u) OP-PHI) (= (n-in u 0) lp))
+                            (not (ty-mem? (n-ty u)))))
+                  (store! found u) 0))
+            (store! i (+ (load i) 1)) 0)))
+    (load found)))
+
+(defn be-select-loop-memory! [(lp i64)] (-> bool)
+  (let [len (n-nouts lp) (mut i) 0 (mut ok) true]
+    (loop
+      (if (or (>= (load i) len) (not (load ok))) (break)
+        (do (let [u (n-out lp (load i))]
+              (if (and (not (n-dead? u))
+                       (and (= (n-op u) OP-PHI) (ty-mem? (n-ty u))))
+                  (if (select-memory! (n-in u 2)) 0 (store! ok false)) 0))
+            (store! i (+ (load i) 1)) 0)))
+    (load ok)))
+
+(defn be-select-loop-memory-init! [(lp i64)] (-> bool)
+  (let [len (n-nouts lp) (mut i) 0 (mut ok) true]
+    (loop
+      (if (or (>= (load i) len) (not (load ok))) (break)
+        (do (let [u (n-out lp (load i))]
+              (if (and (not (n-dead? u))
+                       (and (= (n-op u) OP-PHI) (ty-mem? (n-ty u))))
+                  (if (select-memory! (n-in u 1)) 0 (store! ok false)) 0))
+            (store! i (+ (load i) 1)) 0)))
+    (load ok)))
+
+(defn be-select-loop! [(lp i64) (next-label (ptr i64))] (-> bool)
+  (let [phi (be-loop-phi lp) iff (be-ctrl-succ lp)]
+    (if (= phi NO-NODE)
+        (let [prior (al-get (load (field (backend) clabel)) lp)]
+          (if (>= prior 0) (do (be-emit! (mi-new MI-B -1 -1 -1 prior lp)) true)
+            (let [head (load next-label)]
+              (store! next-label (+ head 1))
+              (al-set! [i64] (field (backend) clabel) lp head)
+              (be-emit! (mi-new MI-LABEL -1 -1 -1 head lp))
+              (if (= iff NO-NODE) false (be-select-control! iff next-label)))))
+      (if (or (= iff NO-NODE) (!= (n-op iff) OP-IF)) false
+      (let [init (select-value! (n-in phi 1))]
+        (if (< init 0) false
+          (do (al-set! [i64] (field (backend) nval) phi init)
+              (let [head (load next-label) exit-label (+ head 1)]
+                (store! next-label (+ head 2))
+                ; Hoist invariant operands and allocation-derived pointers before the header.
+                ; The predicate instruction itself remains below the label and is recomputed.
+                (let [pn (n-in iff 1)]
+                  (if (> (n-nins pn) 1) (select-value! (n-in pn 1)) 0)
+                  (if (> (n-nins pn) 2) (select-value! (n-in pn 2)) 0))
+                (let [bn (n-in phi 2)]
+                  (if (> (n-nins bn) 1) (select-value! (n-in bn 1)) 0)
+                  (if (> (n-nins bn) 2) (select-value! (n-in bn 2)) 0))
+                (if (not (be-select-loop-memory-init! lp)) false
+                  (do (be-emit! (mi-new MI-LABEL -1 -1 -1 head lp))
+                (let [pred (select-value! (n-in iff 1))]
+                  (if (< pred 0) false
+                    (do (be-emit! (mi-new MI-CBZ -1 pred -1 exit-label iff))
+                        (let [back (select-value! (n-in phi 2))]
+                          (if (< back 0) false
+                            (do (store! (field (backend) inloop) true)
+                                (let [mem-ok (be-select-loop-memory! lp)]
+                                  (store! (field (backend) inloop) false)
+                                  (if (not mem-ok) false
+                                    (do (be-emit! (mi-new MI-MOV -1 back -1 init phi))
+                                (be-emit! (mi-new MI-B -1 -1 -1 head lp))
+                                (be-emit! (mi-new MI-LABEL -1 -1 -1 exit-label lp))
+                                (be-select-control! (be-if-arm iff 1) next-label))))))))))))))))))))
+
+(defn be-select-control! [(ctrl i64) (next-label (ptr i64))] (-> bool)
+  (let [c (if (or (= (n-op ctrl) OP-RETURN) (= (n-op ctrl) OP-IF)) ctrl (be-ctrl-succ ctrl))]
+    (if (= c NO-NODE) false
+      (case (n-op c)
+        OP-RETURN
+          (let [mem-ok (if (and (> (n-nins c) 2) (ty-only-obj? (n-ty (n-in c 1))))
+                           (select-memory! (n-in c 2)) true)
+                v (if mem-ok (select-value! (n-in c 1)) -1)]
+            (if (< v 0) false (do (be-emit! (mi-new MI-RET -1 v -1 0 c)) true)))
+        OP-IF
+          (let [ta (be-if-arm c 0) fa (be-if-arm c 1)
+                ts (be-ctrl-succ ta) fs (be-ctrl-succ fa)]
+            (if (and (!= ts NO-NODE) (and (= ts fs) (= (n-op ts) OP-REGION)))
+                ; Acyclic diamonds become dataflow CSELs. This is both smaller and avoids
+                ; manufacturing machine phis before the general loop/block scheduler lands.
+                (be-select-control! ts next-label)
+              (let [pred (select-value! (n-in c 1)) false-label (load next-label)]
+                (store! next-label (+ false-label 1))
+                (if (< pred 0) false
+                  (do (be-emit! (mi-new MI-CBZ -1 pred -1 false-label c))
+                      (if (not (be-select-control! ta next-label)) false
+                        (do (be-emit! (mi-new MI-LABEL -1 -1 -1 false-label c))
+                            (be-select-control! fa next-label))))))))
+        OP-LOOP (be-select-loop! c next-label)
+        false))))
+
+(defn be-select-program! [] (-> bool)
+  (be-reset!)
+  (let [(mut label) 0] (be-select-control! (g-start) (mut label))))
+
+(defn be-inst-count [] (-> i64) (al-len [MInst] (load (field (backend) ins))))
+(defn be-inst [(i i64)] (-> (ptr MInst)) (be-al-elem [MInst] (field (backend) ins) i))
+
+(defn be-stackmap-count [] (-> i64)
+  (let [n (be-inst-count) (mut i) 0 (mut count) 0]
+    (loop
+      (if (>= (load i) n) (break)
+        (do (if (= (load (field (be-inst (load i)) op)) MI-NEW)
+                (store! count (+ (load count) 1)) 0)
+            (store! i (+ (load i) 1)) 0)))
+    (load count)))
+
+(defn be-stackmap-pc [(which i64)] (-> i64)
+  (let [n (be-inst-count) (mut i) 0 (mut seen) 0 (mut pc) -1]
+    (loop
+      (if (or (>= (load i) n) (>= (load pc) 0)) (break)
+        (do (if (= (load (field (be-inst (load i)) op)) MI-NEW)
+                (if (= (load seen) which) (store! pc (load (field (be-inst (load i)) first)))
+                  (store! seen (+ (load seen) 1))) 0)
+            (store! i (+ (load i) 1)) 0)))
+    (load pc)))
+
+(defn be-stackmap-live-count [(which i64)] (-> i64)
+  (let [pc (be-stackmap-pc which) n (be-inst-count) (mut i) 0 (mut count) 0]
+    (loop
+      (if (>= (load i) n) (break)
+        (do (let [m (be-inst (load i))]
+              (if (and (>= (load (field m dst)) 0)
+                       (and (<= (load (field m first)) pc) (>= (load (field m last)) pc)))
+                  (store! count (+ (load count) 1)) 0))
+            (store! i (+ (load i) 1)) 0)))
+    (load count)))
+
+;; Selection emits a dependency-topological order. This explicit scheduler computes live intervals
+;; and is the hook where M10's global code motion adds block placement for control graphs.
+(defn be-schedule! [] (-> i64)
+  (let [n (be-inst-count) (mut i) 0]
+    (loop
+      (if (>= (load i) n) (break)
+        (do (let [m (be-inst (load i)) d (load (field m dst))]
+              (if (< d 0) 0
+                (do (store! (field m first)
+                            (if (= (load (field m op)) MI-ARG) 0 (load i)))
+                    (store! (field m last) (load i)) 0)))
+            (store! i (+ (load i) 1)) 0)))
+    (store! i 0)
+    (loop
+      (if (>= (load i) n) (break)
+        (do (let [m (be-inst (load i)) a (load (field m a)) b (load (field m b))
+                  pred (if (= (load (field m op)) MI-CSEL) (load (field m imm)) -1)
+                  (mut j) 0]
+              (loop
+                (if (>= (load j) n) (break)
+                  (do (let [d (load (field (be-inst (load j)) dst))]
+                        (if (and (>= d 0) (or (or (= d a) (= d b)) (= d pred)))
+                            (store! (field (be-inst (load j)) last) (load i)) 0))
+                      (store! j (+ (load j) 1)) 0))))
+            (store! i (+ (load i) 1)) 0)))
+    ; A linear interval ends at its last textual use, but a preheader value used inside a loop is
+    ; live again on every back edge. Extend such ranges through the branch that targets an earlier
+    ; label so colouring cannot reuse an invariant's register for a loop-carried temporary.
+    (store! i 0)
+    (loop
+      (if (>= (load i) n) (break)
+        (do (let [br (be-inst (load i))]
+              (if (!= (load (field br op)) MI-B) 0
+                (let [label (load (field br imm)) (mut j) 0 (mut at) -1]
+                  (loop
+                    (if (>= (load j) (load i)) (break)
+                      (do (if (and (= (load (field (be-inst (load j)) op)) MI-LABEL)
+                                   (= (load (field (be-inst (load j)) imm)) label))
+                              (store! at (load j)) 0)
+                          (store! j (+ (load j) 1)) 0)))
+                  (if (< (load at) 0) 0
+                    (do (store! j 0)
+                        (loop
+                          (if (>= (load j) (load at)) (break)
+                            (do (let [d (be-inst (load j))]
+                                  (if (>= (load (field d last)) (load at))
+                                      (store! (field d last) (load i)) 0))
+                                (store! j (+ (load j) 1)) 0)))))))
+            (store! i (+ (load i) 1)) 0))))
+    n))
+
+(defn intervals-overlap? [(a (ptr MInst)) (b (ptr MInst))] (-> bool)
+  (and (<= (load (field a first)) (load (field b last)))
+       (<= (load (field b first)) (load (field a last)))))
+
+;; Greedy coloring over the exact interval interference graph. Values beyond the register budget
+;; receive distinct spill slots; lowering treats each slot boundary as a split point.
+(defn be-color! [(nregs i64)] (-> i64)
+  (let [p (backend) n (be-inst-count) (mut i) 0]
+    (store! (field p spills) 0)
+    (loop
+      (if (>= (load i) n) (break)
+        (do (store! (field (be-inst (load i)) reg)
+                    (if (= (load (field (be-inst (load i)) op)) MI-ARG)
+                        (load (field (be-inst (load i)) imm)) -1))
+            (store! (field (be-inst (load i)) spill) -1)
+            (store! i (+ (load i) 1)) 0)))
+    (store! i 0)
+    (loop
+      (if (>= (load i) n) (break)
+        (do (let [m (be-inst (load i))]
+              (if (or (< (load (field m dst)) 0) (= (load (field m op)) MI-ARG)) 0
+                (let [(mut color) 0 (mut found) false]
+                  (loop
+                    (if (or (>= (load color) nregs) (load found)) (break)
+                      (let [(mut j) 0 (mut conflict) false]
+                        (loop
+                          (if (>= (load j) n) (break)
+                            (do (let [q (be-inst (load j))]
+                                  (if (and (!= (load j) (load i))
+                                           (and (= (load (field q reg)) (load color))
+                                           (intervals-overlap? m q)))
+                                      (store! conflict true) 0))
+                                (store! j (+ (load j) 1)) 0)))
+                        (if (load conflict) (store! color (+ (load color) 1)) (store! found true)))))
+                  (if (load found) (store! (field m reg) (load color))
+                    (do (store! (field m spill) (load (field p spills)))
+                        (store! (field p spills) (+ (load (field p spills)) 1)) 0)))))
+            (store! i (+ (load i) 1)) 0)))
+    (load (field p spills))))
+
+(defn be-spills [] (-> i64) (load (field (backend) spills)))
+
+; AArch64 word encoders used by lowering.
+(defn a64-movz [(rd i64) (imm i64) (hw i64)] (-> i64)
+  (| (<< 1 31) (| (<< 2 29) (| (<< 37 23) (| (<< hw 21) (| (<< (& imm 65535) 5) rd))))))
+(defn a64-movk [(rd i64) (imm i64) (hw i64)] (-> i64)
+  (| (<< 1 31) (| (<< 3 29) (| (<< 37 23) (| (<< hw 21) (| (<< (& imm 65535) 5) rd))))))
+(defn a64-add-reg [(rd i64) (rn i64) (rm i64)] (-> i64)
+  (| (<< 1 31) (| (<< 11 24) (| (<< rm 16) (| (<< rn 5) rd)))))
+(defn a64-sub-reg [(rd i64) (rn i64) (rm i64)] (-> i64)
+  (| (<< 1 31) (| (<< 1 30) (| (<< 11 24) (| (<< rm 16) (| (<< rn 5) rd))))))
+(defn a64-mul [(rd i64) (rn i64) (rm i64)] (-> i64)
+  (| (<< 1 31) (| (<< 27 24) (| (<< rm 16) (| (<< 31 10) (| (<< rn 5) rd))))))
+(defn a64-sdiv [(rd i64) (rn i64) (rm i64)] (-> i64)
+  (| (<< 1 31) (| (<< 26 24) (| (<< 6 10) (| (<< rm 16) (| (<< rn 5) rd))))))
+(defn a64-ret [] (-> i64) 3596551104)
+(defn a64-cmp-reg [(rn i64) (rm i64)] (-> i64)
+  (| (<< 1 31) (| (<< 1 30) (| (<< 1 29) (| (<< 11 24) (| (<< rm 16) (| (<< rn 5) 31)))))))
+(defn a64-csinc [(rd i64) (rn i64) (rm i64) (cnd i64)] (-> i64)
+  (| (<< 1 31) (| (<< 212 21) (| (<< rm 16) (| (<< cnd 12) (| (<< 1 10) (| (<< rn 5) rd)))))))
+(defn a64-cset [(rd i64) (cnd i64)] (-> i64) (a64-csinc rd 31 31 (^ cnd 1)))
+(defn a64-cbz [(rt i64) (delta-words i64)] (-> i64)
+  (| 3019898880 (| (<< (& delta-words 524287) 5) rt)))
+(defn a64-csel [(rd i64) (rn i64) (rm i64) (cnd i64)] (-> i64)
+  (| (<< 1 31) (| (<< 212 21) (| (<< rm 16) (| (<< cnd 12) (| (<< rn 5) rd))))))
+(defn a64-b [(delta-words i64)] (-> i64)
+  (| 335544320 (& delta-words 67108863)))
+(defn a64-add-imm [(rd i64) (rn i64) (imm i64)] (-> i64)
+  (| (<< 1 31) (| (<< 17 24) (| (<< (& imm 4095) 10) (| (<< rn 5) rd)))))
+(defn a64-sub-imm [(rd i64) (rn i64) (imm i64)] (-> i64)
+  (| (<< 1 31) (| (<< 1 30) (| (<< 17 24) (| (<< (& imm 4095) 10) (| (<< rn 5) rd))))))
+(defn a64-ldr [(rt i64) (rn i64) (off i64)] (-> i64)
+  (| 4181721088 (| (<< (/ off 8) 10) (| (<< rn 5) rt))))
+(defn a64-str [(rt i64) (rn i64) (off i64)] (-> i64)
+  (| 4177526784 (| (<< (/ off 8) 10) (| (<< rn 5) rt))))
+
+(defn be-u32! [(w i64)] (-> i64)
+  (let [b (field (backend) code)]
+    (al-push! [u8] b (cast u8 (& w 255)))
+    (al-push! [u8] b (cast u8 (& (>> w 8) 255)))
+    (al-push! [u8] b (cast u8 (& (>> w 16) 255)))
+    (al-push! [u8] b (cast u8 (& (>> w 24) 255))) 0))
+
+(defn be-reg-of [(vr i64)] (-> i64)
+  (let [n (be-inst-count) (mut i) 0 (mut r) -1]
+    (loop
+      (if (or (>= (load i) n) (>= (load r) 0)) (break)
+        (do (if (= (load (field (be-inst (load i)) dst)) vr)
+                (store! r (load (field (be-inst (load i)) reg))) 0)
+            (store! i (+ (load i) 1)) 0)))
+    (load r)))
+
+(defn be-spill-of [(vr i64)] (-> i64)
+  (let [n (be-inst-count) (mut i) 0 (mut s) -1]
+    (loop
+      (if (or (>= (load i) n) (>= (load s) 0)) (break)
+        (do (if (= (load (field (be-inst (load i)) dst)) vr)
+                (store! s (load (field (be-inst (load i)) spill))) 0)
+            (store! i (+ (load i) 1)) 0)))
+    (load s)))
+
+(defn be-spill-off [(slot i64)] (-> i64) (+ 1024 (* slot 8)))
+
+(defn be-read-reg! [(vr i64) (scratch i64)] (-> i64)
+  (if (< vr 0) -1
+    (let [r (be-reg-of vr)]
+      (if (>= r 0) r
+        (let [s (be-spill-of vr)]
+          (if (< s 0) -1 (do (be-u32! (a64-ldr scratch 31 (be-spill-off s))) scratch)))))))
+
+(defn be-write-reg [(vr i64)] (-> i64)
+  (let [r (be-reg-of vr)] (if (>= r 0) r 14)))
+
+(defn be-store-written! [(vr i64) (from i64)] (-> i64)
+  (let [s (be-spill-of vr)]
+    (if (< s 0) 0 (be-u32! (a64-str from 31 (be-spill-off s))))))
+
+(defn be-mov-imm! [(rd i64) (v i64)] (-> i64)
+  (be-u32! (a64-movz rd (& v 65535) 0))
+  (let [(mut hw) 1]
+    (loop
+      (if (>= (load hw) 4) (break)
+        (do (let [part (& (>> v (* (load hw) 16)) 65535)]
+              (if (= part 0) 0 (be-u32! (a64-movk rd part (load hw)))))
+            (store! hw (+ (load hw) 1)) 0))) 0))
+
+(defn be-mov-words [(v i64)] (-> i64)
+  (let [(mut words) 1 (mut hw) 1]
+    (loop
+      (if (>= (load hw) 4) (break)
+        (do (if (= (& (>> v (* (load hw) 16)) 65535) 0) 0
+              (store! words (+ (load words) 1)))
+            (store! hw (+ (load hw) 1)) 0)))
+    (load words)))
+
+(defn be-inst-words [(m (ptr MInst))] (-> i64)
+  (let [op (load (field m op)) a (load (field m a)) b (load (field m b))
+        dst (load (field m dst))
+        base (case op
+               MI-ARG 0 MI-LABEL 0
+               MI-MOVI (be-mov-words (load (field m imm)))
+               MI-EQ 2 MI-LT 2 MI-LE 2 MI-CSEL 2
+               MI-RET (if (= (be-reg-of a) 0) 2 3)
+               1)
+        aload (if (and (>= a 0) (< (be-reg-of a) 0)) 1 0)
+        bload (if (and (>= b 0) (< (be-reg-of b) 0)) 1 0)
+        pload (if (and (= op MI-CSEL) (< (be-reg-of (load (field m imm))) 0)) 1 0)
+        dstore (if (and (>= dst 0) (< (be-reg-of dst) 0)) 1 0)]
+    (+ base (+ aload (+ bload (+ pload dstore))))))
+
+(defn be-label-off [(label i64)] (-> i64)
+  (let [n (be-inst-count) (mut i) 0 (mut off) -1]
+    (loop
+      (if (or (>= (load i) n) (>= (load off) 0)) (break)
+        (do (let [m (be-inst (load i))]
+              (if (and (= (load (field m op)) MI-LABEL) (= (load (field m imm)) label))
+                  (store! off (load (field m first))) 0))
+            (store! i (+ (load i) 1)) 0)))
+    (load off)))
+
+(defn be-encode! [] (-> i64)
+  (let [p (backend) n (be-inst-count) (mut i) 0]
+    (al-clear! [u8] (field p code))
+    (do (be-u32! (a64-sub-imm 31 31 2048))
+          (let [(mut off) 0]
+            (loop
+              (if (>= (load i) n) (break)
+                (do (store! (field (be-inst (load i)) first) (load off))
+                    (store! off (+ (load off) (* 4 (be-inst-words (be-inst (load i))))))
+                    (store! i (+ (load i) 1)) 0))))
+          (store! i 0)
+          (loop
+            (if (>= (load i) n) (break)
+              (do (let [m (be-inst (load i)) op (load (field m op))
+                        dst (load (field m dst)) rd (be-write-reg dst)
+                        ra (be-read-reg! (load (field m a)) 15)
+                        rb (be-read-reg! (load (field m b)) 16)]
+                    (case op
+                      MI-MOVI (be-mov-imm! rd (load (field m imm)))
+                      MI-ADD (be-u32! (a64-add-reg rd ra rb))
+                      MI-SUB (be-u32! (a64-sub-reg rd ra rb))
+                      MI-MUL (be-u32! (a64-mul rd ra rb))
+                      MI-SDIV (be-u32! (a64-sdiv rd ra rb))
+                      MI-ARG 0
+                      MI-EQ (do (be-u32! (a64-cmp-reg ra rb)) (be-u32! (a64-cset rd 0)) 0)
+                      MI-LT (do (be-u32! (a64-cmp-reg ra rb)) (be-u32! (a64-cset rd 11)) 0)
+                      MI-LE (do (be-u32! (a64-cmp-reg ra rb)) (be-u32! (a64-cset rd 13)) 0)
+                      MI-LABEL 0
+                      MI-CBZ (let [target (be-label-off (load (field m imm)))
+                                   here (load (field m first))]
+                               (if (< target 0) -1
+                                 (be-u32! (a64-cbz ra (/ (- target here) 4)))))
+                      MI-CSEL (do (be-u32! (a64-cmp-reg (be-read-reg! (load (field m imm)) 17) 31))
+                                  (be-u32! (a64-csel rd ra rb 1)) 0)
+                      MI-MOV (let [to (be-reg-of (load (field m imm)))]
+                               (if (< to 0)
+                                   (be-u32! (a64-str ra 31 (be-spill-off (be-spill-of (load (field m imm))))))
+                                 (be-u32! (a64-add-reg to ra 31))))
+                      MI-B (let [target (be-label-off (load (field m imm)))
+                                 here (load (field m first))]
+                             (if (< target 0) -1
+                               (be-u32! (a64-b (/ (- target here) 4)))))
+                      ; x3 is the runtime heap base in the backend's internal entry convention.
+                      MI-NEW (be-u32! (a64-add-imm rd 3 (load (field m imm))))
+                      MI-LOAD (be-u32! (a64-ldr rd ra (load (field m imm))))
+                      MI-STORE (be-u32! (a64-str rb ra (load (field m imm))))
+                      MI-NEG (be-u32! (a64-sub-reg rd 31 ra))
+                      MI-RET (do (if (= ra 0) 0 (be-u32! (a64-add-reg 0 ra 31)))
+                                 (be-u32! (a64-add-imm 31 31 2048))
+                                 (be-u32! (a64-ret)) 0)
+                      0)
+                    (if (>= dst 0) (be-store-written! dst rd) 0)
+                    (store! i (+ (load i) 1)) 0)))
+          (be-code-len)))))
+
+(defn be-code-len [] (-> i64) (al-len [u8] (load (field (backend) code))))
+(defn be-code-byte [(i i64)] (-> i64) (cast i64 (al-get (load (field (backend) code)) i)))
+
+; Minimal arm64 MH_OBJECT writer: one __TEXT,__text section and one external `_kernel` symbol.
+(defn obj-u8! [(v i64)] (-> i64)
+  (al-push! [u8] (field (backend) obj) (cast u8 (& v 255))) 0)
+(defn obj-u32! [(v i64)] (-> i64)
+  (obj-u8! v) (obj-u8! (>> v 8)) (obj-u8! (>> v 16)) (obj-u8! (>> v 24)) 0)
+(defn obj-u64! [(v i64)] (-> i64) (obj-u32! v) (obj-u32! (>> v 32)) 0)
+(defn obj-name16! [(s (slice u8))] (-> i64)
+  (let [n (slice-len s) (mut i) 0]
+    (loop
+      (if (>= (load i) 16) (break)
+        (do (obj-u8! (if (< (load i) n) (cast i64 (slice-get s (load i))) 0))
+            (store! i (+ (load i) 1)) 0))) 0))
+(defn obj-pad-to! [(at i64)] (-> i64)
+  (loop
+    (if (>= (al-len [u8] (load (field (backend) obj))) at) (break)
+      (obj-u8! 0))) 0)
+(defn align8 [(n i64)] (-> i64) (& (+ n 7) -8))
+
+(defn be-macho! [] (-> i64)
+  (let [p (backend) textlen (be-code-len) textoff 232
+        symoff (align8 (+ textoff textlen)) stroff (+ symoff 16) strsize 9]
+    (al-clear! [u8] (field p obj))
+    ; mach_header_64
+    (obj-u32! 4277009103) (obj-u32! 16777228) (obj-u32! 0) (obj-u32! 1)
+    (obj-u32! 3) (obj-u32! 200) (obj-u32! 0) (obj-u32! 0)
+    ; LC_SEGMENT_64 + one section_64
+    (obj-u32! 25) (obj-u32! 152) (obj-name16! "")
+    (obj-u64! 0) (obj-u64! textlen) (obj-u64! textoff) (obj-u64! textlen)
+    (obj-u32! 7) (obj-u32! 7) (obj-u32! 1) (obj-u32! 0)
+    (obj-name16! "__text") (obj-name16! "__TEXT")
+    (obj-u64! 0) (obj-u64! textlen) (obj-u32! textoff) (obj-u32! 2)
+    (obj-u32! 0) (obj-u32! 0) (obj-u32! 2147484672)
+    (obj-u32! 0) (obj-u32! 0) (obj-u32! 0)
+    ; LC_SYMTAB
+    (obj-u32! 2) (obj-u32! 24) (obj-u32! symoff) (obj-u32! 1)
+    (obj-u32! stroff) (obj-u32! strsize)
+    ; LC_BUILD_VERSION: macOS, minimum 11.0, SDK 11.0, no tool records.
+    (obj-u32! 50) (obj-u32! 24) (obj-u32! 1) (obj-u32! 720896)
+    (obj-u32! 720896) (obj-u32! 0)
+    (obj-pad-to! textoff)
+    (let [(mut i) 0]
+      (loop
+        (if (>= (load i) textlen) (break)
+          (do (obj-u8! (be-code-byte (load i))) (store! i (+ (load i) 1)) 0))))
+    (obj-pad-to! symoff)
+    ; nlist_64: string 1, N_SECT|N_EXT, section 1, value 0
+    (obj-u32! 1) (obj-u8! 15) (obj-u8! 1) (obj-u8! 0) (obj-u8! 0) (obj-u64! 0)
+    ; string table: leading NUL then `_kernel\0`
+    (obj-u8! 0)
+    (let [name "_kernel" (mut i) 0]
+      (loop
+        (if (>= (load i) (slice-len name)) (break)
+          (do (obj-u8! (cast i64 (slice-get name (load i))))
+              (store! i (+ (load i) 1)) 0))))
+    (obj-u8! 0)
+    (al-len [u8] (load (field p obj)))))
+
+(defn be-object-len [] (-> i64) (al-len [u8] (load (field (backend) obj))))
+(defn be-object-byte [(i i64)] (-> i64) (cast i64 (al-get (load (field (backend) obj)) i)))
+(defn be-object-data [] (-> (ptr u8)) (load (field (field (backend) obj) data)))

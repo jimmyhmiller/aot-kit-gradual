@@ -41,6 +41,30 @@ for f in tests/*-test.coil; do
   fi
 done
 
+echo
+echo "=== native backend ==="
+if out=$(./tools/native-gate.sh 2>&1); then
+  note "native-gate.sh" "$out"
+else
+  note "native-gate.sh" "FAILED"; echo "$out" | tail -20; fails=$((fails+1))
+fi
+
+echo
+echo "=== TypeScript frontend ==="
+if out=$(./tools/ts-gate.sh 2>&1); then
+  note "ts-gate.sh" "$out"
+else
+  note "ts-gate.sh" "FAILED"; echo "$out" | tail -20; fails=$((fails+1))
+fi
+
+echo
+echo "=== performance ==="
+if out=$(./tools/benchmark-gate.sh 2>&1); then
+  note "benchmark-gate.sh" "$(echo "$out" | tail -1)"
+else
+  note "benchmark-gate.sh" "FAILED"; echo "$out" | tail -20; fails=$((fails+1))
+fi
+
 if [ "$QUICK" = 0 ]; then
   echo
   echo "=== diagram pipeline ==="

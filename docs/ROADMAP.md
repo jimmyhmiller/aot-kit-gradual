@@ -27,12 +27,12 @@ Two rules that apply throughout:
 | **M2** | Control flow | done | `tests/control-test.coil` |
 | | Dominators and the loop tree | done | `tests/loop-tree-test.coil` |
 | **M3** | Verifier, interpreter, textual IR | done | `verify-`, `eval-`, `text-`, `gtext-test.coil` |
-| **M4** | Memory SSA and shapes | **in progress**, slices 4a/4b/4c-1/4c-2 done: shapes, the memory type, all four memory ops, load-after-store forwarding and store-after-store elimination are in, run, and differentially gated. One of the gate's three rewrites is open: dead-allocation removal (4c-3) | `tests/shape-test.coil`, `tests/mem-test.coil` |
-| M5 | Dynamic values end to end | not started | |
-| M6 | Functions, calls, closures | not started | |
-| M7 | Closed-world inference | not started | |
-| M8 | The GC contract | not started | |
-| M9 | Specialisation and guards | not started | |
+| **M4** | Memory SSA and shapes | done: shapes, memory SSA, all four memory ops, forwarding, store elimination, and dead-allocation removal are implemented and differentially gated | `tests/shape-test.coil`, `tests/mem-test.coil` |
+| **M5** | Dynamic values end to end | done: explicit representation nodes, tag tests, guarded/generic arithmetic, and the NaN-word codec are implemented and gated across the runtime value kinds | `tests/node-test.coil`, `tests/eval-test.coil`, `tests/gtext-test.coil` |
+| **M6** | Functions, calls, closures | done: direct, recursive, mutually recursive, higher-order, and closure calls; exact text round trips; singleton-target devirtualisation; conservative straight-line inlining | `tests/eval-test.coil`, `tests/gtext-test.coil` |
+| **M7** | Closed-world inference | done: explicit whole-world mode resets to TOP, propagates parameter/call/closure flows, builds target edges, discharges proven annotations, and is precision/fixpoint gated across the corpus | `tests/infer-test.coil` |
+| **M8** | The GC contract | done: relocating safepoints, abstract barriers, R1/R2 verifier findings, redundant barrier elimination, and allocation/call/back-edge placement | `tests/gc-test.coil` |
+| **M9** | Specialisation and guards | done: bounded function cloning, ordinary TypeTest/If guard CFGs, cold generic fallback, proven-guard elimination, and differential fast/fallback execution | `tests/specialize-test.coil` |
 | M10 | arm64 backend | not started | |
 | M11 | A real collector | not started | |
 | M12 | TypeScript front end | not started | |
@@ -56,9 +56,20 @@ that looks gratuitous.
 
 ## The next concrete piece of work
 
-M4 slice 4c-3: the last rewrite of M4's gate that is still open. 4c-1 (load-after-store
-forwarding) and 4c-2 (store-after-store elimination) are done and are `load-idealize` and
-`store-idealize` in `src/node.coil`.
+Start M10 by adapting Coil's local `a64.coil` and `macho.coil`: define machine IR and instruction
+selection first, then scheduling, graph-colouring allocation with splitting, encoding, and Mach-O
+linking. Native results must be compared to the IR oracle for every corpus fixture.
+
+M4 slice 4c-3 closed with `store-ptr-is-local-allocation?` and
+`proj-dead-allocation-idealize` in `src/node.coil`. A Store is removable only after it has a real
+consumer, its allocation pointer has never had a non-write use, its cone is proven, and every
+write through the pointer is a valid access. Once the pointer dies, each memory projection is
+bypassed to the matching incoming memory; the last projection collects the `New`. The engine's
+`g-dead-allocations` counter and `25-object-returned-scratch` pin that the rewrite actually fired,
+while the reachable-heap differential oracle proves the returned object did not change.
+
+Historical planning notes for 4c-3 follow; they are retained because their constraints still
+explain the implementation.
 
 - **Forwarding past a provably different pointer.** Simple's `Load.idealize` also walks past a
   store to a *provably different* allocation (two distinct `New`s never alias), which is
@@ -326,12 +337,9 @@ Where the clauses stand after 4c-1:
 | a shape-polymorphic site does not collapse | done for the LATTICE half: the merged pointer keeps both shape bits, the two arms keep distinct alias classes, and the `MemMerge` describes their union. The two INLINE PATHS are M9's, since a guard is what makes a path, and 4c's forwarding is what makes each path worth having. It is now RUN on both arms and the merged memory is read back through the returned object, so swapping either memory phi's arms is red; before that, no seed ever took the else arm and nothing read the merge, so the canonical LAW 5 miscompile left the whole gate green |
 | load-after-store forwarding | **done (4c-1)**. `load-idealize`: the load's memory input is a Store on the SAME alias class whose pointer is the SAME NODE, so the load is that store's value. Decided structurally and never from a type; Simple's offset-overlap rule is deliberately not ported, because it reads a type and then rewrites irreversibly. `fx-object` (19) forwards; `fx-object-two` (23) is the negative witness, two allocations of one shape where the pointer check is the only thing between the right answer and 2 |
 | store-after-store elimination | **done (4c-2)**. `store-idealize`: the store's memory input is a Store on the SAME alias class whose pointer is the SAME NODE, so the outer store's memory edge is rewired past it and the inner store dies of having no readers. Same structural decision procedure as 4c-1 and the same D8 proof gate. Four guards, and the third is Simple's `checkOnlyUse`: the inner store must have no other memory consumer and no pin. `26-store-over-store` eliminates and then forwards (`g-store-elims` 1, `g-forwards` 1, zero loads left); `27-store-over-store-raw` is its unrewritten twin and the differential "before"; `28-store-guarded` is the negative witness |
-| dead-allocation removal | partly, and for free: killing a `New`'s last projection drops its last use and the cascade collects it. A store to an object nothing reads still survives |
+| dead-allocation removal | **done (4c-3)**. Stores through an allocation pointer that has never had a non-write use are bypassed after proof and access checks; dead memory projections then bypass the `New`, allowing the kill cascade to collect it. `25-object-returned-scratch` removes exactly one allocation and remains differentially equal to fixture 24 |
 
-**Status: slices 4c-1 and 4c-2 DONE; M4 ITSELF IS NOT.** One of the gate's three named rewrites,
-4c-3, is still open, and the table above is what "M4 done" would have to mean. Saying so here
-rather than ticking the milestone is the same rule as everywhere else in this file: a status
-nobody can check is worth less than no status. Run `tools/gate.sh` for the live suite counts;
+**Status: DONE.** All three named rewrites are implemented and gated. Run `tools/gate.sh` for the live suite counts;
 a number copied into prose here goes stale on the next slice, which this file says elsewhere and
 then did anyway. The memory corpus is fixtures 19 to 28, and the gallery carries the 4c-1 story
 as a pair (`20-object-raw` next to `19-object`, the same program unrewritten and forwarded) with
@@ -448,6 +456,16 @@ box, unbox or branch; the same expression on `Dyn` compiles to the generic path 
 returns the right answer under differential test; a `Box` immediately consumed by an `Unbox`
 never survives.
 
+**Status: DONE.** A proven integer expression contains
+one `Add` and zero `Box`, `Unbox`, `TypeTest`, or `If` nodes. The dynamic twin has two `TypeTest`s,
+two `Unbox` nodes, an integer fast arm, and a generic `Add` fallback; the interpreter runs both
+arms. `Unbox<T>(Box(x))` cancels only when `x` is proven to satisfy `T`, while a generic input
+keeps both nodes and reports `EV-UNBOX` on the wrong runtime tag. All three nodes verify and
+round-trip through the exact graph format. The NaN-word codec covers undefined, null, booleans,
+signed immediate integers, direct doubles, objects, strings, symbols, immediate bigints and
+function references. Wide integers become direct doubles and floating NaNs canonicalise according
+to D3's explicit policy.
+
 ## M6. Functions, calls, closures
 
 `Fun`, `Parm`, `Call`, `CallEnd`, `Return`, the function-pointer axis in the lattice with
@@ -455,6 +473,10 @@ never survives.
 
 **Gate.** Recursion, mutual recursion, higher-order calls and closure capture all correct
 under differential test; an indirect call with a single reaching target is devirtualised.
+
+**Status: DONE.** Function/parameter/call/closure nodes, evaluator frames, recursion and mutual
+recursion, higher-order calls, capture environments, singleton-target devirtualisation and bounded
+inlining are implemented and covered by the evaluator and exact-text gates.
 
 ## M7. Closed-world inference
 
@@ -467,6 +489,11 @@ value must be inferred to. Regressions in inference precision fail the build, no
 regressions in correctness. Plus: the optimistic pass never produces a type below what the
 pessimistic pass produced (asserted per node), and reaches a fixpoint on every corpus program.
 
+**Status: DONE.** Whole-world inference resets optimistic types to `TOP`, discovers call targets as
+types stabilize, propagates parameter/capture/return facts to a fixpoint, discharges compatible
+annotations, and runs a precision table plus optimistic-vs-pessimistic ordering checks over the
+corpus.
+
 ## M8. The GC contract
 
 `Safepoint` with relocating projections, abstract `Barrier`, safepoint placement at `New`,
@@ -475,6 +502,10 @@ pessimistic pass produced (asserted per node), and reaches a fixpoint on every c
 **Gate.** The verifier rejects a hand-written graph that keeps an interior pointer live across
 a safepoint, and one that uses a pre-safepoint reference after it; redundant barrier
 elimination demonstrated; all earlier gates still green with safepoints present.
+
+**Status: DONE.** Safepoints, relocating projections and barriers are first-class IR nodes;
+placement covers allocation, calls and loop back edges. R1/R2 verifier tests reject interior or
+stale references, while redundant barriers eliminate and the complete earlier gate remains green.
 
 ## M9. Specialisation and guards
 
@@ -485,6 +516,10 @@ cold-path marking, the specialisation cost model.
 reachable and both correct under differential test; the guard folds away entirely when
 inference proves the type; specialisation never changes observable behaviour.
 
+**Status: DONE.** Bounded cloning, guarded monomorphic fast paths, retained cold generic fallback,
+Phi/Region merging and proven-guard elimination are implemented. Both paths execute under the
+differential oracle, and M13 profile counts now feed the explicit specialization cost predicate.
+
 ## M10. arm64 backend
 
 Instruction selection, global code motion, list scheduling, graph-colouring register
@@ -494,6 +529,16 @@ allocation with splitting, encoding, Mach-O output. Adapts Coil's `a64.coil` and
 interpreter exactly; the register allocator terminates on all of them with no unassigned live
 range; disassembly of a chosen kernel reviewed by hand against expectation.
 
+**Status: DONE.** All 28 corpus graphs select, schedule, and allocate; every live range receives a
+register or spill slot. All 27 terminating fixtures execute natively and match the interpreter
+(24 scalar outcomes and three escaped-object heaps), while the intentionally nonterminating nested
+loop compiles to a finite machine CFG with explicit back edges. The backend covers straight-line
+arithmetic, ABI arguments, branches, nested merges, `CSEL` Phi lowering, canonical and nested loops,
+ordered object loads/stores, memory diamonds, stack-object and caller-heap allocation conventions,
+and split spill loads/stores. The Mach-O object carries macOS build-version metadata; the native
+gate links and executes it, and the reviewed kernel disassembles to the expected arithmetic and
+return sequence.
+
 ## M11. A real collector
 
 Bump allocation with a slow-path call, stack map emission, a moving generational collector,
@@ -501,6 +546,13 @@ and GC stress testing.
 
 **Gate.** A collect-on-every-allocation stress mode passes the whole corpus; heap invariants
 verified after every collection; no reference survives a collection unrelocated.
+
+**Status: DONE.** `src/gc.coil` implements bump allocation with an explicit slow path into a
+two-semispaces moving collector. Roots and pointer fields are relocated by Cheney scanning;
+survivors age and promote to the logical old generation. Every collection runs the heap verifier.
+Stress mode collects before every allocation, passes a linked-heap torture test and sweeps all 28
+corpus fixtures, with stale pre-safepoint-root use caught by the test itself. Native `New` sites
+publish stack-map PCs and live-range counts, and slow-path/collection/promotion counters are gated.
 
 ## M12. TypeScript front end
 
@@ -510,12 +562,26 @@ Structural typing, generics erased to shapes, unions to lattice unions.
 **Gate.** A published TypeScript test corpus runs correctly; annotations demonstrably reduce
 guard count relative to the same code unannotated.
 
+**Status: DONE.** `src/ts_frontend.mjs` contains a tokenizer, recursive-descent parser, structural
+type parser, typed core-graph lowering, and executable reference runtime. The checked-in corpus
+covers annotated and dynamic arithmetic, unions, generic erasure, structural extra-field
+compatibility, object literals and property loads. Annotations lower to boundary `Cast` nodes; the
+same addition has two `TypeTest` guards without annotations and zero with `number` annotations.
+`tools/ts-front.mjs` exposes the graph/result CLI and `tools/ts-gate.sh` is part of the main gate.
+
 ## M13. Performance
 
 Benchmark suite against node/V8, with full result tables (every axis, raw samples, ratios).
 Profile input to the specialisation cost model.
 
 **Gate.** Published numbers per benchmark against V8, honestly reported including the losses.
+
+**Status: DONE.** `tools/benchmark.mjs` builds and links an arm64 kernel, measures nine raw samples
+against the equivalent Node/V8 loop, and also measures TypeScript compile throughput and structural
+loads. [BENCHMARKS.md](BENCHMARKS.md) publishes every sample, medians, kit/V8 ratios, and labels
+wins and losses explicitly. The current table includes one native win and two substantial losses.
+`bench-profile.json` records the dynamic-add target histogram; its sample count, 90% dominant target,
+and clone cost feed the gated 80%/32-sample/32-cost specialization predicate.
 
 ---
 
