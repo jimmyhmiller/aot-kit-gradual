@@ -1,0 +1,311 @@
+;; G1 exact machine compilation-unit and CFG contracts.
+(module backendcfgtest)
+
+(import "ty" :use *)
+(import "node" :use *)
+(import "backend" :use *)
+(import "verify" :use *)
+(import "testmatrix" :use *)
+(import "corpus" :use *)
+(import "coil.assert" :use *)
+(import "coil.alloc" :use *)
+(import "coil.slice" :use *)
+(import "coil.str" :use *)
+
+(defn cfg-const [(v i64)] (-> i64)
+  (n-new1 OP-CONST (t-int-con v) (g-start)))
+
+(defn cfg-finish! [(ctrl i64) (value i64)] (-> i64)
+  (let [ret (n-new2 OP-RETURN 0 ctrl value)]
+    (n-add-def! (g-stop) ret)
+    (g-analyze!)
+    ret))
+
+(defn build-cfg-diamond! [(seed i64)] (-> i64)
+  (graph-reset! seed)
+  (let [pred (n-new1 OP-ARG (t-bool) (g-start))
+        arms (n-if-arms! (n-peephole (n-new2 OP-IF 0 (g-start) pred)))
+        join (n-new OP-REGION 0)]
+    (n-add-def! join NO-NODE)
+    (n-add-def! join (arms-t arms))
+    (n-add-def! join (arms-f arms))
+    (cfg-finish! join (cfg-const 9))
+    join))
+
+(defn edge-with-slot [(slot i64)] (-> i64)
+  (let [(mut i) 0
+        (mut found) -1]
+    (loop (if (or (>= (load i) (mu-edge-count)) (>= (load found) 0))
+              (break)
+              (do
+                (if (= (mu-edge-target-slot (load i)) slot) (store! found (load i)) 0)
+                (store! i (+ (load i) 1))
+                0)))
+    (load found)))
+
+(defn build-cfg-loop! [(seed i64)] (-> i64)
+  (graph-reset! seed)
+  (let [lp (n-new OP-LOOP 0)]
+    (n-add-def! lp NO-NODE)
+    (n-add-def! lp (g-start))
+    (n-add-def! lp NO-NODE)
+    (n-peephole lp)
+    (let [pred (n-new1 OP-ARG (t-bool) (g-start))
+          arms (n-if-arms! (n-peephole (n-new2 OP-IF 0 lp pred)))]
+      (n-set-def! lp 2 (arms-t arms))
+      (let [ret (n-new2 OP-RETURN 0 (arms-f arms) (cfg-const 1))]
+        (n-add-def! (g-stop) ret)
+        (wl-push! lp)
+        (iterate!)
+        lp))))
+
+(defn build-cfg-nested-diamond! [(seed i64)] (-> i64)
+  (graph-reset! seed)
+  (let [p (n-new1 OP-ARG (t-bool) (g-start))
+        q (n-new1 OP-ARG (t-bool) (g-start))
+        outer (n-if-arms! (n-peephole (n-new2 OP-IF 0 (g-start) p)))
+        inner (n-if-arms! (n-peephole (n-new2 OP-IF 0 (arms-t outer) q)))
+        inner-join (n-new OP-REGION 0)]
+    (n-add-def! inner-join NO-NODE)
+    (n-add-def! inner-join (arms-t inner))
+    (n-add-def! inner-join (arms-f inner))
+    (let [outer-join (n-new OP-REGION 0)]
+      (n-add-def! outer-join NO-NODE)
+      (n-add-def! outer-join inner-join)
+      (n-add-def! outer-join (arms-f outer))
+      (cfg-finish! outer-join (cfg-const 3))
+      outer-join)))
+
+(defn build-cfg-nested-loop! [(seed i64)] (-> i64)
+  (graph-reset! seed)
+  (let [outer (n-new OP-LOOP 0)]
+    (n-add-def! outer NO-NODE)
+    (n-add-def! outer (g-start))
+    (n-add-def! outer NO-NODE)
+    (n-peephole outer)
+    (let [p (n-new1 OP-ARG (t-bool) (g-start))
+          q (n-new1 OP-ARG (t-bool) (g-start))
+          outer-arms (n-if-arms! (n-peephole (n-new2 OP-IF 0 outer p)))
+          inner (n-new OP-LOOP 0)]
+      (n-add-def! inner NO-NODE)
+      (n-add-def! inner (arms-t outer-arms))
+      (n-add-def! inner NO-NODE)
+      (n-peephole inner)
+      (let [inner-arms (n-if-arms! (n-peephole (n-new2 OP-IF 0 inner q)))]
+        (n-set-def! inner 2 (arms-t inner-arms))
+        (n-set-def! outer 2 (arms-f inner-arms))
+        (let [ret (n-new2 OP-RETURN 0 (arms-f outer-arms) (cfg-const 4))]
+          (n-add-def! (g-stop) ret)
+          (wl-push! inner)
+          (wl-push! outer)
+          (iterate!)
+          outer)))))
+
+(deftest straight_line_has_one_function_one_block_and_no_edges
+         (graph-reset! 101)
+         (cfg-finish! (g-start) (cfg-const 7))
+         (assert (= (g-verify) 0))
+         (assert (mu-build!))
+         (assert (= (mu-function-count) 1))
+         (assert (= (mu-block-count) 1))
+         (assert (= (mu-edge-count) 0))
+         (assert (= (n-op (mu-block-control 0)) OP-START)))
+
+(deftest diamond_preserves_both_arms_and_region_predecessor_slots
+         (let [join (build-cfg-diamond! 102)]
+           (assert (= (g-verify) 0))
+           (assert (mu-build!))
+           (assert (= (mu-function-count) 1))
+           (assert (= (mu-block-count) 4))
+           (assert (= (mu-edge-count) 4))
+           (assert (>= (edge-with-slot 1) 0))
+           (assert (>= (edge-with-slot 2) 0))
+           (assert (= (mu-block-control (mu-edge-target (edge-with-slot 1))) join))))
+
+(deftest loop_preserves_entry_and_backedge_slots_in_rpo
+         (let [lp (build-cfg-loop! 106)]
+           (assert (= (g-verify) 0))
+           (assert (mu-build!))
+           (assert (= (mu-block-count) 4))
+           (assert (= (mu-edge-count) 4))
+           (assert (= (mu-block-control (mu-edge-target (edge-with-slot 1))) lp))
+           (assert (= (mu-block-control (mu-edge-target (edge-with-slot 2))) lp))
+           (assert (= (mu-function-block-count 0) 4))
+           (assert (= (mu-block-layout-index (mu-function-block 0 0)) 0))))
+
+(deftest nested_diamond_has_an_exact_reachable_cfg
+         (build-cfg-nested-diamond! 108)
+         (assert (= (g-verify) 0))
+         (assert (mu-build!))
+         (assert (= (mu-block-count) 7))
+         (assert (= (mu-edge-count) 8))
+         (assert (= (mu-function-block-count 0) 7)))
+
+(deftest nested_loop_has_both_backedges_and_one_function_local_rpo
+         (build-cfg-nested-loop! 109)
+         (assert (= (g-verify) 0))
+         (assert (mu-build!))
+         (assert (= (mu-block-count) 7))
+         (assert (= (mu-edge-count) 8))
+         (assert (= (mu-function-block-count 0) 7))
+         (let [(mut i) 0
+               (mut backs) 0
+               (mut max-depth) 0]
+           (loop (if (>= (load i) (mu-edge-count))
+                     (break)
+                     (do
+                       (if (= (mu-edge-target-slot (load i)) 2)
+                           (store! backs (+ (load backs) 1))
+                           0)
+                       (store! i (+ (load i) 1))
+                       0)))
+           (store! i 0)
+           (loop (if (>= (load i) (mu-block-count))
+                     (break)
+                     (do
+                       (if (> (mu-block-loop-depth (load i)) (load max-depth))
+                           (store! max-depth (mu-block-loop-depth (load i)))
+                           0)
+                       (store! i (+ (load i) 1))
+                       0)))
+           (assert (= (load backs) 2))
+           (assert (= (load max-depth) 2))))
+
+(deftest multiple_functions_have_disjoint_machine_owners
+         (graph-reset! 107)
+         (let [f0 (n-fun-open! 0)
+               x (n-parm! f0 0)
+               f1 (n-fun-open! 1)
+               y (n-parm! f1 0)]
+           (n-fun-close! f0 (n-new2 OP-RETURN 0 (n-fun-entry f0) x))
+           (n-fun-close! f1 (n-new2 OP-RETURN 0 (n-fun-entry f1) y))
+           (g-analyze!)
+           (assert (= (g-verify) 0))
+           (assert (mu-build!))
+           (assert (= (mu-function-count) 2))
+           (assert (= (mu-block-count) 2))
+           (assert (= (mu-function-block-count 0) 1))
+           (assert (= (mu-function-block-count 1) 1))
+           (assert (!= (mu-block-owner (mu-function-block 0 0))
+                       (mu-block-owner (mu-function-block 1 0))))))
+
+(deftest entry_rooted_units_include_closed_world_callees_but_not_unreachable_functions
+         (graph-reset! 112)
+         (let [callee (n-fun-open! 1)
+               x (n-parm! callee 0)
+               unused (n-fun-open! 2)
+               z (n-parm! unused 0)
+               entry (n-fun-open! 0)
+               y (n-parm! entry 0)]
+           (n-fun-close! callee (n-new2 OP-RETURN 0 (n-fun-entry callee) x))
+           (n-fun-close! unused (n-new2 OP-RETURN 0 (n-fun-entry unused) z))
+           (let [site (n-call1! (n-fun-entry entry) callee y)]
+             (n-fun-close! entry (n-new2 OP-RETURN 0 (call-end site) (call-value site))))
+           (g-analyze!)
+           (assert (= (g-verify) 0))
+           (assert (mu-build-entry! entry))
+           (assert (= (mu-function-count) 2))
+           (assert (>= (mu-find-function entry) 0))
+           (assert (>= (mu-find-function callee) 0))
+           (assert (= (mu-find-function unused) -1))))
+
+(deftest unreachable_ideal_control_is_not_a_machine_block
+         (graph-reset! 110)
+         (let [pred (n-new1 OP-CONST (t-bool-con true) (g-start))
+               arms (n-if-arms! (n-peephole (n-new2 OP-IF 0 (g-start) pred)))
+               live (n-new2 OP-RETURN 0 (arms-t arms) (cfg-const 5))
+               dead (n-new2 OP-RETURN 0 (arms-f arms) (cfg-const 6))]
+           (n-add-def! (g-stop) live)
+           (n-add-def! (g-stop) dead)
+           (iterate!)
+           (assert (= (g-verify) 0))
+           (assert (mu-build!))
+           (assert (= (mu-block-count) 1))))
+
+(deftest never_exiting_corpus_control_still_has_a_finite_verified_cfg
+         (corpus-build! CX-NESTED)
+         (assert (= (g-verify) 0))
+         (assert (mu-build!))
+         (assert (> (mu-block-count) 1))
+         (assert (= (mu-function-block-count 0) (mu-block-count))))
+
+(deftest deterministic_dump_is_stable_across_construction_seeds
+         (let [a (stack (array i8 4096))
+               b (stack (array i8 4096))
+               (mut i) 1]
+           (build-cfg-nested-diamond! (matrix-extended-seed 0))
+           (assert (mu-build!))
+           (let [ta (mu-render (cast (ptr i8) a) 4096)]
+             (assert (str-eq ta
+                             "function 0 ideal -1 blocks 7\n  b0 Start ->b1[0] ->b2[0]\n  b1 CProj ->b6[2]\n  b2 CProj ->b3[0] ->b4[0]\n  b3 CProj ->b5[2]\n  b4 CProj ->b5[1]\n  b5 Region ->b6[1]\n  b6 Region\n"))
+             (loop (if (>= (load i) MATRIX-EXTENDED-SEEDS)
+                       (break)
+                       (do
+                         (build-cfg-nested-diamond! (matrix-extended-seed (load i)))
+                         (assert (mu-build!))
+                         (let [tb (mu-render (cast (ptr i8) b) 4096)]
+                           (assert (str-eq ta tb)))
+                         (store! i (+ (load i) 1))
+                         0))))))
+
+(deftest block_ownership_corruption_has_a_named_failure
+         (build-cfg-diamond! 103)
+         (assert (mu-build!))
+         (mu-corrupt-block-owner! 0 99)
+         (assert (not (mu-verify!)))
+         (assert (= (mu-verify-result) MCFG-OWNER)))
+
+(deftest edge_reciprocity_corruption_has_a_named_failure
+         (build-cfg-diamond! 104)
+         (assert (mu-build!))
+         (mu-corrupt-drop-last-pred!)
+         (assert (not (mu-verify!)))
+         (assert (= (mu-verify-result) MCFG-RECIPROCITY)))
+
+(deftest region_predecessor_slot_corruption_has_a_named_failure
+         (build-cfg-diamond! 105)
+         (assert (mu-build!))
+         (let [edge (edge-with-slot 1)]
+           (assert (>= edge 0))
+           (mu-corrupt-edge-target-slot! edge 0)
+           (assert (not (mu-verify!)))
+           (assert (= (mu-verify-result) MCFG-PREDECESSOR-SLOT))))
+
+(deftest rpo_layout_corruption_has_a_named_failure
+         (build-cfg-diamond! 113)
+         (assert (mu-build!))
+         (mu-corrupt-layout! (mu-function-block 0 0) 99)
+         (assert (not (mu-verify!)))
+         (assert (= (mu-verify-result) MCFG-RPO)))
+
+(deftest return_successor_corruption_has_a_named_terminator_failure
+         (graph-reset! 114)
+         (cfg-finish! (g-start) (cfg-const 1))
+         (assert (mu-build!))
+         (mu-corrupt-add-return-successor! 0)
+         (assert (not (mu-verify!)))
+         (assert (= (mu-verify-result) MCFG-TERMINATOR-ARITY)))
+
+(deftest cross_function_edge_corruption_has_a_named_isolation_failure
+         (graph-reset! 115)
+         (let [branching (n-fun-open! 0)
+               p (n-parm! branching 0)
+               arms (n-if-arms! (n-peephole (n-new2 OP-IF 0 (n-fun-entry branching) p)))
+               r0 (n-new2 OP-RETURN 0 (arms-t arms) (cfg-const 1))
+               r1 (n-new2 OP-RETURN 0 (arms-f arms) (cfg-const 2))
+               other (n-fun-open! 1)
+               x (n-parm! other 0)]
+           (n-fun-close! branching r0)
+           (n-fun-add-return! branching r1)
+           (n-fun-close! other (n-new2 OP-RETURN 0 (n-fun-entry other) x))
+           (g-analyze!)
+           (assert (mu-build!))
+           (let [branch-owner (mu-find-function branching)]
+             (assert (= (mu-function-return-count branch-owner) 2))
+             (assert (= (mu-block-owner (mu-function-return-block branch-owner 0)) branch-owner))
+             (assert (= (mu-block-owner (mu-function-return-block branch-owner 1)) branch-owner)))
+           (let [other-owner (mu-find-function other)
+                 other-block (mu-function-block other-owner 0)]
+             (mu-corrupt-edge-target! 0 other-block)
+             (assert (not (mu-verify!)))
+             (assert (= (mu-verify-result) MCFG-FUNCTION-ISOLATION)))))

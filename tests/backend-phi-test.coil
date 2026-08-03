@@ -1,0 +1,365 @@
+;; G3 general Phi edge lowering: positional copies, cycles, and falsification witnesses.
+(module backendphitest)
+
+(import "ty" :use *)
+(import "node" :use *)
+(import "backend" :use *)
+(import "verify" :use *)
+(import "corpus" :use *)
+(import "coil.assert" :use *)
+(import "coil.alloc" :use *)
+(import "coil.arraylist" :use *)
+(import "coil.io" :use *)
+(import "coil.fmt" :use *)
+(import "coil.primitive" :as primitive)
+
+(extern mmap :cc c [(ptr u8) i64 i32 i32 i32 i64] (-> (ptr u8)))
+(extern mprotect :cc c [(ptr u8) i64 i32] (-> i32))
+(extern munmap :cc c [(ptr u8) i64] (-> i32))
+(extern sys_icache_invalidate :cc c [(ptr u8) i64] (-> void))
+
+(defn assert-selected [] (-> i64)
+  (if (= (ms-result) MSEL-OK)
+      0
+      (do
+        (fmt (stderr) "selection failed {d} at {d}\n" (ms-result) (ms-result-item))
+        (let [(mut i) 0]
+          (loop (if (>= (load i) (be-inst-count))
+                    (break)
+                    (do
+                      (fmt (stderr)
+                           "  {d} op={d} dst={d} node={d} block={d}\n"
+                           (load i)
+                           (ms-inst-op (load i))
+                           (ms-inst-dst (load i))
+                           (ms-inst-node (load i))
+                           (ms-inst-block (load i)))
+                      (store! i (+ (load i) 1))
+                      0))))
+        (assert false)
+        0)))
+
+(defn pc [(v i64)] (-> i64)
+  (n-new1 OP-CONST (t-int-con v) (g-start)))
+(defn pb [(op i64) (a i64) (b i64)] (-> i64)
+  (n-peephole (n-new3 op (t-int) NO-NODE a b)))
+(defn finish! [(ctrl i64) (value i64)] (-> i64)
+  (let [ret (n-new2 OP-RETURN 0 ctrl value)]
+    (n-add-def! (g-stop) ret)
+    (g-analyze!)
+    ret))
+
+(defn native1 [(arg i64)] (-> i64)
+  (let [mem (mmap (cast (ptr u8) 0) 4096 3 4098 -1 0)]
+    (assert (!= (cast i64 mem) -1))
+    (let [n (be-code-len)
+          (mut i) 0]
+      (loop (if (>= (load i) n)
+                (break)
+                (do
+                  (store! (index mem (load i)) (cast u8 (be-code-byte (load i))))
+                  (store! i (+ (load i) 1))
+                  0)))
+      (assert (= (mprotect mem 4096 5) 0))
+      (sys_icache_invalidate mem n)
+      (let [fp (cast (fnptr c [i64] i64) mem)
+            got (primitive/call-ptr fp arg)]
+        (assert (= (munmap mem 4096) 0))
+        got))))
+
+(defn lower-and-encode-with! [(nregs i64)] (-> i64)
+  (assert (ms-lower-encodable!))
+  (be-schedule!)
+  (be-color! nregs)
+  (if (be-encode-checked!)
+      0
+      (do
+        (fmt (stderr)
+             "encode failed {d} at {d}, insts={d}, len={d}\n"
+             (be-result)
+             (be-result-node)
+             (be-inst-count)
+             (be-code-len))
+        (assert false)
+        0))
+  0)
+
+(defn lower-and-encode! [] (-> i64)
+  (lower-and-encode-with! 12))
+
+(defn diamond! [(nphis i64)] (-> i64)
+  (graph-reset! (+ 300 nphis))
+  (let [pred (n-new1 OP-ARG (t-bool) (g-start))
+        arms (n-if-arms! (n-peephole (n-new2 OP-IF 0 (g-start) pred)))
+        join (n-new OP-REGION 0)]
+    (n-add-def! join NO-NODE)
+    (n-add-def! join (arms-t arms))
+    (n-add-def! join (arms-f arms))
+    (let [(mut i) 0
+          (mut sum) (pc 0)]
+      (loop (if (>= (load i) nphis)
+                (break)
+                (do
+                  (let [phi (n-new OP-PHI (t-int))]
+                    (n-add-def! phi join)
+                    (n-add-def! phi (pc (+ 10 (load i))))
+                    (n-add-def! phi (pc (+ 20 (load i))))
+                    (store! sum (pb OP-ADD (load sum) phi)))
+                  (store! i (+ (load i) 1))
+                  0)))
+      (finish! join (load sum))
+      join)))
+
+(defn loop-pair! [(swap bool)] (-> i64)
+  (graph-reset! (if swap 312 311))
+  (let [lp (n-new OP-LOOP 0)]
+    (n-add-def! lp NO-NODE)
+    (n-add-def! lp (g-start))
+    (n-add-def! lp NO-NODE)
+    (n-peephole lp)
+    (let [a (n-new OP-PHI (t-int))
+          b (n-new OP-PHI (t-int))]
+      (n-add-def! a lp)
+      (n-add-def! a (pc (if swap 1 0)))
+      (n-add-def! a NO-NODE)
+      (n-add-def! b lp)
+      (n-add-def! b (pc (if swap 2 0)))
+      (n-add-def! b NO-NODE)
+      (n-peephole a)
+      (n-peephole b)
+      (let [anext (if swap b (pb OP-ADD a (pc 1)))
+            bnext (if swap a (pb OP-ADD b (pc 1)))
+            arms (n-if-arms! (n-peephole (n-new2 OP-IF 0 lp (pb OP-LT a (pc (if swap 2 3))))))]
+        (n-set-def! a 2 anext)
+        (n-set-def! b 2 bnext)
+        (n-set-def! lp 2 (arms-t arms))
+        (let [ret (n-new2 OP-RETURN 0 (arms-f arms) (pb OP-ADD a b))]
+          (n-add-def! (g-stop) ret)
+          (wl-push! lp)
+          (wl-push! a)
+          (wl-push! b)
+          (iterate!)
+          lp)))))
+
+(defn assert-incoming-width [(target i64) (width i64)] (-> i64)
+  (let [(mut edge) 0
+        (mut incoming) 0]
+    (loop (if (>= (load edge) (mu-edge-count))
+              (break)
+              (do
+                (if (= (mu-edge-target (load edge)) target)
+                    (do
+                      (assert (= (mu-edge-copy-count (load edge)) width))
+                      (assert (= (mu-edge-move-count (load edge)) width))
+                      (store! incoming (+ (load incoming) 1)))
+                    0)
+                (store! edge (+ (load edge) 1))
+                0)))
+    (assert (= (load incoming) 2))
+    0))
+
+(defn find-copy-edge [] (-> i64)
+  (let [(mut edge) 0
+        (mut found) -1]
+    (loop (if (or (>= (load edge) (mu-edge-count)) (>= (load found) 0))
+              (break)
+              (do
+                (if (> (mu-edge-copy-count (load edge)) 0) (store! found (load edge)) 0)
+                (store! edge (+ (load edge) 1))
+                0)))
+    (load found)))
+
+(deftest two_phi_diamond_has_two_slot_indexed_copies_per_incoming_edge
+         (let [join (diamond! 2)]
+           (assert (= (g-verify) 0))
+           (ms-select!)
+           (assert-selected)
+           (assert-incoming-width (al-get (load (field (machine-unit) ctrl-block)) join) 2)))
+
+(deftest three_phi_diamond_has_unbounded_copy_width
+         (let [join (diamond! 3)]
+           (assert (= (g-verify) 0))
+           (assert (ms-select!))
+           (assert-incoming-width (al-get (load (field (machine-unit) ctrl-block)) join) 3)))
+
+(deftest loop_with_two_independent_carried_values_builds_entry_and_backedge_copies
+         (let [lp (loop-pair! false)]
+           (assert (= (g-verify) 0))
+           (assert (ms-select!))
+           (assert-incoming-width (al-get (load (field (machine-unit) ctrl-block)) lp) 2)))
+
+(deftest loop_swap_is_preserved_as_a_parallel_copy_cycle
+         (let [lp (loop-pair! true)]
+           (assert (= (g-verify) 0))
+           (assert (ms-select!))
+           (let [target (al-get (load (field (machine-unit) ctrl-block)) lp)
+                 (mut edge) 0
+                 (mut cycle) false]
+             (loop (if (>= (load edge) (mu-edge-count))
+                       (break)
+                       (do
+                         (if (and (= (mu-edge-target (load edge)) target)
+                                  (= (mu-edge-target-slot (load edge)) 2))
+                             (let [a-dst (mu-copy-dst (load edge) 0)
+                                   a-src (mu-copy-src (load edge) 0)
+                                   b-dst (mu-copy-dst (load edge) 1)
+                                   b-src (mu-copy-src (load edge) 1)]
+                               (if (and (= a-dst b-src) (= b-dst a-src))
+                                   (do
+                                     (assert (= (mu-edge-move-count (load edge)) 3))
+                                     (assert (mu-move-temporary? (load edge) 0))
+                                     (assert (!= (mu-move-dst (load edge) 0) a-dst))
+                                     (assert (!= (mu-move-dst (load edge) 0) b-dst))
+                                     (assert (not (mu-move-temporary? (load edge) 1)))
+                                     (assert (not (mu-move-temporary? (load edge) 2)))
+                                     (store! cycle true))
+                                   0))
+                             0)
+                         (store! edge (+ (load edge) 1))
+                         0)))
+             (assert (load cycle)))))
+
+(deftest phi_copy_edges_are_already_split_control_projection_blocks
+         (let [join (diamond! 2)]
+           (assert (ms-select!))
+           (let [target (al-get (load (field (machine-unit) ctrl-block)) join)
+                 (mut edge) 0]
+             (loop (if (>= (load edge) (mu-edge-count))
+                       (break)
+                       (do
+                         (if (= (mu-edge-target (load edge)) target)
+                             (assert (= (mu-block-succ-count (mu-edge-source (load edge))) 1))
+                             0)
+                         (store! edge (+ (load edge) 1))
+                         0))))))
+
+(deftest swapped_copy_source_is_rejected_by_named_phi_verifier
+         (diamond! 2)
+         (assert (ms-select!))
+         (let [edge (find-copy-edge)]
+           (ms-corrupt-copy-source! edge 0 (mu-copy-src edge 1))
+           (assert (not (ms-verify!)))
+           (assert (= (ms-result) MSEL-PHI))))
+
+(deftest copy_claiming_the_wrong_phi_is_rejected
+         (diamond! 2)
+         (assert (ms-select!))
+         (let [edge (find-copy-edge)]
+           (ms-corrupt-copy-phi! edge 0 (mu-copy-phi edge 1))
+           (assert (not (ms-verify!)))
+           (assert (= (ms-result) MSEL-PHI))))
+
+(deftest missing_copy_is_rejected
+         (diamond! 2)
+         (assert (ms-select!))
+         (let [edge (find-copy-edge)]
+           (store! (field (mu-edge edge) copy-count) 1)
+           (assert (not (ms-verify!)))
+           (assert (= (ms-result) MSEL-PHI))))
+
+(deftest lowered_two_phi_diamond_executes_both_arm_orders
+         (diamond! 2)
+         (assert (ms-select!))
+         (lower-and-encode!)
+         (assert (= (native1 1) 21))
+         (assert (= (native1 0) 41)))
+
+(deftest lowered_two_value_loop_executes_backedge_copies
+         (loop-pair! false)
+         (assert (ms-select!))
+         (lower-and-encode-with! 2)
+         (let [got (native1 0)]
+           (if (!= got 6) (do (fmt (stderr) "tiny loop got {d}\n" got) 0) 0)
+           (assert (= got 6))))
+
+(deftest lowered_swap_cycle_executes_through_temporary
+         (loop-pair! true)
+         (assert (ms-select!))
+         (lower-and-encode-with! 1)
+         (let [got (native1 0)]
+           (if (!= got 3) (do (fmt (stderr) "tiny swap got {d}\n" got) 0) 0)
+           (assert (= got 3))))
+
+(deftest edge_copies_execute_with_forced_spilled_source_and_destination
+         (let [join (diamond! 2)]
+           (assert (ms-select!))
+           (let [target
+                   (ms-phi-block 0
+                                 (let [(mut node) 0
+                                       (mut phi) NO-NODE]
+                                   (loop (if (>= (load node) (n-count))
+                                             (break)
+                                             (do
+                                               (if (and (= (n-op (load node)) OP-PHI)
+                                                        (= (n-in (load node) 0) join))
+                                                   (do (store! phi (load node)) (break))
+                                                   0)
+                                               (store! node (+ (load node) 1))
+                                               0)))
+                                   (load phi)))
+                 (mut edge) 0
+                 (mut chosen) -1]
+             (loop (if (>= (load edge) (mu-edge-count))
+                       (break)
+                       (do
+                         (if (= (mu-edge-target (load edge)) target)
+                             (do (store! chosen (load edge)) (break))
+                             0)
+                         (store! edge (+ (load edge) 1))
+                         0)))
+             (assert (>= (load chosen) 0))
+             (let [src (mu-copy-src (load chosen) 0)
+                   dst (mu-copy-dst (load chosen) 0)]
+               (assert (ms-lower-encodable!))
+               (be-schedule!)
+               (be-color! 12)
+               (be-force-spill-vreg! src 0)
+               (be-force-spill-vreg! dst 1)
+               (assert (be-encode-checked!))))
+           (assert (> (be-spills) 0))
+           (assert (= (native1 1) 21))
+           (assert (= (native1 0) 41))))
+
+(deftest loop_memory_phi_orders_each_incoming_state_on_its_source_edge
+         (corpus-build! CX-OBJECT-LOOP)
+         (assert (= (g-verify) 0))
+         (ms-select!)
+         (assert-selected)
+         (let [(mut node) 0
+               (mut phi) NO-NODE]
+           (loop (if (>= (load node) (n-count))
+                     (break)
+                     (do
+                       (if (and (not (n-dead? (load node)))
+                                (and (= (n-op (load node)) OP-PHI)
+                                     (ty-mem? (n-ty (load node)))))
+                           (store! phi (load node))
+                           0)
+                       (store! node (+ (load node) 1))
+                       0)))
+           (assert (!= (load phi) NO-NODE))
+           (let [target (ms-phi-block 0 (load phi))
+                 (mut edge) 0
+                 (mut incoming) 0]
+             (loop (if (>= (load edge) (mu-edge-count))
+                       (break)
+                       (do
+                         (if (= (mu-edge-target (load edge)) target)
+                             (do
+                               (assert (= (mu-edge-copy-count (load edge)) 2))
+                               (let [(mut i) 0
+                                     (mut memory) 0]
+                                 (loop (if (>= (load i) (mu-edge-copy-count (load edge)))
+                                           (break)
+                                           (do
+                                             (if (= (mu-copy-kind (load edge) (load i)) MCOPY-MEMORY)
+                                                 (store! memory (+ (load memory) 1))
+                                                 0)
+                                             (store! i (+ (load i) 1))
+                                             0)))
+                                 (assert (= (load memory) 1)))
+                               (store! incoming (+ (load incoming) 1)))
+                             0)
+                         (store! edge (+ (load edge) 1))
+                         0)))
+             (assert (= (load incoming) 2)))))

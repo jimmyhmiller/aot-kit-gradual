@@ -1,0 +1,231 @@
+;; G10 multi-function object publication and metadata validation.
+(module backendobjecttest)
+
+(import "ty" :use *)
+(import "node" :use *)
+(import "backend" :use *)
+(import "verify" :use *)
+(import "corpus" :use *)
+(import "shape" :use *)
+(import "coil.assert" :use *)
+(import "coil.io" :use *)
+(import "coil.fmt" :use *)
+
+(defn object-publish! [] (-> i64)
+  (if (be-macho-checked!) 0
+    (do (fmt (stderr) "object publish failed result={d} item={d} ber={d}\n"
+             (mobj-result) (mobj-item) (be-result))
+        (assert false) 0)))
+
+(defn oc [(v i64)] (-> i64) (n-new1 OP-CONST (t-int-con v) (g-start)))
+(defn ob [(op i64) (a i64) (b i64)] (-> i64) (n-new3 op 0 NO-NODE a b))
+
+(defn object-call-program! [] (-> i64)
+  (graph-reset! 1001)
+  (let [inc (n-fun-open! 0)
+        x (n-parm! inc 0)
+        body (n-new2 OP-RETURN 0 (n-fun-entry inc) (ob OP-ADD x (oc 1)))]
+    (n-fun-close! inc body)
+    (let [site (n-call1! (g-start) inc (oc 41))
+          ret (n-new2 OP-RETURN 0 (call-end site) (call-value site))]
+      (n-add-def! (g-stop) ret)
+      (g-analyze!) 0)))
+
+(defn object-compile! [] (-> i64)
+  (assert (be-select-machine-program!))
+  (assert (>= (be-schedule!) 0))
+  (assert (>= (be-color! 8) 0))
+  (assert (be-encode-checked!)) 0)
+
+(defn object-compile-layout! [(seed i64)] (-> i64)
+  (assert (be-select-machine-program!))
+  (assert (>= (be-schedule!) 0))
+  (assert (>= (be-function-layout-seeded! seed) 0))
+  (assert (>= (be-color! 8) 0))
+  (assert (be-encode-checked!))
+  (object-publish!) 0)
+
+(defn object-compile-runtime! [] (-> i64)
+  (assert (be-select-machine-program!))
+  (be-use-runtime-allocation! true)
+  (assert (>= (be-schedule!) 0))
+  (assert (>= (be-color! 8) 0))
+  (assert (be-encode-checked!)) 0)
+
+(deftest encoder_publishes_exact_nonempty_range_for_every_machine_function
+  (object-call-program!)
+  (object-compile!)
+  (assert (= (mu-function-count) 2))
+  (let [(mut owner) 0]
+    (loop
+      (if (>= (load owner) (mu-function-count)) (break)
+        (do
+          (assert (>= (mu-function-code-start (load owner)) 0))
+          (assert (> (mu-function-code-size (load owner)) 0))
+          (assert (<= (+ (mu-function-code-start (load owner))
+                         (mu-function-code-size (load owner)))
+                      (be-code-len)))
+          (store! owner (+ (load owner) 1)) 0))))
+  (assert (mobj-verify-model!)))
+
+(deftest invalid_function_range_is_named_and_object_publication_is_atomic
+  (object-call-program!)
+  (object-compile!)
+  (object-publish!)
+  (assert (> (be-object-len) 0))
+  (mobj-corrupt-function-range! 1 (be-code-len) 8)
+  (assert (not (be-macho-checked!)))
+  (assert (= (mobj-result) MOBJ-FUNCTION-RANGE))
+  (assert (= (mobj-item) 1))
+  (assert (= (be-object-len) 0)))
+
+(deftest raw_object_parser_cross_checks_local_and_exported_symbols
+  (object-call-program!)
+  (object-compile!)
+  (object-publish!)
+  (assert (mobj-verify-bytes!))
+  (assert (= (mobj-result) MOBJ-OK)))
+
+(deftest corrupt_symbol_section_is_rejected_by_raw_byte_parser
+  (object-call-program!)
+  (object-compile!)
+  (object-publish!)
+  ; LC_SYMTAB.symoff is fixed at byte 352 in schema v1. Corrupt local symbol n_sect.
+  (let [symoff (mobj-u32 352)]
+    (mobj-corrupt-byte! (+ symoff 5) 0)
+    (assert (not (mobj-verify-bytes!)))
+    (assert (= (mobj-result) MOBJ-SYMBOL))
+    (assert (= (mobj-item) 0))))
+
+(deftest versioned_stackmap_and_layout_sections_are_structurally_cross_checked
+  (object-call-program!)
+  (object-compile!)
+  (object-publish!)
+  (let [stackoff (mobj-u32 232) layoutoff (mobj-u32 312)]
+    (assert (= (mobj-u32 stackoff) 1398034241))
+    (assert (= (mobj-u32 (+ stackoff 4)) 2))
+    (assert (= (mobj-u32 (+ stackoff 8)) 1))
+    (assert (= (mobj-u32 layoutoff) 1280593729))
+    (assert (= (mobj-u32 (+ layoutoff 4)) 1))
+    (assert (mobj-verify-bytes!))))
+
+(deftest corrupt_stackmap_reference_and_layout_version_are_named
+  (object-call-program!)
+  (object-compile!)
+  (object-publish!)
+  (let [stackoff (mobj-u32 232)]
+    ; First site instruction index follows the header and function records, then pc/owner.
+    (mobj-corrupt-byte! (+ (+ (+ stackoff 24) (* (mu-function-count) 32)) 8) 255)
+    (assert (not (mobj-verify-bytes!)))
+    (assert (= (mobj-result) MOBJ-STACKMAP)))
+  (object-call-program!)
+  (object-compile!)
+  (object-publish!)
+  (let [layoutoff (mobj-u32 312)]
+    (mobj-corrupt-byte! (+ layoutoff 4) 2)
+    (assert (not (mobj-verify-bytes!)))
+    (assert (= (mobj-result) MOBJ-LAYOUT))))
+
+(deftest three_function_layout_seeds_preserve_valid_symbols_calls_and_metadata
+  (let [(mut seed) 0 (mut prior-entry) -1]
+    (loop
+      (if (>= (load seed) 3) (break)
+        (do
+          (object-call-program!)
+          (object-compile-layout! (load seed))
+          (assert (mobj-verify-model!))
+          (assert (mobj-verify-bytes!))
+          (if (> (load seed) 0)
+              (assert (!= (mu-function-code-start 0) (load prior-entry))) 0)
+          (store! prior-entry (mu-function-code-start 0))
+          (store! seed (+ (load seed) 1)) 0)))))
+
+(deftest corrupt_internal_call_target_is_named_as_a_relocation_failure
+  (object-call-program!)
+  (object-compile!)
+  (let [(mut at) 0 (mut call) -1]
+    (loop
+      (if (or (>= (load at) (be-inst-count)) (>= (load call) 0)) (break)
+        (do (if (= (ms-inst-op (load at)) MI-CALL) (store! call (load at)) 0)
+            (store! at (+ (load at) 1)) 0)))
+    (assert (>= (load call) 0))
+    (mobj-corrupt-call-target! (load call) 99)
+    (assert (not (mobj-verify-model!)))
+    (assert (= (mobj-result) MOBJ-RELOCATION))
+    (assert (= (mobj-item) (load call)))))
+
+(deftest call_stackmaps_exclude_arguments_and_the_not_yet_defined_result
+  (object-call-program!)
+  (object-compile!)
+  (let [(mut at) 0 (mut call) -1]
+    (loop
+      (if (>= (load at) (be-inst-count)) (break)
+        (do (if (= (ms-inst-op (load at)) MI-CALL) (store! call (load at)) 0)
+            (store! at (+ (load at) 1)) 0)))
+    (assert (>= (load call) 0))
+    (assert (not (mobj-root? (load call) (ms-inst-dst (load call)))))
+    (let [(mut vr) 0]
+      (loop
+        (if (>= (load vr) (ml-vreg-count)) (break)
+          (do
+            (if (mobj-root? (load call) (load vr))
+                (assert (or (>= (mra-reg (load vr)) 19)
+                            (>= (mra-spill (load vr)) 0))) 0)
+            (store! vr (+ (load vr) 1)) 0))))))
+
+(deftest allocation_slow_path_has_named_undefined_symbol_and_branch_relocation
+  (corpus-build! CX-OBJECT-RET)
+  (object-compile-runtime!)
+  (object-publish!)
+  (assert (= (mobj-external-reloc-count) 1))
+  (assert (= (mobj-u32 164) 1))
+  (let [basesyms (mu-function-count) relocoff (mobj-u32 160)]
+    (assert (= (& (mobj-u32 (+ relocoff 4)) 16777215) basesyms)))
+  (assert (mobj-verify-bytes!)))
+
+(deftest corrupt_external_branch_relocation_is_named
+  (corpus-build! CX-OBJECT-RET)
+  (object-compile-runtime!)
+  (object-publish!)
+  (let [relocoff (mobj-u32 160)]
+    ; Destroy the relocation type/pcrel/width byte while retaining its address.
+    (mobj-corrupt-byte! (+ relocoff 7) 0)
+    (assert (not (mobj-verify-bytes!)))
+    (assert (= (mobj-result) MOBJ-RELOCATION))
+    (assert (= (mobj-item) 0))))
+
+(deftest managed_root_stackmap_serializes_exact_g7_location_and_kind
+  (graph-reset! 1002)
+  (shape-reset!)
+  (let [sx (shape-transition SHAPE-ROOT "x" (t-dyn)) ax (shape-field-alias sx 0)
+        first (n-new-obj1! (g-start) sx (mk-mem-in ax)) root (n-obj-ptr first)
+        mem1 (n-new4 OP-STORE ax NO-NODE (n-obj-mem first 0) root (oc 1))
+        second (n-new-obj1! (g-start) sx mem1) other (n-obj-ptr second)
+        mem2 (n-new4 OP-STORE ax NO-NODE (n-obj-mem second 0) other (oc 2))
+        value (n-new3 OP-LOAD ax NO-NODE mem2 root)
+        ret (n-new3 OP-RETURN 0 (g-start) value mem2)]
+    (n-add-def! (g-stop) ret) (g-analyze!)
+    (assert (be-select-machine-program!))
+    (be-use-runtime-allocation! true)
+    (assert (>= (be-schedule!) 0))
+    (assert (>= (be-color! 1) 0))
+    (assert (be-encode-checked!))
+    (object-publish!)
+    (let [root-v (ms-vget 0 root) stackoff (mobj-u32 232)
+          sites (mobj-u32 (+ stackoff 8)) roots (mobj-u32 (+ stackoff 12))
+          rootbase (+ (+ (+ stackoff 24) (* (mu-function-count) 32)) (* sites 24))
+          (mut which) 0 (mut found) false]
+      (assert (= sites 2))
+      (assert (> roots 0))
+      (loop
+        (if (>= (load which) roots) (break)
+          (do
+            (let [rec (+ rootbase (* (load which) 16))]
+              (if (= (mobj-u32 rec) root-v)
+                  (do (store! found true)
+                      (assert (= (mobj-u32 (+ rec 4)) MLK-RAW-MANAGED))
+                      (assert (= (mobj-u32 (+ rec 8)) 1))
+                      (assert (= (mobj-u32 (+ rec 12)) (be-spill-off-vreg root-v)))) 0))
+            (store! which (+ (load which) 1)) 0)))
+      (assert (load found))
+      (assert (mobj-verify-bytes!)))))

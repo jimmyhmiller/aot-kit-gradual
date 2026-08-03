@@ -1,0 +1,115 @@
+;; X1 compiled moving-GC bridge metadata and frame laws.
+(module backendnativegctest)
+
+(import "ty" :use *)
+(import "node" :use *)
+(import "shape" :use *)
+(import "backend" :use *)
+(import "coil.assert" :use *)
+
+(defn ngc-const [(v i64)] (-> i64) (n-new1 OP-CONST (t-int-con v) (g-start)))
+(defn ngc-mem [(alias i64)] (-> i64)
+  (n-new1 OP-ARG (t-mem-alias alias (t-top)) (g-start)))
+
+(defn ngc-program! [] (-> i64)
+  (graph-reset! 1201) (shape-reset!)
+  (let [sx (shape-transition SHAPE-ROOT "x" (t-int)) ax (shape-field-alias sx 0)
+        first (n-new-obj1! (g-start) sx (ngc-mem ax)) root (n-obj-ptr first)
+        mem1 (n-new4 OP-STORE ax NO-NODE (n-obj-mem first 0) root (ngc-const 41))
+        second (n-new-obj1! (g-start) sx mem1) other (n-obj-ptr second)
+        mem2 (n-new4 OP-STORE ax NO-NODE (n-obj-mem second 0) other (ngc-const 2))
+        value (n-new3 OP-LOAD ax NO-NODE mem2 root)
+        ret (n-new3 OP-RETURN 0 (g-start) value mem2)]
+    (n-add-def! (g-stop) ret) (g-analyze!) root))
+
+(defn ngc-compile-budget! [(budget i64)] (-> i64)
+  (assert (be-select-machine-program!))
+  (be-use-runtime-allocation! true)
+  (assert (>= (be-schedule!) 0))
+  (assert (>= (be-color! budget) 0))
+  (assert (be-encode-checked!))
+  (assert (be-macho-checked!)) 0)
+(defn ngc-compile! [] (-> i64) (ngc-compile-budget! 1))
+
+(deftest stackmap_v2_contains_exact_native_function_frame_records
+  (ngc-program!) (ngc-compile!)
+  (let [stackoff (mobj-u32 232) rec (+ (mobj-u32 232) 24)]
+    (assert (= (mobj-u32 stackoff) 1398034241))
+    (assert (= (mobj-u32 (+ stackoff 4)) 2))
+    (assert (= (mobj-u32 (+ stackoff 16)) (mu-function-count)))
+    (assert (= (mobj-u32 (+ rec 12)) (mu-function-frame-size 0)))
+    (assert (= (mobj-u64 (+ rec 16)) (mu-function-callee-mask 0)))
+    (assert (mobj-verify-bytes!))))
+
+(deftest corrupt_native_frame_size_is_named_before_runtime_consumption
+  (ngc-program!) (ngc-compile!)
+  (let [stackoff (mobj-u32 232)]
+    (mobj-corrupt-byte! (+ (+ stackoff 24) 12) 1)
+    (assert (not (mobj-verify-bytes!)))
+    (assert (= (mobj-result) MOBJ-STACKMAP))))
+
+(deftest native_layout_uses_header_aware_field_offsets_and_reference_bitmap
+  (ngc-program!) (ngc-compile!)
+  (assert (= (be-field-off 0) 8))
+  (let [layoutoff (mobj-u32 312) count (mobj-u32 (+ layoutoff 8))]
+    (assert (> count 1))
+    ; Shape 1 has one scalar field, hence no reference bit.
+    (let [rec (+ (+ layoutoff 16) 32)]
+      (assert (= (mobj-u32 rec) 1))
+      (assert (= (mobj-u32 (+ rec 4)) 16))
+      (assert (= (mobj-u64 (+ rec 16)) 0)))))
+
+(deftest allocation_return_pc_is_after_relocated_branch_instruction
+  (ngc-program!) (ngc-compile!)
+  (let [stackoff (mobj-u32 232)
+        sitebase (+ (+ stackoff 24) (* (mu-function-count) 32))
+        relocoff (mobj-u32 160)]
+    (assert (= (mobj-u32 sitebase) (+ (mobj-u32 relocoff) 4)))))
+
+(deftest normal_new_contains_inline_bump_path_before_the_relocated_slow_call
+  (ngc-program!) (ngc-compile!)
+  (let [(mut at) 0 (mut allocation) -1]
+    (loop
+      (if (or (>= (load at) (be-inst-count)) (>= (load allocation) 0)) (break)
+        (do (if (= (ms-inst-op (load at)) MI-NEW) (store! allocation (load at)) 0)
+            (store! at (+ (load at) 1)) 0)))
+    (assert (>= (load allocation) 0))
+    (let [first (load (field (be-inst (load allocation)) first))
+          branch (mobj-new-branch-pc (load allocation))]
+      (assert (= (be-code-u32 first) (a64-ldr 9 28 0)))
+      (assert (> branch (+ first 40)))
+      (assert (= (be-code-u32 branch) (a64-bl 0))))))
+
+(deftest managed_root_uses_a_callee_saved_register_at_native_allocation_pressure
+  (let [root (ngc-program!)]
+    (ngc-compile-budget! 10)
+    (let [root-v (ms-vget 0 root) (mut at) 0 (mut seen) 0 (mut second) -1]
+      (loop
+        (if (>= (load at) (be-inst-count)) (break)
+          (do
+            (if (= (ms-inst-op (load at)) MI-NEW)
+                (do (store! seen (+ (load seen) 1))
+                    (if (= (load seen) 2) (store! second (load at)) 0)) 0)
+            (store! at (+ (load at) 1)) 0)))
+      (assert (>= (load second) 0))
+      (assert (mobj-root? (load second) root-v))
+      (assert (>= (mra-reg root-v) 19))
+      (assert (<= (mra-reg root-v) 27)))))
+
+(deftest missing_safepoint_pc_is_rejected_as_a_named_stackmap_failure
+  (ngc-program!) (ngc-compile!)
+  (let [stackoff (mobj-u32 232)
+        sitebase (+ (+ stackoff 24) (* (mu-function-count) 32))]
+    (mobj-corrupt-byte! sitebase 255)
+    (assert (not (mobj-verify-bytes!)))
+    (assert (= (mobj-result) MOBJ-STACKMAP))))
+
+(deftest wrong_serialized_root_kind_is_rejected_before_runtime_consumption
+  (ngc-program!) (ngc-compile!)
+  (let [stackoff (mobj-u32 232) sites (mobj-u32 (+ stackoff 8))
+        sitebase (+ (+ stackoff 24) (* (mu-function-count) 32))
+        rootbase (+ sitebase (* sites 24))]
+    (assert (> (mobj-u32 (+ stackoff 12)) 0))
+    (mobj-corrupt-byte! (+ rootbase 4) 0)
+    (assert (not (mobj-verify-bytes!)))
+    (assert (= (mobj-result) MOBJ-STACKMAP))))

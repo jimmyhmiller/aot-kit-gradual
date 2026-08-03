@@ -1,0 +1,240 @@
+;; G8 global code motion contracts: dominators, placement, and memory ordering.
+(module backendmotiontest)
+
+(import "ty" :use *)
+(import "node" :use *)
+(import "backend" :use *)
+(import "corpus" :use *)
+(import "shape" :use *)
+(import "coil.assert" :use *)
+(import "coil.alloc" :use *)
+
+(defn motion-const [(v i64)] (-> i64)
+  (n-new1 OP-CONST (t-int-con v) (g-start)))
+(defn motion-bin [(op i64) (a i64) (b i64)] (-> i64)
+  (n-peephole (n-new3 op (t-int) NO-NODE a b)))
+
+(defn motion-finish! [(ctrl i64)] (-> i64)
+  (let [ret (n-new2 OP-RETURN 0 ctrl (motion-const 7))]
+    (n-add-def! (g-stop) ret)
+    (g-analyze!)
+    ret))
+
+(defn motion-block-for [(ctrl i64)] (-> i64)
+  (let [(mut i) 0 (mut found) -1]
+    (loop
+      (if (or (>= (load i) (mu-block-count)) (>= (load found) 0)) (break)
+        (do
+          (if (= (mu-block-control (load i)) ctrl) (store! found (load i)) 0)
+          (store! i (+ (load i) 1)) 0)))
+    (load found)))
+
+(defn motion-inst-for [(node i64)] (-> i64)
+  (let [(mut i) 0 (mut found) -1]
+    (loop
+      (if (or (>= (load i) (be-inst-count)) (>= (load found) 0)) (break)
+        (do
+          (if (= (ms-inst-node (load i)) node) (store! found (load i)) 0)
+          (store! i (+ (load i) 1)) 0)))
+    (load found)))
+
+(defn motion-first-pred [(target i64)] (-> i64)
+  (let [(mut edge) 0 (mut found) -1]
+    (loop
+      (if (or (>= (load edge) (mu-edge-count)) (>= (load found) 0)) (break)
+        (do
+          (if (= (mu-edge-target (load edge)) target)
+              (store! found (mu-edge-source (load edge))) 0)
+          (store! edge (+ (load edge) 1)) 0)))
+    (load found)))
+
+(defn build-motion-diamond! [] (-> i64)
+  (graph-reset! 801)
+  (let [pred (n-new1 OP-ARG (t-bool) (g-start))
+        arms (n-if-arms! (n-peephole (n-new2 OP-IF 0 (g-start) pred)))
+        join (n-new OP-REGION 0)]
+    (n-add-def! join NO-NODE)
+    (n-add-def! join (arms-t arms))
+    (n-add-def! join (arms-f arms))
+    (motion-finish! join)
+    join))
+
+(defn build-motion-loop! [] (-> i64)
+  (graph-reset! 802)
+  (let [lp (n-new OP-LOOP 0)]
+    (n-add-def! lp NO-NODE)
+    (n-add-def! lp (g-start))
+    (n-add-def! lp NO-NODE)
+    (n-peephole lp)
+    (let [pred (n-new1 OP-ARG (t-bool) (g-start))
+          arms (n-if-arms! (n-peephole (n-new2 OP-IF 0 lp pred)))]
+      (n-set-def! lp 2 (arms-t arms))
+      (let [ret (n-new2 OP-RETURN 0 (arms-f arms) (motion-const 1))]
+        (n-add-def! (g-stop) ret)
+        (wl-push! lp)
+        (iterate!)
+        lp))))
+
+(deftest diamond_has_exact_immediate_dominators
+  (let [join (build-motion-diamond!)]
+    (assert (mu-build!))
+    (let [entry (mu-function-block 0 0) join-block (motion-block-for join)
+          (mut i) 0]
+      (assert (= (mu-block-idom entry) entry))
+      (loop
+        (if (>= (load i) (mu-block-count)) (break)
+          (do
+            (if (!= (load i) entry) (assert (= (mu-block-idom (load i)) entry)) 0)
+            (store! i (+ (load i) 1)) 0)))
+      (assert (mu-dominates? entry join-block))
+      (assert (not (mu-dominates? join-block entry))))))
+
+(deftest loop_header_and_arms_have_exact_immediate_dominators
+  (let [lp (build-motion-loop!)]
+    (assert (mu-build!))
+    (let [entry (mu-function-block 0 0) header (motion-block-for lp) (mut i) 0]
+      (assert (= (mu-block-idom header) entry))
+      (loop
+        (if (>= (load i) (mu-block-count)) (break)
+          (do
+            (if (and (!= (load i) entry) (!= (load i) header))
+                (assert (= (mu-block-idom (load i)) header)) 0)
+            (store! i (+ (load i) 1)) 0)))
+      (assert (mu-dominates? entry header))
+      (assert (not (mu-dominates? header entry))))))
+
+(deftest idom_analysis_is_deterministic_across_rebuilds
+  (let [first (stack (array i64 8)) (mut i) 0]
+    (build-motion-diamond!)
+    (assert (mu-build!))
+    (loop
+      (if (>= (load i) (mu-block-count)) (break)
+        (do (store! (index first (load i)) (mu-block-idom (load i)))
+            (store! i (+ (load i) 1)) 0)))
+    (build-motion-diamond!)
+    (assert (mu-build!))
+    (store! i 0)
+    (loop
+      (if (>= (load i) (mu-block-count)) (break)
+        (do (assert (= (load (index first (load i))) (mu-block-idom (load i))))
+            (store! i (+ (load i) 1)) 0)))))
+
+(deftest invalid_immediate_dominator_has_a_named_failure
+  (build-motion-diamond!)
+  (assert (mu-build!))
+  (let [nonentry (mu-function-block 0 1)]
+    (mu-corrupt-idom! nonentry nonentry)
+    (assert (not (mu-verify!)))
+    (assert (= (mu-verify-result) MCFG-IDOM))))
+
+(deftest branch_local_constant_sinks_to_its_join_use
+  (let [join (build-motion-diamond!) value (n-in (n-in (g-stop) 0) 1)]
+    (assert (ms-select!))
+    (let [at (motion-inst-for value) target (motion-block-for join)]
+      (assert (>= at 0))
+      (assert (= (ms-inst-op at) MI-MOVI))
+      (assert (= (ms-inst-earliest at) (mu-function-block 0 0)))
+      (assert (= (ms-inst-latest at) target))
+      (assert (= (ms-inst-block at) target)))))
+
+(deftest too_early_placement_has_a_named_failure
+  (let [join (build-motion-diamond!) value (n-in (n-in (g-stop) 0) 1)]
+    (assert (ms-select!))
+    (let [at (motion-inst-for value) target (motion-block-for join)
+          entry (mu-function-block 0 0)]
+      (ms-corrupt-earliest! at target)
+      (ms-corrupt-placement! at entry)
+      (assert (not (ms-verify!)))
+      (assert (= (ms-result) MSEL-PLACEMENT)))))
+
+(deftest non_dominating_placement_has_a_named_failure
+  (let [join (build-motion-diamond!) value (n-in (n-in (g-stop) 0) 1)]
+    (assert (ms-select!))
+    (let [at (motion-inst-for value) target (motion-block-for join)
+          arm (motion-first-pred target)]
+      (assert (>= arm 0))
+      (ms-corrupt-placement! at arm)
+      (assert (not (ms-verify!)))
+      (assert (= (ms-result) MSEL-PLACEMENT)))))
+
+(deftest aliasing_load_before_store_has_an_explicit_anti_dependency
+  (graph-reset! 803)
+  (shape-reset!)
+  (let [sx (shape-transition SHAPE-ROOT "x" (t-dyn)) ax (shape-field-alias sx 0)
+        nw (n-new-obj1! (g-start) sx (mk-mem-in ax)) obj (n-obj-ptr nw)
+        mem0 (n-obj-mem nw 0)
+        init (n-new4 OP-STORE ax NO-NODE mem0 obj (motion-const 1))
+        loaded (n-new3 OP-LOAD ax NO-NODE init obj)
+        later (n-new4 OP-STORE ax NO-NODE init obj (motion-const 2))
+        ret (n-new3 OP-RETURN 0 (g-start) loaded later)]
+    (n-add-def! (g-stop) ret)
+    (g-analyze!)
+    (assert (ms-select!))
+    (let [store-at (motion-inst-for later)]
+      (assert (>= store-at 0))
+      (assert (= (ms-inst-memory-anti-count store-at) 1))
+      (assert (= (ms-inst-memory-anti-node store-at 0) loaded))
+      (ms-corrupt-memory-anti-dep! store-at init)
+      (assert (not (ms-verify!)))
+      (assert (= (ms-result) MSEL-MEMORY-ORDER)))))
+
+(deftest phi_source_latest_bound_is_the_incoming_edge_source
+  (graph-reset! 804)
+  (let [pred (n-new1 OP-ARG (t-bool) (g-start))
+        arms (n-if-arms! (n-peephole (n-new2 OP-IF 0 (g-start) pred)))
+        join (n-new OP-REGION 0) yes (motion-const 11) no (motion-const 22)]
+    (n-add-def! join NO-NODE)
+    (n-add-def! join (arms-t arms))
+    (n-add-def! join (arms-f arms))
+    (let [phi (n-new OP-PHI (t-int))]
+      (n-add-def! phi join)
+      (n-add-def! phi yes)
+      (n-add-def! phi no)
+      (n-add-def! (g-stop) (n-new2 OP-RETURN 0 join phi))
+      (g-analyze!)
+      (assert (ms-select!))
+      (let [at (motion-inst-for yes) latest (ms-inst-latest at)]
+        (assert (>= at 0))
+        (assert (= latest (ms-inst-block at)))
+        (assert (!= latest (motion-block-for join)))
+        (assert (= (mu-edge-target-slot
+                     (let [(mut e) 0 (mut found) -1]
+                       (loop
+                         (if (or (>= (load e) (mu-edge-count)) (>= (load found) 0)) (break)
+                           (do
+                             (if (and (= (mu-edge-source (load e)) latest)
+                                      (= (mu-edge-target (load e)) (motion-block-for join)))
+                                 (store! found (load e)) 0)
+                             (store! e (+ (load e) 1)) 0)))
+                       (load found))) 1))))))
+
+(deftest loop_invariant_arithmetic_hoists_out_of_the_loop
+  (graph-reset! 805)
+  (let [limit-arg (n-new1 OP-ARG (t-int) (g-start))
+        invariant (motion-bin OP-ADD limit-arg (motion-const 3))
+        lp (n-new OP-LOOP 0)]
+    (n-add-def! lp NO-NODE)
+    (n-add-def! lp (g-start))
+    (n-add-def! lp NO-NODE)
+    (n-peephole lp)
+    (let [phi (n-new OP-PHI (t-int))]
+      (n-add-def! phi lp)
+      (n-add-def! phi (motion-const 0))
+      (n-add-def! phi NO-NODE)
+      (n-peephole phi)
+      (let [next (motion-bin OP-ADD phi (motion-const 1))
+            pred (motion-bin OP-LT phi invariant)
+            arms (n-if-arms! (n-peephole (n-new2 OP-IF 0 lp pred)))]
+        (n-set-def! phi 2 next)
+        (n-set-def! lp 2 (arms-t arms))
+        (let [ret (n-new2 OP-RETURN 0 (arms-f arms) phi)]
+          (n-add-def! (g-stop) ret)
+          (wl-push! lp)
+          (wl-push! phi)
+          (iterate!)
+          (assert (ms-select!))
+          (let [at (motion-inst-for invariant) entry (mu-function-block 0 0)]
+            (assert (>= at 0))
+            (assert (= (ms-inst-earliest at) entry))
+            (assert (> (mu-block-loop-depth (ms-inst-latest at)) 0))
+            (assert (= (ms-inst-block at) entry))))))))

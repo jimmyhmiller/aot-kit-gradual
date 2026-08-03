@@ -33,6 +33,7 @@
 (import "coil.io"        :use *)
 (import "coil.fmt"       :use *)
 (import "coil.slice"     :use *)
+(import "coil.primitive" :as primitive)
 (import "ty"        :use *)
 (import "shape"     :use *)
 (import "node"      :use *)
@@ -235,6 +236,7 @@
 (const HV-EMPTY i64 0)   ; describes its mask, and nothing has been written to it
 (const HV-WRITE i64 1)   ; one field of one object, over a previous state
 (const HV-MERGE i64 2)   ; several states over disjoint alias classes
+(const HV-VIEW  i64 3)   ; a narrowed alias view over a wider current state
 
 (defstruct HvEnt
   [(kind  i64)
@@ -289,6 +291,9 @@
 (defn hv-empty! [(mask i64)] (-> i64)
   (hv-push! HV-EMPTY -1 mask 0 0 (RUndef) 0 0))
 
+(defn hv-view! [(prev i64) (mask i64)] (-> i64)
+  (hv-push! HV-VIEW prev mask 0 0 (RUndef) 0 0))
+
 ;; A store to one word. THE MASK IS THE ALIAS'S ALONE, however wide `prev` was, because that is
 ;; what `store-compute` says the type is: a Store produces the new state of ITS class and nothing
 ;; else. A chain that needs more than one class again goes through a MemMerge.
@@ -332,6 +337,7 @@
         HV-WRITE (if (and (= (hve-obj e) obj) (= (hve-alias e) alias)) v
                    (hv-find (hve-prev e) obj alias))
         HV-MERGE (hv-find (hv-kid-with e alias) obj alias)
+        HV-VIEW (hv-find (hve-prev e) obj alias)
         (do (ev-heap-panic "hv-find: a memory version with no kind") -1)))))
 
 ;; The lattice type of everything this state holds, which is what `rt-ty` answers for a memory
@@ -344,6 +350,7 @@
         HV-EMPTY (t-top)
         HV-WRITE (ty-meet (rt-ty (hve-val e)) (hv-contents (hve-prev e)))
         HV-MERGE (hv-kids-contents e)
+        HV-VIEW (hv-contents (hve-prev e))
         (do (ev-heap-panic "hv-contents: a memory version with no kind") (t-bot))))))
 
 (defn hv-kids-contents [(e HvEnt)] (-> i64)
@@ -403,7 +410,9 @@
    (seen   (ArrayList i64))     ; `ev-render-outcome`'s walk: object id, in DISCOVERY order
    (status i64)
    (steps  i64)
+   (budget i64)                ; one caller-supplied bound shared by top-level and function CFGs
    (depth  i64)                 ; active call frames; bounds recursive malformed programs
+   (current-mem i64)            ; latest heap version visible at a function-call boundary
    (result RtVal)
    (resmem i64)                 ; the memory version the Return carried, or -1
    (at     i64)                 ; the node a non-OK status happened at
@@ -457,7 +466,9 @@
     (al-clear! [i64]   (field p seen))
     (store! (field p status) EV-OK)
     (store! (field p steps) 0)
+    (store! (field p budget) 0)
     (store! (field p depth) 0)
+    (store! (field p current-mem) -1)
     (store! (field p result) (RUndef))
     (store! (field p resmem) -1)
     (store! (field p at) NO-NODE)
@@ -479,6 +490,7 @@
 ;; lives in the memory states, so a comparison of two runs that ignores this compares two names
 ;; and no contents.
 (defn ev-result-mem [] (-> i64) (load (field (ev) resmem)))
+(defn ev-current-mem [] (-> i64) (load (field (ev) current-mem)))
 
 (defn ev-fail! [(s i64) (n i64)] (-> RtVal)
   (let [p (ev)]
@@ -653,8 +665,24 @@
 
 (defn ev-arg [(n i64)] (-> RtVal)
   (let [p (ev)]
-    (if (al-get (load (field p bound)) n) (al-get (load (field p args)) n)
-      (ev-fail! EV-UNBOUND n))))
+    (if (and (ty-mem? (n-aux n))
+             (and (> (n-nins n) 0) (!= (n-in n 0) (g-start))))
+        (let [needed (ty-mem-aliases (n-aux n)) cur (load (field p current-mem))]
+          (if (< cur 0)
+              (store! (field p current-mem) (hv-empty! needed))
+            (let [missing (& needed (^ (hv-mask cur) -1))]
+              (if (= missing 0) 0
+                (let [off (al-len [i64] (load (field p hvk))) empty (hv-empty! missing)]
+                  (al-push! [i64] (field p hvk) cur)
+                  (al-push! [i64] (field p hvk) empty)
+                  (store! (field p current-mem) (hv-merge! off 2))))))
+          (RMem (hv-view! (load (field p current-mem)) needed)))
+      (if (al-get (load (field p bound)) n) (al-get (load (field p args)) n)
+        (ev-fail! EV-UNBOUND n)))))
+
+(defn ev-publish-mem [(ver i64)] (-> RtVal)
+  (store! (field (ev) current-mem) ver)
+  (RMem ver))
 
 (defn ev-phi [(n i64)] (-> RtVal)
   (let [p (ev)]
@@ -776,7 +804,7 @@
                       (do (al-push! [i64] (field p hvk) (al-get (load kids) (load j)))
                           (store! j (+ (load j) 1))
                           0)))
-                  (RMem (hv-merge! off k))))]
+                  (ev-publish-mem (hv-merge! off k))))]
       (al-free! [i64] (mut kids))
       res)))
 
@@ -803,7 +831,7 @@
               (if (or (n-dead? u) (!= (n-op u) OP-NEW)) 0
                 (if (or (= (n-nins u) 0) (!= (n-in u 0) c)) 0
                   (do (al-set! [bool]  (field p hasenv) u true)
-                      (al-set! [RtVal] (field p env)    u (RObj (ev-obj-new! (n-aux u))))
+                      (al-set! [RtVal] (field p env) u (RObj (ev-obj-new! (n-aux u))))
                       0))))
             (store! i (+ (load i) 1))
             0)))
@@ -874,14 +902,24 @@
       (if (or (load done) (ev-failed?)) (break)
         (do (let [c (load cur)]
               (store! (field p steps) (+ (load (field p steps)) 1))
-              (if (or (= c NO-NODE) (> (load (field p steps)) 1000000))
+              (if (or (= c NO-NODE)
+                      (> (load (field p steps)) (load (field p budget))))
                   (do (ev-fail! EV-STEPS c) 0)
-                (do (ev-enter-ctrl! c)
+                (do (if (= (n-op c) OP-CALLEND) 0 (ev-enter-ctrl! c))
                     (if (ev-failed?) 0
                       (case (n-op c)
                         OP-RETURN
-                          (do (store! ans (ev-data (n-in c 1)))
-                              (store! done true) 0)
+                          (do
+                            ; Force the returned value first. It can itself be an allocating
+                            ; Call whose CallEnd is the return control; a synthetic memory Arg
+                            ; on that continuation must observe the call's completed heap, not
+                            ; the caller state from before the value was demanded. The explicit
+                            ; memory edge is still evaluated before the value is published.
+                            (let [value (ev-data (n-in c 1))]
+                              (if (ev-failed?) 0
+                                (do (if (= (n-nins c) 3) (do (ev-data (n-in c 2)) 0) 0)
+                                    (if (ev-failed?) 0 (store! ans value)) 0)))
+                            (store! done true) 0)
                         OP-IF
                           (let [pred (ev-data (n-in c 1))]
                             (if (ev-failed?) 0
@@ -906,9 +944,10 @@
                             (al-set! [bool] (field p hasenv) call false)
                             (ev-call call)
                             (if (ev-failed?) 0
+                              (do (ev-enter-ctrl! c)
                               (let [nx (ev-ctrl-succ-mode c true)]
                                 (if (= nx NO-NODE) (do (ev-fail! EV-STUCK c) 0)
-                                  (do (store! prev c) (store! cur nx) 0)))))
+                                  (do (store! prev c) (store! cur nx) 0))))))
                         (let [nx (ev-ctrl-succ-mode c true)]
                           (if (= nx NO-NODE) (do (ev-fail! EV-STUCK c) 0)
                             (do (store! prev c) (store! cur nx) 0))))))) 0)
@@ -945,7 +984,10 @@
                         (store! i (+ (load i) 1)) 0)))
                 (let [argc (al-len [i64] (load parms))
                       (mut oldh) (al-new [bool] (malloc-allocator))
-                      (mut oldv) (al-new [RtVal] (malloc-allocator))]
+                      (mut oldv) (al-new [RtVal] (malloc-allocator))
+                      (mut callids) (al-new [i64] (malloc-allocator))
+                      (mut oldch) (al-new [bool] (malloc-allocator))
+                      (mut oldcv) (al-new [RtVal] (malloc-allocator))]
                   (store! i 0)
                   (loop
                     (if (>= (load i) argc) (break)
@@ -960,6 +1002,22 @@
                                     (al-set! [bool] (field p hasenv) pm true)
                                     (al-set! [RtVal] (field p env) pm av))))
                           (store! i (+ (load i) 1)) 0))))
+                  ; Recursive invocation reuses the same ideal Call and New nodes. Preserve every
+                  ; cached call result and allocation identity as part of the caller frame: a child
+                  ; invocation must not overwrite either the caller's left result or the object the
+                  ; caller allocated before entering that child.
+                  (store! i 0)
+                  (loop
+                    (if (>= (load i) (n-count)) (break)
+                      (do (if (and (not (n-dead? (load i)))
+                                   (or (= (n-op (load i)) OP-CALL)
+                                       (= (n-op (load i)) OP-NEW)))
+                              (do (al-push! [i64] (mut callids) (load i))
+                                  (al-push! [bool] (mut oldch)
+                                            (al-get (load (field p hasenv)) (load i)))
+                                  (al-push! [RtVal] (mut oldcv)
+                                            (al-get (load (field p env)) (load i))) 0) 0)
+                          (store! i (+ (load i) 1)) 0)))
                   (let [ans (if (ev-failed?) (RUndef)
                               (if (>= (load (field p depth)) EV-CALL-DEPTH-MAX)
                                   (ev-fail! EV-CALL n)
@@ -976,7 +1034,18 @@
                                 (do (al-set! [bool] (field p hasenv) pm (al-get (load oldh) (load i)))
                                     (al-set! [RtVal] (field p env) pm (al-get (load oldv) (load i)))))
                             (store! i (+ (load i) 1)) 0))))
+                    (store! i 0)
+                    (loop
+                      (if (>= (load i) (al-len [i64] (load callids))) (break)
+                        (do (let [call-id (al-get (load callids) (load i))]
+                              (al-set! [bool] (field p hasenv) call-id
+                                       (al-get (load oldch) (load i)))
+                              (al-set! [RtVal] (field p env) call-id
+                                       (al-get (load oldcv) (load i))))
+                            (store! i (+ (load i) 1)) 0)))
                     (al-free! [bool] (mut oldh)) (al-free! [RtVal] (mut oldv))
+                    (al-free! [i64] (mut callids))
+                    (al-free! [bool] (mut oldch)) (al-free! [RtVal] (mut oldcv))
                     (al-free! [i64] (mut parms))
                     (if (ev-failed?) ans
                       (do (al-set! [bool] (field p hasenv) n true)
@@ -1065,7 +1134,9 @@
                   (let [x (rt-as-int a) y (rt-as-int b)]
                     (RBool (if (= op OP-EQ) (= x y) (if (= op OP-LT) (< x y) (<= x y)))))
                 (let [x (rt-as-f64 a) y (rt-as-f64 b)]
-                  (RBool (if (= op OP-EQ) (fcmp-eq x y) (if (= op OP-LT) (fcmp-lt x y) (fcmp-le x y))))))
+                  (RBool (if (= op OP-EQ) (primitive/fcmp-eq x y)
+                           (if (= op OP-LT) (primitive/fcmp-lt x y)
+                             (primitive/fcmp-le x y))))))
             ; only `==` is defined on non-numbers here, and only between like kinds
             (if (= op OP-EQ) (RBool (rt-eq? a b)) (ev-fail! EV-TYPE n))))))))
 
@@ -1172,6 +1243,7 @@
 ;; The run proper, without resetting, so bindings made beforehand survive.
 (defn ev-run-nobind [(budget i64)] (-> i64)
   (let [p (ev) (mut cur) (g-start) (mut prev) NO-NODE]
+    (store! (field p budget) budget)
     (loop
       (if (ev-failed?) (break)
         (do (store! (field p steps) (+ (load (field p steps)) 1))
@@ -1180,8 +1252,8 @@
                 (if (n-dead? c) (do (ev-fail! EV-DEAD c) 0)
                   (if (= (n-ty c) (t-xctrl)) (do (ev-fail! EV-DEAD c) 0)
                     (do
-                     ; every allocation pinned to this block happens now; see ev-enter-ctrl!
-                     (ev-enter-ctrl! c)
+                     ; CallEnd executes its call before operations pinned to the continuation.
+                     (if (= (n-op c) OP-CALLEND) 0 (ev-enter-ctrl! c))
                      (case (n-op c)
                       OP-RETURN
                         (do (store! (field p result) (ev-data (n-in c 1)))
@@ -1230,9 +1302,10 @@
                           (al-set! [bool] (field p hasenv) call false)
                           (ev-call call)
                           (if (ev-failed?) 0
+                            (do (ev-enter-ctrl! c)
                             (let [nx (ev-ctrl-succ c)]
                               (if (= nx NO-NODE) (do (ev-fail! EV-STUCK c) 0)
-                                (do (store! prev c) (store! cur nx) 0)))))
+                                (do (store! prev c) (store! cur nx) 0))))))
                       OP-STOP (do (ev-fail! EV-STUCK c) 0)
                       ; Start and CProj just pass control along
                       (let [nx (ev-ctrl-succ c)]

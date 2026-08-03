@@ -1,0 +1,368 @@
+;; G2 selection over verified machine blocks.
+(module backendselectiontest)
+
+(import "ty" :use *)
+(import "node" :use *)
+(import "backend" :use *)
+(import "verify" :use *)
+(import "corpus" :use *)
+(import "shape" :use *)
+(import "testmatrix" :use *)
+(import "coil.assert" :use *)
+(import "coil.alloc" :use *)
+(import "coil.str" :use *)
+
+(defn sel-const [(v i64)] (-> i64)
+  (n-new1 OP-CONST (t-int-con v) (g-start)))
+
+(defn sel-finish! [(ctrl i64) (value i64)] (-> i64)
+  (let [ret (n-new2 OP-RETURN 0 ctrl value)]
+    (n-add-def! (g-stop) ret)
+    (g-analyze!)
+    ret))
+
+(defn build-sel-diamond! [(seed i64)] (-> i64)
+  (graph-reset! seed)
+  (let [pred (n-new1 OP-ARG (t-bool) (g-start))
+        arms (n-if-arms! (n-peephole (n-new2 OP-IF 0 (g-start) pred)))
+        yes (n-new2 OP-RETURN 0 (arms-t arms) (sel-const 11))
+        no (n-new2 OP-RETURN 0 (arms-f arms) (sel-const 22))]
+    (n-add-def! (g-stop) yes)
+    (n-add-def! (g-stop) no)
+    (g-analyze!)
+    0))
+
+(defn count-mi [(op i64)] (-> i64)
+  (let [n (be-inst-count)
+        (mut i) 0
+        (mut count) 0]
+    (loop (if (>= (load i) n)
+              (break)
+              (do
+                (if (= (ms-inst-op (load i)) op) (store! count (+ (load count) 1)) 0)
+                (store! i (+ (load i) 1))
+                0)))
+    (load count)))
+
+(defn find-mi [(op i64)] (-> i64)
+  (let [n (be-inst-count)
+        (mut i) 0
+        (mut found) -1]
+    (loop (if (or (>= (load i) n) (>= (load found) 0))
+              (break)
+              (do
+                (if (= (ms-inst-op (load i)) op) (store! found (load i)) 0)
+                (store! i (+ (load i) 1))
+                0)))
+    (load found)))
+
+(defn assert-owned-instructions [] (-> i64)
+  (let [n (be-inst-count)
+        (mut i) 0]
+    (loop (if (>= (load i) n)
+              (break)
+              (do
+                (let [owner (ms-inst-owner (load i))
+                      bid (ms-inst-block (load i))]
+                  (assert (>= owner 0))
+                  (assert (>= bid 0))
+                  (assert (= (mu-block-owner bid) owner)))
+                (store! i (+ (load i) 1))
+                0)))
+    0))
+
+(deftest straight_line_selection_is_owned_and_ends_in_return
+         (graph-reset! 201)
+         (sel-finish! (g-start) (sel-const 7))
+         (assert (ms-select!))
+         (assert (= (ms-result) MSEL-OK))
+         (assert (= (mu-block-count) 1))
+         (assert (= (be-inst-count) 2))
+         (assert (= (count-mi MI-MOVI) 1))
+         (assert (= (count-mi MI-RET) 1))
+         (assert-owned-instructions))
+
+(deftest broken_memory_dependency_has_a_named_dependency_failure
+         (corpus-build! CX-OBJECT-RAW)
+         (assert (ms-select!))
+         (let [load-at (find-mi MI-LOAD)]
+           (assert (>= load-at 0))
+           (ms-corrupt-memory-dep! load-at (ms-inst-node load-at))
+           (assert (not (ms-verify!)))
+           (assert (= (ms-result) MSEL-DEPENDENCY))))
+
+(deftest opcode_descriptors_distinguish_effects_terminators_and_encoding
+         (let [add (mi-desc MI-ADD)
+               load-op (mi-desc MI-LOAD)
+               branch (mi-desc MI-CBR)
+               jump (mi-desc MI-JMP)]
+           (assert (= (mi-desc-inputs add) 2))
+           (assert (= (mi-desc-outputs add) 1))
+           (assert (= (mi-desc-temporaries add) 0))
+           (assert (= (mi-desc-clobbers add) 0))
+           (assert (= (mi-desc-effects add) 0))
+           (assert (not (mi-desc-memory? add)))
+           (assert (mi-desc-memory? load-op))
+           (assert (mi-desc-pinned? load-op))
+           (assert (mi-desc-terminator? branch))
+           (assert (not (mi-desc-encodable? branch)))
+           (assert (mi-desc-terminator? jump))
+           (assert (not (mi-desc-encodable? jump)))))
+
+(deftest shared_constants_are_materialized_once_per_machine_function
+         (graph-reset! 211)
+         (let [shared (sel-const 17)
+               f0 (n-fun-open! 0)
+               f1 (n-fun-open! 1)]
+           (n-fun-close! f0 (n-new2 OP-RETURN 0 (n-fun-entry f0) shared))
+           (n-fun-close! f1 (n-new2 OP-RETURN 0 (n-fun-entry f1) shared))
+           (g-analyze!)
+           (assert (= (g-verify) 0))
+           (assert (ms-select!))
+           (assert (= (mu-function-count) 2))
+           (assert (= (count-mi MI-MOVI) 2))
+           (let [first (find-mi MI-MOVI)
+                 (mut i) (+ (find-mi MI-MOVI) 1)
+                 (mut second) -1]
+             (loop (if (or (>= (load i) (be-inst-count)) (>= (load second) 0))
+                       (break)
+                       (do
+                         (if (= (ms-inst-op (load i)) MI-MOVI) (store! second (load i)) 0)
+                         (store! i (+ (load i) 1))
+                         0)))
+             (assert (>= first 0))
+             (assert (>= (load second) 0))
+             (assert (!= (ms-inst-owner first) (ms-inst-owner (load second)))))))
+
+(deftest diamond_selection_uses_one_explicit_conditional_and_two_returns
+         (build-sel-diamond! 202)
+         (assert (= (g-verify) 0))
+         (assert (ms-select!))
+         (assert (= (mu-block-count) 3))
+         (assert (= (count-mi MI-CBR) 1))
+         (assert (= (count-mi MI-RET) 2))
+         (assert (= (count-mi MI-JMP) 0))
+         (assert-owned-instructions))
+
+(deftest selection_dump_is_stable_across_the_extended_seed_matrix
+         (let [a (stack (array i8 4096))
+               b (stack (array i8 4096))
+               (mut i) 1]
+           (build-sel-diamond! (matrix-extended-seed 0))
+           (assert (ms-select!))
+           (let [baseline (ms-render (cast (ptr i8) a) 4096)]
+             (loop (if (>= (load i) MATRIX-EXTENDED-SEEDS)
+                       (break)
+                       (do
+                         (build-sel-diamond! (matrix-extended-seed (load i)))
+                         (assert (ms-select!))
+                         (assert (str-eq baseline (ms-render (cast (ptr i8) b) 4096)))
+                         (store! i (+ (load i) 1))
+                         0))))))
+
+(deftest loop_selection_uses_explicit_conditional_jump_and_return
+         (graph-reset! 203)
+         (let [lp (n-new OP-LOOP 0)]
+           (n-add-def! lp NO-NODE)
+           (n-add-def! lp (g-start))
+           (n-add-def! lp NO-NODE)
+           (n-peephole lp)
+           (let [pred (n-new1 OP-ARG (t-bool) (g-start))
+                 arms (n-if-arms! (n-peephole (n-new2 OP-IF 0 lp pred)))]
+             (n-set-def! lp 2 (arms-t arms))
+             (let [ret (n-new2 OP-RETURN 0 (arms-f arms) (sel-const 1))]
+               (n-add-def! (g-stop) ret)
+               (wl-push! lp)
+               (iterate!)
+               (assert (ms-select!))
+               (assert (= (count-mi MI-CBR) 1))
+               (assert (= (count-mi MI-JMP) 2))
+               (assert (= (count-mi MI-RET) 1))
+               (assert-owned-instructions)))))
+
+(deftest nested_diamond_selects_each_block_without_a_shape_pattern
+         (graph-reset! 207)
+         (let [p (n-new1 OP-ARG (t-bool) (g-start))
+               q (n-new1 OP-ARG (t-bool) (g-start))
+               outer (n-if-arms! (n-peephole (n-new2 OP-IF 0 (g-start) p)))
+               inner (n-if-arms! (n-peephole (n-new2 OP-IF 0 (arms-t outer) q)))
+               a (n-new2 OP-RETURN 0 (arms-t inner) (sel-const 1))
+               b (n-new2 OP-RETURN 0 (arms-f inner) (sel-const 2))
+               c (n-new2 OP-RETURN 0 (arms-f outer) (sel-const 3))]
+           (n-add-def! (g-stop) a)
+           (n-add-def! (g-stop) b)
+           (n-add-def! (g-stop) c)
+           (g-analyze!)
+           (assert (ms-select!))
+           (assert (= (mu-block-count) 5))
+           (assert (= (count-mi MI-CBR) 2))
+           (assert (= (count-mi MI-RET) 3))
+           (assert-owned-instructions)))
+
+(deftest nested_merged_control_selects_regions_as_ordinary_jump_blocks
+         (graph-reset! 209)
+         (let [p (n-new1 OP-ARG (t-bool) (g-start))
+               q (n-new1 OP-ARG (t-bool) (g-start))
+               outer (n-if-arms! (n-peephole (n-new2 OP-IF 0 (g-start) p)))
+               inner (n-if-arms! (n-peephole (n-new2 OP-IF 0 (arms-t outer) q)))
+               inner-join (n-new OP-REGION 0)]
+           (n-add-def! inner-join NO-NODE)
+           (n-add-def! inner-join (arms-t inner))
+           (n-add-def! inner-join (arms-f inner))
+           (let [outer-join (n-new OP-REGION 0)]
+             (n-add-def! outer-join NO-NODE)
+             (n-add-def! outer-join inner-join)
+             (n-add-def! outer-join (arms-f outer))
+             (sel-finish! outer-join (sel-const 5))
+             (assert (ms-select!))
+             (assert (= (mu-block-count) 7))
+             (assert (= (count-mi MI-CBR) 2))
+             (assert (= (count-mi MI-JMP) 4))
+             (assert (= (count-mi MI-RET) 1))
+             (let [buf (stack (array i8 4096))]
+               (assert (str-eq (ms-render (cast (ptr i8) buf) 4096)
+                               "function 0\n  b0: ARG ABI-COPY ARG ABI-COPY CBR\n  b1: JMP\n  b2: CBR\n  b3: JMP\n  b4: JMP\n  b5: JMP\n  b6: MOVI RET\n")))
+             (assert-owned-instructions))))
+
+(deftest nested_loop_selects_two_independent_backedges
+         (graph-reset! 208)
+         (let [outer (n-new OP-LOOP 0)]
+           (n-add-def! outer NO-NODE)
+           (n-add-def! outer (g-start))
+           (n-add-def! outer NO-NODE)
+           (n-peephole outer)
+           (let [p (n-new1 OP-ARG (t-bool) (g-start))
+                 q (n-new1 OP-ARG (t-bool) (g-start))
+                 outer-arms (n-if-arms! (n-peephole (n-new2 OP-IF 0 outer p)))
+                 inner (n-new OP-LOOP 0)]
+             (n-add-def! inner NO-NODE)
+             (n-add-def! inner (arms-t outer-arms))
+             (n-add-def! inner NO-NODE)
+             (n-peephole inner)
+             (let [inner-arms (n-if-arms! (n-peephole (n-new2 OP-IF 0 inner q)))
+                   ret (n-new2 OP-RETURN 0 (arms-f outer-arms) (sel-const 4))]
+               (n-set-def! inner 2 (arms-t inner-arms))
+               (n-set-def! outer 2 (arms-f inner-arms))
+               (n-add-def! (g-stop) ret)
+               (wl-push! inner)
+               (wl-push! outer)
+               (iterate!)
+               (assert (ms-select!))
+               (assert (= (mu-block-count) 7))
+               (assert (= (count-mi MI-CBR) 2))
+               (assert (= (count-mi MI-JMP) 4))
+               (assert (= (count-mi MI-RET) 1))
+               (assert-owned-instructions)))))
+
+(deftest object_memory_selection_preserves_new_store_load_order_in_its_block
+         (corpus-build! CX-OBJECT-RAW)
+         (assert (= (g-verify) 0))
+         (assert (ms-select!))
+         (assert (= (count-mi MI-NEW) 1))
+         (assert (= (count-mi MI-STORE) 1))
+         (assert (= (count-mi MI-LOAD) 1))
+         (assert (= (count-mi MI-RET) 1))
+         (assert (= (ms-inst-memory-dep-count (find-mi MI-NEW)) 1))
+         (assert (= (ms-inst-memory-dep-count (find-mi MI-STORE)) 1))
+         (assert (= (ms-inst-memory-dep-count (find-mi MI-LOAD)) 1))
+         (assert (< (find-mi MI-NEW) (find-mi MI-STORE)))
+         (assert (< (find-mi MI-STORE) (find-mi MI-LOAD)))
+         (assert (< (find-mi MI-LOAD) (find-mi MI-RET)))
+         (assert-owned-instructions))
+
+(deftest branch_pinned_allocation_and_memory_stay_in_the_taken_arm_block
+         (graph-reset! 210)
+         (shape-reset!)
+         (let [sx (shape-transition SHAPE-ROOT "x" (t-dyn))
+               ax (shape-field-alias sx 0)
+               pred (n-new1 OP-ARG (t-bool) (g-start))
+               arms (n-if-arms! (n-peephole (n-new2 OP-IF 0 (g-start) pred)))
+               nw (n-new-obj1! (arms-t arms) sx (mk-mem-in ax))
+               obj (n-obj-ptr nw)
+               mem0 (n-obj-mem nw 0)
+               mem1 (n-new4 OP-STORE ax NO-NODE mem0 obj (sel-const 8))
+               value (n-new3 OP-LOAD ax NO-NODE mem1 obj)
+               yes (n-new3 OP-RETURN 0 (arms-t arms) value mem1)
+               no (n-new2 OP-RETURN 0 (arms-f arms) (sel-const 0))]
+           (n-add-def! (g-stop) yes)
+           (n-add-def! (g-stop) no)
+           (g-analyze!)
+           (assert (= (g-verify) 0))
+           (assert (ms-select!))
+           (let [new-at (find-mi MI-NEW)
+                 store-at (find-mi MI-STORE)
+                 load-at (find-mi MI-LOAD)
+                 pinned-block (ms-inst-block new-at)]
+             (assert (!= pinned-block (ms-entry-block 0)))
+             (assert (= (ms-inst-block store-at) pinned-block))
+             (assert (= (ms-inst-block load-at) pinned-block))
+             (assert (< new-at store-at))
+             (assert (< store-at load-at)))))
+
+(deftest value_phi_is_attached_to_each_incoming_edge_by_target_slot
+         (graph-reset! 212)
+         (let [pred (n-new1 OP-ARG (t-bool) (g-start))
+               arms (n-if-arms! (n-peephole (n-new2 OP-IF 0 (g-start) pred)))
+               join (n-new OP-REGION 0)]
+           (n-add-def! join NO-NODE)
+           (n-add-def! join (arms-t arms))
+           (n-add-def! join (arms-f arms))
+           (let [phi (n-new OP-PHI (t-int))]
+             (n-add-def! phi join)
+             (n-add-def! phi (sel-const 1))
+             (n-add-def! phi (sel-const 2))
+             (sel-finish! join phi)
+             (assert (= (g-verify) 0))
+             (assert (ms-select!))
+             (let [target (ms-phi-block 0 phi)
+                   edges (mu-edge-count)
+                   (mut edge) 0
+                   (mut incoming) 0
+                   (mut dst) -1
+                   (mut first-src) -1]
+               (loop (if (>= (load edge) edges)
+                         (break)
+                         (do
+                           (if (= (mu-edge-target (load edge)) target)
+                               (do
+                                 (assert (= (mu-edge-copy-count (load edge)) 1))
+                                 (assert (= (mu-copy-phi (load edge) 0) phi))
+                                 (assert (= (mu-copy-kind (load edge) 0) MCOPY-VALUE))
+                                 (if (< (load dst) 0)
+                                     (do
+                                       (store! dst (mu-copy-dst (load edge) 0))
+                                       (store! first-src (mu-copy-src (load edge) 0)))
+                                     (do
+                                       (assert (= (mu-copy-dst (load edge) 0) (load dst)))
+                                       (assert (!= (mu-copy-src (load edge) 0) (load first-src)))))
+                                 (store! incoming (+ (load incoming) 1)))
+                               0)
+                           (store! edge (+ (load edge) 1))
+                           0)))
+               (assert (= (load incoming) 2))))))
+
+(deftest misplaced_instruction_has_a_named_owner_failure
+         (graph-reset! 204)
+         (sel-finish! (g-start) (sel-const 1))
+         (assert (ms-select!))
+         (ms-corrupt-owner! 0 99)
+         (assert (not (ms-verify!)))
+         (assert (= (ms-result) MSEL-OWNER)))
+
+(deftest missing_value_definition_has_a_named_dependency_failure
+         (graph-reset! 205)
+         (sel-finish! (g-start) (sel-const 1))
+         (assert (ms-select!))
+         (let [ret (find-mi MI-RET)]
+           (assert (>= ret 0))
+           (ms-corrupt-input! ret 9999)
+           (assert (not (ms-verify!)))
+           (assert (= (ms-result) MSEL-DEPENDENCY))))
+
+(deftest duplicate_block_terminator_has_a_named_failure
+         (graph-reset! 206)
+         (sel-finish! (g-start) (sel-const 1))
+         (assert (ms-select!))
+         (ms-corrupt-duplicate-terminator! 0)
+         (assert (not (ms-verify!)))
+         (assert (= (ms-result) MSEL-TERMINATOR)))

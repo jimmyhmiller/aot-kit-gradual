@@ -1,0 +1,687 @@
+;; G0 capability ladder. Unsupported programs are first-class assertions: each must be a verifier-
+;; clean ideal program, must fail with the exact capability code, and must publish no bytes.
+(module backendparitytest)
+
+(import "ty" :use *)
+(import "node" :use *)
+(import "shape" :use *)
+(import "verify" :use *)
+(import "backend" :use *)
+(import "eval" :use *)
+(import "testmatrix" :use *)
+(import "coil.assert" :use *)
+(import "coil.alloc" :use *)
+(import "coil.control" :use *)
+(import "coil.io" :use *)
+(import "coil.fmt" :use *)
+(import "coil.slice" :use *)
+(import "coil.primitive" :as primitive)
+
+(extern mmap :cc c [(ptr u8) i64 i32 i32 i32 i64] (-> (ptr u8)))
+(extern mprotect :cc c [(ptr u8) i64 i32] (-> i32))
+(extern munmap :cc c [(ptr u8) i64] (-> i32))
+(extern sys_icache_invalidate :cc c [(ptr u8) i64] (-> void))
+
+(const PARITY-BUDGET i64 100000)
+(const PARITY-LADDER-COUNT i64 11)
+
+(defn parity-ladder-name [(i i64)] (-> (slice u8))
+  (case i 0
+        "diamond-two-phis" 1
+        "loop-inside-branch" 2
+        "loop-two-phis" 3
+        "loop-copy-cycle" 4
+        "branch-inside-loop" 5
+        "two-direct-functions" 6
+        "live-across-call" 7
+        "direct-recursion" 8
+        "mutual-recursion" 9
+        "recursive-object-allocation-traversal" 10
+        "reduced-binary-trees" "unknown"))
+
+(defn parity-ladder-expected [(i i64)] (-> i64)
+  (case i 0
+        BER-OK 1
+        BER-OK 2
+        BER-UNSUPPORTED-PHI 3
+        BER-UNSUPPORTED-PHI 4
+        BER-UNSUPPORTED-CFG 5
+        BER-UNSUPPORTED-CALL 6
+        BER-UNSUPPORTED-CALL 7
+        BER-UNSUPPORTED-CALL 8
+        BER-UNSUPPORTED-CALL 9
+        BER-UNSUPPORTED-CALL 10
+        BER-UNSUPPORTED-CALL -1))
+
+(defn parity-const [(v i64)] (-> i64)
+  (n-new1 OP-CONST (t-int-con v) (g-start)))
+(defn parity-bin [(op i64) (a i64) (b i64)] (-> i64)
+  (n-new3 op 0 NO-NODE a b))
+
+(defn parity-call3! [(ctrl i64) (fun i64) (a i64) (b i64) (c i64)] (-> CallSite)
+  (let [buf (stack (array i64 3))
+        p (cast (ptr i64) buf)]
+    (store! (index p 0) a)
+    (store! (index p 1) b)
+    (store! (index p 2) c)
+    (n-call! ctrl fun (slice-new [i64] p 3))))
+
+(defn parity-null [] (-> i64)
+  (n-new1 OP-CONST (t-null) (g-start)))
+
+(defn parity-count-op [(op i64)] (-> i64)
+  (let [n (n-count)
+        (mut i) 0
+        (mut count) 0]
+    (loop (if (>= (load i) n)
+              (break)
+              (do
+                (if (and (not (n-dead? (load i))) (= (n-op (load i)) op))
+                    (store! count (+ (load count) 1))
+                    0)
+                (store! i (+ (load i) 1))
+                0)))
+    (load count)))
+
+(defn finish-program! [(ctrl i64) (value i64)] (-> i64)
+  (let [ret (n-new2 OP-RETURN 0 ctrl value)]
+    (n-add-def! (g-stop) ret)
+    (g-analyze!)
+    ret))
+
+(defn parity-native1 [(arg i64)] (-> i64)
+  (let [mem (mmap (cast (ptr u8) 0) 4096 3 4098 -1 0)]
+    (assert (!= (cast i64 mem) -1))
+    (let [n (be-code-len)
+          (mut i) 0]
+      (loop (if (>= (load i) n)
+                (break)
+                (do
+                  (store! (index mem (load i)) (cast u8 (be-code-byte (load i))))
+                  (store! i (+ (load i) 1))
+                  0)))
+      (assert (= (mprotect mem 4096 5) 0))
+      (sys_icache_invalidate mem n)
+      (let [fp (cast (fnptr c [i64] i64) mem)
+            result (primitive/call-ptr fp arg)]
+        (assert (= (munmap mem 4096) 0))
+        result))))
+
+(defn expect-interpreted-int [(seed i64) (want i64)] (-> i64)
+  (assert (= (ev-run-bound seed PARITY-BUDGET) EV-OK))
+  (assert (= (rt-tag (ev-result)) RT-INT))
+  (if (= (rt-payload (ev-result)) want)
+      0
+      (do
+        (fmt (stderr)
+             "\ninterpreter mismatch: seed {d}, got {d}, want {d}\n"
+             seed
+             (rt-payload (ev-result))
+             want)
+        (g-print-flat (stderr))
+        (assert false)
+        0))
+  0)
+
+(defn expect-clean-parity [(name (slice u8))] (-> i64)
+  (if (= (g-verify) 0)
+      0
+      (do
+        (fmt (stderr)
+             "\n{s}: verifier {s} at n{d}\n"
+             name
+             (verr-name (g-verify-code))
+             (g-verify-node))
+        (assert false)
+        0)))
+
+(defn close-loop2! [(lp i64)
+                    (a i64)
+                    (b i64)
+                    (anext i64)
+                    (bnext i64)
+                    (test i64)
+                    (result i64)] (-> i64)
+  (let [arms (n-if-arms! (n-peephole (n-new2 OP-IF 0 lp test)))]
+    (n-set-def! a 2 anext)
+    (n-set-def! b 2 bnext)
+    (n-set-def! lp 2 (arms-t arms))
+    (let [ret (n-new2 OP-RETURN 0 (arms-f arms) result)]
+      (n-add-def! (g-stop) ret)
+      (wl-push! lp)
+      (wl-push! a)
+      (wl-push! b)
+      (iterate!)
+      ret)))
+
+(defn build-two-phi-loop! [(swap bool)] (-> i64)
+  (graph-reset! (if swap 12 11))
+  (let [lp (n-new OP-LOOP 0)]
+    (n-add-def! lp NO-NODE)
+    (n-add-def! lp (g-start))
+    (n-add-def! lp NO-NODE)
+    (n-peephole lp)
+    (let [a (n-new OP-PHI (t-int))
+          b (n-new OP-PHI (t-int))]
+      (n-add-def! a lp)
+      (n-add-def! a (parity-const (if swap 1 0)))
+      (n-add-def! a NO-NODE)
+      (n-add-def! b lp)
+      (n-add-def! b (parity-const (if swap 2 0)))
+      (n-add-def! b NO-NODE)
+      (n-peephole a)
+      (n-peephole b)
+      (if swap
+          (close-loop2! lp a b b a (parity-bin OP-LT a (parity-const 2)) a)
+          (let [anext (parity-bin OP-ADD a (parity-const 1))
+                bnext (parity-bin OP-ADD b (parity-const 1))]
+            (close-loop2! lp
+                          a
+                          b
+                          anext
+                          bnext
+                          (parity-bin OP-LT a (parity-const 3))
+                          (parity-bin OP-ADD a b))))
+      lp)))
+
+(defn build-branch-inside-loop! [] (-> i64)
+  (graph-reset! 13)
+  (let [lp (n-new OP-LOOP 0)]
+    (n-add-def! lp NO-NODE)
+    (n-add-def! lp (g-start))
+    (n-add-def! lp NO-NODE)
+    (n-peephole lp)
+    (let [i (n-new OP-PHI (t-int))]
+      (n-add-def! i lp)
+      (n-add-def! i (parity-const 0))
+      (n-add-def! i NO-NODE)
+      (n-peephole i)
+      (let [outer
+              (n-if-arms! (n-peephole (n-new2 OP-IF
+                                              0
+                                              lp
+                                              (parity-bin OP-LT i (parity-const 3)))))
+            inner
+              (n-if-arms! (n-peephole (n-new2 OP-IF
+                                              0
+                                              (arms-t outer)
+                                              (parity-bin OP-LT i (parity-const 1)))))
+            join (n-new OP-REGION 0)]
+        (n-add-def! join NO-NODE)
+        (n-add-def! join (arms-t inner))
+        (n-add-def! join (arms-f inner))
+        (let [step (n-new OP-PHI (t-int))]
+          (n-add-def! step join)
+          (n-add-def! step (parity-bin OP-ADD i (parity-const 2)))
+          (n-add-def! step (parity-bin OP-ADD i (parity-const 1)))
+          (n-set-def! i 2 step)
+          (n-set-def! lp 2 join)
+          (let [ret (n-new2 OP-RETURN 0 (arms-f outer) i)]
+            (n-add-def! (g-stop) ret)
+            (wl-push! lp)
+            (wl-push! i)
+            (wl-push! join)
+            (wl-push! step)
+            (iterate!)
+            ret))))))
+
+(defn build-loop-inside-branch! [] (-> i64)
+  (graph-reset! 14)
+  (let [arg (n-new1 OP-ARG (t-bool) (g-start))
+        top (n-if-arms! (n-peephole (n-new2 OP-IF 0 (g-start) arg)))
+        lp (n-new OP-LOOP 0)]
+    (n-add-def! lp NO-NODE)
+    (n-add-def! lp (arms-t top))
+    (n-add-def! lp NO-NODE)
+    (n-peephole lp)
+    (let [i (n-new OP-PHI (t-int))]
+      (n-add-def! i lp)
+      (n-add-def! i (parity-const 0))
+      (n-add-def! i NO-NODE)
+      (n-peephole i)
+      (let [test
+              (n-if-arms! (n-peephole (n-new2 OP-IF
+                                              0
+                                              lp
+                                              (parity-bin OP-LT i (parity-const 3)))))
+            next (parity-bin OP-ADD i (parity-const 1))]
+        (n-set-def! i 2 next)
+        (n-set-def! lp 2 (arms-t test))
+        (let [loop-ret (n-new2 OP-RETURN 0 (arms-f test) i)
+              other-ret (n-new2 OP-RETURN 0 (arms-f top) (parity-const 9))]
+          (n-add-def! (g-stop) loop-ret)
+          (n-add-def! (g-stop) other-ret)
+          (wl-push! lp)
+          (wl-push! i)
+          (wl-push! next)
+          (iterate!)
+          lp)))))
+
+(defn build-recursive-allocation-traversal! [] (-> i64)
+  (graph-reset! 30)
+  (shape-reset!)
+  (let [shape (shape-transition SHAPE-ROOT "value" (t-dyn))
+        alias (shape-field-alias shape 0)
+        initial-mem (n-new1 OP-ARG (t-mem-alias alias (t-top)) (g-start))
+        fun (n-fun-open! 0)
+        n (n-parm! fun 0)
+        iff
+          (n-peephole (n-new2 OP-IF
+                              0
+                              (n-fun-entry fun)
+                              (parity-bin OP-LT n (parity-const 1))))
+        arms (n-if-arms! iff)
+        base (n-new2 OP-RETURN 0 (arms-t arms) (parity-const 0))
+        nw (n-new-obj1! (arms-f arms) shape initial-mem)
+        obj (n-obj-ptr nw)
+        fresh-mem (n-obj-mem nw 0)
+        stored (n-store! fresh-mem obj n alias)
+        loaded (n-load! stored obj alias)
+        recur (n-call1! (arms-f arms) fun (parity-bin OP-SUB n (parity-const 1)))
+        step
+          (n-new3 OP-RETURN
+                  0
+                  (call-end recur)
+                  (parity-bin OP-ADD loaded (call-value recur))
+                  stored)]
+    (n-fun-close! fun base)
+    (n-fun-add-return! fun step)
+    (let [site (n-call1! (g-start) fun (parity-const 4))]
+      (finish-program! (call-end site) (call-value site))
+      (call-value recur))))
+
+(defn parity-tree-node! [(shape i64)
+                         (left-alias i64)
+                         (right-alias i64)
+                         (left-mem (ptr i64))
+                         (right-mem (ptr i64))
+                         (left i64)
+                         (right i64)] (-> i64)
+  (let [nw (n-new-obj2! (g-start) shape (load left-mem) (load right-mem))
+        obj (n-obj-ptr nw)
+        lm (n-store! (n-obj-mem nw 0) obj left left-alias)
+        rm (n-store! (n-obj-mem nw 1) obj right right-alias)]
+    (store! left-mem lm)
+    (store! right-mem rm)
+    obj))
+
+(defn build-reduced-binary-trees! [(seed i64)] (-> i64)
+  (graph-reset! seed)
+  (shape-reset!)
+  (let [left-shape (shape-transition SHAPE-ROOT "left" (t-dyn))
+        tree-shape (shape-transition left-shape "right" (t-dyn))
+        left-alias (shape-field-alias tree-shape 0)
+        right-alias (shape-field-alias tree-shape 1)
+        (mut left-mem) (n-new1 OP-ARG (t-mem-alias left-alias (t-top)) (g-start))
+        (mut right-mem) (n-new1 OP-ARG (t-mem-alias right-alias (t-top)) (g-start))
+        null (parity-null)
+        leaf0
+          (parity-tree-node! tree-shape
+                             left-alias
+                             right-alias
+                             (mut left-mem)
+                             (mut right-mem)
+                             null
+                             null)
+        leaf1
+          (parity-tree-node! tree-shape
+                             left-alias
+                             right-alias
+                             (mut left-mem)
+                             (mut right-mem)
+                             null
+                             null)
+        leaf2
+          (parity-tree-node! tree-shape
+                             left-alias
+                             right-alias
+                             (mut left-mem)
+                             (mut right-mem)
+                             null
+                             null)
+        leaf3
+          (parity-tree-node! tree-shape
+                             left-alias
+                             right-alias
+                             (mut left-mem)
+                             (mut right-mem)
+                             null
+                             null)
+        parent0
+          (parity-tree-node! tree-shape
+                             left-alias
+                             right-alias
+                             (mut left-mem)
+                             (mut right-mem)
+                             leaf0
+                             leaf1)
+        parent1
+          (parity-tree-node! tree-shape
+                             left-alias
+                             right-alias
+                             (mut left-mem)
+                             (mut right-mem)
+                             leaf2
+                             leaf3)
+        root
+          (parity-tree-node! tree-shape
+                             left-alias
+                             right-alias
+                             (mut left-mem)
+                             (mut right-mem)
+                             parent0
+                             parent1)
+        check (n-fun-open! 0)
+        node (n-parm! check 0)
+        iff
+          (n-peephole (n-new2 OP-IF
+                              0
+                              (n-fun-entry check)
+                              (parity-bin OP-EQ node null)))
+        arms (n-if-arms! iff)
+        leaf-ret (n-new2 OP-RETURN 0 (arms-t arms) (parity-const 0))
+        nonnull (n-peephole (n-new2 OP-CAST (t-obj-shape tree-shape) (arms-f arms) node))
+        left (n-load! (load left-mem) nonnull left-alias)
+        right (n-load! (load right-mem) nonnull right-alias)
+        left-call (n-call1! (arms-f arms) check left)
+        right-call (n-call1! (call-end left-call) check right)
+        children (parity-bin OP-ADD (call-value left-call) (call-value right-call))
+        branch-ret
+          (n-new2 OP-RETURN
+                  0
+                  (call-end right-call)
+                  (parity-bin OP-ADD (parity-const 1) children))]
+    (n-fun-close! check leaf-ret)
+    (n-fun-add-return! check branch-ret)
+    (let [site (n-call1! (g-start) check root)
+          final-mem (n-memmerge2! (load left-mem) (load right-mem))
+          ret (n-new3 OP-RETURN 0 (call-end site) (call-value site) final-mem)]
+      (n-add-def! (g-stop) ret)
+      (g-analyze!)
+      (call-value left-call))))
+
+(defn expect-selection-failure [(code i64) (node i64)] (-> i64)
+  (assert (= (be-result) code))
+  (assert (= (be-result-node) node))
+  (assert (= (be-code-len) 0))
+  (assert (= (be-object-len) 0))
+  0)
+
+(deftest result_codes_are_stable_and_named
+         (assert (= BER-OK 0))
+         (assert (= BER-MALFORMED-GRAPH 1))
+         (assert (= BER-UNSUPPORTED-OPCODE 2))
+         (assert (= BER-UNSUPPORTED-CFG 3))
+         (assert (= BER-UNSUPPORTED-PHI 4))
+         (assert (= BER-UNSUPPORTED-CALL 5))
+         (assert (= BER-UNSUPPORTED-CALL-LIVE 6))
+         (assert (= BER-ALLOCATION 7))
+         (assert (= BER-ENCODING 8))
+         (assert (= BER-OBJECT 9))
+         (assert (= (be-result-name BER-UNSUPPORTED-CALL) "BER-UNSUPPORTED-CALL")))
+
+(deftest parity_ladder_has_one_monotonic_capability_frontier
+         (let [(mut i) 0
+               (mut frontier) -1
+               (mut unsupported) false]
+           (loop (if (>= (load i) PARITY-LADDER-COUNT)
+                     (break)
+                     (do
+                       (let [expected (parity-ladder-expected (load i))]
+                         (if (= expected BER-OK)
+                             (do (assert (not (load unsupported))) (store! frontier (load i)) 0)
+                             (store! unsupported true)))
+                       (store! i (+ (load i) 1))
+                       0)))
+           (assert (= (load frontier) 1))
+           (fmt (stdout)
+                "\nparity frontier {d}/{d}: {s}\n"
+                (+ (load frontier) 1)
+                PARITY-LADDER-COUNT
+                (parity-ladder-name (load frontier)))))
+
+(deftest unsupported_opcode_is_named_before_code_publication
+         (graph-reset! 1)
+         (let [value (n-new2 OP-NOT 0 NO-NODE (parity-const 0))]
+           (finish-program! (g-start) value)
+           (assert (= (g-verify) 0))
+           (assert (not (be-select-program!)))
+           (expect-selection-failure BER-UNSUPPORTED-OPCODE value)))
+
+(deftest diamond_with_two_value_phis_executes_and_matches_structured_expectations
+         (graph-reset! 10)
+         (let [arg (n-new1 OP-ARG (t-bool) (g-start))
+               iff (n-peephole (n-new2 OP-IF 0 (g-start) arg))
+               arms (n-if-arms! iff)
+               region (n-new OP-REGION 0)]
+           (n-add-def! region NO-NODE)
+           (n-add-def! region (arms-t arms))
+           (n-add-def! region (arms-f arms))
+           (let [x (n-new OP-PHI (t-int))
+                 y (n-new OP-PHI (t-int))]
+             (n-add-def! x region)
+             (n-add-def! x (parity-const 11))
+             (n-add-def! x (parity-const 22))
+             (n-add-def! y region)
+             (n-add-def! y (parity-const 31))
+             (n-add-def! y (parity-const 44))
+             (finish-program! region (parity-bin OP-ADD x y))
+             (assert (= (g-verify) 0))
+             ; The expectations are two fields rather than a compensating aggregate: both branch
+             ; outcomes are checked independently in the interpreter and native code.
+             (expect-interpreted-int 2 42)
+             (expect-interpreted-int 1 66)
+             (assert (be-select-program!))
+             (be-schedule!)
+             (assert (= (be-color! 8) 0))
+             (be-encode!)
+             (assert (= (parity-native1 1) 42))
+             (assert (= (parity-native1 0) 66)))))
+
+(deftest loop_with_two_carried_values_is_rejected_as_phi_before_partial_selection
+         (let [lp (build-two-phi-loop! false)]
+           (assert (= (g-verify) 0))
+           (expect-interpreted-int 1 6)
+           (assert (not (be-select-program!)))
+           (expect-selection-failure (parity-ladder-expected 2) lp)))
+
+(deftest loop_carried_parallel_copy_cycle_is_rejected_as_phi
+         (let [lp (build-two-phi-loop! true)]
+           (assert (= (g-verify) 0))
+           (expect-interpreted-int 1 2)
+           (assert (not (be-select-program!)))
+           (expect-selection-failure (parity-ladder-expected 3) lp)))
+
+(deftest branch_nested_in_loop_preserves_the_interpreter_result
+         (build-branch-inside-loop!)
+         (assert (= (g-verify) 0))
+         (expect-interpreted-int 1 3)
+         (assert (not (be-select-program!)))
+         (assert (= (be-result) (parity-ladder-expected 4)))
+         (assert (= (be-code-len) 0)))
+
+(deftest loop_nested_in_branch_has_both_structured_outcomes
+         (build-loop-inside-branch!)
+         (assert (= (g-verify) 0))
+         (expect-interpreted-int 2 3)
+         (expect-interpreted-int 1 9)
+         (assert (be-select-program!))
+         (be-schedule!)
+         (assert (= (be-color! 8) 0))
+         (be-encode!)
+         (assert (= (parity-native1 1) 3))
+         (assert (= (parity-native1 0) 9)))
+
+(deftest a_real_call_is_rejected_as_call_not_generic_selection_failure
+         (graph-reset! 2)
+         (let [fun (n-fun-open! 0)
+               parm (n-parm! fun 0)
+               body (n-new2 OP-RETURN 0 (n-fun-entry fun) (parity-bin OP-ADD parm (parity-const 1)))]
+           (n-fun-close! fun body)
+           (let [site (n-call1! (g-start) fun (parity-const 41))
+                 call (call-value site)]
+             (finish-program! (call-end site) call)
+             (assert (= (g-verify) 0))
+             (assert (not (be-select-program!)))
+             (expect-selection-failure BER-UNSUPPORTED-CALL call))))
+
+(deftest two_nonrecursive_functions_have_an_interpreter_result_and_a_named_call_boundary
+         (graph-reset! 20)
+         (let [inc (n-fun-open! 0)
+               ix (n-parm! inc 0)
+               inc-ret (n-new2 OP-RETURN 0 (n-fun-entry inc) (parity-bin OP-ADD ix (parity-const 1)))
+               twice (n-fun-open! 1)
+               tx (n-parm! twice 0)
+               twice-ret (n-new2 OP-RETURN 0 (n-fun-entry twice) (parity-bin OP-MUL tx (parity-const 2)))]
+           (n-fun-close! inc inc-ret)
+           (n-fun-close! twice twice-ret)
+           (let [first (n-call1! (g-start) inc (parity-const 20))
+                 second (n-call1! (call-end first) twice (call-value first))]
+             (finish-program! (call-end second) (call-value second))
+             (expect-interpreted-int 1 42)
+             (assert (not (be-select-program!)))
+             (expect-selection-failure (parity-ladder-expected 5) (call-value first)))))
+
+(deftest value_live_across_call_is_preserved_by_the_oracle_and_call_is_named
+         (graph-reset! 21)
+         (let [identity (n-fun-open! 0)
+               x (n-parm! identity 0)
+               body (n-new2 OP-RETURN 0 (n-fun-entry identity) x)]
+           (n-fun-close! identity body)
+           (let [held (parity-const 10)
+                 site (n-call1! (g-start) identity (parity-const 32))]
+             (finish-program! (call-end site) (parity-bin OP-ADD held (call-value site)))
+             (expect-interpreted-int 1 42)
+             (assert (not (be-select-program!)))
+             (expect-selection-failure (parity-ladder-expected 6) (call-value site)))))
+
+(deftest direct_recursion_has_a_stable_oracle_result_and_named_call_failure
+         (graph-reset! 22)
+         (let [fun (n-fun-open! 0)
+               n (n-parm! fun 0)
+               iff
+                 (n-peephole (n-new2 OP-IF
+                                     0
+                                     (n-fun-entry fun)
+                                     (parity-bin OP-LT n (parity-const 2))))
+               arms (n-if-arms! iff)
+               base (n-new2 OP-RETURN 0 (arms-t arms) (parity-const 1))
+               recur (n-call1! (arms-f arms) fun (parity-bin OP-SUB n (parity-const 1)))
+               step
+                 (n-new2 OP-RETURN
+                         0
+                         (call-end recur)
+                         (parity-bin OP-MUL n (call-value recur)))]
+           (n-fun-close! fun base)
+           (n-fun-add-return! fun step)
+           (let [site (n-call1! (g-start) fun (parity-const 5))]
+             (finish-program! (call-end site) (call-value site))
+             (expect-interpreted-int 1 120)
+             (assert (not (be-select-program!)))
+             ; The recursive body call is created before the entry call and is the deterministic first
+             ; offending node in the graph-wide capability preflight.
+             (expect-selection-failure (parity-ladder-expected 7) (call-value recur)))))
+
+(deftest mutual_recursion_has_a_stable_oracle_result_and_named_call_failure
+         (graph-reset! 23)
+         (let [even (n-fun-open! 0)
+               odd (n-fun-open! 1)
+               en (n-parm! even 0)
+               on (n-parm! odd 0)
+               ei
+                 (n-peephole (n-new2 OP-IF
+                                     0
+                                     (n-fun-entry even)
+                                     (parity-bin OP-EQ en (parity-const 0))))
+               ea (n-if-arms! ei)
+               er (n-call1! (arms-f ea) odd (parity-bin OP-SUB en (parity-const 1)))
+               eb (n-new2 OP-RETURN 0 (arms-t ea) (parity-const 1))
+               es (n-new2 OP-RETURN 0 (call-end er) (call-value er))
+               oi
+                 (n-peephole (n-new2 OP-IF
+                                     0
+                                     (n-fun-entry odd)
+                                     (parity-bin OP-EQ on (parity-const 0))))
+               oa (n-if-arms! oi)
+               orc (n-call1! (arms-f oa) even (parity-bin OP-SUB on (parity-const 1)))
+               ob (n-new2 OP-RETURN 0 (arms-t oa) (parity-const 0))
+               os (n-new2 OP-RETURN 0 (call-end orc) (call-value orc))]
+           (n-fun-close! even eb)
+           (n-fun-add-return! even es)
+           (n-fun-close! odd ob)
+           (n-fun-add-return! odd os)
+           (let [site (n-call1! (g-start) even (parity-const 10))]
+             (finish-program! (call-end site) (call-value site))
+             (expect-interpreted-int 1 1)
+             (assert (not (be-select-program!)))
+             (expect-selection-failure (parity-ladder-expected 8) (call-value er)))))
+
+(deftest recursive_fixed_shape_allocation_and_traversal_has_a_stable_oracle
+         (let [first-call (build-recursive-allocation-traversal!)]
+           (expect-clean-parity "recursive allocation/traversal")
+           (expect-interpreted-int 1 10)
+           (assert (not (be-select-program!)))
+           (expect-selection-failure (parity-ladder-expected 9) first-call)))
+
+(deftest reduced_binary_trees_has_structural_observables_and_is_seed_stable
+         (let [(mut i) 0]
+           (loop (if (>= (load i) MATRIX-EXTENDED-SEEDS)
+                     (break)
+                     (do
+                       (let [first-call (build-reduced-binary-trees! (matrix-extended-seed (load i)))]
+                         (expect-clean-parity "reduced binary trees")
+                         (assert (= (parity-count-op OP-NEW) 7))
+                         (assert (= (parity-count-op OP-STORE) 14))
+                         ; A depth-2 full tree has seven nodes; itemCheck visits each exactly once.
+                         ; Record raw-analysed and optimized outcomes independently.
+                         (expect-interpreted-int 1 7)
+                         (iterate!)
+                         (expect-clean-parity "optimized reduced binary trees")
+                         (expect-interpreted-int 1 7)
+                         (assert (not (be-select-program!)))
+                         (expect-selection-failure (parity-ladder-expected 10) first-call))
+                       (store! i (+ (load i) 1))
+                       0)))))
+
+(deftest allocation_encoding_and_object_failures_are_named_and_atomic
+         (graph-reset! 31)
+         (finish-program! (g-start) (parity-const 7))
+         (assert (be-select-program!))
+         (be-schedule!)
+         (assert (not (be-color-checked! 0)))
+         (expect-selection-failure BER-ALLOCATION NO-NODE)
+
+         (assert (be-select-program!))
+         (be-schedule!)
+         (assert (be-color-checked! 8))
+         ; Corrupt one machine instruction after allocation. The checked encoder must name the phase and
+         ; discard bytes rather than silently treating an unknown machine opcode as zero words.
+         (let [m (be-inst 0)
+               node (load (field m node))]
+           (store! (field m op) 999)
+           (assert (not (be-encode-checked!)))
+           (expect-selection-failure BER-ENCODING node))
+
+         (be-reset!)
+         (assert (not (be-macho-checked!)))
+         (expect-selection-failure BER-OBJECT NO-NODE))
+
+(deftest malformed_graph_is_distinct_from_unsupported_and_clears_old_bytes
+         ; First publish valid code so the corruption test proves a later failure invalidates it.
+         (graph-reset! 3)
+         (finish-program! (g-start) (parity-const 7))
+         (assert (be-select-program!))
+         (be-schedule!)
+         (be-color! 8)
+         (be-encode!)
+         (be-macho!)
+         (assert (> (be-code-len) 0))
+         (assert (> (be-object-len) 0))
+         ; Removing the Return value through the ordinary graph API creates one structural defect.
+         (let [ret (n-in (g-stop) 0)]
+           (n-del-def! ret 1)
+           (assert (> (g-verify) 0))
+           (assert (= (g-verify-code) VERR-ARITY))
+           (assert (not (be-select-program!)))
+           (expect-selection-failure BER-MALFORMED-GRAPH ret)
+           (assert (= (be-verify-code) VERR-ARITY))))

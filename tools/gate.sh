@@ -44,6 +44,14 @@ for f in tests/*-test.coil; do
 done
 
 echo
+echo "=== roadmap workflow ==="
+if out=$(node tools/workflow-gate.mjs 2>&1); then
+  note "workflow-gate.mjs" "$out"
+else
+  note "workflow-gate.mjs" "FAILED"; echo "$out" | tail -20; fails=$((fails+1))
+fi
+
+echo
 echo "=== native backend ==="
 if out=$(./tools/native-gate.sh 2>&1); then
   note "native-gate.sh" "$out"

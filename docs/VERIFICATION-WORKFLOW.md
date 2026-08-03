@@ -4,6 +4,24 @@ This workflow is mandatory for every roadmap slice. It is designed around failur
 has already experienced: clean verifiers around wrong programs, fixtures that could not exercise the
 claimed path, provisional types used for irreversible rewrites, and schedule-order-dependent results.
 
+## Programmatic controller
+
+`workflow/roadmap.json` is the machine-readable dependency graph and `workflow/state.json` is the
+tracked completion record. Use:
+
+```sh
+node tools/workflow.mjs status
+node tools/workflow.mjs next
+node tools/workflow.mjs check G0
+node tools/workflow.mjs complete G0
+```
+
+`check` runs the milestone-specific gate plus quick, full, and extended repository gates without
+changing state. `complete` runs the same evidence and advances state atomically only if every command
+passes. It records the commit and commands used. Never edit a milestone to `done` directly in prose;
+advance it through the controller, then mirror the resulting state into the roadmap and current-slice
+document in the same commit.
+
 ## Roles of the evidence
 
 No single check proves compiler correctness. Each layer answers a different question:
@@ -92,7 +110,8 @@ collect-every-allocation.
 
 ### 7. Falsify the gate
 
-Temporarily introduce the smallest defect matching the claim. Examples:
+Prefer a committed corruption or fault-injection test that introduces the smallest defect matching
+the claim in memory. Examples:
 
 - exchange two Phi inputs;
 - omit one predecessor propagation in liveness;
@@ -102,10 +121,11 @@ Temporarily introduce the smallest defect matching the claim. Examples:
 - encode a call target as zero;
 - skip one callee-saved restore.
 
-Run the focused gate and require it to fail for the expected reason. Then restore the correct code
-and rerun it. A gate that stays green is incomplete and the slice is not done.
-
-Do not commit the falsification. Record it in `JOURNAL.md` with the exact test that caught it.
+Run the focused gate and require the verifier or differential to reject the corrupted structure for
+the expected reason. Keep that test permanently so CI repeats the falsification. If in-memory
+corruption or fault injection is impractical, temporarily mutate the implementation, restore it,
+and rerun; record that exceptional manual falsification in `JOURNAL.md` with the exact test and
+failure. Never commit the temporary implementation defect.
 
 ### 8. Review through adversarial lenses
 
@@ -157,9 +177,20 @@ Before marking a roadmap milestone done:
 tools/gate.sh
 ```
 
+Both commands are verification-only and must leave tracked files unchanged. Publishing a new timed
+benchmark report is an explicit operation:
+
+```sh
+tools/benchmark-gate.sh --update
+```
+
+Review and commit the resulting `docs/BENCHMARKS.md` and `bench-profile.json` changes only as part of
+an intentional performance-report slice.
+
 The full gate includes diagrams because broken diagnostic output is a broken compiler tool. Extended
-full-depth binary-trees and expensive seed/stress matrices may live in a separately named extended
-gate, but the normal gate must exercise a bounded witness of the same mechanism.
+full-depth binary-trees and expensive seed/stress matrices live in `tools/extended-gate.sh`; G0
+creates that command. The normal gate must exercise a bounded witness of the same mechanism. A
+milestone whose required extended witness has not yet been added and run is not done.
 
 ### 10. Land atomically
 
@@ -210,8 +241,8 @@ Recommended normal dimensions:
 - register budgets: normal target budget and at least two restricted budgets;
 - collector mode: normal and collect-every-allocation for bounded allocation fixtures.
 
-The exact seeds and budgets belong in one shared test configuration so individual suites cannot
-silently weaken them.
+The exact seeds and budgets belong in one shared test configuration created in G0 so individual
+suites cannot silently weaken them.
 
 ## Native differential protocol
 

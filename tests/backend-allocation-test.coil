@@ -1,0 +1,200 @@
+;; G7 CFG-correct constrained register allocation.
+(module backendallocationtest)
+
+(import "ty" :use *)
+(import "node" :use *)
+(import "backend" :use *)
+(import "shape" :use *)
+(import "corpus" :use *)
+(import "coil.assert" :use *)
+(import "coil.alloc" :use *)
+(import "coil.primitive" :as primitive)
+
+(extern mmap :cc c [(ptr u8) i64 i32 i32 i32 i64] (-> (ptr u8)))
+(extern mprotect :cc c [(ptr u8) i64 i32] (-> i32))
+(extern munmap :cc c [(ptr u8) i64] (-> i32))
+(extern sys_icache_invalidate :cc c [(ptr u8) i64] (-> void))
+
+(defn ra-const [(v i64)] (-> i64) (n-new1 OP-CONST (t-int-con v) (g-start)))
+(defn ra-bin [(op i64) (a i64) (b i64)] (-> i64)
+  (n-peephole (n-new3 op (t-int) NO-NODE a b)))
+
+(defn ra-native1 [(arg i64)] (-> i64)
+  (let [mem (mmap (cast (ptr u8) 0) 4096 3 4098 -1 0)]
+    (assert (!= (cast i64 mem) -1))
+    (let [n (be-code-len) (mut i) 0]
+      (loop
+        (if (>= (load i) n) (break)
+          (do (store! (index mem (load i)) (cast u8 (be-code-byte (load i))))
+              (store! i (+ (load i) 1)) 0)))
+      (assert (= (mprotect mem 4096 5) 0))
+      (sys_icache_invalidate mem n)
+      (let [fp (cast (fnptr c [i64] i64) mem) got (primitive/call-ptr fp arg)]
+        (assert (= (munmap mem 4096) 0)) got))))
+
+(defn build-ra-pressure! [] (-> i64)
+  (graph-reset! 1101)
+  (let [x (n-new1 OP-ARG (t-int) (g-start))
+        left (ra-bin OP-ADD x (ra-const 1)) right (ra-bin OP-ADD x (ra-const 2))
+        result (ra-bin OP-MUL left right)]
+    (n-add-def! (g-stop) (n-new2 OP-RETURN 0 (g-start) result))
+    (g-analyze!) result))
+
+(defn ra-compile! [(nregs i64) (seed i64)] (-> i64)
+  (assert (be-select-machine-program!))
+  (assert (> (be-schedule-seeded! seed) 0))
+  (let [spills (be-color-seeded! nregs seed)]
+    (assert (>= spills 0))
+    (assert (= (mra-result) MRA-OK))
+    (assert (= (be-verify-abi!) MABI-OK))
+    spills))
+
+(deftest cfg_interference_separates_simultaneously_live_operands
+  (let [result (build-ra-pressure!) left (n-in result 1) right (n-in result 2)]
+    (ra-compile! 4 0)
+    (let [a (ms-vget 0 left) b (ms-vget 0 right)]
+      (assert (mra-interferes? a b))
+      (assert (or (!= (mra-reg a) (mra-reg b))
+                  (or (>= (mra-spill a) 0) (>= (mra-spill b) 0))))
+      (assert (mra-verify!)))))
+
+(deftest tiny_register_budget_spills_and_executes_natively
+  (build-ra-pressure!)
+  (assert (> (ra-compile! 1 0) 0))
+  (assert (be-encode-checked!))
+  (assert (= (ra-native1 5) 42)))
+
+(deftest allocation_seeds_preserve_native_result
+  (let [(mut seed) 0]
+    (loop
+      (if (>= (load seed) 3) (break)
+        (do
+          (build-ra-pressure!)
+          (ra-compile! 3 (load seed))
+          (assert (be-encode-checked!))
+          (assert (= (ra-native1 5) 42))
+          (store! seed (+ (load seed) 1)) 0)))))
+
+(deftest caller_live_value_uses_callee_saved_register_or_spill
+  (graph-reset! 1102)
+  (let [identity (n-fun-open! 0) x (n-parm! identity 0)]
+    (n-fun-close! identity (n-new2 OP-RETURN 0 (n-fun-entry identity) x))
+    (let [held (ra-const 32) site (n-call1! (g-start) identity held)
+          result (ra-bin OP-ADD held (call-value site))]
+      (n-add-def! (g-stop) (n-new2 OP-RETURN 0 (call-end site) result))
+      (g-analyze!)
+      (ra-compile! 10 0)
+      (let [vreg (ms-vget 0 held) reg (mra-reg vreg)]
+        (assert (or (>= (mra-spill vreg) 0) (and (>= reg 19) (<= reg 28))))
+        (assert (be-encode-checked!))
+        (assert (= (ra-native1 0) 64))))))
+
+(deftest fixed_argument_register_corruption_is_named
+  (build-ra-pressure!)
+  (ra-compile! 4 0)
+  (let [arg (ms-vget 0 (n-in (n-in (g-stop) 0) 1))]
+    ; Find the actual MI-ARG vreg; the return expression above is not necessarily the argument.
+    (let [(mut at) 0 (mut vreg) -1]
+      (loop
+        (if (or (>= (load at) (be-inst-count)) (>= (load vreg) 0)) (break)
+          (do
+            (if (= (ms-inst-op (load at)) MI-ARG) (store! vreg (ms-inst-dst (load at))) 0)
+            (store! at (+ (load at) 1)) 0)))
+      (assert (>= (load vreg) 0))
+      (mra-corrupt-reg! (load vreg) 7)
+      (assert (not (mra-verify!)))
+      (assert (= (mra-result) MRA-FIXED)))))
+
+(deftest interference_and_illegal_coalesce_corruptions_are_named
+  (let [result (build-ra-pressure!) left (n-in result 1) right (n-in result 2)]
+    (ra-compile! 4 0)
+    (let [a (ms-vget 0 left) b (ms-vget 0 right)]
+      (mra-corrupt-interference! a b false)
+      (assert (not (mra-verify!)))
+      (assert (= (mra-result) MRA-INTERFERENCE)))
+    (ra-compile! 4 0)
+    (let [a (ms-vget 0 left) b (ms-vget 0 right)]
+      (mra-corrupt-reg! b (mra-reg a))
+      (assert (not (mra-verify!)))
+      (assert (= (mra-result) MRA-INTERFERENCE)))))
+
+(deftest spill_kind_corruption_is_named
+  (build-ra-pressure!)
+  (assert (> (ra-compile! 1 0) 0))
+  (let [(mut vr) 0 (mut spilled) -1]
+    (loop
+      (if (or (>= (load vr) (ml-vreg-count)) (>= (load spilled) 0)) (break)
+        (do
+          (if (>= (mra-spill (load vr)) 0) (store! spilled (load vr)) 0)
+          (store! vr (+ (load vr) 1)) 0)))
+    (assert (>= (load spilled) 0))
+    (mra-corrupt-spill-kind! (load spilled)
+      (if (= (ml-value-kind (load spilled)) MLK-SCALAR) MLK-BOXED MLK-SCALAR))
+    (assert (not (mra-verify!)))
+    (assert (= (mra-result) MRA-SPILL-KIND))))
+
+(deftest safe_phi_edge_copy_coalesces_to_one_location
+  (graph-reset! 1103)
+  (let [pred (n-new1 OP-ARG (t-bool) (g-start))
+        arms (n-if-arms! (n-peephole (n-new2 OP-IF 0 (g-start) pred)))
+        join (n-new OP-REGION 0) yes (ra-const 11) no (ra-const 22)]
+    (n-add-def! join NO-NODE) (n-add-def! join (arms-t arms)) (n-add-def! join (arms-f arms))
+    (let [phi (n-new OP-PHI (t-int))]
+      (n-add-def! phi join) (n-add-def! phi yes) (n-add-def! phi no)
+      (n-add-def! (g-stop) (n-new2 OP-RETURN 0 join phi))
+      (g-analyze!)
+      (ra-compile! 4 0)
+      (let [dst (ms-vget 0 phi) (mut edge) 0 (mut copies) 0 (mut coalesced) 0]
+        (loop
+          (if (>= (load edge) (mu-edge-count)) (break)
+            (do
+              (let [(mut i) 0]
+                (loop
+                  (if (>= (load i) (mu-edge-copy-count (load edge))) (break)
+                    (do
+                      (if (= (mu-copy-kind (load edge) (load i)) MCOPY-VALUE)
+                          (let [src (mu-copy-src (load edge) (load i))]
+                            (store! copies (+ (load copies) 1))
+                            (if (or (and (>= (mra-reg dst) 0) (= (mra-reg dst) (mra-reg src)))
+                                    (and (>= (mra-spill dst) 0)
+                                         (= (mra-spill dst) (mra-spill src))))
+                                (store! coalesced (+ (load coalesced) 1)) 0)) 0)
+                      (store! i (+ (load i) 1)) 0))))
+              (store! edge (+ (load edge) 1)) 0)))
+        (assert (= (load copies) 2))
+        (assert (> (load coalesced) 0))
+        (let [(mut at) 0]
+          (loop
+            (if (>= (load at) (be-inst-count)) (break)
+              (do
+                (if (= (ms-inst-dst (load at)) dst)
+                    (do (assert (= (load (field (be-inst (load at)) reg)) (mra-reg dst)))
+                        (assert (= (load (field (be-inst (load at)) spill)) (mra-spill dst)))) 0)
+                (store! at (+ (load at) 1)) 0))))))))
+
+(deftest managed_root_has_exact_kinded_safepoint_location
+  (graph-reset! 1104)
+  (shape-reset!)
+  (let [sx (shape-transition SHAPE-ROOT "x" (t-dyn)) ax (shape-field-alias sx 0)
+        first (n-new-obj1! (g-start) sx (mk-mem-in ax)) root (n-obj-ptr first)
+        mem1 (n-new4 OP-STORE ax NO-NODE (n-obj-mem first 0) root (ra-const 1))
+        second (n-new-obj1! (g-start) sx mem1) other (n-obj-ptr second)
+        mem2 (n-new4 OP-STORE ax NO-NODE (n-obj-mem second 0) other (ra-const 2))
+        value (n-new3 OP-LOAD ax NO-NODE mem2 root)
+        ret (n-new3 OP-RETURN 0 (g-start) value mem2)]
+    (n-add-def! (g-stop) ret) (g-analyze!)
+    (ra-compile! 1 0)
+    (let [root-v (ms-vget 0 root) (mut at) 0 (mut second-at) -1 (mut seen) 0]
+      (loop
+        (if (>= (load at) (be-inst-count)) (break)
+          (do
+            (if (= (ms-inst-op (load at)) MI-NEW)
+                (do (store! seen (+ (load seen) 1))
+                    (if (= (load seen) 2) (store! second-at (load at)) 0)) 0)
+            (store! at (+ (load at) 1)) 0)))
+      (assert (>= (load second-at) 0))
+      (assert (= (ml-value-kind root-v) MLK-RAW-MANAGED))
+      (assert (ml-live-before? (load second-at) root-v))
+      (assert (= (mra-safepoint-kind (load second-at) root-v) MLK-RAW-MANAGED))
+      (assert (!= (>= (mra-safepoint-reg (load second-at) root-v) 0)
+                  (>= (mra-safepoint-spill (load second-at) root-v) 0))))))

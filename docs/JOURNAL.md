@@ -1019,3 +1019,236 @@ paths; the report labels those outcomes rather than selecting only the favorable
 The same run emits `bench-profile.json`: dynamic-add observed 900 number calls and 100 string calls,
 with clone cost 7. `n-profile-specialize?` consumes those three axes and is gated at 32 samples,
 80% dominance, and cost 32; each rejection boundary has a negative test.
+
+## G0: unsupported is an executable result
+
+The backend now reports stable `BER-*` results with an offending ideal node and, for malformed
+input, the underlying verifier code. Selection preflights verifier cleanliness, calls, multiple
+loop Phis, and CFG shapes the prototype walker cannot represent. Any failure clears code and object
+publication. Checked allocation, encoding, and object-emission entry points turn their phase
+failures into the same atomic result protocol.
+
+The permanent parity ladder contains eleven capability fixtures from two-Phi diamonds through
+reduced binary-trees. Every terminating fixture has an interpreter expectation; supported rungs
+also execute natively, while unsupported rungs assert an exact result. Reduced binary-trees builds
+seven fixed-shape two-reference nodes, uses `null` sentinels, traverses them recursively, checks raw
+and optimized outcomes, and repeats across the twelve shared extended seeds.
+
+Two falsifications changed the implementation rather than merely confirming existing tests:
+
+- `branch_nested_in_loop_preserves_the_interpreter_result` initially let the shape walker report
+  success, then native execution did not terminate. Requiring a direct loop-body `CProj` back edge
+  makes that unsupported CFG fail before emission as `BER-UNSUPPORTED-CFG`.
+- `reduced_binary_trees_has_structural_observables_and_is_seed_stable` initially returned 3 instead
+  of 7. The right recursive traversal overwrote the caller's cached left call result because call
+  results were not part of the interpreter frame. The focused Fibonacci test
+  `two_recursive_call_results_are_restored_as_part_of_the_caller_frame` now permanently falsifies
+  that bug; removing call-cache save/restore makes it red.
+
+## G1: CFG identity is an indexed fact
+
+The backend now has a read-only machine compilation-unit projection separate from legacy
+selection. Functions own RPO block lists and return blocks; blocks own reciprocal predecessor and
+successor slices, natural-loop depth, and stable layout indexes; edges retain their function,
+source, target, exact Region/Loop predecessor slot, and future copy range. Entry-rooted builds walk
+closed-world direct calls and exclude unrelated live functions. An exact nested-diamond dump is
+stable across all twelve extended construction seeds.
+
+The first diamond falsified the initial recursive builder: all four blocks were discovered, but a
+recursive return value was reused while unwinding and produced edges `1->0` and `0->0`. Resolving
+the stable control-to-block index after recursive discovery fixed the graph; the exact four-edge
+diamond table permanently detects the self-edge regression. The closure audit also found that
+edge deduplication keyed only `(source,target)`, which would erase distinct merge slots on parallel
+edges. Stable edge identity now includes `target-slot`.
+
+Permanent corruptions independently name owner, reciprocal-list, predecessor-slot, RPO,
+terminator-arity, and cross-function-isolation failures. A real never-exiting corpus fixture still
+builds a finite verified CFG, while provably unreachable ideal control contributes no machine
+block. The full repository gate is green at 273 tests and the extended CFG/parity matrix is green.
+
+## G2: selection is a block walk, not a control-shape trick
+
+The new selector consumes G1 functions and RPO blocks directly. It emits owned `CBR`, `JMP`, and
+`RET` terminators, materializes movable scalar values conservatively in the function entry, and
+packs pinned `New`, `Load`, and `Store` operations into their real control block. Machine-op
+descriptors state arity, placeholders, effects, pinning, memory behavior, terminator status, and
+whether encoding exists. General block terminators deliberately remain non-encodable until their
+later lowering phase.
+
+Selection metadata includes function-local ideal-value maps, exact per-block instruction ranges,
+and explicit memory-SSA dependency ranges. The verifier checks unique membership, ownership,
+definition order, function locality, pinned placement, one-time definitions, supported descriptors,
+memory order, and exactly one successor-compatible terminator. Permanent corruptions name owner,
+scalar dependency, memory dependency, and duplicate-terminator failures. A shared constant used by
+two ideal functions is materialized independently for both machine owners.
+
+The first memory fixture falsified the test rather than the selector: the optimized object fixture
+has intentionally forwarded its `Load`, so demanding `NEW/STORE/LOAD` there failed on a graph that
+no longer contained a load. The gate now uses the verifier-clean raw analyzed twin, whose purpose is
+to retain that exact chain. A second audit showed that list order alone was too weak to constrain a
+future scheduler; memory dependencies are now first-class metadata, and redirecting the load to
+itself makes `broken_memory_dependency_has_a_named_dependency_failure` red.
+
+While closing G2, the globally installed Coil compiler changed to require allocation and numeric
+primitives through their owning namespaces. The repository was migrated to explicit `coil.alloc`
+and `coil.primitive` dependencies and all gates were rerun under the new binary. The full gate is
+green at 289 tests; the extended parity, CFG, and selection matrices are green. Value Phis still
+fail exactly as `MSEL-UNSUPPORTED`, preserving G3's edge-lowering boundary.
+# G3 — general Phi edge lowering
+
+The block selector now destroys SSA by predecessor slot. Every `MEdge` owns typed `MCopy`
+records; value copies resolve into ordered `MMove` sequences, while memory copies remain ordering
+facts. Destinations are reserved before loop inputs are selected, so mutually recursive Phis and
+swap cycles terminate. Cycles preserve one source in a fresh temporary. Conditional projections
+are real one-successor split blocks, so edge moves execute before their jump without arm-order
+guessing.
+
+`ms-lower-encodable!` runs only after the structural verifier, inserts labels, lowers `CBR/JMP`,
+and emits encodable `COPY` instructions. Native tests cover both diamond arms, a two-value loop,
+a swap, and forced spilled copy operands. A loop memory-Phi fixture proves each incoming memory
+state is produced before its source edge. Three corruption witnesses reject swapped sources,
+wrong Phi identity, and missing copies with `MSEL-PHI`.
+
+# G4 — conservative direct calls
+
+Program selection now builds a synthetic entry owner plus the transitive closed-world set of
+direct callees. `MI-CALL` records the callee owner, arg0 vreg, result vreg, effects, and pinned
+block. Encodable lowering uses a real PC-relative arm64 `BL`; x0 transports the supported argument
+and return, and a reserved temporary preserves LR around each call until G5 supplies real frames.
+Internal returns no longer run the top-level stack epilogue.
+
+The focused matrix executes one call, two chained callees, and a branch-local call against the
+interpreter. It rejects live-across-call values atomically as `BER-UNSUPPORTED-CALL-LIVE`, and
+names recursion, runtime function values, and unsupported arity as `BER-UNSUPPORTED-CALL`.
+Corruption tests independently catch bad target identity, a missing argument definition, and
+cross-function instruction ownership. The established generic `ms-select!` API was preserved;
+G4 uses a distinct program-selection entry so explicit-function and legacy gates remain stable.
+
+# G5 — arm64 ABI and per-function frames
+
+Machine-owned code now derives a 16-byte-aligned frame per function from its local spill slots.
+Every entry saves FP/LR in its own frame and every return restores them; the old fixed reservation
+is confined to the still-separate legacy owner path. Spill offsets are function-local and the ABI
+verifier independently checks alignment, bounds, and argument locations.
+
+Calls carry an explicit variable-length argument table. x0-x7 are marshalled through a parallel
+stack staging area, argument 8+ remains in that aligned area for frame-relative callee loads, and
+x0 transports the result. Until exact liveness and constrained allocation land, calls preserve a
+conservative x0-x11 envelope. This replaces G4's call-live rejection and makes direct and mutual
+recursion honest: LR is stack state, not a reserved global scratch register.
+
+Focused native evidence covers zero, one, two, eight, and nine arguments, values live across calls,
+100-deep direct recursion, and mutual recursion. Named corruptions cover misaligned frames,
+out-of-frame spills, bad argument locations, call targets, argument dependencies, and ownership.
+# G8 closure: Simple-style global code motion
+
+- Added exact per-function machine immediate dominators and dominance queries.
+- Added earliest/latest placement intervals, Phi-edge uses, shallow-loop choice, and deterministic
+  repacking with terminators last.
+- Kept calls, allocation, memory, arguments, labels, copies, and control pinned.
+- Added conservative explicit load-to-store anti-dependencies and independent placement/memory
+  verifiers with named corruption witnesses.
+- Closed through the controller after the focused suite, 330-test quick and full gates, native and
+  TypeScript gates, verification-only benchmarks, diagram generation, and extended matrices passed.
+# G9 closure: dependency-correct local scheduling
+
+- Replaced assumed selection order with a seeded ready-list scheduler over explicit scalar, memory,
+  anti-dependency, call/effect, entry, copy, and terminator constraints.
+- Kept latency metadata separate from legality and made seed zero pressure-conservative.
+- Added exact-once and dependency verification plus scalar, memory, call, boundary, and duplication
+  corruption witnesses.
+- Closed through the controller after focused tests, 337-test quick/full gates, native and
+  TypeScript execution, verification-only benchmarks, diagrams, and extended matrices passed.
+# G6 closure: CFG liveness
+
+- Added deterministic scheduled-code use/def/live-in/live-out fixpoints and conceptual Phi-edge
+  transfer sets with independent equation verification.
+- Modeled call arguments and caller clobbers, exact safepoint liveness, and scalar/raw-managed/
+  boxed/nonmoving value kinds, including managed-reference Phis.
+- Added deterministic dumps and named fixpoint, edge, and kind corruptions.
+- Closed through the controller after focused tests, 348-test quick/full gates, native and
+  TypeScript execution, verification-only benchmarks, diagrams, and extended matrices passed.
+# G7 closure: CFG-correct constrained register allocation
+
+- Added vreg allocation over exact CFG liveness interference, explicit ABI/call-clobber masks,
+  copy preferences, deterministic allocation seeds, callee-saved registers, and frame-local typed
+  spill slots.
+- Published exact safepoint register/stack locations and value kinds, and independently verified
+  location uniqueness, interference, fixed registers, spill kinds, and legal coalescing.
+- Kept Phi parallel copies correct under one- and two-register budgets, including mixed spills and
+  swap-cycle temporaries. Those pressure tests exposed and permanently cover a native encoder bug:
+  spilled `CBZ` predicates must compute their displacement from the branch after its reload.
+- Prepared controller closure after focused tests, 357-test quick/full gates, native and TypeScript
+  execution, verification-only benchmarks, diagrams, and extended matrices passed.
+# G10 closure: multi-function Mach-O and metadata
+
+- Replaced the one-symbol object writer with exact per-function text ranges, local function symbols,
+  an exported `_kernel`, a classified dynamic symbol table, and layout-seeded whole-function text
+  repacking.
+- Added real external arm64 branch relocations and a named `_aot_alloc_slow` undefined symbol. The
+  allocation call passes size/shape in x0/x1 and returns the object in x0.
+- Added versioned `__aot_stackmap` and `__aot_layout` sections. Stack maps use post-call PCs and
+  serialize exact G7 register/stack locations and value kinds; layouts serialize shape, size,
+  alignment, field count, and reference bitmap.
+- Added an independent raw-byte parser plus named function-range, symbol, internal/external
+  relocation, stack-map, and layout corruptions. Failed checked publication clears prior bytes.
+- External harnesses link and run three layouts each of nested calls and 42-level mutual recursion,
+  plus a separately linked allocation slow path.
+
+# X1 closure: moving native collector
+
+- Added generated fast-path allocation, a real slow-path moving collector, exact stack maps,
+  descriptor reference bitmaps, root relocation, promotion, remembered old-to-young references,
+  heap verification, and configured OOM behavior.
+- Made allocation counters exact on both paths and exposed allocations, bytes, copies, promotions,
+  peak live heap, collections, verifications, slow paths, moves, and maximum walked frames.
+- Closed the controller only after normal, forced-collection, register/spill/argument/field root,
+  recursive, promotion/barrier, stale-root, and bitmap-corruption witnesses were green.
+
+# X2 implementation: hand-built binary-trees
+
+- Built the canonical stretch, long-lived, and even-depth work trees directly from ordinary ideal
+  functions, recursion, loops, Phis, calls, objects, null leaves, loads, stores, and structured
+  31-field results. No backend path names the fixture or its functions.
+- Raw and optimized interpreters agree through depth 10; native normal, six-register pressure,
+  collect-every-allocation, heap verification, and 20 allocation/schedule seeds agree with Node.
+- Staged depth 12, 14, 16, and 18 runs force real exhaustion while the long-lived root is dormant.
+  Focused mutations cover field exchange, null comparison, recursive results, loop Phis and counts,
+  caller saves, stale roots, and reference bitmaps. The required depth-21 run remains the active
+  release witness until it returns exact metrics.
+
+# X3 implementation: normalized TypeScript to Coil
+
+- Pinned TypeScript 5.9.3 and replaced the hand-written parser product path with normalized,
+  source-ranged IR carrying stable symbols, functions, locals, assignments, branches, loops,
+  direct calls, constructors, object layouts, fields, operators, arity checks, and named rejection.
+- Added atomic TypeScript-to-Coil publication: unsupported input reports its source range before an
+  output is opened. The prior JavaScript graph remains only as a compatibility/oracle test.
+- Added general normalized lowering into public Coil node/shape APIs, including value and memory
+  Phis, loop-carried values, call sequencing, object memory, and immutable narrowed heap views.
+  Readable TypeScript binary-trees agrees with Node and the normalized oracle through depth 10,
+  reaches the Coil interpreter raw/optimized, and passes native normal, stress, pressure, and
+  20-seed gates with exact allocation metrics.
+
+# X4 closure: reproducible depth-21 performance
+
+- Added a verification-only performance gate that runs correctness and validates published evidence
+  while asserting the tracked/untracked worktree inventory is unchanged.
+- Published nine raw depth-21 Coil/Node pairs, medians, per-phase timings, allocation throughput,
+  exact GC movement/promotion/peak metrics, code size, environment, protocol, and explicit losses.
+- Kept publication behind an explicit `--update`; ordinary `--verify` performs no writes.
+- The publication audit exposed a normalized-TypeScript moving-GC failure beyond X3's depth-10
+  contract. Added X5 so the overall controller cannot finish while that gap remains.
+
+# X5 implementation: TypeScript depth-21 moving-GC closure
+
+- Reduced the invalid `Tree.right = 2` heap witness to lost intra-block control ordering: selection
+  mapped `CallEnd` to its block but did not select its effect chain, so scheduling could place a
+  parent allocation before the recursive calls that compute its fields.
+- Added general recursive CallEnd-effect selection for calls and allocations. No fixture or source
+  function name appears in the backend.
+- Added a focused machine regression that requires two field-producing calls before the parent
+  allocation.
+- TypeScript-native depth 21 now returns all 31 exact observables and 613,766,495 allocations /
+  14,730,396,112 bytes through 55 verified moving collections, including six-register pressure and
+  seeds 11 through 14.

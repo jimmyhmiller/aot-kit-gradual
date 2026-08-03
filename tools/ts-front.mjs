@@ -1,6 +1,8 @@
 #!/usr/bin/env node
-import { compileFile, execute, guardCount } from "../src/ts_frontend.mjs";
+import fs from "node:fs";
+import { executeNormalized, normalizeTypeScript } from "../src/frontend_ir.mjs";
+
 const [file, args = "[]"] = process.argv.slice(2);
 if (!file) { console.error("usage: ts-front.mjs FILE.ts '[args]'"); process.exit(2); }
-const { graph } = compileFile(file);
-console.log(JSON.stringify({ result: execute(graph, JSON.parse(args)), guards: guardCount(graph), graph }, null, 2));
+const program = normalizeTypeScript(fs.readFileSync(file, "utf8"), file);
+console.log(JSON.stringify({ result: executeNormalized(program, JSON.parse(args)), program }, null, 2));

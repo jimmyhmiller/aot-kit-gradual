@@ -1,0 +1,366 @@
+;; G4 conservative closed-world direct calls.
+(module backendcalltest)
+
+(import "ty" :use *)
+(import "node" :use *)
+(import "backend" :use *)
+(import "verify" :use *)
+(import "shape" :use *)
+(import "eval" :use *)
+(import "coil.assert" :use *)
+(import "coil.alloc" :use *)
+(import "coil.slice" :use *)
+(import "coil.primitive" :as primitive)
+(import "coil.io" :use *)
+(import "coil.fmt" :use *)
+
+(extern mmap :cc c [(ptr u8) i64 i32 i32 i32 i64] (-> (ptr u8)))
+(extern mprotect :cc c [(ptr u8) i64 i32] (-> i32))
+(extern munmap :cc c [(ptr u8) i64] (-> i32))
+(extern sys_icache_invalidate :cc c [(ptr u8) i64] (-> void))
+
+(defn cc [(v i64)] (-> i64)
+  (n-new1 OP-CONST (t-int-con v) (g-start)))
+(defn cb [(op i64) (a i64) (b i64)] (-> i64)
+  (n-new3 op 0 NO-NODE a b))
+
+(defn native0 [] (-> i64)
+  (let [mem (mmap (cast (ptr u8) 0) 4096 3 4098 -1 0)]
+    (assert (!= (cast i64 mem) -1))
+    (let [n (be-code-len)
+          (mut i) 0]
+      (loop (if (>= (load i) n)
+                (break)
+                (do
+                  (store! (index mem (load i)) (cast u8 (be-code-byte (load i))))
+                  (store! i (+ (load i) 1))
+                  0)))
+      (assert (= (mprotect mem 4096 5) 0))
+      (sys_icache_invalidate mem n)
+      (let [fp (cast (fnptr c [] i64) mem)
+            got (primitive/call-ptr fp)]
+        (assert (= (munmap mem 4096) 0))
+        got))))
+
+(defn native1 [(arg i64)] (-> i64)
+  (let [mem (mmap (cast (ptr u8) 0) 4096 3 4098 -1 0)]
+    (assert (!= (cast i64 mem) -1))
+    (let [n (be-code-len)
+          (mut i) 0]
+      (loop (if (>= (load i) n)
+                (break)
+                (do
+                  (store! (index mem (load i)) (cast u8 (be-code-byte (load i))))
+                  (store! i (+ (load i) 1))
+                  0)))
+      (assert (= (mprotect mem 4096 5) 0))
+      (sys_icache_invalidate mem n)
+      (let [fp (cast (fnptr c [i64] i64) mem)
+            got (primitive/call-ptr fp arg)]
+        (assert (= (munmap mem 4096) 0))
+        got))))
+
+(defn count-call-mi [] (-> i64)
+  (let [n (be-inst-count)
+        (mut i) 0
+        (mut count) 0]
+    (loop (if (>= (load i) n)
+              (break)
+              (do
+                (if (= (ms-inst-op (load i)) MI-CALL)
+                    (store! count (+ (load count) 1))
+                    0)
+                (store! i (+ (load i) 1))
+                0)))
+    (load count)))
+
+(defn find-call-mi [] (-> i64)
+  (let [n (be-inst-count)
+        (mut i) 0
+        (mut found) -1]
+    (loop (if (or (>= (load i) n) (>= (load found) 0))
+              (break)
+              (do
+                (if (= (ms-inst-op (load i)) MI-CALL) (store! found (load i)) 0)
+                (store! i (+ (load i) 1))
+                0)))
+    (load found)))
+
+(deftest callend_effect_chain_keeps_recursive_fields_before_parent_allocation
+  (graph-reset! 403)
+  (shape-reset!)
+  (let [tree-left (shape-transition SHAPE-ROOT "left" (t-obj))
+        tree (shape-transition tree-left "right" (t-obj))
+        left-alias (shape-field-alias tree 0) right-alias (shape-field-alias tree 1)
+        callee (n-fun-open! 0) parm (n-parm! callee 0)
+        callee-ret (n-new2 OP-RETURN 0 (n-fun-entry callee) parm)]
+    (n-fun-close! callee callee-ret)
+    (let [left (n-call1! (g-start) callee (cc 11))
+          right (n-call1! (call-end left) callee (cc 22))
+          incoming (stack (array i64 2))]
+      (store! (index incoming 0) (n-new1 OP-ARG (t-mem-alias left-alias (t-undef)) (call-end right)))
+      (store! (index incoming 1) (n-new1 OP-ARG (t-mem-alias right-alias (t-undef)) (call-end right)))
+      (let [parent (n-new-obj! (call-end right) tree
+                     (slice-new [i64] (cast (ptr i64) incoming) 2))
+            object (n-obj-ptr parent)
+            left-store (n-store! (n-obj-mem parent 0) object (call-value left) left-alias)
+            right-store (n-store! (n-obj-mem parent 1) object (call-value right) right-alias)
+            merge (n-new OP-MEMMERGE 0)]
+        (n-add-def! merge NO-NODE) (n-add-def! merge left-store) (n-add-def! merge right-store)
+        (n-add-def! (g-stop) (n-new3 OP-RETURN 0 (call-end right) object merge))
+        (g-analyze!)
+        (assert (be-select-machine-program!))
+        (assert (>= (be-schedule!) 0))
+        (let [(mut at) 0 (mut calls) 0 (mut latest-call) -1 (mut allocation) -1]
+          (loop
+            (if (>= (load at) (be-inst-count)) (break)
+              (do
+                (if (= (ms-inst-op (load at)) MI-CALL)
+                    (do (store! calls (+ (load calls) 1)) (store! latest-call (load at))) 0)
+                (if (and (= (ms-inst-owner (load at)) 0)
+                         (= (ms-inst-op (load at)) MI-NEW))
+                    (store! allocation (load at)) 0)
+                (store! at (+ (load at) 1)) 0)))
+          (assert (= (load calls) 2))
+          (assert (>= (load allocation) 0))
+          (assert (< (load latest-call) (load allocation))))))))
+
+(defn compile-machine! [] (-> i64)
+  (if (be-select-machine-program!)
+      0
+      (do
+        (fmt (stderr)
+             "call selection failed {d}/{d} at {d}\n"
+             (be-result)
+             (ms-result)
+             (ms-result-item))
+        (let [(mut i) 0]
+          (loop (if (>= (load i) (be-inst-count))
+                    (break)
+                    (do
+                      (fmt (stderr)
+                           " {d}: op={d} owner={d} block={d} earliest={d} latest={d} node={d}\n"
+                           (load i)
+                           (ms-inst-op (load i))
+                           (ms-inst-owner (load i))
+                           (ms-inst-block (load i))
+                           (ms-inst-earliest (load i))
+                           (ms-inst-latest (load i))
+                           (ms-inst-node (load i)))
+                      (store! i (+ (load i) 1))
+                      0))))
+        (assert false)
+        0))
+  (let [scheduled (be-schedule!)]
+    (if (< scheduled 0)
+        (do (fmt (stderr) "schedule failed {d} at {d}\n"
+                 (ms-schedule-result) (ms-schedule-item))
+            (assert false) 0) 0))
+  (let [spills (be-color! 10)]
+    (if (= spills 0) 0
+      (do
+        (fmt (stderr) "unexpected call-test spills: {d}\n" spills)
+        (let [(mut i) 0]
+          (loop
+            (if (>= (load i) (be-inst-count)) (break)
+              (do
+                (let [m (be-inst (load i))]
+                  (fmt (stderr) " {d}: op={d} owner={d} block={d} first={d} last={d} reg={d} spill={d}\n"
+                       (load i) (load (field m op)) (load (field m owner))
+                       (load (field m block-id)) (load (field m first)) (load (field m last))
+                       (load (field m reg)) (load (field m spill))))
+                (store! i (+ (load i) 1)) 0))))
+        (assert false)
+        0)))
+  (assert (be-encode-checked!))
+  0)
+
+(defn build-one-call! [] (-> i64)
+  (graph-reset! 401)
+  (let [inc (n-fun-open! 0)
+        x (n-parm! inc 0)
+        body (n-new2 OP-RETURN 0 (n-fun-entry inc) (cb OP-ADD x (cc 1)))]
+    (n-fun-close! inc body)
+    (let [site (n-call1! (g-start) inc (cc 41))
+          ret (n-new2 OP-RETURN 0 (call-end site) (call-value site))]
+      (n-add-def! (g-stop) ret)
+      (g-analyze!)
+      (call-value site))))
+
+(defn build-chained-calls! [] (-> i64)
+  (graph-reset! 402)
+  (let [inc (n-fun-open! 0)
+        ix (n-parm! inc 0)
+        inc-ret (n-new2 OP-RETURN 0 (n-fun-entry inc) (cb OP-ADD ix (cc 1)))
+        twice (n-fun-open! 1)
+        tx (n-parm! twice 0)
+        twice-ret (n-new2 OP-RETURN 0 (n-fun-entry twice) (cb OP-MUL tx (cc 2)))]
+    (n-fun-close! inc inc-ret)
+    (n-fun-close! twice twice-ret)
+    (let [first (n-call1! (g-start) inc (cc 20))
+          second (n-call1! (call-end first) twice (call-value first))
+          ret (n-new2 OP-RETURN 0 (call-end second) (call-value second))]
+      (n-add-def! (g-stop) ret)
+      (g-analyze!)
+      (call-value first))))
+
+(defn build-branch-call! [] (-> i64)
+  (graph-reset! 403)
+  (let [inc (n-fun-open! 0)
+        x (n-parm! inc 0)
+        body (n-new2 OP-RETURN 0 (n-fun-entry inc) (cb OP-ADD x (cc 1)))]
+    (n-fun-close! inc body)
+    (let [pred (n-new1 OP-ARG (t-bool) (g-start))
+          arms (n-if-arms! (n-peephole (n-new2 OP-IF 0 (g-start) pred)))
+          site (n-call1! (arms-t arms) inc (cc 40))
+          yes (n-new2 OP-RETURN 0 (call-end site) (call-value site))
+          no (n-new2 OP-RETURN 0 (arms-f arms) (cc 9))]
+      (n-add-def! (g-stop) yes)
+      (n-add-def! (g-stop) no)
+      (g-analyze!)
+      (call-value site))))
+
+(deftest one_direct_callee_has_disjoint_machine_ownership_and_executes_real_bl
+         (let [call (build-one-call!)]
+           (assert (= (n-op call) OP-CALL))
+           (assert (= (g-verify) 0))
+           (assert (= (ev-run-bound 1 10000) EV-OK))
+           (assert (= (rt-payload (ev-result)) 42))
+           (compile-machine!)
+           (assert (= (mu-function-count) 2))
+           (assert (= (native0) 42))))
+
+(deftest two_reachable_callees_chain_results_through_two_bl_fixups
+         (build-chained-calls!)
+         (assert (= (g-verify) 0))
+         (assert (= (ev-run-bound 1 10000) EV-OK))
+         (assert (= (rt-payload (ev-result)) 42))
+         (compile-machine!)
+         (assert (= (mu-function-count) 3))
+         (assert (= (count-call-mi) 2))
+         (assert (= (native0) 42)))
+
+(deftest direct_call_in_one_branch_preserves_both_native_outcomes
+         (build-branch-call!)
+         (assert (= (g-verify) 0))
+         (compile-machine!)
+         (assert (= (native1 1) 41))
+         (assert (= (native1 0) 9)))
+
+(deftest value_live_across_call_survives_the_provisional_caller_saved_envelope
+         (graph-reset! 404)
+         (let [identity (n-fun-open! 0)
+               x (n-parm! identity 0)
+               body (n-new2 OP-RETURN 0 (n-fun-entry identity) x)]
+           (n-fun-close! identity body)
+           (let [held (cc 10)
+                 site (n-call1! (g-start) identity (cc 32))
+                 ret (n-new2 OP-RETURN 0 (call-end site) (cb OP-ADD held (call-value site)))]
+             (n-add-def! (g-stop) ret)
+             (g-analyze!)
+             (compile-machine!)
+             (assert (= (native0) 42)))))
+
+(deftest two_register_arguments_are_marshaled_in_parallel
+         (graph-reset! 405)
+         (let [add (n-fun-open! 0)
+               x (n-parm! add 0)
+               y (n-parm! add 1)
+               body (n-new2 OP-RETURN 0 (n-fun-entry add) (cb OP-ADD x y))]
+           (n-fun-close! add body)
+           (let [site (n-call2! (g-start) add (cc 20) (cc 22))
+                 ret (n-new2 OP-RETURN 0 (call-end site) (call-value site))]
+             (n-add-def! (g-stop) ret)
+             (g-analyze!)
+             (compile-machine!)
+             (assert (= (native0) 42)))))
+
+(deftest corrupted_direct_target_is_rejected_by_named_call_verifier
+         (build-one-call!)
+         (assert (ms-select-program!))
+         (let [at (find-call-mi)]
+           (assert (>= at 0))
+           (ms-corrupt-call-target! at 0)
+           (assert (not (ms-verify!)))
+           (assert (= (ms-result) MSEL-CALL))))
+
+(deftest missing_call_argument_definition_is_rejected_as_dependency
+         (build-one-call!)
+         (assert (ms-select-program!))
+         (let [at (find-call-mi)]
+           (ms-corrupt-call-arg! at 0 999999)
+           (assert (not (ms-verify!)))
+           (assert (= (ms-result) MSEL-DEPENDENCY))))
+
+(deftest call_moved_to_callee_owner_is_rejected_as_cross_function_ownership
+         (build-one-call!)
+         (assert (ms-select-program!))
+         (let [at (find-call-mi)]
+           (ms-corrupt-owner! at 1)
+           (assert (not (ms-verify!)))
+           (assert (= (ms-result) MSEL-OWNER))))
+
+(deftest recursive_direct_call_restores_lr_and_sp_from_each_frame
+         (graph-reset! 406)
+         (let [fun (n-fun-open! 0)
+               n (n-parm! fun 0)
+               arms (n-if-arms! (n-peephole (n-new2 OP-IF 0 (n-fun-entry fun) (cb OP-LT n (cc 1)))))
+               recur (n-call1! (arms-f arms) fun (cb OP-SUB n (cc 1)))
+               base (n-new2 OP-RETURN 0 (arms-t arms) (cc 1))
+               step (n-new2 OP-RETURN 0 (call-end recur) (call-value recur))]
+           (n-fun-close! fun base)
+           (n-fun-add-return! fun step)
+           (let [site (n-call1! (g-start) fun (cc 100))
+                 ret (n-new2 OP-RETURN 0 (call-end site) (call-value site))]
+             (n-add-def! (g-stop) ret)
+             (g-analyze!)
+             (assert (= (g-verify) 0))
+             (compile-machine!)
+             (assert (= (native0) 1)))))
+
+(deftest mutual_recursion_preserves_each_functions_lr_and_frame
+         (graph-reset! 409)
+         (let [even (n-fun-open! 0)
+               odd (n-fun-open! 1)
+               en (n-parm! even 0)
+               on (n-parm! odd 0)
+               ea
+                 (n-if-arms! (n-peephole (n-new2 OP-IF 0 (n-fun-entry even) (cb OP-EQ en (cc 0)))))
+               er (n-call1! (arms-f ea) odd (cb OP-SUB en (cc 1)))
+               eb (n-new2 OP-RETURN 0 (arms-t ea) (cc 1))
+               es (n-new2 OP-RETURN 0 (call-end er) (call-value er))
+               oa
+                 (n-if-arms! (n-peephole (n-new2 OP-IF 0 (n-fun-entry odd) (cb OP-EQ on (cc 0)))))
+               orc (n-call1! (arms-f oa) even (cb OP-SUB on (cc 1)))
+               ob (n-new2 OP-RETURN 0 (arms-t oa) (cc 0))
+               os (n-new2 OP-RETURN 0 (call-end orc) (call-value orc))]
+           (n-fun-close! even eb)
+           (n-fun-add-return! even es)
+           (n-fun-close! odd ob)
+           (n-fun-add-return! odd os)
+           (let [site (n-call1! (g-start) even (cc 20))
+                 ret (n-new2 OP-RETURN 0 (call-end site) (call-value site))]
+             (n-add-def! (g-stop) ret)
+             (g-analyze!)
+             (assert (= (g-verify) 0))
+             (assert (= (ev-run-bound 1 100000) EV-OK))
+             (assert (= (rt-payload (ev-result)) 1))
+             (compile-machine!)
+             (assert (= (mu-function-count) 3))
+             (assert (= (native0) 1)))))
+
+(deftest runtime_function_value_is_rejected_even_when_its_type_is_singleton
+         (graph-reset! 407)
+         (let [fun (n-fun-open! 0)
+               x (n-parm! fun 0)
+               body (n-new2 OP-RETURN 0 (n-fun-entry fun) x)]
+           (n-fun-close! fun body)
+           (let [indirect (n-new1 OP-ARG (t-fun-con 0) (g-start))
+                 site (n-call1! (g-start) indirect (cc 42))
+                 ret (n-new2 OP-RETURN 0 (call-end site) (call-value site))]
+             (n-add-def! (g-stop) ret)
+             (g-analyze!)
+             (assert (= (g-verify) 0))
+             (assert (not (be-select-machine-program!)))
+             (assert (= (ms-result) MSEL-CALL))
+             (assert (= (be-result) BER-UNSUPPORTED-CALL)))))

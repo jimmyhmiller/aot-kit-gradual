@@ -94,34 +94,33 @@ Status values are `not started`, `in progress`, `blocked`, and `done`. â€œDoneâ€
 
 | ID | Milestone | Status | Required predecessor | Primary gate |
 |---|---|---|---|---|
-| G0 | Capability diagnostics and parity fixture ladder | not started | baseline | `backend-parity-test` rejects unsupported stages by name |
-| G1 | Machine compilation units, functions, blocks, and edges | not started | G0 | verified exact CFG tables for nested and multi-function fixtures |
-| G2 | General block-based instruction selection | not started | G1 | arbitrary reducible parity CFGs select without shape helpers |
-| G3 | General Phi edge lowering | not started | G2 | multi-Phi, critical-edge, and cyclic-copy native differentials |
-| G4 | Conservative multi-function direct calls | not started | G3 | two native functions call and return through real `BL` |
-| G5 | arm64 ABI and per-function frames | not started | G4 | non-leaf, stack-argument, and recursive frame gates |
-| G6 | CFG liveness | not started | G3, G5 | exact live-in/out and Phi-edge sets over loops and calls |
-| G7 | CFG-correct constrained register allocation | not started | G6 | forced-pressure calls, loops, Phi cycles, and spills agree |
-| G8 | Simple-style global code motion | not started | G2, G6 | placement laws and memory anti-dependencies are executable |
-| G9 | Dependency-correct local scheduling | not started | G8 | seeded schedules preserve dependencies and native results |
-| G10 | Multi-function Mach-O and metadata emission | not started | G5, G7 | symbols, fixups/relocations, external harness execution |
-| X1 | Native allocation and moving-GC bridge | not started | G7, G9, G10 | compiled code collects and resumes with relocated roots |
-| X2 | Hand-built binary-trees integration gate | not started | X1 | interpreter/native/stress/full-depth ladder is green |
-| X3 | Parser-independent frontend IR and TypeScript lowering | not started | X2 | TypeScript binary-trees reaches the same native pipeline |
-| X4 | Published binary-trees performance report | not started | X3 | raw samples, ratios, GC metrics, and losses published |
+| G0 | Capability diagnostics and parity fixture ladder | done | baseline | `backend-parity-test` rejects unsupported stages by name |
+| G1 | Machine compilation units, functions, blocks, and edges | done | G0 | verified exact CFG tables for nested and multi-function fixtures |
+| G2 | General block-based instruction selection | done | G1 | arbitrary reducible parity CFGs select without shape helpers |
+| G3 | General Phi edge lowering | done | G2 | multi-Phi, split-edge, cyclic-copy, memory-Phi, and spill differentials |
+| G4 | Conservative multi-function direct calls | done | G3 | two native functions call and return through real `BL` |
+| G5 | arm64 ABI and per-function frames | done | G4 | non-leaf, stack-argument, and recursive frame gates |
+| G8 | Simple-style global code motion | complete | G3, G5 | placement laws and memory anti-dependencies are executable |
+| G9 | Dependency-correct local scheduling | complete | G8 | seeded schedules preserve dependencies and native results |
+| G6 | CFG liveness | complete | G3, G5, G9 | exact live-in/out and Phi-edge sets over final scheduled code |
+| G7 | CFG-correct constrained register allocation | complete | G6 | forced-pressure calls, loops, Phi cycles, and spills agree |
+| G10 | Multi-function Mach-O and metadata emission | complete | G5, G7 | symbols, fixups/relocations, external harness execution |
+| X1 | Native allocation and moving-GC bridge | complete | G7, G9, G10 | compiled code collects and resumes with relocated roots |
+| X2 | Hand-built binary-trees integration gate | complete | X1 | interpreter/native/stress/full-depth ladder is green |
+| X3 | Parser-independent frontend IR and TypeScript lowering | complete | X2 | TypeScript binary-trees reaches the same native pipeline |
+| X4 | Published binary-trees performance report | complete | X3 | raw samples, ratios, GC metrics, and losses published |
+| X5 | TypeScript depth-21 moving-GC closure | complete | X4 | exact native results survive moving collection at full depth |
 
 ## Critical path
 
 ```text
-G0 -> G1 -> G2 -> G3 -> G4 -> G5 -> G6 -> G7 -> G10
-                  |                 |     |
-                  +-------> G8 ----+-> G9
-                                          \
-                                           X1 -> X2 -> X3 -> X4
+G0 -> G1 -> G2 -> G3 -> G4 -> G5 -> G8 -> G9 -> G6 -> G7 -> G10 -> X1 -> X2 -> X3 -> X4 -> X5
 ```
 
-G8 and G9 may be developed after conservative CFG-correct execution exists, but X1 may not be
-declared complete until scheduling and allocation both provide exact safepoint locations.
+The IDs describe capability groups, not implementation order. Placement and scheduling precede the
+final liveness solution and register allocation because both can change instruction locations and
+therefore live ranges. A later CFG-mutating phase must explicitly invalidate and rerun G6/G7; it may
+not consume stale allocation or safepoint data.
 
 ## Milestone summaries
 
@@ -205,6 +204,12 @@ Lower into the same Coil graph used by X2; do not maintain a second executable â
 Publish compilation phases and runtime separately, including allocation throughput, collection
 counts, copied/promoted bytes, peak live heap, code size, raw samples, ratios, and losses.
 
+### X5: TypeScript full-depth moving-GC closure
+
+Preserve intra-block CallEnd effect chains so recursive field-producing calls precede the parent
+allocation, then prove the normalized TypeScript kernel at depth 21 under collection, verification,
+register pressure, and multiple deterministic schedules.
+
 ## When the Simple gap is closed
 
 Items G0 through G10 are complete only when all of these statements are executable facts:
@@ -230,3 +235,4 @@ TypeScript source path demonstrated by binary-trees.
 The next task is G0, not frontend work and not binary-trees code generation. Follow the slice
 procedure in [VERIFICATION-WORKFLOW.md](VERIFICATION-WORKFLOW.md), then implement the exact G0
 contract in [IMPLEMENTATION-PLAN.md](IMPLEMENTATION-PLAN.md#g0-capability-diagnostics-and-parity-fixture-ladder).
+The ready-to-use contract and checklists are in [CURRENT-SLICE.md](CURRENT-SLICE.md).

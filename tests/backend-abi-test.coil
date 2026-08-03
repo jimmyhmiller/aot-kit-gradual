@@ -1,0 +1,152 @@
+;; G5 arm64 ABI and per-function frames.
+(module backendabitest)
+
+(import "ty" :use *)
+(import "node" :use *)
+(import "backend" :use *)
+(import "verify" :use *)
+(import "eval" :use *)
+(import "coil.assert" :use *)
+(import "coil.alloc" :use *)
+(import "coil.slice" :use *)
+(import "coil.primitive" :as primitive)
+
+(extern mmap :cc c [(ptr u8) i64 i32 i32 i32 i64] (-> (ptr u8)))
+(extern mprotect :cc c [(ptr u8) i64 i32] (-> i32))
+(extern munmap :cc c [(ptr u8) i64] (-> i32))
+(extern sys_icache_invalidate :cc c [(ptr u8) i64] (-> void))
+
+(defn ac [(v i64)] (-> i64)
+  (n-new1 OP-CONST (t-int-con v) (g-start)))
+(defn ab [(op i64) (a i64) (b i64)] (-> i64)
+  (n-new3 op 0 NO-NODE a b))
+
+(defn native0 [] (-> i64)
+  (let [mem (mmap (cast (ptr u8) 0) 4096 3 4098 -1 0)]
+    (assert (!= (cast i64 mem) -1))
+    (let [n (be-code-len)
+          (mut i) 0]
+      (loop (if (>= (load i) n)
+                (break)
+                (do
+                  (store! (index mem (load i)) (cast u8 (be-code-byte (load i))))
+                  (store! i (+ (load i) 1))
+                  0)))
+      (assert (= (mprotect mem 4096 5) 0))
+      (sys_icache_invalidate mem n)
+      (let [fp (cast (fnptr c [] i64) mem)
+            got (primitive/call-ptr fp)]
+        (assert (= (munmap mem 4096) 0))
+        got))))
+
+(defn compile-abi! [(nregs i64)] (-> i64)
+  (assert (be-select-machine-program!))
+  (be-schedule!)
+  (be-color! nregs)
+  (assert (= (be-verify-abi!) MABI-OK))
+  (assert (be-encode-checked!))
+  0)
+
+(defn build-sum-call! [(argc i64)] (-> i64)
+  (graph-reset! (+ 500 argc))
+  (let [fun (n-fun-open! 0)
+        (mut i) 0
+        (mut sum) (ac 0)
+        pbuf (stack (array i64 16))
+        ps (cast (ptr i64) pbuf)]
+    (loop (if (>= (load i) argc)
+              (break)
+              (do
+                (let [p (n-parm! fun (load i))]
+                  (store! (index ps (load i)) p)
+                  (store! sum (ab OP-ADD (load sum) p)))
+                (store! i (+ (load i) 1))
+                0)))
+    (n-fun-close! fun (n-new2 OP-RETURN 0 (n-fun-entry fun) (load sum)))
+    (let [abuf (stack (array i64 16))
+          args (cast (ptr i64) abuf)]
+      (store! i 0)
+      (loop (if (>= (load i) argc)
+                (break)
+                (do
+                  (store! (index args (load i)) (ac (+ (load i) 1)))
+                  (store! i (+ (load i) 1))
+                  0)))
+      (let [site (n-call! (g-start) fun (slice-new [i64] args argc))
+            ret (n-new2 OP-RETURN 0 (call-end site) (call-value site))]
+        (n-add-def! (g-stop) ret)
+        (g-analyze!)
+        (call-value site)))))
+
+(defn find-op-mi [(op i64)] (-> i64)
+  (let [n (be-inst-count)
+        (mut i) 0
+        (mut found) -1]
+    (loop (if (or (>= (load i) n) (>= (load found) 0))
+              (break)
+              (do
+                (if (= (ms-inst-op (load i)) op) (store! found (load i)) 0)
+                (store! i (+ (load i) 1))
+                0)))
+    (load found)))
+
+(deftest zero_argument_call_has_real_frames_and_returns
+         (build-sum-call! 0)
+         (assert (= (g-verify) 0))
+         (compile-abi! 12)
+         (assert (= (native0) 0)))
+
+(deftest eight_register_arguments_match_the_interpreter
+         (build-sum-call! 8)
+         (assert (= (ev-run-bound 1 10000) EV-OK))
+         (assert (= (rt-payload (ev-result)) 36))
+         (compile-abi! 12)
+         (assert (= (native0) 36)))
+
+(deftest ninth_argument_arrives_from_the_caller_stack_area
+         (build-sum-call! 9)
+         (assert (= (ev-run-bound 1 10000) EV-OK))
+         (assert (= (rt-payload (ev-result)) 45))
+         (compile-abi! 12)
+         (assert (= (native0) 45)))
+
+(deftest every_machine_function_frame_is_nonnegative_and_aligned
+         (build-sum-call! 9)
+         (assert (be-select-machine-program!))
+         (be-schedule!)
+         (be-color! 4)
+         (let [(mut owner) 0]
+           (loop (if (>= (load owner) (mu-function-count))
+                     (break)
+                     (do
+                       (assert (>= (mu-function-frame-size (load owner)) 16))
+                       (assert (= (& (mu-function-frame-size (load owner)) 15) 0))
+                       (store! owner (+ (load owner) 1))
+                       0))))
+         (assert (= (be-verify-abi!) MABI-OK)))
+
+(deftest misaligned_frame_has_a_named_abi_failure
+         (build-sum-call! 1)
+         (assert (be-select-machine-program!))
+         (be-schedule!)
+         (be-color! 12)
+         (be-corrupt-frame-size! 0 24)
+         (assert (= (be-verify-abi!) MABI-FRAME)))
+
+(deftest out_of_frame_spill_has_a_named_abi_failure
+         (build-sum-call! 1)
+         (assert (be-select-machine-program!))
+         (be-schedule!)
+         (be-color! 12)
+         (be-corrupt-spill-slot! 0 999)
+         (assert (= (be-verify-abi!) MABI-SPILL)))
+
+(deftest bad_register_argument_index_has_a_named_abi_failure
+         (build-sum-call! 1)
+         (assert (be-select-machine-program!))
+         (be-schedule!)
+         (be-color! 12)
+         (let [at (find-op-mi MI-ARG)]
+           (assert (>= at 0))
+           (be-corrupt-arg-index! at 9)
+           (assert (= (be-verify-abi!) MABI-ARGUMENT))))

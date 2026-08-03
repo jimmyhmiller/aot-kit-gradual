@@ -11,7 +11,7 @@ Every slice must provide:
 - a named capability or invariant;
 - a focused positive test;
 - a focused negative/corruption test when the structure is verifiable;
-- interpreter/native differential coverage for executable behavior;
+- interpreter/native differential coverage for behavior the current slice makes executable;
 - deterministic diagnostic or dump output for failures;
 - full `tools/gate.sh --quick` before commit;
 - full `tools/gate.sh` before a roadmap milestone is marked done;
@@ -51,6 +51,10 @@ the whole project.
    not prose or copied terminal output.
 5. Add a parity-ladder runner that reports the highest completed capability without treating
    expected unsupported stages as general gate failures.
+6. Put the normal and extended seed, register-pressure, and collector matrices in one shared test
+   configuration consumed by the ladder and later suites.
+7. Add `tools/extended-gate.sh` as the named home for broad seed/stress matrices. It may initially
+   run the G0 broad parity matrix; later milestones append their expensive witnesses.
 
 ### Likely files
 
@@ -224,6 +228,10 @@ Make non-leaf and recursive execution ABI-correct.
 ### Purpose
 
 Compute the data needed for safe allocation, calls, and precise stack maps.
+
+This phase runs after global placement and local scheduling. Any later transformation that changes
+the CFG, instruction placement, definitions, uses, or call sites invalidates its result and must
+rerun G6 before allocation.
 
 ### Deliverables
 

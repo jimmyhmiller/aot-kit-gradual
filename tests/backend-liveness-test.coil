@@ -1,0 +1,233 @@
+;; G6 exact CFG liveness over final scheduled machine code.
+(module backendlivenesstest)
+
+(import "ty" :use *)
+(import "node" :use *)
+(import "backend" :use *)
+(import "corpus" :use *)
+(import "shape" :use *)
+(import "coil.assert" :use *)
+(import "coil.alloc" :use *)
+(import "coil.str" :use *)
+(import "coil.io" :use *)
+(import "coil.fmt" :use *)
+
+(defn live-const [(v i64)] (-> i64)
+  (n-new1 OP-CONST (t-int-con v) (g-start)))
+(defn live-bin [(op i64) (a i64) (b i64)] (-> i64)
+  (n-peephole (n-new3 op (t-int) NO-NODE a b)))
+
+(defn live-compile! [(seed i64)] (-> i64)
+  (assert (be-select-machine-program!))
+  (let [scheduled (be-schedule-seeded! seed)]
+    (if (<= scheduled 0)
+        (do (fmt (stderr) "schedule/live failed sched={d}@{d} live={d}@{d}\n"
+                 (ms-schedule-result) (ms-schedule-item) (ml-result) (ml-result-item))
+            (assert (= (ms-schedule-result) MSCHED-OK))
+            (assert (= (ml-result) MLIVE-OK)) 0) 0)
+    (assert (> scheduled 0)))
+  (assert (= (ml-result) MLIVE-OK))
+  0)
+
+(defn live-edge-slot [(slot i64)] (-> i64)
+  (let [(mut edge) 0 (mut found) -1]
+    (loop
+      (if (or (>= (load edge) (mu-edge-count)) (>= (load found) 0)) (break)
+        (do
+          (if (= (mu-edge-target-slot (load edge)) slot) (store! found (load edge)) 0)
+          (store! edge (+ (load edge) 1)) 0)))
+    (load found)))
+
+(defn live-first-op [(op i64)] (-> i64)
+  (let [(mut at) 0 (mut found) -1]
+    (loop
+      (if (or (>= (load at) (be-inst-count)) (>= (load found) 0)) (break)
+        (do
+          (if (= (ms-inst-op (load at)) op) (store! found (load at)) 0)
+          (store! at (+ (load at) 1)) 0)))
+    (load found)))
+
+(defn build-live-diamond! [] (-> i64)
+  (graph-reset! 1001)
+  (let [pred (n-new1 OP-ARG (t-bool) (g-start))
+        arms (n-if-arms! (n-peephole (n-new2 OP-IF 0 (g-start) pred)))
+        join (n-new OP-REGION 0) yes (live-const 11) no (live-const 22)]
+    (n-add-def! join NO-NODE)
+    (n-add-def! join (arms-t arms))
+    (n-add-def! join (arms-f arms))
+    (let [phi (n-new OP-PHI (t-int))]
+      (n-add-def! phi join) (n-add-def! phi yes) (n-add-def! phi no)
+      (n-add-def! (g-stop) (n-new2 OP-RETURN 0 join phi))
+      (g-analyze!)
+      phi)))
+
+(defn build-live-loop! [] (-> i64)
+  (graph-reset! 1002)
+  (let [lp (n-new OP-LOOP 0)]
+    (n-add-def! lp NO-NODE) (n-add-def! lp (g-start)) (n-add-def! lp NO-NODE)
+    (n-peephole lp)
+    (let [phi (n-new OP-PHI (t-int))]
+      (n-add-def! phi lp) (n-add-def! phi (live-const 0)) (n-add-def! phi NO-NODE)
+      (n-peephole phi)
+      (let [next (live-bin OP-ADD phi (live-const 1))
+            arms (n-if-arms! (n-peephole
+                    (n-new2 OP-IF 0 lp (live-bin OP-LT phi (live-const 4)))))]
+        (n-set-def! phi 2 next)
+        (n-set-def! lp 2 (arms-t arms))
+        (n-add-def! (g-stop) (n-new2 OP-RETURN 0 (arms-f arms) phi))
+        (wl-push! lp) (wl-push! phi) (iterate!)
+        next))))
+
+(deftest phi_sources_are_live_only_on_their_matching_edges
+  (let [phi (build-live-diamond!) yes (n-in phi 1) no (n-in phi 2)]
+    (live-compile! 0)
+    (let [yes-v (ms-vget 0 yes) no-v (ms-vget 0 no)
+          yes-edge (live-edge-slot 1) no-edge (live-edge-slot 2)]
+      (assert (ml-edge-live? yes-edge yes-v))
+      (assert (not (ml-edge-live? yes-edge no-v)))
+      (assert (ml-edge-live? no-edge no-v))
+      (assert (not (ml-edge-live? no-edge yes-v))))))
+
+(deftest loop_carried_value_is_live_on_the_backedge
+  (let [next (build-live-loop!)]
+    (live-compile! 0)
+    (let [back (live-edge-slot 2) vreg (ms-vget 0 next)]
+      (assert (>= back 0))
+      (assert (ml-edge-live? back vreg))
+      (assert (> (ml-rounds) 1))
+      (assert (ml-verify!)))))
+
+(deftest caller_live_value_and_call_arguments_are_exact_at_safepoint
+  (graph-reset! 1003)
+  (let [identity (n-fun-open! 0) x (n-parm! identity 0)]
+    (n-fun-close! identity (n-new2 OP-RETURN 0 (n-fun-entry identity) x))
+    (let [held (live-const 32)
+          site (n-call1! (g-start) identity held)
+          result (live-bin OP-ADD held (call-value site))]
+      (n-add-def! (g-stop) (n-new2 OP-RETURN 0 (call-end site) result))
+      (g-analyze!)
+      (live-compile! 1)
+      (let [call-at (live-first-op MI-CALL) held-v (ms-vget 0 held)
+            result-v (ms-vget 0 (call-value site))]
+        (assert (ml-safepoint? call-at))
+        (assert (ml-live-before? call-at held-v))
+        (assert (not (ml-live-before? call-at result-v)))
+        (assert (= (mi-desc-clobbers (mi-desc MI-CALL)) 4095))))))
+
+(deftest allocation_and_boxed_values_retain_gc_kinds
+  (corpus-build! CX-OBJECT-RAW)
+  (live-compile! 0)
+  (let [new-at (live-first-op MI-NEW) load-at (live-first-op MI-LOAD)
+        raw (ms-inst-dst new-at) loaded (ms-inst-dst load-at)]
+    (assert (= (ml-value-kind raw) MLK-RAW-MANAGED))
+    (assert (or (= (ml-value-kind loaded) MLK-BOXED)
+                (= (ml-value-kind loaded) MLK-SCALAR)))
+    (assert (ml-safepoint? new-at))))
+
+(deftest all_four_value_kinds_are_distinct
+  (graph-reset! 1004)
+  (let [value (n-new1 OP-ARG (t-dyn) (g-start))]
+    (n-add-def! (g-stop) (n-new2 OP-RETURN 0 (g-start) value))
+    (g-analyze!) (live-compile! 0)
+    (assert (= (ml-value-kind (ms-vget 0 value)) MLK-BOXED)))
+  (graph-reset! 1005)
+  (let [value (n-new1 OP-ARG (t-str) (g-start))]
+    (n-add-def! (g-stop) (n-new2 OP-RETURN 0 (g-start) value))
+    (g-analyze!) (live-compile! 0)
+    (assert (= (ml-value-kind (ms-vget 0 value)) MLK-NONMOVING)))
+  (graph-reset! 1006)
+  (let [value (n-new1 OP-ARG (t-int) (g-start))]
+    (n-add-def! (g-stop) (n-new2 OP-RETURN 0 (g-start) value))
+    (g-analyze!) (live-compile! 0)
+    (assert (= (ml-value-kind (ms-vget 0 value)) MLK-SCALAR))))
+
+(deftest managed_reference_phi_keeps_its_kind_across_synthetic_edge_copies
+  (graph-reset! 1008)
+  (let [pred (n-new1 OP-ARG (t-bool) (g-start))
+        left (n-new1 OP-ARG (t-obj) (g-start)) right (n-new1 OP-ARG (t-obj) (g-start))
+        arms (n-if-arms! (n-peephole (n-new2 OP-IF 0 (g-start) pred)))
+        join (n-new OP-REGION 0)]
+    (n-add-def! join NO-NODE) (n-add-def! join (arms-t arms)) (n-add-def! join (arms-f arms))
+    (let [phi (n-new OP-PHI (t-obj))]
+      (n-add-def! phi join) (n-add-def! phi left) (n-add-def! phi right)
+      (n-add-def! (g-stop) (n-new2 OP-RETURN 0 join phi))
+      (g-analyze!)
+      (live-compile! 0)
+      (assert (= (ml-value-kind (ms-vget 0 phi)) MLK-RAW-MANAGED)))))
+
+(deftest managed_root_live_across_allocation_is_exposed_at_safepoint
+  (graph-reset! 1007)
+  (shape-reset!)
+  (let [sx (shape-transition SHAPE-ROOT "x" (t-dyn)) ax (shape-field-alias sx 0)
+        na (n-new-obj1! (g-start) sx (mk-mem-in ax)) oa (n-obj-ptr na)
+        ma (n-new4 OP-STORE ax NO-NODE (n-obj-mem na 0) oa (live-const 1))
+        nb (n-new-obj1! (g-start) sx ma) ob (n-obj-ptr nb)
+        mb (n-new4 OP-STORE ax NO-NODE (n-obj-mem nb 0) ob (live-const 2))
+        va (n-new3 OP-LOAD ax NO-NODE mb oa)
+        vb (n-new3 OP-LOAD ax NO-NODE mb ob)
+        sum (n-new3 OP-ADD (t-int) NO-NODE va vb)
+        ret (n-new3 OP-RETURN 0 (g-start) sum mb)]
+    (n-add-def! (g-stop) ret)
+    (g-analyze!))
+  (live-compile! 0)
+  (let [(mut at) 0 (mut first-new) -1 (mut second-new) -1]
+    (loop
+      (if (>= (load at) (be-inst-count)) (break)
+        (do
+          (if (= (ms-inst-op (load at)) MI-NEW)
+              (if (< (load first-new) 0) (store! first-new (load at))
+                  (if (< (load second-new) 0) (store! second-new (load at)) 0)) 0)
+          (store! at (+ (load at) 1)) 0)))
+    (assert (>= (load second-new) 0))
+    (let [root (ms-inst-dst (load first-new))]
+      (assert (= (ml-value-kind root) MLK-RAW-MANAGED))
+      (assert (ml-safepoint? (load second-new)))
+      (assert (ml-live-before? (load second-new) root)))))
+
+(deftest traversal_seeds_converge_to_identical_liveness_dump
+  (let [a (stack (array i8 8192)) b (stack (array i8 8192)) c (stack (array i8 8192))]
+    (build-live-loop!) (live-compile! 0)
+    (let [sa (ml-render (cast (ptr i8) a) 8192)]
+      (build-live-loop!) (live-compile! 1)
+      (let [sb (ml-render (cast (ptr i8) b) 8192)]
+        (build-live-loop!) (live-compile! 2)
+        (let [sc (ml-render (cast (ptr i8) c) 8192)]
+          (assert (str-eq sa sb))
+          (assert (str-eq sa sc)))))))
+
+(deftest missing_successor_propagation_has_a_named_failure
+  (build-live-loop!)
+  (live-compile! 0)
+  (let [(mut bid) 0 (mut vr) 0 (mut found-b) -1 (mut found-v) -1]
+    (loop
+      (if (or (>= (load bid) (mu-block-count)) (>= (load found-b) 0)) (break)
+        (do
+          (store! vr 0)
+          (loop
+            (if (or (>= (load vr) (ml-vreg-count)) (>= (load found-b) 0)) (break)
+              (do
+                (if (ml-live-out? (load bid) (load vr))
+                    (do (store! found-b (load bid)) (store! found-v (load vr))) 0)
+                (store! vr (+ (load vr) 1)) 0)))
+          (store! bid (+ (load bid) 1)) 0)))
+    (assert (>= (load found-b) 0))
+    (ml-corrupt-live-out! (load found-b) (load found-v) false)
+    (assert (not (ml-verify!)))
+    (assert (= (ml-result) MLIVE-FIXPOINT))))
+
+(deftest wrong_phi_edge_liveness_has_a_named_failure
+  (let [phi (build-live-diamond!) yes (n-in phi 1)]
+    (live-compile! 0)
+    (let [edge (live-edge-slot 1) vreg (ms-vget 0 yes)]
+      (assert (ml-edge-live? edge vreg))
+      (ml-corrupt-edge-live! edge vreg false)
+      (assert (not (ml-verify!)))
+      (assert (= (ml-result) MLIVE-PHI)))))
+
+(deftest wrong_gc_kind_has_a_named_failure
+  (corpus-build! CX-OBJECT-RAW)
+  (live-compile! 0)
+  (let [vreg (ms-inst-dst (live-first-op MI-NEW))]
+    (ml-corrupt-kind! vreg MLK-SCALAR)
+    (assert (not (ml-verify!)))
+    (assert (= (ml-result) MLIVE-KIND))))

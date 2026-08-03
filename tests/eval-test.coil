@@ -391,6 +391,27 @@
       (assert (= (ev-run BUDGET) EV-OK))
       (assert (rt-eq? (ev-result) (RInt 120))))))
 
+(deftest two_recursive_call_results_are_restored_as_part_of_the_caller_frame
+  ; fib has two live recursive results from the same two ideal Call nodes. Restoring only Parm
+  ; bindings lets the right recursion overwrite the caller's cached left result; factorial's one
+  ; recursive site cannot expose that frame bug.
+  (graph-reset! 1)
+  (let [fun (n-fun-open! 0) n (n-parm! fun 0)
+        iff (n-peephole (n-new2 OP-IF 0 (n-fun-entry fun) (a-bin OP-LT n (a-int 2))))
+        arms (n-if-arms! iff)
+        base (n-new2 OP-RETURN 0 (arms-t arms) (a-int 1))
+        left (n-call1! (arms-f arms) fun (a-bin OP-SUB n (a-int 1)))
+        right (n-call1! (call-end left) fun (a-bin OP-SUB n (a-int 2)))
+        step (n-new2 OP-RETURN 0 (call-end right)
+                     (a-bin OP-ADD (call-value left) (call-value right)))]
+    (n-fun-close! fun base) (n-fun-add-return! fun step)
+    (let [site (n-call1! (g-start) fun (a-int 6))
+          ret (n-new2 OP-RETURN 0 (call-end site) (call-value site))]
+      (n-add-def! (g-stop) ret) (iterate!)
+      (assert (= (g-verify) 0))
+      (assert (= (ev-run BUDGET) EV-OK))
+      (assert (rt-eq? (ev-result) (RInt 13))))))
+
 (deftest mutual_recursion_resolves_closed_world_function_values
   (graph-reset! 1)
   (let [even (n-fun-open! 0) odd (n-fun-open! 1)
