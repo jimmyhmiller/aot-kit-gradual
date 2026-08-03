@@ -1,600 +1,232 @@
-# Roadmap
-
-Ordered milestones. Each has a **gate**: a check that must be green before the next milestone
-starts. A gate is executable, not a judgement call. Nothing is "done" while its gate is red,
-and no milestone is skipped ahead of an earlier red gate.
-
-Two rules that apply throughout:
-
-- **No stubs that return a plausible value.** Anything unimplemented raises a hard, named
-  error. A placeholder that returns `0` or `-1` turns a missing feature into a miscompile
-  hunt.
-- **Every optimisation is differentially tested.** From M3 onward there is an IR interpreter,
-  and the gate for every later optimisation is that the program's observable result is
-  identical before and after the pass, on the whole test corpus. This is the only practical
-  way to keep a graph optimiser honest.
-
----
-
-## Where things are
-
-`tools/gate.sh` is the single source of truth; every number below is what it prints today.
-
-| | Milestone | Status | Gate |
-|---|---|---|---|
-| **M0** | The type lattice | done | `tests/ty-test.coil` |
-| **M1** | Nodes, peepholes, GVN | done | `tests/node-test.coil` |
-| **M2** | Control flow | done | `tests/control-test.coil` |
-| | Dominators and the loop tree | done | `tests/loop-tree-test.coil` |
-| **M3** | Verifier, interpreter, textual IR | done | `verify-`, `eval-`, `text-`, `gtext-test.coil` |
-| **M4** | Memory SSA and shapes | done: shapes, memory SSA, all four memory ops, forwarding, store elimination, and dead-allocation removal are implemented and differentially gated | `tests/shape-test.coil`, `tests/mem-test.coil` |
-| **M5** | Dynamic values end to end | done: explicit representation nodes, tag tests, guarded/generic arithmetic, and the NaN-word codec are implemented and gated across the runtime value kinds | `tests/node-test.coil`, `tests/eval-test.coil`, `tests/gtext-test.coil` |
-| **M6** | Functions, calls, closures | done: direct, recursive, mutually recursive, higher-order, and closure calls; exact text round trips; singleton-target devirtualisation; conservative straight-line inlining | `tests/eval-test.coil`, `tests/gtext-test.coil` |
-| **M7** | Closed-world inference | done: explicit whole-world mode resets to TOP, propagates parameter/call/closure flows, builds target edges, discharges proven annotations, and is precision/fixpoint gated across the corpus | `tests/infer-test.coil` |
-| **M8** | The GC contract | done: relocating safepoints, abstract barriers, R1/R2 verifier findings, redundant barrier elimination, and allocation/call/back-edge placement | `tests/gc-test.coil` |
-| **M9** | Specialisation and guards | done: bounded function cloning, ordinary TypeTest/If guard CFGs, cold generic fallback, proven-guard elimination, and differential fast/fallback execution | `tests/specialize-test.coil` |
-| M10 | arm64 backend | not started | |
-| M11 | A real collector | not started | |
-| M12 | TypeScript front end | not started | |
-| M13 | Performance | not started | |
-
-Run `tools/gate.sh` for the live counts. Do not trust a test count written in prose, here or
-anywhere else: four of them in this file were once historical rather than current, which is a number
-nobody can check.
-
-## If you are picking this up
-
-Start with [../README.md](../README.md), which has the module map and the reading order. The two
-things most likely to cost you a day are in [DECISIONS.md](DECISIONS.md): **D8** (a rewrite may only
-act on a *proven* type, and what proven means is narrower than it sounds) and **D9** (the
-construction contracts for merges and multi-nodes). Both were learned by getting them wrong, and
-both fail in ways a green test suite cannot see.
-
-[JOURNAL.md](JOURNAL.md) has the long-form record: why each design choice was made, what each
-adversarial review found, and the measurements behind every claim. Read it before changing something
-that looks gratuitous.
-
-## The next concrete piece of work
-
-Start M10 by adapting Coil's local `a64.coil` and `macho.coil`: define machine IR and instruction
-selection first, then scheduling, graph-colouring allocation with splitting, encoding, and Mach-O
-linking. Native results must be compared to the IR oracle for every corpus fixture.
-
-M4 slice 4c-3 closed with `store-ptr-is-local-allocation?` and
-`proj-dead-allocation-idealize` in `src/node.coil`. A Store is removable only after it has a real
-consumer, its allocation pointer has never had a non-write use, its cone is proven, and every
-write through the pointer is a valid access. Once the pointer dies, each memory projection is
-bypassed to the matching incoming memory; the last projection collects the `New`. The engine's
-`g-dead-allocations` counter and `25-object-returned-scratch` pin that the rewrite actually fired,
-while the reachable-heap differential oracle proves the returned object did not change.
-
-Historical planning notes for 4c-3 follow; they are retained because their constraints still
-explain the implementation.
-
-- **Forwarding past a provably different pointer.** Simple's `Load.idealize` also walks past a
-  store to a *provably different* allocation (two distinct `New`s never alias), which is
-  structural and safe. It needs a distinct-allocation predicate that does not exist yet. Its
-  offset-overlap test reads a TYPE and is exactly the shape D8 forbids acting on provisionally,
-  and its push-a-load-up-through-a-Phi rule builds a new Phi on the merge's region, which lands
-  in LAW 5's region/phi arity lockstep. Neither is in 4c-1.
-- **Dead-allocation removal.** A `New` none of whose projections is read is unobservable. Most of
-  this already falls out: killing the last projection drops the New's last use and the cascade
-  takes it. What has to be *added* is dropping a store to an object that escapes nowhere.
-
-Each one is irreversible, so each one must ask `n-ty-proven?` before it acts (D8). NOTE WHAT
-THAT GUARD IS FOR ON A STRUCTURAL RULE, which 4c-1 had to work out: these rules read no type, so
-the guard is not about disbelieving a provisional type. It is about not committing permanently to
-a store that the sweep has not finished with. Each one is gated the same way: the differential
-interpreter must return the identical result on the whole corpus before and after, and the ten
-memory fixtures (19 to 28) are what make "the whole corpus" mean something for memory.
-
-**4c-3 HAS ITS GATE ALREADY, AND IT IS `24-object-returned` AND ITS SCRATCH TWIN.** They are the
-same program with and without an allocation nothing reads back, they are the first pair in the
-corpus whose RESULT is an object, and they are already through `diff-pair`. That is deliberate:
-before D14 the oracle compared objects by their index in the allocation stream, so removing a dead
-allocation shifted every later index and the oracle would have reported `DIFFERENTIAL FAILURE` on a
-pass that changed nothing. The pass now has a gate that will pass when it is right.
-
-AND EVERY MEMORY FIXTURE THAT FORWARDS MUST PIN ITS MEMORY ACROSS THE FOLD. 4c-1 measured this:
-when the forwarded load is the store's last reader, subsuming it runs the kill cascade over the
-entire memory chain, and the `Return` built on the next line is wired to a corpse. `n-keep!` on
-the memory value across the load's construction is the fix, and the corpus-wide verifier
-(`VERR-DEAD-INPUT`) is what catches a missed one, a long way from the cause.
-
-READ **[Open at 4c-1's and 4c-2's close](#m4-memory-ssa-and-shapes)** BEFORE STARTING 4c-3. The
-counter obligation that used to live here is discharged: `g-forwards` and `g-store-elims` are real
-engine counters now, so 4c-3 removing loads by cascade no longer inflates the number that says
-4c-1 still works. What 4c-3 inherits instead is item 7, the one thing 4c-2 could not settle: the
-oracle cannot see a store DISAPPEAR, because the interpreter is demand-driven and a store nothing
-reads is never evaluated. 4c-3 is the slice that makes stores disappear on purpose.
-
-Two things are open from M3 and are worth reading, because the first one will bite around memory
-edges:
-
-1. **A dead node can be wired as an input** and nothing says so at the wiring site. `n-add-def!`
-   accepts a corpse, and the resulting graph fails `g-verify` with `VERR-DEAD-INPUT` a long way from
-   the line that caused it. A named panic was written and reverted because one existing test reuses
-   an `Arg` after the peephole under test has killed it; closing this means fixing that test's
-   hygiene first.
-2. **`g-analyze!` followed by `iterate!`** deleted an entire `If` on 15 of 200 worklist seeds on the
-   nested-guard fixture, from a fully analysed graph. It does not reproduce now, which means only
-   that no gate covers that phase order. A gate for it is the first thing to write when it is picked
-   up.
-3. **The two memory access contracts are checked only by the interpreter**, by decision rather than
-   by omission: `EV-MEM` (the memory edge carries the class this node names) and `EV-SHAPE` (the
-   pointer's shape carries this word) are both statically checkable, and D13 records why they are
-   not verifier rules today. What is closed is the LAUNDERING: no rewrite may turn either refusal
-   into a plausible value, which is `load-compute`'s two answers and `load-idealize`'s
-   `access-refused?`, gated by
-   `a_miswired_access_is_not_laundered_by_the_constant_fold` and
-   `forwarding_refuses_a_store_the_program_itself_refuses`. What is still open is whether M5 wants
-   the static forms as well; that decision needs the `dyn` pointer rule in D13 settled first, and it
-   is not free, because a shape rule strong enough to be worth having makes `EV-SHAPE` unreachable
-   from a verifier-clean graph and so removes the project's own argument for having an oracle.
-4. **An unread store's checks never run at all**, and that is a property of the demand-driven
-   interpreter rather than of any rewrite: a `Store` whose memory result nothing reads is never
-   evaluated, so its `ev-check-access` never happens, in EVERY build. `forwarding_refuses_a_store_the_program_itself_refuses`
-   pins the part that IS a rewrite's fault (a store that was demanded becoming undemanded); the
-   residual is a gap in the oracle's coverage of stores and is worth closing when 4c-3 makes stores
-   disappear on purpose.
-
----
-
-## M0. Foundations: the lattice
-
-The type lattice, interned, with `meet`, `dual`, `join`, `isa`, and the constant/high
-predicates. Simple types, the value axis (kind bitset with integer and float refinements),
-tuples.
-
-**Gate.** Lattice property tests pass: `meet` is commutative, associative and idempotent;
-`dual` is involutive and order-reversing; `meet` is a lower bound and `join` an upper bound;
-`isa` is reflexive and transitive; `x isa ALL` and `ANY isa x` for all `x`; every ascending
-chain terminates.
-
-**Status: DONE.** `src/ty.coil`, gated by `tests/ty-test.coil`: 26 tests, laws checked
-exhaustively over 32 hand-listed types plus all 32 of their duals (every pair for the binary
-laws, every triple for associativity and `isa` transitivity). The sample set was 28 until the M3
-review found that no tuple in it had a tuple MEMBER, which is the one shape that made `meet` stop
-being a lower bound.
-
-Three things this milestone actually caught, which is the argument for gating on laws rather
-than on examples:
-
-- `isa` reads backwards from subtyping intuition (see DESIGN.md). Three laws were written the
-  wrong way round and the property tests said so immediately.
-- `ty-widen` needed `TY-WIDEN-MAX` steps from the low side but twice that from the dual side,
-  because `dual` negates the counter. Termination was still guaranteed, but at the wrong
-  bound, and only the "reaches a fixpoint in N steps" property exposed it.
-- Two Coil compiler bugs, reported and fixed upstream (`docs/repro/impl-body-scope` and
-  `docs/repro/sigbus-emit-ir-singleton-cycle` in the coil repo). One of them had been masking
-  eight real type errors in this file.
-
-## M1. Nodes, peepholes, GVN
-
-Node arena, use-def and def-use edge maintenance, `compute`/`idealize`/hash/eq, `peephole`,
-the worklist with explicit dependency tracking, global value numbering. Ops: `Start`, `Stop`,
-`Return`, `Constant`, integer and float arithmetic, comparisons, `Not`, `Minus`.
-
-**Gate.** Golden tests on printed IR for constant folding and algebraic identities; the same
-program optimises to an identical graph under many worklist seeds; no node leaks (every
-unreachable node is dead).
-
-**Status: DONE.** `src/node.coil`, gated by `tests/node-test.coil`: 27 tests. Ops through
-`Return`, plus an opaque `Arg` node standing in until `Proj` arrives in M2. (Every count in this
-file is the suite's size TODAY, not its size when the milestone closed: this one was 16 at M1 and
-grew as M3's two reviews added the proof-and-provisionality gates to the same file. A count that
-records history rather than the present is a number nobody can check.)
-
-The seed test is doubled up, because the obvious version of it is nearly vacuous. Peepholing
-eagerly during construction leaves only 5 nodes on the worklist, so seeds barely explore
-anything. So there is a second fixture built with **no** peepholing at all, which pushes
-every node and lets `iterate!` do the whole job: 18 items entering, 35 steps, sampled over 24
-seeds. That version also pins something M7 will depend on directly, namely that **eager and
-deferred peepholing reach the same graph**.
-
-Four real bugs this gate caught, none of which a smaller test would have:
-
-- **`Const` was excluded from value numbering**, so no constant ever deduplicated and
-  `(arg+2)` and `(2+arg)` stayed distinct nodes. Deduplicating constants is most of what GVN
-  buys.
-- **The kill cascade ate the replacement.** `x+0` rewrites to `x`, and killing the `Add`
-  released its inputs, which killed the `x` being returned. `return arg+0;` printed
-  `return DEAD;`. Fixed with a pin, which is what Simple's `deadCodeElim` is for.
-- **Operand canonicalisation ran inside `idealize` and returned the node itself**, so the
-  identity rules never saw the new order and `0+x` stayed `0+x`. Normalising *before*
-  `idealize` means each identity rule only handles one form.
-- **The pin was first implemented as a fake `NO-NODE` out edge** and assumed to stay last,
-  which stopped being true the moment `subsume` appended real uses after it. It is a counter
-  now, and `outs` no longer contains a value every walker has to special-case.
-
-## M2. Control flow
-
-`If`, `Region`, `Phi`, `Proj`, `CProj`, `Loop`, `Cast`, `XCtrl`. Dead control flow
-elimination. JavaScript truthiness deciding reachability.
-
-**Gate.** Golden tests covering Simple chapters 5 through 8 translated to hand-built graphs;
-unreachable code provably removed; a `Phi` never survives with a dead input; a loop phi reaches
-a fixpoint, identically under every worklist seed.
-
-**Status: DONE.** `tests/control-test.coil`, 19 tests. Reachability is not a separate pass: an
-`If`'s type is a tuple of its two control outputs, so an untaken branch is `~ctrl` in one slot
-and dead-code elimination falls out of type propagation. `Cast` is in, which is the mechanism
-[D4](DECISIONS.md#d4-guards-are-control-flow-not-a-node-kind) rests on, and a guard with an
-unboxed fast path plus a generic fallback is now a fixture in the diagram gallery.
-
-**The rule this milestone produced**, which was wrong in three separate places: **an analysis
-may act on a provisional type; a transformation may not.** `compute` skips any path whose
-control is high, including `ANY`, because an optimistic answer gets revisited. Every
-*irreversible* rewrite must instead require `~ctrl`, which is proven. The three sites were
-`phi-single-input`, `cproj-idealize` and `stop-idealize`. A fourth, constant folding, needed a
-different guard: it now refuses to fold while any input is still unanalysed.
-
-**The in-progress contract**, now documented in `src/node.coil` and partly checked. A loop body
-must be built *and peepholed* while the merge is still open, and the phis closed before control.
-Get it wrong and the phi momentarily reads `int=0`, `i + 1` folds to the literal `1`, and the
-entire loop is deleted with no error reported. `n-set-def!` hard-errors on the one part of this
-that is cheap to detect (closing control while a phi is still open); the general defence is M7's
-phase structure, which analyses to a fixpoint before transforming anything.
-
-**Deferred out of M2, deliberately:**
-
-- **Lazy phi creation** is a front-end concern, not an IR one. It is the trick where a parser
-  creates a phi only when a variable is actually assigned in a branch. With no parser yet there
-  is nothing to be lazy about, so it moves to the `dyn` front end.
-- **`Never` and never-exit loop breaking.** `Never` exists solely to serve the rewrite that
-  gives an infinite loop an exit edge, and that rewrite exists solely so global code motion can
-  assume every block reaches `Stop`. Adding the op now, with nothing implementing its purpose,
-  would be worse than not having it. It lands with GCM in M10.
-- **The loop tree** (`idom`, `idepth`, nesting depth). **Now DONE**, gated by
-  `tests/loop-tree-test.coil` (5 tests: straight line, diamond, loop, nested loops, staleness).
-  Natural loop bodies by backward reachability from each back edge; nesting depth is the number
-  of bodies containing a node. A loop header's immediate dominator is its entry and never its
-  back edge, which is both correct and what makes the idepth relaxation converge.
-
-  Both tables are rebuilt wholesale by `g-build-loop-tree!` with no incremental maintenance, and
-  a `cfgver` epoch makes reading a stale one a hard error. Dominators computed against a stale
-  CFG are a classic scheduling bug that only appears under optimisation, and it is much cheaper
-  to refuse the read than to debug the schedule. Asking for the idepth of a *data* node is also
-  an error rather than a `-1`: a data node has no dominator depth until a scheduler gives it one.
-
----
-
-## M3. Tooling: textual IR, verifier, evaluator
-
-The textual IR printer and parser, round-trip tested. Graphviz output. The graph verifier
-(well-formedness, edge symmetry, type monotonicity). An **IR interpreter** over the ideal
-graph, which becomes the differential oracle for everything after this point.
-
-**Gate.** `print` then `parse` is the identity on the whole corpus; the verifier is green on
-the corpus and *red* on a set of deliberately corrupted graphs (a verifier that never fails is
-not a verifier); the interpreter agrees with expected results on the corpus, before and after
-`Opto`.
-
-**Status: DONE**, all four slices. **138 tests green across eight suites** (`tools/gate.sh`):
-ty 26, node 27, control 19, loop-tree 5, verify 19, eval 23, text 12, gtext 7, plus 19 diagram
-fixtures rendered and the gallery page rebuilt. M3 stayed open through 3a on purpose, because
-the milestone's gate says "`print` then `parse` is the identity on the whole corpus" and 3a proved
-that for types only; slice 3b is the clause itself, and `src/gtext.coil` gated by
-`tests/gtext-test.coil` closes it. Four items were still open at its close; the two that remain are
-under [The next concrete piece of work](#the-next-concrete-piece-of-work), and all four are written
-up in full in [JOURNAL.md](JOURNAL.md).
-
-**What M3 taught**, four things, because the detail below is long and these are the parts that
-outlive it:
-
-- **ANY is the ABSENCE of information; every other high type is a CLAIM someone computed.** M2 had
-  already produced "an analysis may act on a provisional type, a transformation may not", and M3
-  found that six rewrites were satisfying it with a test that proved nothing (`= (t-xctrl)`, on an
-  axis whose high element IS XCtrl). The durable form is `n-ty-proven?`: transitive, and a FIXPOINT
-  test rather than a "not ANY" test, because a stale LOW type is exactly as provisional as ANY.
-- **A tool is only a tool if it can FAIL.** A verifier that never reports, a printer whose text
-  cannot be told apart from a shorter one, and a round trip that would pass for a printer emitting
-  only op names are all worth nothing. Every check in this milestone therefore has a NAMED code and
-  a test asserting that specific code fires, and every identity claim has a counted floor under it
-  saying how much text or how many nodes it actually compared.
-- **The oracle has to RUN the program.** Golden strings and `g-verify` both stayed green through a
-  merge deleted from a diamond, a Return dropped from Stop, and a discharged type check; the
-  interpreter is what noticed, because a graph missing an arm is still a structurally valid graph.
-- **A fixture can be correct by accident, and its CONSTRUCTION ORDER is part of it.** The flat
-  `if (0)` passed while the same construct one level down miscompiled; the first raw diamond
-  reproduced nothing on 200 seeds until it was built the way the witness was built. So a gate says
-  which shape and which order it needs, and reverting each fix one at a time is the only way to
-  learn whether the gate tests what it claims.
-
-**Open at M3's close**, collected here so M4 does not have to find them at the bottom of a long
-entry. All four are written up in full in [JOURNAL.md](JOURNAL.md); nothing is red.
-
-1. **`g-analyze!` then `iterate!` deleted a whole If on 15 of 200 seeds** on the nested-guard
-   fixture, from a FULLY ANALYSED graph, and does not reproduce now. It is the only item on this
-   list that is a suspected live miscompile rather than a design decision, and it is not an instance
-   of the law above. **A gate for it is the first thing to write when it is picked up**; "it does not
-   reproduce" means only that no current gate covers that phase order.
-2. **`region-dead-path` acting on a provisional `~ctrl`**, now formally M7's phase structure.
-3. **A dead node can be wired as an input** and nothing says so at the wiring site. The named panic
-   in `n-add-def!` was written and reverted, because one existing test reuses an Arg the peephole
-   under test has already killed; closing it means fixing that test's hygiene.
-4. **The `int=[min..max]` versus `w0` spelling wart** in the type format: a decision to make, not a
-   fix, and the graph format inherits whichever way it goes.
-
----
-
-## M4. Memory SSA and shapes
-
-Alias classes, `New`, `Load`, `Store`, `MemMerge`, memory `Phi`. Object shapes with a
-compile-time transition graph, shape sets in the lattice, fixed-offset field access through a
-known shape.
-
-**Gate.** Load-after-store forwarding, store-after-store elimination and dead-allocation
-removal all demonstrated by golden tests; differential tests green; a shape-polymorphic site
-keeps two inline paths instead of collapsing.
-
-Where the clauses stand after 4c-1:
-
-| Clause | State |
-|---|---|
-| the ops exist, verify, print, reparse and RUN | done (`tests/mem-test.coil`) |
-| differential tests green | done, on seven memory fixtures in both build modes, and the comparison is now the reachable HEAP rather than an object's allocation index (D14) |
-| a shape-polymorphic site does not collapse | done for the LATTICE half: the merged pointer keeps both shape bits, the two arms keep distinct alias classes, and the `MemMerge` describes their union. The two INLINE PATHS are M9's, since a guard is what makes a path, and 4c's forwarding is what makes each path worth having. It is now RUN on both arms and the merged memory is read back through the returned object, so swapping either memory phi's arms is red; before that, no seed ever took the else arm and nothing read the merge, so the canonical LAW 5 miscompile left the whole gate green |
-| load-after-store forwarding | **done (4c-1)**. `load-idealize`: the load's memory input is a Store on the SAME alias class whose pointer is the SAME NODE, so the load is that store's value. Decided structurally and never from a type; Simple's offset-overlap rule is deliberately not ported, because it reads a type and then rewrites irreversibly. `fx-object` (19) forwards; `fx-object-two` (23) is the negative witness, two allocations of one shape where the pointer check is the only thing between the right answer and 2 |
-| store-after-store elimination | **done (4c-2)**. `store-idealize`: the store's memory input is a Store on the SAME alias class whose pointer is the SAME NODE, so the outer store's memory edge is rewired past it and the inner store dies of having no readers. Same structural decision procedure as 4c-1 and the same D8 proof gate. Four guards, and the third is Simple's `checkOnlyUse`: the inner store must have no other memory consumer and no pin. `26-store-over-store` eliminates and then forwards (`g-store-elims` 1, `g-forwards` 1, zero loads left); `27-store-over-store-raw` is its unrewritten twin and the differential "before"; `28-store-guarded` is the negative witness |
-| dead-allocation removal | **done (4c-3)**. Stores through an allocation pointer that has never had a non-write use are bypassed after proof and access checks; dead memory projections then bypass the `New`, allowing the kill cascade to collect it. `25-object-returned-scratch` removes exactly one allocation and remains differentially equal to fixture 24 |
-
-**Status: DONE.** All three named rewrites are implemented and gated. Run `tools/gate.sh` for the live suite counts;
-a number copied into prose here goes stale on the next slice, which this file says elsewhere and
-then did anyway. The memory corpus is fixtures 19 to 28, and the gallery carries the 4c-1 story
-as a pair (`20-object-raw` next to `19-object`, the same program unrewritten and forwarded) with
-`23-object-two`, the load that must NOT forward; and the 4c-2 story the same way
-(`27-store-over-store-raw` next to `26-store-over-store`) with `28-store-guarded`, the store that
-must NOT be bypassed.
-
-**What M4 has taught so far**, six things. The long-form record with the measurement behind each
-is in [JOURNAL.md](JOURNAL.md); these are the parts that outlive the milestone:
-
-- **A check written on one path is not a check, and `n-peephole` has two paths.** It runs the
-  constant fold BEFORE `idealize`, so every guard living in `load-idealize` had a second door
-  around it: whenever a Load's type was constant the node became a `Const` and the alias
-  comparison never ran. Six of the review's eight findings are that one defect in different
-  clothes. The fix is never to block the fold for the op; it is to make `compute` not produce the
-  bogus type, because otherwise the bad type stays in the graph and the `Add` above the load folds
-  instead.
-- **A refusal has a DIRECTION, and monotonicity picks it.** `load-compute` answers **ANY** when the
-  memory state's alias bitset lacks the node's class and **ALL** when some shape the pointer can be
-  lacks the word. Backwards on either one is a compute that rises, and
-  `every_memory_compute_is_monotone_in_every_slot` says so by name. The shape predicate must be
-  "some shape misses it" rather than "no shape has it" for the same reason: a shape set only grows.
-- **LAW 3 forbids ACTING on a provisional type; it has never forbidden READING one in order to
-  DECLINE.** `load-idealize` asks `access-refused?` of the store it is about to consume, which is a
-  type read inside an irreversible rewrite and is sound precisely because its only effect is not to
-  fire. Without it, forwarding a correct load off a bogus store drops the store's last reader and
-  the cascade takes the `EV-SHAPE` the program owed with it.
-- **The `n-ty-proven?` guard on a STRUCTURAL rule is not about disbelieving a type.** 4c-1 reads
-  node identity and an alias number, neither of which can be provisional. The guard is there
-  because the rewrite is irreversible and the graph is not finished: a store in a still-settling
-  cone is one the sweep may yet replace, and taking its value commits to its identity for ever.
-  Every one of 4c-2 and 4c-3 inherits that reasoning, not the type-disbelief version.
-- **Root the memory BEFORE building the load.** A forwarded load that was the store's last reader
-  drops it, and the cascade collects the store, both projections and the `New` before the `Return`
-  meant to root them exists; the next line then wires a corpse. `n-keep!`/`n-unkeep!` across the
-  load's construction is the fix, and the only thing that reports it is the corpus-wide verifier's
-  `VERR-DEAD-INPUT`, a long way from the cause. It hit three separate fixtures, two of them tests
-  written before the rewrite existed.
-- **The obvious story about a guard can be false, and the mutation is what tells you.** 4c-2's
-  only-consumer clause was written up as the thing standing between the guarded fixture and a
-  wrong answer. Deleting the clause and re-running the oracle returned the identical answer on
-  every seed: in this IR a Store is a pure state-to-state function, so bypassing one that somebody
-  else reads denotes the same state. The clause is right, for Simple's reason (two unordered live
-  writes to one word are not serialisable onto one mutable heap), and the write-up was wrong.
-  Deleting a guard and watching what actually goes red is cheap; asserting a plausible cause is
-  how a comment outlives the truth.
-- **"The load disappeared" is a vacuous gate**, satisfied by a rule that deletes every load. The
-  weight is carried by the negative witness, `23-object-two`: two allocations of one shape, so both
-  stores name the same alias class and both pointers carry the identical type `obj@2`, and the only
-  thing between the right answer and 2 is that the store's pointer is a different NODE. The graph
-  that returns 2 is well formed, at a type fixpoint, clean under `g-verify`, survives print and
-  reparse, and has every structural count unchanged. Only running it tells them apart, which is
-  D12's whole argument.
-
-**Open at 4c-2's close**, recorded here so none of it is lost between slices. Nothing is red.
-
-1. **The D8 proof gate on `load-idealize` is unreachable from every corpus fixture.** Instrumenting
-   the refusal branch counted **0** proof-gated refusals over 40 seeds on eager `19-object`, on
-   raw-then-`iterate!` `20-object-raw`, on `22-object-loop` and on `21-shape-polymorphic`: an
-   analysed cone is already settled before any peephole runs. The clause is therefore gated on a
-   locally built UNANALYSED graph in `a_refused_forwarding_is_deferred_and_lands_under_every_seed`
-   (119 refusals over 40 seeds, 40/40 refusing at the hand peephole). It is properly tested; what is
-   open is that a later gate sweeping the CORPUS for coverage would not see the guard at all.
-2. **CLOSED at 4c-2.** There are now two engine counters on the graph, `g-forwards` and
-   `g-store-elims`, each bumped from exactly one line: the branch of `load-idealize` that hands
-   back a stored value and the branch of `store-idealize` that rewires past a dead store. They are
-   per-graph (zeroed by `graph-reset!`, so a sweep reads the fixture it just built), and neither
-   `g-verify` nor `g-analyze!` can inflate them because neither runs `idealize`. The old stand-in
-   counted "Loads created and now dead", which equalled forwardings only while forwarding was the
-   sole thing that removed a `Load`; 4c-2 breaks that equality by cascade (`26-store-over-store`
-   removes a store, and the load above it then forwards), so the dead-Load count survives as a
-   reported companion and is no longer the claim.
-3. **`every_seed_builds_the_same_memory_graph` cannot vary the seed**, because every corpus builder
-   calls `graph-reset! 1` itself and re-seeding before `corpus-build!` gets seed 1 back. It was kept
-   and re-commented as what it actually gates, which is worth having and is not the seed claim: a
-   fixture is a pure function of its own source, with nothing carried over from whatever the
-   previous test left in the arena, the shape table or the GVN map. The seed claim lives in the test
-   named above, which builds through a local builder that takes the seed.
-4. **"Both modes" in the corpus sweep means each fixture in the mode it declares**, with both modes
-   asserted present; the suite does NOT run every fixture through both. A raw fixture's contract is
-   that it is unrewritten, and iterating them all is open item 2 at the top of this file (the
-   `g-analyze!`-then-`iterate!` phase order), which 4c-1 covers for the object program only.
-5. **The D8 proof gate on `store-idealize` has no witness at all yet**, which is item 1 one slice
-   later and one degree worse: instrumenting the branch over the whole corpus plus 40
-   raw-then-`iterate!` seeds counted **0** proof-gated refusals, and unlike 4c-1 there is no
-   locally built unanalysed fixture standing in for it either. The construction that forces it is
-   known (`a_refused_forwarding_is_deferred_and_lands_under_every_seed` builds the Load version);
-   the Store analogue is a gate somebody should write before 4c-3 adds a third rule with the same
-   guard. Until then the branch is a rule with no witness.
-6. **The only-consumer clause in `store-idealize` is NOT a value-soundness condition**, and this
-   was measured rather than assumed. Bypassing an inner store somebody else reads leaves that
-   reader alone and denotes the same state, so deleting the clause and running the differential
-   oracle over `28-store-guarded` returns the identical answer on every seed. What the clause
-   defends is Simple's stated reason, serialisability: without it the graph holds two live writes
-   to one word with no memory edge ordering them, which nothing today can observe and which M10's
-   scheduler inherits. `28-store-guarded` is therefore a STRUCTURAL witness (`g-store-elims` is 0
-   and the guarded store's memory input is the first store), not a differential one, and a gate
-   that claimed otherwise would stay green with the clause removed.
-7. **`g-changed!` on an in-place idealize is right by construction and not by measurement.**
-   `n-peephole` records progress only when idealize returns a DIFFERENT node, so an in-place
-   rewrite that says nothing can end an `iterate!` sweep with a proof-gated rewrite pending.
-   `store-idealize` declares it; removing the call changes no count and no answer over 40
-   raw-then-`iterate!` seeds, because something else in the same sweep always bumps `nchg`.
-   `region-remove-path!` has the same shape and does NOT declare it, which is a pre-existing
-   hazard with no witness either way.
-
-## M5. Dynamic values end to end
-
-NaN boxing, `Box`/`Unbox`, `TypeTest`, the full value lattice with unions. `dyn` grows objects,
-closures and dynamic dispatch.
-
-**Gate.** `(+ a b)` on values inferred as integers compiles to an unboxed integer add with no
-box, unbox or branch; the same expression on `Dyn` compiles to the generic path and still
-returns the right answer under differential test; a `Box` immediately consumed by an `Unbox`
-never survives.
-
-**Status: DONE.** A proven integer expression contains
-one `Add` and zero `Box`, `Unbox`, `TypeTest`, or `If` nodes. The dynamic twin has two `TypeTest`s,
-two `Unbox` nodes, an integer fast arm, and a generic `Add` fallback; the interpreter runs both
-arms. `Unbox<T>(Box(x))` cancels only when `x` is proven to satisfy `T`, while a generic input
-keeps both nodes and reports `EV-UNBOX` on the wrong runtime tag. All three nodes verify and
-round-trip through the exact graph format. The NaN-word codec covers undefined, null, booleans,
-signed immediate integers, direct doubles, objects, strings, symbols, immediate bigints and
-function references. Wide integers become direct doubles and floating NaNs canonicalise according
-to D3's explicit policy.
-
-## M6. Functions, calls, closures
-
-`Fun`, `Parm`, `Call`, `CallEnd`, `Return`, the function-pointer axis in the lattice with
-`fidx` sets, the linker table, inlining.
-
-**Gate.** Recursion, mutual recursion, higher-order calls and closure capture all correct
-under differential test; an indirect call with a single reaching target is devirtualised.
-
-**Status: DONE.** Function/parameter/call/closure nodes, evaluator frames, recursion and mutual
-recursion, higher-order calls, capture environments, singleton-target devirtualisation and bounded
-inlining are implemented and covered by the evaluator and exact-text gates.
-
-## M7. Closed-world inference
-
-The optimistic interprocedural dataflow pass: reset to `TOP`, propagate to a fixpoint, build
-the call graph as function-pointer types stabilise, under an explicit whole-world assumption.
-TypeScript-style annotations discharged against the inferred types.
-
-**Gate.** An inference-quality corpus: a table of programs with the type each interesting
-value must be inferred to. Regressions in inference precision fail the build, not just
-regressions in correctness. Plus: the optimistic pass never produces a type below what the
-pessimistic pass produced (asserted per node), and reaches a fixpoint on every corpus program.
-
-**Status: DONE.** Whole-world inference resets optimistic types to `TOP`, discovers call targets as
-types stabilize, propagates parameter/capture/return facts to a fixpoint, discharges compatible
-annotations, and runs a precision table plus optimistic-vs-pessimistic ordering checks over the
-corpus.
-
-## M8. The GC contract
-
-`Safepoint` with relocating projections, abstract `Barrier`, safepoint placement at `New`,
-`Call` and loop back edges. The R1/R2 verifier.
-
-**Gate.** The verifier rejects a hand-written graph that keeps an interior pointer live across
-a safepoint, and one that uses a pre-safepoint reference after it; redundant barrier
-elimination demonstrated; all earlier gates still green with safepoints present.
-
-**Status: DONE.** Safepoints, relocating projections and barriers are first-class IR nodes;
-placement covers allocation, calls and loop back edges. R1/R2 verifier tests reject interior or
-stale references, while redundant barriers eliminate and the complete earlier gate remains green.
-
-## M9. Specialisation and guards
-
-Cloning per argument-type tuple, guard chains at call sites, the retained generic version,
-cold-path marking, the specialisation cost model.
-
-**Gate.** A polymorphic call site produces a monomorphic clone plus a generic fallback, both
-reachable and both correct under differential test; the guard folds away entirely when
-inference proves the type; specialisation never changes observable behaviour.
-
-**Status: DONE.** Bounded cloning, guarded monomorphic fast paths, retained cold generic fallback,
-Phi/Region merging and proven-guard elimination are implemented. Both paths execute under the
-differential oracle, and M13 profile counts now feed the explicit specialization cost predicate.
-
-## M10. arm64 backend
-
-Instruction selection, global code motion, list scheduling, graph-colouring register
-allocation with splitting, encoding, Mach-O output. Adapts Coil's `a64.coil` and `macho.coil`.
-
-**Gate.** Every corpus program compiles to a native binary whose output matches the IR
-interpreter exactly; the register allocator terminates on all of them with no unassigned live
-range; disassembly of a chosen kernel reviewed by hand against expectation.
-
-**Status: DONE.** All 28 corpus graphs select, schedule, and allocate; every live range receives a
-register or spill slot. All 27 terminating fixtures execute natively and match the interpreter
-(24 scalar outcomes and three escaped-object heaps), while the intentionally nonterminating nested
-loop compiles to a finite machine CFG with explicit back edges. The backend covers straight-line
-arithmetic, ABI arguments, branches, nested merges, `CSEL` Phi lowering, canonical and nested loops,
-ordered object loads/stores, memory diamonds, stack-object and caller-heap allocation conventions,
-and split spill loads/stores. The Mach-O object carries macOS build-version metadata; the native
-gate links and executes it, and the reviewed kernel disassembles to the expected arithmetic and
-return sequence.
-
-## M11. A real collector
-
-Bump allocation with a slow-path call, stack map emission, a moving generational collector,
-and GC stress testing.
-
-**Gate.** A collect-on-every-allocation stress mode passes the whole corpus; heap invariants
-verified after every collection; no reference survives a collection unrelocated.
-
-**Status: DONE.** `src/gc.coil` implements bump allocation with an explicit slow path into a
-two-semispaces moving collector. Roots and pointer fields are relocated by Cheney scanning;
-survivors age and promote to the logical old generation. Every collection runs the heap verifier.
-Stress mode collects before every allocation, passes a linked-heap torture test and sweeps all 28
-corpus fixtures, with stale pre-safepoint-root use caught by the test itself. Native `New` sites
-publish stack-map PCs and live-range counts, and slow-path/collection/promotion counters are gated.
-
-## M12. TypeScript front end
-
-A real TypeScript parser and lowering to the core IR. Annotations become boundary casts.
-Structural typing, generics erased to shapes, unions to lattice unions.
-
-**Gate.** A published TypeScript test corpus runs correctly; annotations demonstrably reduce
-guard count relative to the same code unannotated.
-
-**Status: DONE.** `src/ts_frontend.mjs` contains a tokenizer, recursive-descent parser, structural
-type parser, typed core-graph lowering, and executable reference runtime. The checked-in corpus
-covers annotated and dynamic arithmetic, unions, generic erasure, structural extra-field
-compatibility, object literals and property loads. Annotations lower to boundary `Cast` nodes; the
-same addition has two `TypeTest` guards without annotations and zero with `number` annotations.
-`tools/ts-front.mjs` exposes the graph/result CLI and `tools/ts-gate.sh` is part of the main gate.
-
-## M13. Performance
-
-Benchmark suite against node/V8, with full result tables (every axis, raw samples, ratios).
-Profile input to the specialisation cost model.
-
-**Gate.** Published numbers per benchmark against V8, honestly reported including the losses.
-
-**Status: DONE.** `tools/benchmark.mjs` builds and links an arm64 kernel, measures nine raw samples
-against the equivalent Node/V8 loop, and also measures TypeScript compile throughput and structural
-loads. [BENCHMARKS.md](BENCHMARKS.md) publishes every sample, medians, kit/V8 ratios, and labels
-wins and losses explicitly. The current table includes one native win and two substantial losses.
-`bench-profile.json` records the dynamic-add target histogram; its sample count, 90% dominant target,
-and clone cost feed the gated 80%/32-sample/32-cost specialization predicate.
-
----
-
-## Deferred, deliberately
-
-- **Exceptions and `try`/`catch`.** Calls will need exception edges and landing pads become
-  ordinary CFG merges. This is a known, planned shape rather than an oversight; it lands
-  between M6 and M7 if the `dyn` corpus needs it sooner, and it must be designed before M8
-  because an exception edge is a safepoint.
-- **Additional CPU targets** (x86-64, RISC-V). The `MachNode` interface is kept narrow
-  precisely so this stays a contained job, and porting one is the real test of whether it is
-  narrow enough.
-- **ELF output** for the Linux build host.
-- **Open-world mode.** Keeps the generic versions, drops the guard fold-away, supports `eval`.
-- **`defnode`**, the metaprogram that generates per-op tables from one declaration. Lands once
-  the set of per-op behaviours has stopped changing, which will be around M5.
+# Roadmap: close the Simple backend gap
+
+This file is the authoritative roadmap. The previous M0-M13 roadmap described how the current
+prototype was assembled; it is obsolete. Historical rationale remains in [JOURNAL.md](JOURNAL.md),
+and architectural laws remain in [DECISIONS.md](DECISIONS.md).
+
+The present objective is narrower and more demanding:
+
+> Turn the existing ideal IR and optimizer into a general, whole-program native compiler by
+> completing the missing Simple-derived backend machinery, then prove the result with a native,
+> GC-stressed binary-trees program and finally lower that program from TypeScript.
+
+The supporting documents are part of this roadmap:
+
+- [SIMPLE-GAP.md](SIMPLE-GAP.md) records the audited gap and the boundary between reusable work,
+  missing Simple machinery, and this project's deliberate extensions.
+- [IMPLEMENTATION-PLAN.md](IMPLEMENTATION-PLAN.md) specifies every implementation slice, its
+  prerequisites, deliverables, likely files, and executable exit gate.
+- [VERIFICATION-WORKFLOW.md](VERIFICATION-WORKFLOW.md) is the mandatory workflow for implementing,
+  reviewing, falsifying, and landing a slice.
+- [BINARYTREES.md](BINARYTREES.md) defines the integration program, observables, test ladder, GC
+  stress requirements, and final benchmark gate.
+
+If these documents disagree, precedence is:
+
+1. `DECISIONS.md` for compiler law.
+2. This roadmap for order and status.
+3. `IMPLEMENTATION-PLAN.md` for slice contracts.
+4. `VERIFICATION-WORKFLOW.md` for execution procedure.
+5. `BINARYTREES.md` for the integration workload.
+
+## Baseline
+
+The baseline commit is `269c245` (`Complete M10-M13 compiler milestones`). At that baseline:
+
+- `tools/gate.sh --quick` is green with 239 tests.
+- All 28 corpus graphs select, allocate, and encode for arm64.
+- The 27 terminating corpus programs agree with the interpreter.
+- Ideal IR, interpretation, graph text, and inference support direct calls, recursion, mutual
+  recursion, higher-order calls, and closures.
+- The native backend does not select `Call` and does not compile a whole multi-function unit.
+- Native CFG lowering recognizes selected corpus shapes instead of representing arbitrary blocks.
+- Liveness and allocation are based on textual intervals, with a special back-edge extension.
+- Native `New` metadata and the collector are tested separately; compiled code does not yet enter
+  the moving collector and resume with relocated roots.
+- The TypeScript frontend lowers into a JavaScript-side graph and executor, not the native Coil IR.
+
+This baseline is useful and must remain green, but it is not the completion criterion.
+
+## Non-negotiable rules
+
+1. **No shape-specific feature claims.** A second loop-phi helper, another diamond pattern, or a
+   binary-trees-specific selector is not progress toward a general backend.
+2. **No plausible placeholders.** Unsupported input produces a named capability failure before
+   code emission. It never returns `false`, zero, or partial object bytes without a diagnostic.
+3. **Correctness never depends on inlining.** Recursive and ordinary calls must work as calls.
+4. **The interpreter is the semantic oracle.** Every terminating parity fixture is compared before
+   and after optimization and against native execution.
+5. **Every gate must be falsified.** Temporarily reverse or remove the behavior it claims to test;
+   the focused gate must turn red for the expected reason.
+6. **No milestone advances across a red predecessor.** Later exploratory work may exist locally,
+   but no later milestone is marked done or merged while an earlier required gate is red.
+7. **Generated artifacts are not source.** Build output, binaries, dumps, and temporary objects stay
+   ignored unless a document explicitly defines a reviewed golden artifact.
+8. **Claims name their scope.** “Collector model passes,” “native metadata exists,” and “compiled
+   code survives collection” are three different claims and require three different gates.
+
+## Definition of the gap
+
+The audit against `reference/Simple/chapter24` found that parity is strong through the ideal graph,
+peephole engine, lattice, loop tree, callable program model, and optimistic interprocedural analysis.
+The concentrated gap is the general code-generation half:
+
+```text
+whole ideal program
+    -> explicit machine functions and CFG
+    -> general instruction selection
+    -> edge-correct Phi lowering
+    -> global code motion
+    -> local scheduling
+    -> CFG liveness
+    -> constrained register allocation
+    -> ABI frames and calls
+    -> multi-function Mach-O
+```
+
+Native moving-GC integration and TypeScript lowering follow this substrate. They are project goals,
+not Simple parity.
+
+## Milestone table
+
+Status values are `not started`, `in progress`, `blocked`, and `done`. “Done” means the exit gate in
+`IMPLEMENTATION-PLAN.md` is executable, green, and has been falsified successfully.
+
+| ID | Milestone | Status | Required predecessor | Primary gate |
+|---|---|---|---|---|
+| G0 | Capability diagnostics and parity fixture ladder | not started | baseline | `backend-parity-test` rejects unsupported stages by name |
+| G1 | Machine compilation units, functions, blocks, and edges | not started | G0 | verified exact CFG tables for nested and multi-function fixtures |
+| G2 | General block-based instruction selection | not started | G1 | arbitrary reducible parity CFGs select without shape helpers |
+| G3 | General Phi edge lowering | not started | G2 | multi-Phi, critical-edge, and cyclic-copy native differentials |
+| G4 | Conservative multi-function direct calls | not started | G3 | two native functions call and return through real `BL` |
+| G5 | arm64 ABI and per-function frames | not started | G4 | non-leaf, stack-argument, and recursive frame gates |
+| G6 | CFG liveness | not started | G3, G5 | exact live-in/out and Phi-edge sets over loops and calls |
+| G7 | CFG-correct constrained register allocation | not started | G6 | forced-pressure calls, loops, Phi cycles, and spills agree |
+| G8 | Simple-style global code motion | not started | G2, G6 | placement laws and memory anti-dependencies are executable |
+| G9 | Dependency-correct local scheduling | not started | G8 | seeded schedules preserve dependencies and native results |
+| G10 | Multi-function Mach-O and metadata emission | not started | G5, G7 | symbols, fixups/relocations, external harness execution |
+| X1 | Native allocation and moving-GC bridge | not started | G7, G9, G10 | compiled code collects and resumes with relocated roots |
+| X2 | Hand-built binary-trees integration gate | not started | X1 | interpreter/native/stress/full-depth ladder is green |
+| X3 | Parser-independent frontend IR and TypeScript lowering | not started | X2 | TypeScript binary-trees reaches the same native pipeline |
+| X4 | Published binary-trees performance report | not started | X3 | raw samples, ratios, GC metrics, and losses published |
+
+## Critical path
+
+```text
+G0 -> G1 -> G2 -> G3 -> G4 -> G5 -> G6 -> G7 -> G10
+                  |                 |     |
+                  +-------> G8 ----+-> G9
+                                          \
+                                           X1 -> X2 -> X3 -> X4
+```
+
+G8 and G9 may be developed after conservative CFG-correct execution exists, but X1 may not be
+declared complete until scheduling and allocation both provide exact safepoint locations.
+
+## Milestone summaries
+
+### G0: capability diagnostics and parity fixtures
+
+Create a permanent ladder that forces every missing behavior independently. The ladder begins with
+multiple Phis and ends with reduced binary-trees. Unsupported stages must fail with stable codes.
+This ensures later slices cannot confuse “selector accepted the graph” with “program compiled.”
+
+### G1: machine functions and CFG
+
+Add explicit `MFunction`, `MBlock`, and `MEdge` ownership. Enumerate reachable functions, construct
+RPO per function, preserve Region predecessor-slot identity, and verify both directions of every
+edge. No scheduling or clever placement is required yet.
+
+### G2: general selection
+
+Select into blocks. Replace recursive control walking and special recognition of diamonds/loops.
+Every supported ideal control node maps to an explicit terminator or block boundary. Data nodes are
+initially pinned conservatively to a legal controlling block.
+
+### G3: general Phi lowering
+
+Put Phi moves on incoming edges, split critical edges, and resolve parallel copies including cycles.
+`CSEL` becomes optional optimization, never the implementation of merge correctness.
+
+### G4: direct calls
+
+Compile several ideal functions in one invocation and encode direct internal calls. Begin with a
+deliberately conservative call envelope and named rejection of unsupported live-across-call cases.
+
+### G5: ABI and frames
+
+Replace the fixed frame with derived per-function layouts. Model argument and return registers,
+caller/callee saves, LR, stack alignment, outgoing arguments, spills, and recursion.
+
+### G6: liveness
+
+Solve use/def/live-in/live-out over the machine CFG. Attribute Phi uses to incoming edges. Model call
+clobbers and expose value-kind-aware safepoint liveness.
+
+### G7: register allocation
+
+Build interference from CFG liveness, honor fixed masks and clobbers, coalesce safe copies, allocate
+frame-local spill slots, insert splits/reloads/stores, and repeat analysis as necessary.
+
+### G8: global code motion
+
+Port the relevant Simple placement algorithm: earliest legal block, latest use-LCA block, Phi-edge
+uses, loop-depth preference, pinned rules, function locality, and memory/call anti-dependencies.
+
+### G9: local scheduling
+
+Within each block, schedule a dependency graph deterministically. Preserve memory, calls, fixed
+constraints, edge-copy placement, and terminator position.
+
+### G10: object emission
+
+Emit several function symbols, internal call fixups or relocations, runtime symbols, frame metadata,
+and stack-map sections. Validate the object mechanically before linking it from an external harness.
+
+### X1: native GC integration
+
+Replace synthetic native allocation behavior with bump allocation, a slow-path runtime call, real
+layout descriptors, exact stack maps, native frame walking, and root relocation. Stress must execute
+compiled code, not merely replay allocation sites through the collector model.
+
+### X2: hand-built binary-trees
+
+Build the program through the trusted node API before involving a frontend. Run a small-depth
+differential matrix, forced pressure, collect-every-allocation, and a full-depth extended gate.
+
+### X3: TypeScript lowering
+
+Adopt a mature TypeScript parser behind a normalized frontend IR. Implement only the explicit
+semantic subset needed to express the program cleanly, while retaining named rejection elsewhere.
+Lower into the same Coil graph used by X2; do not maintain a second executable “core graph.”
+
+### X4: performance
+
+Publish compilation phases and runtime separately, including allocation throughput, collection
+counts, copied/promoted bytes, peak live heap, code size, raw samples, ratios, and losses.
+
+## When the Simple gap is closed
+
+Items G0 through G10 are complete only when all of these statements are executable facts:
+
+1. One backend invocation compiles a reachable closed program with multiple functions.
+2. Arbitrary supported reducible control flow becomes an explicit verified machine CFG.
+3. Arbitrary Region/Phi sets lower through edge-specific parallel copies.
+4. Direct and mutually recursive functions execute through real calls and independent frames.
+5. Movable nodes receive legal function-local placement based on dominance, uses, loop depth,
+   pinning, and memory dependencies.
+6. Every block receives a dependency-correct schedule.
+7. Liveness covers Phi edges, branches, loops, calls, and safepoints.
+8. Allocation honors register constraints and call clobbers and spills to frame-local locations.
+9. Mach-O emission contains the functions, symbols, calls, and metadata the program needs.
+10. Native output agrees with the interpreter across the parity ladder under normal and forced
+    pressure, including hand-built recursive object programs.
+
+X1-X4 then establish this project's stronger claim: moving-GC-safe native execution and a real
+TypeScript source path demonstrated by binary-trees.
+
+## How to start
+
+The next task is G0, not frontend work and not binary-trees code generation. Follow the slice
+procedure in [VERIFICATION-WORKFLOW.md](VERIFICATION-WORKFLOW.md), then implement the exact G0
+contract in [IMPLEMENTATION-PLAN.md](IMPLEMENTATION-PLAN.md#g0-capability-diagnostics-and-parity-fixture-ladder).
