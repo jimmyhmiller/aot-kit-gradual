@@ -1,0 +1,1 @@
+var value = true && (false ? 1 : 2);

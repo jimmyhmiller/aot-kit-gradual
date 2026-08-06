@@ -62,6 +62,19 @@ function run(command) {
   if (result.status !== 0) fail(`${command} exited ${result.status}`);
 }
 
+function requireCleanWorktree(target) {
+  const result = spawnSync(
+    "git",
+    ["status", "--porcelain=v1", "--untracked-files=all", "--ignore-submodules=none"],
+    { cwd: root, encoding: "utf8" },
+  );
+  if (result.error) fail(`cannot inspect worktree: ${result.error.message}`);
+  if (result.status !== 0) fail(`git status exited ${result.status}: ${result.stderr.trim()}`);
+  if (result.stdout.trim()) {
+    fail(`refusing to complete ${target}: commit the green implementation before recording evidence`);
+  }
+}
+
 function writeState(nextState) {
   const temporary = `${statePath}.tmp`;
   fs.writeFileSync(temporary, `${JSON.stringify(nextState, null, 2)}\n`);
@@ -100,6 +113,7 @@ if (command === "validate") {
   if (!ready(milestone)) fail(`${target} predecessors are not complete`);
   if (state.completed.includes(target)) fail(`${target} is already complete`);
   if (!fs.existsSync(path.join(root, milestone.gate))) fail(`${target} gate does not exist: ${milestone.gate}`);
+  if (command === "complete") requireCleanWorktree(target);
   run(milestone.gate);
   for (const gate of roadmap.completionCommands) {
     if (!fs.existsSync(path.join(root, gate.split(" ")[0]))) fail(`required gate does not exist: ${gate}`);

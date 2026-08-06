@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+// Legacy oracle fixture generator. Never use this as a product compiler path.
 import fs from "node:fs";
 import path from "node:path";
 import { normalizeTypeScript } from "../src/frontend_ir.mjs";

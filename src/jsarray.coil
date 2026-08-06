@@ -1,0 +1,173 @@
+(module jsarray)
+
+(import "coil.arraylist" :use *)
+(import "coil.alloc" :use *)
+(import "jsobject" :use *)
+(import "jsvalue" :use *)
+
+(const JSA-OK i64 0)
+(const JSA-BAD-ARRAY i64 1)
+(const JSA-BAD-INDEX i64 2)
+(const JSA-NONE i64 -1)
+
+(defstruct JsArray [(object i64) (length i64) (capacity i64)])
+(defstruct JsElement [(array i64) (index i64) (value i64) (present bool)])
+(defstruct JsArrayHeap
+  [(arrays (ArrayList JsArray))
+   (elements (ArrayList JsElement))
+   (status i64)
+   (inited bool)])
+
+(defn jsa-disable-growth-ptr [] (-> (ptr bool)) (let [flag (static bool)] flag))
+
+(defn jsa-heap [] (-> (ptr JsArrayHeap))
+  (let [heap (static JsArrayHeap)]
+    (if (load (field heap inited)) 0
+      (do (store! (field heap inited) true)
+          (store! (field heap arrays) (al-new [JsArray] (malloc-allocator)))
+          (store! (field heap elements) (al-new [JsElement] (malloc-allocator))) 0))
+    heap))
+
+(defn jsa-reset! [] (-> i64)
+  (let [heap (jsa-heap)]
+    (al-clear! [JsArray] (field heap arrays))
+    (al-clear! [JsElement] (field heap elements))
+    (store! (field heap status) JSA-OK)
+    (store! (jsa-disable-growth-ptr) false)
+    0))
+
+(defn jsa-valid? [(array i64)] (-> bool)
+  (and (>= array 0) (< array (al-len [JsArray] (load (field (jsa-heap) arrays))))))
+
+(defn jsa-array-make [(object i64) (length i64) (capacity i64)] (-> JsArray)
+  (let [(mut array) (zeroed JsArray)]
+    (store! (field array object) object)
+    (store! (field array length) length)
+    (store! (field array capacity) capacity)
+    (load array)))
+
+(defn jsa-element-make [(array i64) (index i64) (value i64) (present bool)] (-> JsElement)
+  (let [(mut element) (zeroed JsElement)]
+    (store! (field element array) array)
+    (store! (field element index) index)
+    (store! (field element value) value)
+    (store! (field element present) present)
+    (load element)))
+
+(defn jsa-new! [] (-> i64)
+  (let [heap (jsa-heap) id (al-len [JsArray] (load (field heap arrays)))
+        object (jso-new! JSO-NONE)]
+    (if (= object JSO-NONE) (do (store! (field heap status) JSA-BAD-ARRAY) JSA-NONE)
+      (do (al-push! [JsArray] (field heap arrays) (jsa-array-make object 0 0)) id))))
+
+(defn jsa-record [(array i64)] (-> JsArray)
+  (al-get [JsArray] (load (field (jsa-heap) arrays)) array))
+
+(defn jsa-object [(array i64)] (-> i64)
+  (if (jsa-valid? array) (let [record (jsa-record array)] (load (field record object))) JSO-NONE))
+(defn jsa-length [(array i64)] (-> i64)
+  (if (jsa-valid? array) (let [record (jsa-record array)] (load (field record length))) 0))
+(defn jsa-capacity [(array i64)] (-> i64)
+  (if (jsa-valid? array) (let [record (jsa-record array)] (load (field record capacity))) 0))
+
+(defn jsa-element-index [(array i64) (index i64)] (-> i64)
+  (let [elements (load (field (jsa-heap) elements))
+        (mut at) (- (al-len [JsElement] elements) 1) (mut found) JSA-NONE]
+    (loop (if (or (< (load at) 0) (!= (load found) JSA-NONE)) (break)
+      (let [element (al-get [JsElement] elements (load at))]
+        (if (and (= (load (field element array)) array)
+                 (= (load (field element index)) index))
+            (store! found (load at)) 0)
+        (store! at (- (load at) 1)))))
+    (load found)))
+
+(defn jsa-present? [(array i64) (index i64)] (-> bool)
+  (let [at (jsa-element-index array index)]
+    (and (!= at JSA-NONE)
+         (let [element (al-get [JsElement] (load (field (jsa-heap) elements)) at)]
+           (load (field element present))))))
+
+(defn jsa-load [(array i64) (index i64)] (-> i64)
+  (if (or (not (jsa-valid? array)) (or (< index 0) (>= index (jsa-length array))))
+      JSV-UNDEFINED
+    (let [at (jsa-element-index array index)]
+      (if (= at JSA-NONE) JSV-UNDEFINED
+        (let [element (al-get [JsElement] (load (field (jsa-heap) elements)) at)]
+          (if (load (field element present)) (load (field element value)) JSV-UNDEFINED))))))
+
+(defn jsa-next-capacity [(capacity i64) (needed i64)] (-> i64)
+  (let [(mut next) (if (< capacity 4) 4 capacity)]
+    (loop (if (>= (load next) needed) (break)
+      (store! next (* (load next) 2))))
+    (load next)))
+
+(defn jsa-store! [(array i64) (index i64) (value i64)] (-> i64)
+  (let [heap (jsa-heap)]
+    (if (not (jsa-valid? array))
+        (do (store! (field heap status) JSA-BAD-ARRAY) JSA-BAD-ARRAY)
+      (if (< index 0) (do (store! (field heap status) JSA-BAD-INDEX) JSA-BAD-INDEX)
+        (let [(mut record) (jsa-record array) needed (+ index 1)]
+          (if (and (> needed (load (field record capacity)))
+                   (load (jsa-disable-growth-ptr)))
+              (do (store! (field heap status) JSA-BAD-INDEX) JSA-BAD-INDEX)
+            (do
+              (if (> needed (load (field record capacity)))
+                  (store! (field record capacity)
+                          (jsa-next-capacity (load (field record capacity)) needed)) 0)
+              (if (> needed (load (field record length))) (store! (field record length) needed) 0)
+              (al-set! [JsArray] (field heap arrays) array (load record))
+              (let [at (jsa-element-index array index)]
+                (if (= at JSA-NONE)
+                    (al-push! [JsElement] (field heap elements)
+                              (jsa-element-make array index value true))
+                  (let [(mut element) (al-get [JsElement] (load (field heap elements)) at)]
+                    (store! (field element value) value)
+                    (store! (field element present) true)
+                    (al-set! [JsElement] (field heap elements) at (load element)))))
+              (store! (field heap status) JSA-OK)
+              JSA-OK)))))))
+
+(defn jsa-push! [(array i64) (value i64)] (-> i64)
+  (let [index (jsa-length array)]
+    (if (= (jsa-store! array index value) JSA-OK) (jsa-length array) JSA-NONE)))
+
+(defn jsa-pop! [(array i64)] (-> i64)
+  (if (or (not (jsa-valid? array)) (= (jsa-length array) 0)) JSV-UNDEFINED
+    (let [(mut record) (jsa-record array) index (- (load (field record length)) 1)
+          value (jsa-load array index) at (jsa-element-index array index)]
+      (store! (field record length) index)
+      (al-set! [JsArray] (field (jsa-heap) arrays) array (load record))
+      (if (!= at JSA-NONE)
+          (let [(mut element) (al-get [JsElement] (load (field (jsa-heap) elements)) at)]
+            (store! (field element present) false)
+            (store! (field element value) JSV-UNDEFINED)
+            (al-set! [JsElement] (field (jsa-heap) elements) at (load element))) 0)
+      value)))
+
+(defn jsa-slice! [(array i64) (start i64) (end i64)] (-> i64)
+  (if (not (jsa-valid? array)) JSA-NONE
+    (let [length (jsa-length array)
+          from (if (< start 0) (if (< (+ length start) 0) 0 (+ length start))
+                 (if (> start length) length start))
+          to (if (< end 0) (if (< (+ length end) 0) 0 (+ length end))
+               (if (> end length) length end))
+          result (jsa-new!) (mut index) from]
+      (loop (if (>= (load index) to) (break)
+        (do (if (jsa-present? array (load index))
+                (jsa-store! result (- (load index) from) (jsa-load array (load index))) 0)
+            (store! index (+ (load index) 1)))))
+      ; Slice preserves trailing/all holes, so length changes even when no element was stored.
+      (let [(mut record) (jsa-record result) size (if (> to from) (- to from) 0)]
+        (store! (field record length) size)
+        (if (> size (load (field record capacity)))
+            (store! (field record capacity) (jsa-next-capacity 0 size)) 0)
+        (al-set! [JsArray] (field (jsa-heap) arrays) result (load record)))
+      result)))
+
+(defn jsa-property-store! [(array i64) (name (slice u8)) (value i64)] (-> i64)
+  (if (not (jsa-valid? array)) JSA-BAD-ARRAY
+    (jso-store! (jsa-object array) name value)))
+(defn jsa-property-load [(array i64) (name (slice u8))] (-> i64)
+  (if (not (jsa-valid? array)) JSV-UNDEFINED
+    (jso-load (jsa-object array) name)))
+(defn jsa-status [] (-> i64) (load (field (jsa-heap) status)))

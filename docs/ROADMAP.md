@@ -1,238 +1,139 @@
-# Roadmap: close the Simple backend gap
+# Roadmap: run the complete V8 Benchmark Suite v7
 
-This file is the authoritative roadmap. The previous M0-M13 roadmap described how the current
-prototype was assembled; it is obsolete. Historical rationale remains in [JOURNAL.md](JOURNAL.md),
-and architectural laws remain in [DECISIONS.md](DECISIONS.md).
+This file is the authoritative roadmap. The Simple-backend and binary-trees roadmap is complete;
+its implementation history remains in [JOURNAL.md](JOURNAL.md), and its gates remain permanent
+regressions. This roadmap starts a new controller.
 
-The present objective is narrower and more demanding:
+The research and corpus audit behind the scope and ordering are recorded in
+[V8-BENCHMARK-RESEARCH.md](V8-BENCHMARK-RESEARCH.md). Detailed slice contracts are in
+[IMPLEMENTATION-PLAN.md](IMPLEMENTATION-PLAN.md).
 
-> Turn the existing ideal IR and optimizer into a general, whole-program native compiler by
-> completing the missing Simple-derived backend machinery, then prove the result with a native,
-> GC-stressed binary-trees program and finally lower that program from TypeScript.
+## Target
 
-The supporting documents are part of this roadmap:
+Compile and execute all eight programs in the **V8 Benchmark Suite version 7** through the native
+Microsoft `typescript-go` parser, Coil-owned frontend, ideal IR, optimizer, arm64 backend, and
+moving collector:
 
-- [SIMPLE-GAP.md](SIMPLE-GAP.md) records the audited gap and the boundary between reusable work,
-  missing Simple machinery, and this project's deliberate extensions.
-- [IMPLEMENTATION-PLAN.md](IMPLEMENTATION-PLAN.md) specifies every implementation slice, its
-  prerequisites, deliverables, likely files, and executable exit gate.
-- [VERIFICATION-WORKFLOW.md](VERIFICATION-WORKFLOW.md) is the mandatory workflow for implementing,
-  reviewing, falsifying, and landing a slice.
-- [BINARYTREES.md](BINARYTREES.md) defines the integration program, observables, test ladder, GC
-  stress requirements, and final benchmark gate.
+1. Richards
+2. DeltaBlue
+3. Crypto
+4. RayTrace
+5. EarleyBoyer
+6. RegExp
+7. Splay
+8. NavierStokes
 
-If these documents disagree, precedence is:
+The suite is pinned from the official V8 repository at tag `7.4.77`, whose `benchmarks/` directory
+identifies itself as version 7. We use the original JavaScript programs and harness semantics;
+typed adapters may describe closed-world entry points, but may not rewrite the algorithms into an
+easier language subset.
 
-1. `DECISIONS.md` for compiler law.
-2. This roadmap for order and status.
-3. `IMPLEMENTATION-PLAN.md` for slice contracts.
-4. `VERIFICATION-WORKFLOW.md` for execution procedure.
-5. `BINARYTREES.md` for the integration workload.
+This deliberately does **not** mean every file under modern V8's `test/js-perf-test`, nor
+Speedometer or JetStream. V8 now recommends Speedometer and JetStream for modern performance work
+and describes its old suite as a classic peak-performance workload. The finite v7 corpus is the
+right next compiler-coverage target; a later roadmap can graduate to modern suites.
 
-## Baseline
+## What the audit found
 
-The baseline commit is `269c245` (`Complete M10-M13 compiler milestones`). At that baseline:
+The completed compiler already has general CFG lowering, calls, frames, scheduling, allocation,
+objects, exact stack maps, and moving GC. Binary-trees proves that substrate. The missing work is
+mostly language/runtime coverage plus numeric backend coverage:
 
-- `tools/gate.sh --quick` is green with 239 tests.
-- All 28 corpus graphs select, allocate, and encode for arm64.
-- The 27 terminating corpus programs agree with the interpreter.
-- Ideal IR, interpretation, graph text, and inference support direct calls, recursion, mutual
-  recursion, higher-order calls, and closures.
-- The native backend does not select `Call` and does not compile a whole multi-function unit.
-- Native CFG lowering recognizes selected corpus shapes instead of representing arbitrary blocks.
-- Liveness and allocation are based on textual intervals, with a special back-edge extension.
-- Native `New` metadata and the collector are tested separately; compiled code does not yet enter
-  the moving collector and resume with relocated roots.
-- The TypeScript frontend lowers into a JavaScript-side graph and executor, not the native Coil IR.
+- the native parser bridge exists, but the old npm TypeScript normalizer still drives several
+  product and benchmark tools;
+- the frontend handles declarations, direct calls, constructors, structured `if`/`while`/`for`,
+  object literals, and named fields, but not JavaScript's full benchmark surface;
+- the ideal interpreter understands doubles, while native selection and the frontend are still
+  centered on integer arithmetic;
+- the corpus uses function expressions, receiver calls and `this`, prototype-style construction,
+  arrays and indexed access, strings, Math intrinsics, modulo, bitwise operations, shifts,
+  increment/decrement, short-circuit expressions, conditional expressions, `switch`, `do`,
+  `break`, `continue`, `typeof`, `in`, `instanceof`, `delete`, exceptions, and regular expressions;
+- EarleyBoyer is the broadest dynamic-language test (4,684 lines); RegExp contains 237 regular
+  expression literals and must not be claimed complete through a stubbed matcher.
 
-This baseline is useful and must remain green, but it is not the completion criterion.
+The order below follows capability dependencies, not benchmark source order.
 
 ## Non-negotiable rules
 
-1. **No shape-specific feature claims.** A second loop-phi helper, another diamond pattern, or a
-   binary-trees-specific selector is not progress toward a general backend.
-2. **No plausible placeholders.** Unsupported input produces a named capability failure before
-   code emission. It never returns `false`, zero, or partial object bytes without a diagnostic.
-3. **Correctness never depends on inlining.** Recursive and ordinary calls must work as calls.
-4. **The interpreter is the semantic oracle.** Every terminating parity fixture is compared before
-   and after optimization and against native execution.
-5. **Every gate must be falsified.** Temporarily reverse or remove the behavior it claims to test;
-   the focused gate must turn red for the expected reason.
-6. **No milestone advances across a red predecessor.** Later exploratory work may exist locally,
-   but no later milestone is marked done or merged while an earlier required gate is red.
-7. **Generated artifacts are not source.** Build output, binaries, dumps, and temporary objects stay
-   ignored unless a document explicitly defines a reviewed golden artifact.
-8. **Claims name their scope.** “Collector model passes,” “native metadata exists,” and “compiled
-   code survives collection” are three different claims and require three different gates.
+1. **Original workloads.** Preserve the pinned source and expected checks. A port may add types and
+   a closed-world wrapper, but may not replace a data structure, builtin, regular expression, or
+   algorithm with a precomputed answer or benchmark-specific native helper.
+2. **One product frontend.** The native `typescript-go` AST path is authoritative. JavaScript
+   TypeScript-API code may remain temporarily as an independent oracle, never as the compiler path.
+3. **Capability failures are data.** Every corpus item is present from B00 and reports its first
+   stable unsupported capability until it runs. Crashes and generic parse failures are not status.
+4. **Semantics before speed.** Node/V8 is the observable oracle. Raw ideal, optimized ideal, normal
+   native, register-pressure native, and GC-stress native must agree before timing is published.
+5. **No benchmark dispatch.** Compiler and runtime code may not branch on suite, file, function, or
+   benchmark names. Builtins are allowed only as general specified runtime operations.
+6. **No GC exemptions.** Allocation-heavy programs run with exact layouts and stack maps under
+   moving collection. A larger non-collecting heap is not completion evidence.
+7. **No score laundering.** Report compilation separately from execution, retain raw samples, and
+   publish every individual result and loss. The aggregate uses the suite's geometric-mean rules.
+8. **Every milestone is falsified.** Reversing its behavior must turn its focused gate red for the
+   expected reason before the milestone is completed.
 
-## Definition of the gap
+## Milestones
 
-The audit against `reference/Simple/chapter24` found that parity is strong through the ideal graph,
-peephole engine, lattice, loop tree, callable program model, and optimistic interprocedural analysis.
-The concentrated gap is the general code-generation half:
+Status values are `active`, `blocked`, `not started`, and `done`. The executable controller in
+`workflow/state.json` is the status authority. `workflow.mjs complete` accepts only a clean worktree,
+so each evidence record names a commit that already contains the green implementation.
 
-```text
-whole ideal program
-    -> explicit machine functions and CFG
-    -> general instruction selection
-    -> edge-correct Phi lowering
-    -> global code motion
-    -> local scheduling
-    -> CFG liveness
-    -> constrained register allocation
-    -> ABI frames and calls
-    -> multi-function Mach-O
-```
-
-Native moving-GC integration and TypeScript lowering follow this substrate. They are project goals,
-not Simple parity.
-
-## Milestone table
-
-Status values are `not started`, `in progress`, `blocked`, and `done`. “Done” means the exit gate in
-`IMPLEMENTATION-PLAN.md` is executable, green, and has been falsified successfully.
-
-| ID | Milestone | Status | Required predecessor | Primary gate |
+| ID | Milestone | Status | Required predecessor | Exit gate |
 |---|---|---|---|---|
-| G0 | Capability diagnostics and parity fixture ladder | done | baseline | `backend-parity-test` rejects unsupported stages by name |
-| G1 | Machine compilation units, functions, blocks, and edges | done | G0 | verified exact CFG tables for nested and multi-function fixtures |
-| G2 | General block-based instruction selection | done | G1 | arbitrary reducible parity CFGs select without shape helpers |
-| G3 | General Phi edge lowering | done | G2 | multi-Phi, split-edge, cyclic-copy, memory-Phi, and spill differentials |
-| G4 | Conservative multi-function direct calls | done | G3 | two native functions call and return through real `BL` |
-| G5 | arm64 ABI and per-function frames | done | G4 | non-leaf, stack-argument, and recursive frame gates |
-| G8 | Simple-style global code motion | complete | G3, G5 | placement laws and memory anti-dependencies are executable |
-| G9 | Dependency-correct local scheduling | complete | G8 | seeded schedules preserve dependencies and native results |
-| G6 | CFG liveness | complete | G3, G5, G9 | exact live-in/out and Phi-edge sets over final scheduled code |
-| G7 | CFG-correct constrained register allocation | complete | G6 | forced-pressure calls, loops, Phi cycles, and spills agree |
-| G10 | Multi-function Mach-O and metadata emission | complete | G5, G7 | symbols, fixups/relocations, external harness execution |
-| X1 | Native allocation and moving-GC bridge | complete | G7, G9, G10 | compiled code collects and resumes with relocated roots |
-| X2 | Hand-built binary-trees integration gate | complete | X1 | interpreter/native/stress/full-depth ladder is green |
-| X3 | Parser-independent frontend IR and TypeScript lowering | complete | X2 | TypeScript binary-trees reaches the same native pipeline |
-| X4 | Published binary-trees performance report | complete | X3 | raw samples, ratios, GC metrics, and losses published |
-| X5 | TypeScript depth-21 moving-GC closure | complete | X4 | exact native results survive moving collection at full depth |
+| B00 | Pinned corpus, Node oracle, and capability inventory | done | completed roadmap | eight licensed, hashed sources pass Node checks and report stable first gaps |
+| B01 | JavaScript-aware native parser ABI | done | B00 | `.js` mode and named AST roles/literals/operators cover the corpus |
+| B02 | Canonical Coil-owned frontend path | done | B01 | product tools require `typescript-go`; npm parser is oracle-only |
+| B03 | Native JavaScript tagged-value ABI | done | B02 | every value tag survives calls, spills, fields, and moving GC |
+| B04 | JavaScript number semantics in ideal IR | done | B03 | IEEE-754/NaN/-0/mixed-number oracle matrix agrees |
+| B05 | arm64 floating-point lowering | done | B04 | f64 ABI, Phis, allocation, spills, and comparisons agree natively |
+| B06 | `ToInt32`, modulo, bitwise, and shifts | done | B04, B05 | Node edge-case matrix agrees for all 32-bit operators |
+| B07 | Expression evaluation and assignment | done | B03, B04 | updates, compound lvalues, comma, ternary, and short-circuit order agree |
+| B08 | Structured CFG and targeted exits | done | B07 | `do`, `switch`, fallthrough, `break`, and `continue` agree |
+| B09 | Function expressions and lexical closures | done | B03 | captured/recursive closures and indirect closed-world calls survive GC |
+| B10 | Receiver calls, `this`, and constructors | done | B09 | receiver ABI and JS constructor-return rules agree |
+| B11 | Dynamic properties and prototype chains | done | B10 | lookup, shadowing, missing properties, transitions, and prototypes agree |
+| B12 | Dense JavaScript arrays | done | B03, B11 | indexed storage, growth, holes, push/pop/slice, and exact GC scans agree |
+| B13 | Strings and conversion | done | B03 | corpus string operations and conversions agree with Node |
+| B14 | Core builtins and uncaught `throw` | done | B05, B12, B13 | Math/builtin descriptors agree and original failure checks compile honestly |
+| B15 | Richards and DeltaBlue closure | active | B06–B14 as applicable | both original programs pass the full correctness matrix |
+| B16 | NavierStokes closure | not started | B05–B07, B12, B14 | original numeric-array kernel passes every mode |
+| B17 | RayTrace and Splay closure | not started | B05, B07–B08, B10–B14 | both original checks pass; Splay survives forced collection |
+| B18 | Crypto closure | not started | B06–B14 | original RSA/big-integer round trip passes without host substitution |
+| B19 | Dynamic operators and catchable exceptions | not started | B09, B11–B14 | `typeof`/`in`/`instanceof`/`delete` and exceptional CFG agree |
+| B20 | EarleyBoyer closure | not started | B19, B21 when inventory requires | original 4,684-line program passes every mode |
+| B21 | General RegExp runtime | not started | B13 | literals, captures, flags, `lastIndex`, exec/test/match/replace/split agree |
+| B22 | RegExp benchmark closure | not started | B21 | all 237 literals execute and the original check passes |
+| B23 | Whole-suite correctness and stress runner | not started | B15–B18, B20, B22 | all eight pass independently and together in every correctness mode |
+| B24 | Reproducible aot-kit versus Node/V8 publication | not started | B23 | raw samples, medians, Node/aot-kit ratios, and aggregate publish reproducibly |
 
-## Critical path
+Critical path:
 
 ```text
-G0 -> G1 -> G2 -> G3 -> G4 -> G5 -> G8 -> G9 -> G6 -> G7 -> G10 -> X1 -> X2 -> X3 -> X4 -> X5
+B00 -> B01 -> B02 -> B03
+B03 -> B04 -> B05 -> B06
+B03 -> B07 -> B08
+B03 -> B09 -> B10 -> B11 -> B12
+B03 -> B13
+B05 + B12 + B13 -> B14
+shared capabilities -> B15/B16/B17/B18
+B09 + B11 + B12 + B13 + B14 -> B19 -> B20
+B13 -> B21 -> B22
+B15 + B16 + B17 + B18 + B20 + B22 -> B23 -> B24
 ```
 
-The IDs describe capability groups, not implementation order. Placement and scheduling precede the
-final liveness solution and register allocation because both can change instruction locations and
-therefore live ranges. A later CFG-mutating phase must explicitly invalidate and rerun G6/G7; it may
-not consume stale allocation or safepoint data.
+## Completion definition
 
-## Milestone summaries
+The roadmap is complete only when one command builds the pinned suite, runs all eight benchmarks
+through aot-kit, verifies each benchmark's original correctness checks against Node/V8, repeats the
+defined optimization/seed/register-pressure/collector matrix, and produces a reproducible report
+with per-benchmark and aggregate results. Parsing a file, lowering a reduced port, or running only
+the ideal interpreter is intermediate evidence, not a completed benchmark.
 
-### G0: capability diagnostics and parity fixtures
+## Next task
 
-Create a permanent ladder that forces every missing behavior independently. The ladder begins with
-multiple Phis and ends with reduced binary-trees. Unsupported stages must fail with stable codes.
-This ensures later slices cannot confuse “selector accepted the graph” with “program compiled.”
-
-### G1: machine functions and CFG
-
-Add explicit `MFunction`, `MBlock`, and `MEdge` ownership. Enumerate reachable functions, construct
-RPO per function, preserve Region predecessor-slot identity, and verify both directions of every
-edge. No scheduling or clever placement is required yet.
-
-### G2: general selection
-
-Select into blocks. Replace recursive control walking and special recognition of diamonds/loops.
-Every supported ideal control node maps to an explicit terminator or block boundary. Data nodes are
-initially pinned conservatively to a legal controlling block.
-
-### G3: general Phi lowering
-
-Put Phi moves on incoming edges, split critical edges, and resolve parallel copies including cycles.
-`CSEL` becomes optional optimization, never the implementation of merge correctness.
-
-### G4: direct calls
-
-Compile several ideal functions in one invocation and encode direct internal calls. Begin with a
-deliberately conservative call envelope and named rejection of unsupported live-across-call cases.
-
-### G5: ABI and frames
-
-Replace the fixed frame with derived per-function layouts. Model argument and return registers,
-caller/callee saves, LR, stack alignment, outgoing arguments, spills, and recursion.
-
-### G6: liveness
-
-Solve use/def/live-in/live-out over the machine CFG. Attribute Phi uses to incoming edges. Model call
-clobbers and expose value-kind-aware safepoint liveness.
-
-### G7: register allocation
-
-Build interference from CFG liveness, honor fixed masks and clobbers, coalesce safe copies, allocate
-frame-local spill slots, insert splits/reloads/stores, and repeat analysis as necessary.
-
-### G8: global code motion
-
-Port the relevant Simple placement algorithm: earliest legal block, latest use-LCA block, Phi-edge
-uses, loop-depth preference, pinned rules, function locality, and memory/call anti-dependencies.
-
-### G9: local scheduling
-
-Within each block, schedule a dependency graph deterministically. Preserve memory, calls, fixed
-constraints, edge-copy placement, and terminator position.
-
-### G10: object emission
-
-Emit several function symbols, internal call fixups or relocations, runtime symbols, frame metadata,
-and stack-map sections. Validate the object mechanically before linking it from an external harness.
-
-### X1: native GC integration
-
-Replace synthetic native allocation behavior with bump allocation, a slow-path runtime call, real
-layout descriptors, exact stack maps, native frame walking, and root relocation. Stress must execute
-compiled code, not merely replay allocation sites through the collector model.
-
-### X2: hand-built binary-trees
-
-Build the program through the trusted node API before involving a frontend. Run a small-depth
-differential matrix, forced pressure, collect-every-allocation, and a full-depth extended gate.
-
-### X3: TypeScript lowering
-
-Adopt a mature TypeScript parser behind a normalized frontend IR. Implement only the explicit
-semantic subset needed to express the program cleanly, while retaining named rejection elsewhere.
-Lower into the same Coil graph used by X2; do not maintain a second executable “core graph.”
-
-### X4: performance
-
-Publish compilation phases and runtime separately, including allocation throughput, collection
-counts, copied/promoted bytes, peak live heap, code size, raw samples, ratios, and losses.
-
-### X5: TypeScript full-depth moving-GC closure
-
-Preserve intra-block CallEnd effect chains so recursive field-producing calls precede the parent
-allocation, then prove the normalized TypeScript kernel at depth 21 under collection, verification,
-register pressure, and multiple deterministic schedules.
-
-## When the Simple gap is closed
-
-Items G0 through G10 are complete only when all of these statements are executable facts:
-
-1. One backend invocation compiles a reachable closed program with multiple functions.
-2. Arbitrary supported reducible control flow becomes an explicit verified machine CFG.
-3. Arbitrary Region/Phi sets lower through edge-specific parallel copies.
-4. Direct and mutually recursive functions execute through real calls and independent frames.
-5. Movable nodes receive legal function-local placement based on dominance, uses, loop depth,
-   pinning, and memory dependencies.
-6. Every block receives a dependency-correct schedule.
-7. Liveness covers Phi edges, branches, loops, calls, and safepoints.
-8. Allocation honors register constraints and call clobbers and spills to frame-local locations.
-9. Mach-O emission contains the functions, symbols, calls, and metadata the program needs.
-10. Native output agrees with the interpreter across the parity ladder under normal and forced
-    pressure, including hand-built recursive object programs.
-
-X1-X4 then establish this project's stronger claim: moving-GC-safe native execution and a real
-TypeScript source path demonstrated by binary-trees.
-
-## How to start
-
-The next task is G0, not frontend work and not binary-trees code generation. Follow the slice
-procedure in [VERIFICATION-WORKFLOW.md](VERIFICATION-WORKFLOW.md), then implement the exact G0
-contract in [IMPLEMENTATION-PLAN.md](IMPLEMENTATION-PLAN.md#g0-capability-diagnostics-and-parity-fixture-ladder).
-The ready-to-use contract and checklists are in [CURRENT-SLICE.md](CURRENT-SLICE.md).
+Implement B00 exactly as specified in [CURRENT-SLICE.md](CURRENT-SLICE.md): pin the upstream corpus,
+record its license and content hashes, build the Node oracle, and generate a stable capability
+inventory from the native parser path. Do not begin by implementing whichever unsupported syntax
+happens to appear first.

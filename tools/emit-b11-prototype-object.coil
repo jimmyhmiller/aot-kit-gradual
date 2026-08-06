@@ -1,0 +1,49 @@
+(module emitb11prototypeobject)
+
+(import "ty" :use *)
+(import "node" :use *)
+(import "shape" :use *)
+(import "backend" :use *)
+(import "verify" :use *)
+(import "coil.io" :use *)
+(import "coil.fmt" :use *)
+
+(extern write :cc c [i32 (ptr u8) i64] (-> i64))
+(extern atoi :cc c [(ptr i8)] (-> i32))
+(defn pc [(v i64)] (-> i64) (n-new1 OP-CONST (t-int-con v) (g-start)))
+(defn pm [] (-> i64)
+  (n-new1 OP-ARG (t-mem-alias JS-PROPERTY-ALIAS (t-undef)) (g-start)))
+(defn mm [(alias i64)] (-> i64)
+  (n-new1 OP-ARG (t-mem-alias alias (t-undef)) (g-start)))
+
+(defn main [(argc i32) (argv (ptr (ptr i8)))] (-> i64)
+  (let [regs (if (> argc 1) (cast i64 (atoi (load (index argv 1)))) 8)
+        seed (if (> argc 2) (cast i64 (atoi (load (index argv 2)))) 11150)]
+    (graph-reset! seed) (shape-reset!)
+    (let [object-shape (shape-transition SHAPE-ROOT "_keep" (t-int))
+          alias (shape-field-alias object-shape 0)
+          proto-new (n-new-obj1! (g-start) object-shape (mm alias))
+          proto (n-obj-ptr proto-new)
+          stored (n-prop-store! (pm) proto (n-box! (pc 42)) "answer")
+          inherited-seed (n-prop-load! stored proto "answer")
+          bridge (n-store! (n-obj-mem proto-new 0) proto
+                           (n-unbox! inherited-seed (t-int)) alias)
+          child-new (n-new-obj1! (g-start) object-shape bridge)
+          child (n-obj-ptr child-new)
+          linked (n-set-prototype! (n-obj-mem child-new 0) child proto)
+          trigger-new (n-new-obj1! (g-start) object-shape linked)
+          trigger-stored (n-prop-store! (n-obj-mem trigger-new 0)
+                                        (n-obj-ptr trigger-new) (n-box! (pc 1)) "junk")
+          value (n-prop-load! trigger-stored child "answer")
+          ret (n-new3 OP-RETURN 0 (g-start) value trigger-stored)]
+      (n-add-def! (g-stop) ret) (g-analyze!)
+      (if (not (be-select-machine-program!))
+          (do (fmt (stderr) "B11 prototype selection failed be={d}@{d} ms={d}@{d} gv={d}/{d}\n"
+                (be-result) (be-result-node) (ms-result) (ms-result-item)
+                (g-verify-code) (g-verify-node)) 2)
+        (do (be-use-runtime-allocation! true) (be-schedule!)
+            (if (< (be-color! regs) 0) 3
+              (if (not (be-encode-checked!)) 4
+                (if (not (be-macho-checked!)) 5
+                  (if (= (write 1 (be-object-data) (be-object-len))
+                         (be-object-len)) 0 6)))))))))

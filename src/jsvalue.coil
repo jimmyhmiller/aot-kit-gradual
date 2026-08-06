@@ -1,0 +1,71 @@
+;; Canonical 64-bit JavaScript tagged-value ABI shared by the evaluator, backend,
+;; serialized stack maps, and native runtime. Positive and negative quiet-NaN
+;; tag space is reserved; every ordinary double remains its IEEE-754 bit pattern.
+(module jsvalue)
+
+(const JSV-NAN i64 9221120237041090560)
+(const JSV-UNDEFINED i64 9221401712017801216)
+(const JSV-NULL i64 9221683186994511872)
+(const JSV-BOOLEAN i64 9221964661971222528)
+(const JSV-INTEGER i64 9222246136947933184)
+(const JSV-OBJECT i64 9222527611924643840)
+(const JSV-STRING i64 9222809086901354496)
+(const JSV-REF i64 9223090561878065152)
+(const JSV-ARRAY i64 -2251799813685248)
+(const JSV-FUNCTION i64 -1970324836974592)
+(const JSV-CLOSURE i64 -1688849860263936)
+(const JSV-REGEXP i64 -1407374883553280)
+(const JSV-RESERVED-0 i64 -1125899906842624)
+(const JSV-TAG-MASK i64 -281474976710656)
+(const JSV-PAYLOAD-MASK i64 281474976710655)
+(const JSV-INT-SIGN i64 140737488355328)
+(const JSV-INT-MIN i64 -140737488355328)
+(const JSV-INT-MAX i64 140737488355327)
+(const JSV-NEGATIVE-ZERO i64 -9223372036854775808)
+
+(defn jsv-tag [(word i64)] (-> i64) (& word JSV-TAG-MASK))
+(defn jsv-payload [(word i64)] (-> i64) (& word JSV-PAYLOAD-MASK))
+(defn jsv-tagged? [(word i64)] (-> bool)
+  (let [tag (jsv-tag word)]
+    (or (and (>= tag JSV-NAN) (<= tag JSV-REF))
+        (and (>= tag JSV-ARRAY) (<= tag JSV-REGEXP)))))
+(defn jsv-double? [(word i64)] (-> bool) (not (jsv-tagged? word)))
+(defn jsv-managed? [(word i64)] (-> bool)
+  (let [tag (jsv-tag word)]
+    (or (= tag JSV-OBJECT) (= tag JSV-ARRAY) (= tag JSV-CLOSURE) (= tag JSV-REGEXP))))
+(defn jsv-reference? [(word i64)] (-> bool)
+  (let [tag (jsv-tag word)]
+    (or (jsv-managed? word) (= tag JSV-STRING) (= tag JSV-FUNCTION))))
+(defn jsv-well-formed? [(word i64)] (-> bool)
+  (let [tag (jsv-tag word) payload (jsv-payload word)]
+    (cond (= tag JSV-UNDEFINED) (= payload 0)
+          (= tag JSV-NULL) (= payload 0)
+          (= tag JSV-BOOLEAN) (<= payload 1)
+          (= tag JSV-NAN) (= payload 0)
+          (and (>= tag JSV-RESERVED-0) (< tag 0)) false
+          (jsv-managed? word) (and (!= payload 0) (= (& payload 7) 0))
+          (jsv-tagged? word) true
+          :else true)))
+(defn jsv-box-int [(value i64)] (-> i64)
+  (if (and (>= value JSV-INT-MIN) (<= value JSV-INT-MAX))
+      (| JSV-INTEGER (& value JSV-PAYLOAD-MASK))
+      JSV-NAN))
+(defn jsv-unbox-int [(word i64)] (-> i64)
+  (let [payload (jsv-payload word)]
+    (if (!= (& payload JSV-INT-SIGN) 0) (| payload JSV-TAG-MASK) payload)))
+(defn jsv-type-is? [(word i64) (tag i64)] (-> bool) (= (jsv-tag word) tag))
+(defn jsv-strict-equal? [(left i64) (right i64)] (-> bool)
+  (cond (= left JSV-NAN) false
+        (and (or (= left 0) (= left JSV-NEGATIVE-ZERO))
+             (or (= right 0) (= right JSV-NEGATIVE-ZERO))) true
+        :else (= left right)))
+(defn jsv-truthy? [(word i64)] (-> bool)
+  (let [tag (jsv-tag word) payload (jsv-payload word)]
+    (cond (= tag JSV-UNDEFINED) false
+          (= tag JSV-NULL) false
+          (= tag JSV-BOOLEAN) (!= payload 0)
+          (= tag JSV-INTEGER) (!= (jsv-unbox-int word) 0)
+          (= tag JSV-NAN) false
+          (= tag JSV-STRING) (!= payload 0)
+          (jsv-reference? word) true
+          :else (and (!= word 0) (!= word JSV-NEGATIVE-ZERO)))))

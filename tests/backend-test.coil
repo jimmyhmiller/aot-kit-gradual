@@ -7,7 +7,10 @@
 (import "backend" :use *)
 (import "corpus" :use *)
 (import "eval" :use *)
+(import "jsvalue" :use *)
 (import "coil.assert" :use *)
+(import "coil.alloc" :use *)
+(import "coil.slice" :use *)
 (import "coil.control" :use *)
 (import "coil.io" :use *)
 (import "coil.fmt" :use *)
@@ -57,6 +60,19 @@
         (assert (= (munmap heap 4096) 0))
         (assert (= (munmap mem 4096) 0)) got))))
 
+(defn native-call3-double-bits [(a i64) (b i64) (c i64)] (-> i64)
+  (let [mem (mmap (cast (ptr u8) 0) 4096 3 4098 -1 0)]
+    (assert (!= (cast i64 mem) -1))
+    (let [n (be-code-len) (mut i) 0]
+      (loop
+        (if (>= (load i) n) (break)
+          (do (store! (index mem (load i)) (cast u8 (be-code-byte (load i))))
+              (store! i (+ (load i) 1)) 0)))
+      (assert (= (mprotect mem 4096 5) 0)) (sys_icache_invalidate mem n)
+      (let [fp (cast (fnptr c [i64 i64 i64] f64) mem)
+            got (f64-bits (primitive/call-ptr fp a b c))]
+        (assert (= (munmap mem 4096) 0)) got))))
+
 (defn native-call-object-field [(a i64) (b i64) (c i64) (off i64)] (-> i64)
   (let [mem (mmap (cast (ptr u8) 0) 4096 3 4098 -1 0)
         heap (mmap (cast (ptr u8) 0) 4096 3 4098 -1 0)]
@@ -72,6 +88,14 @@
             got (load (cast (ptr i64) (+ obj off)))]
         (assert (= (munmap heap 4096) 0)) (assert (= (munmap mem 4096) 0)) got))))
 
+(defn native-js-word [(i i64)] (-> i64)
+  (case i
+    0 JSV-UNDEFINED 1 JSV-NULL 2 (+ JSV-BOOLEAN 1) 3 (jsv-box-int -17)
+    4 4607182418800017408 5 JSV-NAN 6 (+ JSV-STRING 8) 7 (+ JSV-OBJECT 8)
+    8 (+ JSV-ARRAY 8) 9 (+ JSV-FUNCTION 8) 10 (+ JSV-CLOSURE 8)
+    11 (+ JSV-REGEXP 8) 12 (+ JSV-REF 8) 0))
+(defn native-js-word-count [] (-> i64) 13)
+
 (defn build-kernel [] (-> i64)
   (graph-reset! 1)
   (let [sum (raw-bin OP-ADD (raw-const 20) (raw-const 22))
@@ -79,9 +103,18 @@
         ret (n-new2 OP-RETURN 0 (g-start) product)]
     (n-add-def! (g-stop) ret) (g-analyze!) ret))
 
+(defn select-program-or-report [] (-> bool)
+  (let [ok (be-select-machine-program!)]
+    (if ok 0
+      (do (fmt (stderr) "selection failed be={d}/{d} ms={d}/{d} graph={d}/{d}\n"
+               (be-result) (be-result-node) (ms-result) (ms-result-item)
+               (be-verify-code) (be-result-node)) 0))
+    ok))
+
 (deftest arm64_encoders_match_reviewed_instruction_words
   (assert (= (a64-movz 0 42 0) 3531605312)) ; d2800540  mov x0,#42
   (assert (= (a64-add-reg 0 1 2) 2332164128)) ; 8b020020  add x0,x1,x2
+  (assert (= (a64-sdiv 17 15 16) 2597326321)) ; 9ad00df1  sdiv x17,x15,x16
   (assert (= (a64-ret) 3596551104)))           ; d65f03c0  ret
 
 (deftest selection_scheduling_coloring_and_encoding_form_one_pipeline
@@ -103,6 +136,9 @@
               (store! i (+ (load i) 1)) 0))))
     (be-encode!)
     (assert (> (be-code-len) 12))
+    ; The legacy single-entry ABI emits one stack prologue before the first selected instruction.
+    ; Published instruction offsets are absolute text offsets and must include it.
+    (assert (= (load (field (be-inst 0) first)) 4))
     ; Every arm64 instruction is four bytes and the function ends in RET.
     (assert (= (% (be-code-len) 4) 0))
     (let [n (be-code-len)]
@@ -127,6 +163,214 @@
         (let [fp (cast (fnptr c [] i64) mem)]
           (assert (= (primitive/call-ptr fp) 84)))
         (assert (= (munmap mem 4096) 0))))))
+
+(deftest native_box_and_checked_unbox_are_real_machine_operations
+  (graph-reset! 101)
+  (let [value (raw-const -17)
+        boxed (n-new2 OP-BOX 0 NO-NODE value)
+        unboxed (n-new2 OP-UNBOX (t-int) NO-NODE boxed)
+        ret (n-new2 OP-RETURN 0 (g-start) unboxed)]
+    (n-add-def! (g-stop) ret) (g-analyze!)
+    (assert (be-select-return! ret))
+    (let [(mut at) 0 (mut boxes) 0 (mut unboxes) 0]
+      (loop
+        (if (>= (load at) (be-inst-count)) (break)
+          (do (case (ms-inst-op (load at))
+                MI-JSBOX (store! boxes (+ (load boxes) 1))
+                MI-JSUNBOX (store! unboxes (+ (load unboxes) 1))
+                0)
+              (store! at (+ (load at) 1)) 0)))
+      (assert (= (load boxes) 1))
+      (assert (= (load unboxes) 1)))
+    (be-schedule!) (assert (= (be-color! 8) 0)) (be-encode!)
+    (assert (= (native-call3 0 0 0) -17))))
+
+(deftest native_box_returns_the_canonical_integer_tagged_word
+  (graph-reset! 102)
+  (let [boxed (n-new2 OP-BOX 0 NO-NODE (raw-const 42))
+        ret (n-new2 OP-RETURN 0 (g-start) boxed)]
+    (n-add-def! (g-stop) ret) (g-analyze!)
+    (assert (be-select-return! ret))
+    (be-schedule!) (assert (= (be-color! 8) 0)) (be-encode!)
+    (assert (= (native-call3 0 0 0) (jsv-box-int 42)))))
+
+(deftest tagged_words_survive_direct_calls_and_returns
+  (graph-reset! 103)
+  (let [fun (n-fun-open! 0) value (n-parm! fun 0)
+        body (n-new2 OP-RETURN 0 (n-fun-entry fun) value)]
+    (n-fun-close! fun body)
+    (let [boxed (n-new2 OP-BOX 0 NO-NODE (raw-const -23))
+          site (n-call1! (g-start) fun boxed)
+          unboxed (n-new2 OP-UNBOX (t-int) NO-NODE (call-value site))
+          ret (n-new2 OP-RETURN 0 (call-end site) unboxed)]
+      (n-add-def! (g-stop) ret) (g-analyze!)
+      (assert (select-program-or-report))
+      (be-schedule!) (assert (= (be-color! 8) 0)) (be-encode!)
+      (assert (= (native-call3 0 0 0) -23)))))
+
+(deftest every_tag_survives_the_dynamic_direct_call_abi
+  (graph-reset! 109)
+  (let [fun (n-fun-open! 0) value (n-parm! fun 0)
+        body (n-new2 OP-RETURN 0 (n-fun-entry fun) value)]
+    (n-fun-close! fun body)
+    (let [arg (n-new1 OP-ARG (t-dyn) (g-start)) site (n-call1! (g-start) fun arg)
+          ret (n-new2 OP-RETURN 0 (call-end site) (call-value site))]
+      (n-add-def! (g-stop) ret) (g-analyze!)
+      (assert (select-program-or-report))
+      (be-schedule!) (assert (= (be-color! 8) 0)) (be-encode!)
+      (let [(mut i) 0]
+        (loop
+          (if (>= (load i) (native-js-word-count)) (break)
+            (do (let [word (native-js-word (load i))]
+                  (assert (= (native-call3 word 0 0) word)))
+                (store! i (+ (load i) 1)) 0)))))))
+
+(deftest tagged_words_survive_phi_edges
+  (graph-reset! 104)
+  (let [arg (n-new1 OP-ARG (t-bool) (g-start))
+        iff (n-new2 OP-IF 0 (g-start) arg) arms (n-if-arms! iff)
+        region (n-new OP-REGION 0)]
+    (n-add-def! region NO-NODE) (n-add-def! region (arms-t arms))
+    (n-add-def! region (arms-f arms))
+    (let [phi (n-new OP-PHI (t-dyn))]
+      (n-add-def! phi region)
+      (n-add-def! phi (n-new2 OP-BOX 0 NO-NODE (raw-const 11)))
+      (n-add-def! phi (n-new2 OP-BOX 0 NO-NODE (raw-const 22)))
+      (let [value (n-new2 OP-UNBOX (t-int) NO-NODE phi)
+            ret (n-new2 OP-RETURN 0 region value)]
+        (n-add-def! (g-stop) ret) (g-analyze!)
+        (assert (select-program-or-report))
+        (be-schedule!) (assert (= (be-color! 8) 0)) (be-encode!)
+        (assert (= (native-call3 1 0 0) 11))
+        (assert (= (native-call3 0 0 0) 22))))))
+
+(deftest every_tag_survives_dynamic_phi_edges
+  (graph-reset! 110)
+  (let [pred (n-new1 OP-ARG (t-bool) (g-start))
+        left (n-new1 OP-ARG (t-dyn) (g-start)) right (n-new1 OP-ARG (t-dyn) (g-start))
+        iff (n-new2 OP-IF 0 (g-start) pred) arms (n-if-arms! iff)
+        region (n-new OP-REGION 0)]
+    (n-add-def! region NO-NODE) (n-add-def! region (arms-t arms))
+    (n-add-def! region (arms-f arms))
+    (let [phi (n-new OP-PHI (t-dyn))]
+      (n-add-def! phi region) (n-add-def! phi left) (n-add-def! phi right)
+      (let [ret (n-new2 OP-RETURN 0 region phi)]
+        (n-add-def! (g-stop) ret) (g-analyze!)
+        (assert (select-program-or-report))
+        (be-schedule!) (assert (= (be-color! 8) 0)) (be-encode!)
+        (let [(mut i) 0]
+          (loop
+            (if (>= (load i) (native-js-word-count)) (break)
+              (do (let [word (native-js-word (load i))]
+                    (assert (= (native-call3 1 word JSV-NULL) word))
+                    (assert (= (native-call3 0 JSV-NULL word) word)))
+                  (store! i (+ (load i) 1)) 0))))))))
+
+(deftest tagged_words_survive_forced_spills
+  (graph-reset! 105)
+  (let [fun (n-fun-open! 0) pa (n-parm! fun 0) pb (n-parm! fun 1) pc (n-parm! fun 2)
+        ua (n-new2 OP-UNBOX (t-int) NO-NODE pa)
+        ub (n-new2 OP-UNBOX (t-int) NO-NODE pb)
+        uc (n-new2 OP-UNBOX (t-int) NO-NODE pc)
+        body (n-new2 OP-RETURN 0 (n-fun-entry fun)
+                     (raw-bin OP-ADD (raw-bin OP-ADD ua ub) uc))]
+    (n-fun-close! fun body)
+    (let [a (n-new2 OP-BOX 0 NO-NODE (raw-const 10))
+          b (n-new2 OP-BOX 0 NO-NODE (raw-const 20))
+          c (n-new2 OP-BOX 0 NO-NODE (raw-const 30))
+          buf (stack (array i64 3)) args (cast (ptr i64) buf)]
+      (store! (index args 0) a) (store! (index args 1) b) (store! (index args 2) c)
+      (let [site (n-call! (g-start) fun (slice-new [i64] args 3))
+            ret (n-new2 OP-RETURN 0 (call-end site) (call-value site))]
+        (n-add-def! (g-stop) ret)))
+    (g-analyze!)
+    (assert (select-program-or-report)) (be-schedule!)
+    (assert (> (be-color! 1) 0))
+    (let [(mut vr) 0 (mut boxed-spills) 0]
+      (loop
+        (if (>= (load vr) (ml-vreg-count)) (break)
+          (do (if (and (= (ml-value-kind (load vr)) MLK-BOXED)
+                       (>= (mra-spill (load vr)) 0))
+                  (store! boxed-spills (+ (load boxed-spills) 1)) 0)
+              (store! vr (+ (load vr) 1)) 0)))
+      (assert (> (load boxed-spills) 0)))
+    (be-encode!) (assert (= (native-call3 0 0 0) 60))))
+
+(deftest tagged_words_survive_dynamic_object_fields
+  (graph-reset! 106) (shape-reset!)
+  (let [shape (shape-transition SHAPE-ROOT "value" (t-dyn))
+        alias (shape-field-alias shape 0)
+        mem0 (n-new1 OP-ARG (t-mem-alias alias (t-undef)) (g-start))
+        nw (n-new-obj1! (g-start) shape mem0) object (n-obj-ptr nw)
+        boxed (n-new2 OP-BOX 0 NO-NODE (raw-const -91))
+        mem1 (n-new4 OP-STORE alias NO-NODE (n-obj-mem nw 0) object boxed)
+        loaded (n-new3 OP-LOAD alias NO-NODE mem1 object)
+        value (n-new2 OP-UNBOX (t-int) NO-NODE loaded)
+        ret (n-new3 OP-RETURN 0 (g-start) value mem1)]
+    (n-add-def! (g-stop) ret) (g-analyze!)
+    (assert (select-program-or-report))
+    (be-schedule!) (assert (= (be-color! 8) 0)) (be-encode!)
+    (assert (= (native-call3 0 0 0) -91))))
+
+(deftest every_tag_survives_dynamic_object_field_storage
+  (graph-reset! 111) (shape-reset!)
+  (let [shape (shape-transition SHAPE-ROOT "value" (t-dyn))
+        alias (shape-field-alias shape 0)
+        value (n-new1 OP-ARG (t-dyn) (g-start))
+        mem0 (n-new1 OP-ARG (t-mem-alias alias (t-undef)) (g-start))
+        nw (n-new-obj1! (g-start) shape mem0) object (n-obj-ptr nw)
+        mem1 (n-new4 OP-STORE alias NO-NODE (n-obj-mem nw 0) object value)
+        loaded (n-new3 OP-LOAD alias NO-NODE mem1 object)
+        ret (n-new3 OP-RETURN 0 (g-start) loaded mem1)]
+    (n-add-def! (g-stop) ret) (g-analyze!)
+    (assert (select-program-or-report))
+    (be-schedule!) (assert (>= (be-color! 8) 0)) (be-encode!)
+    (let [(mut i) 0]
+      (loop
+        (if (>= (load i) (native-js-word-count)) (break)
+          (do (let [word (native-js-word (load i))]
+                (assert (= (native-call3 word 0 0) word)))
+              (store! i (+ (load i) 1)) 0))))))
+
+(deftest native_type_tests_distinguish_integer_tags_from_other_values
+  (graph-reset! 107)
+  (let [arg (n-new1 OP-ARG (t-dyn) (g-start))
+        tested (n-new2 OP-TYPETEST (t-int) NO-NODE arg)
+        ret (n-new2 OP-RETURN 0 (g-start) tested)]
+    (n-add-def! (g-stop) ret) (g-analyze!)
+    (assert (select-program-or-report))
+    (be-schedule!) (assert (= (be-color! 8) 0)) (be-encode!)
+    (assert (= (native-call3 (jsv-box-int 7) 0 0) 1))
+    (assert (= (native-call3 (+ JSV-BOOLEAN 1) 0 0) 0))
+    (assert (= (native-call3 4607182418800017408 0 0) 0))))
+
+(deftest native_double_type_tests_include_nan_and_signed_zero_but_exclude_tags
+  (graph-reset! 108)
+  (let [arg (n-new1 OP-ARG (t-dyn) (g-start))
+        tested (n-new2 OP-TYPETEST (t-flt) NO-NODE arg)
+        ret (n-new2 OP-RETURN 0 (g-start) tested)]
+    (n-add-def! (g-stop) ret) (g-analyze!)
+    (assert (select-program-or-report))
+    (be-schedule!) (assert (= (be-color! 8) 0)) (be-encode!)
+    (assert (= (native-call3 4607182418800017408 0 0) 1))
+    (assert (= (native-call3 JSV-NEGATIVE-ZERO 0 0) 1))
+    (assert (= (native-call3 JSV-NAN 0 0) 1))
+    (assert (= (native-call3 JSV-UNDEFINED 0 0) 0))
+    (assert (= (native-call3 (+ JSV-OBJECT 8) 0 0) 0))
+    (assert (= (native-call3 (+ JSV-NAN 1) 0 0) 0))
+    (assert (= (native-call3 JSV-RESERVED-0 0 0) 0))))
+
+(deftest checked_native_double_unbox_preserves_bits
+  (graph-reset! 112)
+  (let [arg (n-new1 OP-ARG (t-dyn) (g-start))
+        value (n-new2 OP-UNBOX (t-flt) NO-NODE arg)
+        ret (n-new2 OP-RETURN 0 (g-start) value)]
+    (n-add-def! (g-stop) ret) (g-analyze!)
+    (assert (select-program-or-report))
+    (be-schedule!) (assert (= (be-color! 8) 0)) (be-encode!)
+    (assert (= (native-call3-double-bits 4607182418800017408 0 0) 4607182418800017408))
+    (assert (= (native-call3-double-bits JSV-NEGATIVE-ZERO 0 0) JSV-NEGATIVE-ZERO))
+    (assert (= (native-call3-double-bits JSV-NAN 0 0) JSV-NAN))))
 
 (deftest forced_spills_split_ranges_through_stack_slots_and_execute
   (let [ret (build-kernel)]

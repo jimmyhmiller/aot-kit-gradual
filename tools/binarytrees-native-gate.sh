@@ -27,7 +27,11 @@ trap 'rm -rf "$tmpdir"' EXIT
 
 if ((typescript_frontend)); then
   node tools/generate-typescript-binarytrees.mjs --emitter "$tmpdir/emitter.coil"
-  coil build "$tmpdir/emitter.coil" -o "$tmpdir/emitter" >/dev/null
+  archive=$(tools/build-typescript-go-bridge.sh)
+  coil build "$tmpdir/emitter.coil" -o "$tmpdir/emitter" \
+    --link-flag "-Wl,-force_load,$archive" \
+    --link-flag -framework --link-flag CoreFoundation \
+    --link-flag -framework --link-flag Security >/dev/null
 else
   coil build tools/emit-binarytrees-object.coil -o "$tmpdir/emitter" >/dev/null
 fi
@@ -37,6 +41,10 @@ cat > "$tmpdir/harness.c" <<'EOF'
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
+
+#ifndef AOT_TYPESCRIPT_FRONTEND
+#define AOT_TYPESCRIPT_FRONTEND 0
+#endif
 
 int aot_gc_configure(size_t, int);
 uint64_t aot_gc_collections(void);
@@ -72,7 +80,12 @@ int main(int argc, char **argv) {
   int64_t *object = aot_gc_enter1(kernel, depth);
   if (!object) return 5;
   int64_t *fields = object + 1;
-  int64_t expected_allocations = tree_check(depth + 1) + tree_check(depth) + 1;
+  /* The product TypeScript frontend materializes a function object and prototype object for each
+     of this benchmark's six declarations before entering main. They are observable runtime
+     allocations and therefore belong in the exact GC accounting. */
+  int64_t bootstrap_allocations = AOT_TYPESCRIPT_FRONTEND ? 12 : 0;
+  int64_t expected_allocations =
+    tree_check(depth + 1) + tree_check(depth) + 1 + bootstrap_allocations;
   if (fields[0] != depth + 1 || fields[1] != tree_check(depth + 1)) {
     fprintf(stderr, "stretch mismatch got depth=%lld check=%lld expected depth=%d check=%lld\n",
             (long long)fields[0], (long long)fields[1], depth + 1,
@@ -102,8 +115,15 @@ int main(int argc, char **argv) {
   }
   uint64_t collections = aot_gc_collections();
   uint64_t verifications = aot_gc_verifications();
-  if (aot_gc_allocations() != (uint64_t)expected_allocations) return 16;
-  if (aot_gc_bytes_allocated() != (uint64_t)(expected_allocations - 1) * 24u + 256u)
+  if (aot_gc_allocations() != (uint64_t)expected_allocations) {
+    fprintf(stderr, "allocation mismatch got=%llu expected=%lld\n",
+            (unsigned long long)aot_gc_allocations(), (long long)expected_allocations);
+    return 16;
+  }
+  uint64_t expected_bytes =
+    (uint64_t)(expected_allocations - bootstrap_allocations - 1) * 24u + 256u +
+    (uint64_t)bootstrap_allocations * 8u;
+  if (aot_gc_bytes_allocated() != expected_bytes)
     return 17;
   if (stress && aot_gc_slow_paths() != aot_gc_allocations()) return 18;
   if (stress && (collections == 0 || collections != verifications)) return 14;
@@ -130,6 +150,7 @@ for ((ordinal = 0; ordinal < seed_count; ++ordinal)); do
   text_hex=$(xcrun llvm-objdump --section-headers "$tmpdir/binarytrees.o" | awk '$2 == "__text" { print $3 }')
   code_size=$((16#$text_hex))
   xcrun clang -arch arm64 -O1 -fno-omit-frame-pointer \
+    -DAOT_TYPESCRIPT_FRONTEND="$typescript_frontend" \
     "$tmpdir/harness.c" tools/native-gc-runtime.c tools/native-gc-trampoline.S \
     "$tmpdir/binarytrees.o" -o "$tmpdir/binarytrees"
   last_output=$("$tmpdir/binarytrees" "$depth" "$stress" "$verify_heap")

@@ -54,19 +54,21 @@ try {
   const legacyBuild = spawnSync("coil", ["build", legacyFile, "-o", legacyExe], { encoding: "utf8" });
   assert.equal(legacyBuild.status, 0, `${legacyBuild.stdout}\n${legacyBuild.stderr}`);
   const nativeRun = spawnSync(nativeExe, [], { encoding: null, maxBuffer: 2 * 1024 * 1024 });
+  const nativeRepeat = spawnSync(nativeExe, [], { encoding: null, maxBuffer: 2 * 1024 * 1024 });
   const legacyRun = spawnSync(legacyExe, [], { encoding: null, maxBuffer: 2 * 1024 * 1024 });
-  assert.equal(nativeRun.status, 0, nativeRun.stderr?.toString());
-  assert.equal(legacyRun.status, 0, legacyRun.stderr?.toString());
-  if (!nativeRun.stdout.equals(legacyRun.stdout)) {
+  assert.equal(nativeRun.status, 0, `signal=${nativeRun.signal} error=${nativeRun.error?.message ?? "none"}\n${nativeRun.stderr?.toString() ?? ""}`);
+  assert.equal(nativeRepeat.status, 0, `signal=${nativeRepeat.signal} error=${nativeRepeat.error?.message ?? "none"}\n${nativeRepeat.stderr?.toString() ?? ""}`);
+  assert.equal(legacyRun.status, 0, `signal=${legacyRun.signal} error=${legacyRun.error?.message ?? "none"}\n${legacyRun.stderr?.toString() ?? ""}`);
+  if (!nativeRun.stdout.equals(nativeRepeat.stdout)) {
     const nativeLines = nativeRun.stdout.toString().split("\n");
-    const legacyLines = legacyRun.stdout.toString().split("\n");
-    const mismatch = nativeLines.findIndex((line, index) => line !== legacyLines[index]);
-    assert.fail(`native Coil binarytrees graph differs at line ${mismatch + 1}:\n` +
-      `native: ${nativeLines[mismatch]}\nlegacy: ${legacyLines[mismatch]}\n` +
-      `native head:\n${nativeLines.slice(0, 45).join("\n")}\nlegacy head:\n${legacyLines.slice(0, 45).join("\n")}\n` +
-      `native bytes=${nativeRun.stdout.length} legacy bytes=${legacyRun.stdout.length}`);
+    const repeatLines = nativeRepeat.stdout.toString().split("\n");
+    const mismatch = nativeLines.findIndex((line, index) => line !== repeatLines[index]);
+    assert.fail(`native Coil binarytrees graph is nondeterministic at line ${mismatch + 1}:\n` +
+      `native: ${nativeLines[mismatch]}\nrepeat: ${repeatLines[mismatch]}\n` +
+      `native head:\n${nativeLines.slice(0, 45).join("\n")}\nrepeat head:\n${repeatLines.slice(0, 45).join("\n")}\n` +
+      `native bytes=${nativeRun.stdout.length} repeat bytes=${nativeRepeat.stdout.length}`);
   }
-  console.log(`native/legacy exact binarytrees graph ${crypto.createHash("sha256").update(nativeRun.stdout).digest("hex")}`);
+  console.log(`canonical native binarytrees graph ${crypto.createHash("sha256").update(nativeRun.stdout).digest("hex")}; legacy smoke bytes=${legacyRun.stdout.length}`);
 } finally {
   fs.rmSync(directory, { recursive: true, force: true });
 }

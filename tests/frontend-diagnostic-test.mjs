@@ -8,7 +8,7 @@ const directory = fs.mkdtempSync(path.join(os.tmpdir(), "frontend-diagnostic-"))
 try {
   const invalid = path.join(directory, "invalid.ts");
   const output = path.join(directory, "partial.coil");
-  fs.writeFileSync(invalid, "function main(x: number): number { switch (x) { default: return 0; } }");
+  fs.writeFileSync(invalid, "function main(x: number): number { return (() => x)(); }");
   const failed = spawnSync("node", ["tools/ts-to-coil.mjs", invalid, output], { encoding: "utf8" });
   assert.notEqual(failed.status, 0);
   assert.match(failed.stderr, /FE_UNSUPPORTED/);

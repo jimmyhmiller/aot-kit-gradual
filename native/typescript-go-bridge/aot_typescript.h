@@ -8,12 +8,27 @@
 typedef uintptr_t AotTsParse;
 typedef int32_t AotTsNode;
 
-AotTsParse aot_ts_parse(const char *source, int32_t source_length);
-void aot_ts_parse_delete(AotTsParse parse);
+enum AotTsScriptKind { AOT_TS_SCRIPT_AUTO = 0, AOT_TS_SCRIPT_JS = 1, AOT_TS_SCRIPT_TS = 2 };
+enum AotTsLiteralKind { AOT_TS_LITERAL_NONE = 0, AOT_TS_LITERAL_NUMBER = 1,
+  AOT_TS_LITERAL_STRING = 2, AOT_TS_LITERAL_BOOLEAN = 3, AOT_TS_LITERAL_NULL = 4,
+  AOT_TS_LITERAL_REGEXP = 5 };
+enum AotTsRole { AOT_TS_ROLE_NAME = 1, AOT_TS_ROLE_BODY = 2, AOT_TS_ROLE_TYPE = 3,
+  AOT_TS_ROLE_INITIALIZER = 4, AOT_TS_ROLE_EXPRESSION = 5, AOT_TS_ROLE_LEFT = 6,
+  AOT_TS_ROLE_OPERATOR = 7, AOT_TS_ROLE_RIGHT = 8, AOT_TS_ROLE_CONDITION = 9,
+  AOT_TS_ROLE_THEN = 10, AOT_TS_ROLE_ELSE = 11, AOT_TS_ROLE_STATEMENT = 12,
+  AOT_TS_ROLE_CALLEE = 13, AOT_TS_ROLE_ARGUMENT = 14, AOT_TS_ROLE_PARAMETER = 15,
+  AOT_TS_ROLE_OBJECT = 16, AOT_TS_ROLE_PROPERTY = 17, AOT_TS_ROLE_ELEMENT = 18,
+  AOT_TS_ROLE_MEMBER = 19, AOT_TS_ROLE_WHEN_TRUE = 20, AOT_TS_ROLE_WHEN_FALSE = 21,
+  AOT_TS_ROLE_LABEL = 22, AOT_TS_ROLE_CLAUSE = 23 };
 
-// Nodes are immutable preorder indexes owned by the parse handle. Kinds currently
-// use the pinned native compiler's ast.Kind values; a stable aot-kit kind mapping
-// will replace them before this ABI is declared stable.
+AotTsParse aot_ts_parse(const char *source, int32_t source_length);
+AotTsParse aot_ts_parse_ex(const char *source, int32_t source_length,
+                           const char *filename, int32_t filename_length, int32_t script_kind);
+void aot_ts_parse_delete(AotTsParse parse);
+int32_t aot_ts_script_kind(AotTsParse parse);
+
+// Nodes are immutable preorder indexes owned by the parse handle. Kind codes are
+// an explicit aot-kit mapping and do not change if upstream ast.Kind is reordered.
 AotTsNode aot_ts_root(AotTsParse parse);
 int32_t aot_ts_node_count(AotTsParse parse);
 int32_t aot_ts_node_kind(AotTsParse parse, AotTsNode node);
@@ -21,6 +36,17 @@ int32_t aot_ts_node_start(AotTsParse parse, AotTsNode node);
 int32_t aot_ts_node_end(AotTsParse parse, AotTsNode node);
 int32_t aot_ts_node_child_count(AotTsParse parse, AotTsNode node);
 AotTsNode aot_ts_node_child(AotTsParse parse, AotTsNode node, int32_t index);
+AotTsNode aot_ts_node_role(AotTsParse parse, AotTsNode node, int32_t role, int32_t index);
+
+// String queries return the required byte length (excluding NUL), write at most
+// capacity-1 bytes, and always NUL-terminate a non-empty destination. -1 means invalid input.
+int32_t aot_ts_node_kind_name(AotTsParse parse, AotTsNode node, char *destination, int32_t capacity);
+int32_t aot_ts_node_operator_name(AotTsParse parse, AotTsNode node, char *destination, int32_t capacity);
+int32_t aot_ts_node_literal_kind(AotTsParse parse, AotTsNode node);
+int32_t aot_ts_node_literal_text(AotTsParse parse, AotTsNode node, char *destination, int32_t capacity);
+uint64_t aot_ts_node_numeric_bits(AotTsParse parse, AotTsNode node);
+int32_t aot_ts_node_regexp_pattern(AotTsParse parse, AotTsNode node, char *destination, int32_t capacity);
+int32_t aot_ts_node_regexp_flags(AotTsParse parse, AotTsNode node, char *destination, int32_t capacity);
 
 int32_t aot_ts_diagnostic_count(AotTsParse parse);
 int32_t aot_ts_diagnostic_code(AotTsParse parse, int32_t index);

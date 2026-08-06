@@ -1,0 +1,87 @@
+(module typescriptnativeb15functioncallsmoke)
+
+(import "frontendnative" :use *)
+(import "frontendnativegraph" :use *)
+(import "typescriptnative" :use *)
+(import "verify" :use *)
+(import "coil.arraylist" :use *)
+(import "coil.str" :use *)
+(import "coil.io" :use *)
+(import "coil.fmt" :use *)
+
+(defn call-function-id [(frontend (ptr NativeFrontend)) (name (slice u8))] (-> i64)
+  (let [(mut index) 0 (mut answer) -1]
+    (loop (if (or (>= (load index) (al-len [FeFunction] (load (field frontend functions))))
+                  (>= (load answer) 0))
+              (break)
+              (let [fn (al-get [FeFunction] (load (field frontend functions)) (load index))]
+                (if (str-eq (fe-function-name frontend (load index)) name)
+                    (store! answer (load (field fn id)))
+                    0)
+                (store! index (+ (load index) 1)))))
+    (load answer)))
+
+(defn call-captures-symbol? [(frontend (ptr NativeFrontend))
+                             (function i64)
+                             (symbol i64)] (-> bool)
+  (let [(mut index) 0 (mut found) false]
+    (loop (if (or (>= (load index) (al-len [FeCapture] (load (field frontend captures))))
+                  (load found))
+              (break)
+              (let [capture (al-get [FeCapture] (load (field frontend captures)) (load index))]
+                (if (and (= (load (field capture function)) function)
+                         (= (load (field capture symbol)) symbol))
+                    (store! found true)
+                    0)
+                (store! index (+ (load index) 1)))))
+    (load found)))
+
+(defn main [] (-> i64)
+  (let [source
+          "let offset=1; Object.prototype.inheritsFrom=function(shuper){this.superConstructor=shuper;}; function Base(x){this.x=x+offset;} function Sub(x){Sub.superConstructor.call(this,x);} Sub.inheritsFrom(Base); function main(){let value=new Sub(41); return value.x;}"
+        (mut frontend) (fe-native-new source)]
+    (if (!= (fe-native-index! (mut frontend)) FE-OK)
+        (do
+          (fmt (stderr) "B15 function-call frontend failed: status={d} code={d} node={d} role={d}\n"
+               (load (field frontend status)) (load (field frontend error-code))
+               (load (field frontend error-node)) (load (field frontend error-role)))
+          (if (> (ts-diagnostic-count (field frontend ast)) 0)
+              (do
+                (fmt (stderr) "TypeScript diagnostic: code={d} start={d} length={d}\n"
+                     (ts-diagnostic-code (field frontend ast) 0)
+                     (ts-diagnostic-start (field frontend ast) 0)
+                     (ts-diagnostic-length (field frontend ast) 0))
+                0)
+              0)
+          (fe-native-free! (mut frontend))
+          1)
+        (let [base (call-function-id (mut frontend) "Base")
+              sub (call-function-id (mut frontend) "Sub")
+              (mut ok) (and (>= base 0) (>= sub 0))
+              (mut index) 0]
+          ;; Function.prototype.call requires the inherited target's environment at the direct
+          ;; native call site, not merely the caller's reference to that function.
+          (loop (if (>= (load index) (al-len [FeCapture] (load (field frontend captures))))
+                    (break)
+                    (let [capture (al-get [FeCapture] (load (field frontend captures)) (load index))]
+                      (if (and (= (load (field capture function)) base)
+                               (not (call-captures-symbol? (mut frontend)
+                                                           sub
+                                                           (load (field capture symbol)))))
+                          (store! ok false)
+                          0)
+                      (store! index (+ (load index) 1)))))
+          (frontend-native-build! (mut frontend) 15001 true)
+          (if (!= (g-verify) 0)
+              (do
+                (fmt (stderr) "B15 function-call graph verify failed: code={d} node={d}\n"
+                     (g-verify-code) (g-verify-node))
+                (store! ok false))
+              0)
+          (if (not (load ok))
+              (do
+                (fmt (stderr) "B15 function-call capture contract failed: Base={d} Sub={d}\n" base sub)
+                0)
+              0)
+          (fe-native-free! (mut frontend))
+          (if (load ok) 0 2)))))

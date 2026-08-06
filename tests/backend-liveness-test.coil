@@ -9,6 +9,7 @@
 (import "coil.assert" :use *)
 (import "coil.alloc" :use *)
 (import "coil.str" :use *)
+(import "coil.slice" :use *)
 (import "coil.io" :use *)
 (import "coil.fmt" :use *)
 
@@ -18,7 +19,10 @@
   (n-peephole (n-new3 op (t-int) NO-NODE a b)))
 
 (defn live-compile! [(seed i64)] (-> i64)
-  (assert (be-select-machine-program!))
+  (if (be-select-machine-program!) 0
+    (do (fmt (stderr) "selection failed select={d}@{d} backend={d}@{d}\n"
+             (ms-result) (ms-result-item) (be-result) (be-result-node))
+        (assert false) 0))
   (let [scheduled (be-schedule-seeded! seed)]
     (if (<= scheduled 0)
         (do (fmt (stderr) "schedule/live failed sched={d}@{d} live={d}@{d}\n"
@@ -112,7 +116,11 @@
         (assert (ml-safepoint? call-at))
         (assert (ml-live-before? call-at held-v))
         (assert (not (ml-live-before? call-at result-v)))
-        (assert (= (mi-desc-clobbers (mi-desc MI-CALL)) 4095))))))
+        (let [clobbers (mi-desc-clobbers (mi-desc MI-CALL))]
+          (assert (= (& clobbers 4095) 4095)) ; x0-x11
+          (assert (!= (& clobbers (<< 1 32)) 0)) ; d0
+          (assert (= (& clobbers (<< 1 40)) 0))  ; d8 is callee-saved
+          (assert (!= (& clobbers (<< 1 48)) 0))))))) ; d16
 
 (deftest allocation_and_boxed_values_retain_gc_kinds
   (corpus-build! CX-OBJECT-RAW)
@@ -231,3 +239,101 @@
     (ml-corrupt-kind! vreg MLK-SCALAR)
     (assert (not (ml-verify!)))
     (assert (= (ml-result) MLIVE-KIND))))
+
+(deftest floating_values_have_an_explicit_register_class
+  (graph-reset! 1008)
+  (let [a (n-new1 OP-ARG (t-flt) (g-start))
+        b (n-new1 OP-ARG (t-int) (g-start))
+        sum (n-new3 OP-ADD 0 NO-NODE a b)
+        ret (n-new2 OP-RETURN 0 (g-start) sum)]
+    (n-add-def! (g-stop) ret)
+    (g-analyze!)
+    (live-compile! 0)
+    (let [fa (ms-vget 0 a) ib (ms-vget 0 b) out (ms-vget 0 sum)
+          convert (live-first-op MI-SCVTF) add (live-first-op MI-FADD)]
+      (assert (>= convert 0))
+      (assert (>= add 0))
+      (assert (= (ml-register-class fa) MRC-FPR))
+      (assert (= (ml-register-class ib) MRC-GPR))
+      (assert (= (ml-register-class (ms-inst-dst convert)) MRC-FPR))
+      (assert (= (ml-register-class out) MRC-FPR))
+      ; FP values remain ordinary non-roots to the collector despite using another register bank.
+      (assert (= (ml-value-kind out) MLK-SCALAR))
+      (assert (>= (mra-allocate! 8 0) 0))
+      (assert (>= (mra-reg fa) 32))
+      (assert (< (mra-reg ib) 32))
+      (assert (or (>= (mra-reg out) 32) (>= (mra-spill out) 0)))
+      (be-corrupt-spill-slot! add 9999)
+      (assert (= (be-verify-abi!) MABI-SPILL))
+      (ml-corrupt-register-class! out MRC-GPR)
+      (assert (not (ml-verify!)))
+      (assert (= (ml-result) MLIVE-CLASS))
+      (ml-corrupt-register-class! out MRC-FPR)
+      (ml-corrupt-register-class! ib MRC-FPR)
+      (assert (not (ml-verify!)))
+      (assert (= (ml-result) MLIVE-CLASS)))))
+
+(deftest js_int32_conversion_rejects_cross_class_operands_and_results
+  (graph-reset! 1012)
+  (let [a (n-new1 OP-ARG (t-flt) (g-start))
+        b (n-new1 OP-ARG (t-flt) (g-start))
+        value (n-new3 OP-BITAND 0 NO-NODE a b)
+        ret (n-new2 OP-RETURN 0 (g-start) value)]
+    (n-add-def! (g-stop) ret)
+    (g-analyze!)
+    (live-compile! 0)
+    (let [convert (live-first-op MI-I32FROMFP)
+          input (ms-inst-a convert) output (ms-inst-dst convert)]
+      (assert (>= convert 0))
+      (assert (= (ml-register-class input) MRC-FPR))
+      (assert (= (ml-register-class output) MRC-GPR))
+      (ml-corrupt-register-class! input MRC-GPR)
+      (assert (not (ml-verify!)))
+      (assert (= (ml-result) MLIVE-CLASS)))
+    (live-compile! 0)
+    (let [convert (live-first-op MI-I32FROMFP)
+          output (ms-inst-dst convert)]
+      (ml-corrupt-register-class! output MRC-FPR)
+      (assert (not (ml-verify!)))
+      (assert (= (ml-result) MLIVE-CLASS)))))
+
+(deftest floating_value_live_across_allocation_is_not_a_gc_root
+  (graph-reset! 1009)
+  (shape-reset!)
+  (let [a (n-new1 OP-ARG (t-flt) (g-start))
+        sx (shape-transition SHAPE-ROOT "x" (t-int))
+        ax (shape-field-alias sx 0)
+        alloc (n-new-obj1! (g-start) sx (mk-mem-in ax))
+        obj (n-obj-ptr alloc)
+        mem (n-new4 OP-STORE ax NO-NODE (n-obj-mem alloc 0) obj (live-const 1))
+        result (n-new3 OP-ADD 0 NO-NODE a (n-new1 OP-CONST (t-flt-con 0.0) (g-start)))
+        ret (n-new3 OP-RETURN 0 (g-start) result mem)]
+    (n-add-def! (g-stop) ret)
+    (g-analyze!)
+    (live-compile! 0)
+    (let [fp (ms-vget 0 a) allocation (live-first-op MI-NEW)]
+      (assert (>= allocation 0))
+      (assert (ml-live-before? allocation fp))
+      (assert (= (ml-register-class fp) MRC-FPR))
+      (assert (= (ml-value-kind fp) MLK-SCALAR))
+      (assert (>= (mra-allocate! 10 0) 0))
+      (assert (= (mra-safepoint-kind allocation fp) MLK-SCALAR)))))
+
+(deftest dynamic_parm_preserves_raw_receiver_representation_for_gc
+  (graph-reset! 1013)
+  (let [fun (n-fun-open! 0)
+        receiver (n-parm! fun 0)
+        body (n-new2 OP-RETURN 0 (n-fun-entry fun) receiver)]
+    (n-fun-close! fun body)
+    (let [raw (n-new1 OP-ARG (t-obj) (g-start))
+          widened (n-new2 OP-CAST (t-dyn) (g-start) raw)
+          site
+            (n-call-receiver! (g-start)
+                              fun
+                              widened
+                              (slice-new [i64] (cast (ptr i64) 0) 0))
+          ret (n-new2 OP-RETURN 0 (call-end site) (call-value site))]
+      (n-add-def! (g-stop) ret)
+      (g-analyze!)
+      (assert (= (n-ty receiver) (t-dyn)))
+      (assert (= (ml-kind-for-parm-representation receiver) MLK-RAW-MANAGED)))))

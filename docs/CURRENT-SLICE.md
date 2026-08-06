@@ -1,29 +1,33 @@
-# Current slice: X5 TypeScript depth-21 moving-GC closure
+# Current slice: B15 Richards and DeltaBlue closure
 
-X4 published the reproducible nine-sample depth-21 report and made ordinary verification
-write-free. That run exposed one deeper gap outside X3's depth-10 contract: the normalized
-TypeScript native kernel can enter collection with an invalid `Tree.right = 2`. X5 keeps the
-controller open until the stack-map/root-location cause is fixed rather than hidden with a larger
-heap, disabled verification, or the hand-built kernel.
+The evaluator execution-model refactor proposed in
+[EVALUATOR-EXECUTION-MODEL.md](EVALUATOR-EXECUTION-MODEL.md) is the recommended prerequisite for
+continuing the DeltaBlue ideal-oracle repair. B15 remains active throughout that work.
 
 ## Contract
 
-The readable TypeScript source must run at depth 21 through normalization, Coil graph construction,
-optimization, selection, motion, scheduling, allocation, encoding, Mach-O linking, and the moving
-collector. All 31 fields and exact allocation metrics must agree with Node and the canonical model.
+The unchanged pinned Richards and DeltaBlue programs must compile through the canonical native
+frontend and pass their original correctness checks in every required execution and stress mode.
 
-## Required evidence
+## Deliverables
 
-- [x] Reduce the invalid relocated field to a named focused CallEnd/allocation-order witness.
-- [x] Fix the general backend invariant, without fixture-specific dispatch.
-- [x] Preserve multi-shape layout/reference bitmaps and exact safepoint locations.
-- [x] Pass TypeScript native depth 21 in normal and heap-verification modes.
-- [x] Pass depth 21 under six-register pressure and seeds 11 through 14.
-- [x] Preserve X1-X4 gates, including verification-only worktree cleanliness.
-- [x] Close X5 only through `node tools/workflow.mjs complete X5`.
+- [ ] Pin the original Richards and DeltaBlue checks and exact Node observables.
+- [ ] Compile both complete programs without source substitution or benchmark-name dispatch.
+- [ ] Reduce each remaining failure to a general capability witness before repairing it.
+- [ ] Pass raw and optimized ideal execution for both programs.
+- [ ] Pass native arm64 execution under normal and forced register pressure.
+- [ ] Pass moving-GC stress and deterministic scheduling-seed matrices.
+- [ ] Corrupt Richards queue/hold expectations and DeltaBlue projection expectations independently.
+- [x] Add `tools/gates/B15.sh`; keep its contract latch red until all remaining evidence passes.
+
+## Exit evidence
+
+B15 closes when both unchanged benchmark programs pass their original checks against Node in raw
+ideal, optimized ideal, native, pressure, GC-stress, and seed modes; each independent correctness
+mutation turns the focused gate red; and the workflow controller passes.
 
 ## Stop conditions
 
-Do not close X5 by increasing the heap until no collection occurs, accepting non-heap values as
-references, disabling heap verification, switching the execution measurement to Node, or treating
-the already-correct hand-built kernel as evidence for the TypeScript-native path.
+Do not close B15 with rewritten benchmark logic, host execution hidden behind the native runner,
+benchmark-name dispatch, disabled collection, relaxed original checks, fixture-only semantics, or
+an unfalsified queue/hold or projection witness.

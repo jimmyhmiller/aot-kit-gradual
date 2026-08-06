@@ -1,0 +1,83 @@
+(module jsnumbermatrix)
+
+(import "ty" :use *)
+(import "node" :use *)
+(import "eval" :use *)
+(import "coil.io" :use *)
+(import "coil.fmt" :use *)
+
+(const MATRIX-BUDGET i64 1000)
+
+(defn matrix-number-bits [(v RtVal)] (-> i64)
+  (match v
+    (RInt [n] (f64-bits (cast f64 n)))
+    (RFlt [bits] (if (f64-nan-bits? bits) JSV-NAN bits))
+    (RUndef [] 0) (RNull [] 0) (RBool [b] 0) (RObj [id] 0)
+    (RStr [id] 0) (RSym [id] 0) (RBig [n] 0) (RFun [f] 0) (RMem [ver] 0)))
+
+(defn matrix-bin [(op i64) (left RtVal) (right RtVal)] (-> RtVal)
+  (graph-reset! 1404)
+  (let [a (n-new1 OP-ARG (t-num) (g-start)) b (n-new1 OP-ARG (t-num) (g-start))
+        value (n-new3 op 0 NO-NODE a b) ret (n-new2 OP-RETURN 0 (g-start) value)]
+    (n-add-def! (g-stop) ret) (g-analyze!)
+    (ev-reset!) (ev-bind! a left) (ev-bind! b right)
+    (if (= (ev-run-nobind MATRIX-BUDGET) EV-OK) (ev-result) (RUndef))))
+
+(defn matrix-unary [(value RtVal)] (-> RtVal)
+  (graph-reset! 1405)
+  (let [a (n-new1 OP-ARG (t-num) (g-start)) neg (n-new2 OP-MINUS 0 NO-NODE a)
+        ret (n-new2 OP-RETURN 0 (g-start) neg)]
+    (n-add-def! (g-stop) ret) (g-analyze!)
+    (ev-reset!) (ev-bind! a value)
+    (if (= (ev-run-nobind MATRIX-BUDGET) EV-OK) (ev-result) (RUndef))))
+
+(defn matrix-bool [(op i64) (left RtVal) (right RtVal)] (-> bool)
+  (match (matrix-bin op left right)
+    (RBool [b] b)
+    (RUndef [] false) (RNull [] false) (RInt [n] false) (RFlt [bits] false)
+    (RObj [id] false) (RStr [id] false) (RSym [id] false) (RBig [n] false)
+    (RFun [f] false) (RMem [ver] false)))
+
+(defn emit-number [(name (slice u8)) (value RtVal)] (-> i64)
+  (let [bits (matrix-number-bits value)]
+    ;; The formatter cannot negate i64::MIN while rendering it. Spell that one bit pattern out.
+    (if (= bits JSV-NEGATIVE-ZERO)
+      (fmt (stdout) "{s}|number|-9223372036854775808\n" name)
+      (fmt (stdout) "{s}|number|{d}\n" name bits))
+    0))
+(defn emit-bool [(name (slice u8)) (value bool)] (-> i64)
+  (do (fmt (stdout) "{s}|bool|{d}\n" name (if value 1 0)) 0))
+
+(defn main [] (-> i64)
+  (emit-number "tag-max-plus-one"
+    (matrix-bin OP-ADD (RInt 140737488355327) (RInt 1)))
+  (emit-number "max-safe-plus-two"
+    (matrix-bin OP-ADD (RInt 9007199254740991) (RInt 2)))
+  (emit-number "large-add"
+    (matrix-bin OP-ADD (RInt 5000000000000000000) (RInt 5000000000000000000)))
+  (emit-number "mixed-add" (matrix-bin OP-ADD (RInt 1) (RFlt (f64-bits 0.5))))
+  (emit-number "zero-times-negative" (matrix-bin OP-MUL (RInt 0) (RInt -1)))
+  (emit-number "zero-div-negative" (matrix-bin OP-DIV (RInt 0) (RInt -1)))
+  (emit-number "negative-zero-times-negative"
+    (matrix-bin OP-MUL (RFlt JSV-NEGATIVE-ZERO) (RInt -1)))
+  (emit-number "one-div-zero" (matrix-bin OP-DIV (RInt 1) (RInt 0)))
+  (emit-number "one-div-negative-zero"
+    (matrix-bin OP-DIV (RInt 1) (RFlt JSV-NEGATIVE-ZERO)))
+  (emit-number "zero-div-zero" (matrix-bin OP-DIV (RInt 0) (RInt 0)))
+  (emit-number "infinity-minus-infinity"
+    (matrix-bin OP-SUB (RFlt 9218868437227405312) (RFlt 9218868437227405312)))
+  (emit-number "infinity-times-zero"
+    (matrix-bin OP-MUL (RFlt 9218868437227405312) (RInt 0)))
+  (emit-number "negate-negative-zero" (matrix-unary (RFlt JSV-NEGATIVE-ZERO)))
+  (emit-number "half" (matrix-bin OP-DIV (RInt 1) (RInt 2)))
+  (emit-bool "nan-strict-equal"
+    (matrix-bool OP-EQ (RFlt JSV-NAN) (RFlt JSV-NAN)))
+  (emit-bool "signed-zero-strict-equal"
+    (matrix-bool OP-EQ (RFlt 0) (RFlt JSV-NEGATIVE-ZERO)))
+  (emit-bool "nan-less-than-one" (matrix-bool OP-LT (RFlt JSV-NAN) (RInt 1)))
+  (emit-bool "negative-infinity-less-than-infinity"
+    (matrix-bool OP-LT (RFlt -4503599627370496) (RFlt 9218868437227405312)))
+  (emit-bool "nan-truthy" (rt-truthy? (RFlt JSV-NAN)))
+  (emit-bool "negative-zero-truthy" (rt-truthy? (RFlt JSV-NEGATIVE-ZERO)))
+  (emit-bool "infinity-truthy" (rt-truthy? (RFlt 9218868437227405312)))
+  0)

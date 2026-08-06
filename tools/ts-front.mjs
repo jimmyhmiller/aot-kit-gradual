@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+// Legacy normalized-interpreter oracle. Product compilation uses tools/aot-compile.mjs.
 import fs from "node:fs";
 import { executeNormalized, normalizeTypeScript } from "../src/frontend_ir.mjs";
 

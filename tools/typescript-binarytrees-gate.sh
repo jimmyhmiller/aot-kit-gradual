@@ -17,7 +17,12 @@ maximum_depth=6
 if [[ "$mode" != "--quick" ]]; then maximum_depth=10; fi
 node tools/generate-typescript-binarytrees.mjs --interpreter-test \
   "$task_tmp/typescript-binarytrees-test.coil" "$maximum_depth"
-coil test "$task_tmp/typescript-binarytrees-test.coil"
+archive=$(tools/build-typescript-go-bridge.sh)
+coil build "$task_tmp/typescript-binarytrees-test.coil" -o "$task_tmp/typescript-binarytrees-test" \
+  --link-flag "-Wl,-force_load,$archive" \
+  --link-flag -framework --link-flag CoreFoundation \
+  --link-flag -framework --link-flag Security
+"$task_tmp/typescript-binarytrees-test"
 
 check_native() {
   local depth="$1" output reference

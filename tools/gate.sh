@@ -16,6 +16,16 @@ QUICK=0
 fails=0
 note() { printf '%-34s %s\n' "$1" "$2"; }
 
+echo "=== native TypeScript bridge ==="
+if out=$(./tools/build-typescript-go-bridge.sh 2>&1); then
+  note "typescript-go bridge" "ready"
+else
+  note "typescript-go bridge" "FAILED"
+  echo "$out" | tail -20
+  exit 1
+fi
+
+echo
 echo "=== typecheck ==="
 for f in src/*.coil; do
   if [ "$f" = "src/frontend_native_graph.coil" ] || [ "$f" = "src/typescript_native.coil" ]; then

@@ -1,0 +1,82 @@
+;; Descriptor-owned JavaScript builtins required by the pinned V8 v7 corpus.
+(module jsbuiltin)
+
+(import "coil.alloc" :use *)
+(import "coil.primitive" :as primitive)
+(import "jsvalue" :use *)
+(import "ty" :use *)
+(import "jsbuiltin_desc" :use *)
+
+(extern fabs :cc c [f64] (-> f64))
+(extern floor :cc c [f64] (-> f64))
+(extern ceil :cc c [f64] (-> f64))
+(extern exp :cc c [f64] (-> f64))
+(extern log :cc c [f64] (-> f64))
+(extern sin :cc c [f64] (-> f64))
+(extern cos :cc c [f64] (-> f64))
+(extern tan :cc c [f64] (-> f64))
+(extern asin :cc c [f64] (-> f64))
+(extern acos :cc c [f64] (-> f64))
+(extern atan :cc c [f64] (-> f64))
+(extern sqrt :cc c [f64] (-> f64))
+(extern pow :cc c [f64 f64] (-> f64))
+
+(const JBI-RANDOM-SEED i64 49734321)
+(const JBI-U32-MASK i64 4294967295)
+(const JBI-F64-EXP-MASK i64 9218868437227405312)
+(const JBI-F64-FRAC-MASK i64 4503599627370495)
+
+(defn jbi-random-seed [] (-> (ptr i64)) (let [seed (static i64)] seed))
+
+(defn jbi-random-reset! [] (-> i64)
+  (store! (jbi-random-seed) JBI-RANDOM-SEED)
+  0)
+
+;; The pinned V8 v7 harness replaces Math.random with this Jenkins 32-bit hash. Keeping the
+;; evaluator byte-for-byte deterministic makes the ideal and native executions share its oracle.
+(defn jbi-random [] (-> f64)
+  (let [p (jbi-random-seed)
+        (mut seed) (& (load p) JBI-U32-MASK)]
+    (store! seed (& (+ (+ (load seed) 2127912214) (<< (load seed) 12)) JBI-U32-MASK))
+    (store! seed (& (^ (^ (load seed) 3345072700) (>> (load seed) 19)) JBI-U32-MASK))
+    (store! seed (& (+ (+ (load seed) 374761393) (<< (load seed) 5)) JBI-U32-MASK))
+    (store! seed (& (^ (+ (load seed) 3550635116) (<< (load seed) 9)) JBI-U32-MASK))
+    (store! seed (& (+ (+ (load seed) 4251993797) (<< (load seed) 3)) JBI-U32-MASK))
+    (store! seed (& (^ (^ (load seed) 3042594569) (>> (load seed) 16)) JBI-U32-MASK))
+    (store! p (load seed))
+    (/ (cast f64 (& (load seed) 268435455)) 268435456.0)))
+
+;; ECMAScript Math.round chooses the integer toward +infinity on a half and preserves negative
+;; zero. The explicit negative interval is the part C's round() would get wrong.
+(defn jbi-round [(value f64)] (-> f64)
+  (if (and (primitive/fcmp-lt value 0.0) (primitive/fcmp-le -0.5 value))
+      -0.0
+      (floor (+ value 0.5))))
+
+(defn jbi-nan? [(value f64)] (-> bool)
+  (let [bits (f64-bits value)]
+    (and (= (& bits JBI-F64-EXP-MASK) JBI-F64-EXP-MASK)
+         (!= (& bits JBI-F64-FRAC-MASK) 0))))
+
+(defn jbi-max [(a f64) (b f64)] (-> f64)
+  (if (or (jbi-nan? a) (jbi-nan? b)) (bits-f64 JSV-NAN)
+    (if (primitive/fcmp-lt a b) b
+      (if (primitive/fcmp-lt b a) a
+        (if (< (f64-bits a) 0) b a)))))
+
+(defn jbi-min [(a f64) (b f64)] (-> f64)
+  (if (or (jbi-nan? a) (jbi-nan? b)) (bits-f64 JSV-NAN)
+    (if (primitive/fcmp-lt a b) a
+      (if (primitive/fcmp-lt b a) b
+        (if (< (f64-bits a) 0) a b)))))
+
+(defn jbi-eval [(id i64) (a f64) (b f64)] (-> f64)
+  (case id JBI-ABS (fabs a) JBI-FLOOR (floor a) JBI-CEIL (ceil a)
+        JBI-ROUND (jbi-round a) JBI-EXP (exp a) JBI-LOG (log a)
+        JBI-SIN (sin a) JBI-COS (cos a) JBI-TAN (tan a)
+        JBI-ASIN (asin a) JBI-ACOS (acos a) JBI-ATAN (atan a)
+        JBI-SQRT (sqrt a) JBI-POW (pow a b)
+        JBI-MAX (jbi-max a b)
+        JBI-MIN (jbi-min a b)
+        JBI-RANDOM (jbi-random)
+        (bits-f64 JSV-NAN)))

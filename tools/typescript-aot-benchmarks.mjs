@@ -24,6 +24,7 @@ const metric = (text, name) => {
 const output = path.join(root, "out", "typescript-aot-benchmarks");
 fs.mkdirSync(output, { recursive: true });
 const report = [];
+const nativeParserArchive = run("tools/build-typescript-go-bridge.sh", []).trim();
 
 for (const benchmark of cases) {
   const sourcePath = path.join(root, "benchmarks", "typescript-aot", `${benchmark.name}.ts`);
@@ -32,7 +33,10 @@ for (const benchmark of cases) {
   const objectPath = path.join(output, `${benchmark.name}.o`);
   const executablePath = path.join(output, benchmark.name);
   run(process.execPath, ["tools/generate-typescript-aot-benchmark.mjs", sourcePath, coilPath]);
-  run("coil", ["build", coilPath, "-o", emitterPath]);
+  run("coil", ["build", coilPath, "-o", emitterPath,
+    "--link-flag", `-Wl,-force_load,${nativeParserArchive}`,
+    "--link-flag", "-framework", "--link-flag", "CoreFoundation",
+    "--link-flag", "-framework", "--link-flag", "Security"]);
   fs.writeFileSync(objectPath, run(emitterPath, [], { encoding: null }));
   run("xcrun", ["clang", "-O2", "-arch", "arm64", "-fno-omit-frame-pointer",
     "tools/typescript-aot-benchmark-harness.c", objectPath, "-o", executablePath]);

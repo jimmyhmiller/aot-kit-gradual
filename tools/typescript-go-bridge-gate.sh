@@ -10,6 +10,7 @@ call_graph_output="$root/.coil/build/typescript-native-call-graph-smoke"
 control_graph_output="$root/.coil/build/typescript-native-control-graph-smoke"
 object_graph_output="$root/.coil/build/typescript-native-object-graph-smoke"
 exact_graph_output="$root/.coil/build/typescript-native-exact-graph-smoke"
+bitwise_graph_output="$root/.coil/build/typescript-native-bitwise-graph-smoke"
 
 coil build "$root/tools/typescript-go-bridge-smoke.coil" \
   -o "$output" \
@@ -87,3 +88,15 @@ coil build "$root/tools/typescript-native-exact-graph-smoke.coil" \
 node "$root/tests/frontend-native-migration-oracle-test.mjs" "$root/.coil/build/typescript-native-exact-graph.txt"
 
 node "$root/tests/frontend-native-binarytrees-exact-graph-test.mjs" "$archive"
+
+coil build "$root/tools/typescript-native-bitwise-graph-smoke.coil" \
+  -o "$bitwise_graph_output" \
+  --link-flag "-Wl,-force_load,$archive" \
+  --link-flag -framework \
+  --link-flag CoreFoundation \
+  --link-flag -framework \
+  --link-flag Security
+
+"$bitwise_graph_output" > "$root/.coil/build/typescript-native-bitwise-graph.txt"
+node "$root/tests/frontend-native-bitwise-exact-graph-test.mjs" \
+  "$root/.coil/build/typescript-native-bitwise-graph.txt"

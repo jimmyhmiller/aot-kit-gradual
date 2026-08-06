@@ -1,0 +1,115 @@
+(module emitb12arrayobject)
+
+(import "frontendnative" :use *)
+(import "frontendnativegraph" :use *)
+(import "backend" :use *)
+(import "node" :use *)
+(import "verify" :use *)
+(import "coil.io" :use *)
+(import "coil.fmt" :use *)
+
+(extern write :cc c [i32 (ptr u8) i64] (-> i64))
+(extern atoi :cc c [(ptr i8)] (-> i32))
+
+(defn main [(argc i32) (argv (ptr (ptr i8)))] (-> i64)
+  (let [regs (if (> argc 1) (cast i64 (atoi (load (index argv 1)))) 8)
+        seed (if (> argc 2) (cast i64 (atoi (load (index argv 2)))) 11220)
+        mode (if (> argc 3) (cast i64 (atoi (load (index argv 3)))) 0)
+        source
+          (cond (= mode 1)
+                  "function main(){let a=[];let j1={x:1};let j2={x:2};let child={x:33};a[0]=child;let junk={x:4};return a[0].x;}"
+                (= mode 2) "function main(){let a=[1];return a.push(2,3);}"
+                (= mode 3) "function main(){let a=[10,20,30,40];let b=a.slice(1,3);return b[1];}"
+                (= mode 4) "function main(){let a=[10,,,];return a[2];}"
+                (= mode 5) "function main(){let a=[1,2];let y=a.pop();return y;}"
+                (= mode 6) "function main(){let a=[10,,,];return a.length;}"
+                (= mode 7) "function main(){let a=[];a[-1]=20;return a[-1];}"
+                (= mode 8) "function main(){let a=[];a['x']=21;return a['x'];}"
+                (= mode 9) "function main(){let a=[];a[1.5]=22;return a[1.5];}"
+                (= mode 10) "function main(){let inner=[42];let outer=[];outer[0]=inner;return outer[0];}"
+                (= mode 11) "function main(){let a=[1,true,null];return a[1];}"
+                (= mode 12) "function main(){let a=[1,true,null];return a[2];}"
+                (= mode 13) "function main(){let a=[10,20,30,40];let b=a.slice(-3,-1);return b[1];}"
+                (or (= mode 14) (= mode 15))
+                  "function main(){let a='co';let b='il';let c=a+b;let d=c+42;let p=parseInt;let s=String;let n=isNaN;let hex=255;let pixels='5,5'.split(',');let whole='abc'.split();let junk=[];return d==='coil42'?c.length+c.charCodeAt(1)+c.substring(1,3).length+c.substr(-2,1).length+c.slice(-3,-1).length+c.charAt(9).length+p('1f',16)+s(-42).length+s(true).length+s(null).length+String.fromCharCode(65,9786).length+hex.toString(16).length+whole.length+(n('12x')?1:0)+(n(c.charCodeAt(99))?1:0)+p(pixels[0],10)+p(pixels[1],10)+junk.length:0;}"
+                (= mode 16)
+                  "function main(){let s=String;let n=isNaN;let p=parseInt;let hex=255;return s(undefined).length+s(NaN).length+n(undefined)+n(null)+n(NaN)+s(-0).length+s(1/2).length+p(7)+p(7/2)+String.fromCharCode(65,9786).length+hex.toString(16).length+'AbC'.toLowerCase().charCodeAt(1)+'AbC'.toUpperCase().charCodeAt(1)+'abcabc'.indexOf('bc',2)+('abc'<'abd')+('abc'<='abc')+('abd'>'abc')+('abd'>='abd');}"
+                (= mode 17) "function main(){return String(1/2).length;}"
+                (= mode 18)
+                  "function main(){let root=Math.sqrt;let absolute=Math.abs;let maximum=Math.max;return root(81)+Math.floor(3.9)+Math.ceil(3.1)+Math.round(1.5)+absolute(-2)+maximum(4,7)+Math.min(4,7)+Math.pow(2,3)+Math.exp(Math.log(1))+Math.sin(0)+Math.cos(0)+Math.tan(0)+Math.asin(0)+Math.acos(1)+Math.atan(0)+(Math.LN2-Math.log(2))+Math.random();}"
+                (= mode 19) "function main(){throw 'boom';}"
+                (= mode 20) "function main(){let error=new Error('boom');let junk={value:7};throw error;}"
+                :else "function main(){let a=[10];a[3]=40;let junk={x:1};return a[3];}")
+        (mut frontend) (fe-native-new source)]
+    (fng-falsify-numeric-string-add! (= mode 15))
+    (if (!= (fe-native-index! (mut frontend)) FE-OK)
+        (do (fe-native-free! (mut frontend)) 2)
+        (do
+          (frontend-native-build! (mut frontend) seed false)
+          (fe-native-free! (mut frontend))
+          (if (not (be-select-machine-program!))
+              (do
+                (fmt (stderr)
+                     "B12 selection failed be={d}@{d} ms={d}@{d} verify={d}@{d}\n"
+                     (be-result)
+                     (be-result-node)
+                     (ms-result)
+                     (ms-result-item)
+                     (g-verify-code)
+                     (g-verify-node))
+                (ms-dump (stderr))
+                (let [(mut at) 0]
+                  (loop (if (>= (load at) (be-inst-count))
+                            (break)
+                            (do
+                              (fmt (stderr)
+                                   "  mi={d} op={s} dst={d} a={d} node={d} block={d} earliest={d} latest={d}\n"
+                                   (load at)
+                                   (mi-op-name (ms-inst-op (load at)))
+                                   (ms-inst-dst (load at))
+                                   (ms-inst-a (load at))
+                                   (ms-inst-node (load at))
+                                   (ms-inst-block (load at))
+                                   (ms-inst-earliest (load at))
+                                   (ms-inst-latest (load at)))
+                              (store! at (+ (load at) 1))
+                              0)))
+                  0)
+                (g-print-flat (stderr))
+                3)
+              (do
+                (be-use-runtime-allocation! true)
+                (be-schedule!)
+                (if (< (be-color! regs) 0)
+                    (do
+                      (fmt (stderr)
+                           "B12 color failed ml={d}@{d} ma={d}@{d}\n"
+                           (ml-result)
+                           (ml-result-item)
+                           (mra-result)
+                           (mra-result-item))
+                      4)
+                    (if (not (be-encode-checked!))
+                        (do
+                          (fmt (stderr)
+                               "B12 encode failed be={d}@{d}\n"
+                               (be-result)
+                               (be-result-node))
+                          5)
+                        (let [encoded-length (be-code-len)]
+                          (if (not (be-macho-checked!))
+                              (do
+                                (fmt (stderr)
+                                     "B12 macho failed be={d}@{d} obj={d}@{d} code={d} start={d} size={d}\n"
+                                     (be-result)
+                                     (be-result-node)
+                                     (mobj-result)
+                                     (mobj-item)
+                                     encoded-length
+                                     (mu-function-code-start 0)
+                                     (mu-function-code-size 0))
+                                6)
+                              (if (= (write 1 (be-object-data) (be-object-len))
+                                     (be-object-len))
+                                  0
+                                  7)))))))))))

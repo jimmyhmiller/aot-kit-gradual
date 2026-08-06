@@ -12,7 +12,8 @@ if [[ ! -d "$checkout/.git" ]]; then
   git clone --filter=blob:none --no-checkout https://github.com/microsoft/typescript-go.git "$checkout"
 fi
 
-if [[ $(git -C "$checkout" rev-parse HEAD 2>/dev/null || true) != "$commit" ]]; then
+if [[ ! -f "$checkout/go.mod" ||
+      $(git -C "$checkout" rev-parse HEAD 2>/dev/null || true) != "$commit" ]]; then
   git -C "$checkout" fetch --depth 1 origin "$commit"
   git -C "$checkout" checkout --detach "$commit"
 fi

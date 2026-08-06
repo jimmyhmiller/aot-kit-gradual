@@ -29,6 +29,7 @@
 
 (defn a-arg [(t i64)] (-> i64) (n-peephole (n-new1 OP-ARG t (g-start))))
 (defn a-int [(v i64)] (-> i64) (n-const (t-int-con v)))
+(defn a-flt-bits [(v i64)] (-> i64) (n-const (t-flt-bits v)))
 (defn a-con [(t i64)] (-> i64) (n-const t))
 (defn a-bin [(op i64) (a i64) (b i64)] (-> i64) (n-peephole (n-new3 op 0 NO-NODE a b)))
 (defn a-un  [(op i64) (a i64)] (-> i64) (n-peephole (n-new2 OP-MINUS 0 NO-NODE a)))
@@ -76,6 +77,18 @@
   (graph-reset! 1) (a-ret (a-bin OP-DIV (a-int 12) (a-int 4)))   (expect-int "12/4" 3)
   (graph-reset! 1) (a-ret (a-un OP-MINUS (a-int 5)))             (expect-int "-5" -5))
 
+(deftest semantic_trace_is_opt_in_and_bounded
+  (graph-reset! 10001)
+  (a-ret (a-int 7))
+  (ev-reset!)
+  (ev-trace-enable! 2)
+  (ev-bind-args! 0)
+  (assert (= (ev-run-nobind BUDGET) EV-OK))
+  (assert (> (ev-trace-count) 0))
+  (assert (<= (ev-trace-count) 2))
+  (ev-trace-disable!)
+  (assert (= (ev-trace-count) 0)))
+
 ;; Inexact division leaves the integers, which is what the lattice claims with `num` and what the
 ;; interpreter has to actually do, or the two disagree about the language.
 (deftest division_leaves_the_integers
@@ -90,7 +103,16 @@
   (a-ret (a-bin OP-DIV (a-int 1) (a-int 0)))
   (ev-run BUDGET)
   (assert (= (ev-status) EV-OK))
-  (assert (not (rt-eq? (ev-result) (RInt 0)))))
+  (assert (not (rt-eq? (ev-result) (RInt 0))))
+
+  ; i64::MIN / -1 cannot be evaluated as signed integer division, but JavaScript does not trap:
+  ; both operands first become Numbers and the rounded double is returned.
+  (graph-reset! 1)
+  (let [a (a-arg (t-int)) b (a-arg (t-int))]
+    (a-ret (a-bin OP-DIV a b))
+    (ev-reset!) (ev-bind! a (RInt TY-IMIN)) (ev-bind! b (RInt -1)) (ev-run-nobind BUDGET)
+    (assert (= (ev-status) EV-OK))
+    (assert (rt-eq? (ev-result) (RFlt (f64-bits 9223372036854775808.0))))))
 
 (deftest comparisons_and_truthiness
   (graph-reset! 1) (a-ret (a-bin OP-LT (a-int 1) (a-int 2)))  (expect-bool "1<2" true)
@@ -98,6 +120,37 @@
   (graph-reset! 1) (a-ret (a-bin OP-EQ (a-int 3) (a-int 3)))  (expect-bool "3==3" true)
   (graph-reset! 1) (a-ret (n-peephole (n-new2 OP-NOT 0 NO-NODE (a-int 0))))  (expect-bool "!0" true)
   (graph-reset! 1) (a-ret (n-peephole (n-new2 OP-NOT 0 NO-NODE (a-int 9))))  (expect-bool "!9" false))
+
+(deftest bitwise_operations_apply_javascript_boolean_coercion
+  (graph-reset! 1)
+  (let [left (a-arg (t-bool)) right (a-arg (t-bool))]
+    (a-ret (a-bin OP-BITOR left right))
+    (ev-reset!)
+    (ev-bind! left (RBool false))
+    (ev-bind! right (RBool true))
+    (ev-run-nobind BUDGET)
+    (assert (= (ev-status) EV-OK))
+    (assert (rt-eq? (ev-result) (RInt 1)))))
+
+(deftest ieee_comparisons_match_javascript_nan_and_signed_zero_rules
+  (graph-reset! 1)
+  (a-ret (a-bin OP-EQ (a-flt-bits 9221120237041090560)
+                      (a-flt-bits 9221120237041090560)))
+  (expect-bool "NaN === NaN" false)
+  (graph-reset! 1)
+  (a-ret (a-bin OP-EQ (a-flt-bits 0) (a-flt-bits JSV-NEGATIVE-ZERO)))
+  (expect-bool "+0 === -0" true)
+  (graph-reset! 1)
+  (a-ret (a-bin OP-LT (a-flt-bits 9221120237041090560) (a-int 1)))
+  (expect-bool "NaN < 1" false)
+
+  ; Arithmetic canonicalises all possible host NaN payloads into the tagged ABI's one NaN word.
+  (graph-reset! 1)
+  (let [a (a-arg (t-flt))]
+    (a-ret (a-bin OP-ADD a (a-int 0)))
+    (ev-reset!) (ev-bind! a (RFlt 9221120237041090561)) (ev-run-nobind BUDGET)
+    (assert (= (ev-status) EV-OK))
+    (assert (rt-eq? (ev-result) (RFlt JSV-NAN)))))
 
 ;; The interpreter's truthiness and the compiler's must agree, or the interpreter takes a different
 ;; branch than the compiler predicted and the oracle is worse than useless. Checked directly, over
@@ -216,17 +269,25 @@
 ; ---------------------------------------------------------------------------
 ; It refuses to guess
 ; ---------------------------------------------------------------------------
-;; Overflow is where a lazy interpreter would silently wrap and quietly disagree with JavaScript,
-;; which promotes to a double. Reporting a named status is the honest answer until M5 gives the
-;; runtime a value domain that can hold the result.
-(deftest overflow_is_reported_not_wrapped
+;; The integer kind is only a tagged fast path. Leaving its range promotes to Number rather than
+;; wrapping or reporting an implementation gap.
+(deftest integer_fast_path_overflow_promotes_to_double
   (graph-reset! 1)
   (let [a (a-arg (t-int))]
     (a-ret (a-bin OP-ADD a a))
     (ev-reset!)
     (ev-bind! a (RInt 5000000000000000000))
     (ev-run-nobind BUDGET)
-    (assert (= (ev-status) EV-OVERFLOW))))
+    (assert (= (ev-status) EV-OK))
+    (assert (rt-eq? (ev-result) (RFlt (f64-bits 10000000000000000000.0))))))
+
+(deftest signed_zero_is_created_by_integer_fast_paths_when_javascript_requires_it
+  (graph-reset! 1) (a-ret (a-un OP-MINUS (a-int 0)))
+  (ev-run BUDGET) (assert (rt-eq? (ev-result) (RFlt JSV-NEGATIVE-ZERO)))
+  (graph-reset! 1) (a-ret (a-bin OP-MUL (a-int 0) (a-int -1)))
+  (ev-run BUDGET) (assert (rt-eq? (ev-result) (RFlt JSV-NEGATIVE-ZERO)))
+  (graph-reset! 1) (a-ret (a-bin OP-DIV (a-int 0) (a-int -1)))
+  (ev-run BUDGET) (assert (rt-eq? (ev-result) (RFlt JSV-NEGATIVE-ZERO))))
 
 (deftest an_unbound_argument_is_reported
   (graph-reset! 1)

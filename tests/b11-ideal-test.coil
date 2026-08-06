@@ -1,0 +1,79 @@
+(module b11idealtest)
+
+(import "ty" :use *)
+(import "shape" :use *)
+(import "node" :use *)
+(import "eval" :use *)
+(import "verify" :use *)
+(import "coil.assert" :use *)
+
+(defn ic [(value i64)] (-> i64) (n-new1 OP-CONST (t-int-con value) (g-start)))
+(defn property-memory [] (-> i64)
+  (n-new1 OP-ARG (t-mem-alias JS-PROPERTY-ALIAS (t-dyn)) (g-start)))
+
+(defn run! [(value i64) (memory i64)] (-> RtVal)
+  (n-add-def! (g-stop) (n-new3 OP-RETURN 0 (g-start) value memory))
+  (g-analyze!)
+  (assert (= (g-verify) 0))
+  (ev-reset!)
+  (ev-bind-args! 0)
+  (assert (= (ev-run-nobind 100000) EV-OK))
+  (ev-result))
+
+(deftest named_property_memory_is_versioned
+  (graph-reset! 11101)
+  (shape-reset!)
+  (let [memory (property-memory)
+        allocation (n-new-obj0! (g-start) SHAPE-ROOT)
+        object (n-obj-ptr allocation)
+        first (n-prop-store! memory object (n-box! (ic 10)) "x")
+        earlier (n-unbox! (n-prop-load! first object "x") (t-int))
+        second (n-prop-store! first object (n-box! (ic 20)) "x")
+        latest (n-unbox! (n-prop-load! second object "x") (t-int))
+        result (n-new3 OP-ADD 0 NO-NODE earlier latest)]
+    (let [answer (run! result second)]
+      (assert (= (rt-tag answer) RT-INT))
+      (assert (= (rt-payload answer) 30)))))
+
+(deftest a_missing_named_property_is_undefined
+  (graph-reset! 11102)
+  (shape-reset!)
+  (let [memory (property-memory)
+        allocation (n-new-obj0! (g-start) SHAPE-ROOT)
+        object (n-obj-ptr allocation)
+        missing (n-prop-load! memory object "missing")
+        answer (run! missing memory)]
+    (assert (= (rt-tag answer) RT-UNDEF))))
+
+(deftest prototype_lookup_and_shadowing_are_memory_versioned
+  (graph-reset! 11103)
+  (shape-reset!)
+  (let [memory (property-memory)
+        prototype-new (n-new-obj0! (g-start) SHAPE-ROOT)
+        prototype (n-obj-ptr prototype-new)
+        object-new (n-new-obj0! (g-start) SHAPE-ROOT)
+        object (n-obj-ptr object-new)
+        inherited-memory (n-prop-store! memory prototype (n-box! (ic 20)) "value")
+        linked-memory (n-set-prototype! inherited-memory object prototype)
+        inherited (n-unbox! (n-prop-load! linked-memory object "value") (t-int))
+        shadow-memory (n-prop-store! linked-memory object (n-box! (ic 7)) "value")
+        shadowed (n-unbox! (n-prop-load! shadow-memory object "value") (t-int))
+        result (n-new3 OP-ADD 0 NO-NODE inherited shadowed)
+        answer (run! result shadow-memory)]
+    (assert (= (rt-tag answer) RT-INT))
+    (assert (= (rt-payload answer) 27))))
+
+(deftest prototype_cycles_fail_by_name
+  (graph-reset! 11104)
+  (shape-reset!)
+  (let [memory (property-memory)
+        a-new (n-new-obj0! (g-start) SHAPE-ROOT) a (n-obj-ptr a-new)
+        b-new (n-new-obj0! (g-start) SHAPE-ROOT) b (n-obj-ptr b-new)
+        first (n-set-prototype! memory a b)
+        cycle (n-set-prototype! first b a)]
+    (n-add-def! (g-stop) (n-new3 OP-RETURN 0 (g-start) (ic 0) cycle))
+    (g-analyze!)
+    (assert (= (g-verify) 0))
+    (ev-reset!)
+    (ev-bind-args! 0)
+    (assert (= (ev-run-nobind 100000) EV-SHAPE))))

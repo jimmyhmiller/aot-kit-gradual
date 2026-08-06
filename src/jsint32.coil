@@ -1,0 +1,70 @@
+;; JavaScript's 32-bit numeric coercions and integer operators.
+(module jsint32)
+
+(import "ty" :use *)
+(import "jsvalue" :use *)
+(import "coil.primitive" :as primitive)
+
+(extern fmod :cc c [f64 f64] (-> f64))
+
+(const JS-U32-MOD i64 4294967296)
+(const JS-U32-MASK i64 4294967295)
+(const JS-I32-SIGN i64 2147483648)
+(const JS-F64-EXP-MASK i64 9218868437227405312)
+(const JS-F64-ABS-MASK i64 9223372036854775807)
+
+(const JS-BIT-AND i64 0)
+(const JS-BIT-OR i64 1)
+(const JS-BIT-XOR i64 2)
+(const JS-SHL i64 3)
+(const JS-SHR i64 4)
+(const JS-USHR i64 5)
+
+(defn js-u32-to-i32 [(u i64)] (-> i64)
+  (if (>= u JS-I32-SIGN) (- u JS-U32-MOD) u))
+
+(defn js-to-uint32-int [(value i64)] (-> i64)
+  (& value JS-U32-MASK))
+
+(defn js-to-int32-int [(value i64)] (-> i64)
+  (js-u32-to-i32 (js-to-uint32-int value)))
+
+(defn js-f64-nonfinite? [(value f64)] (-> bool)
+  (= (& (f64-bits value) JS-F64-EXP-MASK) JS-F64-EXP-MASK))
+
+(defn js-f64-nan-bits? [(bits i64)] (-> bool)
+  (and (= (& bits JS-F64-EXP-MASK) JS-F64-EXP-MASK)
+       (!= (& bits 4503599627370495) 0)))
+
+(defn js-to-uint32-f64 [(value f64)] (-> i64)
+  (if (or (js-f64-nonfinite? value) (= (& (f64-bits value) JS-F64-ABS-MASK) 0)) 0
+    (let [integer (- value (fmod value 1.0))
+          raw (fmod integer (cast f64 JS-U32-MOD))
+          wrapped (if (primitive/fcmp-lt raw 0.0) (+ raw (cast f64 JS-U32-MOD)) raw)]
+      (cast i64 wrapped))))
+
+(defn js-to-int32-f64 [(value f64)] (-> i64)
+  (js-u32-to-i32 (js-to-uint32-f64 value)))
+
+(defn js-bit-not [(value i64)] (-> i64)
+  (js-u32-to-i32 (& (^ (js-to-uint32-int value) JS-U32-MASK) JS-U32-MASK)))
+
+(defn js-bit-bin [(op i64) (left i64) (right i64)] (-> i64)
+  (let [a (js-to-uint32-int left) b (js-to-uint32-int right) count (& b 31)]
+    (case op
+      JS-BIT-AND (js-u32-to-i32 (& a b))
+      JS-BIT-OR (js-u32-to-i32 (| a b))
+      JS-BIT-XOR (js-u32-to-i32 (^ a b))
+      JS-SHL (js-u32-to-i32 (& (<< a count) JS-U32-MASK))
+      JS-SHR (>> (js-u32-to-i32 a) count)
+      JS-USHR (>> a count)
+      0)))
+
+(defn js-remainder-bits [(left f64) (right f64)] (-> i64)
+  (if (or (js-f64-nonfinite? left)
+          (or (= (& (f64-bits right) JS-F64-ABS-MASK) 0)
+              (js-f64-nan-bits? (f64-bits right))))
+      JSV-NAN
+    (if (js-f64-nonfinite? right) (f64-bits left)
+      (let [bits (f64-bits (fmod left right))]
+        (if (js-f64-nan-bits? bits) JSV-NAN bits)))))

@@ -1,0 +1,137 @@
+(module b13idealtest)
+
+(import "node" :use *)
+(import "ty" :use *)
+(import "eval" :use *)
+(import "jsstring" :use *)
+(import "shape" :use *)
+(import "verify" :use *)
+(import "coil.assert" :use *)
+
+(defn si [(value i64)] (-> i64)
+  (n-new1 OP-CONST (t-int-con value) (g-start)))
+(defn sm [] (-> i64)
+  (n-new1 OP-ARG (t-mem-alias JS-PROPERTY-ALIAS (t-undef)) (g-start)))
+
+(defn run-string [(value i64)] (-> RtVal)
+  (let [ret (n-new2 OP-RETURN 0 (g-start) value)]
+    (n-add-def! (g-stop) ret)
+    (g-analyze!)
+    (assert (= (g-verify) 0))
+    (ev-reset!)
+    (ev-bind-args! 0)
+    (assert (= (ev-run-nobind 10000) EV-OK))
+    (ev-result)))
+
+(deftest literal_length_equality_and_concatenation_execute_in_ideal_ir
+         (graph-reset! 11300)
+         (shape-reset!)
+         (jss-reset!)
+         (let [co (n-string-const! (jss-from-utf8! "co"))
+               il (n-string-const! (jss-from-utf8! "il"))
+               coil (n-string-const! (jss-from-utf8! "coil"))
+               combined (n-string-concat! co il)
+               equal (n-string-equal! combined coil)]
+           (assert (= (rt-payload (run-string equal)) 1))))
+
+(deftest utf16_length_and_out_of_range_charcode_are_observable
+         (graph-reset! 11301)
+         (shape-reset!)
+         (jss-reset!)
+         (let [value (n-string-const! (jss-from-utf8! "A😀Z"))]
+           (assert (= (rt-payload (run-string (n-string-length! value))) 4)))
+         (graph-reset! 11302)
+         (shape-reset!)
+         (jss-reset!)
+         (let [value (n-string-const! (jss-from-utf8! "abc"))
+               answer (run-string (n-string-char-code! value (si 3)))]
+           (assert (= (rt-tag answer) RT-FLT))
+           (assert (= (rt-payload answer) JSV-NAN))))
+
+(deftest substring_modes_normalize_ranges_like_javascript
+         (graph-reset! 11303)
+         (shape-reset!)
+         (jss-reset!)
+         (let [value (n-string-const! (jss-from-utf8! "abcdef"))
+               result (run-string (n-string-substring! value (si 4) (si 1) 0))]
+           (assert (jss-equal? (rt-payload result) (jss-from-utf8! "bcd")))))
+
+(deftest primitive_string_parseint_and_isnan_conversions_execute
+         (graph-reset! 11304)
+         (shape-reset!)
+         (jss-reset!)
+         (let [result (run-string (n-to-string! (si -42)))]
+           (assert (jss-equal? (rt-payload result) (jss-from-utf8! "-42"))))
+         (graph-reset! 11305)
+         (shape-reset!)
+         (jss-reset!)
+         (let [text (n-string-const! (jss-from-utf8! "  -1f tail"))
+               result (run-string (n-parse-int! text (si 16)))]
+           (assert (= (rt-tag result) RT-INT))
+           (assert (= (rt-payload result) -31)))
+         (graph-reset! 11306)
+         (shape-reset!)
+         (jss-reset!)
+         (let [text (n-string-const! (jss-from-utf8! "12x"))
+               result (run-string (n-is-nan! text))]
+           (assert (= (rt-tag result) RT-BOOL))
+           (assert (= (rt-payload result) 1))))
+
+(deftest plain_string_split_populates_a_dense_string_array
+         (graph-reset! 11307)
+         (shape-reset!)
+         (jss-reset!)
+         (let [source (n-string-const! (jss-from-utf8! "5,5"))
+               delimiter (n-string-const! (jss-from-utf8! ","))
+               allocation (n-new-obj0! (g-start) SHAPE-ROOT)
+               array (n-array-mark! (n-obj-ptr allocation))
+               split (n-string-split! (sm) source delimiter array)
+               value (n-array-load! split array (si 1))
+               ret (n-new3 OP-RETURN 0 (g-start) value split)]
+           (n-add-def! (g-stop) ret)
+           (g-analyze!)
+           (assert (= (g-verify) 0))
+           (ev-reset!)
+           (ev-bind-args! 0)
+           (assert (= (ev-run-nobind 10000) EV-OK))
+           (assert (= (rt-tag (ev-result)) RT-STR))
+           (assert (jss-equal? (rt-payload (ev-result)) (jss-from-utf8! "5")))))
+
+(deftest from_char_code_keeps_the_low_utf16_code_unit
+         (graph-reset! 11308)
+         (shape-reset!)
+         (jss-reset!)
+         (let [result (run-string (n-string-from-code-unit! (si 65601)))]
+           (assert (= (rt-tag result) RT-STR))
+           (assert (= (jss-length (rt-payload result)) 1))
+           (assert (= (jss-code-unit (rt-payload result) 0) 65))))
+
+(deftest integer_to_string_honors_radices_two_through_thirty_six
+         (graph-reset! 11309)
+         (shape-reset!)
+         (jss-reset!)
+         (let [result (run-string (n-number-to-string! (si 255) (si 16)))]
+           (assert (= (rt-tag result) RT-STR))
+           (assert (jss-equal? (rt-payload result) (jss-from-utf8! "ff")))))
+
+(deftest ascii_case_conversion_and_indexof_cover_the_corpus_forms
+         (graph-reset! 11310)
+         (shape-reset!)
+         (jss-reset!)
+         (let [source (n-string-const! (jss-from-utf8! "AbCabc"))
+               lowered (run-string (n-string-lower! source))]
+           (assert (jss-equal? (rt-payload lowered) (jss-from-utf8! "abcabc"))))
+         (graph-reset! 11311)
+         (shape-reset!)
+         (jss-reset!)
+         (let [source (n-string-const! (jss-from-utf8! "abcabc"))
+               needle (n-string-const! (jss-from-utf8! "bc"))]
+           (assert (= (rt-payload (run-string (n-string-index-of! source needle (si 2)))) 4))))
+
+(deftest string_comparison_is_lexicographic_in_ideal_ir
+         (graph-reset! 11312)
+         (shape-reset!)
+         (jss-reset!)
+         (let [left (n-string-const! (jss-from-utf8! "abc"))
+               right (n-string-const! (jss-from-utf8! "abd"))]
+           (assert (= (rt-payload (run-string (n-string-compare! left right))) -1))))

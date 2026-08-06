@@ -1,7 +1,5 @@
 #!/usr/bin/env node
 import fs from "node:fs";
-import { normalizeTypeScript } from "../src/frontend_ir.mjs";
-import { generateCoilBuilder } from "../src/frontend_coil_codegen.mjs";
 
 const [mode, output, maximumDepthText = "10"] = process.argv.slice(2);
 const maximumDepth = Number(maximumDepthText);
@@ -12,23 +10,35 @@ if (!output || !["--emitter", "--interpreter-test", "--profile-emitter"].include
 if (!Number.isInteger(maximumDepth) || maximumDepth < 4 || maximumDepth > 10 || maximumDepth % 2)
   throw new Error("MAX_DEPTH must be an even integer from 4 through 10");
 const input = "tests/typescript/binarytrees.ts";
-const program = normalizeTypeScript(fs.readFileSync(input, "utf8"), input);
-let generated = generateCoilBuilder(program, { moduleName: "generatedtypescriptbinarytrees" });
-generated = generated.replace(
-  "(defn frontend-build! [(seed i64) (optimize bool)] (-> i64)",
-  "(defn frontend-build-mode! [(seed i64) (optimize bool) (analyze bool)] (-> i64)",
-).replace("    (g-analyze!)\n", "    (if analyze (g-analyze!) 0)\n");
-generated += `
+const source = fs.readFileSync(input, "utf8");
+let generated = `(module generatedtypescriptbinarytrees)
+(import "frontendnative" :use *)
+(import "frontendnativegraph" :use *)
+(import "typescriptnative" :use *)
+(import "node" :use *)
+(import "ty" :use *)
+(import "shape" :use *)
+(import "verify" :use *)
+(import "gtext" :use *)
+(import "backend" :use *)
+(import "eval" :use *)
+(import "coil.assert" :use *)
+(import "coil.io" :use *)
+(import "coil.fmt" :use *)
+(import "coil.slice" :use *)
+(import "coil.alloc" :use *)
+(defn frontend-build-mode! [(seed i64) (optimize bool) (analyze bool)] (-> i64)
+  (let [source ${JSON.stringify(source)} filename ${JSON.stringify(input)}
+        (mut frontend) (fe-native-new-file source filename TS-SCRIPT-TS)]
+    (if (!= (fe-native-index! (mut frontend)) FE-OK)
+        (do (fe-native-free! (mut frontend)) NO-NODE)
+        (let [answer (frontend-native-build-mode! (mut frontend) seed optimize analyze)]
+          (fe-native-free! (mut frontend)) answer))))
 (defn frontend-build! [(seed i64) (optimize bool)] (-> i64)
   (frontend-build-mode! seed optimize true))
 `;
 
 if (mode === "--emitter") {
-  generated = generated.replace("(import \"coil.slice\" :use *)",
-    `(import "coil.slice" :use *)
-(import "backend" :use *)
-(import "coil.io" :use *)
-(import "coil.fmt" :use *)`);
   generated += `
 (extern write :cc c [i32 (ptr u8) i64] (-> i64))
 (extern atoi :cc c [(ptr i8)] (-> i32))
@@ -54,12 +64,6 @@ if (mode === "--emitter") {
                     (if (= (write 1 (be-object-data) (be-object-len)) (be-object-len)) 0 8))))))))))
 `;
 } else if (mode === "--interpreter-test") {
-  generated = generated.replace("(import \"coil.slice\" :use *)",
-    `(import "coil.slice" :use *)
-(import "eval" :use *)
-(import "coil.assert" :use *)
-(import "coil.io" :use *)
-(import "coil.fmt" :use *)`);
   generated += `
 (defn ts-result-field [(slot i64)] (-> i64)
   (let [obj (rt-payload (ev-result)) shape (ev-obj-shape obj)
@@ -98,18 +102,14 @@ if (mode === "--emitter") {
                 (do (assert (= (ts-result-field (+ base 1)) 0)) (assert (= (ts-result-field (+ base 2)) 0)) 0)))
             (store! slot (+ (load slot) 1)) 0))))
     (assert (= (ts-result-field 29) depth)) (assert (= (ts-result-field 30) (ts-check depth))) 0))
-(deftest typescript_binarytrees_lowers_to_coil_ideal
+(defn main [] (-> i64)
   (let [(mut depth) 4]
     (loop (if (> (load depth) ${maximumDepth}) (break)
       (do (ts-run-depth! (load depth) false) (ts-run-depth! (load depth) true)
-          (store! depth (+ (load depth) 2)) 0)))))
+          (store! depth (+ (load depth) 2)) 0))))
+  0)
 `;
 } else {
-  generated = generated.replace("(import \"coil.slice\" :use *)",
-    `(import "coil.slice" :use *)
-(import "backend" :use *)
-(import "coil.io" :use *)
-(import "coil.fmt" :use *)`);
   generated += `
 (extern write :cc c [i32 (ptr u8) i64] (-> i64))
 (extern atoi :cc c [(ptr i8)] (-> i32))

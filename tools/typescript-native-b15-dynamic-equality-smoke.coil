@@ -1,0 +1,32 @@
+(module typescriptnativeb15dynamicequalitysmoke)
+
+(import "frontendnative" :use *)
+(import "frontendnativegraph" :use *)
+(import "eval" :use *)
+(import "coil.io" :use *)
+(import "coil.fmt" :use *)
+
+;; A loop-carried dynamic object must not be treated as numeric merely because its graph type is
+;; temporarily narrow while the loop is being constructed.  This is the reduced DeltaBlue
+;; `u.strength == strength` failure.
+(defn run [(optimize bool)] (-> i64)
+  (let [source
+          "function main(){let strength={rank:1};let current=strength;for(let i=0;i<3;i++){current=strength;}let u={strength:strength};return u.strength==current?0:1;}"
+        (mut frontend) (fe-native-new source)]
+    (if (!= (fe-native-index! (mut frontend)) FE-OK)
+        (do (fe-native-free! (mut frontend)) 1)
+        (do
+          (frontend-native-build-mode! (mut frontend) 15002 optimize true)
+          (ev-reset!)
+          (ev-bind-args! 0)
+          (let [status (ev-run-nobind 100000) result (rt-payload (ev-result))]
+            (if (or (!= status EV-OK) (!= result 0))
+                (do (fmt (stderr) "dynamic equality failed: optimize={d} status={d} result={d} at={d}\n"
+                         (if optimize 1 0) status result (ev-at)) 0)
+                0)
+            (fe-native-free! (mut frontend))
+            (if (and (= status EV-OK) (= result 0)) 0 2))))))
+
+(defn main [] (-> i64)
+  (let [raw (run false) optimized (run true)]
+    (if (and (= raw 0) (= optimized 0)) 0 3)))

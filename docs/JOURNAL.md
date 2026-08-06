@@ -14,6 +14,26 @@ could not see, and the reasoning is usually more valuable than the fix.
 
 ---
 
+# B08 closure: structured CFG and targeted exits
+
+- Extended the stable native JavaScript ABI and both frontends with `do`, `switch`, case/default
+  clauses, labels, `break`, and `continue`, including lexical rejection of illegal or duplicate
+  targets before graph publication.
+- Lowered loops and ordered switch dispatch to explicit Loop/If/CProj/Region/Phi graphs. Target
+  identities remain stable while nested targets become inactive, so an inner switch cannot consume
+  an outer loop's labeled continue or break.
+- Snapshot and merge logic now carries live locals and every active memory alias across case entry,
+  fallthrough, loop backedges, continues, and breaks. Phi types are inferred after construction so
+  open merge nodes obey the optimizer's monotone type contract.
+- Checked raw and optimized ideal results and arm64 execution against Node for nested targets,
+  fallthrough/default placement, mandatory first `do` iteration, and object memory, including one-
+  register pressure and deterministic scheduling seeds.
+- Added named invalid-target and corrupt-Phi negatives. Redirecting the inner switch exit to its
+  outer loop changes both Node and native witnesses, proving the focused gate observes target
+  identity rather than only the final shape.
+
+---
+
 ## M9: guarded specialisation
 
 The first specialiser clones only small, straight-line pure functions under the same 32-node cost
@@ -1252,3 +1272,218 @@ out-of-frame spills, bad argument locations, call targets, argument dependencies
 - TypeScript-native depth 21 now returns all 31 exact observables and 613,766,495 allocations /
   14,730,396,112 bytes through 55 verified moving collections, including six-register pressure and
   seeds 11 through 14.
+# B00 closure: pinned V8 v7 corpus and executable gap inventory
+
+- Checked in the unchanged, BSD-licensed V8 Benchmark Suite v7 harness and all eight programs at
+  tag `7.4.77` / commit `f96b55bd7c9c36e9ab5cbef08f094bf4c57f9707`, with a hash-enforcing,
+  idempotent fetch/verification tool.
+- Added isolated deterministic Node correctness runs for all ten original benchmark checks, with
+  quick and canonical extended matrices and structured observables that exclude wall-clock scores.
+- Added a native Microsoft typescript-go `ScriptKindJS` probe that terminates on the entire corpus
+  with stable capability codes, kinds, ranges, and baseline diagnostics. Generated the checked
+  syntax/operator/builtin/object/number/allocation/exception/RegExp inventory and Markdown report.
+- Added general reduced witnesses and falsified corrupt bytes, missing license material, an omitted
+  benchmark, and injected syntax failure in the focused B00 gate.
+# B01 closure: JavaScript-aware native parser ABI
+
+- Added filename-aware `ScriptKindJS`, `ScriptKindTS`, and extension-derived parsing while retaining
+  the legacy TypeScript entry point during migration. JavaScript mode emits a stable bridge
+  diagnostic for TypeScript-only annotations without misclassifying JSDoc types in the V8 corpus.
+- Replaced unsafe process handles with a checked registry and bounded every node, role, diagnostic,
+  list, and string-buffer query. Invalid handles and double deletion are stable failures, not Go
+  panics crossing the C boundary.
+- Added explicit aot-kit kind mapping and names, 21 named AST roles, stable unary/binary/update/
+  assignment operator names, and number/string/boolean/null/RegExp literal APIs with separated
+  RegExp pattern and flags.
+- Added a checked eight-program ABI snapshot and C boundary tests, including call/function/member/
+  declaration roles and source ranges. Forced TypeScript mode and swapped call roles independently
+  turn the B01 focused gate red.
+# B02 closure: canonical Coil-owned frontend path
+
+- Added `tools/aot-compile.mjs` as the filename-aware `.js`/`.ts` product entry point. It embeds the
+  source only as transport, then requires the pinned native bridge and Coil-owned indexing,
+  resolution, ideal construction, analysis, and rendering.
+- Migrated TypeScript AOT benchmark and binary-trees generators away from npm normalization. The
+  latter now runs its interpreter checks as a standalone linked executable because forking after
+  Go runtime initialization deadlocked the test-runner child.
+- Added frontend preflight failures for unsupported syntax and operators, retaining stable code,
+  kind, named role, and exact source range while publishing no graph.
+- Moved npm TypeScript to development-only status and labeled the remaining normalized paths as
+  independent oracles. A rejecting module loader proves product compilation does not import it;
+  a corrupted native archive independently proves the product path cannot fall back around the
+  bridge.
+# B03 closure: native JavaScript tagged-value ABI
+
+- Centralized the 64-bit NaN-box representation in Coil and C, documented every active and reserved
+  tag, canonical NaN and signed-zero behavior, payload validity, truthiness, strict equality, and
+  exact managed/non-moving classification.
+- Replaced backend Box/Unbox aliases with AArch64 tag construction, checked payload extraction, and
+  exact TypeTest lowering, including canonical/malformed NaN and reserved negative-tag handling.
+- Proved every tag byte-for-byte through native calls/returns, Phis, dynamic fields, and pressure
+  spills. Wrong tags and malformed payloads trap deterministically.
+- Added boxed stack-map roots and boxed layout bitmaps. Moving collection preserves tags while
+  relocating only object, array, closure, and RegExp payloads; dynamic old-to-young stores use a
+  conservative remembered-set barrier followed by exact collector scanning.
+- Migrated recursive and object-argument GC fixtures from raw dynamic pointers to the canonical
+  tagged call ABI. Focused falsification flips the object tag predicate, and omitted raw or boxed
+  barriers independently trap.
+
+# B04 closure: JavaScript number semantics in ideal IR
+
+- Made integers an internal fast path rather than a source-language numeric boundary. Arithmetic,
+  unary minus, and exact division retain signed-48 integers only when valid; overflow, wide results,
+  inexact quotients, and signed zero promote to correctly rounded IEEE doubles.
+- Added mixed-number folding and evaluation for arithmetic, equality, and ordering. NaN is
+  non-reflexive in comparisons and canonical in runtime results; both zero signs compare equal and
+  remain distinguishable by their exact stored bits.
+- Checked 21 deterministic edge cases against Node by signed IEEE-754 bit pattern, including tagged
+  and safe-integer boundaries, infinities, NaN, zero signs, truthiness, and division by zero.
+- The focused gate independently falsifies integer division, wrapped overflow, NaN reflexivity, and
+  negative-zero preservation; evaluator and ideal-node regression suites cover the same invariants.
+
+# B05 closure: arm64 floating-point lowering
+
+- Added an independent FP register class spanning `d0`–`d31`, with class-aware instruction
+  selection, liveness, interference, allocation, ABI-fixed arguments, call clobbers, callee saves,
+  Phi copies, spills, reloads, and verifier diagnostics.
+- Lowered exact double constants, integer-to-double conversion, arithmetic, unary minus, and IEEE
+  comparisons. Native results preserve signed zero, infinities, and canonical NaN bit-for-bit
+  against the checked Node oracle.
+- Proved mixed integer/FP calls and results, values live across calls, normal and forced-pressure
+  Phis, real FP stack traffic, and FP values crossing moving-GC allocation safepoints without being
+  published as roots.
+- Added named cross-class and corrupt-spill negatives. Independently corrupting the first FP reload
+  or substituting integer ordering for unordered NaN makes the focused native gate fail.
+
+# B07 closure: expression evaluation and assignment
+
+- Added prefix/postfix updates, every compound assignment, comma, conditional expressions, and
+  short-circuit value semantics to the normalized oracle and canonical native frontend.
+- Routed local and property updates through cached lvalue records. The independent element witness
+  pins `a[i++] += f()` receiver, key, RHS, returned value, and store order ahead of B12's array layout.
+- Lowered value-producing control through explicit If/CProj/Region/Phi graphs, including local and
+  active-memory merges, and preserved unrelated field aliases across property writes and calls.
+- Checked raw and optimized ideal execution and native arm64 execution against Node, including
+  forced one-register allocation. Eager-RHS and duplicate-receiver mutations both fail the gate.
+
+# B09 closure: function expressions and lexical closures
+
+- Indexed anonymous and named function expressions in recursive preorder, resolved parameters,
+  self names, outer bindings, and sibling mutable captures without leaking expression-local names.
+- Added explicit ideal closures, shared mutable cells, exact capture widths and target sets, plus
+  evaluator and verifier coverage for arity, tags, layouts, and corrupt targets.
+- Materialized native closure environments as shaped heap objects. Calls reload captured cell
+  pointers from those environments, and singleton closed-world function values devirtualize to
+  verified machine targets.
+- Checked raw and optimized results against Node, then exercised three seeds, one-register pressure,
+  and forced moving collection. The native allocation count distinguishes real environments from
+  the former cell-only lowering, while capture-by-value changes the oracle and fails natively.
+
+# B10 closure: receivers, `this`, and constructors
+
+- Added receiver-aware native indexing and lowering, with an explicit ideal/native call ABI slot
+  for `this`; ordinary detached calls remain unbound and nested receiver expressions evaluate once.
+- Lowered construction as allocation-before-initialization and selected an explicit object result
+  over the fresh receiver only when JavaScript constructor-return rules require it.
+- Added named verifier and frontend failures for missing/scalar receivers and malformed method or
+  constructor layouts. Omitted and duplicate receiver mutations independently fail the witnesses.
+- Checked raw and optimized execution against Node, then exercised three seeds, one-register
+  pressure, normal collection, and forced moving GC while preserving relocated receiver roots.
+
+# B12 closure: dense JavaScript arrays
+
+- Added canonical ArrayMark/Load/Store/Len/Resize/Copy ideal operations, sparse literal lowering,
+  exact length and truncation behavior, hole-preserving copy, and Node-compatible push/pop/slice.
+- Implemented weak-owner native array side records with tagged backing storage, identity-preserving
+  growth, exact moving-GC element relocation, old-to-young barriers, and dead-record reclamation.
+- Routed negative, fractional, and named keys through ordinary property storage while dense numeric
+  indexes retain array semantics; nested arrays preserve the distinct `JSV_ARRAY` tag when boxed.
+- Checked mixed tags, holes, growth, key routing, builtin bounds, three seeds, eight/one-register
+  allocation, normal and stress collection. Disabled growth, omitted element scans, and omitted
+  barriers independently fail the native witnesses.
+- The focused gate, 443-test quick/full gates, diagram pipeline, and extended backend matrices all
+  passed through the canonical workflow controller.
+
+# B13 closure: strings and conversion
+
+- Added immutable UTF-16 strings with canonical tags, content equality, concatenation, character
+  and range operations, dense plain-string splitting, exact root relocation, and stress collection.
+- Lowered the pinned primitive surface through ideal IR and arm64 runtime operations, including
+  ASCII case conversion, `indexOf`, UTF-16 lexical relations, `String.fromCharCode`, numeric/string
+  conversion, radix formatting and parsing, and `isNaN`.
+- Audited every corpus string spelling and explicitly assigned RegExp operations to B21 and boxed
+  `new String`/general object conversion to their later dynamic builtin closure work.
+- Node, raw/optimized ideal, eight/one-register native, moving-GC stress, and ABI witnesses agree.
+  Numeric-only addition and zero-valued out-of-range `charCodeAt` mutations fail independently.
+- The focused B13 gate, predecessor inventory/array gates, 458-test quick/full gates, diagram
+  pipeline, and extended backend matrices passed before workflow advancement.
+
+# B14 closure: core builtins and uncaught `throw`
+
+- Inventoried the exact pinned Math surface and lowered every operation through explicit
+  descriptors covering arity, numeric coercion, result kind, allocation, and safepoint effects.
+- Added fractional numeric literals, Math function aliases, `Math.LN2`, exact signed-zero/NaN
+  min/max behavior, and the V8 v7 harness's deterministic Jenkins `Math.random` sequence.
+- Added canonical ideal operations and arm64 runtime lowering for builtin calls and uncaught throws.
+  Unknown builtins fail with stable frontend diagnostics before graph or object publication.
+- Preserved the original tagged throw payload through ideal evaluation and native failure. A moving
+  collection relocates a thrown `Error` object correctly before the stable exit-70 diagnostic.
+- Perturbed-sqrt and swallowed-throw mutations fail independently. The focused B14 gate, 464-test
+  quick/full gates, diagram pipeline, and extended backend matrices passed through the controller.
+
+# B15 progress: Richards and DeltaBlue
+
+- Preserved the pinned benchmark bodies with a registration/timing-only adapter and added exact
+  Node success witnesses plus independent Richards queue and DeltaBlue projection mutations.
+- DeltaBlue now selects, emits, links, and runs its complete native kernel under normal and forced
+  moving-GC execution. The backend fixes distinguish the kernel `Start` from foreign function
+  controls and correctly place `Proj(New)` memory chains instead of silently dropping stores.
+- Richards passes raw and optimized ideal execution. The evaluator now preserves exact Fun-node
+  identity beyond the 64-target type mask, implements JavaScript excess/missing argument behavior,
+  executes control-owned dynamic effects, and handles zero-iteration memory phis.
+- Native Return selection now retains preceding calls, and live calls/property effects are selected
+  even when dynamic memory is absent from the fixed-field Return tuple. This changed Richards from
+  a vacuous three-instruction kernel to its real program; its remaining witness is a nonterminating
+  scheduler, now isolated to the emitted native semantics rather than harness or entry dispatch.
+- Added the still-red `B15.sh` gate and contract latch. DeltaBlue raw/optimized ideal inheritance,
+  Richards native termination/counters, native mutations, and the full seed/pressure matrix remain.
+
+# B15 evaluator execution-model migration
+
+- Unified top-level and function-local `CallEnd` handling: each arrival executes and publishes its
+  call before continuation-pinned effects. Removed the former eager/deferred result-use split.
+- Added arrival invalidation for control-pinned demand calls. DeltaBlue had cached `size()` across a
+  loop backedge, so the stale nonzero result executed `removeFirst()` twice and produced the former
+  `output` property failure at node 2161.
+- Moved observable array length/elements into one imperative payload keyed by the evaluator object
+  identity. Array memory versions remain ordering/alias tokens and no longer answer runtime reads.
+- `coil test tests/b12-ideal-test.coil` passes 6/6 and `coil test tests/eval-test.coil` passes 39/39.
+  Raw and optimized DeltaBlue both advance from `EV-TYPE` at node 2161 after 277 steps to
+  `EV-UNBOX` at node 1778 after 400861 steps.
+- The new first divergence is outside the repaired duplicate-pop path: the source compares
+  `u.strength == strength`, both object identities, but the generated graph unboxes the loaded
+  `strength` property as a float. The evaluator correctly reports the loaded value as object 168.
+- Plain frontend-backed `coil test` now links through the project `[link]` session but hangs after
+  entering the forked test child and calling the Go parser. Non-forked generated runners remain the
+  reliable frontend/evaluator acceptance path for this migration.
+
+# B15 native closure and property-runtime investigation
+
+- Richards and DeltaBlue both reached successful standalone native runs with their original checks;
+  B15 remains active because its raw/optimized ideal, mutation, stress, seed, and predecessor matrix
+  is the completion contract, not one successful native configuration.
+- Richards required boxed delegated call returns to contribute return-representation evidence for
+  real function owners. Recursively querying call return kinds from function return inference caused
+  an analysis cycle and emitter crash; a future generalization needs an explicit fixed point rather
+  than recursive inference.
+- DeltaBlue exposed collision-driven quadratic behavior in the native named-property side table.
+  Replacing the reverse linear fallback scan with open addressing, and rebuilding that index after
+  collector side-record compaction, reduced the recorded standalone run from roughly 171 ms to
+  4.5 ms. The remaining gap is dominated by more than 200,000 generic property ABI calls, not
+  register pressure or property lookup complexity.
+- Added persistent benchmark debug runs, normalized semantic-trace comparison, and same-process
+  Node/native timing harnesses. These are diagnostic tools; only the milestone's correctness matrix
+  can close B15.
+- The dedicated native moving-GC gate now passes raw/boxed argument, recursive root, promotion,
+  barrier, OOM, and omitted-barrier witnesses. The stale handoff that still named the earlier boxed
+  argument failure was removed after this verification.

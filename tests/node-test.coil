@@ -29,6 +29,7 @@
 (defn mk-bin [(op i64) (a i64) (b i64)] (-> i64) (n-peephole (n-new3 op 0 NO-NODE a b)))
 (defn mk-un  [(op i64) (a i64)] (-> i64) (n-peephole (n-new2 op 0 NO-NODE a)))
 (defn mk-int [(v i64)] (-> i64) (mk-con (t-int-con v)))
+(defn mk-flt-bits [(v i64)] (-> i64) (mk-con (t-flt-bits v)))
 
 ;; Finish a program: return the value, hook it to Stop, then run peepholes to a fixpoint.
 (defn mk-ret [(v i64)] (-> i64)
@@ -100,14 +101,14 @@
   (check-prog "12/4" "return int=3;")
 
   (graph-reset! 1)
-  ; inexact division leaves the integers, so it is `num` and cannot fold to a literal
+  ; inexact constant division folds to its exact IEEE-754 result
   (mk-ret (mk-bin OP-DIV (mk-int 1) (mk-int 2)))
-  (check-prog "1/2" "return (int=1/int=2);")
+  (check-prog "1/2" "return flt=0.5;")
 
   (graph-reset! 1)
-  ; division by zero is an infinity, which is a float, so again no integer to fold to
+  ; division by zero folds to the IEEE-754 infinity constant
   (mk-ret (mk-bin OP-DIV (mk-int 1) (mk-int 0)))
-  (check-prog "1/0" "return (int=1/int=0);"))
+  (check-prog "1/0" "return flt=inf;"))
 
 (deftest folds-comparisons
   (graph-reset! 1)
@@ -130,6 +131,19 @@
   (mk-ret (mk-un OP-MINUS (mk-int 5)))
   (check-prog "-5" "return int=-5;"))
 
+(deftest folds_ieee_comparisons_without_assuming_nan_reflexivity
+  (graph-reset! 1)
+  (let [nan (mk-flt-bits 9221120237041090560)]
+    (assert (= (n-ty (mk-bin OP-EQ nan nan)) (t-bool-con false)))
+    (assert (= (n-ty (mk-bin OP-LT nan (mk-int 1))) (t-bool-con false))))
+  (graph-reset! 1)
+  (assert (= (n-ty (mk-bin OP-EQ (mk-flt-bits 0)
+                                  (mk-flt-bits -9223372036854775808)))
+             (t-bool-con true)))
+  (assert (= (n-ty (mk-bin OP-LT (mk-flt-bits 9218868437227405312)
+                                  (mk-flt-bits -4503599627370496)))
+             (t-bool-con false))))
+
 ; ---------------------------------------------------------------------------
 ; Algebraic identities, which need a non-constant operand to be visible
 ; ---------------------------------------------------------------------------
@@ -143,9 +157,9 @@
   (check-prog "arg*1" "return arg;")
 
   (graph-reset! 1)
-  ; x*0 is 0 for integers. It is NOT for floats, where x could be NaN or an infinity.
+  ; An unbounded integer refinement can be negative, and negative * +0 is -0.
   (mk-ret (mk-bin OP-MUL (mk-arg (t-int)) (mk-int 0)))
-  (check-prog "arg*0" "return int=0;")
+  (check-prog "arg*0" "return (arg*int=0);")
 
   (graph-reset! 1)
   (let [a (mk-arg (t-int))]
@@ -241,8 +255,10 @@
     (assert (= (n-peephole (n-new3 OP-SUB 0 NO-NODE a (mk-int 0))) a))
     (assert (= (n-peephole (n-new3 OP-MUL 0 NO-NODE a (mk-int 1))) a))
     (assert (= (n-peephole (n-new2 OP-MINUS 0 NO-NODE (mk-un OP-MINUS a))) a))
-    (assert (n-int-con? (n-peephole (n-new3 OP-MUL 0 NO-NODE a (mk-int 0))) 0))
-    (assert (= (n-ty (n-peephole (n-new3 OP-EQ 0 NO-NODE a a))) (t-bool-con true)))))
+    (assert (= (n-ty (n-peephole (n-new3 OP-EQ 0 NO-NODE a a))) (t-bool-con true))))
+  (let [nonnegative (mk-arg (t-int-range 0 TY-IMAX))]
+    (assert (n-int-con?
+      (n-peephole (n-new3 OP-MUL 0 NO-NODE nonnegative (mk-int 0))) 0))))
 
 ; ---------------------------------------------------------------------------
 ; Cast: the one rewrite that deletes a type check
@@ -324,23 +340,23 @@
 (deftest gvn-sees-through-commutativity
   (graph-reset! 1)
   ; (arg+2) - (2+arg). Canonical operand order makes both Adds structurally identical, value
-  ; numbering collapses them to one node, and then x-x folds to 0. Any one of the three
-  ; missing and this stays an expression.
+  ; numbering collapses them to one node. The subtraction stays because this broad numeric result
+  ; may have promoted, and Infinity-Infinity is NaN rather than zero.
   (let [a (mk-arg (t-int))
         l (mk-bin OP-ADD a (mk-int 2))
         r (mk-bin OP-ADD (mk-int 2) a)]
     (mk-ret (mk-bin OP-SUB l r)))
-  (check-prog "(arg+2)-(2+arg)" "return int=0;"))
+  (check-prog "(arg+2)-(2+arg)" "return ((arg+int=2)-(arg+int=2));"))
 
 (deftest gvn-dedups-identical-expressions
   (graph-reset! 1)
   (let [a (mk-arg (t-int))
         l (mk-bin OP-MUL a a)
         r (mk-bin OP-MUL a a)]
-    ; both multiplies are the same node, so this is x-x
+    ; both multiplies are the same node; promoted numeric results still exclude the x-x identity
     (assert (= l r))
     (mk-ret (mk-bin OP-SUB l r)))
-  (check-prog "(arg*arg)-(arg*arg)" "return int=0;"))
+  (check-prog "(arg*arg)-(arg*arg)" "return ((arg*arg)-(arg*arg));"))
 
 (deftest gvn-dedups-constants
   (graph-reset! 1)
@@ -369,10 +385,10 @@
     (assert (= (n-ty e) (t-int-range -2 9))))
 
   (graph-reset! 1)
-  ; an unbounded range must not pretend to a bound after overflow
+  ; an unbounded range can leave the tagged integer fast path and therefore becomes numeric
   (let [a (mk-arg (t-int))
         e (mk-bin OP-ADD a (mk-int 1))]
-    (assert (= (n-ty e) (t-int)))))
+    (assert (= (n-ty e) (t-num)))))
 
 (deftest dynamic-operands_stay_sound
   (graph-reset! 1)

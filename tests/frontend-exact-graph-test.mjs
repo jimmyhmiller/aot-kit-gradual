@@ -50,7 +50,7 @@ try {
   const run = spawnSync(executable, [], { encoding: null });
   assert.equal(run.status, 0, `${run.stdout?.toString()}\n${run.stderr?.toString()}`);
   const digest = crypto.createHash("sha256").update(run.stdout).digest("hex");
-  assert.equal(digest, "27c043eec283fd68f03acffd45f0a94933482960b3f13ea83d48be0d2967df1a",
+  assert.equal(digest, "85cdc61f8ea051a7f8ca7ffc41248e19fd8c3f413e14f68e1056a7e102445636",
     `exact frontend graph changed: ${digest}`);
   console.log(`exact TypeScript frontend graph ${digest}`);
 } finally {

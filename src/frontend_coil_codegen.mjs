@@ -143,20 +143,28 @@ export function generateCoilBuilder(program, { moduleName = "generatedfrontend" 
         case "Unary": {
           const value = expression(node.value);
           if (node.operator === "+") return value;
-          return { code: node.operator === "!" ? `(fe-bin OP-EQ ${value.code} (fe-const 0))` : `(fe-bin OP-SUB (fe-const 0) ${value.code})`, type: infer(node, env, expected) };
+          const code = node.operator === "!" ? `(fe-bin OP-EQ ${value.code} (fe-const 0))`
+            : node.operator === "~" ? `(n-new2 OP-BITNOT 0 NO-NODE ${value.code})`
+            : `(fe-bin OP-SUB (fe-const 0) ${value.code})`;
+          return { code, type: infer(node, env, expected) };
         }
         case "Binary": {
-          if (["=", "+=", "-="].includes(node.operator)) {
+          if (["=", "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=", "<<=", ">>=", ">>>="].includes(node.operator)) {
             if (node.left.kind !== "Name") throw new Error(`frontend Coil lowering only assigns locals at ${node.range.file}:${node.range.start.line}`);
             const right = expression(node.right, env.get(node.left.symbol.id));
-            const value = node.operator === "=" ? right.code : `(fe-bin ${node.operator === "+=" ? "OP-ADD" : "OP-SUB"} (load ${symbolVar(node.left.symbol.id)}) ${right.code})`;
+            const compound = ({ "+=": "OP-ADD", "-=": "OP-SUB", "*=": "OP-MUL", "/=": "OP-DIV",
+              "%=": "OP-MOD", "&=": "OP-BITAND", "|=": "OP-BITOR", "^=": "OP-BITXOR",
+              "<<=": "OP-SHL", ">>=": "OP-SHR", ">>>=": "OP-USHR" })[node.operator];
+            const value = node.operator === "=" ? right.code : `(fe-bin ${compound} (load ${symbolVar(node.left.symbol.id)}) ${right.code})`;
             return { code: `(let [assigned ${value}] (do (store! ${symbolVar(node.left.symbol.id)} assigned) assigned))`, type: env.get(node.left.symbol.id) };
           }
           const left = expression(node.left), right = expression(node.right);
           if (node.operator === ">") return { code: `(fe-bin OP-LT ${right.code} ${left.code})`, type: infer(node, env, expected) };
           if (node.operator === ">=") return { code: `(fe-bin OP-LE ${right.code} ${left.code})`, type: infer(node, env, expected) };
           if (node.operator === "!==") return { code: `(fe-bin OP-EQ (fe-bin OP-EQ ${left.code} ${right.code}) (fe-const 0))`, type: infer(node, env, expected) };
-          const op = ({ "+": "OP-ADD", "-": "OP-SUB", "*": "OP-MUL", "/": "OP-DIV",
+          const op = ({ "+": "OP-ADD", "-": "OP-SUB", "*": "OP-MUL", "/": "OP-DIV", "%": "OP-MOD",
+            "&": "OP-BITAND", "|": "OP-BITOR", "^": "OP-BITXOR", "<<": "OP-SHL",
+            ">>": "OP-SHR", ">>>": "OP-USHR",
             "<": "OP-LT", "<=": "OP-LE", "===": "OP-EQ" })[node.operator];
           if (!op) throw new Error(`no Coil operator for ${node.operator}`);
           return { code: `(fe-bin ${op} ${left.code} ${right.code})`, type: infer(node, env, expected) };
@@ -315,3 +323,4 @@ export function generateCoilBuilder(program, { moduleName = "generatedfrontend" 
 function safe(name) {
   return name.replace(/[^A-Za-z0-9_]/g, "_");
 }
+// Independent normalized-IR oracle only. Product compilation is Coil-owned via tools/aot-compile.mjs.

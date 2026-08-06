@@ -3,23 +3,59 @@
 (module frontendnative)
 
 (import "typescriptnative" :use *)
+(import "jsbuiltin_desc" :use *)
 (import "coil.alloc" :use *)
 (import "coil.arraylist" :use *)
 (import "coil.str" :use *)
+(import "coil.slice" :use *)
 
 (const FE-ROLE-FUNCTION i64 1)
 (const FE-ROLE-PARAMETER i64 2)
 (const FE-ROLE-LOCAL i64 3)
+(const FE-ROLE-GLOBAL i64 4)
 (const FE-OK i64 0)
 (const FE-PARSE i64 1)
 (const FE-UNBOUND i64 2)
+(const FE-UNSUPPORTED i64 3)
+(const FE-TARGET i64 4)
+(const FE-CODE-UNSUPPORTED-SYNTAX i64 1001)
+(const FE-CODE-UNSUPPORTED-OPERATOR i64 1002)
+(const FE-CODE-UNBOUND-NAME i64 1003)
+(const FE-CODE-INVALID-TARGET i64 1004)
+(const FE-CODE-CONSTRUCTOR-LAYOUT i64 1005)
+(const FE-CODE-MISSING-RECEIVER i64 1006)
+(const FE-CODE-UNKNOWN-BUILTIN i64 1007)
+(const FE-RECEIVER-DYNAMIC i64 -2)
+(const FE-INTRINSIC-STRING i64 -10)
+(const FE-INTRINSIC-PARSEINT i64 -11)
+(const FE-INTRINSIC-ISNAN i64 -12)
+(const FE-INTRINSIC-UNDEFINED i64 -13)
+(const FE-INTRINSIC-NAN i64 -14)
+(const FE-INTRINSIC-MATH i64 -15)
+(const FE-INTRINSIC-ERROR i64 -16)
+(const FE-INTRINSIC-ARRAY i64 -17)
+(const FE-INTRINSIC-OBJECT i64 -18)
+
+(defn fe-intrinsic-name [(name (slice u8))] (-> i64)
+  (cond (str-eq name "String") FE-INTRINSIC-STRING
+        (str-eq name "parseInt") FE-INTRINSIC-PARSEINT
+        (str-eq name "isNaN") FE-INTRINSIC-ISNAN
+        (str-eq name "undefined") FE-INTRINSIC-UNDEFINED
+        (str-eq name "NaN") FE-INTRINSIC-NAN
+        (str-eq name "Math") FE-INTRINSIC-MATH
+        (str-eq name "Error") FE-INTRINSIC-ERROR
+        (str-eq name "Array") FE-INTRINSIC-ARRAY
+        (str-eq name "Object") FE-INTRINSIC-OBJECT
+        :else -1))
 
 (defstruct FeFunction
   [(id i64)
    (node i64)
+   (parent i64)
    (name-node i64)
    (body-node i64)
    (result-node i64)
+   (receiver-type-node i64)
    (parameter-start i64)
    (parameter-count i64)])
 
@@ -27,33 +63,53 @@
   [(id i64) (node i64) (name-node i64) (owner i64) (role i64) (type-node i64)])
 
 (defstruct FeResolution [(node i64) (symbol i64)])
+(defstruct FeCapture [(function i64) (symbol i64) (mutable bool)])
 (defstruct FeBinding [(name-node i64) (symbol i64) (depth i64)])
 (defstruct FeTypeDecl [(node i64) (name-node i64) (field-start i64) (field-count i64)])
 (defstruct FeField [(owner i64) (node i64) (name-node i64) (type-node i64)])
+(defstruct FeTarget [(label-node i64) (can-break bool) (can-continue bool)])
+(defstruct FePrototypeMethod [(constructor i64) (name-node i64) (target i64)])
+(defstruct FePrototypeParent [(constructor i64) (parent i64)])
+
+(defn fe-target-make [(label-node i64) (can-break bool) (can-continue bool)] (-> FeTarget)
+  (let [(mut target) (zeroed FeTarget)]
+    (store! (field target label-node) label-node)
+    (store! (field target can-break) can-break)
+    (store! (field target can-continue) can-continue)
+    (load target)))
 
 (defstruct NativeFrontend
   [(ast TsAst)
    (functions (ArrayList FeFunction))
    (symbols (ArrayList FeSymbol))
    (resolutions (ArrayList FeResolution))
+   (captures (ArrayList FeCapture))
    (types (ArrayList FeTypeDecl))
    (fields (ArrayList FeField))
+   (prototype-methods (ArrayList FePrototypeMethod))
+   (prototype-parents (ArrayList FePrototypeParent))
    (status i64)
-   (error-node i64)])
+   (error-node i64)
+   (error-code i64)
+   (error-role i64)])
 
 (defn fe-function-make [(id i64)
                         (node i64)
+                        (parent i64)
                         (name i64)
                         (body i64)
                         (result i64)
+                        (receiver-type i64)
                         (parameter-start i64)
                         (parameter-count i64)] (-> FeFunction)
   (let [(mut fn) (zeroed FeFunction)]
     (store! (field fn id) id)
     (store! (field fn node) node)
+    (store! (field fn parent) parent)
     (store! (field fn name-node) name)
     (store! (field fn body-node) body)
     (store! (field fn result-node) result)
+    (store! (field fn receiver-type-node) receiver-type)
     (store! (field fn parameter-start) parameter-start)
     (store! (field fn parameter-count) parameter-count)
     (load fn)))
@@ -73,6 +129,13 @@
     (store! (field resolution node) node)
     (store! (field resolution symbol) symbol)
     (load resolution)))
+
+(defn fe-capture-make [(function i64) (symbol i64)] (-> FeCapture)
+  (let [(mut capture) (zeroed FeCapture)]
+    (store! (field capture function) function)
+    (store! (field capture symbol) symbol)
+    (store! (field capture mutable) false)
+    (load capture)))
 
 (defn fe-binding-make [(name-node i64) (symbol i64) (depth i64)] (-> FeBinding)
   (let [(mut binding) (zeroed FeBinding)]
@@ -104,11 +167,240 @@
     (store! (field frontend functions) (al-new [FeFunction] a))
     (store! (field frontend symbols) (al-new [FeSymbol] a))
     (store! (field frontend resolutions) (al-new [FeResolution] a))
+    (store! (field frontend captures) (al-new [FeCapture] a))
     (store! (field frontend types) (al-new [FeTypeDecl] a))
     (store! (field frontend fields) (al-new [FeField] a))
+    (store! (field frontend prototype-methods) (al-new [FePrototypeMethod] a))
+    (store! (field frontend prototype-parents) (al-new [FePrototypeParent] a))
     (store! (field frontend status) 0)
     (store! (field frontend error-node) -1)
+    (store! (field frontend error-code) 0)
+    (store! (field frontend error-role) 0)
     (load frontend)))
+
+(defn fe-native-new-file [(source (slice u8)) (filename (slice u8)) (script-kind i64)] (-> NativeFrontend)
+  (let [a (malloc-allocator)
+        (mut frontend) (zeroed NativeFrontend)]
+    (store! (field frontend ast) (ts-open-file source filename script-kind))
+    (store! (field frontend functions) (al-new [FeFunction] a))
+    (store! (field frontend symbols) (al-new [FeSymbol] a))
+    (store! (field frontend resolutions) (al-new [FeResolution] a))
+    (store! (field frontend captures) (al-new [FeCapture] a))
+    (store! (field frontend types) (al-new [FeTypeDecl] a))
+    (store! (field frontend fields) (al-new [FeField] a))
+    (store! (field frontend prototype-methods) (al-new [FePrototypeMethod] a))
+    (store! (field frontend prototype-parents) (al-new [FePrototypeParent] a))
+    (store! (field frontend status) FE-OK)
+    (store! (field frontend error-node) -1)
+    (store! (field frontend error-code) 0)
+    (store! (field frontend error-role) 0)
+    (load frontend)))
+
+(defn fe-fail! [(frontend (mut NativeFrontend)) (code i64) (node i64) (role i64)] (-> i64)
+  (if (= (load (field frontend status)) FE-OK)
+      (do
+        (store! (field frontend status) FE-UNSUPPORTED)
+        (store! (field frontend error-code) code)
+        (store! (field frontend error-node) node)
+        (store! (field frontend error-role) role))
+      0)
+  FE-UNSUPPORTED)
+
+(defn fe-supported-binary? [(ast TsAst) (node i64)] (-> bool)
+  (let [operator-node (ts-role ast node TS-ROLE-OPERATOR 0)
+        operator (if (= operator-node -1) "" (ts-text ast operator-node))]
+    (or (str-eq operator "=")
+        (str-eq operator "+=")
+        (str-eq operator "-=")
+        (str-eq operator "*=")
+        (str-eq operator "/=")
+        (str-eq operator "%=")
+        (str-eq operator "&=")
+        (str-eq operator "|=")
+        (str-eq operator "^=")
+        (str-eq operator "<<=")
+        (str-eq operator ">>=")
+        (str-eq operator ">>>=")
+        (str-eq operator "+")
+        (str-eq operator "-")
+        (str-eq operator "*")
+        (str-eq operator "/")
+        (str-eq operator "%")
+        (str-eq operator "&")
+        (str-eq operator "|")
+        (str-eq operator "^")
+        (str-eq operator "<<")
+        (str-eq operator ">>")
+        (str-eq operator ">>>")
+        (str-eq operator "<")
+        (str-eq operator "<=")
+        (str-eq operator ">")
+        (str-eq operator ">=")
+        (str-eq operator "==")
+        (str-eq operator "!=")
+        (str-eq operator "===")
+        (str-eq operator "!==")
+        (str-eq operator "&&")
+        (str-eq operator "||")
+        (str-eq operator ","))))
+
+(defn fe-supported-prefix? [(ast TsAst) (node i64)] (-> bool)
+  (let [text (ts-text ast node)
+        operator (if (> (slice-len text) 0) (substr text 0 1) "")]
+    (or (str-eq operator "+")
+        (str-eq operator "-")
+        (str-eq operator "!")
+        (str-eq operator "~")
+        (str-eq operator "++")
+        (str-eq operator "--"))))
+
+(defn fe-supported-postfix? [(ast TsAst) (node i64)] (-> bool)
+  (let [text (ts-text ast node)
+        length (slice-len text)
+        operator (if (>= length 2) (substr text (- length 2) length) "")]
+    (or (str-eq operator "++") (str-eq operator "--"))))
+
+(defn fe-target-valid? [(frontend (ptr NativeFrontend))
+                        (targets (ptr (ArrayList FeTarget)))
+                        (node i64)
+                        (wants-continue bool)] (-> bool)
+  (let [ast (field frontend ast)
+        label (ts-role ast node TS-ROLE-LABEL 0)
+        (mut index) (- (al-len [FeTarget] (load targets)) 1)
+        (mut valid) false]
+    (loop (if (or (< (load index) 0) (load valid))
+              (break)
+              (let [target (al-get [FeTarget] (load targets) (load index))
+                    capability
+                      (if wants-continue
+                          (load (field target can-continue))
+                          (load (field target can-break)))
+                    label-match
+                      (if (= label -1)
+                          (= (load (field target label-node)) -1)
+                          (and (!= (load (field target label-node)) -1)
+                               (str-eq (ts-text ast label)
+                                       (ts-text ast (load (field target label-node))))))]
+                (if (and capability label-match) (store! valid true) 0)
+                (store! index (- (load index) 1)))))
+    (load valid)))
+
+(defn fe-active-label? [(frontend (ptr NativeFrontend))
+                        (targets (ptr (ArrayList FeTarget)))
+                        (label i64)] (-> bool)
+  (let [ast (field frontend ast)
+        (mut index) 0
+        (mut found) false]
+    (loop (if (or (>= (load index) (al-len [FeTarget] (load targets))) (load found))
+              (break)
+              (let [target (al-get [FeTarget] (load targets) (load index))]
+                (if (and (!= (load (field target label-node)) -1)
+                         (str-eq (ts-text ast label)
+                                 (ts-text ast (load (field target label-node)))))
+                    (store! found true)
+                    0)
+                (store! index (+ (load index) 1)))))
+    (load found)))
+
+(defn fe-validate-node! [(frontend (mut NativeFrontend))
+                         (node i64)
+                         (targets (mut (ArrayList FeTarget)))] (-> i64)
+  (let [ast (field frontend ast)
+        kind (ts-kind ast node)]
+    (cond (and (= kind TSK-CALL)
+               (let [callee (ts-child ast node 0)]
+                 (and (= (ts-kind ast callee) TSK-PROPERTY-ACCESS)
+                      (and (str-eq (ts-text ast (ts-child ast callee 0)) "Math")
+                           (< (jbi-find (ts-text ast callee)) 0)))))
+            (fe-fail! (mut frontend) FE-CODE-UNKNOWN-BUILTIN node TS-ROLE-CALLEE)
+          (= kind TSK-REGEXP-LITERAL) (fe-fail! (mut frontend) FE-CODE-UNSUPPORTED-SYNTAX node 0)
+          (and (= kind TSK-BINARY) (not (fe-supported-binary? ast node)))
+            (fe-fail! (mut frontend) FE-CODE-UNSUPPORTED-OPERATOR node TS-ROLE-OPERATOR)
+          (and (= kind TSK-PREFIX-UNARY) (not (fe-supported-prefix? ast node)))
+            (fe-fail! (mut frontend) FE-CODE-UNSUPPORTED-OPERATOR node TS-ROLE-OPERATOR)
+          (and (= kind TSK-POSTFIX-UNARY) (not (fe-supported-postfix? ast node)))
+            (fe-fail! (mut frontend) FE-CODE-UNSUPPORTED-OPERATOR node TS-ROLE-OPERATOR)
+          (= kind TSK-ELEMENT-ACCESS)
+            (let [(mut index) 0]
+              (loop (if (or (!= (load (field frontend status)) FE-OK)
+                            (>= (load index) (ts-child-count ast node)))
+                        (break)
+                        (do
+                          (let [child (ts-child ast node (load index))]
+                            (if (and (= (load index) 1) (= (ts-kind ast child) TSK-STRING-LITERAL))
+                                0
+                                (fe-validate-node! (mut frontend) child (mut targets))))
+                          (store! index (+ (load index) 1)))))
+              0)
+          (= kind TSK-FUNCTION-EXPRESSION)
+            (let [(mut nested-targets) (al-new [FeTarget] (malloc-allocator))
+                  body (ts-role ast node TS-ROLE-BODY 0)]
+              ;; Abrupt-control targets never cross a function boundary.
+              (fe-validate-node! (mut frontend) body (mut nested-targets))
+              (al-free! [FeTarget] (mut nested-targets))
+              0)
+          (or (= kind TSK-BREAK) (= kind TSK-CONTINUE))
+            (if (fe-target-valid? frontend targets node (= kind TSK-CONTINUE))
+                0
+                (do
+                  (store! (field frontend status) FE-TARGET)
+                  (store! (field frontend error-code) FE-CODE-INVALID-TARGET)
+                  (store! (field frontend error-node) node)
+                  (store! (field frontend error-role) TS-ROLE-LABEL)))
+          (= kind TSK-LABELED)
+            (let [label (ts-role ast node TS-ROLE-LABEL 0)
+                  statement (ts-role ast node TS-ROLE-STATEMENT 0)
+                  statement-kind (ts-kind ast statement)]
+              (if (fe-active-label? frontend targets label)
+                  (do
+                    (store! (field frontend status) FE-TARGET)
+                    (store! (field frontend error-code) FE-CODE-INVALID-TARGET)
+                    (store! (field frontend error-node) label)
+                    (store! (field frontend error-role) TS-ROLE-LABEL))
+                  (do
+                    (al-push! [FeTarget]
+                              (mut targets)
+                              (fe-target-make label
+                                              true
+                                              (or (= statement-kind TSK-DO)
+                                                  (or (= statement-kind TSK-WHILE) (= statement-kind TSK-FOR)))))
+                    (fe-validate-node! (mut frontend) statement (mut targets))
+                    (store! (field targets len) (- (al-len [FeTarget] (load targets)) 1)))))
+          (or (= kind TSK-DO) (or (= kind TSK-WHILE) (= kind TSK-FOR)))
+            (let [(mut index) 0]
+              (al-push! [FeTarget] (mut targets) (fe-target-make -1 true true))
+              (loop (if (or (>= (load index) (ts-child-count ast node))
+                            (!= (load (field frontend status)) FE-OK))
+                        (break)
+                        (do
+                          (fe-validate-node! (mut frontend) (ts-child ast node (load index)) (mut targets))
+                          (store! index (+ (load index) 1)))))
+              (store! (field targets len) (- (al-len [FeTarget] (load targets)) 1)))
+          (= kind TSK-SWITCH)
+            (let [(mut index) 0]
+              (al-push! [FeTarget] (mut targets) (fe-target-make -1 true false))
+              (loop (if (or (>= (load index) (ts-child-count ast node))
+                            (!= (load (field frontend status)) FE-OK))
+                        (break)
+                        (do
+                          (fe-validate-node! (mut frontend) (ts-child ast node (load index)) (mut targets))
+                          (store! index (+ (load index) 1)))))
+              (store! (field targets len) (- (al-len [FeTarget] (load targets)) 1)))
+          :else
+            (let [(mut index) 0]
+              (loop (if (or (!= (load (field frontend status)) FE-OK)
+                            (>= (load index) (ts-child-count ast node)))
+                        (break)
+                        (do
+                          (fe-validate-node! (mut frontend) (ts-child ast node (load index)) (mut targets))
+                          (store! index (+ (load index) 1)))))))
+    (load (field frontend status))))
+
+(defn fe-validate-supported! [(frontend (mut NativeFrontend)) (node i64)] (-> i64)
+  (let [(mut targets) (al-new [FeTarget] (malloc-allocator))]
+    (fe-validate-node! (mut frontend) node (mut targets))
+    (al-free! [FeTarget] (mut targets))
+    (load (field frontend status))))
 
 (defn fe-type-name [(frontend (ptr NativeFrontend)) (index i64)] (-> (slice u8))
   (let [type (al-get [FeTypeDecl] (load (field frontend types)) index)]
@@ -175,19 +467,338 @@
                 (store! index (+ (load index) 1)))))
     (load answer)))
 
+(defn fe-function-for-node [(frontend (ptr NativeFrontend)) (node i64)] (-> i64)
+  (let [(mut index) 0
+        (mut answer) -1]
+    (loop (if (or (>= (load index) (al-len [FeFunction] (load (field frontend functions))))
+                  (!= (load answer) -1))
+              (break)
+              (let [fn (al-get [FeFunction] (load (field frontend functions)) (load index))]
+                (if (= (load (field fn node)) node) (store! answer (load index)) 0)
+                (store! index (+ (load index) 1)))))
+    (load answer)))
+
+(defn fe-symbol-owner [(frontend (ptr NativeFrontend)) (symbol-id i64)] (-> i64)
+  (let [(mut index) 0
+        (mut answer) -1]
+    (loop (if (or (>= (load index) (al-len [FeSymbol] (load (field frontend symbols))))
+                  (!= (load answer) -1))
+              (break)
+              (let [symbol (al-get [FeSymbol] (load (field frontend symbols)) (load index))]
+                (if (= (load (field symbol id)) symbol-id)
+                    (store! answer (load (field symbol owner)))
+                    0)
+                (store! index (+ (load index) 1)))))
+    (load answer)))
+
+(defn fe-symbol-role [(frontend (ptr NativeFrontend)) (symbol-id i64)] (-> i64)
+  (let [(mut index) 0 (mut answer) 0]
+    (loop (if (or (>= (load index) (al-len [FeSymbol] (load (field frontend symbols))))
+                  (!= (load answer) 0))
+              (break)
+              (let [symbol (al-get [FeSymbol] (load (field frontend symbols)) (load index))]
+                (if (= (load (field symbol id)) symbol-id)
+                    (store! answer (load (field symbol role)))
+                    0)
+                (store! index (+ (load index) 1)))))
+    (load answer)))
+
+(defn fe-record-capture! [(frontend (mut NativeFrontend)) (function i64) (symbol i64)] (-> i64)
+  (let [(mut index) 0
+        (mut found) false]
+    (loop (if (or (>= (load index) (al-len [FeCapture] (load (field frontend captures))))
+                  (load found))
+              (break)
+              (let [capture (al-get [FeCapture] (load (field frontend captures)) (load index))]
+                (if (and (= (load (field capture function)) function)
+                         (= (load (field capture symbol)) symbol))
+                    (store! found true)
+                    0)
+                (store! index (+ (load index) 1)))))
+    (if (not (load found))
+        (al-push! [FeCapture] (mut (field frontend captures)) (fe-capture-make function symbol))
+        0)
+    symbol))
+
+(defn fe-mark-capture-mutable! [(frontend (mut NativeFrontend)) (symbol i64)] (-> i64)
+  (let [(mut index) 0]
+    (loop (if (>= (load index) (al-len [FeCapture] (load (field frontend captures))))
+              (break)
+              (do
+                (if (= (load (field (index (load (field (field frontend captures) data))
+                                           (load index))
+                                    symbol))
+                       symbol)
+                    (store! (field (index (load (field (field frontend captures) data))
+                                          (load index))
+                                   mutable)
+                            true)
+                    0)
+                (store! index (+ (load index) 1)))))
+    0))
+
+(defn fe-assignment-operator? [(ast TsAst) (node i64)] (-> bool)
+  (let [operator-node (ts-role ast node TS-ROLE-OPERATOR 0)
+        operator (if (= operator-node -1) "" (ts-text ast operator-node))]
+    (or (str-eq operator "=")
+        (str-eq operator "+=")
+        (str-eq operator "-=")
+        (str-eq operator "*=")
+        (str-eq operator "/=")
+        (str-eq operator "%=")
+        (str-eq operator "&=")
+        (str-eq operator "|=")
+        (str-eq operator "^=")
+        (str-eq operator "<<=")
+        (str-eq operator ">>=")
+        (str-eq operator ">>>="))))
+
+(defn fe-mark-mutations! [(frontend (mut NativeFrontend)) (node i64)] (-> i64)
+  (let [ast (field frontend ast)
+        kind (ts-kind ast node)
+        (mut target) -1]
+    (if (and (= kind TSK-BINARY) (fe-assignment-operator? ast node))
+        (store! target (ts-role ast node TS-ROLE-LEFT 0))
+        (if (or (= kind TSK-PREFIX-UNARY) (= kind TSK-POSTFIX-UNARY))
+            (let [text (ts-text ast node)]
+              (if (or (str-eq (substr text 0 2) "++")
+                      (or (str-eq (substr text 0 2) "--")
+                          (or (str-eq (substr text (- (slice-len text) 2) (slice-len text)) "++")
+                              (str-eq (substr text (- (slice-len text) 2) (slice-len text)) "--"))))
+                  (store! target (ts-role ast node TS-ROLE-EXPRESSION 0))
+                  0))
+            0))
+    (if (and (!= (load target) -1) (= (ts-kind ast (load target)) TSK-IDENTIFIER))
+        (let [symbol (fe-resolution-symbol frontend (load target))]
+          (if (!= symbol -1) (fe-mark-capture-mutable! (mut frontend) symbol) 0))
+        0)
+    (let [(mut index) 0]
+      (loop (if (>= (load index) (ts-child-count ast node))
+                (break)
+                (do
+                  (fe-mark-mutations! (mut frontend) (ts-child ast node (load index)))
+                  (store! index (+ (load index) 1))))))
+    0))
+
 (defn fe-function-name [(frontend (ptr NativeFrontend)) (index i64)] (-> (slice u8))
   (let [fn (al-get [FeFunction] (load (field frontend functions)) index)]
     (ts-text (field frontend ast) (load (field fn name-node)))))
+
+(defn fe-prototype-method-make [(constructor i64) (name-node i64) (target i64)] (-> FePrototypeMethod)
+  (let [(mut method) (zeroed FePrototypeMethod)]
+    (store! (field method constructor) constructor)
+    (store! (field method name-node) name-node)
+    (store! (field method target) target)
+    (load method)))
+
+(defn fe-prototype-parent-make [(constructor i64) (parent i64)] (-> FePrototypeParent)
+  (let [(mut relation) (zeroed FePrototypeParent)]
+    (store! (field relation constructor) constructor)
+    (store! (field relation parent) parent)
+    (load relation)))
+
+(defn fe-index-prototype-method! [(frontend (mut NativeFrontend)) (node i64)] (-> i64)
+  (let [ast (field frontend ast)
+        kind (ts-kind ast node)]
+    (if (= (ts-kind ast node) TSK-BINARY)
+        (let [operator-node (ts-role ast node TS-ROLE-OPERATOR 0)
+              left (ts-role ast node TS-ROLE-LEFT 0)
+              right (ts-role ast node TS-ROLE-RIGHT 0)]
+          (if (and (!= operator-node -1)
+                   (and (str-eq (ts-text ast operator-node) "=")
+                        (and (!= left -1) (= (ts-kind ast left) TSK-PROPERTY-ACCESS))))
+              (let [base (ts-child ast left 0)
+                    method-name (ts-child ast left 1)]
+                (if (= (ts-kind ast base) TSK-PROPERTY-ACCESS)
+                    (let [constructor-name (ts-child ast base 0)
+                          prototype-name (ts-child ast base 1)
+                          constructor (fe-find-function-name frontend constructor-name)
+                          target
+                            (if (= right -1) -1
+                              (if (= (ts-kind ast right) TSK-IDENTIFIER)
+                                  (fe-find-function-name frontend right)
+                                  (if (= (ts-kind ast right) TSK-FUNCTION-EXPRESSION)
+                                      (let [function-index (fe-function-for-node frontend right)]
+                                        (if (>= function-index 0)
+                                            (load (field (index (load (field (field frontend functions) data))
+                                                                function-index) id))
+                                            -1))
+                                      -1)))]
+                      (if (and (str-eq (ts-text ast prototype-name) "prototype")
+                               (and (>= constructor 0) (>= target 0)))
+                          (do
+                            ; Prototype method ABI always carries the receiver, even when this
+                            ; particular body does not read `this` (for example an empty abstract
+                            ; hook). Call sites cannot vary arity based on body usage.
+                            (if (= (load (field (index (load (field (field frontend functions) data))
+                                                        target)
+                                                 receiver-type-node))
+                                   -1)
+                                (store! (field (index (load (field (field frontend functions) data))
+                                                      target)
+                                               receiver-type-node)
+                                        FE-RECEIVER-DYNAMIC)
+                                0)
+                            (al-push! [FePrototypeMethod]
+                                      (mut (field frontend prototype-methods))
+                                      (fe-prototype-method-make constructor method-name target)))
+                          0))
+                    0))
+              0))
+        0)
+    (if (or (= kind TSK-FUNCTION-DECLARATION) (= kind TSK-FUNCTION-EXPRESSION))
+        0
+        (let [(mut index) 0]
+          (loop (if (>= (load index) (ts-child-count ast node))
+                    (break)
+                    (do
+                      (fe-index-prototype-method! (mut frontend) (ts-child ast node (load index)))
+                      (store! index (+ (load index) 1)))))))
+    0))
+
+(defn fe-index-prototype-parent! [(frontend (mut NativeFrontend)) (node i64)] (-> i64)
+  (let [ast (field frontend ast)]
+    (if (= (ts-kind ast node) TSK-CALL)
+        (let [callee (ts-child ast node 0)]
+          (if (and (= (ts-kind ast callee) TSK-PROPERTY-ACCESS)
+                   (and (str-eq (ts-text ast (ts-child ast callee 1)) "inheritsFrom")
+                        (> (ts-child-count ast node) 1)))
+              (let [constructor (fe-find-function-name frontend (ts-child ast callee 0))
+                    parent (fe-find-function-name frontend (ts-child ast node 1))]
+                (if (and (>= constructor 0) (>= parent 0))
+                    (al-push! [FePrototypeParent]
+                              (mut (field frontend prototype-parents))
+                              (fe-prototype-parent-make constructor parent))
+                    0))
+              0))
+        0)
+    (if (or (= (ts-kind ast node) TSK-FUNCTION-DECLARATION)
+            (= (ts-kind ast node) TSK-FUNCTION-EXPRESSION))
+        0
+        (let [(mut index) 0]
+          (loop (if (>= (load index) (ts-child-count ast node))
+                    (break)
+                    (do
+                      (fe-index-prototype-parent! (mut frontend) (ts-child ast node (load index)))
+                      (store! index (+ (load index) 1)))))))
+    0))
+
+(defn fe-prototype-target? [(frontend (ptr NativeFrontend)) (function-id i64)] (-> bool)
+  (let [(mut index) 0 (mut found) false]
+    (loop (if (or (>= (load index)
+                      (al-len [FePrototypeMethod] (load (field frontend prototype-methods))))
+                  (load found))
+              (break)
+              (let [method (al-get [FePrototypeMethod]
+                                   (load (field frontend prototype-methods))
+                                   (load index))]
+                (if (= (load (field method target)) function-id) (store! found true) 0)
+                (store! index (+ (load index) 1)))))
+    (load found)))
+
+; Finite polymorphic types use 63 target bits. Keep every dynamically published prototype method
+; in that compact namespace; exact-only functions may retain larger IDs because Fun/Closure nodes
+; carry their full identity independently of the summary type.
+(defn fe-prioritize-prototype-functions! [(frontend (mut NativeFrontend))] (-> i64)
+  (let [count (al-len [FeFunction] (load (field frontend functions)))
+        (mut mapping) (al-new [i64] (malloc-allocator))
+        (mut reordered) (al-new [FeFunction] (malloc-allocator))
+        (mut index) 0
+        (mut pass) 0]
+    (loop (if (>= (load index) count)
+              (break)
+              (do (al-push! [i64] (mut mapping) -1) (store! index (+ (load index) 1)))))
+    (loop (if (>= (load pass) 2)
+              (break)
+              (do
+                (store! index 0)
+                (loop (if (>= (load index) count)
+                          (break)
+                          (let [fn (al-get [FeFunction]
+                                           (load (field frontend functions))
+                                           (load index))
+                                old-id (load (field fn id))
+                                dynamic (fe-prototype-target? frontend old-id)]
+                            (if (= dynamic (= (load pass) 0))
+                                (let [new-id (al-len [FeFunction] (load reordered))
+                                      copy (stack FeFunction)]
+                                  (store! copy fn)
+                                  (al-set! [i64] (mut mapping) old-id new-id)
+                                  (store! (field copy id) new-id)
+                                  (al-push! [FeFunction] (mut reordered) (load copy)))
+                                0)
+                            (store! index (+ (load index) 1)))))
+                (store! pass (+ (load pass) 1)))))
+    (store! index 0)
+    (loop (if (>= (load index) count)
+              (break)
+              (let [fn (index (load (field reordered data)) (load index))
+                    parent (load (field fn parent))]
+                (if (>= parent 0) (store! (field fn parent) (al-get [i64] (load mapping) parent)) 0)
+                (store! index (+ (load index) 1)))))
+    (store! index 0)
+    (loop (if (>= (load index) (al-len [FeSymbol] (load (field frontend symbols))))
+              (break)
+              (let [symbol (index (load (field (field frontend symbols) data)) (load index))
+                    owner (load (field symbol owner))]
+                (if (and (>= owner 0) (< owner count))
+                    (store! (field symbol owner) (al-get [i64] (load mapping) owner))
+                    0)
+                (store! index (+ (load index) 1)))))
+    (store! index 0)
+    (loop (if (>= (load index)
+                  (al-len [FePrototypeMethod] (load (field frontend prototype-methods))))
+              (break)
+              (let [method (index (load (field (field frontend prototype-methods) data))
+                                  (load index))]
+                (store! (field method constructor)
+                        (al-get [i64] (load mapping) (load (field method constructor))))
+                (store! (field method target)
+                        (al-get [i64] (load mapping) (load (field method target))))
+                (store! index (+ (load index) 1)))))
+    (store! index 0)
+    (loop (if (>= (load index)
+                  (al-len [FePrototypeParent] (load (field frontend prototype-parents))))
+              (break)
+              (let [relation (index (load (field (field frontend prototype-parents) data))
+                                    (load index))]
+                (store! (field relation constructor)
+                        (al-get [i64] (load mapping) (load (field relation constructor))))
+                (store! (field relation parent)
+                        (al-get [i64] (load mapping) (load (field relation parent))))
+                (store! index (+ (load index) 1)))))
+    (al-free! [FeFunction] (mut (field frontend functions)))
+    (store! (field frontend functions) (load reordered))
+    (al-free! [i64] (mut mapping))
+    0))
+
+(defn fe-uses-implicit-this? [(ast TsAst) (node i64)] (-> bool)
+  (let [kind (ts-kind ast node)]
+    (if (= kind TSK-THIS)
+        true
+        (if (or (= kind TSK-FUNCTION-DECLARATION) (= kind TSK-FUNCTION-EXPRESSION))
+            false
+            (let [(mut index) 0
+                  (mut found) false]
+              (loop (if (or (>= (load index) (ts-child-count ast node)) (load found))
+                        (break)
+                        (do
+                          (if (fe-uses-implicit-this? ast (ts-child ast node (load index)))
+                              (store! found true)
+                              0)
+                          (store! index (+ (load index) 1)))))
+              (load found))))))
 
 (defn fe-symbol-name [(frontend (ptr NativeFrontend)) (index i64)] (-> (slice u8))
   (let [symbol (al-get [FeSymbol] (load (field frontend symbols)) index)]
     (ts-text (field frontend ast) (load (field symbol name-node)))))
 
-(defn fe-find-function-parts! [(frontend (mut NativeFrontend)) (node i64) (id i64)] (-> i64)
+(defn fe-find-function-parts! [(frontend (mut NativeFrontend)) (node i64) (id i64) (parent i64)] (-> i64)
   (let [ast (field frontend ast)
         (mut name) -1
         (mut body) -1
         (mut result) -1
+        (mut receiver-type) -1
         (mut parameter-start) (al-len [FeSymbol] (load (field frontend symbols)))
         (mut parameter-count) 0
         (mut index) 0]
@@ -197,27 +808,58 @@
                     kind (ts-kind ast child)]
                 (if (and (= (load name) -1) (= kind TSK-IDENTIFIER)) (store! name child) 0)
                 (if (= kind TSK-PARAMETER)
-                    (let [parameter-name (ts-child-of-kind ast child TSK-IDENTIFIER)
-                          type-node (if (> (ts-child-count ast child) 1) (ts-child ast child 1) -1)
-                          sid (al-len [FeSymbol] (load (field frontend symbols)))]
-                      (al-push! [FeSymbol]
-                                (mut (field frontend symbols))
-                                (fe-symbol-make sid child parameter-name id FE-ROLE-PARAMETER type-node))
-                      (store! parameter-count (+ (load parameter-count) 1)))
+                    (let [parameter-name (ts-role ast child TS-ROLE-NAME 0)
+                          type-node (ts-role ast child TS-ROLE-TYPE 0)]
+                      (if (and (!= parameter-name -1)
+                               (or (= (ts-kind ast parameter-name) TSK-THIS)
+                                   (str-eq (ts-text ast parameter-name) "this")))
+                          (store! receiver-type type-node)
+                          (let [sid (al-len [FeSymbol] (load (field frontend symbols)))]
+                            (al-push! [FeSymbol]
+                                      (mut (field frontend symbols))
+                                      (fe-symbol-make sid child parameter-name id FE-ROLE-PARAMETER type-node))
+                            (store! parameter-count (+ (load parameter-count) 1)))))
                     0)
                 (if (= kind TSK-BLOCK)
                     (store! body child)
                     (if (and (!= kind TSK-IDENTIFIER) (!= kind TSK-PARAMETER)) (store! result child) 0))
                 (store! index (+ (load index) 1)))))
+    (if (and (= (load receiver-type) -1)
+             (and (!= (load body) -1) (fe-uses-implicit-this? ast (load body))))
+        (store! receiver-type FE-RECEIVER-DYNAMIC)
+        0)
     (al-push! [FeFunction]
               (mut (field frontend functions))
               (fe-function-make id
                                 node
+                                parent
                                 (load name)
                                 (load body)
                                 (load result)
+                                (load receiver-type)
                                 (load parameter-start)
                                 (load parameter-count)))
+    0))
+
+;; Function identities are allocated in syntax preorder before any parameter or local identity.
+;; A nested expression records the immediately enclosing function, not merely the source file.
+(defn fe-index-functions! [(frontend (mut NativeFrontend)) (node i64) (parent i64)] (-> i64)
+  (let [ast (field frontend ast)
+        kind (ts-kind ast node)
+        (mut child-parent) parent]
+    (if (or (= kind TSK-FUNCTION-DECLARATION) (= kind TSK-FUNCTION-EXPRESSION))
+        (let [id (al-len [FeFunction] (load (field frontend functions)))]
+          (fe-find-function-parts! (mut frontend) node id parent)
+          (store! child-parent id))
+        0)
+    (let [(mut index) 0]
+      (loop (if (>= (load index) (ts-child-count ast node))
+                (break)
+                (do
+                  (fe-index-functions! (mut frontend)
+                                       (ts-child ast node (load index))
+                                       (load child-parent))
+                  (store! index (+ (load index) 1))))))
     0))
 
 (defn fe-scan-locals! [(frontend (mut NativeFrontend)) (node i64) (owner i64) (symbol-base i64)] (-> i64)
@@ -231,12 +873,36 @@
                     (mut (field frontend symbols))
                     (fe-symbol-make sid node name owner FE-ROLE-LOCAL maybe-type)))
         0)
-    (let [(mut index) 0]
-      (loop (if (>= (load index) (ts-child-count ast node))
-                (break)
-                (do
-                  (fe-scan-locals! (mut frontend) (ts-child ast node (load index)) owner symbol-base)
-                  (store! index (+ (load index) 1))))))
+    (if (= (ts-kind ast node) TSK-FUNCTION-EXPRESSION)
+        0
+        (let [(mut index) 0]
+          (loop (if (>= (load index) (ts-child-count ast node))
+                    (break)
+                    (do
+                      (fe-scan-locals! (mut frontend) (ts-child ast node (load index)) owner symbol-base)
+                      (store! index (+ (load index) 1)))))))
+    0))
+
+(defn fe-scan-globals! [(frontend (mut NativeFrontend)) (root i64) (owner i64) (symbol-base i64)] (-> i64)
+  (let [ast (field frontend ast)
+        (mut index) 0]
+    (loop (if (>= (load index) (ts-child-count ast root))
+              (break)
+              (let [statement (ts-child ast root (load index))]
+                (if (= (ts-kind ast statement) TSK-VARIABLE-STATEMENT)
+                    (let [list (ts-child ast statement 0)
+                          (mut declaration-index) 0]
+                      (loop (if (>= (load declaration-index) (ts-child-count ast list))
+                                (break)
+                                (let [declaration (ts-child ast list (load declaration-index))
+                                      name (ts-child-of-kind ast declaration TSK-IDENTIFIER)
+                                      sid (+ symbol-base (al-len [FeSymbol] (load (field frontend symbols))))]
+                                  (al-push! [FeSymbol]
+                                            (mut (field frontend symbols))
+                                            (fe-symbol-make sid declaration name owner FE-ROLE-GLOBAL -1))
+                                  (store! declaration-index (+ (load declaration-index) 1))))))
+                    0)
+                (store! index (+ (load index) 1)))))
     0))
 
 (defn fe-symbol-for-declaration [(frontend (ptr NativeFrontend)) (node i64) (owner i64)] (-> i64)
@@ -258,13 +924,73 @@
     (loop (if (or (>= (load index) (al-len [FeFunction] (load (field frontend functions)))) (!= (load answer) -1))
               (break)
               (let [fn (al-get [FeFunction] (load (field frontend functions)) (load index))]
-                (if (str-eq name (ts-text (field frontend ast) (load (field fn name-node))))
+                (if (and (= (ts-kind (field frontend ast) (load (field fn node)))
+                            TSK-FUNCTION-DECLARATION)
+                         (str-eq name (ts-text (field frontend ast) (load (field fn name-node)))))
                     (store! answer (load (field fn id)))
                     0)
                 (store! index (+ (load index) 1)))))
     (load answer)))
 
-(defn fe-resolve-name! [(frontend (mut NativeFrontend)) (bindings (ptr (ArrayList FeBinding))) (node i64)] (-> i64)
+(defn fe-main-id [(frontend (ptr NativeFrontend))] (-> i64)
+  (let [(mut index) 0 (mut answer) -1]
+    (loop (if (or (>= (load index) (al-len [FeFunction] (load (field frontend functions))))
+                  (!= (load answer) -1))
+              (break)
+              (do
+                (if (str-eq (fe-function-name frontend (load index)) "main")
+                    (store! answer (load (field (index (load (field (field frontend functions) data))
+                                                        (load index)) id)))
+                    0)
+                (store! index (+ (load index) 1)))))
+    (load answer)))
+
+(defn fe-validate-receiver-abis! [(frontend (mut NativeFrontend)) (node i64)] (-> i64)
+  (let [ast (field frontend ast)
+        kind (ts-kind ast node)
+        (mut target) -1]
+    (if (= kind TSK-NEW-EXPRESSION)
+        (do
+          (store! target (fe-find-function-name frontend (ts-child ast node 0)))
+          (if (>= (load target) 0)
+              (let [fn (al-get [FeFunction] (load (field frontend functions)) (load target))]
+                ; Untyped JavaScript constructors deliberately acquire a dynamic receiver layout
+                ; from their `this` writes and prototype publication. A declared return type with
+                ; no receiver/object layout remains the B10 ABI error.
+                (if (and (= (load (field fn receiver-type-node)) -1)
+                         (and (!= (load (field fn result-node)) -1)
+                              (= (fe-type-index-for-node frontend
+                                                       (load (field fn result-node))) -1)))
+                    (fe-fail! (mut frontend) FE-CODE-CONSTRUCTOR-LAYOUT node TS-ROLE-CALLEE)
+                    0))
+              0))
+        (if (= kind TSK-CALL)
+            (let [callee (ts-child ast node 0)]
+              (if (= (ts-kind ast callee) TSK-PROPERTY-ACCESS)
+                  (do
+                    (store! target (fe-find-function-name frontend (ts-child ast callee 1)))
+                    (if (>= (load target) 0)
+                        (let [fn (al-get [FeFunction] (load (field frontend functions)) (load target))]
+                          (if (= (load (field fn receiver-type-node)) -1)
+                              (fe-fail! (mut frontend) FE-CODE-MISSING-RECEIVER node TS-ROLE-OBJECT)
+                              0))
+                        0))
+                  0))
+            0))
+    (let [(mut i) 0]
+      (loop (if (or (>= (load i) (ts-child-count ast node))
+                    (!= (load (field frontend status)) FE-OK))
+                (break)
+                (do
+                  (fe-validate-receiver-abis! (mut frontend) (ts-child ast node (load i)))
+                  (store! i (+ (load i) 1))
+                  0))))
+    (load (field frontend status))))
+
+(defn fe-resolve-name! [(frontend (mut NativeFrontend))
+                        (bindings (ptr (ArrayList FeBinding)))
+                        (node i64)
+                        (owner i64)] (-> i64)
   (let [name (ts-text (field frontend ast) node)
         (mut index) (- (al-len [FeBinding] (load bindings)) 1)
         (mut answer) -1]
@@ -276,12 +1002,23 @@
                     0)
                 (store! index (- (load index) 1)))))
     (if (= (load answer) -1) (store! answer (fe-find-function-name frontend node)) 0)
+    (if (= (load answer) -1) (store! answer (fe-intrinsic-name name)) 0)
     (if (= (load answer) -1)
-        (do (store! (field frontend status) FE-UNBOUND) (store! (field frontend error-node) node) -1)
+        (do
+          (store! (field frontend status) FE-UNBOUND)
+          (store! (field frontend error-node) node)
+          (store! (field frontend error-code) FE-CODE-UNBOUND-NAME)
+          (store! (field frontend error-role) TS-ROLE-NAME)
+          -1)
         (do
           (al-push! [FeResolution]
                     (mut (field frontend resolutions))
                     (fe-resolution-make node (load answer)))
+          (if (and (and (>= (load answer) 0)
+                        (>= (load answer) (al-len [FeFunction] (load (field frontend functions)))))
+                   (!= (fe-symbol-owner frontend (load answer)) owner))
+              (fe-record-capture! (mut frontend) owner (load answer))
+              0)
           (load answer)))))
 
 (defn fe-resolve-node! [(frontend (mut NativeFrontend))
@@ -292,7 +1029,40 @@
   (let [ast (field frontend ast)
         kind (ts-kind ast node)]
     (cond (= (load (field frontend status)) FE-UNBOUND) 0
-          (= kind TSK-IDENTIFIER) (do (fe-resolve-name! (mut frontend) bindings node) 0)
+          (= kind TSK-IDENTIFIER) (do (fe-resolve-name! (mut frontend) bindings node owner) 0)
+          (= kind TSK-FUNCTION-EXPRESSION)
+            (let [function-index (fe-function-for-node frontend node)
+                  fn (al-get [FeFunction] (load (field frontend functions)) function-index)
+                  saved (al-len [FeBinding] (load bindings))
+                  function-id (load (field fn id))
+                  parameter-start (load (field fn parameter-start))
+                  parameter-count (load (field fn parameter-count))
+                  (mut index) 0]
+              ;; A named expression's name exists only in its own body.
+              (if (!= (load (field fn name-node)) -1)
+                  (al-push! [FeBinding]
+                            (mut bindings)
+                            (fe-binding-make (load (field fn name-node)) function-id depth))
+                  0)
+              (loop (if (>= (load index) parameter-count)
+                        (break)
+                        (let [symbol
+                                (al-get [FeSymbol]
+                                        (load (field frontend symbols))
+                                        (+ parameter-start (load index)))]
+                          (al-push! [FeBinding]
+                                    (mut bindings)
+                                    (fe-binding-make (load (field symbol name-node))
+                                                     (load (field symbol id))
+                                                     depth))
+                          (store! index (+ (load index) 1)))))
+              (fe-resolve-node! (mut frontend)
+                                (mut bindings)
+                                (load (field fn body-node))
+                                function-id
+                                (+ depth 1))
+              (store! (field bindings len) saved)
+              0)
           (= kind TSK-VARIABLE-DECLARATION)
             (let [count (ts-child-count ast node)
                   name (ts-child-of-kind ast node TSK-IDENTIFIER)
@@ -319,13 +1089,32 @@
               (store! (field bindings len) saved)
               0)
           (= kind TSK-PROPERTY-ACCESS)
-            (fe-resolve-node! (mut frontend) (mut bindings) (ts-child ast node 0) owner depth)
+            (let [object (ts-child ast node 0)]
+              (fe-resolve-node! (mut frontend) (mut bindings) object owner depth)
+              (if (= (ts-kind ast object) TSK-IDENTIFIER)
+                  (let [symbol (fe-resolution-symbol frontend object)]
+                    (if (and (>= symbol 0)
+                             (< symbol
+                                (al-len [FeFunction] (load (field frontend functions)))))
+                        ; A declaration used as a property receiver needs its JavaScript function
+                        ; object identity. A direct callee does not: capturing every call target
+                        ; would manufacture cyclic, unused closure environments.
+                        (fe-record-capture! (mut frontend) owner symbol)
+                        0))
+                  0))
           (= kind TSK-PROPERTY-ASSIGNMENT)
             (fe-resolve-node! (mut frontend)
                               (mut bindings)
                               (ts-child ast node (- (ts-child-count ast node) 1))
                               owner
                               depth)
+          (= kind TSK-LABELED)
+            (fe-resolve-node! (mut frontend)
+                              (mut bindings)
+                              (ts-role ast node TS-ROLE-STATEMENT 0)
+                              owner
+                              depth)
+          (or (= kind TSK-BREAK) (= kind TSK-CONTINUE)) 0
           :else
             (let [(mut index) 0]
               (loop (if (>= (load index) (ts-child-count ast node))
@@ -346,6 +1135,20 @@
         start (load (field fn parameter-start))
         count (load (field fn parameter-count))
         (mut index) 0]
+    ;; Source-file `var` bindings are hoisted and shared. The graph builder materializes them as
+    ;; main-owned closure cells, so every function resolves the same symbol identity.
+    (loop (if (>= (load index) (al-len [FeSymbol] (load (field frontend symbols))))
+              (break)
+              (let [symbol (al-get [FeSymbol] (load (field frontend symbols)) (load index))]
+                (if (= (load (field symbol role)) FE-ROLE-GLOBAL)
+                    (al-push! [FeBinding]
+                              (mut bindings)
+                              (fe-binding-make (load (field symbol name-node))
+                                               (load (field symbol id))
+                                               0))
+                    0)
+                (store! index (+ (load index) 1)))))
+    (store! index 0)
     (loop (if (>= (load index) count)
               (break)
               (let [symbol (al-get [FeSymbol] (load (field frontend symbols)) (+ start (load index)))]
@@ -357,65 +1160,353 @@
     (al-free! [FeBinding] (mut bindings))
     0))
 
+(defn fe-resolve-top-level! [(frontend (mut NativeFrontend)) (root i64) (owner i64)] (-> i64)
+  (let [ast (field frontend ast)
+        (mut bindings) (al-new [FeBinding] (malloc-allocator))
+        (mut index) 0]
+    (loop (if (>= (load index) (al-len [FeSymbol] (load (field frontend symbols))))
+              (break)
+              (let [symbol (al-get [FeSymbol] (load (field frontend symbols)) (load index))]
+                (if (= (load (field symbol role)) FE-ROLE-GLOBAL)
+                    (al-push! [FeBinding]
+                              (mut bindings)
+                              (fe-binding-make (load (field symbol name-node))
+                                               (load (field symbol id))
+                                               0))
+                    0)
+                (store! index (+ (load index) 1)))))
+    (store! index 0)
+    (loop (if (or (>= (load index) (ts-child-count ast root))
+                  (= (load (field frontend status)) FE-UNBOUND))
+              (break)
+              (let [statement (ts-child ast root (load index))
+                    kind (ts-kind ast statement)]
+                (if (or (= kind TSK-VARIABLE-STATEMENT) (= kind TSK-EXPRESSION-STATEMENT))
+                    (fe-resolve-node! (mut frontend) (mut bindings) statement owner 0)
+                    0)
+                (store! index (+ (load index) 1)))))
+    (al-free! [FeBinding] (mut bindings))
+    0))
+
+(defn fe-copy-global-captures! [(frontend (mut NativeFrontend)) (caller i64) (callee i64)] (-> i64)
+  (let [limit (al-len [FeCapture] (load (field frontend captures)))
+        (mut index) 0]
+    (loop (if (>= (load index) limit)
+              (break)
+              (let [capture (al-get [FeCapture] (load (field frontend captures)) (load index))]
+                (if (and (= (load (field capture function)) callee)
+                         (or (< (load (field capture symbol))
+                                (al-len [FeFunction] (load (field frontend functions))))
+                             (= (fe-symbol-role frontend (load (field capture symbol)))
+                                FE-ROLE-GLOBAL)))
+                    (fe-record-capture! (mut frontend) caller (load (field capture symbol)))
+                    0)
+                (store! index (+ (load index) 1)))))
+    0))
+
+(defn fe-copy-prototype-captures! [(frontend (mut NativeFrontend))
+                                   (caller i64)
+                                   (constructor i64)] (-> i64)
+  (let [(mut index) 0]
+    (loop (if (>= (load index)
+                  (al-len [FePrototypeMethod] (load (field frontend prototype-methods))))
+              (break)
+              (let [method
+                      (al-get [FePrototypeMethod]
+                              (load (field frontend prototype-methods))
+                              (load index))]
+                (if (= (load (field method constructor)) constructor)
+                    (fe-copy-global-captures! (mut frontend)
+                                              caller
+                                              (load (field method target)))
+                    0)
+                (store! index (+ (load index) 1)))))
+    (store! index 0)
+    (loop (if (>= (load index)
+                  (al-len [FePrototypeParent] (load (field frontend prototype-parents))))
+              (break)
+              (let [relation
+                      (al-get [FePrototypeParent]
+                              (load (field frontend prototype-parents))
+                              (load index))]
+                (if (= (load (field relation constructor)) constructor)
+                    (fe-copy-prototype-captures! (mut frontend)
+                                                 caller
+                                                 (load (field relation parent)))
+                    0)
+                (store! index (+ (load index) 1)))))
+    0))
+
+(defn fe-call-prototype-parent [(frontend (ptr NativeFrontend)) (constructor i64)] (-> i64)
+  (let [(mut index) 0 (mut answer) -1]
+    (loop (if (or (>= (load index)
+                      (al-len [FePrototypeParent] (load (field frontend prototype-parents))))
+                  (>= (load answer) 0))
+              (break)
+              (let [relation (al-get [FePrototypeParent]
+                                     (load (field frontend prototype-parents))
+                                     (load index))]
+                (if (= (load (field relation constructor)) constructor)
+                    (store! answer (load (field relation parent)))
+                    0)
+                (store! index (+ (load index) 1)))))
+    (load answer)))
+
+(defn fe-call-prototype-method [(frontend (ptr NativeFrontend))
+                                (constructor i64)
+                                (name-node i64)] (-> i64)
+  (let [ast (field frontend ast)
+        (mut current) constructor
+        (mut answer) -1
+        (mut fuel) 64]
+    (loop (if (or (< (load current) 0)
+                  (or (<= (load fuel) 0) (>= (load answer) 0)))
+              (break)
+              (let [(mut index) 0]
+                (loop (if (or (>= (load index)
+                                  (al-len [FePrototypeMethod]
+                                          (load (field frontend prototype-methods))))
+                              (>= (load answer) 0))
+                          (break)
+                          (let [method (al-get [FePrototypeMethod]
+                                               (load (field frontend prototype-methods))
+                                               (load index))]
+                            (if (and (= (load (field method constructor)) (load current))
+                                     (str-eq (ts-text ast (load (field method name-node)))
+                                             (ts-text ast name-node)))
+                                (store! answer (load (field method target)))
+                                0)
+                            (store! index (+ (load index) 1)))))
+                (if (< (load answer) 0)
+                    (store! current (fe-call-prototype-parent frontend (load current)))
+                    0)
+                (store! fuel (- (load fuel) 1)))))
+    (load answer)))
+
+(defn fe-explicit-call-target [(frontend (ptr NativeFrontend)) (node i64)] (-> i64)
+  (let [ast (field frontend ast)]
+    (if (= (ts-kind ast node) TSK-IDENTIFIER)
+        (fe-resolution-symbol frontend node)
+        (if (= (ts-kind ast node) TSK-PROPERTY-ACCESS)
+            (let [base (ts-child ast node 0)
+                  name (ts-text ast (ts-child ast node 1))]
+              (if (str-eq name "superConstructor")
+                  (fe-call-prototype-parent frontend (fe-find-function-name frontend base))
+                  (if (and (= (ts-kind ast base) TSK-PROPERTY-ACCESS)
+                           (str-eq (ts-text ast (ts-child ast base 1)) "prototype"))
+                      (let [constructor (fe-explicit-call-target frontend (ts-child ast base 0))]
+                        (if (>= constructor 0)
+                            (fe-call-prototype-method frontend constructor (ts-child ast node 1))
+                            -1))
+                      -1)))
+            -1))))
+
+(defn fe-propagate-call-captures-node! [(frontend (mut NativeFrontend))
+                                        (caller i64)
+                                        (node i64)] (-> i64)
+  (let [ast (field frontend ast)
+        kind (ts-kind ast node)]
+    (if (or (= kind TSK-CALL) (= kind TSK-NEW-EXPRESSION))
+        (let [callee-node (ts-child ast node 0)]
+          (cond (= (ts-kind ast callee-node) TSK-IDENTIFIER)
+                  (let [callee (fe-resolution-symbol frontend callee-node)]
+                    (if (and (>= callee 0)
+                             (< callee (al-len [FeFunction] (load (field frontend functions)))))
+                        (do
+                          (fe-copy-global-captures! (mut frontend) caller callee)
+                          (if (= kind TSK-NEW-EXPRESSION)
+                              (fe-copy-prototype-captures! (mut frontend) caller callee)
+                              0))
+                        0))
+                (= (ts-kind ast callee-node) TSK-PROPERTY-ACCESS)
+                  (let [name (ts-text ast (ts-child ast callee-node 1))
+                        (mut method-index) 0]
+                    (if (str-eq name "call")
+                        (let [target (fe-explicit-call-target frontend (ts-child ast callee-node 0))]
+                          (if (>= target 0)
+                              (fe-copy-global-captures! (mut frontend) caller target)
+                              0))
+                        (loop (if (>= (load method-index)
+                                  (al-len [FePrototypeMethod]
+                                          (load (field frontend prototype-methods))))
+                              (break)
+                              (let [method
+                                      (al-get [FePrototypeMethod]
+                                              (load (field frontend prototype-methods))
+                                              (load method-index))]
+                                (if (str-eq name (ts-text ast (load (field method name-node))))
+                                    (fe-copy-global-captures! (mut frontend)
+                                                              caller
+                                                              (load (field method target)))
+                                    0)
+                                (store! method-index (+ (load method-index) 1)))))))
+                :else 0))
+        0)
+    (if (or (= kind TSK-FUNCTION-DECLARATION) (= kind TSK-FUNCTION-EXPRESSION))
+        0
+        (let [(mut index) 0]
+          (loop (if (>= (load index) (ts-child-count ast node))
+                    (break)
+                    (do
+                      (fe-propagate-call-captures-node! (mut frontend)
+                                                        caller
+                                                        (ts-child ast node (load index)))
+                      (store! index (+ (load index) 1)))))))
+    0))
+
+(defn fe-propagate-call-captures! [(frontend (mut NativeFrontend))] (-> i64)
+  (let [(mut changed) true]
+    (loop (if (not (load changed))
+              (break)
+              (do
+                (let [before (al-len [FeCapture] (load (field frontend captures)))
+                      (mut function-index) 0]
+                  (loop (if (>= (load function-index)
+                                (al-len [FeFunction] (load (field frontend functions))))
+                            (break)
+                            (let [fn
+                                    (al-get [FeFunction]
+                                            (load (field frontend functions))
+                                            (load function-index))]
+                              (fe-propagate-call-captures-node! (mut frontend)
+                                                                (load (field fn id))
+                                                                (load (field fn body-node)))
+                              (store! function-index (+ (load function-index) 1)))))
+                  (store! changed (!= before (al-len [FeCapture] (load (field frontend captures))))))))
+    0)))
+
+; Prototype dispatch loads a function identity from an object before the exact implementation is
+; known. Give every prototype method the same closed-world global environment so one indirect call
+; ABI works for overloaded method names. Lexical/local captures remain specific to nested closures.
+(defn fe-normalize-prototype-captures! [(frontend (mut NativeFrontend))] (-> i64)
+  (let [function-count (al-len [FeFunction] (load (field frontend functions)))
+        original (al-len [FeCapture] (load (field frontend captures)))
+        (mut method-index) 0]
+    (loop (if (>= (load method-index)
+                  (al-len [FePrototypeMethod] (load (field frontend prototype-methods))))
+              (break)
+              (let [method (al-get [FePrototypeMethod]
+                                   (load (field frontend prototype-methods))
+                                   (load method-index))
+                    target (load (field method target))
+                    (mut capture-index) 0]
+                (loop (if (>= (load capture-index) original)
+                          (break)
+                          (let [capture (al-get [FeCapture]
+                                               (load (field frontend captures))
+                                               (load capture-index))
+                                symbol (load (field capture symbol))]
+                            (if (and (or (< symbol function-count)
+                                         (= (fe-symbol-role frontend symbol) FE-ROLE-GLOBAL))
+                                     (let [(mut scan) 0 (mut method-capture) false]
+                                       (loop (if (or (>= (load scan)
+                                                         (al-len [FePrototypeMethod]
+                                                                 (load (field frontend prototype-methods))))
+                                                     (load method-capture))
+                                                 (break)
+                                                 (let [candidate
+                                                         (al-get [FePrototypeMethod]
+                                                                 (load (field frontend prototype-methods))
+                                                                 (load scan))]
+                                                   (if (= (load (field capture function))
+                                                          (load (field candidate target)))
+                                                       (store! method-capture true)
+                                                       0)
+                                                   (store! scan (+ (load scan) 1)))))
+                                       (load method-capture)))
+                                (fe-record-capture! (mut frontend) target symbol)
+                                0)
+                            (store! capture-index (+ (load capture-index) 1)))))
+                (store! method-index (+ (load method-index) 1)))))
+    0))
+
 (defn fe-native-index! [(frontend (mut NativeFrontend))] (-> i64)
   (let [ast (field frontend ast)]
     (if (> (ts-diagnostic-count ast) 0)
-        (do (store! (field frontend status) 1) (store! (field frontend error-node) 0) 1)
-        (let [root (ts-root ast)
-              (mut index) 0
-              (mut function-count) 0]
-          ;; Type layouts are indexed by source declaration order. They do not
-          ;; consume symbol ids, matching the legacy normalized IR.
-          (loop (if (>= (load index) (ts-child-count ast root))
-                    (break)
-                    (let [node (ts-child ast root (load index))
-                          kind (ts-kind ast node)]
-                      (if (or (= kind TSK-TYPE-ALIAS-DECLARATION) (= kind TSK-INTERFACE-DECLARATION))
-                          (fe-index-type! (mut frontend) node)
-                          0)
-                      (store! index (+ (load index) 1)))))
-          ;; Function ids are allocated globally before any parameter/local id.
-          (store! index 0)
-          (loop (if (>= (load index) (ts-child-count ast root))
-                    (break)
-                    (let [node (ts-child ast root (load index))]
-                      (if (= (ts-kind ast node) TSK-FUNCTION-DECLARATION)
+        (do (store! (field frontend status) FE-PARSE) (store! (field frontend error-node) 0) FE-PARSE)
+        (let [root (ts-root ast)]
+          (fe-validate-supported! (mut frontend) root)
+          (if (!= (load (field frontend status)) FE-OK)
+              (load (field frontend status))
+              (let [(mut index) 0
+                    (mut function-count) 0]
+                ;; Type layouts are indexed by source declaration order. They do not
+                ;; consume symbol ids, matching the legacy normalized IR.
+                (loop (if (>= (load index) (ts-child-count ast root))
+                          (break)
+                          (let [node (ts-child ast root (load index))
+                                kind (ts-kind ast node)]
+                            (if (or (= kind TSK-TYPE-ALIAS-DECLARATION) (= kind TSK-INTERFACE-DECLARATION))
+                                (fe-index-type! (mut frontend) node)
+                                0)
+                            (store! index (+ (load index) 1)))))
+                ;; Function ids are allocated globally in syntax preorder before any parameter/local id.
+                (fe-index-functions! (mut frontend) root -1)
+                (store! function-count (al-len [FeFunction] (load (field frontend functions))))
+                (store! index 0)
+                (loop (if (>= (load index) (ts-child-count ast root))
+                          (break)
                           (do
-                            (fe-find-function-parts! (mut frontend) node (load function-count))
-                            (store! function-count (+ (load function-count) 1)))
-                          0)
-                      (store! index (+ (load index) 1)))))
-          ;; fe-find-function-parts! appended parameters too early. Rebase them after
-          ;; all function ids, matching frontend_ir.mjs's nextSymbol order.
-          (let [(mut si) 0]
-            (loop (if (>= (load si) (al-len [FeSymbol] (load (field frontend symbols))))
-                      (break)
+                            (fe-index-prototype-method! (mut frontend) (ts-child ast root (load index)))
+                            (fe-index-prototype-parent! (mut frontend) (ts-child ast root (load index)))
+                            (store! index (+ (load index) 1)))))
+                (fe-prioritize-prototype-functions! (mut frontend))
+                (fe-validate-receiver-abis! (mut frontend) root)
+                ;; fe-find-function-parts! appended parameters too early. Rebase them after
+                ;; all function ids, matching frontend_ir.mjs's nextSymbol order.
+                (let [(mut si) 0]
+                  (loop (if (>= (load si) (al-len [FeSymbol] (load (field frontend symbols))))
+                            (break)
+                            (do
+                              (store! (field (index (load (field (field frontend symbols) data)) (load si)) id)
+                                      (+ (load function-count) (load si)))
+                              (store! si (+ (load si) 1))))))
+                (let [main-id (fe-main-id frontend)]
+                  (if (>= main-id 0)
+                      (fe-scan-globals! (mut frontend) root main-id (load function-count))
+                      0))
+                (let [(mut fi) 0]
+                  (loop (if (>= (load fi) (al-len [FeFunction] (load (field frontend functions))))
+                            (break)
+                            (let [fn (al-get [FeFunction] (load (field frontend functions)) (load fi))]
+                              (fe-scan-locals! (mut frontend)
+                                               (load (field fn body-node))
+                                               (load (field fn id))
+                                               (load function-count))
+                              (store! fi (+ (load fi) 1))))))
+                (let [main-id (fe-main-id frontend)]
+                  (if (>= main-id 0) (fe-resolve-top-level! (mut frontend) root main-id) 0))
+                (let [(mut fi) 0]
+                  (loop (if (>= (load fi) (al-len [FeFunction] (load (field frontend functions))))
+                            (break)
+                            (let [fn (al-get [FeFunction] (load (field frontend functions)) (load fi))]
+                              ;; Nested expressions are resolved exactly where the enclosing resolver
+                              ;; encounters them, with the then-active lexical binding stack.
+                              (if (= (load (field fn parent)) -1)
+                                  (fe-resolve-function! (mut frontend) (load fi))
+                                  0)
+                              (store! fi (+ (load fi) 1)))))
+                  (if (= (load (field frontend status)) FE-OK)
+                      (fe-propagate-call-captures! (mut frontend))
+                      0)
+                  (if (= (load (field frontend status)) FE-OK)
                       (do
-                        (store! (field (index (load (field (field frontend symbols) data)) (load si)) id)
-                                (+ (load function-count) (load si)))
-                        (store! si (+ (load si) 1))))))
-          (let [(mut fi) 0]
-            (loop (if (>= (load fi) (al-len [FeFunction] (load (field frontend functions))))
-                      (break)
-                      (let [fn (al-get [FeFunction] (load (field frontend functions)) (load fi))]
-                        (fe-scan-locals! (mut frontend)
-                                         (load (field fn body-node))
-                                         (load (field fn id))
-                                         (load function-count))
-                        (store! fi (+ (load fi) 1))))))
-          (let [(mut fi) 0]
-            (loop (if (>= (load fi) (al-len [FeFunction] (load (field frontend functions))))
-                      (break)
-                      (do
-                        (fe-resolve-function! (mut frontend) (load fi))
-                        (store! fi (+ (load fi) 1)))))
-            (load (field frontend status)))))))
+                        (fe-normalize-prototype-captures! (mut frontend))
+                        (fe-propagate-call-captures! (mut frontend)))
+                      0)
+                  (if (= (load (field frontend status)) FE-OK)
+                      (fe-mark-mutations! (mut frontend) root)
+                      0)
+                  (load (field frontend status)))))))))
 
 (defn fe-native-free! [(frontend (mut NativeFrontend))] (-> i64)
   (al-free! [FeFunction] (mut (field frontend functions)))
   (al-free! [FeSymbol] (mut (field frontend symbols)))
   (al-free! [FeResolution] (mut (field frontend resolutions)))
+  (al-free! [FeCapture] (mut (field frontend captures)))
   (al-free! [FeTypeDecl] (mut (field frontend types)))
   (al-free! [FeField] (mut (field frontend fields)))
+  (al-free! [FePrototypeMethod] (mut (field frontend prototype-methods)))
+  (al-free! [FePrototypeParent] (mut (field frontend prototype-parents)))
   (ts-close! (mut (field frontend ast)))
   0)

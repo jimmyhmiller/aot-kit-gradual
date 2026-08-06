@@ -14,11 +14,15 @@ coil build tools/emit-native-gc-field-object.coil -o "$tmpdir/field-emitter" >/d
 coil build tools/emit-native-gc-argument-object.coil -o "$tmpdir/argument-emitter" >/dev/null
 coil build tools/emit-native-gc-recursive-object.coil -o "$tmpdir/recursive-emitter" >/dev/null
 coil build tools/emit-native-gc-barrier-object.coil -o "$tmpdir/barrier-emitter" >/dev/null
+coil build tools/emit-native-gc-boxed-object.coil -o "$tmpdir/boxed-emitter" >/dev/null
+coil build tools/emit-native-gc-boxed-barrier-object.coil -o "$tmpdir/boxed-barrier-emitter" >/dev/null
 "$tmpdir/emitter" > "$tmpdir/program.o"
 "$tmpdir/field-emitter" > "$tmpdir/field-program.o"
 "$tmpdir/argument-emitter" > "$tmpdir/argument-program.o"
 "$tmpdir/recursive-emitter" > "$tmpdir/recursive-program.o"
 "$tmpdir/barrier-emitter" > "$tmpdir/barrier-program.o"
+"$tmpdir/boxed-emitter" > "$tmpdir/boxed-program.o"
+"$tmpdir/boxed-barrier-emitter" > "$tmpdir/boxed-barrier-program.o"
 xcrun llvm-objdump -r "$tmpdir/program.o" | grep -q '_aot_alloc_slow'
 xcrun llvm-objdump --section-headers "$tmpdir/program.o" | grep -q '__aot_stackmap'
 
@@ -64,6 +68,15 @@ test "$(printf '%s' "$field_out" | cut -d' ' -f2)" = 4
 test "$(printf '%s' "$field_out" | cut -d' ' -f3)" = 4
 test "$(printf '%s' "$field_out" | cut -d' ' -f4)" -ge 3
 test "$(printf '%s' "$field_out" | cut -d' ' -f5)" = 4
+xcrun clang -arch arm64 -O1 -fno-omit-frame-pointer \
+  "$tmpdir/harness.c" tools/native-gc-runtime.c tools/native-gc-trampoline.S \
+  "$tmpdir/boxed-program.o" -o "$tmpdir/boxed-program"
+boxed_out=$("$tmpdir/boxed-program" stress)
+test "$(printf '%s' "$boxed_out" | cut -d' ' -f1)" = 41
+test "$(printf '%s' "$boxed_out" | cut -d' ' -f2)" -ge 4
+test "$(printf '%s' "$boxed_out" | cut -d' ' -f2)" = \
+  "$(printf '%s' "$boxed_out" | cut -d' ' -f3)"
+test "$(printf '%s' "$boxed_out" | cut -d' ' -f4)" -ge 3
 xcrun clang -arch arm64 -O1 -fno-omit-frame-pointer \
   "$tmpdir/harness.c" tools/native-gc-runtime.c tools/native-gc-trampoline.S \
   "$tmpdir/argument-program.o" -o "$tmpdir/argument-program"
@@ -151,6 +164,14 @@ xcrun clang -arch arm64 -O1 -fno-omit-frame-pointer \
   "$tmpdir/barrier-program.o" -o "$tmpdir/barrier-program"
 test "$("$tmpdir/barrier-program")" = "41 5 5 1 1"
 
+xcrun clang -arch arm64 -O1 -fno-omit-frame-pointer \
+  "$tmpdir/barrier-harness.c" tools/native-gc-runtime.c tools/native-gc-trampoline.S \
+  "$tmpdir/boxed-barrier-program.o" -o "$tmpdir/boxed-barrier-program"
+boxed_barrier_out=$("$tmpdir/boxed-barrier-program")
+test "$(printf '%s' "$boxed_barrier_out" | cut -d' ' -f1)" = 41
+test "$(printf '%s' "$boxed_barrier_out" | cut -d' ' -f4)" -ge 1
+test "$(printf '%s' "$boxed_barrier_out" | cut -d' ' -f5)" -ge 1
+
 cat > "$tmpdir/omitted-barrier-harness.c" <<'EOF'
 #include <stdint.h>
 #include <stddef.h>
@@ -174,4 +195,13 @@ omitted_barrier_status=$?
 set -e
 test "$omitted_barrier_status" = 86
 
-echo "compiled fast allocation, promotion, recursive roots, and old-to-young barriers verified; OOM and omitted barriers trapped"
+xcrun clang -arch arm64 -O1 -fno-omit-frame-pointer \
+  "$tmpdir/omitted-barrier-harness.c" tools/native-gc-runtime.c tools/native-gc-trampoline.S \
+  "$tmpdir/boxed-barrier-program.o" -o "$tmpdir/omitted-boxed-barrier-program"
+set +e
+"$tmpdir/omitted-boxed-barrier-program"
+omitted_boxed_barrier_status=$?
+set -e
+test "$omitted_boxed_barrier_status" = 86
+
+echo "compiled fast allocation, promotion, recursive raw/boxed roots, and old-to-young raw/boxed barriers verified; OOM and omitted barriers trapped"

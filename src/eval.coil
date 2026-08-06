@@ -17,26 +17,33 @@
 ;;     two variables is exactly that.
 ;;
 ;; WHAT IT REFUSES TO GUESS. Every operation the op set claims but the runtime value domain cannot
-;; represent yet returns a NAMED status rather than a plausible number. Integer overflow is the
-;; clearest case: JavaScript would promote to a double, and doing that properly needs M5's NaN
-;; boxing, so overflow reports EV-OVERFLOW instead of silently wrapping. A wrapped answer would
-;; make this oracle quietly disagree with the language it is supposed to be defining.
+;; represent yet returns a NAMED status rather than a plausible answer. Numbers are no longer such
+;; a gap: integer fast paths promote to IEEE doubles whenever JavaScript Number semantics require
+;; it, including overflow, signed zero, infinities, and canonical NaN.
 ;;
 ;; A FAILING CAST IS A COMPILER BUG, NOT A PROGRAM CONDITION. Reaching a `Cast` whose value does
 ;; not satisfy the cast means the compiler narrowed a type somewhere it had not proven, so that
 ;; gets its own status and its own test.
 (module eval)
 
-(import "coil.alloc"     :use *)
+(import "coil.alloc" :use *)
 (import "coil.arraylist" :use *)
-(import "coil.control"   :use *)
-(import "coil.io"        :use *)
-(import "coil.fmt"       :use *)
-(import "coil.slice"     :use *)
+(import "coil.control" :use *)
+(import "coil.io" :use *)
+(import "coil.fmt" :use *)
+(import "coil.slice" :use *)
 (import "coil.primitive" :as primitive)
-(import "ty"        :use *)
-(import "shape"     :use *)
-(import "node"      :use *)
+(import "ty" :use *)
+(import "shape" :use *)
+(import "node" :use *)
+(import "jsvalue" :use *)
+
+(extern free :cc c [(ptr i8)] (-> void))
+(import "jsobject" :use *)
+(import "jsint32" :use *)
+(import "jsstring" :use *)
+(import "jsbuiltin" :use *)
+(import "jsbuiltin_desc" :use *)
 
 ; ============================================================================
 ; Runtime values
@@ -53,14 +60,14 @@
   (RUndef)
   (RNull)
   (RBool [(b bool)])
-  (RInt  [(n i64)])
-  (RFlt  [(bits i64)])
-  (RObj  [(id i64)])      ; an object's identity; its shape is in the object table
-  (RStr  [(id i64)])      ; interned string identity (content table arrives with the front end)
-  (RSym  [(id i64)])
-  (RBig  [(n i64)])       ; immediate bigint subset; large limbs arrive with the runtime
-  (RFun  [(fidx i64)])
-  (RMem  [(ver i64)]))    ; a memory state, as a version in the heap arena
+  (RInt [(n i64)])
+  (RFlt [(bits i64)])
+  (RObj [(id i64)])  ; an object's identity; its shape is in the object table
+  (RStr [(id i64)])  ; interned string identity (content table arrives with the front end)
+  (RSym [(id i64)])
+  (RBig [(n i64)])  ; immediate bigint subset; large limbs arrive with the runtime
+  (RFun [(fidx i64)])
+  (RMem [(ver i64)]))  ; a memory state, as a version in the heap arena
 
 ;; The tag and the payload, so that the questions "is this the same value" and "is this a memory
 ;; state" are each answered once instead of in an N-by-N nest of matches. `rt-eq?` was that nest
@@ -72,29 +79,44 @@
 ;; check a program that makes one), and an object and a memory state are indices into their
 ;; tables, where equality IS identity.
 (const RT-UNDEF i64 0)
-(const RT-NULL  i64 1)
-(const RT-BOOL  i64 2)
-(const RT-INT   i64 3)
-(const RT-FLT   i64 4)
-(const RT-OBJ   i64 5)
-(const RT-STR   i64 6)
-(const RT-SYM   i64 7)
-(const RT-BIG   i64 8)
-(const RT-FUN   i64 9)
-(const RT-MEM   i64 10)
+(const RT-NULL i64 1)
+(const RT-BOOL i64 2)
+(const RT-INT i64 3)
+(const RT-FLT i64 4)
+(const RT-OBJ i64 5)
+(const RT-STR i64 6)
+(const RT-SYM i64 7)
+(const RT-BIG i64 8)
+(const RT-FUN i64 9)
+(const RT-MEM i64 10)
 
 (defn rt-tag [(v RtVal)] (-> i64)
   (match v
-    (RUndef [] RT-UNDEF) (RNull [] RT-NULL) (RBool [b] RT-BOOL)
-    (RInt [n] RT-INT) (RFlt [bits] RT-FLT) (RObj [id] RT-OBJ)
-    (RStr [id] RT-STR) (RSym [id] RT-SYM) (RBig [n] RT-BIG) (RFun [f] RT-FUN)
+    (RUndef [] RT-UNDEF)
+    (RNull [] RT-NULL)
+    (RBool [b] RT-BOOL)
+    (RInt [n] RT-INT)
+    (RFlt [bits] RT-FLT)
+    (RObj [id] RT-OBJ)
+    (RStr [id] RT-STR)
+    (RSym [id] RT-SYM)
+    (RBig [n] RT-BIG)
+    (RFun [f] RT-FUN)
     (RMem [ver] RT-MEM)))
 
 (defn rt-payload [(v RtVal)] (-> i64)
   (match v
-    (RUndef [] 0) (RNull [] 0) (RBool [b] (if b 1 0))
-    (RInt [n] n) (RFlt [bits] bits) (RObj [id] id)
-    (RStr [id] id) (RSym [id] id) (RBig [n] n) (RFun [f] f) (RMem [ver] ver)))
+    (RUndef [] 0)
+    (RNull [] 0)
+    (RBool [b] (if b 1 0))
+    (RInt [n] n)
+    (RFlt [bits] bits)
+    (RObj [id] id)
+    (RStr [id] id)
+    (RSym [id] id)
+    (RBig [n] n)
+    (RFun [f] f)
+    (RMem [ver] ver)))
 
 ; ---------------------------------------------------------------------------
 ; The generated-code dynamic word (D3)
@@ -103,18 +125,18 @@
 ;; consequently all source NaNs canonicalise to DYN-NAN. Preserving every NaN payload and also
 ;; adding non-double values to one 64-bit set is mathematically impossible, so this policy is part
 ;; of the representation contract rather than an accidental encoder detail.
-(const DYN-NAN   i64 9221120237041090560)
-(const DYN-UNDEF i64 9221401712017801216)
-(const DYN-NULL  i64 9221683186994511872)
-(const DYN-BOOL  i64 9221964661971222528)
-(const DYN-INT   i64 9222246136947933184)
-(const DYN-OBJ   i64 9222527611924643840)
-(const DYN-STR   i64 9222809086901354496)
-(const DYN-REF   i64 9223090561878065152)
-(const DYN-TAG-MASK i64 -281474976710656)
-(const DYN-PAYLOAD-MASK i64 281474976710655)
-(const DYN-INT-MIN i64 -140737488355328)
-(const DYN-INT-MAX i64 140737488355327)
+(const DYN-NAN i64 JSV-NAN)
+(const DYN-UNDEF i64 JSV-UNDEFINED)
+(const DYN-NULL i64 JSV-NULL)
+(const DYN-BOOL i64 JSV-BOOLEAN)
+(const DYN-INT i64 JSV-INTEGER)
+(const DYN-OBJ i64 JSV-OBJECT)
+(const DYN-STR i64 JSV-STRING)
+(const DYN-REF i64 JSV-REF)
+(const DYN-TAG-MASK i64 JSV-TAG-MASK)
+(const DYN-PAYLOAD-MASK i64 JSV-PAYLOAD-MASK)
+(const DYN-INT-MIN i64 JSV-INT-MIN)
+(const DYN-INT-MAX i64 JSV-INT-MAX)
 (const DYN-REF-ID-MASK i64 70368744177663)
 (const DYN-REF-SYM i64 0)
 (const DYN-REF-BIG i64 1)
@@ -127,56 +149,73 @@
     (RBool [b] (| DYN-BOOL (if b 1 0)))
     ; Integers outside the signed 48-bit payload become direct doubles. This preserves their JS
     ; numeric value; the `int`/`flt` distinction is an optimiser refinement, not a source tag.
-    (RInt [n] (if (and (>= n DYN-INT-MIN) (<= n DYN-INT-MAX))
-                  (| DYN-INT (& n DYN-PAYLOAD-MASK))
-                (f64-bits (cast f64 n))))
+    (RInt [n]
+          (if (and (>= n DYN-INT-MIN) (<= n DYN-INT-MAX))
+              (| DYN-INT (& n DYN-PAYLOAD-MASK))
+              (f64-bits (cast f64 n))))
     (RFlt [bits] (if (f64-nan-bits? bits) DYN-NAN bits))
-    (RObj [id] (if (and (>= id 0) (<= id DYN-PAYLOAD-MASK))
-                   (| DYN-OBJ id)
-                 (do (panic-corrupt "dyn-encode: object id does not fit the NaN payload") 0)))
-    (RStr [id] (if (and (>= id 0) (<= id DYN-PAYLOAD-MASK)) (| DYN-STR id)
-                 (do (panic-corrupt "dyn-encode: string id does not fit the NaN payload") 0)))
-    (RSym [id] (if (and (>= id 0) (<= id DYN-REF-ID-MASK)) (| DYN-REF id)
-                 (do (panic-corrupt "dyn-encode: symbol id does not fit the NaN payload") 0)))
-    (RBig [n] (if (and (>= n -35184372088832) (<= n 35184372088831))
-                 (| DYN-REF (| (<< DYN-REF-BIG 46) (& n DYN-REF-ID-MASK)))
-               (do (panic-corrupt "dyn-encode: bigint needs the future limb table") 0)))
-    (RFun [f] (if (and (>= f 0) (<= f DYN-REF-ID-MASK))
-                 (| DYN-REF (| (<< DYN-REF-FUN 46) f))
-               (do (panic-corrupt "dyn-encode: function index does not fit the NaN payload") 0)))
+    (RObj [id]
+          (if (and (>= id 0) (<= id DYN-PAYLOAD-MASK))
+              (| DYN-OBJ id)
+              (do (panic-corrupt "dyn-encode: object id does not fit the NaN payload") 0)))
+    (RStr [id]
+          (if (and (>= id 0) (<= id DYN-PAYLOAD-MASK))
+              (| DYN-STR id)
+              (do (panic-corrupt "dyn-encode: string id does not fit the NaN payload") 0)))
+    (RSym [id]
+          (if (and (>= id 0) (<= id DYN-REF-ID-MASK))
+              (| DYN-REF id)
+              (do (panic-corrupt "dyn-encode: symbol id does not fit the NaN payload") 0)))
+    (RBig [n]
+          (if (and (>= n -35184372088832) (<= n 35184372088831))
+              (| DYN-REF (| (<< DYN-REF-BIG 46) (& n DYN-REF-ID-MASK)))
+              (do (panic-corrupt "dyn-encode: bigint needs the future limb table") 0)))
+    (RFun [f]
+          (if (and (>= f 0) (<= f DYN-PAYLOAD-MASK))
+              (| JSV-FUNCTION f)
+              (let [closure (- (- 0 f) 1)]
+                (if (and (>= closure 0) (<= closure DYN-REF-ID-MASK))
+                    (| DYN-REF (| (<< DYN-REF-FUN 46) closure))
+                    (do (panic-corrupt "dyn-encode: function index does not fit the NaN payload") 0)))))
     (RMem [ver] (do (panic-corrupt "dyn-encode: a memory state is not a dynamic value") 0))))
 
 (defn dyn-decode [(word i64)] (-> RtVal)
-  (let [tag (& word DYN-TAG-MASK) payload (& word DYN-PAYLOAD-MASK)]
-    (case tag
-      DYN-UNDEF (RUndef)
-      DYN-NULL  (RNull)
-      DYN-BOOL  (RBool (!= payload 0))
-      DYN-INT   (RInt (if (!= (& payload 140737488355328) 0)
-                           (| payload DYN-TAG-MASK)
-                         payload))
-      DYN-OBJ   (RObj payload)
-      DYN-STR   (RStr payload)
-      DYN-REF   (let [kind (>> payload 46) id (& payload DYN-REF-ID-MASK)]
-                  (case kind
-                    DYN-REF-SYM (RSym id)
-                    DYN-REF-BIG (RBig (if (!= (& id 35184372088832) 0)
-                                           (| id -70368744177664) id))
-                    DYN-REF-FUN (RFun id)
-                    (do (panic-corrupt "dyn-decode: reserved reference subtype") (RUndef))))
-      (RFlt word))))
+  (let [tag (& word DYN-TAG-MASK)
+        payload (& word DYN-PAYLOAD-MASK)]
+    (case tag DYN-UNDEF
+          (RUndef) DYN-NULL
+          (RNull) DYN-BOOL
+          (RBool (!= payload 0)) DYN-INT
+          (RInt (if (!= (& payload 140737488355328) 0)
+                    (| payload DYN-TAG-MASK)
+                    payload))
+            DYN-OBJ
+          (RObj payload) DYN-STR
+          (RStr payload) JSV-FUNCTION
+          (RFun payload) DYN-REF
+          (let [kind (>> payload 46)
+                id (& payload DYN-REF-ID-MASK)]
+            (case kind DYN-REF-SYM
+                  (RSym id) DYN-REF-BIG
+                  (RBig (if (!= (& id 35184372088832) 0)
+                            (| id -70368744177664)
+                            id))
+                    DYN-REF-FUN
+                  (RFun (- 0 (+ id 1)))
+                  (do (panic-corrupt "dyn-decode: reserved reference subtype") (RUndef))))
+            (RFlt word))))
 
 ; ============================================================================
 ; Statuses
 ; ============================================================================
-(const EV-OK        i64 0)
-(const EV-STEPS     i64 1)   ; step budget exhausted: the program may not terminate
-(const EV-STUCK     i64 2)   ; control has nowhere to go, or arrived somewhere impossible
-(const EV-UNBOUND   i64 3)   ; an Arg with no bound value
-(const EV-TYPE      i64 4)   ; an operation on a value it is not defined for
-(const EV-OVERFLOW  i64 5)   ; integer overflow; JS promotes to double, which needs M5
-(const EV-CAST      i64 6)   ; a Cast whose value does not satisfy it: a COMPILER bug
-(const EV-DEAD      i64 7)   ; control reached a dead or unreachable node
+(const EV-OK i64 0)
+(const EV-STEPS i64 1)  ; step budget exhausted: the program may not terminate
+(const EV-STUCK i64 2)  ; control has nowhere to go, or arrived somewhere impossible
+(const EV-UNBOUND i64 3)  ; an Arg with no bound value
+(const EV-TYPE i64 4)  ; an operation on a value it is not defined for
+(const EV-RESERVED-5 i64 5)  ; retained so later stable status numbers do not change
+(const EV-CAST i64 6)  ; a Cast whose value does not satisfy it: a COMPILER bug
+(const EV-DEAD i64 7)  ; control reached a dead or unreachable node
 
 ;; THE TWO MEMORY CONTRACTS, and both are COMPILER bugs rather than program conditions, which is
 ;; why each gets its own status instead of being folded into EV-TYPE.
@@ -190,23 +229,27 @@
 ;;             language that is `o.z` on an object with no `z`, which is `undefined`; in THIS IR
 ;;             it is a front end that emitted a fixed-offset access without proving the shape,
 ;;             and answering `undefined` would hide exactly the guard D4 exists to require.
-(const EV-MEM       i64 8)
-(const EV-SHAPE     i64 9)
-(const EV-UNBOX     i64 10)  ; a dynamic word did not contain the representation requested
-(const EV-CALL      i64 11)  ; malformed callee, arity, or function body
+(const EV-MEM i64 8)
+(const EV-SHAPE i64 9)
+(const EV-UNBOX i64 10)  ; a dynamic word did not contain the representation requested
+(const EV-CALL i64 11)  ; malformed callee, arity, or function body
+(const EV-THROW i64 12)  ; uncaught JavaScript throw; result retains the original payload
 
 (defn ev-status-name [(s i64)] (-> (slice u8))
-  (case s
-    EV-OK "ok" EV-STEPS "step budget exhausted" EV-STUCK "control is stuck"
-    EV-UNBOUND "unbound argument" EV-TYPE "undefined for these values"
-    EV-OVERFLOW "integer overflow (JS would promote to double: needs M5)"
-    EV-CAST "a Cast was not satisfied: the compiler narrowed without proof"
-    EV-DEAD "control reached a dead node"
-    EV-MEM "a memory edge does not describe the alias class being touched"
-    EV-SHAPE "an object's shape does not carry that field: the shape was not guarded"
-    EV-UNBOX "an Unbox input did not satisfy its requested type"
-    EV-CALL "a Call did not match a closed-world function definition"
-    "?"))
+  (case s EV-OK
+        "ok" EV-STEPS
+        "step budget exhausted" EV-STUCK
+        "control is stuck" EV-UNBOUND
+        "unbound argument" EV-TYPE
+        "undefined for these values" EV-RESERVED-5
+        "reserved evaluator status" EV-CAST
+        "a Cast was not satisfied: the compiler narrowed without proof" EV-DEAD
+        "control reached a dead node" EV-MEM
+        "a memory edge does not describe the alias class being touched" EV-SHAPE
+        "an object's shape does not carry that field: the shape was not guarded" EV-UNBOX
+        "an Unbox input did not satisfy its requested type" EV-CALL
+        "a Call did not match a closed-world function definition" EV-THROW
+        "uncaught JavaScript throw" "?"))
 
 ; ============================================================================
 ; The heap: a memory state is a VALUE
@@ -233,55 +276,83 @@
 ;; checks the mask, so a miswired memory edge is EV-MEM at the node that read it instead of a
 ;; plausible value from an unrelated field. That check is most of what makes running a memory
 ;; graph evidence of anything.
-(const HV-EMPTY i64 0)   ; describes its mask, and nothing has been written to it
-(const HV-WRITE i64 1)   ; one field of one object, over a previous state
-(const HV-MERGE i64 2)   ; several states over disjoint alias classes
-(const HV-VIEW  i64 3)   ; a narrowed alias view over a wider current state
+(const HV-EMPTY i64 0)  ; describes its mask, and nothing has been written to it
+(const HV-WRITE i64 1)  ; one field of one object, over a previous state
+(const HV-MERGE i64 2)  ; several states over disjoint alias classes
+(const HV-VIEW i64 3)  ; a narrowed alias view over a wider current state
+(const HV-PROPWRITE i64 4)  ; one named own property over the property-table class
+(const HV-PROTOWRITE i64 5)  ; one object's prototype edge over the property-table class
+(const HV-ARRAYWRITE i64 6)  ; one dense array index over the property-table class
+(const HV-ARRAYRESIZE i64 7)  ; an exact array length; hides truncated older writes
 
 (defstruct HvEnt
-  [(kind  i64)
-   (prev  i64)      ; WRITE: the state this one extends; -1 otherwise
-   (mask  i64)      ; the alias classes this state describes
-   (obj   i64)      ; WRITE: which object
-   (alias i64)      ; WRITE: which class, and therefore which word
-   (val   RtVal)    ; WRITE: what was written
-   (koff  i64)      ; MERGE: the window into `hvk` holding its children
-   (klen  i64)])
+  [(kind i64)
+   (prev i64)  ; WRITE: the state this one extends; -1 otherwise
+   (mask i64)  ; the alias classes this state describes
+   (obj i64)  ; WRITE: which object
+   (alias i64)  ; WRITE: which class, and therefore which word
+   (name i64)  ; PROPWRITE: interned property name
+   (val RtVal)  ; WRITE: what was written
+   (koff i64)  ; MERGE: the window into `hvk` holding its children
+   (klen i64)])
 
-(defn hve-kind  [(e HvEnt)] (-> i64) (load (field e kind)))
-(defn hve-prev  [(e HvEnt)] (-> i64) (load (field e prev)))
-(defn hve-mask  [(e HvEnt)] (-> i64) (load (field e mask)))
-(defn hve-obj   [(e HvEnt)] (-> i64) (load (field e obj)))
-(defn hve-alias [(e HvEnt)] (-> i64) (load (field e alias)))
-(defn hve-val   [(e HvEnt)] (-> RtVal) (load (field e val)))
-(defn hve-koff  [(e HvEnt)] (-> i64) (load (field e koff)))
-(defn hve-klen  [(e HvEnt)] (-> i64) (load (field e klen)))
+(defn hve-kind [(e HvEnt)] (-> i64)
+  (load (field e kind)))
+(defn hve-prev [(e HvEnt)] (-> i64)
+  (load (field e prev)))
+(defn hve-mask [(e HvEnt)] (-> i64)
+  (load (field e mask)))
+(defn hve-obj [(e HvEnt)] (-> i64)
+  (load (field e obj)))
+(defn hve-alias [(e HvEnt)] (-> i64)
+  (load (field e alias)))
+(defn hve-name [(e HvEnt)] (-> i64)
+  (load (field e name)))
+(defn hve-val [(e HvEnt)] (-> RtVal)
+  (load (field e val)))
+(defn hve-koff [(e HvEnt)] (-> i64)
+  (load (field e koff)))
+(defn hve-klen [(e HvEnt)] (-> i64)
+  (load (field e klen)))
 
 ;; An impossible heap is a bug in this file, not a program condition, so it aborts rather than
 ;; taking a status: a status is the interpreter's report ABOUT a program, and every one of these
 ;; would be the interpreter reporting about itself.
 (defn ev-heap-panic [(msg (slice u8))] (-> i64)
   (let [w (stderr)] (ps w "eval heap: ") (ps w msg) (ps w "\n"))
-  (abort) 0)
+  (abort)
+  0)
 
-(defn hv-count [] (-> i64) (al-len [HvEnt] (load (field (ev) hv))))
+(defn hv-count [] (-> i64)
+  (al-len [HvEnt] (load (field (ev) hv))))
 
 (defn hv-ent [(v i64)] (-> HvEnt)
-  (if (and (>= v 0) (< v (hv-count))) 0
-    (do (ev-heap-panic "hv-ent: not a memory version") 0))
+  (if (and (>= v 0) (< v (hv-count)))
+      0
+      (do (ev-heap-panic "hv-ent: not a memory version") 0))
   (al-get (load (field (ev) hv)) v))
 
-(defn hv-push! [(kind i64) (prev i64) (mask i64) (obj i64) (alias i64) (val RtVal)
-                (koff i64) (klen i64)] (-> i64)
-  (let [p (ev) (mut e) (zeroed HvEnt) id (hv-count)]
-    (store! (field e kind)  kind)
-    (store! (field e prev)  prev)
-    (store! (field e mask)  mask)
-    (store! (field e obj)   obj)
+(defn hv-push! [(kind i64)
+                (prev i64)
+                (mask i64)
+                (obj i64)
+                (alias i64)
+                (name i64)
+                (val RtVal)
+                (koff i64)
+                (klen i64)] (-> i64)
+  (let [p (ev)
+        (mut e) (zeroed HvEnt)
+        id (hv-count)]
+    (store! (field e kind) kind)
+    (store! (field e prev) prev)
+    (store! (field e mask) mask)
+    (store! (field e obj) obj)
     (store! (field e alias) alias)
-    (store! (field e val)   val)
-    (store! (field e koff)  koff)
-    (store! (field e klen)  klen)
+    (store! (field e name) name)
+    (store! (field e val) val)
+    (store! (field e koff) koff)
+    (store! (field e klen) klen)
     (al-push! [HvEnt] (field p hv) (load e))
     id))
 
@@ -289,98 +360,270 @@
 ;; holds nothing. This is what an `Arg` of memory type evaluates to, which is how memory ENTERS a
 ;; graph at all (see `ev-value-in`).
 (defn hv-empty! [(mask i64)] (-> i64)
-  (hv-push! HV-EMPTY -1 mask 0 0 (RUndef) 0 0))
+  (hv-push! HV-EMPTY -1 mask 0 0 SHAPE-NO-NAME (RUndef) 0 0))
 
 (defn hv-view! [(prev i64) (mask i64)] (-> i64)
-  (hv-push! HV-VIEW prev mask 0 0 (RUndef) 0 0))
+  (hv-push! HV-VIEW prev mask 0 0 SHAPE-NO-NAME (RUndef) 0 0))
 
 ;; A store to one word. THE MASK IS THE ALIAS'S ALONE, however wide `prev` was, because that is
 ;; what `store-compute` says the type is: a Store produces the new state of ITS class and nothing
 ;; else. A chain that needs more than one class again goes through a MemMerge.
 (defn hv-write! [(prev i64) (obj i64) (alias i64) (val RtVal)] (-> i64)
-  (hv-push! HV-WRITE prev (<< 1 alias) obj alias val 0 0))
+  (let [version (hv-push! HV-WRITE prev (<< 1 alias) obj alias SHAPE-NO-NAME val 0 0)]
+    ;; Synthetic memory Args ask for the latest imperative write at call boundaries. Keep that
+    ;; answer incrementally: walking the complete version history made object-heavy benchmarks
+    ;; quadratic in the number of stores.
+    (if (and (>= alias 0) (< alias JS-PROPERTY-ALIAS))
+        (al-set! [i64] (field (ev) latest-fixed) (+ (* obj JS-PROPERTY-ALIAS) alias) version)
+        0)
+    version))
+
+(defn hv-prop-write! [(prev i64) (obj i64) (name i64) (val RtVal)] (-> i64)
+  (hv-push! HV-PROPWRITE prev (<< 1 JS-PROPERTY-ALIAS) obj JS-PROPERTY-ALIAS name val 0 0))
+
+(defn hv-proto-write! [(prev i64) (obj i64) (prototype RtVal)] (-> i64)
+  (hv-push! HV-PROTOWRITE prev (<< 1 JS-PROPERTY-ALIAS) obj JS-PROPERTY-ALIAS SHAPE-NO-NAME prototype 0 0))
+
+(defn hv-array-write! [(prev i64) (obj i64) (index i64) (value RtVal)] (-> i64)
+  (let [version (hv-push! HV-ARRAYWRITE prev (<< 1 JS-PROPERTY-ALIAS)
+                          obj JS-PROPERTY-ALIAS index value 0 0)]
+    (al-set! [i64] (field (ev) latest-array) obj version)
+    version))
+
+(defn hv-array-resize! [(prev i64) (obj i64) (length i64)] (-> i64)
+  (let [version (hv-push! HV-ARRAYRESIZE prev (<< 1 JS-PROPERTY-ALIAS)
+                          obj JS-PROPERTY-ALIAS length (RUndef) 0 0)]
+    (al-set! [i64] (field (ev) latest-array) obj version)
+    version))
 
 ;; The children must already be in `hvk` and their masks disjoint; `ev-memmerge` checks the
 ;; disjointness, because that is a claim about the GRAPH and its failure is EV-MEM rather than an
 ;; abort.
 (defn hv-merge! [(off i64) (len i64)] (-> i64)
-  (let [p (ev) (mut mask) 0 (mut i) 0]
-    (loop
-      (if (>= (load i) len) (break)
-        (do (store! mask (| (load mask) (hv-mask (al-get (load (field p hvk)) (+ off (load i))))))
-            (store! i (+ (load i) 1))
-            0)))
-    (hv-push! HV-MERGE -1 (load mask) 0 0 (RUndef) off len)))
+  (let [p (ev)
+        (mut mask) 0
+        (mut i) 0]
+    (loop (if (>= (load i) len)
+              (break)
+              (do
+                (store! mask (| (load mask) (hv-mask (al-get (load (field p hvk)) (+ off (load i))))))
+                (store! i (+ (load i) 1))
+                0)))
+    (hv-push! HV-MERGE -1 (load mask) 0 0 SHAPE-NO-NAME (RUndef) off len)))
 
-(defn hv-mask [(v i64)] (-> i64) (let [e (hv-ent v)] (hve-mask e)))
+(defn hv-mask [(v i64)] (-> i64)
+  (let [e (hv-ent v)] (hve-mask e)))
 
 ;; Which child of a merge owns this alias class. The masks are disjoint, so there is at most one,
 ;; and -1 (no child) is a legitimate answer: the class is simply not described by this state, and
 ;; the caller reports EV-MEM.
 (defn hv-kid-with [(e HvEnt) (alias i64)] (-> i64)
-  (let [p (ev) off (hve-koff e) n (hve-klen e) (mut i) 0 (mut found) -1]
-    (loop
-      (if (or (>= (load i) n) (!= (load found) -1)) (break)
-        (do (let [k (al-get (load (field p hvk)) (+ off (load i)))]
-              (if (!= (& (hv-mask k) (<< 1 alias)) 0) (store! found k) 0))
-            (store! i (+ (load i) 1))
-            0)))
+  (let [p (ev)
+        off (hve-koff e)
+        n (hve-klen e)
+        (mut i) 0
+        (mut found) -1]
+    (loop (if (or (>= (load i) n) (!= (load found) -1))
+              (break)
+              (do
+                (let [k (al-get (load (field p hvk)) (+ off (load i)))]
+                  (if (!= (& (hv-mask k) (<< 1 alias)) 0) (store! found k) 0))
+                (store! i (+ (load i) 1))
+                0)))
     (load found)))
 
 ;; The version that wrote (obj, alias) most recently, or -1. Both recursive calls are in tail
 ;; position, so a long store chain costs no stack.
 (defn hv-find [(v i64) (obj i64) (alias i64)] (-> i64)
-  (if (< v 0) -1
-    (let [e (hv-ent v)]
-      (case (hve-kind e)
-        HV-EMPTY -1
-        HV-WRITE (if (and (= (hve-obj e) obj) (= (hve-alias e) alias)) v
-                   (hv-find (hve-prev e) obj alias))
-        HV-MERGE (hv-find (hv-kid-with e alias) obj alias)
-        HV-VIEW (hv-find (hve-prev e) obj alias)
-        (do (ev-heap-panic "hv-find: a memory version with no kind") -1)))))
+  (if (< v 0)
+      -1
+      (let [e (hv-ent v)]
+        (case (hve-kind e) HV-EMPTY
+              -1 HV-WRITE
+              (if (and (= (hve-obj e) obj) (= (hve-alias e) alias))
+                  v
+                  (hv-find (hve-prev e) obj alias))
+                HV-PROPWRITE
+              (hv-find (hve-prev e) obj alias) HV-PROTOWRITE
+              (hv-find (hve-prev e) obj alias) HV-ARRAYWRITE
+              (hv-find (hve-prev e) obj alias) HV-ARRAYRESIZE
+              (hv-find (hve-prev e) obj alias) HV-MERGE
+              (hv-find (hv-kid-with e alias) obj alias) HV-VIEW
+              (hv-find (hve-prev e) obj alias) (do (ev-heap-panic "hv-find: a memory version with no kind") -1)))))
+
+;; A synthetic memory Arg denotes the imperative heap at a call/control boundary. Its narrowed
+;; persistent view can omit an older sibling branch even though that write has executed, so recover
+;; the most recently executed write for the requested object and class in that specific case.
+(defn hv-find-latest [(obj i64) (alias i64)] (-> i64)
+  (if (and (and (>= obj 0) (< obj (ev-obj-count)))
+           (and (>= alias 0) (< alias JS-PROPERTY-ALIAS)))
+      (al-get [i64] (load (field (ev) latest-fixed)) (+ (* obj JS-PROPERTY-ALIAS) alias))
+      -1))
+
+(defn hv-find-prop [(v i64) (obj i64) (name i64)] (-> i64)
+  (if (< v 0)
+      -1
+      (let [e (hv-ent v)]
+        (case (hve-kind e) HV-EMPTY
+              -1 HV-WRITE
+              (hv-find-prop (hve-prev e) obj name) HV-PROPWRITE
+              (if (and (= (hve-obj e) obj) (= (hve-name e) name))
+                  v
+                  (hv-find-prop (hve-prev e) obj name))
+                HV-PROTOWRITE
+              (hv-find-prop (hve-prev e) obj name) HV-ARRAYWRITE
+              (hv-find-prop (hve-prev e) obj name) HV-ARRAYRESIZE
+              (hv-find-prop (hve-prev e) obj name) HV-MERGE
+              (let [kid (hv-kid-with e JS-PROPERTY-ALIAS)]
+                (if (< kid 0) -1 (hv-find-prop kid obj name)))
+                HV-VIEW
+              (hv-find-prop (hve-prev e) obj name) (do (ev-heap-panic "hv-find-prop: a memory version with no kind") -1)))))
+
+(defn hv-find-proto [(v i64) (obj i64)] (-> i64)
+  (if (< v 0)
+      -1
+      (let [e (hv-ent v)]
+        (case (hve-kind e) HV-EMPTY
+              -1 HV-WRITE
+              (hv-find-proto (hve-prev e) obj) HV-PROPWRITE
+              (hv-find-proto (hve-prev e) obj) HV-PROTOWRITE
+              (if (= (hve-obj e) obj) v (hv-find-proto (hve-prev e) obj)) HV-ARRAYWRITE
+              (hv-find-proto (hve-prev e) obj) HV-ARRAYRESIZE
+              (hv-find-proto (hve-prev e) obj) HV-MERGE
+              (let [kid (hv-kid-with e JS-PROPERTY-ALIAS)]
+                (if (< kid 0) -1 (hv-find-proto kid obj)))
+                HV-VIEW
+              (hv-find-proto (hve-prev e) obj) (do (ev-heap-panic "hv-find-proto: a memory version with no kind") -1)))))
+
+(defn hv-find-array [(v i64) (obj i64) (index i64)] (-> i64)
+  (if (< v 0)
+      -1
+      (let [e (hv-ent v)]
+        (case (hve-kind e) HV-EMPTY
+              -1 HV-WRITE
+              (hv-find-array (hve-prev e) obj index) HV-PROPWRITE
+              (hv-find-array (hve-prev e) obj index) HV-PROTOWRITE
+              (hv-find-array (hve-prev e) obj index) HV-ARRAYWRITE
+              (if (and (= (hve-obj e) obj) (= (hve-name e) index))
+                  v
+                  (hv-find-array (hve-prev e) obj index))
+                HV-ARRAYRESIZE
+              (if (and (= (hve-obj e) obj) (>= index (hve-name e)))
+                  -1
+                  (hv-find-array (hve-prev e) obj index))
+                HV-MERGE
+              (let [kid (hv-kid-with e JS-PROPERTY-ALIAS)]
+                (if (< kid 0) -1 (hv-find-array kid obj index)))
+                HV-VIEW
+              (hv-find-array (hve-prev e) obj index)
+                (do (ev-heap-panic "hv-find-array: a memory version with no kind") -1)))))
+
+(defn hv-array-length [(v i64) (obj i64)] (-> i64)
+  (if (< v 0)
+      0
+      (let [e (hv-ent v)]
+        (case (hve-kind e) HV-EMPTY
+              0 HV-WRITE
+              (hv-array-length (hve-prev e) obj) HV-PROPWRITE
+              (hv-array-length (hve-prev e) obj) HV-PROTOWRITE
+              (hv-array-length (hve-prev e) obj) HV-ARRAYWRITE
+              (let [prior (hv-array-length (hve-prev e) obj)]
+                (if (= (hve-obj e) obj)
+                    (if (> (+ (hve-name e) 1) prior) (+ (hve-name e) 1) prior)
+                    prior))
+                HV-ARRAYRESIZE
+              (if (= (hve-obj e) obj) (hve-name e) (hv-array-length (hve-prev e) obj)) HV-MERGE
+              (let [kid (hv-kid-with e JS-PROPERTY-ALIAS)]
+                (if (< kid 0) 0 (hv-array-length kid obj)))
+                HV-VIEW
+              (hv-array-length (hve-prev e) obj) (do (ev-heap-panic "hv-array-length: a memory version with no kind") 0)))))
+
+(defn ev-prototype-at [(ver i64) (object i64)] (-> i64)
+  (let [version (hv-find-proto ver object)]
+    (if (< version 0)
+        JSO-NONE
+        (let [value (hve-val (hv-ent version))]
+          (if (= (rt-tag value) RT-OBJ) (rt-payload value) JSO-NONE)))))
 
 ;; The lattice type of everything this state holds, which is what `rt-ty` answers for a memory
 ;; value. Shadowed writes are included, which only makes the answer more general and so cannot
 ;; make a Cast pass that should have failed.
 (defn hv-contents [(v i64)] (-> i64)
-  (if (< v 0) (t-top)
-    (let [e (hv-ent v)]
-      (case (hve-kind e)
-        HV-EMPTY (t-top)
-        HV-WRITE (ty-meet (rt-ty (hve-val e)) (hv-contents (hve-prev e)))
-        HV-MERGE (hv-kids-contents e)
-        HV-VIEW (hv-contents (hve-prev e))
-        (do (ev-heap-panic "hv-contents: a memory version with no kind") (t-bot))))))
+  (if (< v 0)
+      (t-top)
+      (let [e (hv-ent v)]
+        (case (hve-kind e) HV-EMPTY
+              (t-top) HV-WRITE
+              (ty-meet (rt-ty (hve-val e)) (hv-contents (hve-prev e))) HV-PROPWRITE
+              (ty-meet (rt-ty (hve-val e)) (hv-contents (hve-prev e))) HV-PROTOWRITE
+              (ty-meet (rt-ty (hve-val e)) (hv-contents (hve-prev e))) HV-ARRAYWRITE
+              (ty-meet (rt-ty (hve-val e)) (hv-contents (hve-prev e))) HV-ARRAYRESIZE
+              (hv-contents (hve-prev e)) HV-MERGE
+              (hv-kids-contents e) HV-VIEW
+              (hv-contents (hve-prev e)) (do (ev-heap-panic "hv-contents: a memory version with no kind") (t-bot))))))
 
 (defn hv-kids-contents [(e HvEnt)] (-> i64)
-  (let [p (ev) off (hve-koff e) n (hve-klen e) (mut t) (t-top) (mut i) 0]
-    (loop
-      (if (>= (load i) n) (break)
-        (do (store! t (ty-meet (load t) (hv-contents (al-get (load (field p hvk)) (+ off (load i))))))
-            (store! i (+ (load i) 1))
-            0)))
+  (let [p (ev)
+        off (hve-koff e)
+        n (hve-klen e)
+        (mut t) (t-top)
+        (mut i) 0]
+    (loop (if (>= (load i) n)
+              (break)
+              (do
+                (store! t (ty-meet (load t) (hv-contents (al-get (load (field p hvk)) (+ off (load i))))))
+                (store! i (+ (load i) 1))
+                0)))
     (load t)))
 
 ; ---------------------------------------------------------------------------
 ; Objects
 ; ---------------------------------------------------------------------------
+(defstruct EvArrayElement [(object i64) (index i64) (value RtVal) (present bool)])
+
+(const EVT-CONTROL i64 1)
+(const EVT-CALL i64 2)
+(const EVT-RETURN i64 3)
+(const EVT-PROPLOAD i64 4)
+(const EVT-PROPSTORE i64 5)
+(const EVT-FAIL i64 6)
+
+(defstruct EvTraceEvent
+  [(kind i64) (step i64) (depth i64) (node i64) (context i64)
+   (object i64) (name i64) (value RtVal)])
+
 ;; AN OBJECT IS AN IDENTITY AND A SHAPE. Its FIELDS are not here: they live in the memory states,
 ;; because that is where the IR puts them. An object table that also held values would be a second
 ;; heap, and the two would drift on exactly the graph where the memory edges are wrong, which is
 ;; the graph this oracle exists to catch.
-(defn ev-obj-count [] (-> i64) (al-len [i64] (load (field (ev) objs))))
+(defn ev-obj-count [] (-> i64)
+  (al-len [i64] (load (field (ev) objs))))
 
 (defn ev-obj-new! [(shape i64)] (-> i64)
-  (if (shape-defined? shape) 0
-    (do (ev-heap-panic "ev-obj-new!: a New whose shape id is not defined") 0))
-  (let [p (ev) id (ev-obj-count)]
+  (if (shape-defined? shape)
+      0
+      (do (ev-heap-panic "ev-obj-new!: a New whose shape id is not defined") 0))
+  (let [p (ev)
+        id (ev-obj-count)
+        dynamic-id (jso-new! JSO-NONE)]
+    (if (= id dynamic-id)
+        0
+        (do (ev-heap-panic "ev-obj-new!: static and dynamic object identities diverged") 0))
     (al-push! [i64] (field p objs) shape)
+    (al-push! [i64] (field p array-lengths) 0)
+    (al-push! [i64] (field p latest-array) -1)
+    (let [(mut alias) 0]
+      (loop (if (>= (load alias) JS-PROPERTY-ALIAS)
+                (break)
+                (do
+                  (al-push! [i64] (field p latest-fixed) -1)
+                  (store! alias (+ (load alias) 1))))))
     id))
 
 (defn ev-obj-shape [(o i64)] (-> i64)
-  (if (and (>= o 0) (< o (ev-obj-count))) 0
-    (do (ev-heap-panic "ev-obj-shape: not an allocated object") 0))
+  (if (and (>= o 0) (< o (ev-obj-count)))
+      0
+      (do (ev-heap-panic "ev-obj-shape: not an allocated object") 0))
   (al-get (load (field (ev) objs)) o))
 
 ; ============================================================================
@@ -396,74 +639,146 @@
 ;; node. It was `hasphi` in M3, when a Phi was the only node whose value came from control rather
 ;; than from its inputs.
 (defstruct Ev
-  [(bound  (ArrayList bool))    ; node id -> is this Arg bound
-   (args   (ArrayList RtVal))   ; node id -> its bound value
-   (hasenv (ArrayList bool))    ; node id -> does the environment hold a value for this node
-   (env    (ArrayList RtVal))   ; node id -> that value
-   (hv     (ArrayList HvEnt))   ; the heap: every memory state this run has produced
-   (hvk    (ArrayList i64))     ; a MemMerge's children, addressed by (koff, klen)
-   (objs   (ArrayList i64))     ; object id -> its shape
-   (cfun   (ArrayList i64))     ; closure id -> closed-world function index
-   (coff   (ArrayList i64))     ; closure id -> first captured value
-   (clen   (ArrayList i64))     ; closure id -> captured value count
-   (cvals  (ArrayList RtVal))   ; flattened immutable closure environments
-   (seen   (ArrayList i64))     ; `ev-render-outcome`'s walk: object id, in DISCOVERY order
+  [(bound (ArrayList bool))  ; node id -> is this Arg bound
+   (args (ArrayList RtVal))  ; node id -> its bound value
+   (hasenv (ArrayList bool))  ; node id -> does the environment hold a value for this node
+   (env (ArrayList RtVal))  ; node id -> that value
+   (hv (ArrayList HvEnt))  ; the heap: every memory state this run has produced
+   (hvk (ArrayList i64))  ; a MemMerge's children, addressed by (koff, klen)
+   (objs (ArrayList i64))  ; object id -> its shape
+   (array-lengths (ArrayList i64))  ; object id -> current observable array length
+   (array-elements (ArrayList EvArrayElement))  ; imperative indexed payload, keyed by object id
+   (latest-fixed (ArrayList i64))  ; (object * 63 + alias) -> latest executed fixed-field write
+   (latest-array (ArrayList i64))  ; object id -> latest executed array write/resize
+   (cfun (ArrayList i64))  ; closure id -> exact ideal Fun node
+   (coff (ArrayList i64))  ; closure id -> first captured value
+   (clen (ArrayList i64))  ; closure id -> captured value count
+   (cvals (ArrayList RtVal))  ; flattened immutable closure environments
+   (seen (ArrayList i64))  ; `ev-render-outcome`'s walk: object id, in DISCOVERY order
+   (effect-head (ArrayList i64))  ; control node -> first effect controlled there
+   (effect-next (ArrayList i64))  ; effect node -> next effect on the same control
+   (frame-nodes (ArrayList i64))  ; cached nodes whose values recursive calls must restore
+   (active-funs (ArrayList i64))  ; function nodes on the active invocation stack
+   (trace (ArrayList EvTraceEvent))  ; bounded semantic events, overwritten as a ring
+   (trace-limit i64)
+   (trace-next i64)
+   (trace-enabled bool)
    (status i64)
-   (steps  i64)
-   (budget i64)                ; one caller-supplied bound shared by top-level and function CFGs
-   (depth  i64)                 ; active call frames; bounds recursive malformed programs
-   (current-mem i64)            ; latest heap version visible at a function-call boundary
+   (steps i64)
+   (budget i64)  ; one caller-supplied bound shared by top-level and function CFGs
+   (depth i64)  ; active call frames; bounds recursive malformed programs
+   (current-mem i64)  ; latest heap version visible at a function-call boundary
    (result RtVal)
-   (resmem i64)                 ; the memory version the Return carried, or -1
-   (at     i64)                 ; the node a non-OK status happened at
+   (resmem i64)  ; the memory version the Return carried, or -1
+   (at i64)  ; the node a non-OK status happened at
    (inited bool)])
 
 (defn ev [] (-> (ptr Ev))
   (let [p (static Ev)]
-    (if (load (field p inited)) 0
-      (do (store! (field p inited) true)
-          (store! (field p bound)  (al-new [bool]  (malloc-allocator)))
-          (store! (field p args)   (al-new [RtVal] (malloc-allocator)))
-          (store! (field p hasenv) (al-new [bool]  (malloc-allocator)))
-          (store! (field p env)    (al-new [RtVal] (malloc-allocator)))
-          (store! (field p hv)     (al-new [HvEnt] (malloc-allocator)))
-          (store! (field p hvk)    (al-new [i64]   (malloc-allocator)))
-          (store! (field p objs)   (al-new [i64]   (malloc-allocator)))
-          (store! (field p cfun)   (al-new [i64]   (malloc-allocator)))
-          (store! (field p coff)   (al-new [i64]   (malloc-allocator)))
-          (store! (field p clen)   (al-new [i64]   (malloc-allocator)))
-          (store! (field p cvals)  (al-new [RtVal] (malloc-allocator)))
-          (store! (field p seen)   (al-new [i64]   (malloc-allocator)))
+    (if (load (field p inited))
+        0
+        (do
+          (store! (field p inited) true)
+          (store! (field p bound) (al-new [bool] (malloc-allocator)))
+          (store! (field p args) (al-new [RtVal] (malloc-allocator)))
+          (store! (field p hasenv) (al-new [bool] (malloc-allocator)))
+          (store! (field p env) (al-new [RtVal] (malloc-allocator)))
+          (store! (field p hv) (al-new [HvEnt] (malloc-allocator)))
+          (store! (field p hvk) (al-new [i64] (malloc-allocator)))
+          (store! (field p objs) (al-new [i64] (malloc-allocator)))
+          (store! (field p array-lengths) (al-new [i64] (malloc-allocator)))
+          (store! (field p array-elements) (al-new [EvArrayElement] (malloc-allocator)))
+          (store! (field p latest-fixed) (al-new [i64] (malloc-allocator)))
+          (store! (field p latest-array) (al-new [i64] (malloc-allocator)))
+          (store! (field p cfun) (al-new [i64] (malloc-allocator)))
+          (store! (field p coff) (al-new [i64] (malloc-allocator)))
+          (store! (field p clen) (al-new [i64] (malloc-allocator)))
+          (store! (field p cvals) (al-new [RtVal] (malloc-allocator)))
+          (store! (field p seen) (al-new [i64] (malloc-allocator)))
+          (store! (field p effect-head) (al-new [i64] (malloc-allocator)))
+          (store! (field p effect-next) (al-new [i64] (malloc-allocator)))
+          (store! (field p frame-nodes) (al-new [i64] (malloc-allocator)))
+          (store! (field p active-funs) (al-new [i64] (malloc-allocator)))
+          (store! (field p trace) (al-new [EvTraceEvent] (malloc-allocator)))
+          (store! (field p trace-limit) 0)
+          (store! (field p trace-next) 0)
+          (store! (field p trace-enabled) false)
           0))
     p))
 
 ;; Sized to the graph on every run, because node ids are dense per graph and a stale table from a
 ;; previous, larger graph would be read with the wrong indices.
 (defn ev-reset! [] (-> i64)
-  (let [p (ev) n (n-count) (mut i) 0]
-    (al-clear! [bool]  (field p bound))
+  (let [p (ev)
+        n (n-count)
+        (mut i) 0]
+    (al-clear! [bool] (field p bound))
     (al-clear! [RtVal] (field p args))
-    (al-clear! [bool]  (field p hasenv))
+    (al-clear! [bool] (field p hasenv))
     (al-clear! [RtVal] (field p env))
     ; The heap belongs to ONE run. Carrying versions or object ids across runs would make a
     ; differential comparison of two builds of one program compare object identities minted in
     ; different runs, which is the one thing about an identity that must not be observable.
     (al-clear! [HvEnt] (field p hv))
-    (al-clear! [i64]   (field p hvk))
-    (al-clear! [i64]   (field p objs))
-    (al-clear! [i64]   (field p cfun))
-    (al-clear! [i64]   (field p coff))
-    (al-clear! [i64]   (field p clen))
+    (al-clear! [i64] (field p hvk))
+    (al-clear! [i64] (field p objs))
+    (al-clear! [i64] (field p array-lengths))
+    (al-clear! [EvArrayElement] (field p array-elements))
+    (al-clear! [i64] (field p latest-fixed))
+    (al-clear! [i64] (field p latest-array))
+    (jso-reset!)
+    (jso-track-shapes! false)
+    (jbi-random-reset!)
+    (al-clear! [i64] (field p cfun))
+    (al-clear! [i64] (field p coff))
+    (al-clear! [i64] (field p clen))
     (al-clear! [RtVal] (field p cvals))
-    (loop
-      (if (>= (load i) n) (break)
-        (do (al-push! [bool]  (field p bound)  false)
-            (al-push! [RtVal] (field p args)   (RUndef))
-            (al-push! [bool]  (field p hasenv) false)
-            (al-push! [RtVal] (field p env)    (RUndef))
-            (store! i (+ (load i) 1))
-            0)))
-    (al-clear! [i64]   (field p seen))
+    (al-clear! [i64] (field p effect-head))
+    (al-clear! [i64] (field p effect-next))
+    (al-clear! [i64] (field p frame-nodes))
+    (al-clear! [i64] (field p active-funs))
+    (al-clear! [EvTraceEvent] (field p trace))
+    (store! (field p trace-next) 0)
+    (loop (if (>= (load i) n)
+              (break)
+              (do
+                (al-push! [bool] (field p bound) false)
+                (al-push! [RtVal] (field p args) (RUndef))
+                (al-push! [bool] (field p hasenv) false)
+                (al-push! [RtVal] (field p env) (RUndef))
+                (al-push! [i64] (field p effect-head) NO-NODE)
+                (al-push! [i64] (field p effect-next) NO-NODE)
+                (store! i (+ (load i) 1))
+                0)))
+    ;; Prepend in descending node order so each per-control chain retains source/node order.
+    (store! i n)
+    (loop (if (<= (load i) 0)
+              (break)
+              (do
+                (store! i (- (load i) 1))
+                (if (not (n-dead? (load i)))
+                    (let [op (n-op (load i))]
+                      (if (or (= op OP-CALL)
+                              (or (= op OP-PROPLOAD)
+                                  (or (= op OP-ARRAYLOAD) (ev-effect-op? op))))
+                          (let [control (ev-effect-control (load i))]
+                            (if (>= control 0)
+                                (do
+                                  (al-set! [i64] (field p effect-next)
+                                           (load i)
+                                           (al-get [i64] (load (field p effect-head)) control))
+                                  (al-set! [i64] (field p effect-head) control (load i))
+                                  0)
+                                0))
+                          0)
+                      (if (or (= op OP-CALL)
+                              (or (= op OP-NEW)
+                                  (or (= op OP-PROPLOAD)
+                                      (or (= op OP-ARRAYLOAD) (ev-effect-op? op)))))
+                          (al-push! [i64] (field p frame-nodes) (load i))
+                          0))
+                    0))))
+    (al-clear! [i64] (field p seen))
     (store! (field p status) EV-OK)
     (store! (field p steps) 0)
     (store! (field p budget) 0)
@@ -474,33 +789,79 @@
     (store! (field p at) NO-NODE)
     0))
 
-(defn ev-bind! [(n i64) (v RtVal)] (-> i64)
+(defn ev-trace-enable! [(limit i64)] (-> i64)
   (let [p (ev)]
-    (al-set! [bool]  (field p bound) n true)
-    (al-set! [RtVal] (field p args)  n v)
+    (store! (field p trace-enabled) (> limit 0))
+    (store! (field p trace-limit) (if (> limit 0) limit 0))
+    (store! (field p trace-next) 0)
+    (al-clear! [EvTraceEvent] (field p trace))
     0))
 
-(defn ev-status [] (-> i64) (load (field (ev) status)))
-(defn ev-steps  [] (-> i64) (load (field (ev) steps)))
-(defn ev-at     [] (-> i64) (load (field (ev) at)))
-(defn ev-result [] (-> RtVal) (load (field (ev) result)))
+(defn ev-trace-disable! [] (-> i64) (ev-trace-enable! 0))
+
+(defn ev-trace-count [] (-> i64)
+  (al-len [EvTraceEvent] (load (field (ev) trace))))
+
+(defn ev-trace-event! [(kind i64) (node i64) (context i64)
+                       (object i64) (name i64) (value RtVal)] (-> i64)
+  (let [p (ev)]
+    (if (and (load (field p trace-enabled)) (> (load (field p trace-limit)) 0))
+        (let [(mut event) (zeroed EvTraceEvent)
+              limit (load (field p trace-limit))
+              index (load (field p trace-next))]
+          (store! (field event kind) kind)
+          (store! (field event step) (load (field p steps)))
+          (store! (field event depth) (load (field p depth)))
+          (store! (field event node) node)
+          (store! (field event context) context)
+          (store! (field event object) object)
+          (store! (field event name) name)
+          (store! (field event value) value)
+          (if (< (al-len [EvTraceEvent] (load (field p trace))) limit)
+              (al-push! [EvTraceEvent] (field p trace) (load event))
+              (al-set! [EvTraceEvent] (field p trace) index (load event)))
+          (store! (field p trace-next) (% (+ index 1) limit))
+          0)
+        0)))
+
+(defn ev-bind! [(n i64) (v RtVal)] (-> i64)
+  (let [p (ev)]
+    (al-set! [bool] (field p bound) n true)
+    (al-set! [RtVal] (field p args) n v)
+    0))
+
+(defn ev-status [] (-> i64)
+  (load (field (ev) status)))
+(defn ev-steps [] (-> i64)
+  (load (field (ev) steps)))
+(defn ev-at [] (-> i64)
+  (load (field (ev) at)))
+(defn ev-result [] (-> RtVal)
+  (load (field (ev) result)))
 
 ;; The memory state the Return carried, or -1 when it carried none. It is what makes the FIELDS of
 ;; a returned object observable: an object is an identity and a shape, and everything it holds
 ;; lives in the memory states, so a comparison of two runs that ignores this compares two names
 ;; and no contents.
-(defn ev-result-mem [] (-> i64) (load (field (ev) resmem)))
-(defn ev-current-mem [] (-> i64) (load (field (ev) current-mem)))
+(defn ev-result-mem [] (-> i64)
+  (load (field (ev) resmem)))
+(defn ev-current-mem [] (-> i64)
+  (load (field (ev) current-mem)))
 
 (defn ev-fail! [(s i64) (n i64)] (-> RtVal)
   (let [p (ev)]
     ; the FIRST failure is the interesting one; later ones are consequences of it
     (if (= (load (field p status)) EV-OK)
-        (do (store! (field p status) s) (store! (field p at) n) 0)
-      0)
+        (do
+          (store! (field p status) s)
+          (store! (field p at) n)
+          (ev-trace-event! EVT-FAIL n s 0 SHAPE-NO-NAME (RUndef))
+          0)
+        0)
     (RUndef)))
 
-(defn ev-failed? [] (-> bool) (!= (load (field (ev) status)) EV-OK))
+(defn ev-failed? [] (-> bool)
+  (!= (load (field (ev) status)) EV-OK))
 
 ; ============================================================================
 ; Value helpers
@@ -508,44 +869,47 @@
 ;; A runtime value's most specific type. This is how a Cast is checked and how the interpreter and
 ;; the lattice are held to the same story: membership is `ty-isa` against the same lattice the
 ;; optimiser reasoned with, not a second hand-written notion of what an int is.
+(defn ev-fun-node [(token i64)] (-> i64)
+  (if (>= token 0)
+      token
+      (al-get (load (field (ev) cfun)) (- (- 0 token) 1))))
 (defn ev-fun-fidx [(token i64)] (-> i64)
-  (if (>= token 0) token
-    (al-get (load (field (ev) cfun)) (- (- 0 token) 1))))
+  (n-aux (ev-fun-node token)))
 (defn ev-fun-closure-id [(token i64)] (-> i64)
   (if (>= token 0) -1 (- (- 0 token) 1)))
 
 (defn rt-ty [(v RtVal)] (-> i64)
   (match v
-    (RUndef  [] (t-undef))
-    (RNull   [] (t-null))
+    (RUndef [] (t-undef))
+    (RNull [] (t-null))
     (RBool [b] (t-bool-con b))
-    (RInt  [n] (t-int-con n))
-    (RFlt  [bits] (t-flt-bits bits))
+    (RInt [n] (t-int-con n))
+    (RFlt [bits] (t-flt-bits bits))
     ; An object's most specific type is its own shape, singleton. That is the claim a shape-set
     ; type is an over-approximation of, so a Cast to `obj#{s}` on an object of shape s passes and
     ; one on an object of another shape does not, which is exactly what a shape guard must mean.
-    (RObj  [id] (t-obj-shape (ev-obj-shape id)))
-    (RStr  [id] (t-str))
-    (RSym  [id] (t-kinds VK-SYM))
-    (RBig  [n] (t-kinds VK-BIG))
-    (RFun  [f] (t-fun-con (ev-fun-fidx f)))
-    (RMem  [ver] (t-mem (hv-mask ver) (hv-contents ver)))))
+    (RObj [id] (t-obj-shape (ev-obj-shape id)))
+    (RStr [id] (t-str))
+    (RSym [id] (t-kinds VK-SYM))
+    (RBig [n] (t-kinds VK-BIG))
+    (RFun [f] (t-fun-con (ev-fun-fidx f)))
+    (RMem [ver] (t-mem (hv-mask ver) (hv-contents ver)))))
 
 (defn rt-print [(w (ptr Writer)) (v RtVal)] (-> i64)
   (match v
-    (RUndef  [] (ps w "undefined"))
-    (RNull   [] (ps w "null"))
+    (RUndef [] (ps w "undefined"))
+    (RNull [] (ps w "null"))
     (RBool [b] (ps w (if b "true" "false")))
-    (RInt  [n] (do (fmt w "{d}" n) 0))
-    (RFlt  [bits] (do (fmt w "{f}" (bits-f64 bits)) 0))
+    (RInt [n] (do (fmt w "{d}" n) 0))
+    (RFlt [bits] (do (fmt w "{f}" (bits-f64 bits)) 0))
     ; the IDENTITY is in the print, because "two objects" and "one object twice" is the whole
     ; difference a fixture about allocation is asserting
-    (RObj  [id] (do (fmt w "obj{d}#{d}" id (ev-obj-shape id)) 0))
-    (RStr  [id] (do (fmt w "str#{d}" id) 0))
-    (RSym  [id] (do (fmt w "sym#{d}" id) 0))
-    (RBig  [n] (do (fmt w "{d}n" n) 0))
-    (RFun  [f] (do (fmt w "fun#{d}" f) 0))
-    (RMem  [ver] (do (fmt w "mem#{d}@{d}" (hv-mask ver) ver) 0))))
+    (RObj [id] (do (fmt w "obj{d}#{d}" id (ev-obj-shape id)) 0))
+    (RStr [id] (do (fmt w "str#{d}" id) 0))
+    (RSym [id] (do (fmt w "sym#{d}" id) 0))
+    (RBig [n] (do (fmt w "{d}n" n) 0))
+    (RFun [f] (do (fmt w "fun#{d}" f) 0))
+    (RMem [ver] (do (fmt w "mem#{d}@{d}" (hv-mask ver) ver) 0))))
 
 ;; Identity of runtime values, WITHIN ONE RUN. This is JavaScript `===` and it is what OP-EQ is
 ;; implemented with: bit equality on floats on purpose (two NaNs are the same outcome even though
@@ -566,27 +930,28 @@
 ;; make the oracle worse than useless. Both are tested against each other.
 (defn rt-truthy? [(v RtVal)] (-> bool)
   (match v
-    (RUndef  [] false)
-    (RNull   [] false)
+    (RUndef [] false)
+    (RNull [] false)
     (RBool [b] b)
-    (RInt  [n] (!= n 0))
-    (RFlt  [bits] (not (fbits-falsey? bits)))
-    (RObj  [id] true)          ; every object is truthy: `ty-can-be-truthy?`'s VK-ALWAYS-TRUTHY
-    (RStr  [id] (!= id 0))     ; string id 0 is the interned empty string
-    (RSym  [id] true)
-    (RBig  [n] (!= n 0))
-    (RFun  [f] true)
+    (RInt [n] (!= n 0))
+    (RFlt [bits] (not (fbits-falsey? bits)))
+    (RObj [id] true)  ; every object is truthy: `ty-can-be-truthy?`'s VK-ALWAYS-TRUTHY
+    (RStr [id] (!= (jss-length id) 0))
+    (RSym [id] true)
+    (RBig [n] (!= n 0))
+    (RFun [f] true)
     ; A memory state is not a condition. `ty-can-be-falsey?` and `ty-can-be-truthy?` both answer
     ; false for one, so the lattice says an If on it takes NEITHER arm; this answer is never the
     ; one used, because every caller asks `rt-condition?` first and reports EV-TYPE.
-    (RMem  [ver] false)))
+    (RMem [ver] false)))
 
 ;; Can this value be a condition at all? The verifier NOW answers this statically -- `v-need-value`
 ;; rejects a memory producer with VERR-VALUE-IS-MEM, which is the mirror of VERR-MEM-SLOT that was
 ;; missing while `op-value?` (`>= OP-CONST`) admitted Store and MemMerge. This stays anyway, and
 ;; not out of caution: the interpreter runs on graphs nobody verified, including the ones a gate
 ;; builds by hand to provoke a failure, and a status is a better answer there than a wrong branch.
-(defn rt-condition? [(v RtVal)] (-> bool) (!= (rt-tag v) RT-MEM))
+(defn rt-condition? [(v RtVal)] (-> bool)
+  (!= (rt-tag v) RT-MEM))
 
 ; ============================================================================
 ; Data evaluation
@@ -596,67 +961,112 @@
 ;; means an op was added without teaching the oracle about it, and an oracle that silently answers
 ;; for an op it does not know is the worst possible outcome.
 (defn ev-data [(n i64)] (-> RtVal)
-  (if (= n NO-NODE) (ev-fail! EV-STUCK n)
-    (if (n-dead? n) (ev-fail! EV-DEAD n)
-      (if (ev-failed?) (RUndef)
-        (case (n-op n)
-          OP-CONST (ev-const n)
-          OP-ARG   (ev-arg n)
-          OP-PHI   (ev-phi n)
-          OP-CAST  (ev-cast n)
-          OP-BOX   (ev-box n)
-          OP-UNBOX (ev-unbox n)
-          OP-TYPETEST (ev-typetest n)
-          OP-FUN   (RFun (n-aux n))
-          OP-CLOSURE (ev-closure n)
-          OP-PARM  (ev-parm n)
-          OP-CALL  (ev-call n)
-          OP-ADD   (ev-arith n OP-ADD)
-          OP-SUB   (ev-arith n OP-SUB)
-          OP-MUL   (ev-arith n OP-MUL)
-          OP-DIV   (ev-div n)
-          OP-MINUS (ev-minus n)
-          OP-NOT   (ev-not n)
-          OP-EQ    (ev-cmp n OP-EQ)
-          OP-LT    (ev-cmp n OP-LT)
-          OP-LE    (ev-cmp n OP-LE)
-          OP-PROJ  (ev-proj n)
-          OP-LOAD  (ev-load n)
-          OP-STORE (ev-store n)
-          OP-MEMMERGE (ev-memmerge n)
-          OP-BARRIER (ev-data (n-in n 1))
-          ; A New is a MULTI node and has no single value: its object and each of its fields'
-          ; memory states are read through its projections, exactly as an If's arms are.
-          OP-NEW   (ev-fail! EV-STUCK n)
-          (do (ev-unknown-op n) (RUndef)))))))
+  (if (= n NO-NODE)
+      (ev-fail! EV-STUCK n)
+      (if (n-dead? n)
+          (ev-fail! EV-DEAD n)
+          (if (ev-failed?)
+              (RUndef)
+              (case (n-op n) OP-CONST
+                    (ev-const n) OP-ARG
+                    (ev-arg n) OP-PHI
+                    (ev-phi n) OP-CAST
+                    (ev-cast n) OP-BOX
+                    (ev-box n) OP-UNBOX
+                    (ev-unbox n) OP-TYPETEST
+                    (ev-typetest n) OP-FUN
+                    (RFun n) OP-CLOSURE
+                    (ev-closure n) OP-PARM
+                    (ev-parm n) OP-CALL
+                    (ev-call n) OP-ADD
+                    (ev-arith n OP-ADD) OP-SUB
+                    (ev-arith n OP-SUB) OP-MUL
+                    (ev-arith n OP-MUL) OP-DIV
+                    (ev-div n) OP-MINUS
+                    (ev-minus n) OP-NOT
+                    (ev-not n) OP-EQ
+                    (ev-cmp n OP-EQ) OP-LT
+                    (ev-cmp n OP-LT) OP-LE
+                    (ev-cmp n OP-LE) OP-MOD
+                    (ev-mod n) OP-BITAND
+                    (ev-bit-bin n JS-BIT-AND) OP-BITOR
+                    (ev-bit-bin n JS-BIT-OR) OP-BITXOR
+                    (ev-bit-bin n JS-BIT-XOR) OP-SHL
+                    (ev-bit-bin n JS-SHL) OP-SHR
+                    (ev-bit-bin n JS-SHR) OP-USHR
+                    (ev-bit-bin n JS-USHR) OP-BITNOT
+                    (ev-bit-not n) OP-PROJ
+                    (ev-proj n) OP-LOAD
+                    (ev-load n) OP-STORE
+                    (ev-store n) OP-PROPLOAD
+                    (ev-prop-load n) OP-PROPSTORE
+                    (ev-effect-data n) OP-SETPROTO
+                    (ev-effect-data n) OP-ARRAYMARK
+                    (ev-data (n-in n 1)) OP-ARRAYLOAD
+                    (ev-array-load n) OP-ARRAYSTORE
+                    (ev-effect-data n) OP-ARRAYLEN
+                    (ev-array-length n) OP-ARRAYRESIZE
+                    (ev-effect-data n) OP-ARRAYCOPY
+                    (ev-effect-data n) OP-STRINGCONST
+                    (RStr (n-aux n)) OP-STRINGLEN
+                    (ev-string-length n) OP-STRINGEQ
+                    (ev-string-equal n) OP-STRINGCONCAT
+                    (ev-string-concat n) OP-STRINGCHARCODE
+                    (ev-string-char-code n) OP-STRINGSUBSTRING
+                    (ev-string-substring n) OP-TOSTRING
+                    (ev-to-string n) OP-PARSEINT
+                    (ev-parse-int n) OP-ISNAN
+                    (ev-is-nan n) OP-STRINGSPLIT
+                    (ev-effect-data n) OP-STRINGFROMCODEUNIT
+                    (ev-string-from-code-unit n) OP-NUMBERTOSTRING
+                    (ev-number-to-string n) OP-STRINGLOWER
+                    (ev-string-case n false) OP-STRINGUPPER
+                    (ev-string-case n true) OP-STRINGINDEXOF
+                    (ev-string-index-of n) OP-STRINGCOMPARE
+                    (ev-string-compare n) OP-JSBUILTIN
+                    (ev-js-builtin n) OP-JSTHROW
+                    (ev-js-throw n) OP-MEMMERGE
+                    (ev-memmerge n) OP-BARRIER
+                    (ev-data (n-in n 1))
+                    ; A New is a MULTI node and has no single value: its object and each of its fields'
+                    ; memory states are read through its projections, exactly as an If's arms are.
+                    OP-NEW (ev-fail! EV-STUCK n)
+                    (do (ev-unknown-op n) (RUndef)))))))
 
 (defn ev-unknown-op [(n i64)] (-> i64)
   (let [w (stderr)]
-    (ps w "eval: no rule for op ") (ps w (op-name (n-op n)))
+    (ps w "eval: no rule for op ")
+    (ps w (op-name (n-op n)))
     (ps w "\n  The interpreter is the differential oracle. An op it does not implement must be a\n")
     (ps w "  hard error: answering anyway would make every later differential test meaningless.\n"))
-  (abort) 0)
+  (abort)
+  0)
 
 ;; A constant's value is read out of its TYPE, which is the single source of truth for what a
 ;; constant is. Anything the type says is constant but that has no runtime representation yet is a
 ;; typed failure rather than a guess.
-(defn ev-const [(n i64)] (-> RtVal) (ev-from-ty (n-ty n) n))
+(defn ev-const [(n i64)] (-> RtVal)
+  (ev-from-ty (n-ty n) n))
 
 (defn ev-from-ty [(t i64) (n i64)] (-> RtVal)
   (match (ty-get t)
     (TVal [v]
-      (let [k (val-kinds v)]
-        (if (= k VK-UNDEF) (RUndef)
-          (if (= k VK-NULL) (RNull)
-            (if (= k VK-BOOL)
-                (if (= (val-ilo v) (val-ihi v)) (RBool (!= (val-ilo v) 0)) (ev-fail! EV-TYPE n))
-              (if (= k VK-INT)
-                  (if (= (val-ilo v) (val-ihi v)) (RInt (val-ilo v)) (ev-fail! EV-TYPE n))
-                (if (= k VK-FLT)
-                    (if (= (val-fsz v) FSZ-CON) (RFlt (val-fbits v)) (ev-fail! EV-TYPE n))
-                  (ev-fail! EV-TYPE n))))))))
-    (TBot [] (ev-fail! EV-TYPE n)) (TTop [] (ev-fail! EV-TYPE n))
-    (TCtrl [] (ev-fail! EV-TYPE n)) (TXCtrl [] (ev-fail! EV-TYPE n))
+          (let [k (val-kinds v)]
+            (if (= k VK-UNDEF)
+                (RUndef)
+                (if (= k VK-NULL)
+                    (RNull)
+                    (if (= k VK-BOOL)
+                        (if (= (val-ilo v) (val-ihi v)) (RBool (!= (val-ilo v) 0)) (ev-fail! EV-TYPE n))
+                        (if (= k VK-INT)
+                            (if (= (val-ilo v) (val-ihi v)) (RInt (val-ilo v)) (ev-fail! EV-TYPE n))
+                            (if (= k VK-FLT)
+                                (if (= (val-fsz v) FSZ-CON) (RFlt (val-fbits v)) (ev-fail! EV-TYPE n))
+                                (ev-fail! EV-TYPE n))))))))
+    (TBot [] (ev-fail! EV-TYPE n))
+    (TTop [] (ev-fail! EV-TYPE n))
+    (TCtrl [] (ev-fail! EV-TYPE n))
+    (TXCtrl [] (ev-fail! EV-TYPE n))
     (TTuple [o l] (ev-fail! EV-TYPE n))
     ; A memory state has no runtime representation as an `RtVal` and never will: 4b's Load is what
     ; turns memory into a value, and it does so through an alias and an offset rather than by
@@ -665,20 +1075,23 @@
 
 (defn ev-arg [(n i64)] (-> RtVal)
   (let [p (ev)]
-    (if (and (ty-mem? (n-aux n))
-             (and (> (n-nins n) 0) (!= (n-in n 0) (g-start))))
-        (let [needed (ty-mem-aliases (n-aux n)) cur (load (field p current-mem))]
+    (if (ty-mem? (n-aux n))
+        (let [needed (ty-mem-aliases (n-aux n))
+              cur (load (field p current-mem))]
           (if (< cur 0)
               (store! (field p current-mem) (hv-empty! needed))
-            (let [missing (& needed (^ (hv-mask cur) -1))]
-              (if (= missing 0) 0
-                (let [off (al-len [i64] (load (field p hvk))) empty (hv-empty! missing)]
-                  (al-push! [i64] (field p hvk) cur)
-                  (al-push! [i64] (field p hvk) empty)
-                  (store! (field p current-mem) (hv-merge! off 2))))))
+              (let [missing (& needed (^ (hv-mask cur) -1))]
+                (if (= missing 0)
+                    0
+                    (let [off (al-len [i64] (load (field p hvk)))
+                          empty (hv-empty! missing)]
+                      (al-push! [i64] (field p hvk) cur)
+                      (al-push! [i64] (field p hvk) empty)
+                      (store! (field p current-mem) (hv-merge! off 2))))))
           (RMem (hv-view! (load (field p current-mem)) needed)))
-      (if (al-get (load (field p bound)) n) (al-get (load (field p args)) n)
-        (ev-fail! EV-UNBOUND n)))))
+        (if (al-get (load (field p bound)) n)
+            (al-get (load (field p args)) n)
+            (ev-fail! EV-UNBOUND n)))))
 
 (defn ev-publish-mem [(ver i64)] (-> RtVal)
   (store! (field (ev) current-mem) ver)
@@ -686,9 +1099,14 @@
 
 (defn ev-phi [(n i64)] (-> RtVal)
   (let [p (ev)]
-    (if (al-get (load (field p hasenv)) n) (al-get (load (field p env)) n)
-      ; a Phi with no environment entry means control never arrived at its merge
-      (ev-fail! EV-STUCK n))))
+    (if (al-get (load (field p hasenv)) n)
+        (al-get (load (field p env)) n)
+        ;; A memory Phi can be absent when a loop exits before its body merge executes. Synthetic
+        ;; heap boundaries denote the current imperative state in that zero-iteration case.
+        (if (ty-mem? (n-ty n))
+            (RMem (hv-view! (load (field p current-mem)) (ty-mem-aliases (n-ty n))))
+            ; a scalar Phi with no environment entry still means control never arrived there
+            (ev-fail! EV-STUCK n)))))
 
 ; ---------------------------------------------------------------------------
 ; Memory
@@ -705,10 +1123,11 @@
 ;; asked by Load and by Store, and both are the checks that make running a memory graph mean
 ;; something; see EV-MEM and EV-SHAPE.
 (defn ev-check-access [(n i64) (ver i64) (obj i64) (alias i64)] (-> bool)
-  (if (= (& (hv-mask ver) (<< 1 alias)) 0) (do (ev-fail! EV-MEM n) false)
-    (if (= (shape-field-by-alias (ev-obj-shape obj) alias) SHAPE-NO-FIELD)
-        (do (ev-fail! EV-SHAPE n) false)
-      true)))
+  (if (= (& (hv-mask ver) (<< 1 alias)) 0)
+      (do (ev-fail! EV-MEM n) false)
+      (if (= (shape-field-by-alias (ev-obj-shape obj) alias) SHAPE-NO-FIELD)
+          (do (ev-fail! EV-SHAPE n) false)
+          true)))
 
 ;; A New's projections. Slot 0 is the object, which control established when it arrived at the
 ;; block (see `ev-enter-ctrl!`); slot 1+i is field i's memory, which is the incoming state for
@@ -720,53 +1139,606 @@
 ;; the same write over the same parent, and the only cost is an arena entry. Allocating the object
 ;; here instead would make a second consumer see a second object.
 (defn ev-proj [(n i64)] (-> RtVal)
-  (let [m (n-in n 0) slot (n-aux n) p (ev)]
-    (if (= m NO-NODE) (ev-fail! EV-STUCK n)
-      ; a projection of an If or a Return carries no runtime value: control took the arm, and
-      ; nothing reads the tuple itself
-      (if (= (n-op m) OP-SAFEPOINT)
-          (if (or (< slot 1) (>= slot (n-nins m))) (ev-fail! EV-STUCK n)
-            (ev-data (n-in m slot)))
-        (if (!= (n-op m) OP-NEW) (ev-fail! EV-STUCK n)
-          (if (not (al-get (load (field p hasenv)) m)) (ev-fail! EV-STUCK n)
-            (let [ov (al-get (load (field p env)) m)]
-              (if (= slot 0) ov
-                (if (or (< slot 1) (>= slot (n-nins m))) (ev-fail! EV-STUCK n)
-                  (let [alias (shape-field-alias (n-aux m) (- slot 1))
-                        inm   (ev-data (n-in m slot))]
-                    (if (ev-failed?) inm
-                      (let [ver (rt-need-mem inm n)]
-                        (if (ev-failed?) (RUndef)
-                          (RMem (hv-write! ver (rt-payload ov) alias (RUndef))))))))))))))))
+  (let [m (n-in n 0)
+        slot (n-aux n)
+        p (ev)]
+    (if (= m NO-NODE)
+        (ev-fail! EV-STUCK n)
+        ; a projection of an If or a Return carries no runtime value: control took the arm, and
+        ; nothing reads the tuple itself
+        (if (= (n-op m) OP-SAFEPOINT)
+            (if (or (< slot 1) (>= slot (n-nins m)))
+                (ev-fail! EV-STUCK n)
+                (ev-data (n-in m slot)))
+            (if (!= (n-op m) OP-NEW)
+                (ev-fail! EV-STUCK n)
+                (if (not (al-get (load (field p hasenv)) m))
+                    (ev-fail! EV-STUCK n)
+                    (let [ov (al-get (load (field p env)) m)]
+                      (if (= slot 0)
+                          ov
+                          (if (or (< slot 1) (>= slot (n-nins m)))
+                              (ev-fail! EV-STUCK n)
+                              (let [alias (shape-field-alias (n-aux m) (- slot 1))
+                                    inm (ev-data (n-in m slot))]
+                                (if (ev-failed?)
+                                    inm
+                                    (let [ver (rt-need-mem inm n)]
+                                      (if (ev-failed?)
+                                          (RUndef)
+                                          (RMem (hv-write! ver (rt-payload ov) alias (RUndef))))))))))))))))
 
 (defn ev-load [(n i64)] (-> RtVal)
   (let [mv (ev-data (n-in n 1))]
-    (if (ev-failed?) mv
-      (let [pv (ev-data (n-in n 2))]
-        (if (ev-failed?) pv
-          (let [ver (rt-need-mem mv n) obj (rt-need-obj pv n)]
-            (if (ev-failed?) (RUndef)
-              (if (not (ev-check-access n ver obj (n-aux n))) (RUndef)
-                (let [e (hv-find ver obj (n-aux n))]
-                  ; NOTHING IN THIS CHAIN EVER INITIALISED THAT WORD. Every object is created by
-                  ; a New that writes `undefined` into each of its fields' classes, so a live
-                  ; object whose field is missing here means the load's memory edge does not
-                  ; descend from that allocation: the chain was miswired, and `undefined` would
-                  ; be a plausible answer that hides it.
-                  (if (< e 0) (ev-fail! EV-MEM n)
-                    (let [ent (hv-ent e)] (hve-val ent))))))))))))
+    (if (ev-failed?)
+        mv
+        (let [pv (ev-data (n-in n 2))]
+          (if (ev-failed?)
+              pv
+              (let [ver (rt-need-mem mv n)
+                    obj (rt-need-obj pv n)]
+                (if (ev-failed?)
+                    (RUndef)
+                    (if (not (ev-check-access n ver obj (n-aux n)))
+                        (RUndef)
+                        (let [direct (hv-find ver obj (n-aux n))
+                              e (if (and (< direct 0) (= (n-op (n-in n 1)) OP-ARG))
+                                    (hv-find-latest obj (n-aux n))
+                                    direct)]
+                          ; NOTHING IN THIS CHAIN EVER INITIALISED THAT WORD. Every object is created by
+                          ; a New that writes `undefined` into each of its fields' classes, so a live
+                          ; object whose field is missing here means the load's memory edge does not
+                          ; descend from that allocation: the chain was miswired, and `undefined` would
+                          ; be a plausible answer that hides it.
+                          (if (< e 0)
+                              (ev-fail! EV-MEM n)
+                              (let [ent (hv-ent e)] (hve-val ent))))))))))))
 
 (defn ev-store [(n i64)] (-> RtVal)
   (let [mv (ev-data (n-in n 1))]
-    (if (ev-failed?) mv
-      (let [pv (ev-data (n-in n 2))]
-        (if (ev-failed?) pv
-          (let [xv (ev-data (n-in n 3))]
-            (if (ev-failed?) xv
-              (let [ver (rt-need-mem mv n) obj (rt-need-obj pv n)]
-                (if (ev-failed?) (RUndef)
-                  (if (not (ev-check-access n ver obj (n-aux n))) (RUndef)
-                    (RMem (hv-write! ver obj (n-aux n) xv))))))))))))
+    (if (ev-failed?)
+        mv
+        (let [pv (ev-data (n-in n 2))]
+          (if (ev-failed?)
+              pv
+              (let [xv (ev-data (n-in n 3))]
+                (if (ev-failed?)
+                    xv
+                    (let [ver (rt-need-mem mv n)
+                          obj (rt-need-obj pv n)]
+                      (if (ev-failed?)
+                          (RUndef)
+                          (if (not (ev-check-access n ver obj (n-aux n)))
+                              (RUndef)
+                              (RMem (hv-write! ver obj (n-aux n) xv))))))))))))
+
+(defn ev-prop-load [(n i64)] (-> RtVal)
+  (let [p (ev)]
+    (if (al-get (load (field p hasenv)) n)
+        (al-get (load (field p env)) n)
+        (let [mv (ev-data (n-in n 1))]
+    (if (ev-failed?)
+        mv
+        (let [pv (ev-data (n-in n 2))]
+          (if (ev-failed?)
+              pv
+              (let [ver (rt-need-mem mv n)
+                    object (rt-need-obj pv n)]
+                (if (ev-failed?)
+                    (RUndef)
+                    (if (= (& (hv-mask ver) (<< 1 JS-PROPERTY-ALIAS)) 0)
+                        (ev-fail! EV-MEM n)
+                        ;; Dynamic properties live in the imperative object table. The memory input
+                        ;; proves ordering and carries the alias mask; it is not a historical value
+                        ;; snapshot. Effect caching below makes demanding that token idempotent.
+                        (let [answer (dyn-decode (jso-load object (shape-name-bytes (n-aux n))))]
+                          (ev-trace-event! EVT-PROPLOAD n (ev-effect-control n)
+                                           object (n-aux n) answer)
+                          (al-set! [bool] (field p hasenv) n true)
+                          (al-set! [RtVal] (field p env) n answer)
+                          answer)))))))))))
+
+(defn ev-prop-store [(n i64)] (-> RtVal)
+  (let [mv (ev-data (n-in n 1))]
+    (if (ev-failed?)
+        mv
+        (let [pv (ev-data (n-in n 2))]
+          (if (ev-failed?)
+              pv
+              (let [xv (ev-data (n-in n 3))]
+                (if (ev-failed?)
+                    xv
+                    (let [ver (rt-need-mem mv n)
+                          object (rt-need-obj pv n)]
+                      (if (ev-failed?)
+                          (RUndef)
+                          (if (= (& (hv-mask ver) (<< 1 JS-PROPERTY-ALIAS)) 0)
+                              (ev-fail! EV-MEM n)
+                              (do
+                                (ev-trace-event! EVT-PROPSTORE n (ev-effect-control n)
+                                                 object (n-aux n) xv)
+                                (jso-store! object (shape-name-bytes (n-aux n)) (dyn-encode xv))
+                                (al-set! [i64] (field (ev) objs) object (jso-shape object))
+                                ;; Named properties are deliberately imperative in the whole-program
+                                ;; evaluator. Preserve the ordered alias token without appending an
+                                ;; unused historical value for every loop iteration.
+                                (RMem ver))))))))))))
+
+(defn ev-set-proto [(n i64)] (-> RtVal)
+  (let [mv (ev-data (n-in n 1))]
+    (if (ev-failed?)
+        mv
+        (let [ov (ev-data (n-in n 2))]
+          (if (ev-failed?)
+              ov
+              (let [pv (ev-data (n-in n 3))]
+                (if (ev-failed?)
+                    pv
+                    (let [ver (rt-need-mem mv n)
+                          object (rt-need-obj ov n)]
+                      (if (ev-failed?)
+                          (RUndef)
+                          (if (= (& (hv-mask ver) (<< 1 JS-PROPERTY-ALIAS)) 0)
+                              (ev-fail! EV-MEM n)
+                              (if (and (!= (rt-tag pv) RT-OBJ) (!= (rt-tag pv) RT-NULL))
+                                  (ev-fail! EV-TYPE n)
+                                  (let [prototype (if (= (rt-tag pv) RT-OBJ) (rt-payload pv) JSO-NONE)
+                                        (mut current) prototype
+                                        (mut steps) 0
+                                        (mut cycle) false
+                                        limit (ev-obj-count)]
+                                    (loop (if (= (load current) JSO-NONE)
+                                              (break)
+                                              (do
+                                                (if (= (load current) object) (do (store! cycle true) (break)) 0)
+                                                (store! current (ev-prototype-at ver (load current)))
+                                                (store! steps (+ (load steps) 1))
+                                                (if (> (load steps) limit) (do (store! cycle true) (break)) 0))))
+                                    (if (load cycle)
+                                        (ev-fail! EV-SHAPE n)
+                                        (do
+                                          (jso-set-prototype! object prototype)
+                                          (RMem (hv-proto-write! ver object pv))))))))))))))))
+
+(defn ev-array-element-index [(object i64) (index i64)] (-> i64)
+  (let [elements (load (field (ev) array-elements))
+        (mut at) (- (al-len [EvArrayElement] elements) 1)
+        (mut found) -1]
+    (loop (if (or (< (load at) 0) (>= (load found) 0))
+              (break)
+              (let [element (al-get [EvArrayElement] elements (load at))]
+                (if (and (= (load (field element object)) object)
+                         (= (load (field element index)) index))
+                    (store! found (load at)) 0)
+                (store! at (- (load at) 1)))))
+    (load found)))
+
+(defn ev-array-current-length [(object i64)] (-> i64)
+  (al-get [i64] (load (field (ev) array-lengths)) object))
+
+(defn ev-array-current-load [(object i64) (index i64)] (-> RtVal)
+  (if (or (< index 0) (>= index (ev-array-current-length object)))
+      (RUndef)
+      (let [at (ev-array-element-index object index)]
+        (if (< at 0)
+            (RUndef)
+            (let [element (al-get [EvArrayElement]
+                                  (load (field (ev) array-elements)) at)]
+              (if (load (field element present))
+                  (load (field element value))
+                  (RUndef)))))))
+
+(defn ev-array-current-store! [(object i64) (index i64) (value RtVal)] (-> i64)
+  (let [p (ev)
+        at (ev-array-element-index object index)
+        (mut element) (zeroed EvArrayElement)]
+    (store! (field element object) object)
+    (store! (field element index) index)
+    (store! (field element value) value)
+    (store! (field element present) true)
+    (if (< at 0)
+        (al-push! [EvArrayElement] (field p array-elements) (load element))
+        (al-set! [EvArrayElement] (field p array-elements) at (load element)))
+    (if (>= index (ev-array-current-length object))
+        (al-set! [i64] (field p array-lengths) object (+ index 1)) 0)
+    0))
+
+(defn ev-array-current-resize! [(object i64) (length i64)] (-> i64)
+  (let [p (ev) elements (load (field p array-elements)) (mut i) 0]
+    (al-set! [i64] (field p array-lengths) object length)
+    (loop (if (>= (load i) (al-len [EvArrayElement] elements))
+              (break)
+              (let [(mut element) (al-get [EvArrayElement] elements (load i))]
+                (if (and (= (load (field element object)) object)
+                         (>= (load (field element index)) length))
+                    (do (store! (field element present) false)
+                        (store! (field element value) (RUndef))
+                        (al-set! [EvArrayElement] (field p array-elements) (load i) (load element)) 0)
+                    0)
+                (store! i (+ (load i) 1)))))
+    0))
+
+;; Until heap versions become validation-only tokens, every observable array write has to update
+;; both representations together. Keeping that lockstep here prevents builtins such as StringSplit
+;; from publishing a version that ArrayLoad cannot observe through the imperative array payload.
+(defn ev-array-publish-write! [(prev i64) (object i64) (index i64) (value RtVal)] (-> i64)
+  (ev-array-current-store! object index value)
+  (hv-array-write! prev object index value))
+
+(defn ev-array-version [(n i64) (object i64) (version i64)] (-> i64)
+  ;; Like fixed-field recovery above, a synthetic memory Arg denotes the imperative heap at a
+  ;; call boundary. Array mutations performed by a callee can be absent from that Arg's narrowed
+  ;; persistent view, so use the most recently executed version for this object in that case.
+  (let [latest (al-get [i64] (load (field (ev) latest-array)) object)]
+    (if (and (= (n-op (n-in n 1)) OP-ARG) (>= latest 0)) latest version)))
+
+(defn ev-array-load-uncached [(n i64)] (-> RtVal)
+  (let [mv (ev-data (n-in n 1))]
+    (if (ev-failed?)
+        mv
+        (let [av (ev-data (n-in n 2))]
+          (if (ev-failed?)
+              av
+              (let [iv (ev-data (n-in n 3))]
+                (if (ev-failed?)
+                    iv
+                    (if (!= (rt-tag iv) RT-INT)
+                        (ev-fail! EV-TYPE n)
+                        (let [ver (rt-need-mem mv n)
+                              object (rt-need-obj av n)
+                              index (rt-payload iv)]
+                          (if (ev-failed?)
+                              (RUndef)
+                              (if (= (& (hv-mask ver) (<< 1 JS-PROPERTY-ALIAS)) 0)
+                                  (ev-fail! EV-MEM n)
+                              (ev-array-current-load object index))))))))))))
+
+(defn ev-array-load [(n i64)] (-> RtVal)
+  ;; An ArrayLoad ordered before a resize (notably Array.prototype.pop) denotes the old element.
+  ;; Preserve that value for all later users on the same dynamic control arrival.
+  (let [p (ev)]
+    (if (al-get (load (field p hasenv)) n)
+        (al-get (load (field p env)) n)
+        (let [answer (ev-array-load-uncached n)]
+          (if (ev-failed?)
+              answer
+              (do
+                (al-set! [bool] (field p hasenv) n true)
+                (al-set! [RtVal] (field p env) n answer)
+                answer))))))
+
+(defn ev-array-store [(n i64)] (-> RtVal)
+  (let [mv (ev-data (n-in n 1))]
+    (if (ev-failed?)
+        mv
+        (let [av (ev-data (n-in n 2))]
+          (if (ev-failed?)
+              av
+              (let [iv (ev-data (n-in n 3))]
+                (if (ev-failed?)
+                    iv
+                    (let [value (ev-data (n-in n 4))]
+                      (if (ev-failed?)
+                          value
+                          (if (or (!= (rt-tag iv) RT-INT) (< (rt-payload iv) 0))
+                              (ev-fail! EV-TYPE n)
+                              (let [ver (rt-need-mem mv n)
+                                    object (rt-need-obj av n)]
+                                (if (ev-failed?)
+                                    (RUndef)
+                                    (if (= (& (hv-mask ver) (<< 1 JS-PROPERTY-ALIAS)) 0)
+                                        (ev-fail! EV-MEM n)
+                                        (RMem (ev-array-publish-write! ver
+                                                                      object
+                                                                      (rt-payload iv)
+                                                                      value)))))))))))))))
+
+(defn ev-array-length [(n i64)] (-> RtVal)
+  (let [mv (ev-data (n-in n 1))]
+    (if (ev-failed?)
+        mv
+        (let [av (ev-data (n-in n 2))]
+          (if (ev-failed?)
+              av
+              (let [ver (rt-need-mem mv n)
+                    object (rt-need-obj av n)]
+                (if (ev-failed?)
+                    (RUndef)
+                    (if (= (& (hv-mask ver) (<< 1 JS-PROPERTY-ALIAS)) 0)
+                        (ev-fail! EV-MEM n)
+                        (RInt (ev-array-current-length object))))))))))
+
+(defn ev-array-resize [(n i64)] (-> RtVal)
+  (let [ordered (ev-data (n-in n 4))
+        mv (ev-data (n-in n 1))]
+    (if (ev-failed?)
+        ordered
+        (if (ev-failed?)
+            mv
+            (let [av (ev-data (n-in n 2))]
+              (if (ev-failed?)
+                  av
+                  (let [lv (ev-data (n-in n 3))]
+                    (if (ev-failed?)
+                        lv
+                        (if (!= (rt-tag lv) RT-INT)
+                            (ev-fail! EV-TYPE n)
+                            (let [ver (rt-need-mem mv n)
+                                  object (rt-need-obj av n)]
+                              (if (ev-failed?)
+                                  (RUndef)
+                                  (if (= (& (hv-mask ver) (<< 1 JS-PROPERTY-ALIAS)) 0)
+                                      (ev-fail! EV-MEM n)
+                                    (let [length (if (< (rt-payload lv) 0) 0 (rt-payload lv))]
+                                      (ev-array-current-resize! object length)
+                                      (RMem (hv-array-resize! ver object length)))))))))))))))
+
+(defn ev-array-copy [(n i64)] (-> RtVal)
+  (let [mv (ev-data (n-in n 1))
+        sv (ev-data (n-in n 2))
+        dv (ev-data (n-in n 3))
+        iv (ev-data (n-in n 4))]
+    (if (ev-failed?)
+        (RUndef)
+        (if (!= (rt-tag iv) RT-INT)
+            (ev-fail! EV-TYPE n)
+            (let [ver (rt-need-mem mv n)
+                  source (rt-need-obj sv n)
+                  result (rt-need-obj dv n)
+                  start (rt-payload iv)]
+              (if (ev-failed?)
+                  (RUndef)
+                  (if (= (& (hv-mask ver) (<< 1 JS-PROPERTY-ALIAS)) 0)
+                      (ev-fail! EV-MEM n)
+                      (let [count (ev-array-current-length result)
+                            (mut current) ver
+                            (mut index) 0]
+                        (loop (if (>= (load index) count)
+                                  (break)
+                                  (let [value (ev-array-current-load source (+ start (load index)))]
+                                    (if (!= (rt-tag value) RT-UNDEF)
+                                        (do (store! current
+                                                    (ev-array-publish-write! (load current)
+                                                                             result
+                                                                             (load index)
+                                                                             value)) 0)
+                                        0)
+                                    (store! index (+ (load index) 1)))))
+                        (RMem (load current))))))))))
+
+(defn ev-need-string [(value RtVal) (n i64)] (-> i64)
+  (if (= (rt-tag value) RT-STR)
+      (rt-payload value)
+      (do (ev-fail! EV-TYPE n) JSS-NONE)))
+
+(defn ev-string-length [(n i64)] (-> RtVal)
+  (let [string (ev-need-string (ev-data (n-in n 1)) n)]
+    (if (ev-failed?) (RUndef) (RInt (jss-length string)))))
+
+(defn ev-string-from-code-unit [(n i64)] (-> RtVal)
+  (match (ev-data (n-in n 1))
+    (RInt [v] (RStr (jss-from-code-unit! v)))
+    (RBig [v] (RStr (jss-from-code-unit! v)))
+    (RUndef [] (do (ev-fail! EV-TYPE n) (RUndef)))
+    (RNull [] (do (ev-fail! EV-TYPE n) (RUndef)))
+    (RBool [v] (do (ev-fail! EV-TYPE n) (RUndef)))
+    (RFlt [v] (do (ev-fail! EV-TYPE n) (RUndef)))
+    (RStr [v] (do (ev-fail! EV-TYPE n) (RUndef)))
+    (RObj [v] (do (ev-fail! EV-TYPE n) (RUndef)))
+    (RSym [v] (do (ev-fail! EV-TYPE n) (RUndef)))
+    (RFun [v] (do (ev-fail! EV-TYPE n) (RUndef)))
+    (RMem [v] (do (ev-fail! EV-TYPE n) (RUndef)))))
+
+(defn ev-number-to-string [(n i64)] (-> RtVal)
+  (let [value (ev-data (n-in n 1))
+        radix (ev-data (n-in n 2))]
+    (if (or (!= (rt-tag value) RT-INT) (!= (rt-tag radix) RT-INT))
+        (do (ev-fail! EV-TYPE n) (RUndef))
+        (let [base (rt-payload radix)]
+          (if (or (< base 2) (> base 36))
+              (do (ev-fail! EV-TYPE n) (RUndef))
+              (RStr (jss-from-int-radix! (rt-payload value) base)))))))
+
+(defn ev-string-case [(n i64) (upper bool)] (-> RtVal)
+  (let [string (ev-need-string (ev-data (n-in n 1)) n)]
+    (if (ev-failed?) (RUndef) (RStr (jss-ascii-case! string upper)))))
+
+(defn ev-string-index-of [(n i64)] (-> RtVal)
+  (let [string (ev-need-string (ev-data (n-in n 1)) n)
+        needle (ev-need-string (ev-data (n-in n 2)) n)
+        start (ev-data (n-in n 3))]
+    (if (or (ev-failed?) (!= (rt-tag start) RT-INT))
+        (do (ev-fail! EV-TYPE n) (RUndef))
+        (RInt (jss-index-of string needle (rt-payload start))))))
+
+(defn ev-string-compare [(n i64)] (-> RtVal)
+  (let [left (ev-need-string (ev-data (n-in n 1)) n)
+        right (ev-need-string (ev-data (n-in n 2)) n)]
+    (if (ev-failed?) (RUndef) (RInt (jss-compare left right)))))
+
+(defn ev-builtin-number [(value RtVal) (n i64)] (-> f64)
+  (match value
+    (RInt [v] (cast f64 v))
+    (RFlt [bits] (bits-f64 bits))
+    (RNull [] 0.0)
+    (RBool [v] (if v 1.0 0.0))
+    (RUndef [] (bits-f64 JSV-NAN))
+    (RStr [v] (do (ev-fail! EV-TYPE n) 0.0))
+    (RObj [v] (do (ev-fail! EV-TYPE n) 0.0))
+    (RSym [v] (do (ev-fail! EV-TYPE n) 0.0))
+    (RBig [v] (do (ev-fail! EV-TYPE n) 0.0))
+    (RFun [v] (do (ev-fail! EV-TYPE n) 0.0))
+    (RMem [v] (do (ev-fail! EV-TYPE n) 0.0))))
+
+(defn ev-js-builtin [(n i64)] (-> RtVal)
+  (let [a (ev-builtin-number (ev-data (n-in n 1)) n)
+        b (ev-builtin-number (ev-data (n-in n 2)) n)]
+    (if (ev-failed?) (RUndef) (rt-flt-result (jbi-eval (n-aux n) a b)))))
+
+(defn ev-js-throw [(n i64)] (-> RtVal)
+  (let [value (ev-data (n-in n 1))]
+    (if (ev-failed?)
+        value
+        (do
+          ;; A throw can originate inside a nested call, before the top-level Return assigns the
+          ;; evaluator result. Publish the original payload at the throw site.
+          (store! (field (ev) result) value)
+          (ev-fail! EV-THROW n)
+          value))))
+
+(defn ev-string-equal [(n i64)] (-> RtVal)
+  (let [left (ev-need-string (ev-data (n-in n 1)) n)
+        right (ev-need-string (ev-data (n-in n 2)) n)]
+    (if (ev-failed?) (RUndef) (RBool (jss-equal? left right)))))
+
+(defn ev-string-concat [(n i64)] (-> RtVal)
+  (let [left (ev-need-string (ev-data (n-in n 1)) n)
+        right (ev-need-string (ev-data (n-in n 2)) n)]
+    (if (ev-failed?) (RUndef) (RStr (jss-concat! left right)))))
+
+(defn ev-string-char-code [(n i64)] (-> RtVal)
+  (let [string (ev-need-string (ev-data (n-in n 1)) n)
+        index (ev-data (n-in n 2))]
+    (if (or (ev-failed?) (!= (rt-tag index) RT-INT))
+        (ev-fail! EV-TYPE n)
+        (let [unit (jss-code-unit string (rt-payload index))]
+          (if (< unit 0) (RFlt JSV-NAN) (RInt unit))))))
+
+(defn ev-string-substring [(n i64)] (-> RtVal)
+  (let [string (ev-need-string (ev-data (n-in n 1)) n)
+        start (ev-data (n-in n 2))
+        end (ev-data (n-in n 3))]
+    (if (or (ev-failed?) (or (!= (rt-tag start) RT-INT) (!= (rt-tag end) RT-INT)))
+        (ev-fail! EV-TYPE n)
+        (RStr (case (n-aux n) 0
+                    (jss-substring! string (rt-payload start) (rt-payload end)) 1
+                    (jss-substr! string (rt-payload start) (rt-payload end)) 2
+                    (jss-slice! string (rt-payload start) (rt-payload end)) 3
+                    (jss-char-at! string (rt-payload start)) (do (ev-fail! EV-TYPE n) JSS-NONE))))))
+
+(defn ev-to-string-value [(value RtVal) (n i64)] (-> i64)
+  (match value
+    (RUndef [] (jss-from-utf8! "undefined"))
+    (RNull [] (jss-from-utf8! "null"))
+    (RBool [b] (jss-from-utf8! (if b "true" "false")))
+    (RInt [value] (jss-from-int-radix! value 10))
+    (RFlt [bits]
+          (if (f64-nan-bits? bits)
+              (jss-from-utf8! "NaN")
+              (if (= (& bits 9223372036854775807) 0)
+                  (jss-from-utf8! "0")
+                  (let [cap 64
+                        buf (cast (ptr i8) (malloc cap))
+                        fb (stack FixBuf)
+                        w (stack Writer)]
+                    (store! (field fb data) buf)
+                    (store! (field fb cap) cap)
+                    (store! (field fb len) 0)
+                    (fixed-buffer-writer w fb)
+                    (fmt w "{f}" (bits-f64 bits))
+                    (let [length (load (field fb len))
+                          result
+                            (if (>= length cap)
+                                (do (ev-fail! EV-TYPE n) JSS-NONE)
+                                (jss-from-utf8! (slice-new [u8] (cast (ptr u8) buf) length)))]
+                      (free buf)
+                      result)))))
+    (RStr [string] string)
+    (RObj [id] (do (ev-fail! EV-TYPE n) JSS-NONE))
+    (RSym [id] (do (ev-fail! EV-TYPE n) JSS-NONE))
+    (RBig [value] (jss-from-int-radix! value 10))
+    (RFun [fidx] (do (ev-fail! EV-TYPE n) JSS-NONE))
+    (RMem [ver] (do (ev-fail! EV-TYPE n) JSS-NONE))))
+
+(defn ev-to-string [(n i64)] (-> RtVal)
+  (let [string (ev-to-string-value (ev-data (n-in n 1)) n)]
+    (if (ev-failed?) (RUndef) (RStr string))))
+
+(defn ev-parse-int [(n i64)] (-> RtVal)
+  (let [string (ev-to-string-value (ev-data (n-in n 1)) n)
+        radix (ev-data (n-in n 2))]
+    (if (or (ev-failed?) (!= (rt-tag radix) RT-INT))
+        (ev-fail! EV-TYPE n)
+        (match (jss-parse-int string (rt-payload radix))
+          (Some [value] (RInt value))
+          (None [] (RFlt JSV-NAN))))))
+
+(defn ev-is-nan [(n i64)] (-> RtVal)
+  (let [value (ev-data (n-in n 1))]
+    (match value
+      (RUndef [] (RBool true))
+      (RNull [] (RBool false))
+      (RBool [b] (RBool false))
+      (RInt [value] (RBool false))
+      (RFlt [bits] (RBool (f64-nan-bits? bits)))
+      (RStr [string] (RBool (not (jss-numeric? string))))
+      (RObj [id] (ev-fail! EV-TYPE n))
+      (RSym [id] (ev-fail! EV-TYPE n))
+      (RBig [value] (RBool false))
+      (RFun [fidx] (ev-fail! EV-TYPE n))
+      (RMem [ver] (ev-fail! EV-TYPE n)))))
+
+(defn ev-string-split [(n i64)] (-> RtVal)
+  (let [mv (ev-data (n-in n 1))
+        sv (ev-data (n-in n 2))
+        dv (ev-data (n-in n 3))
+        av (ev-data (n-in n 4))]
+    (if (ev-failed?)
+        (RUndef)
+        (let [ver (rt-need-mem mv n)
+              string (ev-need-string sv n)
+              result (rt-need-obj av n)]
+          (if (ev-failed?)
+              (RUndef)
+              (if (= (& (hv-mask ver) (<< 1 JS-PROPERTY-ALIAS)) 0)
+                  (ev-fail! EV-MEM n)
+                  (if (= (rt-tag dv) RT-UNDEF)
+                      (RMem (ev-array-publish-write! ver result 0 (RStr string)))
+                      (let [delimiter (ev-need-string dv n)
+                            length (jss-length string)
+                            width (jss-length delimiter)
+                            (mut current) ver
+                            (mut start) 0
+                            (mut index) 0
+                            (mut output) 0]
+                        (if (= width 0)
+                            (loop (if (>= (load index) length)
+                                      (break)
+                                      (do
+                                        (store! current
+                                                (ev-array-publish-write!
+                                                  (load current)
+                                                  result
+                                                  (load output)
+                                                  (RStr (jss-window! string
+                                                                    (load index)
+                                                                    (+ (load index) 1)))))
+                                        (store! output (+ (load output) 1))
+                                        (store! index (+ (load index) 1)))))
+                            (do
+                              (loop (if (> (+ (load index) width) length)
+                                        (break)
+                                        (if (jss-match-at? string (load index) delimiter)
+                                            (do
+                                              (store! current
+                                                      (ev-array-publish-write!
+                                                        (load current)
+                                                        result
+                                                        (load output)
+                                                        (RStr (jss-window! string
+                                                                          (load start)
+                                                                          (load index)))))
+                                              (store! output (+ (load output) 1))
+                                              (store! index (+ (load index) width))
+                                              (store! start (load index)))
+                                            (store! index (+ (load index) 1)))))
+                              (store! current
+                                      (ev-array-publish-write!
+                                        (load current)
+                                        result
+                                        (load output)
+                                        (RStr (jss-window! string (load start) length))))))
+                        (RMem (load current))))))))))
 
 ;; THE CHILDREN ARE COLLECTED BEFORE THE WINDOW IS OPENED, and that is the same hazard
 ;; `ty-tuple-open` and `shape-fields-open` are shaped around: evaluating an input can itself be a
@@ -779,31 +1751,58 @@
         (mut kids) (al-new [i64] (malloc-allocator))
         (mut mask) 0
         (mut i) 1]
-    (loop
-      (if (or (>= (load i) len) (ev-failed?)) (break)
-        (do (let [v (ev-data (n-in n (load i)))]
-              (if (ev-failed?) 0
-                (let [ver (rt-need-mem v n)]
-                  (if (ev-failed?) 0
-                    ; DISJOINT, checked. Two states both claiming a class means the merge has no
-                    ; answer for it: `ty-meet` on the alias axis would OR the bits and report a
-                    ; state that describes the class twice, and a later load would silently read
-                    ; whichever child the scan reached first.
-                    (if (!= (& (load mask) (hv-mask ver)) 0) (do (ev-fail! EV-MEM n) 0)
-                      (do (store! mask (| (load mask) (hv-mask ver)))
-                          (al-push! [i64] (mut kids) ver)
-                          0))))))
-            (store! i (+ (load i) 1))
-            0)))
-    (let [res (if (ev-failed?) (RUndef)
+    (loop (if (or (>= (load i) len) (ev-failed?))
+              (break)
+              (do
+                (let [input (n-in n (load i))
+                      (mut prior) 1
+                      (mut duplicate-input) false]
+                  (loop (if (or (>= (load prior) (load i)) (load duplicate-input))
+                            (break)
+                            (do
+                              (if (= (n-in n (load prior)) input)
+                                  (store! duplicate-input true)
+                                  0)
+                              (store! prior (+ (load prior) 1)))))
+                  (if (load duplicate-input)
+                      0
+                      (let [v (ev-data input)]
+                        (if (ev-failed?)
+                            0
+                            (let [ver (rt-need-mem v n)]
+                              (if (ev-failed?)
+                                  0
+                                  (let [(mut kid) 0 (mut duplicate) false]
+                                    (loop (if (or (>= (load kid) (al-len [i64] (load kids)))
+                                                  (load duplicate))
+                                              (break)
+                                              (do
+                                                (if (= (al-get [i64] (load kids) (load kid)) ver)
+                                                    (store! duplicate true)
+                                                    0)
+                                                (store! kid (+ (load kid) 1)))))
+                                    (if (load duplicate)
+                                        0
+                                        (if (!= (& (load mask) (hv-mask ver)) 0)
+                                            (do (ev-fail! EV-MEM n) 0)
+                                            (do
+                                              (store! mask (| (load mask) (hv-mask ver)))
+                                              (al-push! [i64] (mut kids) ver)
+                                              0))))))))))
+                (store! i (+ (load i) 1))
+                0)))
+    (let [res
+            (if (ev-failed?)
+                (RUndef)
                 (let [off (al-len [i64] (load (field p hvk)))
-                      k   (al-len [i64] (load kids))
+                      k (al-len [i64] (load kids))
                       (mut j) 0]
-                  (loop
-                    (if (>= (load j) k) (break)
-                      (do (al-push! [i64] (field p hvk) (al-get (load kids) (load j)))
-                          (store! j (+ (load j) 1))
-                          0)))
+                  (loop (if (>= (load j) k)
+                            (break)
+                            (do
+                              (al-push! [i64] (field p hvk) (al-get (load kids) (load j)))
+                              (store! j (+ (load j) 1))
+                              0)))
                   (ev-publish-mem (hv-merge! off k))))]
       (al-free! [i64] (mut kids))
       res)))
@@ -823,33 +1822,163 @@
 ;; Allocating an object nobody goes on to use is harmless, and saying so is the whole content of
 ;; the dead-allocation removal 4c gates: an allocation whose result is never read is unobservable,
 ;; which is why removing it is legal.
+(defn ev-effect-op? [(op i64)] (-> bool)
+  (or (= op OP-PROPSTORE)
+      (or (= op OP-SETPROTO)
+          (or (= op OP-ARRAYSTORE)
+              (or (= op OP-ARRAYRESIZE)
+                  (or (= op OP-ARRAYCOPY) (= op OP-STRINGSPLIT)))))))
+
+;; A memory-effect node may be demanded by several downstream tokens, but its mutation executes
+;; once per dynamic arrival at its control. `ev-enter-ctrl!` clears the cache on each arrival;
+;; recursive calls preserve these entries as part of the caller frame below.
+(defn ev-effect-data [(n i64)] (-> RtVal)
+  (let [p (ev)]
+    (if (al-get (load (field p hasenv)) n)
+        (al-get (load (field p env)) n)
+        (let [value
+                (case (n-op n) OP-PROPSTORE
+                      (ev-prop-store n) OP-SETPROTO
+                      (ev-set-proto n) OP-ARRAYSTORE
+                      (ev-array-store n) OP-ARRAYRESIZE
+                      (ev-array-resize n) OP-ARRAYCOPY
+                      (ev-array-copy n) OP-STRINGSPLIT
+                      (ev-string-split n)
+                      (do (ev-unknown-op n) (RUndef)))]
+          (if (ev-failed?)
+              value
+              (do
+                (al-set! [bool] (field p hasenv) n true)
+                (al-set! [RtVal] (field p env) n value)
+                value))))))
+
+(defn ev-effect-control-fuel [(n i64) (fuel i64)] (-> i64)
+  (if (or (< n 0) (<= fuel 0))
+      NO-NODE
+      (let [direct (if (> (n-nins n) 0) (n-in n 0) NO-NODE)]
+        (if (!= direct NO-NODE)
+            (if (or (= (n-op direct) OP-START)
+                    (or (= (n-op direct) OP-FUNSTART)
+                        (or (= (n-op direct) OP-REGION)
+                            (or (= (n-op direct) OP-LOOP)
+                                (or (= (n-op direct) OP-CPROJ)
+                                    (= (n-op direct) OP-CALLEND))))))
+                direct
+                (if (= (n-op n) OP-PROJ)
+                    (ev-effect-control-fuel direct (- fuel 1))
+                    NO-NODE))
+            (if (> (n-nins n) 1)
+                (ev-effect-control-fuel (n-in n 1) (- fuel 1))
+                NO-NODE)))))
+
+(defn ev-effect-control [(n i64)] (-> i64)
+  (ev-effect-control-fuel n 128))
+
 (defn ev-enter-ctrl! [(c i64)] (-> i64)
-  (let [p (ev) len (n-nouts c) (mut i) 0]
-    (loop
-      (if (>= (load i) len) (break)
-        (do (let [u (n-out c (load i))]
-              (if (or (n-dead? u) (!= (n-op u) OP-NEW)) 0
-                (if (or (= (n-nins u) 0) (!= (n-in u 0) c)) 0
-                  (do (al-set! [bool]  (field p hasenv) u true)
-                      (al-set! [RtVal] (field p env) u (RObj (ev-obj-new! (n-aux u))))
-                      0))))
-            (store! i (+ (load i) 1))
-            0)))
+  (let [p (ev)
+        len (n-nouts c)
+        (mut i) 0]
+    ;; Establish every identity first: one allocation's memory input can be a projection of
+    ;; another allocation controlled by the same block.
+    (loop (if (>= (load i) len)
+              (break)
+              (do
+                (let [u (n-out c (load i))]
+                  (if (and (and (not (n-dead? u)) (= (n-op u) OP-NEW))
+                           (and (> (n-nins u) 0) (= (n-in u 0) c)))
+                      (do
+                        (al-set! [bool] (field p hasenv) u true)
+                        (al-set! [RtVal] (field p env) u (RObj (ev-obj-new! (n-aux u))))
+                        0)
+                      0))
+                (store! i (+ (load i) 1))
+                0)))
+    (store! i 0)
+    (loop (if (or (>= (load i) len) (ev-failed?))
+              (break)
+              (do
+                (let [u (n-out c (load i))]
+                  (if (and (and (not (n-dead? u)) (= (n-op u) OP-NEW))
+                           (and (> (n-nins u) 0) (= (n-in u 0) c)))
+                      (let [obj (rt-payload (al-get (load (field p env)) u))
+                            (mut slot) 1]
+                        ;; Publish field initialization even when no Proj memory value is demanded
+                        ;; before the object escapes through a closure or call.
+                        (loop (if (or (>= (load slot) (n-nins u)) (ev-failed?))
+                                  (break)
+                                  (let [memory (ev-data (n-in u (load slot)))]
+                                    (if (= (rt-tag memory) RT-MEM)
+                                        (let [alias (shape-field-alias (n-aux u) (- (load slot) 1))]
+                                          (if (< (hv-find-latest obj alias) 0)
+                                              (do
+                                                (ev-publish-mem
+                                                  (hv-write! (load (field p current-mem))
+                                                             obj alias (RUndef)))
+                                                0)
+                                              0))
+                                        (do (ev-fail! EV-MEM u) 0))
+                                    (store! slot (+ (load slot) 1))))))
+                      0))
+                (store! i (+ (load i) 1)))))
+    ;; Dynamic object effects are control-pinned but may not contribute to the fixed-field Return
+    ;; memory tuple. Execute them on block entry so prototype construction and property publication
+    ;; remain observable through later synthetic memory Args.
+    (store! i (if (and (>= c 0) (< c (al-len [i64] (load (field p effect-head)))))
+                  (al-get [i64] (load (field p effect-head)) c)
+                  NO-NODE))
+    (loop (if (or (= (load i) NO-NODE) (ev-failed?))
+              (break)
+              (do
+                (let [u (load i)
+                      op (n-op u)]
+                  (al-set! [bool] (field p hasenv) u false)
+                  (if (and (not (n-dead? u)) (= (ev-effect-control u) c))
+                      (if (or (= op OP-PROPLOAD) (= op OP-ARRAYLOAD))
+                          ;; The per-control chain is in graph/source order. Sample a load when its
+                          ;; block is entered so a following imperative property effect cannot
+                          ;; retroactively change it. Richards relies on `v=this.v1; this.v1=null`.
+                          (let [(mut later) (al-get [i64] (load (field p effect-next)) u)
+                                (mut before-effect) false]
+                            (loop (if (or (= (load later) NO-NODE) (load before-effect))
+                                      (break)
+                                      (do
+                                        (if (and (= (ev-effect-control (load later)) c)
+                                                 (ev-effect-op? (n-op (load later))))
+                                            (store! before-effect true)
+                                            0)
+                                        (store! later
+                                                (al-get [i64]
+                                                        (load (field p effect-next))
+                                                        (load later))))))
+                            (if (load before-effect) (do (ev-data u) 0) 0))
+                          (if (ev-effect-op? op)
+                              (let [memory (ev-data u)]
+                                (if (= (rt-tag memory) RT-MEM)
+                                    (do (ev-publish-mem (rt-payload memory)) 0)
+                                    (do (ev-fail! EV-MEM u) 0)))
+                              0))
+                      0))
+                (store! i (al-get [i64] (load (field p effect-next)) (load i))))))
     0))
 
 ;; The check that earns this its own status. A Cast is the compiler asserting a narrower type on a
 ;; control path; if the value does not satisfy it, the compiler narrowed without proof.
 (defn ev-cast [(n i64)] (-> RtVal)
   (let [v (ev-data (n-in n 1))]
-    (if (ev-failed?) v
-      (if (ty-isa (rt-ty v) (n-aux n)) v (ev-fail! EV-CAST n)))))
+    (if (ev-failed?)
+        v
+        (if (ty-isa (rt-ty v) (n-aux n)) v (ev-fail! EV-CAST n)))))
 
-(defn ev-box [(n i64)] (-> RtVal) (ev-data (n-in n 1)))
+(defn ev-box [(n i64)] (-> RtVal)
+  (ev-data (n-in n 1)))
 
 (defn ev-unbox [(n i64)] (-> RtVal)
   (let [v (ev-data (n-in n 1))]
-    (if (ev-failed?) v
-      (if (ty-isa (rt-ty v) (n-aux n)) v (ev-fail! EV-UNBOX n)))))
+    (if (ev-failed?)
+        v
+        (if (and (= (n-aux n) (t-flt)) (= (rt-tag v) RT-INT))
+            (RFlt (f64-bits (cast f64 (rt-payload v))))
+            (if (ty-isa (rt-ty v) (n-aux n)) v (ev-fail! EV-UNBOX n))))))
 
 (defn ev-typetest [(n i64)] (-> RtVal)
   (let [v (ev-data (n-in n 1))]
@@ -860,197 +1989,304 @@
 ; ---------------------------------------------------------------------------
 (defn ev-parm [(n i64)] (-> RtVal)
   (let [p (ev)]
-    (if (al-get (load (field p hasenv)) n) (al-get (load (field p env)) n)
-      (ev-fail! EV-CALL n))))
-
-(defn ev-find-fun [(fidx i64)] (-> i64)
-  (let [n (n-count) (mut i) 0 (mut found) NO-NODE]
-    (loop
-      (if (or (>= (load i) n) (!= (load found) NO-NODE)) (break)
-        (do (if (and (and (not (n-dead? (load i))) (= (n-op (load i)) OP-FUN))
-                     (= (n-aux (load i)) fidx))
-                (store! found (load i)) 0)
-            (store! i (+ (load i) 1)) 0)))
-    (load found)))
+    (if (al-get (load (field p hasenv)) n)
+        (al-get (load (field p env)) n)
+        (ev-fail! EV-CALL n))))
 
 (defn ev-closure [(n i64)] (-> RtVal)
   (let [p (ev)]
-    (if (al-get (load (field p hasenv)) n) (al-get (load (field p env)) n)
-      (let [fv (ev-data (n-in n 0))]
-        (if (or (ev-failed?) (!= (rt-tag fv) RT-FUN)) (ev-fail! EV-CALL n)
-          (let [id (al-len [i64] (load (field p cfun))) (mut i) 1]
-            (al-push! [i64] (field p cfun) (ev-fun-fidx (rt-payload fv)))
-            (al-push! [i64] (field p coff) (al-len [RtVal] (load (field p cvals))))
-            (al-push! [i64] (field p clen) (- (n-nins n) 1))
-            (loop
-              (if (>= (load i) (n-nins n)) (break)
-                (do (al-push! [RtVal] (field p cvals) (ev-data (n-in n (load i))))
-                    (store! i (+ (load i) 1)) 0)))
-            (let [v (RFun (- 0 (+ id 1)))]
-              (al-set! [bool] (field p hasenv) n true)
-              (al-set! [RtVal] (field p env) n v)
-              v)))))))
+    (if (al-get (load (field p hasenv)) n)
+        (al-get (load (field p env)) n)
+        (let [fv (ev-data (n-in n 0))]
+          (if (or (ev-failed?) (!= (rt-tag fv) RT-FUN))
+              (ev-fail! EV-CALL n)
+              (let [id (al-len [i64] (load (field p cfun)))
+                    base (- (n-nins n) (n-aux n))
+                    (mut i) 0]
+                (al-push! [i64] (field p cfun) (ev-fun-node (rt-payload fv)))
+                (al-push! [i64] (field p coff) (al-len [RtVal] (load (field p cvals))))
+                (al-push! [i64] (field p clen) (n-aux n))
+                (loop (if (>= (load i) (n-aux n))
+                          (break)
+                          (do
+                            (al-push! [RtVal] (field p cvals) (ev-data (n-in n (+ base (load i)))))
+                            (store! i (+ (load i) 1))
+                            0)))
+                (let [v (RFun (- 0 (+ id 1)))]
+                  (al-set! [bool] (field p hasenv) n true)
+                  (al-set! [RtVal] (field p env) n v)
+                  v)))))))
 
 (const EV-CALL-DEPTH-MAX i64 512)
 
 ;; Execute one function's private CFG. A Fun owns its entry in slot 0 and every Return in the
 ;; remaining slots, so none of these controls can accidentally become a successor of Start.
 (defn ev-exec-fun [(fun i64)] (-> RtVal)
-  (let [p (ev) (mut cur) (n-in fun 0) (mut prev) NO-NODE
-        (mut ans) (RUndef) (mut done) false]
-    (loop
-      (if (or (load done) (ev-failed?)) (break)
-        (do (let [c (load cur)]
-              (store! (field p steps) (+ (load (field p steps)) 1))
-              (if (or (= c NO-NODE)
-                      (> (load (field p steps)) (load (field p budget))))
-                  (do (ev-fail! EV-STEPS c) 0)
-                (do (if (= (n-op c) OP-CALLEND) 0 (ev-enter-ctrl! c))
-                    (if (ev-failed?) 0
-                      (case (n-op c)
-                        OP-RETURN
-                          (do
-                            ; Force the returned value first. It can itself be an allocating
-                            ; Call whose CallEnd is the return control; a synthetic memory Arg
-                            ; on that continuation must observe the call's completed heap, not
-                            ; the caller state from before the value was demanded. The explicit
-                            ; memory edge is still evaluated before the value is published.
-                            (let [value (ev-data (n-in c 1))]
-                              (if (ev-failed?) 0
-                                (do (if (= (n-nins c) 3) (do (ev-data (n-in c 2)) 0) 0)
-                                    (if (ev-failed?) 0 (store! ans value)) 0)))
-                            (store! done true) 0)
-                        OP-IF
-                          (let [pred (ev-data (n-in c 1))]
-                            (if (ev-failed?) 0
-                              (if (not (rt-condition? pred)) (do (ev-fail! EV-TYPE c) 0)
-                                (let [arm (ev-if-arm c (if (rt-truthy? pred) 0 1))]
-                                  (if (= arm NO-NODE) (do (ev-fail! EV-STUCK c) 0)
-                                    (do (store! prev c) (store! cur arm) 0))))))
-                        OP-REGION
-                          (do (ev-enter-merge! c (load prev))
-                              (if (ev-failed?) 0
-                                (let [nx (ev-ctrl-succ-mode c true)]
-                                  (if (= nx NO-NODE) (do (ev-fail! EV-STUCK c) 0)
-                                    (do (store! prev c) (store! cur nx) 0)))))
-                        OP-LOOP
-                          (do (ev-enter-merge! c (load prev))
-                              (if (ev-failed?) 0
-                                (let [nx (ev-ctrl-succ-mode c true)]
-                                  (if (= nx NO-NODE) (do (ev-fail! EV-STUCK c) 0)
-                                    (do (store! prev c) (store! cur nx) 0)))))
-                        OP-CALLEND
-                          (let [call (n-in c 1)]
-                            (al-set! [bool] (field p hasenv) call false)
-                            (ev-call call)
-                            (if (ev-failed?) 0
-                              (do (ev-enter-ctrl! c)
-                              (let [nx (ev-ctrl-succ-mode c true)]
-                                (if (= nx NO-NODE) (do (ev-fail! EV-STUCK c) 0)
-                                  (do (store! prev c) (store! cur nx) 0))))))
-                        (let [nx (ev-ctrl-succ-mode c true)]
-                          (if (= nx NO-NODE) (do (ev-fail! EV-STUCK c) 0)
-                            (do (store! prev c) (store! cur nx) 0))))))) 0)
-            0)))
+  (let [p (ev)
+        (mut cur) (n-in fun 0)
+        (mut prev) NO-NODE
+        (mut ans) (RUndef)
+        (mut done) false]
+    (loop (if (or (load done) (ev-failed?))
+              (break)
+              (do
+                (let [c (load cur)]
+                  (store! (field p steps) (+ (load (field p steps)) 1))
+                  (ev-trace-event! EVT-CONTROL c fun 0 SHAPE-NO-NAME (RUndef))
+                  (if (or (= c NO-NODE)
+                          (> (load (field p steps)) (load (field p budget))))
+                      (do (ev-fail! EV-STEPS c) 0)
+                      (do
+                        ;; Merge Phis establish the block environment before any allocation or
+                        ;; effect controlled by that block can read them.
+                        (if (or (= (n-op c) OP-CALLEND)
+                                (or (= (n-op c) OP-REGION) (= (n-op c) OP-LOOP)))
+                            0
+                            (ev-enter-ctrl! c))
+                        (if (ev-failed?)
+                            0
+                            (case (n-op c) OP-RETURN
+                                  (do
+                                    ; Force the returned value first. It can itself be an allocating
+                                    ; Call whose CallEnd is the return control; a synthetic memory Arg
+                                    ; on that continuation must observe the call's completed heap, not
+                                    ; the caller state from before the value was demanded. The explicit
+                                    ; memory edge is still evaluated before the value is published.
+                                    (let [value (ev-data (n-in c 1))]
+                                      (if (ev-failed?)
+                                          0
+                                          (do
+                                            (if (= (n-nins c) 3)
+                                                (let [memory (ev-data (n-in c 2))]
+                                                  (if (= (rt-tag memory) RT-MEM)
+                                                      (do (ev-publish-mem (rt-payload memory)) 0)
+                                                      (do (ev-fail! EV-MEM c) 0)))
+                                                0)
+                                            (if (ev-failed?) 0 (store! ans value))
+                                            (if (ev-failed?) 0
+                                                (ev-trace-event! EVT-RETURN c fun 0 SHAPE-NO-NAME value))
+                                            0)))
+                                    (store! done true)
+                                    0)
+                                    OP-IF
+                                  (let [pred (ev-data (n-in c 1))]
+                                    (if (ev-failed?)
+                                        0
+                                        (if (not (rt-condition? pred))
+                                            (do (ev-fail! EV-TYPE c) 0)
+                                            (let [arm (ev-if-arm c (if (rt-truthy? pred) 0 1))]
+                                              (if (= arm NO-NODE)
+                                                  (do (ev-fail! EV-STUCK c) 0)
+                                                  (do (store! prev c) (store! cur arm) 0))))))
+                                    OP-REGION
+                                  (do
+                                    (ev-enter-merge! c (load prev))
+                                    (if (ev-failed?) 0 (ev-enter-ctrl! c))
+                                    (if (ev-failed?)
+                                        0
+                                        (let [nx (ev-ctrl-succ-mode c true)]
+                                          (if (= nx NO-NODE)
+                                              (do (ev-fail! EV-STUCK c) 0)
+                                              (do (store! prev c) (store! cur nx) 0)))))
+                                    OP-LOOP
+                                  (do
+                                    (ev-enter-merge! c (load prev))
+                                    (if (ev-failed?) 0 (ev-enter-ctrl! c))
+                                    (if (ev-failed?)
+                                        0
+                                        (let [nx (ev-ctrl-succ-mode c true)]
+                                          (if (= nx NO-NODE)
+                                              (do (ev-fail! EV-STUCK c) 0)
+                                              (do (store! prev c) (store! cur nx) 0)))))
+                                    OP-CALLEND
+                                  (let [call (n-in c 1)]
+                                    ;; CallEnd is the sole dynamic execution point for its call.
+                                    ;; Publish the answer before continuation-pinned effects so a
+                                    ;; later data user cannot invoke the callee a second time.
+                                    (al-set! [bool] (field p hasenv) call false)
+                                    (let [answer (ev-call call)]
+                                    (if (ev-failed?)
+                                        0
+                                        (do
+                                          (al-set! [bool] (field p hasenv) call true)
+                                          (al-set! [RtVal] (field p env) call answer)
+                                          (ev-enter-ctrl! c)
+                                          (let [nx (ev-ctrl-succ-mode c true)]
+                                            (if (= nx NO-NODE)
+                                                (do (ev-fail! EV-STUCK c) 0)
+                                                (do (store! prev c) (store! cur nx) 0)))))))
+                                    (let [nx (ev-ctrl-succ-mode c true)]
+                                      (if (= nx NO-NODE)
+                                          (do (ev-fail! EV-STUCK c) 0)
+                                          (do (store! prev c) (store! cur nx) 0)))))))
+                  0)
+                0)))
     (load ans)))
 
 (defn ev-call [(n i64)] (-> RtVal)
   (let [p (ev)]
-    (if (al-get (load (field p hasenv)) n) (al-get (load (field p env)) n)
-      (let [cv (ev-data (n-in n 1))]
-        (if (or (ev-failed?) (!= (rt-tag cv) RT-FUN)) (ev-fail! EV-CALL n)
-          (let [token (rt-payload cv)
-                cid (ev-fun-closure-id token)
-                capc (if (< cid 0) 0 (al-get (load (field p clen)) cid))
-                fun (ev-find-fun (ev-fun-fidx token))]
-            (if (= fun NO-NODE) (ev-fail! EV-CALL n)
-              (let [(mut parms) (al-new [i64] (malloc-allocator))
-                    len (n-nouts fun) (mut i) 0]
-                ; Gather parameters by their explicit index. Holes and duplicates are rejected.
-                (loop
-                  (if (>= (load i) (+ capc (- (n-nins n) 2))) (break)
-                    (do (al-push! [i64] (mut parms) NO-NODE)
-                        (store! i (+ (load i) 1)) 0)))
-                (store! i 0)
-                (loop
-                  (if (>= (load i) len) (break)
-                    (do (let [u (n-out fun (load i))]
-                          (if (and (not (n-dead? u)) (= (n-op u) OP-PARM))
-                              (let [idx (n-aux u)]
-                                (if (or (or (< idx 0) (>= idx (al-len [i64] (load parms))))
-                                        (!= (al-get (load parms) idx) NO-NODE))
-                                    (do (ev-fail! EV-CALL n) 0)
-                                  (al-set! [i64] (mut parms) idx u))) 0))
-                        (store! i (+ (load i) 1)) 0)))
-                (let [argc (al-len [i64] (load parms))
-                      (mut oldh) (al-new [bool] (malloc-allocator))
-                      (mut oldv) (al-new [RtVal] (malloc-allocator))
-                      (mut callids) (al-new [i64] (malloc-allocator))
-                      (mut oldch) (al-new [bool] (malloc-allocator))
-                      (mut oldcv) (al-new [RtVal] (malloc-allocator))]
-                  (store! i 0)
-                  (loop
-                    (if (>= (load i) argc) (break)
-                      (do (let [pm (al-get (load parms) (load i))]
-                            (if (= pm NO-NODE) (do (ev-fail! EV-CALL n) 0)
-                              (do (al-push! [bool] (mut oldh) (al-get (load (field p hasenv)) pm))
-                                  (al-push! [RtVal] (mut oldv) (al-get (load (field p env)) pm))
-                                  (let [av (if (< (load i) capc)
-                                               (al-get (load (field p cvals))
-                                                 (+ (al-get (load (field p coff)) cid) (load i)))
-                                             (ev-data (n-in n (+ 2 (- (load i) capc)))))]
-                                    (al-set! [bool] (field p hasenv) pm true)
-                                    (al-set! [RtVal] (field p env) pm av))))
-                          (store! i (+ (load i) 1)) 0))))
-                  ; Recursive invocation reuses the same ideal Call and New nodes. Preserve every
-                  ; cached call result and allocation identity as part of the caller frame: a child
-                  ; invocation must not overwrite either the caller's left result or the object the
-                  ; caller allocated before entering that child.
-                  (store! i 0)
-                  (loop
-                    (if (>= (load i) (n-count)) (break)
-                      (do (if (and (not (n-dead? (load i)))
-                                   (or (= (n-op (load i)) OP-CALL)
-                                       (= (n-op (load i)) OP-NEW)))
-                              (do (al-push! [i64] (mut callids) (load i))
-                                  (al-push! [bool] (mut oldch)
-                                            (al-get (load (field p hasenv)) (load i)))
-                                  (al-push! [RtVal] (mut oldcv)
-                                            (al-get (load (field p env)) (load i))) 0) 0)
-                          (store! i (+ (load i) 1)) 0)))
-                  (let [ans (if (ev-failed?) (RUndef)
-                              (if (>= (load (field p depth)) EV-CALL-DEPTH-MAX)
-                                  (ev-fail! EV-CALL n)
-                                (do (store! (field p depth) (+ (load (field p depth)) 1))
-                                    (let [v (ev-exec-fun fun)]
-                                      (store! (field p depth) (- (load (field p depth)) 1))
-                                      v))))]
-                    ; Restore the caller frame even on failure.
-                    (store! i 0)
-                    (loop
-                      (if (>= (load i) argc) (break)
-                        (do (let [pm (al-get (load parms) (load i))]
-                              (if (= pm NO-NODE) 0
-                                (do (al-set! [bool] (field p hasenv) pm (al-get (load oldh) (load i)))
-                                    (al-set! [RtVal] (field p env) pm (al-get (load oldv) (load i)))))
-                            (store! i (+ (load i) 1)) 0))))
-                    (store! i 0)
-                    (loop
-                      (if (>= (load i) (al-len [i64] (load callids))) (break)
-                        (do (let [call-id (al-get (load callids) (load i))]
-                              (al-set! [bool] (field p hasenv) call-id
-                                       (al-get (load oldch) (load i)))
-                              (al-set! [RtVal] (field p env) call-id
-                                       (al-get (load oldcv) (load i))))
-                            (store! i (+ (load i) 1)) 0)))
-                    (al-free! [bool] (mut oldh)) (al-free! [RtVal] (mut oldv))
-                    (al-free! [i64] (mut callids))
-                    (al-free! [bool] (mut oldch)) (al-free! [RtVal] (mut oldcv))
-                    (al-free! [i64] (mut parms))
-                    (if (ev-failed?) ans
-                      (do (al-set! [bool] (field p hasenv) n true)
-                          (al-set! [RtVal] (field p env) n ans)
-                          ans))))))))))))
+    (if (al-get (load (field p hasenv)) n)
+        (al-get (load (field p env)) n)
+        (let [cv (ev-data (n-in n 1))]
+          (if (or (ev-failed?) (!= (rt-tag cv) RT-FUN))
+              (ev-fail! EV-CALL n)
+              (let [token (rt-payload cv)
+                    cid (ev-fun-closure-id token)
+                    capc (if (< cid 0) 0 (al-get (load (field p clen)) cid))
+                    fun (ev-fun-node token)]
+                (if (or (< fun 0) (or (>= fun (n-count)) (!= (n-op fun) OP-FUN)))
+                    (ev-fail! EV-CALL n)
+                    (let [(mut parms) (al-new [i64] (malloc-allocator))
+                          len (n-nouts fun)
+                          (mut i) 0]
+                      (ev-trace-event! EVT-CALL n fun 0 SHAPE-NO-NAME cv)
+                      ; A trailing memory input is the call's effect token, not a source parameter.
+                      ; Evaluate it before entering the callee so memory Args inherit the caller heap.
+                      (let [last (- (n-nins n) 1)]
+                        (if (and (>= last 2) (ty-mem? (n-ty (n-in n last))))
+                            (let [memory (ev-data (n-in n last))]
+                              (if (= (rt-tag memory) RT-MEM)
+                                  (do (ev-publish-mem (rt-payload memory)) 0)
+                                  (do (ev-fail! EV-MEM n) 0)))
+                            0))
+                      ; JavaScript ignores excess arguments and supplies undefined for missing
+                      ; arguments. Captures occupy the leading ABI parameters but are exact.
+                      (loop (if (>= (load i) (fun-parm-count fun))
+                                (break)
+                                (do
+                                  (al-push! [i64] (mut parms) NO-NODE)
+                                  (store! i (+ (load i) 1))
+                                  0)))
+                      (store! i 0)
+                      (loop (if (>= (load i) len)
+                                (break)
+                                (do
+                                  (let [u (n-out fun (load i))]
+                                    (if (and (not (n-dead? u)) (= (n-op u) OP-PARM))
+                                        (let [idx (n-aux u)]
+                                          (if (or (or (< idx 0) (>= idx (al-len [i64] (load parms))))
+                                                  (!= (al-get (load parms) idx) NO-NODE))
+                                              (do (ev-fail! EV-CALL n) 0)
+                                              (al-set! [i64] (mut parms) idx u)))
+                                        0))
+                                  (store! i (+ (load i) 1))
+                                  0)))
+                      (let [argc (al-len [i64] (load parms))
+                            (mut recursive) false
+                            (mut oldh) (al-new [bool] (malloc-allocator))
+                            (mut oldv) (al-new [RtVal] (malloc-allocator))
+                            (mut callids) (al-new [i64] (malloc-allocator))
+                            (mut oldch) (al-new [bool] (malloc-allocator))
+                            (mut oldcv) (al-new [RtVal] (malloc-allocator))]
+                        (store! i 0)
+                        (loop (if (or (>= (load i) (al-len [i64] (load (field p active-funs))))
+                                      (load recursive))
+                                  (break)
+                                  (do
+                                    (if (= (al-get [i64] (load (field p active-funs)) (load i)) fun)
+                                        (store! recursive true) 0)
+                                    (store! i (+ (load i) 1)))))
+                        (store! i 0)
+                        (loop (if (>= (load i) argc)
+                                  (break)
+                                  (do
+                                    (let [pm (al-get (load parms) (load i))]
+                                      (if (= pm NO-NODE)
+                                          0
+                                          (do
+                                            (al-push! [bool] (mut oldh) (al-get (load (field p hasenv)) pm))
+                                            (al-push! [RtVal] (mut oldv) (al-get (load (field p env)) pm))
+                                            (let [source-argc
+                                                    (- (- (n-nins n) 2)
+                                                       (if (and (> (n-nins n) 2)
+                                                                (ty-mem? (n-ty (n-in n (- (n-nins n) 1)))))
+                                                           1
+                                                           0))
+                                                  av
+                                                    (if (< (load i) capc)
+                                                        (al-get (load (field p cvals))
+                                                                (+ (al-get (load (field p coff)) cid) (load i)))
+                                                        (if (< (- (load i) capc) source-argc)
+                                                            (ev-data (n-in n (+ 2 (- (load i) capc))))
+                                                            (RUndef)))]
+                                              (al-set! [bool] (field p hasenv) pm true)
+                                              (al-set! [RtVal] (field p env) pm av))))
+                                      (store! i (+ (load i) 1))
+                                      0))))
+                        ; Recursive invocation reuses the same ideal Call and New nodes. Preserve every
+                        ; cached call result and allocation identity as part of the caller frame: a child
+                        ; invocation must not overwrite either the caller's left result or the object the
+                        ; caller allocated before entering that child.
+                        (store! i 0)
+                        (loop (if (or (not (load recursive))
+                                      (>= (load i) (al-len [i64] (load (field p frame-nodes)))))
+                                  (break)
+                                  (do
+                                    (let [cached
+                                            (al-get [i64]
+                                                    (load (field p frame-nodes))
+                                                    (load i))]
+                                      (al-push! [i64] (mut callids) cached)
+                                      (al-push! [bool]
+                                                (mut oldch)
+                                                (al-get (load (field p hasenv)) cached))
+                                      (al-push! [RtVal]
+                                                (mut oldcv)
+                                                (al-get (load (field p env)) cached)))
+                                    (store! i (+ (load i) 1))
+                                    0)))
+                        (let [ans
+                                (if (ev-failed?)
+                                    (RUndef)
+                                    (if (>= (load (field p depth)) EV-CALL-DEPTH-MAX)
+                                        (ev-fail! EV-CALL n)
+                                        (do
+                                          (store! (field p depth) (+ (load (field p depth)) 1))
+                                          (al-push! [i64] (field p active-funs) fun)
+                                          (let [v (ev-exec-fun fun)]
+                                            (al-pop! [i64] (field p active-funs))
+                                            (store! (field p depth) (- (load (field p depth)) 1))
+                                            v))))]
+                          ; Restore the caller frame even on failure.
+                          (store! i 0)
+                          (loop (if (>= (load i) argc)
+                                    (break)
+                                    (do
+                                      (let [pm (al-get (load parms) (load i))]
+                                        (if (= pm NO-NODE)
+                                            0
+                                            (do
+                                              (al-set! [bool] (field p hasenv) pm (al-get (load oldh) (load i)))
+                                              (al-set! [RtVal] (field p env) pm (al-get (load oldv) (load i)))))
+                                        (store! i (+ (load i) 1))
+                                        0))))
+                          (store! i 0)
+                          (loop (if (>= (load i) (al-len [i64] (load callids)))
+                                    (break)
+                                    (do
+                                      (let [call-id (al-get (load callids) (load i))]
+                                        (al-set! [bool]
+                                                 (field p hasenv)
+                                                 call-id
+                                                 (al-get (load oldch) (load i)))
+                                        (al-set! [RtVal]
+                                                 (field p env)
+                                                 call-id
+                                                 (al-get (load oldcv) (load i))))
+                                      (store! i (+ (load i) 1))
+                                      0)))
+                          (al-free! [bool] (mut oldh))
+                          (al-free! [RtVal] (mut oldv))
+                          (al-free! [i64] (mut callids))
+                          (al-free! [bool] (mut oldch))
+                          (al-free! [RtVal] (mut oldcv))
+                          (al-free! [i64] (mut parms))
+                          (if (ev-failed?)
+                              ans
+                              (do
+                                (al-set! [bool] (field p hasenv) n true)
+                                (al-set! [RtVal] (field p env) n ans)
+                                ans))))))))))))
 
 ; ---------------------------------------------------------------------------
 ; Arithmetic
@@ -1061,84 +2297,198 @@
 ;; An object would coerce through valueOf in real JavaScript, which needs a call, so arithmetic on
 ;; one is EV-TYPE here for the same reason arithmetic on a string is: a guess would make this
 ;; oracle disagree with the language it defines.
-(defn rt-num? [(v RtVal)] (-> bool) (or (= (rt-tag v) RT-INT) (= (rt-tag v) RT-FLT))
-)
-(defn rt-int? [(v RtVal)] (-> bool) (= (rt-tag v) RT-INT))
+(defn rt-num? [(v RtVal)] (-> bool)
+  (or (= (rt-tag v) RT-INT) (= (rt-tag v) RT-FLT)))
+(defn rt-int? [(v RtVal)] (-> bool)
+  (= (rt-tag v) RT-INT))
 (defn rt-as-f64 [(v RtVal)] (-> f64)
   (match v
     (RInt [n] (cast f64 n))
     (RFlt [b] (bits-f64 b))
-    (RUndef [] 0.0) (RNull [] 0.0) (RBool [b] 0.0) (RObj [id] 0.0)
-    (RStr [id] 0.0) (RSym [id] 0.0) (RBig [n] 0.0) (RFun [f] 0.0) (RMem [ver] 0.0)))
+    (RUndef [] 0.0)
+    (RNull [] 0.0)
+    (RBool [b] 0.0)
+    (RObj [id] 0.0)
+    (RStr [id] 0.0)
+    (RSym [id] 0.0)
+    (RBig [n] 0.0)
+    (RFun [f] 0.0)
+    (RMem [ver] 0.0)))
 (defn rt-as-int [(v RtVal)] (-> i64)
-  (match v (RInt [n] n) (RFlt [b] 0) (RUndef [] 0) (RNull [] 0) (RBool [b] 0)
-           (RObj [id] 0) (RStr [id] 0) (RSym [id] 0) (RBig [n] 0) (RFun [f] 0)
-           (RMem [ver] 0)))
+  (match v
+    (RInt [n] n)
+    (RFlt [b] 0)
+    (RUndef [] 0)
+    (RNull [] 0)
+    (RBool [b] 0)
+    (RObj [id] 0)
+    (RStr [id] 0)
+    (RSym [id] 0)
+    (RBig [n] 0)
+    (RFun [f] 0)
+    (RMem [ver] 0)))
+
+;; Keep the runtime representation deterministic even when the host produces a NaN payload whose
+;; quiet/sign bits depend on the particular operation or machine instruction.
+(defn rt-flt-result [(value f64)] (-> RtVal)
+  (let [bits (f64-bits value)] (RFlt (if (f64-nan-bits? bits) JSV-NAN bits))))
 
 (defn ev-arith [(n i64) (op i64)] (-> RtVal)
   (let [a (ev-data (n-in n 1))]
-    (if (ev-failed?) a
-      (let [b (ev-data (n-in n 2))]
-        (if (ev-failed?) b
-          (if (not (and (rt-num? a) (rt-num? b))) (ev-fail! EV-TYPE n)
-            (if (and (rt-int? a) (rt-int? b)) (ev-int-arith n op (rt-as-int a) (rt-as-int b))
-              (ev-flt-arith op (rt-as-f64 a) (rt-as-f64 b)))))))))
+    (if (ev-failed?)
+        a
+        (let [b (ev-data (n-in n 2))]
+          (if (ev-failed?)
+              b
+              (if (not (and (rt-num? a) (rt-num? b)))
+                  (ev-fail! EV-TYPE n)
+                  (if (and (rt-int? a) (rt-int? b))
+                      (ev-int-arith n op (rt-as-int a) (rt-as-int b))
+                      (ev-flt-arith op (rt-as-f64 a) (rt-as-f64 b)))))))))
 
 (defn ev-int-arith [(n i64) (op i64) (x i64) (y i64)] (-> RtVal)
   (if (= op OP-ADD)
-      (let [s (+ x y)] (if (add-ovf? x y s) (ev-fail! EV-OVERFLOW n) (RInt s)))
-    (if (= op OP-SUB)
-        (if (= y TY-IMIN) (ev-fail! EV-OVERFLOW n)
-          (let [s (- x y)] (if (add-ovf? x (- 0 y) s) (ev-fail! EV-OVERFLOW n) (RInt s))))
-      (let [pr (* x y)] (if (mul-ovf? x y pr) (ev-fail! EV-OVERFLOW n) (RInt pr))))))
+      (let [s (+ x y)]
+        (if (or (add-ovf? x y s) (or (< s JSV-INT-MIN) (> s JSV-INT-MAX)))
+            (ev-flt-arith op (cast f64 x) (cast f64 y))
+            (RInt s)))
+      (if (= op OP-SUB)
+          (if (= y TY-IMIN)
+              (ev-flt-arith op (cast f64 x) (cast f64 y))
+              (let [s (- x y)]
+                (if (or (add-ovf? x (- 0 y) s) (or (< s JSV-INT-MIN) (> s JSV-INT-MAX)))
+                    (ev-flt-arith op (cast f64 x) (cast f64 y))
+                    (RInt s))))
+          (let [pr (* x y)]
+            (if (or (mul-ovf? x y pr) (or (< pr JSV-INT-MIN) (> pr JSV-INT-MAX)))
+                (ev-flt-arith op (cast f64 x) (cast f64 y))
+                (if (and (= pr 0) (!= (< x 0) (< y 0)))
+                    (RFlt JSV-NEGATIVE-ZERO)
+                    (RInt pr)))))))
 
 (defn ev-flt-arith [(op i64) (x f64) (y f64)] (-> RtVal)
-  (RFlt (f64-bits (if (= op OP-ADD) (+ x y) (if (= op OP-SUB) (- x y) (* x y))))))
+  (rt-flt-result (if (= op OP-ADD) (+ x y) (if (= op OP-SUB) (- x y) (* x y)))))
 
 ;; Division leaves the integers: 1/2 is 0.5 and x/0 is an infinity. An exact integer quotient
 ;; stays an integer, which is what `div-numeric` claims in the lattice.
+(defn ev-int-div [(x i64) (y i64)] (-> RtVal)
+  (if (= y 0)
+      (rt-flt-result (/ (cast f64 x) 0.0))
+      (if (and (= x TY-IMIN) (= y -1))
+          (rt-flt-result (/ (cast f64 x) (cast f64 y)))
+          (if (!= (% x y) 0)
+              (rt-flt-result (/ (cast f64 x) (cast f64 y)))
+              (let [q (/ x y)]
+                (if (and (= q 0) (!= (< x 0) (< y 0)))
+                    (RFlt JSV-NEGATIVE-ZERO)
+                    (if (and (>= q JSV-INT-MIN) (<= q JSV-INT-MAX))
+                        (RInt q)
+                        (rt-flt-result (/ (cast f64 x) (cast f64 y))))))))))
+
 (defn ev-div [(n i64)] (-> RtVal)
   (let [a (ev-data (n-in n 1))]
-    (if (ev-failed?) a
-      (let [b (ev-data (n-in n 2))]
-        (if (ev-failed?) b
-          (if (not (and (rt-num? a) (rt-num? b))) (ev-fail! EV-TYPE n)
-            (if (and (rt-int? a) (rt-int? b))
-                (let [x (rt-as-int a) y (rt-as-int b)]
-                  (if (= y 0) (RFlt (f64-bits (/ (cast f64 x) 0.0)))
-                    (if (and (= x TY-IMIN) (= y -1)) (ev-fail! EV-OVERFLOW n)
-                      (if (= (% x y) 0) (RInt (/ x y))
-                        (RFlt (f64-bits (/ (cast f64 x) (cast f64 y))))))))
-              (RFlt (f64-bits (/ (rt-as-f64 a) (rt-as-f64 b)))))))))))
+    (if (ev-failed?)
+        a
+        (let [b (ev-data (n-in n 2))]
+          (if (ev-failed?)
+              b
+              (if (not (and (rt-num? a) (rt-num? b)))
+                  (ev-fail! EV-TYPE n)
+                  (if (and (rt-int? a) (rt-int? b))
+                      (ev-int-div (rt-as-int a) (rt-as-int b))
+                      (rt-flt-result (/ (rt-as-f64 a) (rt-as-f64 b))))))))))
 
 (defn ev-minus [(n i64)] (-> RtVal)
   (let [a (ev-data (n-in n 1))]
-    (if (ev-failed?) a
-      (if (not (rt-num? a)) (ev-fail! EV-TYPE n)
-        (if (rt-int? a)
-            (let [x (rt-as-int a)]
-              (if (= x TY-IMIN) (ev-fail! EV-OVERFLOW n) (RInt (- 0 x))))
-          (RFlt (f64-bits (- 0.0 (rt-as-f64 a)))))))))
+    (if (ev-failed?)
+        a
+        (if (not (rt-num? a))
+            (ev-fail! EV-TYPE n)
+            (if (rt-int? a)
+                (let [x (rt-as-int a)]
+                  (if (= x 0)
+                      (RFlt JSV-NEGATIVE-ZERO)
+                      (if (or (= x TY-IMIN) (> (- 0 x) JSV-INT-MAX))
+                          (rt-flt-result (- 0.0 (cast f64 x)))
+                          (RInt (- 0 x)))))
+                (rt-flt-result (- 0.0 (rt-as-f64 a))))))))
 
 (defn ev-not [(n i64)] (-> RtVal)
   (let [a (ev-data (n-in n 1))]
     (if (ev-failed?) a (RBool (not (rt-truthy? a))))))
 
+(defn rt-to-int32 [(v RtVal)] (-> i64)
+  (if (= (rt-tag v) RT-BOOL)
+      (if (= (rt-payload v) 0) 0 1)
+      (if (rt-int? v)
+          (js-to-int32-int (rt-as-int v))
+          (js-to-int32-f64 (rt-as-f64 v)))))
+
+(defn rt-bit-coercible? [(v RtVal)] (-> bool)
+  (or (rt-num? v) (= (rt-tag v) RT-BOOL)))
+
+(defn ev-bit-bin [(n i64) (op i64)] (-> RtVal)
+  (let [a (ev-data (n-in n 1))]
+    (if (ev-failed?)
+        a
+        (let [b (ev-data (n-in n 2))]
+          (if (ev-failed?)
+              b
+              (if (not (and (rt-bit-coercible? a) (rt-bit-coercible? b)))
+                  (ev-fail! EV-TYPE n)
+                  (RInt (js-bit-bin op (rt-to-int32 a) (rt-to-int32 b)))))))))
+
+(defn ev-bit-not [(n i64)] (-> RtVal)
+  (let [a (ev-data (n-in n 1))]
+    (if (ev-failed?)
+        a
+        (if (not (rt-num? a))
+            (ev-fail! EV-TYPE n)
+            (RInt (js-bit-not (rt-to-int32 a)))))))
+
+(defn ev-mod [(n i64)] (-> RtVal)
+  (let [a (ev-data (n-in n 1))]
+    (if (ev-failed?)
+        a
+        (let [b (ev-data (n-in n 2))]
+          (if (ev-failed?)
+              b
+              (if (not (and (rt-num? a) (rt-num? b)))
+                  (ev-fail! EV-TYPE n)
+                  (RFlt (js-remainder-bits (rt-as-f64 a) (rt-as-f64 b)))))))))
+
 (defn ev-cmp [(n i64) (op i64)] (-> RtVal)
   (let [a (ev-data (n-in n 1))]
-    (if (ev-failed?) a
-      (let [b (ev-data (n-in n 2))]
-        (if (ev-failed?) b
-          (if (and (rt-num? a) (rt-num? b))
-              (if (and (rt-int? a) (rt-int? b))
-                  (let [x (rt-as-int a) y (rt-as-int b)]
-                    (RBool (if (= op OP-EQ) (= x y) (if (= op OP-LT) (< x y) (<= x y)))))
-                (let [x (rt-as-f64 a) y (rt-as-f64 b)]
-                  (RBool (if (= op OP-EQ) (primitive/fcmp-eq x y)
-                           (if (= op OP-LT) (primitive/fcmp-lt x y)
-                             (primitive/fcmp-le x y))))))
-            ; only `==` is defined on non-numbers here, and only between like kinds
-            (if (= op OP-EQ) (RBool (rt-eq? a b)) (ev-fail! EV-TYPE n))))))))
+    (if (ev-failed?)
+        a
+        (let [b (ev-data (n-in n 2))]
+          (if (ev-failed?)
+              b
+              (if (and (rt-num? a) (rt-num? b))
+                  (if (and (rt-int? a) (rt-int? b))
+                      (let [x (rt-as-int a)
+                            y (rt-as-int b)]
+                        (RBool (if (= op OP-EQ) (= x y) (if (= op OP-LT) (< x y) (<= x y)))))
+                      (let [x (rt-as-f64 a)
+                            y (rt-as-f64 b)]
+                        (RBool (if (= op OP-EQ)
+                                   (primitive/fcmp-eq x y)
+                                   (if (= op OP-LT)
+                                       (primitive/fcmp-lt x y)
+                                       (primitive/fcmp-le x y))))))
+                  ; Boolean/numeric equality appears in the frontend's canonical logical-not
+                  ; form (`predicate == 0`) and follows JavaScript's numeric Boolean coercion.
+                  (if (= op OP-EQ)
+                      (if (and (= (rt-tag a) RT-BOOL) (rt-num? b))
+                          (RBool (primitive/fcmp-eq
+                                   (if (= (rt-payload a) 0) 0.0 1.0)
+                                   (rt-as-f64 b)))
+                          (if (and (rt-num? a) (= (rt-tag b) RT-BOOL))
+                              (RBool (primitive/fcmp-eq
+                                       (rt-as-f64 a)
+                                       (if (= (rt-payload b) 0) 0.0 1.0)))
+                              (RBool (rt-eq? a b))))
+                      (ev-fail! EV-TYPE n))))))))
 
 ; ============================================================================
 ; Control
@@ -1146,56 +2496,76 @@
 ;; The unique live control successor. There is no schedule, so this is found by looking at the
 ;; def-use edges: exactly one live control node should read this one as its control input.
 (defn ev-ctrl-succ-mode [(n i64) (include-fun-returns bool)] (-> i64)
-  (let [len (n-nouts n) (mut found) NO-NODE (mut count) 0 (mut i) 0]
-    (loop
-      (if (>= (load i) len) (break)
-        (do (let [u (n-out n (load i))]
-              ; `u == n` is a self back edge (a bodyless loop is its own back edge). It is a real
-              ; control edge but not a forward step, and counting it made every such loop look
-              ; ambiguous and therefore stuck.
-              (if (or (or (= u NO-NODE) (n-dead? u)) (= u n)) 0
-                (if (and (and (op-control? (n-op u)) (ev-reads-ctrl? u n))
-                         (or include-fun-returns (not (ev-function-body-return? u))))
-                    (do (store! count (+ (load count) 1))
-                        (if (= (load found) NO-NODE) (store! found u) 0)
-                        0)
-                  0)))
-            (store! i (+ (load i) 1))
-            0)))
+  (let [len (n-nouts n)
+        (mut found) NO-NODE
+        (mut count) 0
+        (mut i) 0]
+    (loop (if (>= (load i) len)
+              (break)
+              (do
+                (let [u (n-out n (load i))]
+                  ; `u == n` is a self back edge (a bodyless loop is its own back edge). It is a real
+                  ; control edge but not a forward step, and counting it made every such loop look
+                  ; ambiguous and therefore stuck.
+                  (if (or (or (= u NO-NODE) (n-dead? u)) (= u n))
+                      0
+                      (if (and (and (op-control? (n-op u)) (ev-reads-ctrl? u n))
+                               (or include-fun-returns (not (ev-function-body-return? u))))
+                          (do
+                            (store! count (+ (load count) 1))
+                            (if (= (load found) NO-NODE) (store! found u) 0)
+                            0)
+                          0)))
+                (store! i (+ (load i) 1))
+                0)))
     ; Stop is not a successor to step into: a Return ends the run
     (if (= (load count) 1) (load found) NO-NODE)))
 
-(defn ev-ctrl-succ [(n i64)] (-> i64) (ev-ctrl-succ-mode n false))
+(defn ev-ctrl-succ [(n i64)] (-> i64)
+  (ev-ctrl-succ-mode n false))
 
 (defn ev-function-body-return? [(n i64)] (-> bool)
-  (if (!= (n-op n) OP-RETURN) false
-    (let [len (n-nouts n) (mut i) 0 (mut yes) false]
-      (loop
-        (if (or (>= (load i) len) (load yes)) (break)
-          (do (let [u (n-out n (load i))]
-                (if (and (not (n-dead? u)) (= (n-op u) OP-FUN)) (store! yes true) 0))
-              (store! i (+ (load i) 1)) 0)))
-      (load yes))))
+  (if (!= (n-op n) OP-RETURN)
+      false
+      (let [len (n-nouts n)
+            (mut i) 0
+            (mut yes) false]
+        (loop (if (or (>= (load i) len) (load yes))
+                  (break)
+                  (do
+                    (let [u (n-out n (load i))]
+                      (if (and (not (n-dead? u)) (= (n-op u) OP-FUN)) (store! yes true) 0))
+                    (store! i (+ (load i) 1))
+                    0)))
+        (load yes))))
 
 ;; Does `u` read `n` as CONTROL (as opposed to as a value)? For a merge that means any path slot;
 ;; for everything else it means slot 0.
 (defn ev-reads-ctrl? [(u i64) (n i64)] (-> bool)
-  (if (= (n-op u) OP-STOP) false
-    (let [lo (n-cpred-lo u) hi (n-cpred-hi u) (mut i) lo (mut yes) false]
-      (loop
-        (if (or (>= (load i) hi) (load yes)) (break)
-          (do (if (= (n-in u (load i)) n) (store! yes true) 0)
-              (store! i (+ (load i) 1))
-              0)))
-      (load yes))))
+  (if (= (n-op u) OP-STOP)
+      false
+      (let [lo (n-cpred-lo u)
+            hi (n-cpred-hi u)
+            (mut i) lo
+            (mut yes) false]
+        (loop (if (or (>= (load i) hi) (load yes))
+                  (break)
+                  (do
+                    (if (= (n-in u (load i)) n) (store! yes true) 0)
+                    (store! i (+ (load i) 1))
+                    0)))
+        (load yes))))
 
 (defn ev-pred-index [(merge i64) (from i64)] (-> i64)
-  (let [hi (n-nins merge) (mut i) 1 (mut at) NO-NODE]
-    (loop
-      (if (or (>= (load i) hi) (!= (load at) NO-NODE)) (break)
-        (do (if (= (n-in merge (load i)) from) (store! at (load i)) 0)
-            (store! i (+ (load i) 1))
-            0)))
+  (let [hi (n-nins merge)
+        (mut i) 1
+        (mut at) NO-NODE]
+    (loop (if (or (>= (load i) hi) (!= (load at) NO-NODE))
+              (break)
+              (do
+                (if (= (n-in merge (load i)) from) (store! at (load i)) 0)
+                (store! i (+ (load i) 1))
+                0)))
     (load at)))
 
 ;; SIMULTANEOUS update, and it has to be. Every Phi on this merge takes the value on the incoming
@@ -1203,36 +2573,44 @@
 ;; one at a time would let an earlier phi's new value feed a later phi's input, which silently
 ;; miscompiles a loop that swaps two variables.
 (defn ev-enter-merge! [(merge i64) (from i64)] (-> i64)
-  (let [p (ev) idx (ev-pred-index merge from)]
-    (if (= idx NO-NODE) (do (ev-fail! EV-STUCK merge) 0)
-      (let [len (n-nouts merge)
-            (mut pending-n) (al-new [i64] (malloc-allocator))
-            (mut pending-v) (al-new [RtVal] (malloc-allocator))
-            (mut i) 0]
-        (loop
-          (if (>= (load i) len) (break)
-            (do (let [u (n-out merge (load i))]
-                  (if (or (n-dead? u) (not (op-phi? (n-op u)))) 0
-                    (if (>= idx (n-nins u)) (do (ev-fail! EV-STUCK u) 0)
-                      (do (al-push! [i64] (mut pending-n) u)
-                          (al-push! [RtVal] (mut pending-v) (ev-data (n-in u idx)))
-                          0))))
-                ; A MEMORY PHI IS AN ORDINARY PHI HERE, and it is worth noticing that nothing
-                ; above had to change for it: its incoming value is a memory state, which is a
-                ; value, so it is evaluated in the old environment and committed with the rest.
-                (store! i (+ (load i) 1))
-                0)))
-        (let [m (al-len [i64] (load pending-n)) (mut k) 0]
-          (loop
-            (if (>= (load k) m) (break)
-              (do (let [u (al-get (load pending-n) (load k))]
-                    (al-set! [bool]  (field p hasenv) u true)
-                    (al-set! [RtVal] (field p env)    u (al-get (load pending-v) (load k))))
-                  (store! k (+ (load k) 1))
-                  0))))
-        (al-free! [i64] (mut pending-n))
-        (al-free! [RtVal] (mut pending-v))
-        0))))
+  (let [p (ev)
+        idx (ev-pred-index merge from)]
+    (if (= idx NO-NODE)
+        (do (ev-fail! EV-STUCK merge) 0)
+        (let [len (n-nouts merge)
+              (mut pending-n) (al-new [i64] (malloc-allocator))
+              (mut pending-v) (al-new [RtVal] (malloc-allocator))
+              (mut i) 0]
+          (loop (if (>= (load i) len)
+                    (break)
+                    (do
+                      (let [u (n-out merge (load i))]
+                        (if (or (n-dead? u) (not (op-phi? (n-op u))))
+                            0
+                            (if (>= idx (n-nins u))
+                                (do (ev-fail! EV-STUCK u) 0)
+                                (do
+                                  (al-push! [i64] (mut pending-n) u)
+                                  (al-push! [RtVal] (mut pending-v) (ev-data (n-in u idx)))
+                                  0))))
+                      ; A MEMORY PHI IS AN ORDINARY PHI HERE, and it is worth noticing that nothing
+                      ; above had to change for it: its incoming value is a memory state, which is a
+                      ; value, so it is evaluated in the old environment and committed with the rest.
+                      (store! i (+ (load i) 1))
+                      0)))
+          (let [m (al-len [i64] (load pending-n))
+                (mut k) 0]
+            (loop (if (>= (load k) m)
+                      (break)
+                      (do
+                        (let [u (al-get (load pending-n) (load k))]
+                          (al-set! [bool] (field p hasenv) u true)
+                          (al-set! [RtVal] (field p env) u (al-get (load pending-v) (load k))))
+                        (store! k (+ (load k) 1))
+                        0))))
+          (al-free! [i64] (mut pending-n))
+          (al-free! [RtVal] (mut pending-v))
+          0))))
 
 ;; Run from Start until a Return, or until the step budget runs out. The budget is what turns a
 ;; non-terminating program into a reported status rather than a hung test.
@@ -1242,90 +2620,122 @@
 
 ;; The run proper, without resetting, so bindings made beforehand survive.
 (defn ev-run-nobind [(budget i64)] (-> i64)
-  (let [p (ev) (mut cur) (g-start) (mut prev) NO-NODE]
+  (let [p (ev)
+        (mut cur) (g-start)
+        (mut prev) NO-NODE]
     (store! (field p budget) budget)
-    (loop
-      (if (ev-failed?) (break)
-        (do (store! (field p steps) (+ (load (field p steps)) 1))
-            (if (> (load (field p steps)) budget) (do (ev-fail! EV-STEPS (load cur)) 0)
-              (let [c (load cur)]
-                (if (n-dead? c) (do (ev-fail! EV-DEAD c) 0)
-                  (if (= (n-ty c) (t-xctrl)) (do (ev-fail! EV-DEAD c) 0)
-                    (do
-                     ; CallEnd executes its call before operations pinned to the continuation.
-                     (if (= (n-op c) OP-CALLEND) 0 (ev-enter-ctrl! c))
-                     (case (n-op c)
-                      OP-RETURN
-                        (do (store! (field p result) (ev-data (n-in c 1)))
-                            ; THE FINAL MEMORY IS EVALUATED TOO, when the Return carries one. It
-                            ; is not the program's result and nothing compares it, but forcing
-                            ; the chain is what makes a store nobody reads still run, and
-                            ; therefore what makes EV-MEM reachable on a miswired tail. A
-                            ; program whose value is fine and whose heap is not is not a program
-                            ; that passed.
-                            (if (or (ev-failed?) (< (n-nins c) 3)) 0
-                              (let [m (ev-data (n-in c 2))]
-                                ; and it is REMEMBERED, because the reachable heap rooted at the
-                                ; result is what a cross-run comparison has to look at; see
-                                ; `ev-render-outcome`
-                                (if (= (rt-tag m) RT-MEM)
-                                    (do (store! (field p resmem) (rt-payload m)) 0)
-                                  0)
-                                0))
-                            (if (ev-failed?) 0 (store! (field p status) EV-OK))
-                            (break))
-                      OP-IF
-                        (let [pred (ev-data (n-in c 1))]
-                          (if (ev-failed?) 0
-                            (if (not (rt-condition? pred)) (do (ev-fail! EV-TYPE c) 0)
-                            (let [want (if (rt-truthy? pred) 0 1)
-                                  arm  (ev-if-arm c want)]
-                              (if (= arm NO-NODE) (do (ev-fail! EV-STUCK c) 0)
-                                (do (store! prev c) (store! cur arm) 0))))))
-                      OP-REGION
-                        (do (ev-enter-merge! c (load prev))
-                            (if (ev-failed?) 0
-                              (let [nx (ev-ctrl-succ c)]
-                                (if (= nx NO-NODE) (do (ev-fail! EV-STUCK c) 0)
-                                  (do (store! prev c) (store! cur nx) 0)))))
-                      OP-LOOP
-                        (do (ev-enter-merge! c (load prev))
-                            (if (ev-failed?) 0
-                              (let [nx (ev-ctrl-succ c)]
-                                (if (= nx NO-NODE) (do (ev-fail! EV-STUCK c) 0)
-                                  (do (store! prev c) (store! cur nx) 0)))))
-                      OP-CALLEND
-                        (let [call (n-in c 1)]
-                          ; A Call node is one dynamic execution per arrival at CallEnd. Clear a
-                          ; prior loop iteration's cached result, evaluate now, and leave the new
-                          ; value cached for the Return or data users immediately downstream.
-                          (al-set! [bool] (field p hasenv) call false)
-                          (ev-call call)
-                          (if (ev-failed?) 0
-                            (do (ev-enter-ctrl! c)
-                            (let [nx (ev-ctrl-succ c)]
-                              (if (= nx NO-NODE) (do (ev-fail! EV-STUCK c) 0)
-                                (do (store! prev c) (store! cur nx) 0))))))
-                      OP-STOP (do (ev-fail! EV-STUCK c) 0)
-                      ; Start and CProj just pass control along
-                      (let [nx (ev-ctrl-succ c)]
-                        (if (= nx NO-NODE) (do (ev-fail! EV-STUCK c) 0)
-                          (do (store! prev c) (store! cur nx) 0)))))))))
-            0))))
+    (loop (if (ev-failed?)
+              (break)
+              (do
+                (store! (field p steps) (+ (load (field p steps)) 1))
+                (if (> (load (field p steps)) budget)
+                    (do (ev-fail! EV-STEPS (load cur)) 0)
+                    (let [c (load cur)]
+                      (ev-trace-event! EVT-CONTROL c NO-NODE 0 SHAPE-NO-NAME (RUndef))
+                      (if (n-dead? c)
+                          (do (ev-fail! EV-DEAD c) 0)
+                          (if (= (n-ty c) (t-xctrl))
+                              (do (ev-fail! EV-DEAD c) 0)
+                              (do
+                                ; CallEnd executes its call before operations pinned to the continuation.
+                                (if (or (= (n-op c) OP-CALLEND)
+                                        (or (= (n-op c) OP-REGION) (= (n-op c) OP-LOOP)))
+                                    0
+                                    (ev-enter-ctrl! c))
+                                (case (n-op c) OP-RETURN
+                                      (do
+                                        (store! (field p result) (ev-data (n-in c 1)))
+                                        ; THE FINAL MEMORY IS EVALUATED TOO, when the Return carries one. It
+                                        ; is not the program's result and nothing compares it, but forcing
+                                        ; the chain is what makes a store nobody reads still run, and
+                                        ; therefore what makes EV-MEM reachable on a miswired tail. A
+                                        ; program whose value is fine and whose heap is not is not a program
+                                        ; that passed.
+                                        (if (or (ev-failed?) (< (n-nins c) 3))
+                                            0
+                                            (let [m (ev-data (n-in c 2))]
+                                              ; and it is REMEMBERED, because the reachable heap rooted at the
+                                              ; result is what a cross-run comparison has to look at; see
+                                              ; `ev-render-outcome`
+                                              (if (= (rt-tag m) RT-MEM)
+                                                  (do (store! (field p resmem) (rt-payload m)) 0)
+                                                  0)
+                                              0))
+                                        (if (ev-failed?) 0 (store! (field p status) EV-OK))
+                                        (break))
+                                        OP-IF
+                                      (let [pred (ev-data (n-in c 1))]
+                                        (if (ev-failed?)
+                                            0
+                                            (if (not (rt-condition? pred))
+                                                (do (ev-fail! EV-TYPE c) 0)
+                                                (let [want (if (rt-truthy? pred) 0 1)
+                                                      arm (ev-if-arm c want)]
+                                                  (if (= arm NO-NODE)
+                                                      (do (ev-fail! EV-STUCK c) 0)
+                                                      (do (store! prev c) (store! cur arm) 0))))))
+                                        OP-REGION
+                                      (do
+                                        (ev-enter-merge! c (load prev))
+                                        (if (ev-failed?) 0 (ev-enter-ctrl! c))
+                                        (if (ev-failed?)
+                                            0
+                                            (let [nx (ev-ctrl-succ c)]
+                                              (if (= nx NO-NODE)
+                                                  (do (ev-fail! EV-STUCK c) 0)
+                                                  (do (store! prev c) (store! cur nx) 0)))))
+                                        OP-LOOP
+                                      (do
+                                        (ev-enter-merge! c (load prev))
+                                        (if (ev-failed?) 0 (ev-enter-ctrl! c))
+                                        (if (ev-failed?)
+                                            0
+                                            (let [nx (ev-ctrl-succ c)]
+                                              (if (= nx NO-NODE)
+                                                  (do (ev-fail! EV-STUCK c) 0)
+                                                  (do (store! prev c) (store! cur nx) 0)))))
+                                        OP-CALLEND
+                                      (let [call (n-in c 1)]
+                                        ; A Call node is one dynamic execution per arrival at CallEnd. Clear a
+                                        ; prior loop iteration's cached result, evaluate now, and leave the new
+                                        ; value cached for the Return or data users immediately downstream.
+                                        (al-set! [bool] (field p hasenv) call false)
+                                        (let [answer (ev-call call)]
+                                        (if (ev-failed?)
+                                            0
+                                            (do
+                                              (al-set! [bool] (field p hasenv) call true)
+                                              (al-set! [RtVal] (field p env) call answer)
+                                              (ev-enter-ctrl! c)
+                                              (let [nx (ev-ctrl-succ c)]
+                                                (if (= nx NO-NODE)
+                                                    (do (ev-fail! EV-STUCK c) 0)
+                                                    (do (store! prev c) (store! cur nx) 0)))))))
+                                        OP-STOP
+                                      (do (ev-fail! EV-STUCK c) 0)
+                                      ; Start and CProj just pass control along
+                                      (let [nx (ev-ctrl-succ c)]
+                                        (if (= nx NO-NODE)
+                                            (do (ev-fail! EV-STUCK c) 0)
+                                            (do (store! prev c) (store! cur nx) 0)))))))))
+                0))))
   (load (field (ev) status)))
 
 ;; The CProj off this If with the wanted slot index. Note the If may have been folded away, in
 ;; which case there is no projection and control does not branch here at all.
 (defn ev-if-arm [(iff i64) (idx i64)] (-> i64)
-  (let [len (n-nouts iff) (mut found) NO-NODE (mut i) 0]
-    (loop
-      (if (or (>= (load i) len) (!= (load found) NO-NODE)) (break)
-        (do (let [u (n-out iff (load i))]
-              (if (and (and (not (n-dead? u)) (= (n-op u) OP-CPROJ)) (= (n-aux u) idx))
-                  (store! found u)
-                0))
-            (store! i (+ (load i) 1))
-            0)))
+  (let [len (n-nouts iff)
+        (mut found) NO-NODE
+        (mut i) 0]
+    (loop (if (or (>= (load i) len) (!= (load found) NO-NODE))
+              (break)
+              (do
+                (let [u (n-out iff (load i))]
+                  (if (and (and (not (n-dead? u)) (= (n-op u) OP-CPROJ)) (= (n-aux u) idx))
+                      (store! found u)
+                      0))
+                (store! i (+ (load i) 1))
+                0)))
     (load found)))
 
 ; ============================================================================
@@ -1338,35 +2748,40 @@
 (defn ev-value-in [(t i64) (seed i64)] (-> RtVal)
   (match (ty-get t)
     (TVal [v]
-      (let [k (val-kinds v)
-            lo (val-ilo v)
-            hi (val-ihi v)]
-        (if (!= (& k VK-INT) 0)
-            ;; INSIDE THE RANGE, AND IT HAS TO BE ABLE TO BE ZERO. This arm used to answer
-            ;; `1 + seed%97` for an unbounded int, with a comment saying the bias existed "so
-            ;; truthiness is exercised rather than every branch always going the same way". For a
-            ;; `dyn` argument it guaranteed the opposite: every value was truthy under every seed,
-            ;; so every branch predicated on a dyn Arg took its TRUE arm for ever. Measured: 5001
-            ;; seeds, 5001 truthy, 0 falsey, and `CX-SHAPE-POLY` returned the true arm's object on
-            ;; all 60 seeds it was tried with. The else arm of eight corpus fixtures was dead code
-            ;; as far as the oracle was concerned, which is LAW 5's failure mode (a phi reading the
-            ;; wrong arm) going unseen on the one M4 fixture built to have two arms.
-            ;;
-            ;; A bool-typed Arg already alternates, one line below. This makes an int-typed one do
-            ;; the same: one seed in three is falsey, which is often enough that a 12-seed or
-            ;; 40-seed sweep walks both arms and rare enough that a fixture pinned at one seed
-            ;; mostly keeps its answer.
-            (if (or (> lo hi) (= lo TY-IMIN))
-                (if (= (% (abs64 seed) 3) 0) (RInt 0) (RInt (+ 1 (% (abs64 seed) 97))))
-              (if (= lo hi) (RInt lo)
-                (RInt (+ lo (% (abs64 seed) (+ (- hi lo) 1))))))
-          (if (!= (& k VK-BOOL) 0) (RBool (= (% (abs64 seed) 2) 0))
-            (if (!= (& k VK-FLT) 0)
-                (if (= (val-fsz v) FSZ-CON) (RFlt (val-fbits v))
-                  (RFlt (f64-bits (+ 0.5 (cast f64 (% (abs64 seed) 13))))))
-              (if (= k VK-UNDEF) (RUndef)
-                (if (= k VK-NULL) (RNull)
-                  (do (ev-no-value-for t) (RUndef)))))))))
+          (let [k (val-kinds v)
+                lo (val-ilo v)
+                hi (val-ihi v)]
+            (if (!= (& k VK-INT) 0)
+                ;; INSIDE THE RANGE, AND IT HAS TO BE ABLE TO BE ZERO. This arm used to answer
+                ;; `1 + seed%97` for an unbounded int, with a comment saying the bias existed "so
+                ;; truthiness is exercised rather than every branch always going the same way". For a
+                ;; `dyn` argument it guaranteed the opposite: every value was truthy under every seed,
+                ;; so every branch predicated on a dyn Arg took its TRUE arm for ever. Measured: 5001
+                ;; seeds, 5001 truthy, 0 falsey, and `CX-SHAPE-POLY` returned the true arm's object on
+                ;; all 60 seeds it was tried with. The else arm of eight corpus fixtures was dead code
+                ;; as far as the oracle was concerned, which is LAW 5's failure mode (a phi reading the
+                ;; wrong arm) going unseen on the one M4 fixture built to have two arms.
+                ;;
+                ;; A bool-typed Arg already alternates, one line below. This makes an int-typed one do
+                ;; the same: one seed in three is falsey, which is often enough that a 12-seed or
+                ;; 40-seed sweep walks both arms and rare enough that a fixture pinned at one seed
+                ;; mostly keeps its answer.
+                (if (or (> lo hi) (= lo TY-IMIN))
+                    (if (= (% (abs64 seed) 3) 0) (RInt 0) (RInt (+ 1 (% (abs64 seed) 97))))
+                    (if (= lo hi)
+                        (RInt lo)
+                        (RInt (+ lo (% (abs64 seed) (+ (- hi lo) 1))))))
+                (if (!= (& k VK-BOOL) 0)
+                    (RBool (= (% (abs64 seed) 2) 0))
+                    (if (!= (& k VK-FLT) 0)
+                        (if (= (val-fsz v) FSZ-CON)
+                            (RFlt (val-fbits v))
+                            (RFlt (f64-bits (+ 0.5 (cast f64 (% (abs64 seed) 13))))))
+                        (if (= k VK-UNDEF)
+                            (RUndef)
+                            (if (= k VK-NULL)
+                                (RNull)
+                                (do (ev-no-value-for t) (RUndef)))))))))
     (TBot [] (do (ev-no-value-for t) (RUndef)))
     (TTop [] (do (ev-no-value-for t) (RUndef)))
     (TCtrl [] (do (ev-no-value-for t) (RUndef)))
@@ -1381,14 +2796,18 @@
     ;; object it never allocated.
     (TMem [a c] (RMem (hv-empty! a)))))
 
-(defn abs64 [(x i64)] (-> i64) (if (< x 0) (- 0 x) x))
+(defn abs64 [(x i64)] (-> i64)
+  (if (< x 0) (- 0 x) x))
 
 (defn ev-no-value-for [(t i64)] (-> i64)
   (let [w (stderr)]
-    (ps w "eval: no runtime value can represent the type ") (ty-print w t) (ps w "\n")
+    (ps w "eval: no runtime value can represent the type ")
+    (ty-print w t)
+    (ps w "\n")
     (ps w "  A differential run needs an inhabitant of every argument's declared type. Inventing\n")
     (ps w "  one outside the type would test lying to the compiler rather than the optimisation.\n"))
-  (abort) 0)
+  (abort)
+  0)
 
 ;; Bind every live Arg. Keyed by DECLARED TYPE and position among the arguments sharing that type,
 ;; deliberately not by node id: an optimisation may delete an argument and shift every later id, and
@@ -1396,28 +2815,34 @@
 ;; therefore receive the same value, which weakens those cases rather than invalidating them; when
 ;; the corpus grows an interesting pair like that, the fixture should name its arguments instead.
 (defn ev-bind-args! [(seed i64)] (-> i64)
-  (let [n (n-count) (mut i) 0
+  (let [n (n-count)
+        (mut i) 0
         (mut seen-t) (al-new [i64] (malloc-allocator))]
-    (loop
-      (if (>= (load i) n) (break)
-        (do (if (or (n-dead? (load i)) (!= (n-op (load i)) OP-ARG)) 0
-              (let [t (n-aux (load i))
-                    k (count-of (load seen-t) t)]
-                (al-push! [i64] (mut seen-t) t)
-                (ev-bind! (load i) (ev-value-in t (+ (* seed 31) (* k 7919))))
-                0))
-            (store! i (+ (load i) 1))
-            0)))
+    (loop (if (>= (load i) n)
+              (break)
+              (do
+                (if (or (n-dead? (load i)) (!= (n-op (load i)) OP-ARG))
+                    0
+                    (let [t (n-aux (load i))
+                          k (count-of (load seen-t) t)]
+                      (al-push! [i64] (mut seen-t) t)
+                      (ev-bind! (load i) (ev-value-in t (+ (* seed 31) (* k 7919))))
+                      0))
+                (store! i (+ (load i) 1))
+                0)))
     (al-free! [i64] (mut seen-t))
     0))
 
 (defn count-of [(l (ArrayList i64)) (x i64)] (-> i64)
-  (let [n (al-len [i64] l) (mut i) 0 (mut c) 0]
-    (loop
-      (if (>= (load i) n) (break)
-        (do (if (= (al-get l (load i)) x) (store! c (+ (load c) 1)) 0)
-            (store! i (+ (load i) 1))
-            0)))
+  (let [n (al-len [i64] l)
+        (mut i) 0
+        (mut c) 0]
+    (loop (if (>= (load i) n)
+              (break)
+              (do
+                (if (= (al-get l (load i)) x) (store! c (+ (load c) 1)) 0)
+                (store! i (+ (load i) 1))
+                0)))
     (load c)))
 
 ;; One differential run: build the graph, bind arguments from the seed, run, and hand back both the
@@ -1433,12 +2858,92 @@
 (defn ev-print [(w (ptr Writer))] (-> i64)
   (let [s (ev-status)]
     (if (= s EV-OK)
-        (do (ps w "=> ") (rt-print w (ev-result) ) (fmt w "  ({d} steps)" (ev-steps)) 0)
-      (do (ps w "!! ") (ps w (ev-status-name s))
-          (if (= (ev-at) NO-NODE) 0
-            (do (fmt w " at n{d} " (ev-at)) (ps w (op-name (n-op (ev-at)))) 0))
+        (do (ps w "=> ") (rt-print w (ev-result)) (fmt w "  ({d} steps)" (ev-steps)) 0)
+        (do
+          (ps w "!! ")
+          (ps w (ev-status-name s))
+          (if (= (ev-at) NO-NODE)
+              0
+              (do (fmt w " at n{d} " (ev-at)) (ps w (op-name (n-op (ev-at)))) 0))
           (fmt w "  ({d} steps)" (ev-steps))
           0))))
+
+(defn ev-trace-kind-name [(kind i64)] (-> (slice u8))
+  (case kind EVT-CONTROL "control" EVT-CALL "call" EVT-RETURN "return"
+        EVT-PROPLOAD "load" EVT-PROPSTORE "store" EVT-FAIL "failure" "event"))
+
+(defn ev-trace-print [(w (ptr Writer))] (-> i64)
+  (let [p (ev)
+        length (al-len [EvTraceEvent] (load (field p trace)))
+        limit (load (field p trace-limit))
+        start (if (and (> limit 0) (= length limit)) (load (field p trace-next)) 0)
+        (mut ordinal) 0]
+    (fmt w "evaluator trace: {d} most recent semantic events\n" length)
+    (loop (if (>= (load ordinal) length)
+              (break)
+              (let [index (% (+ start (load ordinal)) length)
+                    event (al-get [EvTraceEvent] (load (field p trace)) index)
+                    kind (load (field event kind))
+                    node (load (field event node))]
+                (fmt w "  step={d} depth={d} {s}"
+                     (load (field event step)) (load (field event depth))
+                     (ev-trace-kind-name kind))
+                (if (and (>= node 0) (< node (n-count)))
+                    (do (fmt w " n{d}:{s}" node (op-name (n-op node))) 0)
+                    (do (fmt w " n{d}" node) 0))
+                (if (= kind EVT-CONTROL)
+                    (do (fmt w " fun=n{d}" (load (field event context))) 0)
+                    (if (= kind EVT-CALL)
+                        (do (fmt w " callee=n{d}" (load (field event context))) 0)
+                        (if (= kind EVT-FAIL)
+                            (do (ps w " status=")
+                                (ps w (ev-status-name (load (field event context)))) 0)
+                            0)))
+                (if (or (= kind EVT-PROPLOAD) (= kind EVT-PROPSTORE))
+                    (do
+                      (fmt w " object={d} property=" (load (field event object)))
+                      (if (= (load (field event name)) SHAPE-NO-NAME)
+                          (ps w "?")
+                          (ps w (shape-name-bytes (load (field event name)))))
+                      0)
+                    0)
+                (if (or (= kind EVT-PROPLOAD)
+                        (or (= kind EVT-PROPSTORE)
+                            (or (= kind EVT-CALL) (= kind EVT-RETURN))))
+                    (do (ps w " value=") (rt-print w (load (field event value))) 0)
+                    0)
+                (ps w "\n")
+                (store! ordinal (+ (load ordinal) 1)))))
+    0))
+
+;; Machine-readable semantic trace. `AOT_TRACE ` is an extraction marker, so ordinary diagnostics
+;; and trace events may safely share stderr.
+(defn ev-trace-print-jsonl [(w (ptr Writer))] (-> i64)
+  (let [p (ev)
+        length (al-len [EvTraceEvent] (load (field p trace)))
+        limit (load (field p trace-limit))
+        start (if (and (> limit 0) (= length limit)) (load (field p trace-next)) 0)
+        (mut ordinal) 0]
+    (loop (if (>= (load ordinal) length)
+              (break)
+              (let [index (% (+ start (load ordinal)) length)
+                    event (al-get [EvTraceEvent] (load (field p trace)) index)
+                    kind (load (field event kind))
+                    node (load (field event node))
+                    value (load (field event value))]
+                (ps w "AOT_TRACE {")
+                (fmt w "\"sequence\":{d},\"step\":{d},\"depth\":{d},"
+                     (load ordinal) (load (field event step)) (load (field event depth)))
+                (fmt w "\"kind\":\"{s}\",\"node\":{d},\"op\":\"{s}\","
+                     (ev-trace-kind-name kind) node
+                     (if (and (>= node 0) (< node (n-count))) (op-name (n-op node)) "none"))
+                (fmt w "\"context\":{d},\"object\":{d},\"name\":{d},"
+                     (load (field event context)) (load (field event object))
+                     (load (field event name)))
+                (fmt w "\"valueTag\":{d},\"valuePayload\":{d}}}\n"
+                     (rt-tag value) (rt-payload value))
+                (store! ordinal (+ (load ordinal) 1)))))
+    0))
 
 ; ============================================================================
 ; The OUTCOME of a run, for the differential oracle
@@ -1473,12 +2978,16 @@
 ;; The walk's object numbering. `seen` is a list in discovery order, so an object's ordinal is its
 ;; index; -1 means it has not been reached yet.
 (defn ev-seen-ord [(o i64)] (-> i64)
-  (let [p (ev) n (al-len [i64] (load (field p seen))) (mut i) 0 (mut found) -1]
-    (loop
-      (if (or (>= (load i) n) (!= (load found) -1)) (break)
-        (do (if (= (al-get (load (field p seen)) (load i)) o) (store! found (load i)) 0)
-            (store! i (+ (load i) 1))
-            0)))
+  (let [p (ev)
+        n (al-len [i64] (load (field p seen)))
+        (mut i) 0
+        (mut found) -1]
+    (loop (if (or (>= (load i) n) (!= (load found) -1))
+              (break)
+              (do
+                (if (= (al-get (load (field p seen)) (load i)) o) (store! found (load i)) 0)
+                (store! i (+ (load i) 1))
+                0)))
     (load found)))
 
 (defn ev-seen-push! [(o i64)] (-> i64)
@@ -1497,36 +3006,40 @@
 (defn ev-render-val [(w (ptr Writer)) (v RtVal) (mem i64)] (-> i64)
   (match v
     (RObj [id]
-      (let [k (ev-seen-ord id)]
-        (if (>= k 0) (do (fmt w "@{d}" k) 0)
-          (let [ord (ev-seen-push! id)
-                s   (ev-obj-shape id)]
-            ;; THE SHAPE IS NAMED BY ITS FIELD NAMES, not by its id. A shape id is allocated in
-            ;; transition order and is therefore a build artefact exactly like an object index:
-            ;; `{x}` and `{y}` are both shape 1 in their own runs, so an outcome carrying the id
-            ;; would call two differently shaped results identical. The field names are what the
-            ;; source language actually said.
-            (fmt w "@{d}:{{" ord)
-            (let [n (shape-field-count s) (mut i) 0]
-              (loop
-                (if (>= (load i) n) (break)
-                  (do (if (> (load i) 0) (ps w " ") 0)
-                      (ps w (shape-name-bytes (shape-field-name s (load i))))
-                      (ps w ":")
-                      (let [a   (shape-field-alias s (load i))
-                            ver (if (< mem 0) -1 (hv-find mem id a))]
-                        (if (< ver 0) (ps w "?")
-                          (ev-render-val w (hve-val (hv-ent ver)) mem)))
-                      (store! i (+ (load i) 1))
-                      0))))
-            (ps w "}")
-            0))))
+          (let [k (ev-seen-ord id)]
+            (if (>= k 0)
+                (do (fmt w "@{d}" k) 0)
+                (let [ord (ev-seen-push! id)
+                      s (ev-obj-shape id)]
+                  ;; THE SHAPE IS NAMED BY ITS FIELD NAMES, not by its id. A shape id is allocated in
+                  ;; transition order and is therefore a build artefact exactly like an object index:
+                  ;; `{x}` and `{y}` are both shape 1 in their own runs, so an outcome carrying the id
+                  ;; would call two differently shaped results identical. The field names are what the
+                  ;; source language actually said.
+                  (fmt w "@{d}:{{" ord)
+                  (let [n (shape-field-count s)
+                        (mut i) 0]
+                    (loop (if (>= (load i) n)
+                              (break)
+                              (do
+                                (if (> (load i) 0) (ps w " ") 0)
+                                (ps w (shape-name-bytes (shape-field-name s (load i))))
+                                (ps w ":")
+                                (let [a (shape-field-alias s (load i))
+                                      ver (if (< mem 0) -1 (hv-find mem id a))]
+                                  (if (< ver 0)
+                                      (ps w "?")
+                                      (ev-render-val w (hve-val (hv-ent ver)) mem)))
+                                (store! i (+ (load i) 1))
+                                0))))
+                  (ps w "}")
+                  0))))
     ; every other runtime value is its own outcome, and `rt-print` already spells it
     (RUndef [] (rt-print w v))
-    (RNull  [] (rt-print w v))
+    (RNull [] (rt-print w v))
     (RBool [b] (rt-print w v))
-    (RInt  [n] (rt-print w v))
-    (RFlt  [bits] (rt-print w v))
+    (RInt [n] (rt-print w v))
+    (RFlt [bits] (rt-print w v))
     (RStr [id] (rt-print w v))
     (RSym [id] (rt-print w v))
     (RBig [n] (rt-print w v))
@@ -1547,14 +3060,16 @@
 ;; truncated outcome, which is a differential oracle that stops noticing.
 (defn ev-outcome [(buf (ptr i8)) (cap i64)] (-> (slice u8))
   (let [fb (stack FixBuf)
-        w  (stack Writer)]
+        w (stack Writer)]
     (store! (field fb data) buf)
-    (store! (field fb cap)  cap)
-    (store! (field fb len)  0)
+    (store! (field fb cap) cap)
+    (store! (field fb len) 0)
     (fixed-buffer-writer w fb)
     (ev-render-outcome w)
     (let [n (load (field fb len))]
       (if (>= n cap)
-          (do (ev-heap-panic "ev-outcome: the run's outcome does not fit the buffer; a truncated outcome compares equal to another truncated one") 0)
-        0)
+          (do
+            (ev-heap-panic "ev-outcome: the run's outcome does not fit the buffer; a truncated outcome compares equal to another truncated one")
+            0)
+          0)
       (slice-new [u8] (cast (ptr u8) buf) n))))

@@ -21,6 +21,29 @@ tools/gate.sh --quick  # skip the diagram pipeline
 Green means every milestone's gate still holds. **Nothing is marked done and nothing is committed
 while it is red**, which is the contract the whole project runs on.
 
+The product frontend entry point is:
+
+```sh
+node tools/aot-compile.mjs input.ts --output graph.txt
+node tools/aot-compile.mjs input.js --output graph.txt
+```
+
+It always uses the pinned native `typescript-go` bridge and Coil-owned resolution/lowering. The npm
+TypeScript normalizer under `src/frontend_ir.mjs` is retained only as an independent test oracle.
+
+To isolate and debug Richards or DeltaBlue without running the complete B15 gate:
+
+```sh
+node tools/debug-benchmark.mjs deltablue
+node tools/debug-benchmark.mjs deltablue --stage ideal
+node tools/debug-benchmark.mjs deltablue --stage native --seed 0 --registers 10
+```
+
+Every run keeps its adapted source, generated Coil, executables, stdout/stderr, semantic JSONL
+traces, first-divergence report, command manifest, and crash backtrace under
+`.coil/debug/BENCHMARK/RUN-ID/`. Use `--run-dir DIR` to reproduce into a known directory; failures
+print the complete rerun command and never remove their evidence.
+
 Read in this order:
 
 1. **[docs/ROADMAP.md](docs/ROADMAP.md)** for where things are and what to do next. There is a
@@ -45,12 +68,16 @@ Read in this order:
 | `src/gtext.coil` | The textual form of a *graph*, printed and parsed |
 | `src/corpus.coil` | The shared fixtures: the verifier, the diagrams and the differential tests all use these same graphs |
 | `src/dot.coil` | Graphviz output |
+| `src/typescript_native.coil` | Native `typescript-go` AST bridge |
+| `src/frontend_native.coil` | Coil-owned declaration and symbol resolution |
+| `src/frontend_native_graph.coil` | Native frontend lowering into the ideal graph |
 | `tests/*-test.coil` | One suite per area; `tools/gate.sh` runs them all |
 | `tools/dot-dump.coil`, `render-dot.sh`, `build-page.py` | The diagram pipeline and the gallery page |
 
-There is no front end yet. Graphs are built through the node API, which is deliberate: the IR and its
-tooling come first, and the `dyn` surface language arrives later (see
-[D6](docs/DECISIONS.md#d6-the-first-driver-is-a-minimal-dynamic-core-language-in-s-expression-syntax)).
+The first TypeScript subset and native backend are complete. The active roadmap expands the native
+`typescript-go`/Coil frontend and runtime until the complete V8 Benchmark Suite v7 runs through the
+same ideal and native pipeline. Graphs can still be built directly through the node API for focused
+compiler tests.
 
 ## The two things that will cost you a day
 
