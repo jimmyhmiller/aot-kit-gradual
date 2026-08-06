@@ -14,6 +14,7 @@ const cases = [
   { name: "floating-point", input: 123456789, repeats: 20_000 },
 ];
 const measuredSamples = 9;
+const nodeWarmupIterations = 1_000;
 const median = values => [...values].sort((a, b) => a - b)[Math.floor(values.length / 2)];
 const run = (command, args, options = {}) => execFileSync(command, args, { cwd: root, encoding: "utf8", ...options });
 const metric = (text, name) => {
@@ -63,7 +64,10 @@ for (const benchmark of cases) {
     return { result: metric(text, "result"), runtimeNs: metric(text, "runtime_ns") };
   };
 
-  for (let i = 0; i < 3; ++i) { nativeRun(); nodeRun(); }
+  // Give V8 enough in-process calls to tier up before any timed observation. Keep this distinct
+  // from `repeats`: each warmup iteration invokes the exported workload exactly as a sample does.
+  for (let i = 0; i < nodeWarmupIterations; ++i) nodeRun();
+  for (let i = 0; i < 3; ++i) nativeRun();
   const samples = [];
   for (let i = 0; i < measuredSamples; ++i) {
     const native = nativeRun();
@@ -80,7 +84,7 @@ for (const benchmark of cases) {
 
 fs.writeFileSync(path.join(output, "results.json"), `${JSON.stringify({
   generatedAt: new Date().toISOString(), platform: `${os.platform()} ${os.arch()}`,
-  node: process.version, measuredSamples, benchmarks: report,
+  node: process.version, nodeWarmupIterations, measuredSamples, benchmarks: report,
 }, null, 2)}\n`);
 console.log("\n| Benchmark | Coil median | Node median | Coil / Node |");
 console.log("|---|---:|---:|---:|");
