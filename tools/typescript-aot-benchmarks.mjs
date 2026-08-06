@@ -10,11 +10,13 @@ const cases = [
   { name: "sum-loop", input: 20_000_000, repeats: 1 },
   { name: "branch-loop", input: 20_000_000, repeats: 1 },
   { name: "call-loop", input: 5_000_000, repeats: 1 },
-  { name: "bitwise-mix", input: 123456789, repeats: 20_000 },
-  { name: "floating-point", input: 123456789, repeats: 20_000 },
+  { name: "bitwise-mix", input: 2_000_000, repeats: 1 },
+  { name: "floating-point", input: 20_000_000, repeats: 1 },
 ];
 const measuredSamples = 9;
-const nodeWarmupIterations = 1_000;
+const nodeWarmupIterations = Number(process.env.AOT_NODE_WARMUP_ITERATIONS ?? 1_000);
+if (!Number.isSafeInteger(nodeWarmupIterations) || nodeWarmupIterations < 0)
+  throw new Error("AOT_NODE_WARMUP_ITERATIONS must be a non-negative integer");
 const median = values => [...values].sort((a, b) => a - b)[Math.floor(values.length / 2)];
 const run = (command, args, options = {}) => execFileSync(command, args, { cwd: root, encoding: "utf8", ...options });
 const metric = (text, name) => {
@@ -55,8 +57,11 @@ for (const benchmark of cases) {
   const nodeCompileNs = Number(process.hrtime.bigint() - nodeCompileStarted);
   const nodeRun = () => {
     const started = process.hrtime.bigint();
-    let result;
-    for (let i = 0; i < benchmark.repeats; ++i) result = module.main(benchmark.input);
+    let result = 0;
+    // Vary the argument and retain every result so V8 cannot hoist an identical pure call or
+    // discard all but the final iteration. This matches the native harness's observable checksum.
+    for (let i = 0; i < benchmark.repeats; ++i)
+      result = (result ^ module.main(benchmark.input + i)) | 0;
     return { result, runtimeNs: Number(process.hrtime.bigint() - started) };
   };
   const nativeRun = () => {

@@ -7,5 +7,6 @@ export function main(): number {
   bits %= 97;
   let fp = 1.5 * 4 + 7 / 2 - 0.5;
   let comparisons = (fp === 9 ? 1 : 0) + (NaN !== NaN ? 2 : 0) + (-0 === 0 ? 4 : 0);
-  return (~bits) * 10 + comparisons;
+  let radixLiterals = 0x13579bdf ^ 0b101101 ^ 0o765;
+  return (~bits) * 10 + comparisons + (radixLiterals & 255);
 }

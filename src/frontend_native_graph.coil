@@ -179,6 +179,18 @@
     (al-free! [u8] (mut bytes))
     (n-string-const! string)))
 
+(defn fng-numeric-literal [(ast TsAst) (node i64)] (-> i64)
+  (let [bits (ts-numeric-bits ast node)
+        number (bits-f64 bits)]
+    ;; TypeScript accepts hexadecimal, binary, and octal integer spellings that the decimal text
+    ;; parser does not. Recover every exactly represented safe integer from the parser's numeric
+    ;; value so bitwise loop Phis start in the GPR representation instead of an accidental FPR.
+    (if (and (>= number -9007199254740991.0)
+             (and (<= number 9007199254740991.0)
+                  (= bits (f64-bits (cast f64 (cast i64 number))))))
+        (fng-const (cast i64 number))
+        (n-new1 OP-CONST (t-flt-bits bits) (g-start)))))
+
 (defn fng-bin [(op i64) (left i64) (right i64)] (-> i64)
   (fng-peep (n-new3 op 0 NO-NODE left right)))
 
@@ -2685,9 +2697,7 @@
                             value))))
           (= kind TSK-THIS) (load (field context receiver))
           (= kind TSK-NUMERIC-LITERAL)
-            (match (str-parse-int (ts-text ast node))
-              (Some [value] (fng-const value))
-              (None [] (n-new1 OP-CONST (t-flt-bits (ts-numeric-bits ast node)) (g-start))))
+            (fng-numeric-literal ast node)
           (= kind TSK-STRING-LITERAL) (fng-string-literal ast node)
           (= kind TSK-NULL) (fng-null)
           (= kind TSK-TRUE) (fng-bool true)
@@ -3093,9 +3103,7 @@
   (let [ast (field frontend ast)
         kind (ts-kind ast node)]
     (cond (= kind TSK-NUMERIC-LITERAL)
-            (match (str-parse-int (ts-text ast node))
-              (Some [integer] (fng-const integer))
-              (None [] (n-new1 OP-CONST (t-flt-bits (ts-numeric-bits ast node)) (g-start))))
+            (fng-numeric-literal ast node)
           (= kind TSK-STRING-LITERAL) (fng-string-literal ast node)
           (= kind TSK-NULL) (fng-null)
           (= kind TSK-TRUE) (fng-bool true)
