@@ -8,9 +8,7 @@ import { execFileSync, spawnSync } from "node:child_process";
 const roadmap = JSON.parse(fs.readFileSync("workflow/roadmap.json", "utf8"));
 const state = JSON.parse(fs.readFileSync("workflow/state.json", "utf8"));
 assert.deepEqual(roadmap.milestones.map(milestone => milestone.id), [
-  "B00", "B01", "B02", "B03", "B04", "B05", "B06", "B07", "B08", "B09",
-  "B10", "B11", "B12", "B13", "B14", "B15", "B16", "B17", "B18", "B19",
-  "B21", "B20", "B22", "B23", "B24",
+  "R00", "R01", "R02", "R03", "R04", "R05", "R06", "R07", "R08", "R09",
 ]);
 assert.deepEqual(roadmap.completionCommands, [
   "tools/gate.sh --quick",
@@ -21,7 +19,7 @@ const ids = new Set(roadmap.milestones.map(milestone => milestone.id));
 assert.ok(state.active === null || ids.has(state.active));
 assert.ok(state.completed.every(id => ids.has(id)));
 const validation = execFileSync("node", ["tools/workflow.mjs", "validate"], { encoding: "utf8" });
-assert.match(validation, /25 milestones/);
+assert.match(validation, /10 milestones/);
 if (state.active !== null) {
   const next = execFileSync("node", ["tools/workflow.mjs", "next"], { encoding: "utf8" });
   assert.match(next, new RegExp(`^${state.active}:`));

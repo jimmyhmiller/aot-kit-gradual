@@ -12,15 +12,15 @@ tracked completion record. Use:
 ```sh
 node tools/workflow.mjs status
 node tools/workflow.mjs next
-node tools/workflow.mjs check G0
-node tools/workflow.mjs complete G0
+node tools/workflow.mjs check R00
+node tools/workflow.mjs complete R00
 ```
 
 `check` runs the milestone-specific gate plus quick, full, and extended repository gates without
 changing state. `complete` runs the same evidence and advances state atomically only if every command
 passes. It records the commit and commands used. Never edit a milestone to `done` directly in prose;
-advance it through the controller, then mirror the resulting state into the roadmap and current-slice
-document in the same commit.
+advance it through the controller, then mirror the resulting state into the roadmap in the same
+commit.
 
 ## Roles of the evidence
 
@@ -56,7 +56,7 @@ slice. Build output must remain ignored.
 
 ### 2. Restate one contract
 
-Copy the chosen slice from `IMPLEMENTATION-PLAN.md` into the working notes and state:
+Copy the chosen milestone contract from `ROADMAP.md` into the working notes and state:
 
 - the exact supported input after the slice;
 - the exact unsupported input that remains;
@@ -210,14 +210,15 @@ scratch output.
 
 | Milestones | Required dimensions |
 |---|---|
-| G0-G3 | raw/optimized, worklist seeds, exact CFG/Phi structure, native differential |
-| G4-G5 | leaf/non-leaf, argument counts, nested calls, recursion, disassembly |
-| G6-G7 | CFG traversal seeds, normal/low registers, calls, loops, Phi edges, spills |
-| G8-G9 | placement/scheduler seeds, memory aliases, loops, calls, before/after phase |
-| G10 | symbol/layout permutations, object inspection, external link/run |
-| X1 | normal/stress collection, root in every location kind, promotion/barrier cases |
-| X2-X3 | depth matrix, optimized/raw/native/interpreter/Node, pressure and GC stress |
-| X4 | correctness outside timing, raw samples, environment metadata, losses |
+| R00-R01 | raw/optimized semantics, Node traces, support-ledger completeness, stable diagnostics |
+| R02 | cache disabled/cold/mono/poly/mega/invalidated, shapes, generic fallbacks, GC stress |
+| R03 | normal/exceptional CFG, nested unwinding, handler liveness, source-mapped stacks |
+| R04 | cycles/live bindings, resolution matrix, incremental invalidation, reproducible artifacts |
+| R05 | microtask/timer order, rejection paths, suspension GC, virtual-time determinism |
+| R06 | minor/major/stress GC, barriers, weak roots, heap limits, pause and leak measurements |
+| R07 | host error matrix, resource ownership, cancellation, descriptor/native-memory leak checks |
+| R08 | protocol fuzzing, backpressure, timeout races, load, shutdown, bounded resources |
+| R09 | clean release install, package-owned tests, application corpus, reproducible publication |
 
 ## Parity ladder policy
 

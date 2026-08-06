@@ -1,139 +1,362 @@
-# Roadmap: run the complete V8 Benchmark Suite v7
+# Roadmap: a usable ahead-of-time JavaScript and TypeScript runtime
 
-This file is the authoritative roadmap. The Simple-backend and binary-trees roadmap is complete;
-its implementation history remains in [JOURNAL.md](JOURNAL.md), and its gates remain permanent
-regressions. This roadmap starts a new controller.
+This is the only project roadmap. It replaces the V8-v7 benchmark campaign and its separate
+implementation plan. The old milestone gates remain regression tests, but they no longer determine
+the product direction.
 
-The research and corpus audit behind the scope and ordering are recorded in
-[V8-BENCHMARK-RESEARCH.md](V8-BENCHMARK-RESEARCH.md). Detailed slice contracts are in
-[IMPLEMENTATION-PLAN.md](IMPLEMENTATION-PLAN.md).
+## Product target
 
-## Target
+Build a runtime that can compile and run an ordinary multi-module TypeScript application, including
+unmodified JavaScript dependencies, without a JIT. The first credible product is a command-line
+application; the next is an HTTP service. Both must have correct ECMAScript behavior, useful host
+APIs, source-mapped diagnostics, bounded memory use, and competitive warmed throughput.
 
-Compile and execute all eight programs in the **V8 Benchmark Suite version 7** through the native
-Microsoft `typescript-go` parser, Coil-owned frontend, ideal IR, optimizer, arm64 backend, and
-moving collector:
+The acceptance application must exercise ESM cycles and live bindings, exceptions, promises,
+filesystem and network I/O, object and array mutation, closures, classes, JSON, and at least five
+unmodified npm packages. Passing hand-written microbenchmarks alone is never product completion.
 
-1. Richards
-2. DeltaBlue
-3. Crypto
-4. RayTrace
-5. EarleyBoyer
-6. RegExp
-7. Splay
-8. NavierStokes
+## Compatibility contract
 
-The suite is pinned from the official V8 repository at tag `7.4.77`, whose `benchmarks/` directory
-identifies itself as version 7. We use the original JavaScript programs and harness semantics;
-typed adapters may describe closed-world entry points, but may not rewrite the algorithms into an
-easier language subset.
+- Target a pinned ECMAScript edition and a pinned TypeScript compiler version. Record both in a
+  generated support manifest; do not use “JavaScript support” as an unbounded claim.
+- Node is the observable oracle for supported ECMAScript and host behavior. Compare values, thrown
+  error classes, messages where standardized, side-effect order, module order, and microtask order.
+- TypeScript is checked and erased before JavaScript lowering. Types may justify optimizations only
+  after proof; removing an annotation must not change runtime behavior.
+- Unsupported syntax, semantics, modules, and host APIs fail before object publication with a stable
+  diagnostic and source range. Silent approximation is a correctness bug.
+- The runtime is allowed a documented Node-compatible subset. Every deviation must be explicit,
+  tested, and present in the support manifest.
 
-This deliberately does **not** mean every file under modern V8's `test/js-perf-test`, nor
-Speedometer or JetStream. V8 now recommends Speedometer and JetStream for modern performance work
-and describes its old suite as a classic peak-performance workload. The finite v7 corpus is the
-right next compiler-coverage target; a later roadmap can graduate to modern suites.
+## Rules that keep the implementation clean
 
-## What the audit found
+1. Implement language mechanisms, never application- or benchmark-name dispatch.
+2. Reduce every full-application failure to the smallest independent conformance case before fixing
+   it. Keep the reduction permanently.
+3. Give each representation one owner and one verifier. Frontend, ideal IR, machine IR, runtime,
+   module loader, and host layer must not repair each other's malformed state.
+4. Keep semantics separate from optimization. Every program must work with optimization disabled;
+   an optimization needs guards or proof and an equivalent generic path.
+5. Centralize runtime operations behind typed descriptors that declare coercion, allocation,
+   safepoints, exceptions, and side effects. Do not scatter special builtin rules through lowering.
+6. Preserve exact GC metadata. No non-collecting application mode may be used as completion evidence.
+7. Add observability with each subsystem: stable errors, source locations, traces, counters, and
+   inspectable state are deliverables, not cleanup work.
+8. Keep gates monotonic. A supported behavior never returns to “expected unsupported.”
+9. Falsify every milestone gate by injecting or simulating the defect it claims to detect.
+10. Do not mark a milestone complete with tracked changes, generated artifacts, skipped stress
+    dimensions, or results that cannot be reproduced from one command.
 
-The completed compiler already has general CFG lowering, calls, frames, scheduling, allocation,
-objects, exact stack maps, and moving GC. Binary-trees proves that substrate. The missing work is
-mostly language/runtime coverage plus numeric backend coverage:
+## Standard evidence required for every milestone
 
-- the native parser bridge exists, but the old npm TypeScript normalizer still drives several
-  product and benchmark tools;
-- the frontend handles declarations, direct calls, constructors, structured `if`/`while`/`for`,
-  object literals, and named fields, but not JavaScript's full benchmark surface;
-- the ideal interpreter understands doubles, while native selection and the frontend are still
-  centered on integer arithmetic;
-- the corpus uses function expressions, receiver calls and `this`, prototype-style construction,
-  arrays and indexed access, strings, Math intrinsics, modulo, bitwise operations, shifts,
-  increment/decrement, short-circuit expressions, conditional expressions, `switch`, `do`,
-  `break`, `continue`, `typeof`, `in`, `instanceof`, `delete`, exceptions, and regular expressions;
-- EarleyBoyer is the broadest dynamic-language test (4,684 lines); RegExp contains 237 regular
-  expression literals and must not be claimed complete through a stubbed matcher.
+Every milestone gets a focused `tools/gates/RNN.sh` and must satisfy all applicable rows below.
 
-The order below follows capability dependencies, not benchmark source order.
+| Evidence | Required proof |
+|---|---|
+| Differential semantics | Node and native agree on result, exception, side effects, and ordering |
+| Phase structure | Exact or normalized structural checks prove the intended mechanism exists |
+| Negative behavior | Unsupported and corrupt inputs fail early with stable named diagnostics |
+| Stress | Deterministic seed, register-pressure, and collect-every-allocation modes agree |
+| Falsification | A deliberately broken invariant makes the focused gate fail for the expected reason |
+| Application witness | A realistic multi-file program uses the capability without test-only adapters |
+| Hygiene | Full gate is green, worktree is clean, outputs are reproducible, documentation matches code |
 
-## Non-negotiable rules
+Coverage counts are floors, not targets. Each capability matrix records every syntax/operator/API
+row, its positive cases, edge cases, error cases, and execution modes. A milestone cannot close if a
+declared row has no test or if a test only checks the final integer while hiding evaluation order.
 
-1. **Original workloads.** Preserve the pinned source and expected checks. A port may add types and
-   a closed-world wrapper, but may not replace a data structure, builtin, regular expression, or
-   algorithm with a precomputed answer or benchmark-specific native helper.
-2. **One product frontend.** The native `typescript-go` AST path is authoritative. JavaScript
-   TypeScript-API code may remain temporarily as an independent oracle, never as the compiler path.
-3. **Capability failures are data.** Every corpus item is present from B00 and reports its first
-   stable unsupported capability until it runs. Crashes and generic parse failures are not status.
-4. **Semantics before speed.** Node/V8 is the observable oracle. Raw ideal, optimized ideal, normal
-   native, register-pressure native, and GC-stress native must agree before timing is published.
-5. **No benchmark dispatch.** Compiler and runtime code may not branch on suite, file, function, or
-   benchmark names. Builtins are allowed only as general specified runtime operations.
-6. **No GC exemptions.** Allocation-heavy programs run with exact layouts and stack maps under
-   moving collection. A larger non-collecting heap is not completion evidence.
-7. **No score laundering.** Report compilation separately from execution, retain raw samples, and
-   publish every individual result and loss. The aggregate uses the suite's geometric-mean rules.
-8. **Every milestone is falsified.** Reversing its behavior must turn its focused gate red for the
-   expected reason before the milestone is completed.
+## Sequence and status
 
-## Milestones
+Only one milestone is active at a time. `workflow/state.json` is the machine-readable status
+authority.
 
-Status values are `active`, `blocked`, `not started`, and `done`. The executable controller in
-`workflow/state.json` is the status authority. `workflow.mjs complete` accepts only a clean worktree,
-so each evidence record names a commit that already contains the green implementation.
+| ID | Milestone | Status | Exit condition |
+|---|---|---|---|
+| R00 | Baseline and compatibility ledger | active | exact current support is generated, tested, and reproducible |
+| R01 | Complete core ECMAScript semantics | not started | supported synchronous JS behavior agrees comprehensively with Node |
+| R02 | Dynamic object and call runtime | not started | generic properties/calls are correct and inline caches are verified |
+| R03 | Exceptions and diagnostic stack model | not started | catch/finally and cross-frame unwinding produce source-mapped stacks |
+| R04 | ESM, packages, and separate compilation | not started | a cyclic multi-package program builds incrementally and runs correctly |
+| R05 | Promises, jobs, and event loop | not started | async ordering and rejection behavior agree with Node |
+| R06 | Production garbage collector | not started | generational GC is precise, bounded, observable, and stress-clean |
+| R07 | Standard library and CLI host | not started | real CLIs run with documented filesystem/process/buffer APIs |
+| R08 | Networking and service host | not started | a real HTTP service passes correctness, load, shutdown, and leak gates |
+| R09 | Ecosystem qualification and release | not started | unmodified packages and applications pass a published compatibility suite |
 
-| ID | Milestone | Status | Required predecessor | Exit gate |
-|---|---|---|---|---|
-| B00 | Pinned corpus, Node oracle, and capability inventory | done | completed roadmap | eight licensed, hashed sources pass Node checks and report stable first gaps |
-| B01 | JavaScript-aware native parser ABI | done | B00 | `.js` mode and named AST roles/literals/operators cover the corpus |
-| B02 | Canonical Coil-owned frontend path | done | B01 | product tools require `typescript-go`; npm parser is oracle-only |
-| B03 | Native JavaScript tagged-value ABI | done | B02 | every value tag survives calls, spills, fields, and moving GC |
-| B04 | JavaScript number semantics in ideal IR | done | B03 | IEEE-754/NaN/-0/mixed-number oracle matrix agrees |
-| B05 | arm64 floating-point lowering | done | B04 | f64 ABI, Phis, allocation, spills, and comparisons agree natively |
-| B06 | `ToInt32`, modulo, bitwise, and shifts | done | B04, B05 | Node edge-case matrix agrees for all 32-bit operators |
-| B07 | Expression evaluation and assignment | done | B03, B04 | updates, compound lvalues, comma, ternary, and short-circuit order agree |
-| B08 | Structured CFG and targeted exits | done | B07 | `do`, `switch`, fallthrough, `break`, and `continue` agree |
-| B09 | Function expressions and lexical closures | done | B03 | captured/recursive closures and indirect closed-world calls survive GC |
-| B10 | Receiver calls, `this`, and constructors | done | B09 | receiver ABI and JS constructor-return rules agree |
-| B11 | Dynamic properties and prototype chains | done | B10 | lookup, shadowing, missing properties, transitions, and prototypes agree |
-| B12 | Dense JavaScript arrays | done | B03, B11 | indexed storage, growth, holes, push/pop/slice, and exact GC scans agree |
-| B13 | Strings and conversion | done | B03 | corpus string operations and conversions agree with Node |
-| B14 | Core builtins and uncaught `throw` | done | B05, B12, B13 | Math/builtin descriptors agree and original failure checks compile honestly |
-| B15 | Richards and DeltaBlue closure | active | B06–B14 as applicable | both original programs pass the full correctness matrix |
-| B16 | NavierStokes closure | not started | B05–B07, B12, B14 | original numeric-array kernel passes every mode |
-| B17 | RayTrace and Splay closure | not started | B05, B07–B08, B10–B14 | both original checks pass; Splay survives forced collection |
-| B18 | Crypto closure | not started | B06–B14 | original RSA/big-integer round trip passes without host substitution |
-| B19 | Dynamic operators and catchable exceptions | not started | B09, B11–B14 | `typeof`/`in`/`instanceof`/`delete` and exceptional CFG agree |
-| B20 | EarleyBoyer closure | not started | B19, B21 when inventory requires | original 4,684-line program passes every mode |
-| B21 | General RegExp runtime | not started | B13 | literals, captures, flags, `lastIndex`, exec/test/match/replace/split agree |
-| B22 | RegExp benchmark closure | not started | B21 | all 237 literals execute and the original check passes |
-| B23 | Whole-suite correctness and stress runner | not started | B15–B18, B20, B22 | all eight pass independently and together in every correctness mode |
-| B24 | Reproducible aot-kit versus Node/V8 publication | not started | B23 | raw samples, medians, Node/aot-kit ratios, and aggregate publish reproducibly |
+The dependency chain is deliberately linear. Work may be researched early, but implementation does
+not jump ahead to host APIs while foundational language, exception, module, or scheduling semantics
+remain provisional.
 
-Critical path:
+## R00 — baseline and compatibility ledger
 
-```text
-B00 -> B01 -> B02 -> B03
-B03 -> B04 -> B05 -> B06
-B03 -> B07 -> B08
-B03 -> B09 -> B10 -> B11 -> B12
-B03 -> B13
-B05 + B12 + B13 -> B14
-shared capabilities -> B15/B16/B17/B18
-B09 + B11 + B12 + B13 + B14 -> B19 -> B20
-B13 -> B21 -> B22
-B15 + B16 + B17 + B18 + B20 + B22 -> B23 -> B24
-```
+### Build
 
-## Completion definition
+- Pin the ECMAScript edition, TypeScript version, Node oracle version range, arm64 ABI, and supported
+  operating-system target.
+- Generate one machine-readable support manifest from tests. It must distinguish `supported`,
+  `partial`, and `unsupported`, and link every supported row to a differential test.
+- Inventory syntax, runtime semantics, builtins, module behavior, host APIs, diagnostics, GC modes,
+  and tooling separately. Import the useful V8-v7 and native-conformance evidence without treating
+  benchmark completion as the product goal.
+- Establish application-shaped fixtures: a multi-file CLI, a package with an ESM cycle, and an
+  allocation-heavy program. Initially they may report named gaps.
 
-The roadmap is complete only when one command builds the pinned suite, runs all eight benchmarks
-through aot-kit, verifies each benchmark's original correctness checks against Node/V8, repeats the
-defined optimization/seed/register-pressure/collector matrix, and produces a reproducible report
-with per-benchmark and aggregate results. Parsing a file, lowering a reduced port, or running only
-the ideal interpreter is intermediate evidence, not a completed benchmark.
+### Stay in scope
 
-## Next task
+This milestone documents and mechanizes reality. It does not inflate support by adding shallow
+features, change semantics merely to improve counts, or label phase-local tests as product support.
 
-Implement B00 exactly as specified in [CURRENT-SLICE.md](CURRENT-SLICE.md): pin the upstream corpus,
-record its license and content hashes, build the Node oracle, and generate a stable capability
-inventory from the native parser path. Do not begin by implementing whichever unsupported syntax
-happens to appear first.
+### Exit gate
+
+- The manifest is deterministically regenerated and diff-checked.
+- Removing a test, support row, fixture, or Node comparison fails the gate.
+- Every existing supported feature runs raw ideal, optimized ideal, normal native, pressure native,
+  and GC-stress native where applicable.
+- Compiler/runtime crashes are zero; every known gap has a stable category and source range.
+- `README.md`, conformance documentation, and the manifest make identical support claims.
+
+## R01 — complete core ECMAScript semantics
+
+### Build
+
+- Finish lexical environments, declaration initialization, temporal dead zones, hoisting, `this`,
+  `arguments`, rest/default/spread behavior, destructuring, classes, accessors, symbols, iterators,
+  generators, coercions, equality, property-key conversion, and evaluation order.
+- Complete strings, arrays, typed arrays, ArrayBuffer/DataView, Map, Set, Date, JSON, RegExp, and the
+  required Math/Object/Reflect surfaces. Each builtin uses the central runtime descriptor model.
+- Define one ECMAScript value representation and one conversion library. Frontend and optimizer
+  must call those operations rather than duplicate coercion logic.
+- Keep TypeScript transformations explicit: enums, parameter properties, namespaces, decorators,
+  and JSX are either correctly lowered by a pinned transform or named unsupported.
+
+### Clean implementation tests
+
+- Table-driven differential tests cover boundary values, NaN and negative zero, holes, descriptors,
+  prototype mutations, proxies if claimed, symbols, Unicode, regex state, iterator closing, and
+  abrupt completion ordering.
+- Metamorphic tests remove TypeScript annotations and compare behavior; optimization-off and
+  optimization-on results match.
+- Each builtin has descriptor validation plus fault injection for wrong coercion, missing safepoint,
+  and incorrect exception behavior.
+- At least one unmodified parser, serializer, template engine, and collection-heavy package runs.
+
+### Exit gate
+
+All rows claimed by the R00 core-language and builtin manifests are green against Node, and the
+remaining unsupported rows are explicit. No application fixture fails on synchronous language
+semantics.
+
+## R02 — dynamic object and call runtime
+
+### Build
+
+- Implement hidden-class transitions, property descriptors, prototype-chain lookup, indexed
+  elements, dictionary fallback, and correct invalidation after prototype or descriptor mutation.
+- Implement generic call, method, constructor, bound-function, closure, accessor, and runtime-native
+  call paths with one stable ABI and correct receiver/`new.target` behavior.
+- Add monomorphic and polymorphic inline caches for loads, stores, and calls. Megamorphic sites must
+  fall back to a correct generic operation. Cache state belongs to runtime metadata, not source-name
+  special cases.
+- Specify invalidation, concurrency assumptions, GC tracing, and serialization of all cache and
+  shape metadata.
+
+### Clean implementation tests
+
+- Run identical programs with caches disabled, cold, monomorphic, polymorphic, megamorphic, and
+  invalidated; observables must match.
+- Structural tests inspect cache guards and fallback edges. Mutation tests remove a guard or
+  invalidation and require a semantic failure.
+- Property/call fuzzing varies shapes, prototypes, accessors, receivers, arities, and collection
+  points against Node.
+- Benchmark property and call throughput only after correctness; publish miss rates and fallback
+  counts so a suspicious speedup cannot hide omitted work.
+
+### Exit gate
+
+The application fixtures use generic dynamic calls and properties without closed-world adapters,
+survive prototype mutation and GC stress, and show no correctness dependence on cache state.
+
+## R03 — exceptions and diagnostic stack model
+
+### Build
+
+- Add explicit exceptional control edges through ideal and machine IR, calls, runtime operations,
+  landing pads, `try`/`catch`/`finally`, rethrow, and constructor/iterator cleanup.
+- Root thrown values and all handler-live references precisely at every safepoint.
+- Define Error subclasses, `cause`, stack capture, source-map lookup, and uncaught-exception output.
+- Preserve original source ranges through transforms, inlining, specialization, and native emission.
+
+### Clean implementation tests
+
+- Differential traces cover nested handlers, return/throw through `finally`, exceptions during
+  cleanup, cross-module and cross-native-frame throws, and collection immediately before catch.
+- Corruption tests remove exceptional liveness, handler edges, or source mappings and require named
+  verifier failures.
+- Stack tests assert function, file, and line frames while allowing documented Node formatting
+  differences. Release binaries retain enough metadata for actionable reports.
+
+### Exit gate
+
+All supported abrupt completions agree with Node; no fatal runtime path substitutes for a catchable
+exception; application failures produce stable source-mapped stacks.
+
+## R04 — ESM, packages, and separate compilation
+
+### Build
+
+- Implement ESM resolution, linking, instantiation, evaluation, live bindings, cycles, namespace
+  objects, dynamic import, and top-level await policy. Define the supported `package.json` fields.
+- Separate frontend artifacts, runtime ABI, module metadata, and final native linking. Artifacts are
+  content-addressed and versioned so stale objects cannot link silently.
+- Add incremental builds, dependency invalidation, deterministic output, and a documented interop
+  boundary for CommonJS if supported.
+- Keep module semantics in the loader/linker rather than flattening source files into one script.
+
+### Clean implementation tests
+
+- Compare evaluation/event traces for cycles, re-exports, ambiguous exports, failure caching,
+  package conditions, symlinks, and dynamic imports against Node.
+- Rebuild after changing public API, private implementation, compiler flags, and dependency
+  metadata; assert exactly the correct artifacts invalidate.
+- Build in different directory orders and absolute paths; normalized artifacts and behavior match.
+
+### Exit gate
+
+A multi-package TypeScript CLI with ESM cycles and at least five unmodified npm dependencies builds
+incrementally, runs from a clean checkout, and reproduces byte-identical normalized artifacts.
+
+## R05 — promises, jobs, and event loop
+
+### Build
+
+- Implement Promise resolution, thenable assimilation, async functions, `await`, async iteration,
+  microtask queues, unhandled rejection policy, timers, and event-loop shutdown rules.
+- Make async roots and suspended frames explicit GC objects with verified layouts and source stacks.
+- Define deterministic test hooks for virtual time and queue inspection without changing production
+  ordering semantics.
+
+### Clean implementation tests
+
+- Differential event logs cover nested promises, thenables, rejection propagation, `finally`, timer
+  ordering, queue starvation boundaries, async generators, and process exit.
+- Stress collection at every suspension/resumption point and inject failures in callbacks and host
+  completions.
+- Falsification swaps microtask/macrotask order, drops a rejection, or loses a suspended root and
+  must fail a focused gate.
+
+### Exit gate
+
+Async application fixtures agree with Node on event order and error propagation across all stress
+modes, with no leaked suspended frames after quiescence.
+
+## R06 — production garbage collector
+
+### Build
+
+- Evolve the collector to generational operation with nursery allocation, promotion, remembered
+  sets, write barriers, large-object handling, heap growth limits, and explicit OOM behavior.
+- Preserve precise stack maps and layouts across calls, exceptions, async suspension, modules,
+  inline caches, weak references, and finalization.
+- Add heap statistics, pause/throughput counters, verification mode, poisoning, heap snapshots, and
+  deterministic stress controls.
+
+### Clean implementation tests
+
+- Compare generational and full-collection modes on the same semantic corpus. Collect at every
+  allocation and at every safepoint under restricted heaps.
+- Barrier fault injection, stale-root poisoning, randomized heap relocation, weak/finalizer tests,
+  and long-running leak slopes must catch missing edges.
+- Benchmark allocation throughput, live-heap overhead, p50/p95/p99 pause, and peak RSS separately;
+  never hide pauses inside aggregate throughput.
+
+### Exit gate
+
+All application fixtures run under a bounded heap for sustained periods, heap growth stabilizes,
+stress verification is clean, and OOM produces the documented controlled failure.
+
+## R07 — standard library and CLI host
+
+### Build
+
+- Provide documented `console`, process arguments/environment/exit/signals, filesystem, paths,
+  URLs, buffers, encoding, streams, timers, and cryptographic primitives required by selected apps.
+- Use capability-scoped host interfaces with explicit ownership, cancellation, errors, and GC
+  lifetimes. Runtime semantics must not directly invoke scattered OS calls.
+- Decide API compatibility operation by operation; generate the host support manifest from tests.
+
+### Clean implementation tests
+
+- Differential tests use temporary sandboxes for files, permissions, Unicode paths, partial I/O,
+  stream backpressure, cancellation, signals, and resource cleanup.
+- Leak tests count file descriptors, native allocations, handles, and heap roots before and after
+  repeated application runs.
+- Package tests run without patches or hidden Node subprocesses.
+
+### Exit gate
+
+At least three useful unmodified TypeScript CLIs install, compile, and pass their own test fixtures.
+Failures have source-mapped stacks and leave no files, descriptors, or processes behind.
+
+## R08 — networking and service host
+
+### Build
+
+- Add sockets, DNS, HTTP/1.1 client/server, streaming bodies, backpressure, cancellation, timeouts,
+  graceful shutdown, and the minimum TLS surface required by the acceptance service.
+- Integrate I/O completion with the R05 event loop through one ownership and wakeup model.
+- Keep protocol parsing general and independently fuzzable; do not special-case the chosen service.
+
+### Clean implementation tests
+
+- Differential integration tests cover keep-alive, pipelining policy, malformed requests, aborted
+  peers, slow readers/writers, timeout races, DNS/TLS failures, and shutdown with in-flight work.
+- Protocol fuzzing and sanitizers run against parsers and native boundaries.
+- Load tests publish throughput, latency percentiles, RSS, GC pauses, error rate, and open-handle
+  counts at steady state. Node receives the same warmup, workload, and correctness checks.
+
+### Exit gate
+
+An unmodified framework-based TypeScript HTTP service passes functional and load tests, shuts down
+cleanly, sustains a bounded heap, and has no known correctness divergence from its Node execution.
+
+## R09 — ecosystem qualification and release
+
+### Build
+
+- Curate a versioned package/app corpus spanning parsing, validation, templating, data structures,
+  CLI, and HTTP. Pin sources, licenses, hashes, install graphs, and expected behavior.
+- Add a single build/run command, artifact cache, release packaging, compatibility report, upgrade
+  notes, and stable runtime/compiler versioning policy.
+- Provide CPU/heap profiles, optimization and fallback diagnostics, source maps, and a minimal
+  debugger story sufficient to diagnose application failures.
+
+### Clean implementation tests
+
+- Run package-owned tests where practical plus black-box Node differentials. No source patches,
+  precomputed answers, benchmark dispatch, hidden Node execution, or disabled GC are permitted.
+- Reproduce release artifacts in a clean environment and verify signatures/hashes and ABI rejection
+  of incompatible objects.
+- Track correctness, startup, warmed throughput, latency, memory, and binary size independently.
+  Regressions require explicit budgets and reviewed waivers; compiler time never substitutes for
+  runtime evidence.
+
+### Exit gate
+
+The acceptance CLI and HTTP service, five or more unmodified dependencies each, and the compatibility
+corpus pass from a clean release artifact. The published report states exactly what is supported,
+what is not, performance versus warmed Node, memory behavior, and every known incompatibility.
+
+## Immediate next work
+
+Execute R00 only:
+
+1. Define the support-manifest schema and generator.
+2. Map every current native conformance case and builtin to a manifest row.
+3. Add explicit missing-capability rows for exceptions, ESM, promises, host APIs, and GC production
+   features.
+4. Add the three named application-shaped gap fixtures.
+5. Create `tools/gates/R00.sh` with deletion detection, deterministic regeneration, and claim/test
+   cross-checks.
+
+Do not begin R01 implementation until R00 makes the current boundary measurable and its gate has
+been deliberately falsified.

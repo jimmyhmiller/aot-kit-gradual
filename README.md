@@ -31,7 +31,7 @@ node tools/aot-compile.mjs input.js --output graph.txt
 It always uses the pinned native `typescript-go` bridge and Coil-owned resolution/lowering. The npm
 TypeScript normalizer under `src/frontend_ir.mjs` is retained only as an independent test oracle.
 
-To isolate and debug Richards or DeltaBlue without running the complete B15 gate:
+To isolate and debug the retained Richards or DeltaBlue regression workloads:
 
 ```sh
 node tools/debug-benchmark.mjs deltablue
@@ -75,10 +75,12 @@ Read in this order:
 | `tests/*-test.coil` | One suite per area; `tools/gate.sh` runs them all |
 | `tools/dot-dump.coil`, `render-dot.sh`, `build-page.py` | The diagram pipeline and the gallery page |
 
-The verified TypeScript subset and native backend are under active expansion. The roadmap grows the native
-`typescript-go`/Coil frontend and runtime until the complete V8 Benchmark Suite v7 runs through the
-same ideal and native pipeline. Graphs can still be built directly through the node API for focused
-compiler tests.
+The verified TypeScript subset and native backend are under active expansion. The roadmap grows the
+native `typescript-go`/Coil frontend into a usable JavaScript and TypeScript runtime: complete
+semantics, dynamic objects and calls, exceptions, modules, async execution, production GC, host APIs,
+and application compatibility. The V8-v7 workloads remain regression evidence rather than the
+product destination. Graphs can still be built directly through the node API for focused compiler
+tests.
 
 Source-level native claims are tracked by the [Node differential conformance gate](docs/NATIVE-CONFORMANCE.md).
 It distinguishes product-path support from phase-local capability tests and correctness-qualifies

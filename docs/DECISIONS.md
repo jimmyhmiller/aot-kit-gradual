@@ -228,7 +228,8 @@ every phi on that region, in the same operation. Diverging for even one peephole
 the wrong arm, which is a miscompile that typechecks cleanly.
 
 **Still open, and it will bite while wiring memory edges.** A dead node can be wired as an input and
-nothing says so at the wiring site. See the note in [ROADMAP.md](ROADMAP.md#the-next-concrete-piece-of-work).
+nothing says so at the wiring site. Treat this as verifier debt under the roadmap's rule that each
+representation owns and validates its invariants.
 
 ---
 
