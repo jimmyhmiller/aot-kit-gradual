@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import assert from "node:assert/strict";
-import { readdir, readFile } from "node:fs/promises";
+import { access, readdir, readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 
 const layers = [
@@ -36,12 +36,10 @@ for (const [index, layer] of layers.entries()) {
   }
 }
 
-const facade = await readFile(new URL("../src/backend.coil", import.meta.url), "utf8");
-assert.doesNotMatch(facade, /^\(def/m, "backend facade contains no implementation definitions");
-const reexports = [...facade.matchAll(/\(import "(backend_[^"]+)" :reexport\)/g)].map(
-  ([, dependency]) => dependency,
+await assert.rejects(
+  access(new URL("../src/backend.coil", import.meta.url)),
+  "the retired backend facade must not be restored",
 );
-assert.deepEqual(reexports, layers, "backend facade reexports every layer in dependency order");
 
 async function coilSources(directory) {
   const files = [];
@@ -56,7 +54,6 @@ async function coilSources(directory) {
 let callers = 0;
 for (const root of ["../src/", "../tests/", "../tools/"]) {
   for (const file of await coilSources(new URL(root, import.meta.url))) {
-    if (file.pathname.endsWith("/src/backend.coil")) continue;
     const source = await readFile(file, "utf8");
     assert.doesNotMatch(
       source,
@@ -69,5 +66,5 @@ for (const root of ["../src/", "../tests/", "../tools/"]) {
 }
 
 console.log(
-  `backend module DAG verified: ${layers.length} layers, ${callers} explicit callers, one public facade`,
+  `backend module DAG verified: ${layers.length} layers, ${callers} explicit callers, no umbrella facade`,
 );

@@ -842,7 +842,7 @@ typedef struct {
 } AotGcThread;
 
 /* x28 points here while generated code is running. Keep the layout in lockstep
-   with the three fixed offsets emitted by backend.coil. */
+   with the three fixed offsets emitted by backend_aarch64.coil. */
 AotGcThread aot_gc_thread_state;
 
 static AotJsValue js_canonical_stored_value(AotJsValue value) {

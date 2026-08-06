@@ -17,7 +17,8 @@ The project substantially recreated the parts of Simple it originally named as r
 
 The project did not recreate the general code-generation sequence represented in late Simple by
 CFG construction, global placement, local scheduling, register allocation, and encoding of a whole
-program. `src/backend.coil` is currently a useful arm64 prototype specialized to the shared corpus.
+program. The backend phase modules were then expanded beyond the original arm64 prototype; see
+`docs/BACKEND-ARCHITECTURE.md` for their current boundaries.
 
 ## Reusable implementation
 

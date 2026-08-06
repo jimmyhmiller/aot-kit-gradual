@@ -1,9 +1,8 @@
 # Backend architecture
 
-`src/backend.coil` is a public compatibility facade. It contains no implementation and uses
-Coil's explicit `:reexport` imports for out-of-tree consumers. In-repo tools and tests import the
-phases they actually use, so their dependencies remain visible. The implementation follows a
-one-way dependency order:
+The backend has no umbrella module. Tools, tests, and external consumers import the phases they
+actually use, so their dependencies remain visible. The implementation follows a one-way
+dependency order:
 
 ```text
 core → cfg → select → liveness → schedule → allocate → aarch64 → macho
@@ -11,8 +10,8 @@ core → cfg → select → liveness → schedule → allocate → aarch64 → m
 
 Later modules may import any earlier layer directly because Coil does not place an imported
 module's own dependencies or types into another module's scope. No layer may import to its right.
-`tools/backend-module-gate.mjs` checks that rule, the facade's complete ordered re-export list, and
-that no in-repo caller hides its dependencies behind the facade.
+`tools/backend-module-gate.mjs` checks that rule, ensures the retired `src/backend.coil` facade is
+not restored, and rejects in-repo umbrella imports.
 
 | Module | Owns |
 |---|---|
