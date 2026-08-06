@@ -9,6 +9,7 @@ const root = path.resolve(path.dirname(new URL(import.meta.url).pathname), "..")
 const cases = [
   { name: "sum-loop", input: 20_000_000, repeats: 1 },
   { name: "branch-loop", input: 20_000_000, repeats: 1 },
+  { name: "call-loop", input: 5_000_000, repeats: 1 },
   { name: "bitwise-mix", input: 123456789, repeats: 20_000 },
   { name: "floating-point", input: 123456789, repeats: 20_000 },
 ];

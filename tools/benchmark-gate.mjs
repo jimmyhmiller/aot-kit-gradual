@@ -40,7 +40,8 @@ assert.ok(report.profile.dominantHits * 100 >= report.profile.samples * 80);
 assert.ok(report.profile.cloneCost <= 32);
 
 const nativeReport = JSON.parse(fs.readFileSync("out/typescript-aot-benchmarks/results.json", "utf8"));
-assert.equal(nativeReport.benchmarks.length, 4);
+assert.deepEqual(nativeReport.benchmarks.map(benchmark => benchmark.name),
+  ["sum-loop", "branch-loop", "call-loop", "bitwise-mix", "floating-point"]);
 for (const benchmark of nativeReport.benchmarks) {
   assert.equal(benchmark.samples.length, nativeReport.measuredSamples);
   assert.ok(benchmark.samples.every(sample => sample.coilRuntimeNs > 0 && sample.nodeRuntimeNs > 0));

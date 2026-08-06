@@ -14,10 +14,8 @@ The normal gate covers the currently verified end-to-end surface:
 - dense arrays including holes, indexed and non-index properties, growth, push, pop, and slice;
 - the currently selected `Math` builtins and numeric coercions.
 
-`tools/native-source-conformance.sh --extended` audits those sources across construction/schedule
-seeds, register pressure, and moving-GC stress. It is intentionally not part of the green extended
-gate yet: the number/bitwise witness currently diverges from Node under a nonzero schedule seed.
-The manifest is
+`tools/native-source-conformance.sh --extended` repeats those sources across construction/schedule
+seeds, register pressure, and moving-GC stress and is part of the extended gate. The manifest is
 `tests/native-conformance/manifest.json`; feature labels make omissions reviewable rather than
 leaving coverage implicit in source text.
 
@@ -36,8 +34,7 @@ support:
 
 Phase-local ideal/backend tests for these mechanisms remain valuable, but they are not a substitute
 for product-path source conformance. A gap moves into the verified set only after it agrees with
-Node in normal mode; extended-mode agreement is the remaining release qualification for the whole
-verified set.
+Node in normal and extended modes.
 
 ## Native benchmarks
 

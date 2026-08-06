@@ -15,3 +15,4 @@ coil test tests/backend-schedule-test.coil
 coil test tests/backend-liveness-test.coil
 coil test tests/backend-object-test.coil
 coil test tests/extended/backend-parity-test.coil
+./tools/native-source-conformance.sh --extended

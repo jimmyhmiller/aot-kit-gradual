@@ -9,5 +9,5 @@ export function main(n: number): number {
     sum = sum + step(i);
     i = i + 1;
   }
-  return sum;
+  return sum | 0;
 }

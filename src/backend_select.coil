@@ -306,26 +306,54 @@
                 0)))
     (load found)))
 
+(defn be-node-fp-value-fuel? [(node i64) (excluded i64) (fuel i64)] (-> bool)
+  (if (or (= node excluded) (<= fuel 0))
+      false
+      (let [op (n-op node)]
+        (if (= op OP-MOD)
+            true
+            (if (= op OP-PARM)
+                (be-parm-fp-value? node)
+                (if (be-float-only? (n-ty node))
+                    true
+                    (if (= op OP-PHI)
+                        ;; Loop Phis are initially bounded by the declared TypeScript type. A
+                        ;; numeric backedge can nevertheless require an FPR (for example an
+                        ;; integer accumulator updated by a floating-point call result). Inspect
+                        ;; every incoming value while excluding the Phi itself to terminate the
+                        ;; loop-carried cycle.
+                        (let [(mut input) 1
+                              (mut found) false]
+                          (loop (if (or (>= (load input) (n-nins node)) (load found))
+                                    (break)
+                                    (do
+                                      (if (be-node-fp-value-fuel?
+                                            (n-in node (load input)) node (- fuel 1))
+                                          (store! found true)
+                                          0)
+                                      (store! input (+ (load input) 1))
+                                      0)))
+                          (load found))
+                        (if (or (= op OP-ADD) (or (= op OP-SUB) (or (= op OP-MUL) (= op OP-DIV))))
+                            (or (and (= op OP-DIV) (not (ty-int-only? (n-ty node))))
+                                (or (be-node-fp-value-fuel? (n-in node 1) excluded (- fuel 1))
+                                    (be-node-fp-value-fuel? (n-in node 2) excluded (- fuel 1))))
+                            (if (= op OP-MINUS)
+                                (be-node-fp-value-fuel? (n-in node 1) excluded (- fuel 1))
+                                (if (= op OP-CALL)
+                                    (let [callee (n-in node 1)]
+                                      (and (= (n-op callee) OP-FUN)
+                                           (and (> (n-nins callee) 1)
+                                                (be-node-fp-value-fuel?
+                                                  (n-in (n-in callee 1) 1)
+                                                  excluded
+                                                  (- fuel 1)))))
+                                    false))))))))))
+
 (defn be-node-fp-value? [(node i64)] (-> bool)
-  (let [op (n-op node)]
-    (if (= op OP-MOD)
-        true
-        (if (= op OP-PARM)
-            (be-parm-fp-value? node)
-            (if (be-float-only? (n-ty node))
-                true
-                (if (or (= op OP-ADD) (or (= op OP-SUB) (or (= op OP-MUL) (= op OP-DIV))))
-                    (or (and (= op OP-DIV) (not (ty-int-only? (n-ty node))))
-                        (or (be-node-fp-value? (n-in node 1))
-                            (be-node-fp-value? (n-in node 2))))
-                    (if (= op OP-MINUS)
-                        (be-node-fp-value? (n-in node 1))
-                        (if (= op OP-CALL)
-                            (let [callee (n-in node 1)]
-                              (and (= (n-op callee) OP-FUN)
-                                   (and (> (n-nins callee) 1)
-                                        (be-node-fp-value? (n-in (n-in callee 1) 1)))))
-                            false))))))))
+  ;; This is a representation query, not a graph walk. Eight edges cover the supported numeric
+  ;; expression shapes while bounding repeated queries on large, Phi-heavy programs.
+  (be-node-fp-value-fuel? node NO-NODE 8))
 
 ; Frontend dynamic values cross the JavaScript-value ABI at these nodes. Hand-written
 ; backend fixtures also use t-dyn for unconstrained machine integers, so type alone is
