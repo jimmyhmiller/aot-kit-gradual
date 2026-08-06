@@ -26,6 +26,14 @@ else
 fi
 
 echo
+echo "=== backend module boundaries ==="
+if out=$(node tools/backend-module-gate.mjs 2>&1); then
+  note "backend-module-gate.mjs" "$out"
+else
+  note "backend-module-gate.mjs" "FAILED"; echo "$out" | tail -20; fails=$((fails+1))
+fi
+
+echo
 echo "=== typecheck ==="
 for f in src/*.coil; do
   if [ "$f" = "src/frontend_native_graph.coil" ] || [ "$f" = "src/typescript_native.coil" ]; then

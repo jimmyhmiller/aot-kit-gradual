@@ -1,0 +1,769 @@
+;; Interference construction, register allocation, spill layout, and ABI verification.
+(module backend_allocate)
+
+(import "backend_core" :use *)
+(import "backend_cfg" :use *)
+(import "backend_select" :use *)
+(import "backend_liveness" :use *)
+(import "backend_schedule" :use *)
+(import "node" :use *)
+(import "ty" :use *)
+(import "verify" :use *)
+(import "shape" :use *)
+(import "jsvalue" :use *)
+(import "jsstring" :use *)
+(import "coil.alloc" :use *)
+(import "coil.arraylist" :use *)
+(import "coil.control" :use *)
+(import "coil.io" :use *)
+(import "coil.fmt" :use *)
+(import "coil.slice" :use *)
+
+; ---------------------------------------------------------------------------
+; G7 CFG interference and constrained allocation.
+; ---------------------------------------------------------------------------
+
+(defn mra-result [] (-> i64)
+  (load (field (machine-unit) allocation-result)))
+(defn mra-result-item [] (-> i64)
+  (load (field (machine-unit) allocation-item)))
+(defn mra-seed [] (-> i64)
+  (load (field (machine-unit) allocation-seed)))
+(defn mra-reg [(vreg i64)] (-> i64)
+  (al-get (load (field (machine-unit) alloc-reg)) vreg))
+(defn mra-spill [(vreg i64)] (-> i64)
+  (al-get (load (field (machine-unit) alloc-spill)) vreg))
+(defn mra-owner [(vreg i64)] (-> i64)
+  (al-get (load (field (machine-unit) alloc-owner)) vreg))
+(defn mra-spill-kind [(vreg i64)] (-> i64)
+  (al-get (load (field (machine-unit) alloc-spill-kind)) vreg))
+(defn mra-safepoint-reg [(at i64) (vreg i64)] (-> i64)
+  (if (and (ml-safepoint? at) (ml-live-before? at vreg)) (mra-reg vreg) -2))
+(defn mra-safepoint-spill [(at i64) (vreg i64)] (-> i64)
+  (if (and (ml-safepoint? at) (ml-live-before? at vreg)) (mra-spill vreg) -2))
+(defn mra-safepoint-kind [(at i64) (vreg i64)] (-> i64)
+  (if (and (ml-safepoint? at) (ml-live-before? at vreg)) (ml-value-kind vreg) -1))
+(defn mra-interferes? [(a i64) (b i64)] (-> bool)
+  (!= (al-get (load (field (machine-unit) alloc-interference))
+              (+ (* a (ml-vreg-count)) b))
+      0))
+
+(defn mra-phys-reg [(color i64)] (-> i64)
+  (if (< color 8)
+      color
+      ; x28 is the native GC thread-state register.  It is fixed for the whole
+      ; generated unit and therefore never participates in graph coloring.
+      (if (< color 17)
+          (+ 19 (- color 8))
+          (if (< color 24) (+ 8 (- color 17)) -1))))
+
+(defn mra-phys-reg-for-class [(class i64) (color i64)] (-> i64)
+  (if (= class MRC-FPR)
+      ; d0-d7 are ABI ingress/egress, d8-d15 callee-saved, and d16-d31 caller-saved.
+      (if (< color 32) (+ 32 color) -1)
+      (mra-phys-reg color)))
+
+(defn mra-init! [] (-> i64)
+  (let [u (machine-unit)
+        vregs (ml-vreg-count)
+        (mut i) 0]
+    (al-clear! [i64] (field u alloc-interference))
+    (al-clear! [i64] (field u alloc-live))
+    (al-clear! [i64] (field u alloc-reg))
+    (al-clear! [i64] (field u alloc-spill))
+    (al-clear! [i64] (field u alloc-owner))
+    (al-clear! [i64] (field u alloc-forbidden))
+    (al-clear! [i64] (field u alloc-spill-kind))
+    (loop (if (>= (load i) (* vregs vregs))
+              (break)
+              (do
+                (al-push! [i64] (field u alloc-interference) 0)
+                (store! i (+ (load i) 1))
+                0)))
+    (store! i 0)
+    (loop (if (>= (load i) vregs)
+              (break)
+              (do
+                (al-push! [i64] (field u alloc-live) 0)
+                (al-push! [i64] (field u alloc-reg) -1)
+                (al-push! [i64] (field u alloc-spill) -1)
+                (al-push! [i64] (field u alloc-owner) -1)
+                (al-push! [i64] (field u alloc-forbidden) 0)
+                (al-push! [i64] (field u alloc-spill-kind) (ml-value-kind (load i)))
+                (store! i (+ (load i) 1))
+                0)))
+    (store! i 0)
+    (loop (if (>= (load i) (be-inst-count))
+              (break)
+              (do
+                (let [m (be-inst (load i))
+                      dst (load (field m dst))]
+                  (if (>= dst 0)
+                      (do
+                        (al-set! [i64] (field u alloc-owner) dst (load (field m owner)))
+                        (if (= (load (field m op)) MI-ARG)
+                            (al-set! [i64]
+                                     (field u alloc-reg)
+                                     dst
+                                     (+ (load (field m imm))
+                                        (if (= (ml-register-class dst) MRC-FPR) 32 0)))
+                            0))
+                      0))
+                (store! i (+ (load i) 1))
+                0)))
+    ;; Ingress copies are sequential moves. A fresh destination must avoid every still-fixed
+    ;; ingress register in its function, or one copy can overwrite another argument before that
+    ;; argument has been copied. Calls/safepoints remain governed by ordinary liveness masks.
+    (store! i 0)
+    (loop (if (>= (load i) (be-inst-count))
+              (break)
+              (do
+                (let [m (be-inst (load i))]
+                  (if (= (load (field m op)) MI-ABI-COPY)
+                      (let [source-def (ms-owner-def-inst (load (field m owner))
+                                                          (load (field m a)))
+                            dst (load (field m dst))
+                            owner (load (field m owner))
+                            (mut at) 0
+                            (mut mask) 0]
+                        (if (and (>= source-def 0)
+                                 (or (= (ms-inst-op source-def) MI-ARG)
+                                     (= (ms-inst-op source-def) MI-STACKARG)))
+                            (do
+                              (loop (if (>= (load at) (be-inst-count))
+                                        (break)
+                                        (do
+                                          (let [arg (be-inst (load at))]
+                                            (if (and (= (load (field arg owner)) owner)
+                                                     (= (load (field arg op)) MI-ARG))
+                                                (store! mask
+                                                        (| (load mask)
+                                                           (<< 1
+                                                               (+ (load (field arg imm))
+                                                                  (if (= (ml-register-class (load (field arg dst)))
+                                                                         MRC-FPR)
+                                                                      32
+                                                                      0)))))
+                                                0))
+                                          (store! at (+ (load at) 1)))))
+                              (al-set! [i64] (field u alloc-forbidden) dst (load mask)))
+                            0))
+                      0))
+                (store! i (+ (load i) 1)))))
+    0))
+
+(defn mra-add-interference! [(a i64) (b i64)] (-> i64)
+  (if (or (< a 0) (or (< b 0) (= a b)))
+      0
+      (let [u (machine-unit)
+            n (ml-vreg-count)]
+        (al-set! [i64] (field u alloc-interference) (+ (* a n) b) 1)
+        (al-set! [i64] (field u alloc-interference) (+ (* b n) a) 1)
+        0)))
+
+(defn mra-build-interference! [] (-> i64)
+  (let [u (machine-unit)
+        blocks (mu-block-count)
+        vregs (ml-vreg-count)
+        (mut bid) 0]
+    (loop (if (>= (load bid) blocks)
+              (break)
+              (do
+                (let [(mut vr) 0]
+                  (loop (if (>= (load vr) vregs)
+                            (break)
+                            (do
+                              (al-set! [i64]
+                                       (field u alloc-live)
+                                       (load vr)
+                                       (if (ml-live-out? (load bid) (load vr)) 1 0))
+                              (store! vr (+ (load vr) 1))
+                              0))))
+                (let [first (mu-block-inst-first (load bid))
+                      count (mu-block-inst-count (load bid))
+                      (mut i) count
+                      (mut vr) 0]
+                  (loop (if (<= (load i) 0)
+                            (break)
+                            (do
+                              (store! i (- (load i) 1))
+                              (let [at (+ first (load i))
+                                    m (be-inst (+ first (load i)))
+                                    dst (load (field m dst))]
+                                ; Values live after any call-like instruction cannot occupy its clobber mask.
+                                (if (!= (mi-desc-clobbers (mi-desc (load (field m op)))) 0)
+                                    (let [(mut vr) 0]
+                                      (loop (if (>= (load vr) vregs)
+                                                (break)
+                                                (do
+                                                  (if (and (!= (load vr) dst)
+                                                           (!= (al-get (load (field u alloc-live)) (load vr)) 0))
+                                                      (al-set! [i64]
+                                                               (field u alloc-forbidden)
+                                                               (load vr)
+                                                               (| (al-get (load (field u alloc-forbidden)) (load vr))
+                                                                  (mi-desc-clobbers (mi-desc (load (field m op))))))
+                                                      0)
+                                                  (store! vr (+ (load vr) 1))
+                                                  0))))
+                                    0)
+                                (if (>= dst 0)
+                                    (do
+                                      (store! vr 0)
+                                      (loop (if (>= (load vr) vregs)
+                                                (break)
+                                                (do
+                                                  (if (!= (al-get (load (field u alloc-live)) (load vr)) 0)
+                                                      (mra-add-interference! dst (load vr))
+                                                      0)
+                                                  (store! vr (+ (load vr) 1))
+                                                  0)))
+                                      (al-set! [i64] (field u alloc-live) dst 0))
+                                    0)
+                                (store! vr 0)
+                                (loop (if (>= (load vr) vregs)
+                                          (break)
+                                          (do
+                                            (if (ml-inst-uses? at (load vr))
+                                                (al-set! [i64] (field u alloc-live) (load vr) 1)
+                                                0)
+                                            (store! vr (+ (load vr) 1))
+                                            0))))))))
+                (store! bid (+ (load bid) 1))
+                0)))
+    0))
+
+(defn mra-reg-legal? [(vreg i64) (reg i64)] (-> bool)
+  (if (< reg 0)
+      false
+      (let [u (machine-unit)
+            forbidden (al-get (load (field u alloc-forbidden)) vreg)
+            vregs (ml-vreg-count)
+            (mut other) 0
+            (mut ok) true]
+        (if (or (!= (= (ml-register-class vreg) MRC-FPR) (>= reg 32))
+                (!= (& forbidden (<< 1 reg)) 0))
+            false
+            (do
+              (loop (if (or (>= (load other) vregs) (not (load ok)))
+                        (break)
+                        (do
+                          (if (and (mra-interferes? vreg (load other))
+                                   (= (mra-reg (load other)) reg))
+                              (store! ok false)
+                              0)
+                          (store! other (+ (load other) 1))
+                          0)))
+              (load ok))))))
+
+(defn mra-copy-preference [(vreg i64)] (-> i64)
+  (let [(mut at) 0
+        (mut preferred) -1]
+    (loop (if (or (>= (load at) (be-inst-count)) (>= (load preferred) 0))
+              (break)
+              (do
+                (let [m (be-inst (load at))]
+                  (if (= (load (field m op)) MI-COPY)
+                      (let [dst (load (field m dst))
+                            src (load (field m a))
+                            other (if (= dst vreg) src (if (= src vreg) dst -1))]
+                        (if (and (>= other 0)
+                                 (and (not (mra-interferes? vreg other))
+                                      (= (ml-value-kind vreg) (ml-value-kind other))))
+                            (store! preferred (mra-reg other))
+                            0))
+                      0))
+                (store! at (+ (load at) 1))
+                0)))
+    (load preferred)))
+
+(defn mra-assign! [(nregs i64) (seed i64)] (-> i64)
+  (let [u (machine-unit)
+        vregs (ml-vreg-count)
+        funcs (mu-function-count)
+        (mut owner) 0
+        (mut rank) 0
+        (mut spills) 0]
+    (loop (if (>= (load owner) funcs)
+              (break)
+              (do
+                (store! (field (mu-function (load owner)) frame-size) 0)
+                (store! (field (mu-function (load owner)) callee-mask) 0)
+                (store! (field (mu-function (load owner)) callee-count) 0)
+                (store! owner (+ (load owner) 1))
+                0)))
+    (loop (if (>= (load rank) vregs)
+              (break)
+              (do
+                (let [vreg (if (= (& seed 1) 0) (load rank) (- vregs (+ (load rank) 1)))]
+                  (if (or (< (mra-owner vreg) 0) (>= (mra-reg vreg) 0))
+                      0
+                      (let [preferred (mra-copy-preference vreg)
+                            (mut color) 0
+                            (mut chosen) -1]
+                        (if (and (>= preferred 0) (mra-reg-legal? vreg preferred))
+                            (store! chosen preferred)
+                            0)
+                        (loop (if (or (>= (load color) nregs) (>= (load chosen) 0))
+                                  (break)
+                                  (do
+                                    (let [physical
+                                            (mra-phys-reg-for-class (ml-register-class vreg)
+                                                                    (load color))]
+                                      (if (mra-reg-legal? vreg physical) (store! chosen physical) 0))
+                                    (store! color (+ (load color) 1))
+                                    0)))
+                        (if (>= (load chosen) 0)
+                            (al-set! [i64] (field u alloc-reg) vreg (load chosen))
+                            (let [fun (mra-owner vreg)
+                                  slot (load (field (mu-function (mra-owner vreg)) frame-size))]
+                              (al-set! [i64] (field u alloc-spill) vreg slot)
+                              (store! (field (mu-function fun) frame-size) (+ slot 1))
+                              (store! spills (+ (load spills) 1)))))))
+                (store! rank (+ (load rank) 1))
+                0)))
+    ; Derive each function's callee-save area, then convert spill counts to aligned frame bytes.
+    (let [(mut vr) 0]
+      (loop (if (>= (load vr) vregs)
+                (break)
+                (do
+                  (let [fun (mra-owner (load vr))
+                        reg (mra-reg (load vr))]
+                    (if (and (>= fun 0)
+                             (or (and (>= reg 19) (<= reg 28))
+                                 (and (>= reg 40) (<= reg 47))))
+                        (store! (field (mu-function fun) callee-mask)
+                                (| (load (field (mu-function fun) callee-mask)) (<< 1 reg)))
+                        0))
+                  (store! vr (+ (load vr) 1))
+                  0))))
+    (store! owner 0)
+    (loop (if (>= (load owner) funcs)
+              (break)
+              (do
+                (let [slots (load (field (mu-function (load owner)) frame-size))
+                      saves (popcount64 (load (field (mu-function (load owner)) callee-mask)))]
+                  (store! (field (mu-function (load owner)) callee-count) saves)
+                  (store! (field (mu-function (load owner)) frame-size)
+                          (& (+ (+ 16 (* (+ saves slots) 8)) 15) -16)))
+                (store! owner (+ (load owner) 1))
+                0)))
+    (load spills)))
+
+(defn mra-publish! [] (-> i64)
+  (let [n (be-inst-count)
+        (mut at) 0]
+    (loop (if (>= (load at) n)
+              (break)
+              (do
+                (let [m (be-inst (load at))
+                      dst (load (field m dst))]
+                  (if (>= dst 0)
+                      (do
+                        (store! (field m reg) (mra-reg dst))
+                        (store! (field m spill) (mra-spill dst)))
+                      0))
+                (store! at (+ (load at) 1))
+                0)))
+    0))
+
+(defn mra-expected-interferes? [(a i64) (b i64)] (-> bool)
+  (if (= a b)
+      false
+      (let [blocks (mu-block-count)
+            (mut bid) 0
+            (mut found) false]
+        (loop (if (or (>= (load bid) blocks) (load found))
+                  (break)
+                  (do
+                    (let [first (mu-block-inst-first (load bid))
+                          count (mu-block-inst-count (load bid))
+                          (mut i) count
+                          (mut alive) (ml-live-out? (load bid) a)
+                          (mut blive) (ml-live-out? (load bid) b)]
+                      (loop (if (or (<= (load i) 0) (load found))
+                                (break)
+                                (do
+                                  (store! i (- (load i) 1))
+                                  (let [at (+ first (load i))
+                                        dst (ms-inst-dst (+ first (load i)))]
+                                    (if (and (= dst a) (load blive)) (store! found true) 0)
+                                    (if (and (= dst b) (load alive)) (store! found true) 0)
+                                    (if (= dst a) (store! alive false) 0)
+                                    (if (= dst b) (store! blive false) 0)
+                                    (if (ml-inst-uses? at a) (store! alive true) 0)
+                                    (if (ml-inst-uses? at b) (store! blive true) 0))))))
+                    (store! bid (+ (load bid) 1))
+                    0)))
+        (load found))))
+
+(defn mra-verify! [] (-> bool)
+  (let [u (machine-unit)
+        vregs (ml-vreg-count)
+        (mut vr) 0]
+    (store! (field u allocation-result) MRA-OK)
+    (store! (field u allocation-item) -1)
+    (loop (if (or (>= (load vr) vregs) (!= (mra-result) MRA-OK))
+              (break)
+              (do
+                (if (>= (mra-owner (load vr)) 0)
+                    (do
+                      (if (= (>= (mra-reg (load vr)) 0) (>= (mra-spill (load vr)) 0))
+                          (do
+                            (store! (field u allocation-result) MRA-LOCATION)
+                            (store! (field u allocation-item) (load vr)))
+                          0)
+                      (if (and (>= (mra-reg (load vr)) 0)
+                               (not (mra-reg-legal? (load vr) (mra-reg (load vr)))))
+                          (do
+                            (store! (field u allocation-result) MRA-INTERFERENCE)
+                            (store! (field u allocation-item) (load vr)))
+                          0)
+                      (if (!= (mra-spill-kind (load vr)) (ml-value-kind (load vr)))
+                          (do
+                            (store! (field u allocation-result) MRA-SPILL-KIND)
+                            (store! (field u allocation-item) (load vr)))
+                          0))
+                    0)
+                (store! vr (+ (load vr) 1))
+                0)))
+    (if (= (mra-result) MRA-OK)
+        (let [cells (* vregs vregs) (mut cell) 0]
+          ;; Snapshot the published graph, rebuild it with the same reverse-liveness construction,
+          ;; and compare matrices linearly. Calling mra-expected-interferes? for every pair scanned
+          ;; every block again, making verification quartic on whole benchmark programs.
+          (al-clear! [i64] (field u alloc-expected))
+          (loop (if (>= (load cell) cells)
+                    (break)
+                    (do
+                      (al-push! [i64]
+                                (field u alloc-expected)
+                                (al-get (load (field u alloc-interference)) (load cell)))
+                      (al-set! [i64] (field u alloc-interference) (load cell) 0)
+                      (store! cell (+ (load cell) 1)))))
+          (mra-build-interference!)
+          (store! cell 0)
+          (loop (if (or (>= (load cell) cells) (!= (mra-result) MRA-OK))
+                    (break)
+                    (do
+                      (if (!= (al-get (load (field u alloc-interference)) (load cell))
+                              (al-get (load (field u alloc-expected)) (load cell)))
+                          (do
+                            (store! (field u allocation-result) MRA-INTERFERENCE)
+                            (store! (field u allocation-item) (load cell)))
+                          0)
+                      (store! cell (+ (load cell) 1))))))
+        0)
+    ; Every definition of a vreg, including Phi edge copies, publishes the same location.
+    (if (= (mra-result) MRA-OK)
+        (let [(mut at) 0]
+          (loop (if (or (>= (load at) (be-inst-count)) (!= (mra-result) MRA-OK))
+                    (break)
+                    (do
+                      (let [m (be-inst (load at))
+                            dst (load (field m dst))]
+                        (if (and (>= dst 0)
+                                 (or (!= (load (field m reg)) (mra-reg dst))
+                                     (!= (load (field m spill)) (mra-spill dst))))
+                            (do
+                              (store! (field u allocation-result) MRA-LOCATION)
+                              (store! (field u allocation-item) (load at)))
+                            0))
+                      (let [m (be-inst (load at))]
+                        (if (and (= (load (field m op)) MI-ARG)
+                                 (!= (mra-reg (load (field m dst)))
+                                     (+ (load (field m imm))
+                                        (if (= (ml-register-class (load (field m dst))) MRC-FPR)
+                                            32
+                                            0))))
+                            (do
+                              (store! (field u allocation-result) MRA-FIXED)
+                              (store! (field u allocation-item) (load at)))
+                            0))
+                      (store! at (+ (load at) 1))
+                      0))))
+        0)
+    (= (mra-result) MRA-OK)))
+
+(defn mra-corrupt-reg! [(vreg i64) (reg i64)] (-> i64)
+  (al-set! [i64] (field (machine-unit) alloc-reg) vreg reg)
+  (al-set! [i64] (field (machine-unit) alloc-spill) vreg -1)
+  (mra-publish!)
+  0)
+(defn mra-corrupt-spill-kind! [(vreg i64) (kind i64)] (-> i64)
+  (al-set! [i64] (field (machine-unit) alloc-spill-kind) vreg kind)
+  0)
+(defn mra-corrupt-interference! [(a i64) (b i64) (present bool)] (-> i64)
+  (let [u (machine-unit)
+        n (ml-vreg-count)
+        value (if present 1 0)]
+    (al-set! [i64] (field u alloc-interference) (+ (* a n) b) value)
+    (al-set! [i64] (field u alloc-interference) (+ (* b n) a) value)
+    0))
+
+(defn mra-allocate! [(nregs i64) (seed i64)] (-> i64)
+  (let [u (machine-unit)]
+    (store! (field u allocation-seed) seed)
+    (store! (field u allocation-result) MRA-OK)
+    (store! (field u allocation-item) -1)
+    (mra-init!)
+    (mra-build-interference!)
+    (let [spills (mra-assign! nregs seed)]
+      (mra-publish!)
+      (if (mra-verify!) spills -1))))
+
+;; Greedy coloring over the exact interval interference graph. Values beyond the register budget
+;; receive distinct spill slots; lowering treats each slot boundary as a split point.
+(defn be-color-linear! [(nregs i64)] (-> i64)
+  (let [p (backend)
+        n (be-inst-count)
+        (mut i) 0]
+    (store! (field p spills) 0)
+    (let [(mut owner) 0]
+      (loop (if (>= (load owner) (mu-function-count))
+                (break)
+                (do
+                  (store! (field (mu-function (load owner)) frame-size) 0)
+                  (store! owner (+ (load owner) 1))
+                  0))))
+    (loop (if (>= (load i) n)
+              (break)
+              (do
+                (store! (field (be-inst (load i)) reg)
+                        (if (= (load (field (be-inst (load i)) op)) MI-ARG)
+                            (load (field (be-inst (load i)) imm))
+                            -1))
+                (store! (field (be-inst (load i)) spill) -1)
+                (store! i (+ (load i) 1))
+                0)))
+    (store! i 0)
+    (loop (if (>= (load i) n)
+              (break)
+              (do
+                (let [m (be-inst (load i))]
+                  (if (or (< (load (field m dst)) 0) (= (load (field m op)) MI-ARG))
+                      0
+                      (let [(mut color) 0
+                            (mut found) false]
+                        (loop (if (or (>= (load color) nregs) (load found))
+                                  (break)
+                                  (let [(mut j) 0
+                                        (mut conflict) false]
+                                    (loop (if (>= (load j) n)
+                                              (break)
+                                              (do
+                                                (let [q (be-inst (load j))]
+                                                  (if (and (!= (load j) (load i))
+                                                           (and (= (load (field q reg)) (load color))
+                                                                (intervals-overlap? m q)))
+                                                      (store! conflict true)
+                                                      0))
+                                                (store! j (+ (load j) 1))
+                                                0)))
+                                    (if (load conflict) (store! color (+ (load color) 1)) (store! found true)))))
+                        (if (load found)
+                            (store! (field m reg) (load color))
+                            (let [owner (load (field m owner))]
+                              (if (>= owner 0)
+                                  (let [slot (load (field (mu-function owner) frame-size))]
+                                    (store! (field m spill) slot)
+                                    (store! (field (mu-function owner) frame-size) (+ slot 1)))
+                                  (do
+                                    (store! (field m spill) (load (field p spills)))
+                                    (store! (field p spills) (+ (load (field p spills)) 1))
+                                    0))))))
+                  (store! i (+ (load i) 1))
+                  0))))
+    (let [funcs (mu-function-count)
+          (mut owner) 0]
+      (loop (if (>= (load owner) funcs)
+                (break)
+                (do
+                  (let [slots (load (field (mu-function (load owner)) frame-size))
+                        bytes (& (+ (+ 16 (* slots 8)) 15) -16)]
+                    (store! (field (mu-function (load owner)) frame-size) bytes)
+                    (store! (field p spills) (+ (load (field p spills)) slots)))
+                  (store! owner (+ (load owner) 1))
+                  0))))
+    (load (field p spills))))
+
+(defn be-color-seeded! [(nregs i64) (seed i64)] (-> i64)
+  (if (and (> (be-inst-count) 0) (>= (ms-inst-owner 0) 0))
+      (let [spills (mra-allocate! nregs seed)]
+        (store! (field (backend) spills) (if (< spills 0) 0 spills))
+        spills)
+      (be-color-linear! nregs)))
+
+(defn be-color! [(nregs i64)] (-> i64)
+  (be-color-seeded! nregs 0))
+
+; Repack whole function instruction ranges before liveness/allocation. Seeds rotate function text
+; order, including moving the exported entry away from offset zero. Block-local scheduled order is
+; unchanged.
+(defn be-function-layout-seeded! [(seed i64)] (-> i64)
+  (let [p (backend)
+        u (machine-unit)
+        funcs (mu-function-count)
+        n (be-inst-count)
+        work (field u schedule-work)
+        (mut rank) 0]
+    (al-clear! [MInst] work)
+    (loop (if (>= (load rank) funcs)
+              (break)
+              (do
+                (let [owner (% (+ (load rank) seed) funcs)
+                      (mut at) 0]
+                  (loop (if (>= (load at) n)
+                            (break)
+                            (do
+                              (if (= (ms-inst-owner (load at)) owner)
+                                  (al-push! [MInst] work (load (be-inst (load at))))
+                                  0)
+                              (store! at (+ (load at) 1))
+                              0))))
+                (store! rank (+ (load rank) 1))
+                0)))
+    (if (!= (al-len [MInst] (load work)) n)
+        -1
+        (do
+          (al-clear! [MInst] (field p ins))
+          (let [(mut at) 0]
+            (loop (if (>= (load at) n)
+                      (break)
+                      (do
+                        (al-push! [MInst] (field p ins) (load (be-al-elem [MInst] work (load at))))
+                        (store! at (+ (load at) 1))
+                        0))))
+          (let [(mut bid) 0]
+            (loop (if (>= (load bid) (mu-block-count))
+                      (break)
+                      (do
+                        (store! (field (mu-block (load bid)) inst-first) -1)
+                        (store! (field (mu-block (load bid)) inst-count) 0)
+                        (store! bid (+ (load bid) 1))
+                        0))))
+          (let [(mut at) 0]
+            (loop (if (>= (load at) n)
+                      (break)
+                      (do
+                        (let [bid (ms-inst-block (load at))]
+                          (if (>= bid 0)
+                              (let [b (mu-block bid)]
+                                (if (< (load (field b inst-first)) 0)
+                                    (store! (field b inst-first) (load at))
+                                    0)
+                                (store! (field b inst-count) (+ (load (field b inst-count)) 1)))
+                              0))
+                        (store! at (+ (load at) 1))
+                        0)))
+            n)))))
+
+(defn be-color-checked! [(nregs i64)] (-> bool)
+  (if (<= nregs 0)
+      (be-fail! BER-ALLOCATION NO-NODE)
+      (do (be-color! nregs) true)))
+
+(defn be-spills [] (-> i64)
+  (load (field (backend) spills)))
+
+(defn be-verify-abi! [] (-> i64)
+  (let [funcs (mu-function-count)
+        n (be-inst-count)
+        (mut owner) 0
+        (mut at) 0
+        (mut result) MABI-OK]
+    (loop (if (or (>= (load owner) funcs) (!= (load result) MABI-OK))
+              (break)
+              (do
+                (let [frame (mu-function-frame-size (load owner))]
+                  (if (or (< frame 16) (!= (& frame 15) 0)) (store! result MABI-FRAME) 0))
+                (store! owner (+ (load owner) 1))
+                0)))
+    (loop (if (or (>= (load at) n) (!= (load result) MABI-OK))
+              (break)
+              (do
+                (let [m (be-inst (load at))
+                      op (load (field m op))
+                      own (load (field m owner))
+                      spill (load (field m spill))]
+                  (if (and (>= own 0) (>= spill 0))
+                      (if (> (+ 16 (* (+ (mu-function-callee-count own) (+ spill 1)) 8))
+                             (mu-function-frame-size own))
+                          (store! result MABI-SPILL)
+                          0)
+                      0)
+                  (if (and (= (load result) MABI-OK)
+                           (or (and (= op MI-ARG)
+                                    (or (< (load (field m imm)) 0) (>= (load (field m imm)) 8)))
+                               (and (= op MI-STACKARG)
+                                    (or (< (load (field m imm)) 0) (>= (load (field m imm)) 16)))))
+                      (store! result MABI-ARGUMENT)
+                      0)
+                  (if (and (= (load result) MABI-OK)
+                           (and (> (ms-inst-arg-count (load at)) 0)
+                                (not (ms-call-args-valid? (load at)))))
+                      (store! result MABI-ARGUMENT)
+                      0))
+                (store! at (+ (load at) 1))
+                0)))
+    (load result)))
+
+(defn be-corrupt-frame-size! [(owner i64) (bytes i64)] (-> i64)
+  (store! (field (mu-function owner) frame-size) bytes)
+  0)
+(defn be-corrupt-spill-slot! [(at i64) (slot i64)] (-> i64)
+  (store! (field (be-inst at) spill) slot)
+  (store! (field (be-inst at) reg) -1)
+  0)
+(defn be-corrupt-arg-index! [(at i64) (idx i64)] (-> i64)
+  (store! (field (be-inst at) imm) idx)
+  0)
+
+(defn be-falsify-shift-mask-ptr [] (-> (ptr bool))
+  (let [enabled (static bool)] enabled))
+(defn be-falsify-unsigned-shift-ptr [] (-> (ptr bool))
+  (let [enabled (static bool)] enabled))
+(defn be-falsify-shift-mask! [] (-> i64)
+  (store! (be-falsify-shift-mask-ptr) true)
+  0)
+(defn be-falsify-unsigned-shift! [] (-> i64)
+  (store! (be-falsify-unsigned-shift-ptr) true)
+  0)
+
+; Focused phase tests use this after coloring to exercise lowering's spill boundary independent of
+; the later CFG allocator milestone. Every definition of a Phi vreg must name the same location.
+(defn be-force-spill-vreg! [(vreg i64) (slot i64)] (-> i64)
+  (let [n (be-inst-count)
+        (mut i) 0
+        (mut owner) -1]
+    (loop (if (>= (load i) n)
+              (break)
+              (do
+                (let [m (be-inst (load i))]
+                  (if (= (load (field m dst)) vreg)
+                      (do
+                        (store! (field m reg) -1)
+                        (store! (field m spill) slot)
+                        (store! owner (load (field m owner)))
+                        0)
+                      0))
+                (store! i (+ (load i) 1))
+                0)))
+    (if (<= (load (field (backend) spills)) slot)
+        (store! (field (backend) spills) (+ slot 1))
+        0)
+    (if (>= (load owner) 0)
+        (let [need
+                (& (+ (+ 16
+                         (* (+ (mu-function-callee-count (load owner))
+                               (+ slot 1))
+                            8))
+                      15)
+                   -16)]
+          (if (< (mu-function-frame-size (load owner)) need)
+              (store! (field (mu-function (load owner)) frame-size) need)
+              0))
+        0)
+    0))
+
+; AArch64 word encoders used by lowering.

@@ -1,0 +1,138 @@
+;; Local instruction scheduling plus interval compatibility for the legacy allocator.
+(module backend_schedule)
+
+(import "backend_core" :use *)
+(import "backend_cfg" :use *)
+(import "backend_select" :use *)
+(import "backend_liveness" :use *)
+(import "node" :use *)
+(import "ty" :use *)
+(import "verify" :use *)
+(import "shape" :use *)
+(import "jsvalue" :use *)
+(import "jsstring" :use *)
+(import "coil.alloc" :use *)
+(import "coil.arraylist" :use *)
+(import "coil.control" :use *)
+(import "coil.io" :use *)
+(import "coil.fmt" :use *)
+(import "coil.slice" :use *)
+
+(defn be-note-call-arg-uses! [(at i64) (n i64)] (-> i64)
+  (let [m (be-inst at)
+        argc (load (field m arg-count))
+        (mut argi) 0]
+    (loop (if (>= (load argi) argc)
+              (break)
+              (do
+                (let [vr (ms-inst-arg at (load argi))
+                      (mut k) 0]
+                  (loop (if (>= (load k) n)
+                            (break)
+                            (do
+                              (if (= (load (field (be-inst (load k)) dst)) vr)
+                                  (store! (field (be-inst (load k)) last) at)
+                                  0)
+                              (store! k (+ (load k) 1))
+                              0))))
+                (store! argi (+ (load argi) 1))
+                0)))
+    0))
+
+(defn be-schedule-intervals! [] (-> i64)
+  (let [n (be-inst-count)
+        (mut i) 0]
+    (loop (if (>= (load i) n)
+              (break)
+              (do
+                (let [m (be-inst (load i))
+                      d (load (field m dst))]
+                  (if (< d 0)
+                      0
+                      (do
+                        (store! (field m first)
+                                (if (= (load (field m op)) MI-ARG) 0 (load i)))
+                        (store! (field m last) (load i))
+                        0)))
+                (store! i (+ (load i) 1))
+                0)))
+    (store! i 0)
+    (loop (if (>= (load i) n)
+              (break)
+              (do
+                (let [m (be-inst (load i))
+                      a (load (field m a))
+                      b (load (field m b))
+                      pred (if (= (load (field m op)) MI-CSEL) (load (field m imm)) -1)
+                      (mut j) 0]
+                  (loop (if (>= (load j) n)
+                            (break)
+                            (do
+                              (let [d (load (field (be-inst (load j)) dst))]
+                                (if (and (>= d 0) (or (or (= d a) (= d b)) (= d pred)))
+                                    (store! (field (be-inst (load j)) last) (load i))
+                                    0))
+                              (store! j (+ (load j) 1))
+                              0)))
+                  (if (> (ms-inst-arg-count (load i)) 0)
+                      (be-note-call-arg-uses! (load i) n)
+                      0))
+                (store! i (+ (load i) 1))
+                0)))
+    ; A linear interval ends at its last textual use, but a preheader value used inside a loop is
+    ; live again on every back edge. Extend such ranges through the branch that targets an earlier
+    ; label so colouring cannot reuse an invariant's register for a loop-carried temporary.
+    (store! i 0)
+    (loop (if (>= (load i) n)
+              (break)
+              (do
+                (let [br (be-inst (load i))]
+                  (if (!= (load (field br op)) MI-B)
+                      0
+                      (let [label (load (field br imm))
+                            (mut j) 0
+                            (mut at) -1]
+                        (loop (if (>= (load j) (load i))
+                                  (break)
+                                  (do
+                                    (if (and (= (load (field (be-inst (load j)) op)) MI-LABEL)
+                                             (= (load (field (be-inst (load j)) imm)) label))
+                                        (store! at (load j))
+                                        0)
+                                    (store! j (+ (load j) 1))
+                                    0)))
+                        (if (< (load at) 0)
+                            0
+                            (do
+                              (store! j 0)
+                              (loop (if (>= (load j) (load at))
+                                        (break)
+                                        (do
+                                          (let [d (be-inst (load j))]
+                                            (if (>= (load (field d last)) (load at))
+                                                (store! (field d last) (load i))
+                                                0))
+                                          (store! j (+ (load j) 1))
+                                          0)))))))
+                  (store! i (+ (load i) 1))
+                  0))))
+    n))
+
+(defn be-schedule-seeded! [(seed i64)] (-> i64)
+  (let [n (be-inst-count)]
+    (if (and (> n 0) (>= (ms-inst-owner 0) 0))
+        ;; Run the legality scheduler for production seed zero as well as perturbation seeds. GCM
+        ;; placement alone does not order a heap read before a later aliasing write; the explicit
+        ;; memory anti-edge is enforced here.
+        (if (ms-local-schedule! seed)
+            (let [scheduled (be-schedule-intervals!)]
+              (if (ml-compute! seed) scheduled -1))
+            -1)
+        (be-schedule-intervals!))))
+
+(defn be-schedule! [] (-> i64)
+  (be-schedule-seeded! 0))
+
+(defn intervals-overlap? [(a (ptr MInst)) (b (ptr MInst))] (-> bool)
+  (and (<= (load (field a first)) (load (field b last)))
+       (<= (load (field b first)) (load (field a last)))))

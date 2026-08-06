@@ -71,6 +71,7 @@ Read in this order:
 | `src/typescript_native.coil` | Native `typescript-go` AST bridge |
 | `src/frontend_native.coil` | Coil-owned declaration and symbol resolution |
 | `src/frontend_native_graph.coil` | Native frontend lowering into the ideal graph |
+| `src/backend.coil` | Stable backend facade; see [the layered backend map](docs/BACKEND-ARCHITECTURE.md) |
 | `tests/*-test.coil` | One suite per area; `tools/gate.sh` runs them all |
 | `tools/dot-dump.coil`, `render-dot.sh`, `build-page.py` | The diagram pipeline and the gallery page |
 

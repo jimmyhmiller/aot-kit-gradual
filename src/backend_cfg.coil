@@ -1,0 +1,964 @@
+;; Structural machine CFG construction, dominance, loop depth, and verification.
+(module backend_cfg)
+
+(import "backend_core" :use *)
+(import "node" :use *)
+(import "ty" :use *)
+(import "verify" :use *)
+(import "shape" :use *)
+(import "jsvalue" :use *)
+(import "jsstring" :use *)
+(import "coil.alloc" :use *)
+(import "coil.arraylist" :use *)
+(import "coil.control" :use *)
+(import "coil.io" :use *)
+(import "coil.fmt" :use *)
+(import "coil.slice" :use *)
+
+(defn be-has-input? [(n i64) (want i64)] (-> bool)
+  (let [len (n-nins n)
+        (mut i) 0
+        (mut yes) false]
+    (loop (if (or (>= (load i) len) (load yes))
+              (break)
+              (do
+                (if (= (n-in n (load i)) want) (store! yes true) 0)
+                (store! i (+ (load i) 1))
+                0)))
+    (load yes)))
+
+(defn be-cfg-control? [(op i64)] (-> bool)
+  (or (or (= op OP-IF) (= op OP-RETURN))
+      (or (or (= op OP-LOOP) (= op OP-REGION))
+          (or (= op OP-CPROJ) (= op OP-CALLEND)))))
+
+(defn be-ctrl-succ [(ctrl i64)] (-> i64)
+  (let [len (n-nouts ctrl)
+        (mut i) 0
+        (mut found) NO-NODE
+        (mut count) 0]
+    (loop (if (>= (load i) len)
+              (break)
+              (do
+                (let [u (n-out ctrl (load i))]
+                  (if (and (not (n-dead? u))
+                           (and (be-cfg-control? (n-op u)) (> (n-nins u) 0)))
+                      (if (be-has-input? u ctrl)
+                          (do (store! found u) (store! count (+ (load count) 1)) 0)
+                          0)
+                      0))
+                (store! i (+ (load i) 1))
+                0)))
+    (if (= (load count) 1) (load found) NO-NODE)))
+
+(defn be-if-arm [(iff i64) (slot i64)] (-> i64)
+  (let [len (n-nouts iff)
+        (mut i) 0
+        (mut found) NO-NODE]
+    (loop (if (>= (load i) len)
+              (break)
+              (do
+                (let [u (n-out iff (load i))]
+                  (if (and (not (n-dead? u))
+                           (and (= (n-op u) OP-CPROJ) (= (n-aux u) slot)))
+                      (store! found u)
+                      0))
+                (store! i (+ (load i) 1))
+                0)))
+    (load found)))
+
+; ---------------------------------------------------------------------------
+; G1 structural machine CFG. This pass only reads the ideal graph. Selection remains separate
+; until G2, so building or verifying this table cannot perturb optimizer or legacy backend state.
+; ---------------------------------------------------------------------------
+
+(defn mu-target-slot [(target i64) (incoming i64)] (-> i64)
+  (if (or (= (n-op target) OP-REGION) (= (n-op target) OP-LOOP))
+      (let [len (n-nins target)
+            (mut i) 1
+            (mut found) -1]
+        (loop (if (or (>= (load i) len) (>= (load found) 0))
+                  (break)
+                  (do
+                    (if (= (n-in target (load i)) incoming) (store! found (load i)) 0)
+                    (store! i (+ (load i) 1))
+                    0)))
+        (load found))
+      0))
+
+(defn mu-add-edge! [(owner i64) (source i64) (target i64) (slot i64)] (-> i64)
+  (let [u (machine-unit)
+        len (mu-edge-count)
+        (mut i) 0
+        (mut prior) -1]
+    (loop (if (or (>= (load i) len) (>= (load prior) 0))
+              (break)
+              (do
+                (let [e (mu-edge (load i))]
+                  (if (and (= (load (field e source)) source)
+                           (and (= (load (field e target)) target)
+                                (= (load (field e target-slot)) slot)))
+                      (store! prior (load i))
+                      0))
+                (store! i (+ (load i) 1))
+                0)))
+    (if (>= (load prior) 0)
+        (load prior)
+        (do (al-push! [MEdge] (field u edges) (me-new len owner source target slot)) len))))
+
+(defn mu-note-return! [(owner i64) (ret i64)] (-> i64)
+  (let [u (machine-unit)
+        f (mu-function owner)]
+    (if (< (load (field f return-first)) 0)
+        (store! (field f return-first) (al-len [i64] (load (field u returns))))
+        0)
+    (al-push! [i64]
+              (field u returns)
+              (al-get (load (field u ctrl-block)) ret))
+    (store! (field f return-count) (+ (load (field f return-count)) 1))
+    0))
+
+(defn mu-walk-block! [(owner i64) (head i64)] (-> i64)
+  (let [u (machine-unit)
+        known (al-get (load (field u ctrl-block)) head)]
+    (if (>= known 0)
+        known
+        (let [bid (mu-block-count)
+              (mut ctrl) head
+              (mut done) false]
+          (al-push! [MBlock] (field u blocks) (mb-new bid owner head))
+          (loop (if (load done)
+                    (break)
+                    (let [mapped (al-get (load (field u ctrl-block)) (load ctrl))]
+                      (if (and (>= mapped 0) (!= mapped bid))
+                          (do
+                            (mu-add-edge! owner bid mapped 0)
+                            (store! done true))
+                          (do
+                            (al-set! [i64] (field u ctrl-block) (load ctrl) bid)
+                            (case (n-op (load ctrl)) OP-RETURN
+                                  (do (mu-note-return! owner (load ctrl)) (store! done true)) OP-IF
+                                  (let [a (be-if-arm (load ctrl) 0)
+                                        b (be-if-arm (load ctrl) 1)]
+                                    (if (!= a NO-NODE)
+                                        (do
+                                          (mu-walk-block! owner a)
+                                          (mu-add-edge! owner
+                                                        bid
+                                                        (al-get (load (field u ctrl-block)) a)
+                                                        0)
+                                          0)
+                                        0)
+                                    (if (!= b NO-NODE)
+                                        (do
+                                          (mu-walk-block! owner b)
+                                          (mu-add-edge! owner
+                                                        bid
+                                                        (al-get (load (field u ctrl-block)) b)
+                                                        0)
+                                          0)
+                                        0)
+                                    (store! done true))
+                                    (let [next (be-ctrl-succ (load ctrl))]
+                                      (if (= next NO-NODE)
+                                          (store! done true)
+                                          (if (or (= (n-op next) OP-REGION)
+                                                  (or (= (n-op next) OP-LOOP) (= (n-op next) OP-CPROJ)))
+                                              (do
+                                                (mu-walk-block! owner next)
+                                                (mu-add-edge! owner
+                                                              bid
+                                                              (al-get (load (field u ctrl-block)) next)
+                                                              (mu-target-slot next (load ctrl)))
+                                                (store! done true))
+                                              (store! ctrl next)))))))))
+            bid)))))
+
+(defn mu-build-function! [(ideal i64) (entry i64)] (-> i64)
+  (let [u (machine-unit)
+        id (mu-function-count)
+        first (mu-block-count)]
+    (al-push! [MFunction] (field u functions) (mf-new id ideal entry))
+    (al-push! [i64] (field u symbols) (if (= ideal NO-NODE) -1 (n-aux ideal)))
+    (mu-walk-block! id entry)
+    (let [f (mu-function id)]
+      (store! (field f block-first) first)
+      (store! (field f block-count) (- (mu-block-count) first)))
+    id))
+
+(defn mu-find-function [(ideal i64)] (-> i64)
+  (let [n (mu-function-count)
+        (mut i) 0
+        (mut found) -1]
+    (loop (if (or (>= (load i) n) (>= (load found) 0))
+              (break)
+              (do
+                (if (= (mu-function-ideal (load i)) ideal) (store! found (load i)) 0)
+                (store! i (+ (load i) 1))
+                0)))
+    (load found)))
+
+(defn mu-find-function-symbol [(symbol i64)] (-> i64)
+  (let [(mut owner) 0
+        (mut found) -1]
+    (loop (if (or (>= (load owner) (mu-function-count)) (>= (load found) 0))
+              (break)
+              (do
+                (if (= (al-get (load (field (machine-unit) symbols)) (load owner)) symbol)
+                    (store! found (load owner))
+                    0)
+                (store! owner (+ (load owner) 1)))))
+    (load found)))
+
+(defn mu-direct-callee [(call i64)] (-> i64)
+  (let [callee (n-in call 1)]
+    (case (n-op callee) OP-FUN
+          callee OP-CLOSURE
+          (n-in callee 0)
+            (let [fidx (ty-fun-singleton (n-ty callee))]
+              (if (< fidx 0) NO-NODE (n-find-fun-index fidx))))))
+
+(defn mu-build-call-targets! [(call i64)] (-> i64)
+  (let [direct (mu-direct-callee call)
+        targets (ty-fun-targets (n-ty (n-in call 1)))
+        (mut fidx) 0]
+    (if (!= direct NO-NODE) (mu-build-reachable-function! direct) 0)
+    (loop (if (>= (load fidx) 63)
+              (break)
+              (do
+                (if (!= (& targets (<< 1 (load fidx))) 0)
+                    (let [fun (n-find-fun-index (load fidx))]
+                      (if (!= fun NO-NODE) (mu-build-reachable-function! fun) 0))
+                    0)
+                (store! fidx (+ (load fidx) 1)))))
+    0))
+
+(defn mu-build-reachable-function! [(ideal i64)] (-> i64)
+  (let [prior (mu-find-function ideal)]
+    (if (>= prior 0)
+        prior
+        (let [owner (mu-build-function! ideal (n-fun-entry ideal))
+              lim (n-count)
+              (mut i) 0]
+          ; Function ownership is already recorded on every reachable control in this function.
+          ; A call belongs here exactly when its control maps to one of those blocks.
+          (loop (if (>= (load i) lim)
+                    (break)
+                    (do
+                      (if (and (not (n-dead? (load i))) (= (n-op (load i)) OP-CALL))
+                          (let [ctrl (n-in (load i) 0)
+                                bid
+                                  (if (= ctrl NO-NODE)
+                                      -1
+                                      (al-get (load (field (machine-unit) ctrl-block)) ctrl))]
+                            (if (and (>= bid 0) (= (mu-block-owner bid) owner))
+                                (mu-build-call-targets! (load i))
+                                0))
+                          0)
+                      (store! i (+ (load i) 1))
+                      0)))
+          owner))))
+
+(defn mu-finalize-adjacency! [] (-> i64)
+  (let [u (machine-unit)
+        blocks (mu-block-count)
+        edges (mu-edge-count)
+        (mut b) 0]
+    (al-clear! [i64] (field u pred-edges))
+    (al-clear! [i64] (field u succ-edges))
+    (loop (if (>= (load b) blocks)
+              (break)
+              (do
+                (let [block (mu-block (load b))
+                      (mut e) 0]
+                  (store! (field block pred-first) (al-len [i64] (load (field u pred-edges))))
+                  (store! (field block pred-count) 0)
+                  (store! (field block succ-first) (al-len [i64] (load (field u succ-edges))))
+                  (store! (field block succ-count) 0)
+                  (loop (if (>= (load e) edges)
+                            (break)
+                            (do
+                              (if (= (mu-edge-target (load e)) (load b))
+                                  (do
+                                    (al-push! [i64] (field u pred-edges) (load e))
+                                    (store! (field block pred-count)
+                                            (+ (load (field block pred-count)) 1)))
+                                  0)
+                              (if (= (mu-edge-source (load e)) (load b))
+                                  (do
+                                    (al-push! [i64] (field u succ-edges) (load e))
+                                    (store! (field block succ-count)
+                                            (+ (load (field block succ-count)) 1)))
+                                  0)
+                              (store! e (+ (load e) 1))
+                              0))))
+                (store! b (+ (load b) 1))
+                0)))
+    0))
+
+(defn mu-rpo-visit! [(owner i64) (bid i64)] (-> i64)
+  (let [u (machine-unit)]
+    (if (!= (al-get (load (field u rpo-seen)) bid) 0)
+        0
+        (do
+          (al-set! [i64] (field u rpo-seen) bid 1)
+          (let [edges (mu-edge-count)
+                (mut i) 0]
+            (loop (if (>= (load i) edges)
+                      (break)
+                      (do
+                        (let [e (mu-edge (load i))]
+                          (if (and (= (load (field e owner)) owner)
+                                   (= (load (field e source)) bid))
+                              (mu-rpo-visit! owner (load (field e target)))
+                              0))
+                        (store! i (+ (load i) 1))
+                        0))))
+          (al-push! [i64] (field u rpo-post) bid)
+          0))))
+
+(defn mu-compute-rpo! [] (-> bool)
+  (let [u (machine-unit)
+        blocks (mu-block-count)
+        funcs (mu-function-count)
+        (mut fidx) 0
+        (mut ok) true]
+    (al-clear! [i64] (field u block-order))
+    (loop (if (>= (load fidx) funcs)
+              (break)
+              (do
+                (al-clear! [i64] (field u rpo-seen))
+                (al-clear! [i64] (field u rpo-post))
+                (let [(mut i) 0]
+                  (loop (if (>= (load i) blocks)
+                            (break)
+                            (do
+                              (al-push! [i64] (field u rpo-seen) 0)
+                              (store! i (+ (load i) 1))
+                              0))))
+                (let [funrec (mu-function (load fidx))
+                      entry (load (field funrec entry))
+                      entry-block (al-get (load (field u ctrl-block)) entry)
+                      first (al-len [i64] (load (field u block-order)))]
+                  (if (< entry-block 0)
+                      (store! ok false)
+                      (mu-rpo-visit! (load fidx) entry-block))
+                  (let [n (al-len [i64] (load (field u rpo-post)))
+                        (mut i) n]
+                    (loop (if (<= (load i) 0)
+                              (break)
+                              (do
+                                (store! i (- (load i) 1))
+                                (let [bid (al-get (load (field u rpo-post)) (load i))
+                                      layout (- n (+ (load i) 1))]
+                                  (al-push! [i64] (field u block-order) bid)
+                                  (store! (field (mu-block bid) layout-index) layout))
+                                0)))
+                    (store! (field funrec block-first) first)
+                    (store! (field funrec block-count) n)))
+                (store! fidx (+ (load fidx) 1))
+                0)))
+    ; Every built block must be reachable from its declared function entry.
+    (and (load ok) (= (al-len [i64] (load (field u block-order))) blocks))))
+
+(defn mu-idom-intersect [(left i64) (right i64)] (-> i64)
+  (let [(mut a) left
+        (mut b) right]
+    (loop (if (= (load a) (load b))
+              (break)
+              (do
+                (loop (if (<= (mu-block-layout-index (load a))
+                              (mu-block-layout-index (load b)))
+                          (break)
+                          (store! a (mu-block-idom (load a)))))
+                (loop (if (<= (mu-block-layout-index (load b))
+                              (mu-block-layout-index (load a)))
+                          (break)
+                          (store! b (mu-block-idom (load b)))))
+                0)))
+    (load a)))
+
+(defn mu-compute-idoms! [] (-> bool)
+  (let [u (machine-unit)
+        blocks (mu-block-count)
+        funcs (mu-function-count)
+        (mut i) 0
+        (mut fidx) 0
+        (mut ok) true]
+    (al-clear! [i64] (field u block-idom))
+    (loop (if (>= (load i) blocks)
+              (break)
+              (do
+                (al-push! [i64] (field u block-idom) -1)
+                (store! i (+ (load i) 1))
+                0)))
+    (loop (if (or (>= (load fidx) funcs) (not (load ok)))
+              (break)
+              (let [count (mu-function-block-count (load fidx))
+                    entry (mu-function-block (load fidx) 0)
+                    (mut changed) true
+                    (mut rounds) 0]
+                (al-set! [i64] (field u block-idom) entry entry)
+                (loop (if (or (not (load changed)) (> (load rounds) (+ count 1)))
+                          (break)
+                          (do
+                            (store! changed false)
+                            (store! i 1)
+                            (loop (if (>= (load i) count)
+                                      (break)
+                                      (do
+                                        (let [bid (mu-function-block (load fidx) (load i))
+                                              block (mu-block bid)
+                                              (mut p) 0
+                                              (mut next) -1]
+                                          (loop (if (>= (load p) (load (field block pred-count)))
+                                                    (break)
+                                                    (do
+                                                      (let [eid
+                                                              (al-get (load (field u pred-edges))
+                                                                      (+ (load (field block pred-first)) (load p)))
+                                                            pred (mu-edge-source eid)]
+                                                        (if (>= (mu-block-idom pred) 0)
+                                                            (if (< (load next) 0)
+                                                                (store! next pred)
+                                                                (store! next (mu-idom-intersect pred (load next))))
+                                                            0))
+                                                      (store! p (+ (load p) 1))
+                                                      0)))
+                                          (if (and (>= (load next) 0) (!= (mu-block-idom bid) (load next)))
+                                              (do
+                                                (al-set! [i64] (field u block-idom) bid (load next))
+                                                (store! changed true))
+                                              0))
+                                        (store! i (+ (load i) 1))
+                                        0)))
+                            (store! rounds (+ (load rounds) 1))
+                            0)))
+                (store! i 0)
+                (loop (if (>= (load i) count)
+                          (break)
+                          (do
+                            (if (< (mu-block-idom (mu-function-block (load fidx) (load i))) 0)
+                                (store! ok false)
+                                0)
+                            (store! i (+ (load i) 1))
+                            0)))
+                (store! fidx (+ (load fidx) 1))
+                0)))
+    (load ok)))
+
+(defn mu-dominates? [(ancestor i64) (descendant i64)] (-> bool)
+  (if (!= (mu-block-owner ancestor) (mu-block-owner descendant))
+      false
+      (let [(mut cursor) descendant]
+        (loop (if (or (= (load cursor) ancestor)
+                      (= (mu-block-idom (load cursor)) (load cursor)))
+                  (break)
+                  (store! cursor (mu-block-idom (load cursor)))))
+        (= (load cursor) ancestor))))
+
+(defn mu-compute-loop-depth! [] (-> i64)
+  (let [u (machine-unit)
+        blocks (mu-block-count)
+        edges (mu-edge-count)
+        (mut i) 0]
+    (loop (if (>= (load i) blocks)
+              (break)
+              (do
+                (store! (field (mu-block (load i)) loop-depth) 0)
+                (store! i (+ (load i) 1))
+                0)))
+    (store! i 0)
+    (loop (if (>= (load i) edges)
+              (break)
+              (do
+                (let [back (mu-edge (load i))
+                      header (load (field back target))
+                      source (load (field back source))
+                      slot (load (field back target-slot))]
+                  (if (and (= slot 2) (= (n-op (mu-block-control header)) OP-LOOP))
+                      (do
+                        (al-clear! [i64] (field u rpo-seen))
+                        (al-clear! [i64] (field u rpo-post))
+                        (let [(mut b) 0]
+                          (loop (if (>= (load b) blocks)
+                                    (break)
+                                    (do
+                                      (al-push! [i64] (field u rpo-seen) 0)
+                                      (store! b (+ (load b) 1))
+                                      0))))
+                        (al-set! [i64] (field u rpo-seen) header 1)
+                        (if (= source header)
+                            0
+                            (do
+                              (al-set! [i64] (field u rpo-seen) source 1)
+                              (al-push! [i64] (field u rpo-post) source)))
+                        (loop (let [n (al-len [i64] (load (field u rpo-post)))]
+                                (if (= n 0)
+                                    (break)
+                                    (let [current (al-get (load (field u rpo-post)) (- n 1))
+                                          (mut eid) 0]
+                                      (al-pop! [i64] (field u rpo-post))
+                                      (loop (if (>= (load eid) edges)
+                                                (break)
+                                                (do
+                                                  (let [pred-edge (mu-edge (load eid))]
+                                                    (if (and (= (load (field pred-edge target)) current)
+                                                             (= (load (field pred-edge owner))
+                                                                (load (field back owner))))
+                                                        (let [pred (load (field pred-edge source))]
+                                                          (if (= (al-get (load (field u rpo-seen)) pred) 0)
+                                                              (do
+                                                                (al-set! [i64] (field u rpo-seen) pred 1)
+                                                                (if (= pred header)
+                                                                    0
+                                                                    (al-push! [i64] (field u rpo-post) pred)))
+                                                              0))
+                                                        0))
+                                                  (store! eid (+ (load eid) 1))
+                                                  0)))))))
+                        (let [(mut b) 0]
+                          (loop (if (>= (load b) blocks)
+                                    (break)
+                                    (do
+                                      (if (!= (al-get (load (field u rpo-seen)) (load b)) 0)
+                                          (store! (field (mu-block (load b)) loop-depth)
+                                                  (+ (load (field (mu-block (load b)) loop-depth)) 1))
+                                          0)
+                                      (store! b (+ (load b) 1))
+                                      0))))
+                        0)
+                      0))
+                (store! i (+ (load i) 1))
+                0)))
+    0))
+
+(defn mu-fail-verify! [(code i64) (item i64)] (-> bool)
+  (let [u (machine-unit)]
+    (store! (field u verify-result) code)
+    (store! (field u verify-item) item)
+    false))
+
+(defn mu-adj-count [(edge i64) (pred bool)] (-> i64)
+  (let [u (machine-unit)
+        len
+          (if pred
+              (al-len [i64] (load (field u pred-edges)))
+              (al-len [i64] (load (field u succ-edges))))
+        (mut i) 0
+        (mut count) 0]
+    (loop (if (>= (load i) len)
+              (break)
+              (do
+                (if (= (if pred
+                           (al-get (load (field u pred-edges)) (load i))
+                           (al-get (load (field u succ-edges)) (load i)))
+                       edge)
+                    (store! count (+ (load count) 1))
+                    0)
+                (store! i (+ (load i) 1))
+                0)))
+    (load count)))
+
+(defn mu-block-adj-valid? [(bid i64) (pred bool)] (-> bool)
+  (let [u (machine-unit)
+        b (mu-block bid)
+        first (if pred (load (field b pred-first)) (load (field b succ-first)))
+        count (if pred (load (field b pred-count)) (load (field b succ-count)))
+        list-len
+          (if pred
+              (al-len [i64] (load (field u pred-edges)))
+              (al-len [i64] (load (field u succ-edges))))
+        (mut i) 0
+        (mut ok) true]
+    (if (or (< first 0) (or (< count 0) (> (+ first count) list-len)))
+        false
+        (do
+          (loop (if (or (>= (load i) count) (not (load ok)))
+                    (break)
+                    (do
+                      (let [eid
+                              (if pred
+                                  (al-get (load (field u pred-edges)) (+ first (load i)))
+                                  (al-get (load (field u succ-edges)) (+ first (load i))))]
+                        (if (or (< eid 0) (>= eid (mu-edge-count)))
+                            (store! ok false)
+                            (if (!= (if pred (mu-edge-target eid) (mu-edge-source eid)) bid)
+                                (store! ok false)
+                                0)))
+                      (store! i (+ (load i) 1))
+                      0)))
+          (load ok)))))
+
+(defn mu-slot-valid? [(eid i64)] (-> bool)
+  (let [u (machine-unit)
+        e (mu-edge eid)
+        s (load (field e source))
+        t (load (field e target))
+        slot (load (field e target-slot))
+        target (mu-block-control t)]
+    (if (or (= (n-op target) OP-REGION) (= (n-op target) OP-LOOP))
+        (if (or (<= slot 0) (or (>= slot (n-nins target)) (= (n-in target slot) NO-NODE)))
+            false
+            (let [incoming (n-in target slot)
+                  mapped (al-get (load (field u ctrl-block)) incoming)
+                  edges (mu-edge-count)
+                  (mut i) 0
+                  (mut same) 0]
+              (loop (if (>= (load i) edges)
+                        (break)
+                        (do
+                          (let [other (mu-edge (load i))]
+                            (if (and (= (load (field other target)) t)
+                                     (= (load (field other target-slot)) slot))
+                                (store! same (+ (load same) 1))
+                                0))
+                          (store! i (+ (load i) 1))
+                          0)))
+              (and (= mapped s) (= (load same) 1))))
+        (= slot 0))))
+
+(defn mu-block-terminator-op [(bid i64)] (-> i64)
+  (let [lim (n-count)
+        (mut i) 0
+        (mut op) -1]
+    (loop (if (>= (load i) lim)
+              (break)
+              (do
+                (if (= (al-get (load (field (machine-unit) ctrl-block)) (load i)) bid)
+                    (let [candidate (n-op (load i))]
+                      (if (or (= candidate OP-IF) (= candidate OP-RETURN))
+                          (store! op candidate)
+                          0))
+                    0)
+                (store! i (+ (load i) 1))
+                0)))
+    (load op)))
+
+(defn mu-block-terminator [(bid i64)] (-> i64)
+  (let [lim (n-count)
+        (mut i) 0
+        (mut found) NO-NODE]
+    (loop (if (>= (load i) lim)
+              (break)
+              (do
+                (if (= (al-get (load (field (machine-unit) ctrl-block)) (load i)) bid)
+                    (let [candidate (n-op (load i))]
+                      (if (or (= candidate OP-IF) (= candidate OP-RETURN))
+                          (store! found (load i))
+                          0))
+                    0)
+                (store! i (+ (load i) 1))
+                0)))
+    (load found)))
+
+(defn mu-verify-terminators! [] (-> bool)
+  (let [blocks (mu-block-count)
+        (mut i) 0]
+    (loop (if (>= (load i) blocks)
+              (break)
+              (do
+                (let [op (mu-block-terminator-op (load i))
+                      succ (load (field (mu-block (load i)) succ-count))]
+                  (if (or (and (= op OP-IF) (!= succ 2))
+                          (and (= op OP-RETURN) (!= succ 0)))
+                      (do (mu-fail-verify! MCFG-TERMINATOR-ARITY (load i)) (break))
+                      0))
+                (store! i (+ (load i) 1))
+                0)))
+    (= (mu-verify-result) MCFG-OK)))
+
+(defn mu-verify-rpo! [] (-> bool)
+  (let [u (machine-unit)
+        funcs (mu-function-count)
+        blocks (mu-block-count)
+        (mut fidx) 0]
+    (al-clear! [i64] (field u rpo-seen))
+    (let [(mut i) 0]
+      (loop (if (>= (load i) blocks)
+                (break)
+                (do
+                  (al-push! [i64] (field u rpo-seen) 0)
+                  (store! i (+ (load i) 1))
+                  0))))
+    (loop (if (>= (load fidx) funcs)
+              (break)
+              (do
+                (let [f (mu-function (load fidx))
+                      n (load (field f block-count))
+                      (mut pos) 0]
+                  (let [entry-block (al-get (load (field u ctrl-block)) (load (field f entry)))]
+                    (if (or (= n 0) (!= (mu-function-block (load fidx) 0) entry-block))
+                        (do (mu-fail-verify! MCFG-RPO (load fidx)) 0)
+                        0))
+                  (loop (if (or (>= (load pos) n) (!= (mu-verify-result) MCFG-OK))
+                            (break)
+                            (do
+                              (let [bid (mu-function-block (load fidx) (load pos))]
+                                (if (or (< bid 0)
+                                        (or (>= bid blocks)
+                                            (or (!= (mu-block-owner bid) (load fidx))
+                                                (or (!= (mu-block-layout-index bid) (load pos))
+                                                    (!= (al-get (load (field u rpo-seen)) bid) 0)))))
+                                    (do (mu-fail-verify! MCFG-RPO bid) (break))
+                                    (al-set! [i64] (field u rpo-seen) bid 1)))
+                              (store! pos (+ (load pos) 1))
+                              0))))
+                (if (!= (mu-verify-result) MCFG-OK) (break) 0)
+                (store! fidx (+ (load fidx) 1))
+                0)))
+    (if (= (mu-verify-result) MCFG-OK)
+        (let [(mut i) 0]
+          (loop (if (>= (load i) blocks)
+                    (break)
+                    (do
+                      (if (= (al-get (load (field u rpo-seen)) (load i)) 0)
+                          (do (mu-fail-verify! MCFG-RPO (load i)) (break))
+                          0)
+                      (store! i (+ (load i) 1))
+                      0))))
+        0)
+    (= (mu-verify-result) MCFG-OK)))
+
+(defn mu-verify-idoms! [] (-> bool)
+  (let [blocks (mu-block-count)
+        funcs (mu-function-count)
+        (mut fidx) 0]
+    (loop (if (or (>= (load fidx) funcs) (!= (mu-verify-result) MCFG-OK))
+              (break)
+              (do
+                (let [count (mu-function-block-count (load fidx))
+                      entry (mu-function-block (load fidx) 0)
+                      (mut i) 0]
+                  (if (!= (mu-block-idom entry) entry)
+                      (do (mu-fail-verify! MCFG-IDOM entry) 0)
+                      0)
+                  (store! i 1)
+                  (loop (if (or (>= (load i) count) (!= (mu-verify-result) MCFG-OK))
+                            (break)
+                            (do
+                              (let [bid (mu-function-block (load fidx) (load i))
+                                    parent (mu-block-idom bid)]
+                                (if (or (< parent 0)
+                                        (or (>= parent blocks)
+                                            (or (!= (mu-block-owner parent) (load fidx))
+                                                (>= (mu-block-layout-index parent)
+                                                    (mu-block-layout-index bid)))))
+                                    (do (mu-fail-verify! MCFG-IDOM bid) 0)
+                                    0))
+                              (store! i (+ (load i) 1))
+                              0))))
+                (store! fidx (+ (load fidx) 1))
+                0)))
+    (= (mu-verify-result) MCFG-OK)))
+
+(defn mu-verify! [] (-> bool)
+  (let [u (machine-unit)
+        blocks (mu-block-count)
+        edges (mu-edge-count)
+        funcs (mu-function-count)
+        (mut i) 0]
+    (store! (field u verify-result) MCFG-OK)
+    (store! (field u verify-item) -1)
+    (loop (if (>= (load i) blocks)
+              (break)
+              (do
+                (let [b (mu-block (load i))
+                      owner (load (field b owner))]
+                  (if (or (!= (load (field b id)) (load i))
+                          (or (< owner 0) (>= owner funcs)))
+                      (do (mu-fail-verify! MCFG-OWNER (load i)) (break))
+                      (if (or (not (mu-block-adj-valid? (load i) true))
+                              (not (mu-block-adj-valid? (load i) false)))
+                          (do (mu-fail-verify! MCFG-RECIPROCITY (load i)) (break))
+                          0)))
+                (store! i (+ (load i) 1))
+                0)))
+    (if (!= (mu-verify-result) MCFG-OK)
+        false
+        (do
+          (store! i 0)
+          (loop (if (>= (load i) edges)
+                    (break)
+                    (do
+                      (let [e (mu-edge (load i))
+                            s (load (field e source))
+                            t (load (field e target))
+                            owner (load (field e owner))
+                            slot (load (field e target-slot))]
+                        (if (or (< s 0) (or (>= s blocks) (or (< t 0) (>= t blocks))))
+                            (do (mu-fail-verify! MCFG-OWNER (load i)) (break))
+                            (if (or (!= owner (mu-block-owner s)) (!= owner (mu-block-owner t)))
+                                (do (mu-fail-verify! MCFG-FUNCTION-ISOLATION (load i)) (break))
+                                (if (or (!= (mu-adj-count (load i) false) 1)
+                                        (!= (mu-adj-count (load i) true) 1))
+                                    (do (mu-fail-verify! MCFG-RECIPROCITY (load i)) (break))
+                                    (if (not (mu-slot-valid? (load i)))
+                                        (do (mu-fail-verify! MCFG-PREDECESSOR-SLOT (load i)) (break))
+                                        0)))))
+                      (store! i (+ (load i) 1))
+                      0)))
+          (if (!= (mu-verify-result) MCFG-OK)
+              false
+              (if (not (mu-verify-terminators!))
+                  false
+                  (if (not (mu-verify-rpo!))
+                      false
+                      (mu-verify-idoms!))))))))
+
+; Test-only corruption hooks are explicit and narrow; production callers only build and verify.
+(defn mu-corrupt-block-owner! [(bid i64) (new-owner i64)] (-> i64)
+  (store! (field (mu-block bid) owner) new-owner)
+  0)
+(defn mu-corrupt-edge-target-slot! [(eid i64) (slot i64)] (-> i64)
+  (store! (field (mu-edge eid) target-slot) slot)
+  0)
+(defn mu-corrupt-drop-last-pred! [] (-> i64)
+  (let [u (machine-unit)
+        n (al-len [i64] (load (field u pred-edges)))]
+    (if (> n 0) (store! (field (field u pred-edges) len) (- n 1)) 0)
+    0))
+(defn mu-corrupt-layout! [(bid i64) (layout i64)] (-> i64)
+  (store! (field (mu-block bid) layout-index) layout)
+  0)
+(defn mu-corrupt-idom! [(bid i64) (parent i64)] (-> i64)
+  (al-set! [i64] (field (machine-unit) block-idom) bid parent)
+  0)
+(defn mu-corrupt-add-return-successor! [(bid i64)] (-> i64)
+  (let [owner (mu-block-owner bid)]
+    (al-push! [MEdge]
+              (field (machine-unit) edges)
+              (me-new (mu-edge-count) owner bid bid 0))
+    (mu-finalize-adjacency!)
+    0))
+(defn mu-corrupt-edge-target! [(eid i64) (target i64)] (-> i64)
+  (store! (field (mu-edge eid) target) target)
+  (mu-finalize-adjacency!)
+  0)
+
+(defn mu-dump [(w (ptr Writer))] (-> i64)
+  (let [funcs (mu-function-count)
+        edges (mu-edge-count)
+        (mut fidx) 0]
+    (loop (if (>= (load fidx) funcs)
+              (break)
+              (do
+                (let [f (mu-function (load fidx))
+                      ideal (load (field f ideal))
+                      nblocks (load (field f block-count))]
+                  (fmt w "function {d} ideal {d} blocks {d}\n" (load fidx) ideal nblocks)
+                  (let [(mut rpo) 0]
+                    (loop (if (>= (load rpo) nblocks)
+                              (break)
+                              (do
+                                (let [bid (mu-function-block (load fidx) (load rpo))
+                                      ctrl (mu-block-control bid)]
+                                  (fmt w "  b{d} {s}" (load rpo) (op-name (n-op ctrl)))
+                                  ; Dump successors in target-layout order, independent of discovery order.
+                                  (let [(mut target-layout) 0]
+                                    (loop (if (>= (load target-layout) nblocks)
+                                              (break)
+                                              (do
+                                                (let [(mut eid) 0]
+                                                  (loop (if (>= (load eid) edges)
+                                                            (break)
+                                                            (do
+                                                              (let [e (mu-edge (load eid))
+                                                                    target (mu-edge-target (load eid))]
+                                                                (if (and (= (mu-edge-source (load eid)) bid)
+                                                                         (and (= (mu-block-owner target) (load fidx))
+                                                                              (= (mu-block-layout-index target)
+                                                                                 (load target-layout))))
+                                                                    (do
+                                                                      (fmt w
+                                                                           " ->b{d}[{d}]"
+                                                                           (load target-layout)
+                                                                           (mu-edge-target-slot (load eid)))
+                                                                      0)
+                                                                    0))
+                                                              (store! eid (+ (load eid) 1))
+                                                              0))))
+                                                (store! target-layout (+ (load target-layout) 1))
+                                                0))))
+                                  (ps w "\n"))
+                                (store! rpo (+ (load rpo) 1))
+                                0)))))
+                (store! fidx (+ (load fidx) 1))
+                0)))
+    0))
+
+(defn mu-render [(buf (ptr i8)) (cap i64)] (-> (slice u8))
+  (let [fb (stack FixBuf)
+        w (stack Writer)]
+    (store! (field fb data) buf)
+    (store! (field fb cap) cap)
+    (store! (field fb len) 0)
+    (fixed-buffer-writer w fb)
+    (mu-dump w)
+    (let [n (load (field fb len))]
+      (if (>= n cap) (do (panic-corrupt "mu-render: buffer too small") 0) 0)
+      (slice-new [u8] (cast (ptr u8) buf) n))))
+
+(defn mu-finish-build! [] (-> bool)
+  (mu-finalize-adjacency!)
+  (store! (field (machine-unit) phase) 1)
+  (if (mu-compute-rpo!)
+      (if (mu-compute-idoms!)
+          (do (mu-compute-loop-depth!) (mu-verify!))
+          (mu-fail-verify! MCFG-RPO -1))
+      (mu-fail-verify! MCFG-RPO -1)))
+
+(defn mu-build-entry! [(entry-fun i64)] (-> bool)
+  (mu-reset!)
+  (if (or (!= (g-verify) 0) (= (n-op entry-fun) OP-FUNSTART))
+      false
+      (if (!= (n-op entry-fun) OP-FUN)
+          false
+          (do
+            (mu-build-reachable-function! entry-fun)
+            (mu-finish-build!)))))
+
+(defn mu-build-program! [] (-> bool)
+  (mu-reset!)
+  (if (!= (g-verify) 0)
+      false
+      (let [owner (mu-build-function! NO-NODE (g-start))
+            lim (n-count)
+            (mut i) 0]
+        (loop (if (>= (load i) lim)
+                  (break)
+                  (do
+                    (if (and (not (n-dead? (load i))) (= (n-op (load i)) OP-CALL))
+                        (let [ctrl (n-in (load i) 0)
+                              bid
+                                (if (= ctrl NO-NODE)
+                                    -1
+                                    (al-get (load (field (machine-unit) ctrl-block)) ctrl))]
+                          (if (and (>= bid 0) (= (mu-block-owner bid) owner))
+                              (mu-build-call-targets! (load i))
+                              0))
+                        0)
+                    (store! i (+ (load i) 1))
+                    0)))
+        (mu-finish-build!))))
+
+(defn mu-build! [] (-> bool)
+  (mu-reset!)
+  (if (!= (g-verify) 0)
+      false
+      (let [lim (n-count)
+            (mut i) 0
+            (mut found) false]
+        (loop (if (>= (load i) lim)
+                  (break)
+                  (do
+                    (if (and (not (n-dead? (load i))) (= (n-op (load i)) OP-FUN))
+                        (do
+                          (mu-build-function! (load i) (n-fun-entry (load i)))
+                          (store! found true))
+                        0)
+                    (store! i (+ (load i) 1))
+                    0)))
+        ; A graph without explicit Fun nodes is one synthetic top-level machine function.
+        (if (not (load found)) (mu-build-function! NO-NODE (g-start)) 0)
+        (mu-finish-build!))))

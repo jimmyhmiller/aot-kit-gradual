@@ -1,0 +1,916 @@
+;; M10 arm64 backend: machine IR, scheduling, register allocation, and encoding.
+(module backend_core)
+
+(import "node" :use *)
+(import "ty" :use *)
+(import "verify" :use *)
+(import "shape" :use *)
+(import "jsvalue" :use *)
+(import "jsstring" :use *)
+(import "coil.alloc" :use *)
+(import "coil.arraylist" :use *)
+(import "coil.control" :use *)
+(import "coil.io" :use *)
+(import "coil.fmt" :use *)
+(import "coil.slice" :use *)
+
+(const MI-MOVI i64 0)
+(const MI-ADD i64 1)
+(const MI-SUB i64 2)
+(const MI-MUL i64 3)
+(const MI-SDIV i64 4)
+(const MI-NEG i64 5)
+(const MI-RET i64 6)
+(const MI-ARG i64 7)
+(const MI-EQ i64 8)
+(const MI-LT i64 9)
+(const MI-LE i64 10)
+(const MI-LABEL i64 11)
+(const MI-CBZ i64 12)
+(const MI-CSEL i64 13)
+(const MI-MOV i64 14)
+(const MI-B i64 15)
+(const MI-NEW i64 16)
+(const MI-LOAD i64 17)
+(const MI-STORE i64 18)
+(const MI-CBR i64 19)  ; block conditional: a=predicate, b=true block, imm=false block
+(const MI-JMP i64 20)  ; block jump: imm=target block
+(const MI-COPY i64 21)  ; resolved edge copy: dst <- a
+(const MI-CALL i64 22)  ; direct call: dst=result, a=arg0, imm=machine function
+(const MI-STACKARG i64 23)  ; callee incoming stack argument, imm=contiguous stack slot
+(const MI-ABI-COPY i64 24)  ; early allocatable copy from a fixed ABI ingress vreg
+(const MI-JSBOX i64 25)
+(const MI-JSUNBOX i64 26)
+(const MI-JSTEST i64 27)
+(const MI-FMOVI i64 28)  ; exact IEEE bits -> FP vreg
+(const MI-SCVTF i64 29)  ; signed i64 -> f64
+(const MI-FADD i64 30)
+(const MI-FSUB i64 31)
+(const MI-FMUL i64 32)
+(const MI-FDIV i64 33)
+(const MI-FNEG i64 34)
+(const MI-FEQ i64 35)  ; FP inputs, boolean GPR output
+(const MI-FLT i64 36)
+(const MI-FLE i64 37)
+(const MI-FTRUTH i64 38)  ; FP Number truthiness -> boolean GPR
+(const MI-MOD i64 39)
+(const MI-BITAND i64 40)
+(const MI-BITOR i64 41)
+(const MI-BITXOR i64 42)
+(const MI-SHL i64 43)
+(const MI-SHR i64 44)
+(const MI-USHR i64 45)
+(const MI-BITNOT i64 46)
+(const MI-I32FROMFP i64 47)  ; JavaScript ToInt32/ToUint32 residue: f64 -> low 32 bits
+(const MI-FMOD i64 48)  ; JavaScript Number remainder, including signed zero
+(const MI-JSPROP i64 49)  ; external named-property runtime: a=owner, b=value/prototype, imm=operation
+(const MI-JSARRAY i64 50)  ; external dense-array runtime: a=owner, b=index, arg0=boxed value, imm=operation
+(const MI-JSSTRING i64 51)  ; external immutable UTF-16 runtime: a,b,arg0 plus operation
+(const JSSOP-NEW i64 0)
+(const JSSOP-SET-UNIT i64 1)
+(const JSSOP-LENGTH i64 2)
+(const JSSOP-EQUAL i64 3)
+(const JSSOP-CONCAT i64 4)
+(const JSSOP-CHAR-CODE i64 5)
+(const JSSOP-SUBSTRING i64 6)
+(const JSSOP-FROM-INT i64 10)
+(const JSSOP-FROM-BOOL i64 11)
+(const JSSOP-FROM-NULL i64 12)
+(const JSSOP-FROM-UNDEFINED i64 13)
+(const JSSOP-PARSE-INT i64 14)
+(const JSSOP-IS-NAN i64 15)
+(const JSSOP-SPLIT i64 16)
+(const JSSOP-IS-NAN-VALUE i64 17)
+(const JSSOP-FROM-CODE-UNIT i64 18)
+(const JSSOP-FROM-INT-RADIX i64 19)
+(const JSSOP-FROM-DOUBLE-BITS i64 20)
+(const JSSOP-LOWER i64 21)
+(const JSSOP-UPPER i64 22)
+(const JSSOP-INDEX-OF i64 23)
+(const JSSOP-COMPARE i64 24)
+(const JSSOP-FROM-VALUE i64 25)
+(const JSSOP-VALUE-EQUAL i64 26)
+(const JSSOP-VALUE-TRUTHY i64 27)
+(const JSSOP-BUILTIN-BASE i64 100)
+
+; Stable public result codes. Success is the only state in which generated code or object bytes
+; are consumable. Later milestones may replace an unsupported result with success, but must never
+; renumber or reuse an existing code.
+(const BER-OK i64 0)
+(const BER-MALFORMED-GRAPH i64 1)
+(const BER-UNSUPPORTED-OPCODE i64 2)
+(const BER-UNSUPPORTED-CFG i64 3)
+(const BER-UNSUPPORTED-PHI i64 4)
+(const BER-UNSUPPORTED-CALL i64 5)
+(const BER-UNSUPPORTED-CALL-LIVE i64 6)
+(const BER-ALLOCATION i64 7)
+(const BER-ENCODING i64 8)
+(const BER-OBJECT i64 9)
+
+; Machine-CFG verifier results are stable for the same reason as backend phase results: focused
+; corruption fixtures must name the broken law instead of collapsing to a generic false.
+(const MCFG-OK i64 0)
+(const MCFG-OWNER i64 1)
+(const MCFG-RECIPROCITY i64 2)
+(const MCFG-PREDECESSOR-SLOT i64 3)
+(const MCFG-TERMINATOR-ARITY i64 4)
+(const MCFG-RPO i64 5)
+(const MCFG-FUNCTION-ISOLATION i64 6)
+(const MCFG-IDOM i64 7)
+
+(const MSEL-OK i64 0)
+(const MSEL-OWNER i64 1)
+(const MSEL-DUPLICATE i64 2)
+(const MSEL-DEPENDENCY i64 3)
+(const MSEL-TERMINATOR i64 4)
+(const MSEL-UNSUPPORTED i64 5)
+(const MSEL-PHI i64 6)
+(const MSEL-CALL i64 7)
+(const MSEL-CALL-LIVE i64 8)
+(const MSEL-PLACEMENT i64 9)
+(const MSEL-MEMORY-ORDER i64 10)
+
+(const MABI-OK i64 0)
+(const MABI-FRAME i64 1)
+(const MABI-SPILL i64 2)
+(const MABI-ARGUMENT i64 3)
+
+(const MSCHED-OK i64 0)
+(const MSCHED-CYCLE i64 1)
+(const MSCHED-DEPENDENCY i64 2)
+(const MSCHED-MEMORY i64 3)
+(const MSCHED-EXACTLY-ONCE i64 4)
+(const MSCHED-BOUNDARY i64 5)
+
+(const MLIVE-OK i64 0)
+(const MLIVE-RANGE i64 1)
+(const MLIVE-FIXPOINT i64 2)
+(const MLIVE-PHI i64 3)
+(const MLIVE-KIND i64 4)
+(const MLIVE-SAFEPOINT i64 5)
+(const MLIVE-CLASS i64 6)
+
+(const MLK-SCALAR i64 0)
+(const MLK-RAW-MANAGED i64 1)
+(const MLK-BOXED i64 2)
+(const MLK-NONMOVING i64 3)
+(const JSV-RAW-NULLABLE-OBJECT i64 -2)
+
+
+;; Register classes are independent of GC kinds: an f64 is a scalar for stack-map purposes but
+;; cannot share a physical register or an interference color with an integer scalar.
+(const MRC-GPR i64 0)
+(const MRC-FPR i64 1)
+
+(const MRA-OK i64 0)
+(const MRA-INTERFERENCE i64 1)
+(const MRA-FIXED i64 2)
+(const MRA-LOCATION i64 3)
+(const MRA-SPILL-KIND i64 4)
+(const MRA-COALESCE i64 5)
+
+(const MOBJ-OK i64 0)
+(const MOBJ-HEADER i64 1)
+(const MOBJ-FUNCTION-RANGE i64 2)
+(const MOBJ-SYMBOL i64 3)
+(const MOBJ-RELOCATION i64 4)
+(const MOBJ-STACKMAP i64 5)
+(const MOBJ-LAYOUT i64 6)
+(const MOBJ-ATOMIC i64 7)
+
+(defstruct MInst
+  [(op i64)
+   (dst i64)
+   (a i64)
+   (b i64)
+   (imm i64)
+   (node i64)
+   (owner i64)
+   (block-id i64)
+   (mem-first i64)
+   (mem-count i64)
+   (anti-first i64)
+   (anti-count i64)
+   (arg-first i64)
+   (arg-count i64)
+   (reg i64)
+   (spill i64)
+   (first i64)
+   (last i64)
+   (earliest i64)
+   (latest i64)
+   (schedule-order i64)])
+
+(defstruct MOpcodeDesc
+  [(inputs i64)
+   (outputs i64)
+   (temporaries i64)
+   (clobbers i64)
+   (effects i64)
+   (pinned bool)
+   (memory bool)
+   (terminator bool)
+   (encodable bool)])
+
+; These records intentionally use indexes into unit-owned tables. Stable indexes survive later
+; edge splitting and avoid pointers becoming stale when an ArrayList grows.
+(defstruct MFunction
+  [(id i64)
+   (ideal i64)
+   (entry i64)
+   (block-first i64)
+   (block-count i64)
+   (return-first i64)
+   (return-count i64)
+   (frame-size i64)
+   (callee-mask i64)
+   (callee-count i64)
+   (code-start i64)
+   (code-size i64)])
+
+(defstruct MBlock
+  [(id i64)
+   (owner i64)
+   (ideal-ctrl i64)
+   (pred-first i64)
+   (pred-count i64)
+   (succ-first i64)
+   (succ-count i64)
+   (inst-first i64)
+   (inst-count i64)
+   (loop-depth i64)
+   (layout-index i64)])
+
+(defstruct MEdge
+  [(id i64)
+   (owner i64)
+   (source i64)
+   (target i64)
+   (target-slot i64)
+   (copy-first i64)
+   (copy-count i64)
+   (move-first i64)
+   (move-count i64)])
+
+(const MCOPY-VALUE i64 0)
+(const MCOPY-MEMORY i64 1)
+
+; Phi transport belongs to an incoming edge, not to either endpoint block.  Keeping the ideal
+; Phi and its selected source in the record makes target-slot mistakes independently verifiable.
+(defstruct MCopy
+  [(edge i64) (phi i64) (dst i64) (src i64) (kind i64)])
+
+(defstruct MMove
+  [(edge i64) (dst i64) (src i64) (temporary bool)])
+
+(defstruct MachineUnit
+  [(functions (ArrayList MFunction))
+   (blocks (ArrayList MBlock))
+   (edges (ArrayList MEdge))
+   (returns (ArrayList i64))
+   (pred-edges (ArrayList i64))
+   (succ-edges (ArrayList i64))
+   (edge-copies (ArrayList MCopy))
+   (edge-moves (ArrayList MMove))
+   (copy-work-dst (ArrayList i64))
+   (copy-work-src (ArrayList i64))
+   (copy-work-live (ArrayList i64))
+   (symbols (ArrayList i64))
+   (runtime-deps (ArrayList i64))
+   (ctrl-block (ArrayList i64))
+   (block-order (ArrayList i64))
+   (block-idom (ArrayList i64))
+   (rpo-seen (ArrayList i64))
+   (rpo-post (ArrayList i64))
+   (selected-values (ArrayList i64))
+   (selected-nodes (ArrayList i64))
+   (packed-insts (ArrayList MInst))
+   (selection-memory-deps (ArrayList i64))
+   (memory-anti-deps (ArrayList i64))
+   (call-args (ArrayList i64))
+   (schedule-work (ArrayList MInst))
+   (schedule-done (ArrayList i64))
+   (vreg-new-def (ArrayList i64))
+   ;; vreg -> target block for Phi definitions, or -1 for ordinary instruction definitions.
+   ;; GCM queries this for nearly every operand; deriving it by rescanning all edge-copy tables
+   ;; makes large Phi-heavy programs quadratic.
+   (vreg-phi-block (ArrayList i64))
+   (live-use (ArrayList i64))
+   (live-def (ArrayList i64))
+   (live-in (ArrayList i64))
+   (live-out (ArrayList i64))
+   (edge-live (ArrayList i64))
+   (value-kind (ArrayList i64))
+   (register-class (ArrayList i64))
+   (alloc-interference (ArrayList i64))
+   (alloc-expected (ArrayList i64))
+   (alloc-live (ArrayList i64))
+   (alloc-reg (ArrayList i64))
+   (alloc-spill (ArrayList i64))
+   (alloc-owner (ArrayList i64))
+   (alloc-forbidden (ArrayList i64))
+   (alloc-spill-kind (ArrayList i64))
+   (phase i64)
+   (next-vreg i64)
+   (verify-result i64)
+   (verify-item i64)
+   (selection-result i64)
+   (selection-item i64)
+   (schedule-result i64)
+   (schedule-item i64)
+   (schedule-seed i64)
+   (liveness-result i64)
+   (liveness-item i64)
+   (liveness-seed i64)
+   (liveness-rounds i64)
+   (allocation-result i64)
+   (allocation-item i64)
+   (allocation-seed i64)
+   (inited bool)])
+
+(defn machine-unit [] (-> (ptr MachineUnit))
+  (let [u (static MachineUnit)]
+    (if (load (field u inited))
+        0
+        (do
+          (store! (field u functions) (al-new [MFunction] (malloc-allocator)))
+          (store! (field u blocks) (al-new [MBlock] (malloc-allocator)))
+          (store! (field u edges) (al-new [MEdge] (malloc-allocator)))
+          (store! (field u returns) (al-new [i64] (malloc-allocator)))
+          (store! (field u pred-edges) (al-new [i64] (malloc-allocator)))
+          (store! (field u succ-edges) (al-new [i64] (malloc-allocator)))
+          (store! (field u edge-copies) (al-new [MCopy] (malloc-allocator)))
+          (store! (field u edge-moves) (al-new [MMove] (malloc-allocator)))
+          (store! (field u copy-work-dst) (al-new [i64] (malloc-allocator)))
+          (store! (field u copy-work-src) (al-new [i64] (malloc-allocator)))
+          (store! (field u copy-work-live) (al-new [i64] (malloc-allocator)))
+          (store! (field u symbols) (al-new [i64] (malloc-allocator)))
+          (store! (field u runtime-deps) (al-new [i64] (malloc-allocator)))
+          (store! (field u ctrl-block) (al-new [i64] (malloc-allocator)))
+          (store! (field u block-order) (al-new [i64] (malloc-allocator)))
+          (store! (field u block-idom) (al-new [i64] (malloc-allocator)))
+          (store! (field u rpo-seen) (al-new [i64] (malloc-allocator)))
+          (store! (field u rpo-post) (al-new [i64] (malloc-allocator)))
+          (store! (field u selected-values) (al-new [i64] (malloc-allocator)))
+          (store! (field u selected-nodes) (al-new [i64] (malloc-allocator)))
+          (store! (field u packed-insts) (al-new [MInst] (malloc-allocator)))
+          (store! (field u selection-memory-deps) (al-new [i64] (malloc-allocator)))
+          (store! (field u memory-anti-deps) (al-new [i64] (malloc-allocator)))
+          (store! (field u call-args) (al-new [i64] (malloc-allocator)))
+          (store! (field u schedule-work) (al-new [MInst] (malloc-allocator)))
+          (store! (field u schedule-done) (al-new [i64] (malloc-allocator)))
+          (store! (field u vreg-new-def) (al-new [i64] (malloc-allocator)))
+          (store! (field u vreg-phi-block) (al-new [i64] (malloc-allocator)))
+          (store! (field u live-use) (al-new [i64] (malloc-allocator)))
+          (store! (field u live-def) (al-new [i64] (malloc-allocator)))
+          (store! (field u live-in) (al-new [i64] (malloc-allocator)))
+          (store! (field u live-out) (al-new [i64] (malloc-allocator)))
+          (store! (field u edge-live) (al-new [i64] (malloc-allocator)))
+          (store! (field u value-kind) (al-new [i64] (malloc-allocator)))
+          (store! (field u register-class) (al-new [i64] (malloc-allocator)))
+          (store! (field u alloc-interference) (al-new [i64] (malloc-allocator)))
+          (store! (field u alloc-expected) (al-new [i64] (malloc-allocator)))
+          (store! (field u alloc-live) (al-new [i64] (malloc-allocator)))
+          (store! (field u alloc-reg) (al-new [i64] (malloc-allocator)))
+          (store! (field u alloc-spill) (al-new [i64] (malloc-allocator)))
+          (store! (field u alloc-owner) (al-new [i64] (malloc-allocator)))
+          (store! (field u alloc-forbidden) (al-new [i64] (malloc-allocator)))
+          (store! (field u alloc-spill-kind) (al-new [i64] (malloc-allocator)))
+          (store! (field u inited) true)
+          0))
+    u))
+
+(defn mu-reset! [] (-> i64)
+  (let [u (machine-unit)]
+    (al-clear! [MFunction] (field u functions))
+    (al-clear! [MBlock] (field u blocks))
+    (al-clear! [MEdge] (field u edges))
+    (al-clear! [i64] (field u returns))
+    (al-clear! [i64] (field u pred-edges))
+    (al-clear! [i64] (field u succ-edges))
+    (al-clear! [MCopy] (field u edge-copies))
+    (al-clear! [MMove] (field u edge-moves))
+    (al-clear! [i64] (field u copy-work-dst))
+    (al-clear! [i64] (field u copy-work-src))
+    (al-clear! [i64] (field u copy-work-live))
+    (al-clear! [i64] (field u symbols))
+    (al-clear! [i64] (field u runtime-deps))
+    (al-clear! [i64] (field u ctrl-block))
+    (al-clear! [i64] (field u block-order))
+    (al-clear! [i64] (field u block-idom))
+    (al-clear! [i64] (field u rpo-seen))
+    (al-clear! [i64] (field u rpo-post))
+    (al-clear! [i64] (field u selected-values))
+    (al-clear! [i64] (field u selected-nodes))
+    (al-clear! [MInst] (field u packed-insts))
+    (al-clear! [i64] (field u selection-memory-deps))
+    (al-clear! [i64] (field u memory-anti-deps))
+    (al-clear! [i64] (field u call-args))
+    (al-clear! [MInst] (field u schedule-work))
+    (al-clear! [i64] (field u schedule-done))
+    (al-clear! [i64] (field u vreg-new-def))
+    (al-clear! [i64] (field u vreg-phi-block))
+    (al-clear! [i64] (field u live-use))
+    (al-clear! [i64] (field u live-def))
+    (al-clear! [i64] (field u live-in))
+    (al-clear! [i64] (field u live-out))
+    (al-clear! [i64] (field u edge-live))
+    (al-clear! [i64] (field u value-kind))
+    (al-clear! [i64] (field u register-class))
+    (al-clear! [i64] (field u alloc-interference))
+    (al-clear! [i64] (field u alloc-expected))
+    (al-clear! [i64] (field u alloc-live))
+    (al-clear! [i64] (field u alloc-reg))
+    (al-clear! [i64] (field u alloc-spill))
+    (al-clear! [i64] (field u alloc-owner))
+    (al-clear! [i64] (field u alloc-forbidden))
+    (al-clear! [i64] (field u alloc-spill-kind))
+    (let [(mut i) 0]
+      (loop (if (>= (load i) (n-count))
+                (break)
+                (do
+                  (al-push! [i64] (field u ctrl-block) -1)
+                  (store! i (+ (load i) 1))
+                  0))))
+    (store! (field u phase) 0)
+    (store! (field u next-vreg) 0)
+    (store! (field u verify-result) MCFG-OK)
+    (store! (field u verify-item) -1)
+    (store! (field u selection-result) MSEL-OK)
+    (store! (field u selection-item) -1)
+    (store! (field u schedule-result) MSCHED-OK)
+    (store! (field u schedule-item) -1)
+    (store! (field u schedule-seed) 0)
+    (store! (field u liveness-result) MLIVE-OK)
+    (store! (field u liveness-item) -1)
+    (store! (field u liveness-seed) 0)
+    (store! (field u liveness-rounds) 0)
+    (store! (field u allocation-result) MRA-OK)
+    (store! (field u allocation-item) -1)
+    (store! (field u allocation-seed) 0)
+    0))
+
+(defn mu-function-count [] (-> i64)
+  (al-len [MFunction] (load (field (machine-unit) functions))))
+(defn mu-block-count [] (-> i64)
+  (al-len [MBlock] (load (field (machine-unit) blocks))))
+(defn mu-edge-count [] (-> i64)
+  (al-len [MEdge] (load (field (machine-unit) edges))))
+(defn mu-verify-result [] (-> i64)
+  (load (field (machine-unit) verify-result)))
+(defn mu-verify-item [] (-> i64)
+  (load (field (machine-unit) verify-item)))
+
+(defn mf-new [(id i64) (ideal i64) (entry i64)] (-> MFunction)
+  (let [p (stack MFunction)]
+    (store! (field p id) id)
+    (store! (field p ideal) ideal)
+    (store! (field p entry) entry)
+    (store! (field p block-first) -1)
+    (store! (field p block-count) 0)
+    (store! (field p return-first) -1)
+    (store! (field p return-count) 0)
+    (store! (field p frame-size) -1)
+    (store! (field p callee-mask) 0)
+    (store! (field p callee-count) 0)
+    (store! (field p code-start) -1)
+    (store! (field p code-size) 0)
+    (load p)))
+
+(defn mb-new [(id i64) (owner i64) (ctrl i64)] (-> MBlock)
+  (let [p (stack MBlock)]
+    (store! (field p id) id)
+    (store! (field p owner) owner)
+    (store! (field p ideal-ctrl) ctrl)
+    (store! (field p pred-first) -1)
+    (store! (field p pred-count) 0)
+    (store! (field p succ-first) -1)
+    (store! (field p succ-count) 0)
+    (store! (field p inst-first) -1)
+    (store! (field p inst-count) 0)
+    (store! (field p loop-depth) 0)
+    (store! (field p layout-index) -1)
+    (load p)))
+
+(defn me-new [(id i64) (owner i64) (source i64) (target i64) (slot i64)] (-> MEdge)
+  (let [p (stack MEdge)]
+    (store! (field p id) id)
+    (store! (field p owner) owner)
+    (store! (field p source) source)
+    (store! (field p target) target)
+    (store! (field p target-slot) slot)
+    (store! (field p copy-first) -1)
+    (store! (field p copy-count) 0)
+    (store! (field p move-first) -1)
+    (store! (field p move-count) 0)
+    (load p)))
+
+(defn mc-new [(edge i64) (phi i64) (dst i64) (src i64) (kind i64)] (-> MCopy)
+  (let [p (stack MCopy)]
+    (store! (field p edge) edge)
+    (store! (field p phi) phi)
+    (store! (field p dst) dst)
+    (store! (field p src) src)
+    (store! (field p kind) kind)
+    (load p)))
+
+(defn mm-new [(edge i64) (dst i64) (src i64) (temporary bool)] (-> MMove)
+  (let [p (stack MMove)]
+    (store! (field p edge) edge)
+    (store! (field p dst) dst)
+    (store! (field p src) src)
+    (store! (field p temporary) temporary)
+    (load p)))
+
+(defn mu-function [(i i64)] (-> (ptr MFunction))
+  (be-al-elem [MFunction] (field (machine-unit) functions) i))
+(defn mu-block [(i i64)] (-> (ptr MBlock))
+  (be-al-elem [MBlock] (field (machine-unit) blocks) i))
+(defn mu-edge [(i i64)] (-> (ptr MEdge))
+  (be-al-elem [MEdge] (field (machine-unit) edges) i))
+(defn mu-block-owner [(i i64)] (-> i64)
+  (load (field (mu-block i) owner)))
+(defn mu-block-control [(i i64)] (-> i64)
+  (load (field (mu-block i) ideal-ctrl)))
+(defn mu-edge-source [(i i64)] (-> i64)
+  (load (field (mu-edge i) source)))
+(defn mu-edge-target [(i i64)] (-> i64)
+  (load (field (mu-edge i) target)))
+(defn mu-edge-target-slot [(i i64)] (-> i64)
+  (load (field (mu-edge i) target-slot)))
+(defn mu-edge-copy-count [(i i64)] (-> i64)
+  (load (field (mu-edge i) copy-count)))
+(defn mu-edge-copy [(edge i64) (which i64)] (-> (ptr MCopy))
+  (let [first (load (field (mu-edge edge) copy-first))]
+    (be-al-elem [MCopy] (field (machine-unit) edge-copies) (+ first which))))
+(defn mu-copy-phi [(edge i64) (which i64)] (-> i64)
+  (load (field (mu-edge-copy edge which) phi)))
+(defn mu-copy-dst [(edge i64) (which i64)] (-> i64)
+  (load (field (mu-edge-copy edge which) dst)))
+(defn mu-copy-src [(edge i64) (which i64)] (-> i64)
+  (load (field (mu-edge-copy edge which) src)))
+(defn mu-copy-kind [(edge i64) (which i64)] (-> i64)
+  (load (field (mu-edge-copy edge which) kind)))
+(defn mu-edge-move-count [(i i64)] (-> i64)
+  (load (field (mu-edge i) move-count)))
+(defn mu-edge-move [(edge i64) (which i64)] (-> (ptr MMove))
+  (let [first (load (field (mu-edge edge) move-first))]
+    (be-al-elem [MMove] (field (machine-unit) edge-moves) (+ first which))))
+(defn mu-move-dst [(edge i64) (which i64)] (-> i64)
+  (load (field (mu-edge-move edge which) dst)))
+(defn mu-move-src [(edge i64) (which i64)] (-> i64)
+  (load (field (mu-edge-move edge which) src)))
+(defn mu-move-temporary? [(edge i64) (which i64)] (-> bool)
+  (load (field (mu-edge-move edge which) temporary)))
+(defn mu-function-ideal [(i i64)] (-> i64)
+  (load (field (mu-function i) ideal)))
+(defn mu-function-block-count [(i i64)] (-> i64)
+  (load (field (mu-function i) block-count)))
+(defn mu-function-frame-size [(i i64)] (-> i64)
+  (load (field (mu-function i) frame-size)))
+(defn mu-function-code-start [(i i64)] (-> i64)
+  (load (field (mu-function i) code-start)))
+(defn mu-function-code-size [(i i64)] (-> i64)
+  (load (field (mu-function i) code-size)))
+(defn mu-function-callee-mask [(i i64)] (-> i64)
+  (load (field (mu-function i) callee-mask)))
+(defn mu-function-callee-count [(i i64)] (-> i64)
+  (load (field (mu-function i) callee-count)))
+(defn mu-function-block [(fun i64) (rpo i64)] (-> i64)
+  (let [f (mu-function fun)]
+    (al-get (load (field (machine-unit) block-order))
+            (+ (load (field f block-first)) rpo))))
+(defn mu-function-return-count [(fidx i64)] (-> i64)
+  (load (field (mu-function fidx) return-count)))
+(defn mu-function-return-block [(fidx i64) (i i64)] (-> i64)
+  (let [f (mu-function fidx)]
+    (al-get (load (field (machine-unit) returns))
+            (+ (load (field f return-first)) i))))
+(defn mu-block-layout-index [(i i64)] (-> i64)
+  (load (field (mu-block i) layout-index)))
+(defn mu-block-loop-depth [(i i64)] (-> i64)
+  (load (field (mu-block i) loop-depth)))
+(defn mu-block-idom [(i i64)] (-> i64)
+  (al-get (load (field (machine-unit) block-idom)) i))
+(defn mu-block-inst-first [(i i64)] (-> i64)
+  (load (field (mu-block i) inst-first)))
+(defn mu-block-inst-count [(i i64)] (-> i64)
+  (load (field (mu-block i) inst-count)))
+(defn mu-block-succ-count [(i i64)] (-> i64)
+  (load (field (mu-block i) succ-count)))
+(defn mu-block-succ-edge [(bid i64) (i i64)] (-> i64)
+  (let [b (mu-block bid)]
+    (al-get (load (field (machine-unit) succ-edges))
+            (+ (load (field b succ-first)) i))))
+(defn mu-block-succ-target [(bid i64) (i i64)] (-> i64)
+  (mu-edge-target (mu-block-succ-edge bid i)))
+
+(defstruct Backend
+  [(ins (ArrayList MInst))
+   (nval (ArrayList i64))  ; graph node -> virtual register, -1 when unselected
+   (mseen (ArrayList i64))
+   (clabel (ArrayList i64))
+   (code (ArrayList u8))
+   (obj (ArrayList u8))
+   (spills i64)
+   (inloop bool)
+   (result i64)
+   (result-node i64)
+   (verify-code i64)
+   (object-result i64)
+   (object-item i64)
+   (runtime-allocation bool)
+   (inited bool)])
+
+(defn backend [] (-> (ptr Backend))
+  (let [p (static Backend)]
+    (if (load (field p inited))
+        0
+        (do
+          (store! (field p inited) true)
+          (store! (field p ins) (al-new [MInst] (malloc-allocator)))
+          (store! (field p nval) (al-new [i64] (malloc-allocator)))
+          (store! (field p mseen) (al-new [i64] (malloc-allocator)))
+          (store! (field p clabel) (al-new [i64] (malloc-allocator)))
+          (store! (field p code) (al-new [u8] (malloc-allocator)))
+          (store! (field p obj) (al-new [u8] (malloc-allocator)))
+          0))
+    p))
+
+(defn be-reset! [] (-> i64)
+  (let [p (backend)
+        (mut i) 0]
+    (al-clear! [MInst] (field p ins))
+    (al-clear! [i64] (field p nval))
+    (al-clear! [i64] (field p mseen))
+    (al-clear! [i64] (field p clabel))
+    (al-clear! [u8] (field p code))
+    (al-clear! [u8] (field p obj))
+    (loop (if (>= (load i) (n-count))
+              (break)
+              (do
+                (al-push! [i64] (field p nval) -1)
+                (al-push! [i64] (field p mseen) 0)
+                (al-push! [i64] (field p clabel) -1)
+                (store! i (+ (load i) 1))
+                0)))
+    (store! (field p spills) 0)
+    (store! (field p inloop) false)
+    (store! (field p result) BER-OK)
+    (store! (field p result-node) NO-NODE)
+    (store! (field p verify-code) VERR-NONE)
+    (store! (field p object-result) MOBJ-OK)
+    (store! (field p object-item) -1)
+    (store! (field p runtime-allocation) false)
+    0))
+
+(defn be-result [] (-> i64)
+  (load (field (backend) result)))
+(defn be-result-node [] (-> i64)
+  (load (field (backend) result-node)))
+(defn be-verify-code [] (-> i64)
+  (load (field (backend) verify-code)))
+(defn mobj-result [] (-> i64)
+  (load (field (backend) object-result)))
+(defn mobj-item [] (-> i64)
+  (load (field (backend) object-item)))
+(defn be-use-runtime-allocation! [(enabled bool)] (-> i64)
+  (store! (field (backend) runtime-allocation) enabled)
+  0)
+(defn be-runtime-allocation? [] (-> bool)
+  (load (field (backend) runtime-allocation)))
+
+(defn be-result-name [(code i64)] (-> (slice u8))
+  (case code BER-OK
+        "BER-OK" BER-MALFORMED-GRAPH
+        "BER-MALFORMED-GRAPH" BER-UNSUPPORTED-OPCODE
+        "BER-UNSUPPORTED-OPCODE" BER-UNSUPPORTED-CFG
+        "BER-UNSUPPORTED-CFG" BER-UNSUPPORTED-PHI
+        "BER-UNSUPPORTED-PHI" BER-UNSUPPORTED-CALL
+        "BER-UNSUPPORTED-CALL" BER-UNSUPPORTED-CALL-LIVE
+        "BER-UNSUPPORTED-CALL-LIVE" BER-ALLOCATION
+        "BER-ALLOCATION" BER-ENCODING
+        "BER-ENCODING" BER-OBJECT
+        "BER-OBJECT" "BER-?"))
+
+(defn be-result-print [(w (ptr Writer))] (-> i64)
+  (let [code (be-result)
+        node (be-result-node)]
+    (ps w (be-result-name code))
+    (if (= node NO-NODE) 0 (do (fmt w " at n{d}" node) 0))
+    (if (= code BER-MALFORMED-GRAPH)
+        (do (ps w " (") (ps w (verr-name (be-verify-code))) (ps w ")") 0)
+        0)
+    (ps w "\n")
+    0))
+
+(defn be-fail! [(code i64) (node i64)] (-> bool)
+  (let [p (backend)]
+    (if (= (load (field p result)) BER-OK)
+        (do (store! (field p result) code) (store! (field p result-node) node))
+        0)
+    ; Publication is atomic: a failure invalidates bytes from this and all prior compilations.
+    (al-clear! [u8] (field p code))
+    (al-clear! [u8] (field p obj))
+    false))
+
+(defn be-preflight! [] (-> bool)
+  (if (= (g-verify) 0)
+      ; Calls are rejected before control-shape walking so CallEnd cannot be misreported as a CFG
+      ; accident and no callee/body instructions can leak into the current compilation.
+      (let [n (n-count)
+            (mut i) 0
+            (mut call) NO-NODE]
+        (loop (if (or (>= (load i) n) (!= (load call) NO-NODE))
+                  (break)
+                  (do
+                    (if (and (not (n-dead? (load i))) (= (n-op (load i)) OP-CALL))
+                        (store! call (load i))
+                        0)
+                    (store! i (+ (load i) 1))
+                    0)))
+        (if (!= (load call) NO-NODE)
+            (be-fail! BER-UNSUPPORTED-CALL (load call))
+            ; The prototype loop selector searches for one loop Phi. More than one is not a
+            ; conservative subset: accepting it silently chooses whichever use happens to be last.
+            (let [(mut loop-node) NO-NODE
+                  (mut cfg-node) NO-NODE]
+              (store! i 0)
+              (loop (if (or (>= (load i) n) (!= (load loop-node) NO-NODE))
+                        (break)
+                        (do
+                          (if (and (not (n-dead? (load i))) (= (n-op (load i)) OP-LOOP))
+                              (let [outs (n-nouts (load i))
+                                    (mut j) 0
+                                    (mut phis) 0]
+                                (loop (if (>= (load j) outs)
+                                          (break)
+                                          (do
+                                            (let [u (n-out (load i) (load j))]
+                                              (if (and (not (n-dead? u))
+                                                       (and (= (n-op u) OP-PHI) (not (ty-mem? (n-ty u)))))
+                                                  (store! phis (+ (load phis) 1))
+                                                  0))
+                                            (store! j (+ (load j) 1))
+                                            0)))
+                                (if (> (load phis) 1) (store! loop-node (load i)) 0)
+                                ; A Region back edge means control branched inside the loop body. The
+                                ; shape walker accepted this and emitted an infinite native loop.
+                                (if (and (= (load cfg-node) NO-NODE)
+                                         (!= (n-op (n-in (load i) 2)) OP-CPROJ))
+                                    (store! cfg-node (load i))
+                                    0))
+                              0)
+                          (store! i (+ (load i) 1))
+                          0)))
+              (if (!= (load loop-node) NO-NODE)
+                  (be-fail! BER-UNSUPPORTED-PHI (load loop-node))
+                  (if (!= (load cfg-node) NO-NODE)
+                      (be-fail! BER-UNSUPPORTED-CFG (load cfg-node))
+                      true)))))
+      (do
+        (store! (field (backend) verify-code) (g-verify-code))
+        (be-fail! BER-MALFORMED-GRAPH (g-verify-node)))))
+
+(defn mi-new [(op i64) (dst i64) (a i64) (b i64) (imm i64) (node i64)] (-> MInst)
+  (let [p (stack MInst)]
+    (store! (field p op) op)
+    (store! (field p dst) dst)
+    (store! (field p a) a)
+    (store! (field p b) b)
+    (store! (field p imm) imm)
+    (store! (field p node) node)
+    (store! (field p owner) -1)
+    (store! (field p block-id) -1)
+    (store! (field p mem-first) -1)
+    (store! (field p mem-count) 0)
+    (store! (field p anti-first) -1)
+    (store! (field p anti-count) 0)
+    (store! (field p arg-first) -1)
+    (store! (field p arg-count) 0)
+    (store! (field p reg) -1)
+    (store! (field p spill) -1)
+    (store! (field p first) -1)
+    (store! (field p last) -1)
+    (store! (field p earliest) -1)
+    (store! (field p latest) -1)
+    (store! (field p schedule-order) -1)
+    (load p)))
+
+(defn mi-desc-new [(inputs i64)
+                   (outputs i64)
+                   (effects i64)
+                   (pinned bool)
+                   (memory bool)
+                   (terminator bool)
+                   (encodable bool)] (-> MOpcodeDesc)
+  (let [p (stack MOpcodeDesc)]
+    (store! (field p inputs) inputs)
+    (store! (field p outputs) outputs)
+    (store! (field p temporaries) 0)
+    (store! (field p clobbers) 0)
+    (store! (field p effects) effects)
+    (store! (field p pinned) pinned)
+    (store! (field p memory) memory)
+    (store! (field p terminator) terminator)
+    (store! (field p encodable) encodable)
+    (load p)))
+
+(defn mi-desc [(op i64)] (-> MOpcodeDesc)
+  (case op MI-MOVI
+        (mi-desc-new 0 1 0 false false false true) MI-ARG
+        (mi-desc-new 0 1 0 true false false true) MI-NEG
+        (mi-desc-new 1 1 0 false false false true) MI-ADD
+        (mi-desc-new 2 1 0 false false false true) MI-SUB
+        (mi-desc-new 2 1 0 false false false true) MI-MUL
+        (mi-desc-new 2 1 0 false false false true) MI-SDIV
+        (mi-desc-new 2 1 0 false false false true) MI-EQ
+        (mi-desc-new 2 1 0 false false false true) MI-LT
+        (mi-desc-new 2 1 0 false false false true) MI-LE
+        (mi-desc-new 2 1 0 false false false true) MI-NEW
+        (mi-desc-new 0 1 3 true true false true) MI-LOAD
+        (mi-desc-new 1 1 2 true true false true) MI-STORE
+        (mi-desc-new 2 0 2 true true false true) MI-RET
+        (mi-desc-new 1 0 1 true false true true) MI-CBR
+        (mi-desc-new 1 0 1 true false true false) MI-JMP
+        (mi-desc-new 0 0 1 true false true false) MI-CBZ
+        (mi-desc-new 1 0 1 true false true true) MI-B
+        (mi-desc-new 0 0 1 true false true true) MI-LABEL
+        (mi-desc-new 0 0 1 true false false true) MI-CSEL
+        (mi-desc-new 3 1 0 false false false true) MI-MOV
+        (mi-desc-new 1 1 0 false false false true) MI-COPY
+        (mi-desc-new 1 1 0 true false false true) MI-CALL
+        (mi-desc-new 1 1 3 true true false true) MI-STACKARG
+        (mi-desc-new 0 1 0 true false false true) MI-ABI-COPY
+        (mi-desc-new 1 1 0 true false false true) MI-JSBOX
+        (mi-desc-new 1 1 0 false false false true) MI-JSUNBOX
+        (mi-desc-new 1 1 0 false false false true) MI-JSTEST
+        (mi-desc-new 1 1 0 false false false true) MI-FMOVI
+        (mi-desc-new 0 1 0 false false false true) MI-SCVTF
+        (mi-desc-new 1 1 0 false false false true) MI-FADD
+        (mi-desc-new 2 1 0 false false false true) MI-FSUB
+        (mi-desc-new 2 1 0 false false false true) MI-FMUL
+        (mi-desc-new 2 1 0 false false false true) MI-FDIV
+        (mi-desc-new 2 1 0 false false false true) MI-FNEG
+        (mi-desc-new 1 1 0 false false false true) MI-FEQ
+        (mi-desc-new 2 1 0 false false false true) MI-FLT
+        (mi-desc-new 2 1 0 false false false true) MI-FLE
+        (mi-desc-new 2 1 0 false false false true) MI-FTRUTH
+        (mi-desc-new 1 1 0 false false false true) MI-MOD
+        (mi-desc-new 2 1 0 false false false true) MI-BITAND
+        (mi-desc-new 2 1 0 false false false true) MI-BITOR
+        (mi-desc-new 2 1 0 false false false true) MI-BITXOR
+        (mi-desc-new 2 1 0 false false false true) MI-SHL
+        (mi-desc-new 2 1 0 false false false true) MI-SHR
+        (mi-desc-new 2 1 0 false false false true) MI-USHR
+        (mi-desc-new 2 1 0 false false false true) MI-BITNOT
+        (mi-desc-new 1 1 0 false false false true) MI-I32FROMFP
+        (mi-desc-new 1 1 0 false false false true) MI-FMOD
+        (mi-desc-new 2 1 0 false false false true) MI-JSPROP
+        (mi-desc-new 2 1 3 true true false true) MI-JSARRAY
+        (mi-desc-new 2 1 3 false false false true) MI-JSSTRING
+        (mi-desc-new 2 1 3 false false false true) (mi-desc-new -1 -1 0 false false false false)))
+
+(defn mi-desc-inputs [(d MOpcodeDesc)] (-> i64)
+  (load (field d inputs)))
+(defn mi-desc-outputs [(d MOpcodeDesc)] (-> i64)
+  (load (field d outputs)))
+(defn mi-desc-temporaries [(d MOpcodeDesc)] (-> i64)
+  (load (field d temporaries)))
+(defn mi-desc-clobbers [(d MOpcodeDesc)] (-> i64)
+  ; Effect class 3 is a call/safepoint. x0-x11, d0-d7, and d16-d31 are caller-clobbered.
+  ; Physical FP locations occupy bits 32..63 in allocator masks.
+  (if (= (load (field d effects)) 3) -280379760046081 (load (field d clobbers))))
+(defn mi-desc-effects [(d MOpcodeDesc)] (-> i64)
+  (load (field d effects)))
+(defn mi-desc-pinned? [(d MOpcodeDesc)] (-> bool)
+  (load (field d pinned)))
+(defn mi-desc-memory? [(d MOpcodeDesc)] (-> bool)
+  (load (field d memory)))
+(defn mi-desc-terminator? [(d MOpcodeDesc)] (-> bool)
+  (load (field d terminator)))
+(defn mi-desc-encodable? [(d MOpcodeDesc)] (-> bool)
+  (load (field d encodable)))
+
+; Keep struct-valued descriptor temporaries out of large compiler loops. Coil currently lowers a
+; struct result bound inside a loop as dynamic stack storage whose lifetime is the surrounding
+; function; these scalar wrappers bound that storage to one ordinary call frame.
+(defn mi-op-inputs [(op i64)] (-> i64)
+  (mi-desc-inputs (mi-desc op)))
+(defn mi-op-pinned? [(op i64)] (-> bool)
+  (mi-desc-pinned? (mi-desc op)))
+(defn mi-op-terminator? [(op i64)] (-> bool)
+  (mi-desc-terminator? (mi-desc op)))
+(defn mi-op-effects [(op i64)] (-> i64)
+  (mi-desc-effects (mi-desc op)))
+
+(defn be-emit! [(m MInst)] (-> i64)
+  (let [p (backend)
+        id (al-len [MInst] (load (field p ins)))]
+    (al-push! [MInst] (field p ins) m)
+    id))
+
+
+;; Shared typed ArrayList indexing lives in the core because every later phase uses it.
+(defn be-al-elem [T] [(p (ptr (ArrayList T))) (i i64)] (-> (ptr T))
+  (index (load (field p data)) i))
