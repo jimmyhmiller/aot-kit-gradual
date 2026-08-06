@@ -19,9 +19,10 @@ int main(int argc, char **argv) {
   uint64_t verifications = aot_gc_verifications();
   uint64_t moves = aot_gc_moves();
   uint64_t allocations = aot_gc_allocations();
-  /* Each invocation allocates two shared cells and three materialized closure environments.
-     Ten across both calls distinguishes the native environment ABI from cell-only lowering. */
-  if (two != 301020 || five != 601920 || allocations != 10 ||
+  /* Each invocation allocates two module-facade objects, two shared cells, and three materialized
+     closure environments. Fourteen across both calls distinguishes the native environment ABI
+     from cell-only lowering while accounting for the product entry facade. */
+  if (two != 301020 || five != 601920 || allocations != 14 ||
       (stress && (collections == 0 || collections != verifications || moves == 0))) {
     fprintf(stderr, "B09 native mismatch: limit2=%lld limit5=%lld alloc=%llu gc=%llu/%llu moves=%llu\n",
       (long long)two, (long long)five, (unsigned long long)allocations,

@@ -107,6 +107,21 @@
 (defn be-function-return-kind [(owner i64)] (-> i64)
   (be-function-return-kind-fuel owner 32))
 
+(defn be-function-fp-return? [(owner i64)] (-> bool)
+  (let [count (mu-function-return-count owner)
+        (mut index) 0
+        (mut found) false]
+    (loop (if (or (>= (load index) count) (load found))
+              (break)
+              (let [term (mu-block-terminator (mu-function-return-block owner (load index)))]
+                (if (and (!= term NO-NODE)
+                         (and (= (n-op term) OP-RETURN)
+                              (be-node-fp-value? (n-in term 1))))
+                    (store! found true)
+                    0)
+                (store! index (+ (load index) 1)))))
+    (load found)))
+
 (defn be-call-return-kind-fuel [(call i64) (fuel i64)] (-> i64)
   (let [targets (infer-call-targets call)
         funcs (mu-function-count)
@@ -341,13 +356,30 @@
                             (if (= op OP-MINUS)
                                 (be-node-fp-value-fuel? (n-in node 1) excluded (- fuel 1))
                                 (if (= op OP-CALL)
-                                    (let [callee (n-in node 1)]
-                                      (and (= (n-op callee) OP-FUN)
-                                           (and (> (n-nins callee) 1)
-                                                (be-node-fp-value-fuel?
-                                                  (n-in (n-in callee 1) 1)
-                                                  excluded
-                                                  (- fuel 1)))))
+                                    (let [callee (n-in node 1)
+                                          target
+                                            (if (= (n-op callee) OP-CLOSURE)
+                                                (n-in callee 0)
+                                                callee)]
+                                      (and (= (n-op target) OP-FUN)
+                                           (and (> (n-nins target) 1)
+                                                (let [(mut input) 1
+                                                      (mut found) false]
+                                                  (loop (if (or (>= (load input) (n-nins target))
+                                                                (load found))
+                                                            (break)
+                                                            (do
+                                                              (let [ret (n-in target (load input))]
+                                                                (if (and (= (n-op ret) OP-RETURN)
+                                                                         (be-node-fp-value-fuel?
+                                                                           (n-in ret 1)
+                                                                           excluded
+                                                                           (- fuel 1)))
+                                                                    (store! found true)
+                                                                    0))
+                                                              (store! input (+ (load input) 1))
+                                                              0)))
+                                                  (load found)))))
                                     false))))))))))
 
 (defn be-node-fp-value? [(node i64)] (-> bool)
@@ -1316,7 +1348,13 @@
               (if (not (ms-select-memory-at! owner (n-in node 1) bid))
                   (store! ok false)
                   (let [ptr (ms-select-value-at! owner (n-in node 2) bid)
-                        value (ms-select-value-at! owner (n-in node 3) bid)]
+                        raw-value (ms-select-value-at! owner (n-in node 3) bid)
+                        value
+                          (if (and (>= raw-value 0)
+                                   (and (= (shape-alias-ty (n-aux node)) (t-flt))
+                                        (not (be-node-fp-value? (n-in node 3)))))
+                              (ms-fp-input! owner (n-in node 3) raw-value bid)
+                              raw-value)]
                     (if (or (< ptr 0) (< value 0))
                         (store! ok false)
                         (let [at
@@ -2481,8 +2519,18 @@
                               (let [node (n-in term 1)
                                     raw (ms-select-value-at! owner node bid)
                                     return-kind (be-function-return-kind owner)
-                                    value
+                                    normalized
                                       (if (and (>= raw 0)
+                                               (and (= return-kind MLK-SCALAR)
+                                                    (and (be-function-fp-return? owner)
+                                                         (not (be-node-fp-value? node)))))
+                                          (let [converted (ms-new-vreg!)]
+                                            (ms-emit! owner bid
+                                                      (mi-new MI-SCVTF converted raw -1 0 NO-NODE))
+                                            converted)
+                                          raw)
+                                    value
+                                      (if (and (>= normalized 0)
                                                (and (be-function-return-mixed? owner)
                                                     (and (= return-kind MLK-BOXED)
                                                          (not (be-box-input-already-tagged? node)))))
@@ -2494,9 +2542,9 @@
                                                 (let [boxed (ms-new-vreg!)]
                                                   (ms-emit! owner
                                                             bid
-                                                            (mi-new MI-JSBOX boxed raw -1 tag term))
+                                                            (mi-new MI-JSBOX boxed normalized -1 tag term))
                                                   boxed)))
-                                          raw)]
+                                          normalized)]
                                 (if (< value 0)
                                     (ms-fail! MSEL-UNSUPPORTED term)
                                     (if (and (= return-kind MLK-BOXED)

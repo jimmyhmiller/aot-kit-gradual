@@ -3,5 +3,5 @@ function read(value: Pair | null): number { return value === null ? 0 : value.le
 
 export function main(): number {
   let pair: Pair = {left: 19, right: 23};
-  return read(pair) + read(null);
+  return (read(pair) + read(null)) | 0;
 }

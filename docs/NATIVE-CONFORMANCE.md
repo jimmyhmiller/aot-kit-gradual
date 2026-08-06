@@ -12,29 +12,21 @@ The normal gate covers the currently verified end-to-end surface:
 - updates, short-circuit values, comma and ternary expressions, structured loops, switches,
   labels, breaks, and continues;
 - dense arrays including holes, indexed and non-index properties, growth, push, pop, and slice;
-- the currently selected `Math` builtins and numeric coercions.
+- closures, mutable captures, named recursion, direct calls, receiver calls, constructors, and
+  constructor object-return semantics;
+- typed and dynamic objects, structural values, nullable unions, prototype lookup and shadowing;
+- strings, conversion, parsing, the currently selected `Math` builtins, and numeric coercions;
+- a combined allocation-heavy program spanning recursive trees, closures, arrays, strings, loops,
+  calls, and moving-GC relocation.
 
 `tools/native-source-conformance.sh --extended` repeats those sources across construction/schedule
 seeds, register pressure, and moving-GC stress and is part of the extended gate. The manifest is
 `tests/native-conformance/manifest.json`; feature labels make omissions reviewable rather than
 leaving coverage implicit in source text.
 
-## Known product-path gaps
-
-The manifest also retains source cases marked `status: "gap"`. Run one directly with
-`--case=NAME`, or run `--audit` to stop at the first gap. These are not counted as verified native
-support:
-
-- closures and named recursion currently emit an object but crash in native execution;
-- receiver calls and constructors currently fail the existing B10 source witness;
-- the combined dynamic-property/prototype witness traps in native execution;
-- the string/conversion composition reaches a graph-verifier failure;
-- the structural object/union call witness reaches a liveness failure;
-- the integrated heap program emits but crashes natively.
-
-Phase-local ideal/backend tests for these mechanisms remain valuable, but they are not a substitute
-for product-path source conformance. A gap moves into the verified set only after it agrees with
-Node in normal and extended modes.
+The manifest contains no expected product-path gaps. `--audit` remains available as a guard against
+future quarantined cases: any case marked `status: "gap"` is excluded from the ordinary support
+claim until it agrees with Node in normal and extended modes.
 
 ## Native benchmarks
 
@@ -43,6 +35,6 @@ checks its result against Node before accepting samples, and records all nine na
 samples plus native/Node compilation time in `out/typescript-aot-benchmarks/results.json`.
 `tools/benchmark-gate.sh` validates that report. Timing never proceeds past a correctness mismatch.
 
-The current correctness-qualified workloads cover an integer loop, branch-heavy control, a
-straight-line bitwise kernel, and a floating-point kernel. Runtime subsystems listed as conformance
-gaps are intentionally not represented as performance claims yet.
+The correctness-qualified workloads cover integer and branch-heavy loops, a call-heavy loop, a
+straight-line bitwise kernel, and a floating-point kernel. Benchmarks are performance witnesses,
+while the source-conformance matrix remains the exhaustive semantic oracle for supported features.

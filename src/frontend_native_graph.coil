@@ -185,6 +185,28 @@
 (defn fng-string-coerce [(context FngContext) (source i64) (value i64)] (-> i64)
   (if (= (fng-infer context source FNG-DYNAMIC) FNG-STRING) value (n-to-string! value)))
 
+(defn fng-direct-call-object-type [(value i64)] (-> i64)
+  (if (and (>= value 0) (= (n-op value) OP-CALL))
+      (let [callee (n-in value 1)
+            target (if (= (n-op callee) OP-CLOSURE) (n-in callee 0) callee)
+            (mut index) 1
+            (mut answer) (t-top)
+            (mut valid) (= (n-op target) OP-FUN)]
+        (loop (if (or (>= (load index) (n-nins target)) (not (load valid)))
+                  (break)
+                  (let [ret (n-in target (load index))]
+                    (if (= (n-op ret) OP-RETURN)
+                        (let [result-type (n-ty (n-in ret 1))]
+                          (if (ty-only-obj? result-type)
+                              (if (= (load answer) (t-top))
+                                  (store! answer result-type)
+                                  (if (!= (load answer) result-type) (store! valid false) 0))
+                              (store! valid false)))
+                        0)
+                    (store! index (+ (load index) 1)))))
+        (if (load valid) (load answer) (t-top)))
+      (t-top)))
+
 (defn fng-box-dynamic-argument! [(value i64)] (-> i64)
   ;; A Phi's semantic `dyn` type does not prove that its incoming machine words are tagged.
   ;; Lift the representation conversion through the merge so raw null/object arms are boxed,
@@ -211,7 +233,20 @@
                                     (n-box! (n-in value (load index)))))
                     (store! index (+ (load index) 1)))))
         boxed)
-      (n-box! value))))
+      (let [object-type (fng-direct-call-object-type value)]
+        (n-box! (if (= object-type (t-top))
+                    value
+                    (n-new2 OP-CAST object-type (n-in value 0) value)))))))
+
+(defn fng-tagged-dynamic-value? [(value i64)] (-> bool)
+  ;; Type computation can lag graph construction, so `n-ty == dyn` alone is not reliable while
+  ;; lowering a body. These producers have a defined tagged-JavaScript-value machine ABI.
+  (if (< value 0)
+      false
+      (let [op (n-op value)]
+        (or (= op OP-PROPLOAD)
+            (or (= op OP-ARRAYLOAD)
+                (and (= op OP-LOAD) (= (shape-alias-ty (n-aux value)) (t-dyn))))))))
 
 ;; A dynamic argument can be consumed while a loop Phi is still open. At that point its backedge
 ;; is unknown, so `fng-box-dynamic-argument!` must leave a Box(Phi) placeholder. Once all function
@@ -278,7 +313,7 @@
         ;; parameters just as they unbox dynamic parameters; publish numeric actuals in that same
         ;; tagged ABI instead of passing an FPR/GPR word to a callee expecting a boxed value.
         (if (or (= parameter-type FNG-DYNAMIC) (= parameter-type FNG-NUMBER))
-            (fng-box-dynamic-argument! value)
+            (if (fng-tagged-dynamic-value? value) value (fng-box-dynamic-argument! value))
             value))))
 
 (defn fng-condition-expression [(context FngContext) (source i64)] (-> i64)
@@ -303,20 +338,43 @@
       (fng-bin OP-EQ value (fng-null))))
 
 (defn fng-int-value [(context FngContext) (source i64) (value i64)] (-> i64)
-  (if (= (n-ty value) (t-dyn))
-      (if (= (n-op value) OP-CALL)
+  (let [frontend (load (field context frontend))
+        ast (field frontend ast)
+        captured-cell
+          (and (= (ts-kind ast source) TSK-IDENTIFIER)
+               (let [symbol (fe-resolution-symbol frontend source)]
+                 (and (>= symbol 0) (fng-symbol-cell? context symbol))))]
+  (if (or (= (n-ty value) (t-dyn)) captured-cell)
+      (if (or (= (n-op value) OP-CALL)
+              (or (= (n-op value) OP-ADD)
+                  (or (= (n-op value) OP-SUB)
+                      (or (= (n-op value) OP-MUL)
+                          (or (= (n-op value) OP-DIV) (= (n-op value) OP-MOD))))))
           value
           (fng-bin OP-BITOR (n-unbox! value (t-flt)) (fng-const 0)))
-      (if (ty-isa (n-ty value) (t-num)) value value)))
+      (if (ty-isa (n-ty value) (t-num)) value value))))
 
 (defn fng-number-value [(context FngContext) (source i64) (value i64)] (-> i64)
-  (if (= (n-ty value) (t-dyn))
-      (if (= (n-op value) OP-CALL) value (n-unbox! value (t-flt)))
-      (if (ty-isa (n-ty value) (t-num)) value value)))
+  (let [frontend (load (field context frontend))
+        ast (field frontend ast)
+        captured-cell
+          (and (= (ts-kind ast source) TSK-IDENTIFIER)
+               (let [symbol (fe-resolution-symbol frontend source)]
+                 (and (>= symbol 0) (fng-symbol-cell? context symbol))))]
+  (if (or (= (n-ty value) (t-dyn)) captured-cell)
+      (if (or (= (n-op value) OP-CALL)
+              (or (= (n-op value) OP-ADD)
+                  (or (= (n-op value) OP-SUB)
+                      (or (= (n-op value) OP-MUL)
+                          (or (= (n-op value) OP-DIV) (= (n-op value) OP-MOD))))))
+          value
+          (n-unbox! value (t-flt)))
+      (if (ty-isa (n-ty value) (t-num)) value value))))
 
 (defn fng-numeric-equality-peer? [(value i64)] (-> bool)
   (let [ty (n-ty value)]
-    (and (ty-isa ty (t-num))
+    (and (and (!= (ty-kinds ty) VK-NULL) (!= (ty-kinds ty) VK-UNDEF))
+         (and (ty-isa ty (t-num))
          (if (!= (n-op value) OP-PHI)
              true
              ;; An open Phi initially has bottom type, which is below every concrete type.  Its
@@ -325,17 +383,22 @@
                  (let [initial-ty (n-ty (n-in value 1))]
                    (and (!= initial-ty (t-bot))
                         (and (!= initial-ty (t-dyn)) (ty-isa initial-ty (t-num)))))
-                 false)))))
+                 false))))))
 
 (defn fng-equal-value [(context FngContext)
                        (left-source i64) (left i64)
                        (right-source i64) (right i64)] (-> i64)
-  (let [left-dynamic (= (n-ty left) (t-dyn))
-        right-dynamic (= (n-ty right) (t-dyn))]
+  (let [left-dynamic (or (= (n-ty left) (t-dyn)) (fng-tagged-dynamic-value? left))
+        right-dynamic (or (= (n-ty right) (t-dyn)) (fng-tagged-dynamic-value? right))]
     ;; `dyn` includes numeric values, so `ty-isa dyn num` is true.  It is not proof that a
     ;; particular dynamic value is numeric.  In particular, an open loop Phi has bottom type before
     ;; its backedge arrives; bottom satisfies every `ty-isa` query and is not numeric evidence.
-    (cond (and left-dynamic (fng-numeric-equality-peer? right))
+    (cond (or (fng-nullish-literal? context left-source)
+              (fng-nullish-literal? context right-source))
+            (fng-bin OP-EQ
+                     (if left-dynamic left (n-box! left))
+                     (if right-dynamic right (n-box! right)))
+          (and left-dynamic (fng-numeric-equality-peer? right))
             (fng-bin OP-EQ (n-unbox! left (t-flt)) right)
           (and right-dynamic (fng-numeric-equality-peer? left))
             (fng-bin OP-EQ left (n-unbox! right (t-flt)))
@@ -378,6 +441,21 @@
           (or (= kind TSK-TYPE-LITERAL) (= kind TSK-UNION-TYPE)) (t-obj)
           :else (t-int))))
 
+(defn fng-field-coil-type [(frontend (ptr NativeFrontend))
+                           (shapes (ptr (ArrayList i64)))
+                           (type-node i64)] (-> i64)
+  ;; Source `number` values use the JavaScript numeric ABI at calls, but a static object field must
+  ;; have one raw in-memory representation. Use f64 so integer and fractional assignments share
+  ;; the same slot representation across constructors and methods.
+  (let [kind (if (<= type-node -1) -1 (ts-kind (field frontend ast) type-node))]
+    (if (= (fng-type-tag frontend type-node) FNG-NUMBER)
+        (t-flt)
+        ;; Nullable and other union fields need the tagged representation: a raw object slot
+        ;; cannot distinguish null from an object pointer while preserving both values.
+        (if (= kind TSK-UNION-TYPE)
+            (t-dyn)
+            (fng-coil-type frontend shapes type-node)))))
+
 (defn fng-field-index [(frontend (ptr NativeFrontend)) (owner i64) (name-node i64)] (-> i64)
   (let [name (ts-text (field frontend ast) name-node)
         (mut index) 0
@@ -392,6 +470,22 @@
                 (store! index (+ (load index) 1)))))
     (load answer)))
 
+(defn fng-unique-field-index [(frontend (ptr NativeFrontend)) (name-node i64)] (-> i64)
+  (let [ast (field frontend ast)
+        name (ts-text ast name-node)
+        (mut index) 0
+        (mut answer) -1]
+    (loop (if (>= (load index) (al-len [FeField] (load (field frontend fields))))
+              (break)
+              (let [field-value (al-get [FeField] (load (field frontend fields)) (load index))]
+                (if (str-eq name (fe-field-name frontend (load index)))
+                    (if (= (load answer) -1)
+                        (store! answer (load index))
+                        (store! answer -2))
+                    0)
+                (store! index (+ (load index) 1)))))
+    (if (= (load answer) -2) -1 (load answer))))
+
 (defn fng-field-local-index [(frontend (ptr NativeFrontend)) (field-index i64)] (-> i64)
   (let [field-value (al-get [FeField] (load (field frontend fields)) field-index)
         owner (load (field field-value owner))
@@ -399,7 +493,13 @@
     (- field-index (load (field type field-start)))))
 
 (defn fng-memory [(ctrl i64) (alias i64)] (-> i64)
-  (n-new1 OP-ARG (t-mem-alias alias (t-undef)) ctrl))
+  ;; A function-entry memory argument represents an existing heap, not a freshly undefined field.
+  ;; Static shape aliases carry their declared field type across calls; dynamic/runtime aliases
+  ;; retain the conservative undefined seed until an explicit effect supplies stronger evidence.
+  (n-new1 OP-ARG
+          (t-mem-alias alias
+                       (if (shape-alias-defined? alias) (shape-alias-ty alias) (t-undef)))
+          ctrl))
 
 (defn fng-merge [(memories (ptr (ArrayList i64)))] (-> i64)
   (let [merge (n-new OP-MEMMERGE 0)
@@ -845,7 +945,11 @@
                                   (load (field context cell-shape))
                                   (slice-new [i64] (cast (ptr i64) incoming) 1))
                     object (n-obj-ptr nw)
-                    stored (n-store! (n-obj-mem nw 0) object node alias)]
+                    stored
+                      (n-store! (n-obj-mem nw 0)
+                                object
+                                (fng-box-dynamic-argument! node)
+                                alias)]
                 (al-set! [i64] (mut (load (field context values))) symbol object)
                 (store! (load (field context memory)) (fng-preserve-active-memory context stored))
                 node))
@@ -854,7 +958,11 @@
                             (t-obj-shape (load (field context cell-shape)))
                             (load (load (field context ctrl)))
                             cell)
-                  stored (n-store! (fng-current-memory context alias) cast-node node alias)]
+                  stored
+                    (n-store! (fng-current-memory context alias)
+                              cast-node
+                              (fng-box-dynamic-argument! node)
+                              alias)]
               (store! (load (field context memory)) (fng-preserve-active-memory context stored))
               node)))))
 
@@ -976,6 +1084,8 @@
                   (fng-type-tag frontend (load (field fn receiver-type-node))))
               (= kind TSK-NUMERIC-LITERAL) FNG-NUMBER
               (= kind TSK-STRING-LITERAL) FNG-STRING
+              (= kind TSK-PARENTHESIZED-EXPRESSION)
+                (fng-infer context (ts-child ast node 0) FNG-DYNAMIC)
               (or (= kind TSK-TRUE) (= kind TSK-FALSE)) FNG-BOOLEAN
               (= kind TSK-NULL) FNG-NULL
               (= kind TSK-ARRAY-LITERAL) FNG-ARRAY
@@ -1853,6 +1963,37 @@
                       -1)))
             -1))))
 
+;; An identifier bound by `let f = function (...) { ... }` resolves to the local variable symbol,
+;; not directly to the nested function id. Recover the closed-world target from the declaration so
+;; calls use the function's parameter ABI while still loading the already-materialized closure
+;; environment from the local binding.
+(defn fng-local-function-target [(frontend (ptr NativeFrontend)) (node i64)] (-> i64)
+  (let [ast (field frontend ast)
+        symbol-id (fe-resolution-symbol frontend node)
+        (mut index) 0
+        (mut answer) -1]
+    (loop (if (or (>= (load index) (al-len [FeSymbol] (load (field frontend symbols))))
+                  (>= (load answer) 0))
+              (break)
+              (let [symbol (al-get [FeSymbol] (load (field frontend symbols)) (load index))]
+                (if (= (load (field symbol id)) symbol-id)
+                    (let [declaration (load (field symbol node))
+                          count (ts-child-count ast declaration)
+                          initializer (if (> count 1) (ts-child ast declaration (- count 1)) -1)]
+                      (if (and (>= initializer 0)
+                               (= (ts-kind ast initializer) TSK-FUNCTION-EXPRESSION))
+                          (let [function-index (fe-function-for-node frontend initializer)]
+                            (if (>= function-index 0)
+                                (store! answer
+                                        (load (field (index (load (field (field frontend functions) data))
+                                                                  function-index)
+                                                     id)))
+                                0))
+                          0))
+                    0)
+                (store! index (+ (load index) 1)))))
+    (load answer)))
+
 (defn fng-user-call [(context FngContext) (node i64)] (-> i64)
   (let [frontend (load (field context frontend))
         ast (field frontend ast)
@@ -1892,7 +2033,9 @@
                     (if (>= inherited 0)
                         inherited
                         (if (>= unique 0) unique typed))))
-              (fe-resolution-symbol frontend callee-node)))
+              (let [resolved (fe-resolution-symbol frontend callee-node)
+                    local-target (fng-local-function-target frontend callee-node)]
+                (if (>= local-target 0) local-target resolved))))
         ;; A property-call syntax does not by itself add a receiver slot to a statically resolved
         ;; function. Static namespace helpers such as Strength.stronger(s1, s2) do not compile a
         ;; `this` Parm; passing the base object shifts every explicit argument by one. Unresolved
@@ -1925,7 +2068,7 @@
           (if (and (>= function-index 0) (>= receiver-type 0))
               (fe-type-index-for-node frontend receiver-type)
               -1)
-        receiver
+        raw-receiver
           (if construct
               (if (>= receiver-owner 0)
                   (fng-empty-object context receiver-owner)
@@ -1944,13 +2087,21 @@
                                 first)))
                       (fng-undefined))
                   NO-NODE)))
+        receiver
+          (if (and (not construct)
+                   (and (>= receiver-owner 0)
+                        (= (n-ty raw-receiver) (t-dyn))))
+              (n-unbox! raw-receiver
+                        (t-obj-shape
+                          (al-get [i64] (load (load (field context shapes))) receiver-owner)))
+              raw-receiver)
         target
           (if (and (>= callee 0)
                    (< callee (al-len [FeFunction] (load (field frontend functions)))))
-              (if (> method-targets 0)
+                  (if (> method-targets 0)
                   (al-get [i64] (load (load (field context functions))) callee)
                   (if (> (fng-capture-count frontend callee) 0)
-                  (fng-closure-expression context (load (field fn node)))
+                  (fng-expression context callee-node)
                   (al-get [i64] (load (load (field context functions))) callee)))
               (if (and receiver-call (< function-index 0))
                   (do
@@ -2046,7 +2197,13 @@
                   (if (>= function-index 0)
                       (fe-type-index-for-node frontend (load (field fn result-node)))
                       -1)]
-            (if (>= result-owner 0) value (fng-pin-after-call! context value receiver)))
+            (if (>= result-owner 0)
+                (n-new2 OP-CAST
+                        (t-obj-shape
+                          (al-get [i64] (load (load (field context shapes))) result-owner))
+                        (load (load (field context ctrl)))
+                        value)
+                (fng-pin-after-call! context value receiver)))
           value))))
 
 (defn fng-intrinsic-call [(context FngContext) (node i64) (intrinsic i64)] (-> i64)
@@ -2145,7 +2302,10 @@
                                   (mut stores)
                                   (n-store! (n-obj-mem nw local)
                                             object
-                                            (al-get [i64] (load field-values) local)
+                                            (let [field-value (al-get [i64] (load field-values) local)]
+                                              (if (= (shape-alias-ty alias) (t-dyn))
+                                                  (fng-box-dynamic-argument! field-value)
+                                                  field-value))
                                             alias)))
                       (al-push! [i64] (mut stores) (fng-current-memory context alias)))
                   (store! index (+ (load index) 1)))))
@@ -2216,8 +2376,24 @@
         object-node (ts-child ast node 0)
         name-node (ts-child ast node 1)
         owner (fng-infer context object-node FNG-DYNAMIC)
-        object (fng-expression context object-node)
-        field-index (if (< owner 0) -1 (fng-field-index frontend owner name-node))]
+        raw-object (fng-expression context object-node)
+        field-index
+          (if (< owner 0)
+              (fng-unique-field-index frontend name-node)
+              (fng-field-index frontend owner name-node))
+        field-owner
+          (if (< field-index 0)
+              owner
+              (load (field (index (load (field (field frontend fields) data)) field-index) owner)))
+        object
+          (if (and (>= field-owner 0)
+                   (and (= (n-ty raw-object) (t-dyn))
+                        (and (!= (n-op raw-object) OP-CAST)
+                             (!= (ts-kind ast object-node) TSK-THIS))))
+              (n-unbox! raw-object
+                        (t-obj-shape
+                          (al-get [i64] (load (load (field context shapes))) field-owner)))
+              raw-object)]
     (if (and (= owner FNG-STRING) (str-eq (ts-text ast name-node) "length"))
         (n-string-length! object)
         (if (and (= owner FNG-ARRAY) (str-eq (ts-text ast name-node) "length"))
@@ -2231,7 +2407,7 @@
                                 object
                                 (ts-text ast name-node)))
                 (let [alias (al-get [i64] (load (load (field context aliases))) field-index)
-                      shape (al-get [i64] (load (load (field context shapes))) owner)
+                      shape (al-get [i64] (load (load (field context shapes))) field-owner)
                       cast-node (n-new2 OP-CAST (t-obj-shape shape) (load (load (field context ctrl))) object)]
                   (n-load! (fng-current-memory context alias) cast-node alias)))))))
 
@@ -2347,7 +2523,15 @@
                               (t-obj-shape (load (field target shape)))
                               (load (load (field context ctrl)))
                               (load (field target object)))
-                    stored (n-store! (fng-current-memory context alias) cast-node new-value alias)
+                    stored-value
+                      (if (= (shape-alias-ty alias) (t-dyn))
+                          (fng-box-dynamic-argument! new-value)
+                          (if (and (= (shape-alias-ty alias) (t-flt))
+                                   (= (n-ty new-value) (t-dyn)))
+                              (n-unbox! new-value (t-flt))
+                              new-value))
+                    stored
+                      (n-store! (fng-current-memory context alias) cast-node stored-value alias)
                     (mut memories) (al-new [i64] (malloc-allocator))
                     (mut index) 0]
                 (loop (if (>= (load index) (al-len [i64] (load (field context aliases))))
@@ -4220,9 +4404,10 @@
                             (store! shape
                                     (shape-transition (load shape)
                                                       (fe-field-name frontend field-index)
-                                                      (fng-coil-type frontend
-                                                                     shapes
-                                                                     (load (field field-value type-node)))))
+                                                      (fng-field-coil-type
+                                                        frontend
+                                                        shapes
+                                                        (load (field field-value type-node)))))
                             (store! fi (+ (load fi) 1)))))
                 (al-push! [i64] (mut shapes) (load shape))
                 (store! fi 0)

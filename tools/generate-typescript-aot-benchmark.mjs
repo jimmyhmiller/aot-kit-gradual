@@ -181,6 +181,7 @@ const generated = `(module generatedtypescriptbenchmark)
           (if (!= (g-verify) 0)
                   (do
                     (fmt (stderr) "verify={d} node={d}\\n" (g-verify-code) (g-verify-node))
+                    (g-print-flat (stderr))
                     4)
                   (do
                   (fmt (stderr) "phase=machine-select-begin\\n")

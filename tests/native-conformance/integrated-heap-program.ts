@@ -10,7 +10,7 @@ function sum(tree: Tree): number {
 
 export function main(): number {
   let roots = [];
-  for (let i = 0; i < 5; i++) roots.push(build(4, i));
+  for (let i = 0; i < 5; i++) roots[i] = build(4, i);
   let offset = 1;
   let read = function(index: number): number { return sum(roots[index]) + offset; };
   let label = 'native' + '-typescript';
