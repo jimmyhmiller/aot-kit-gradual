@@ -75,10 +75,14 @@ Read in this order:
 | `tests/*-test.coil` | One suite per area; `tools/gate.sh` runs them all |
 | `tools/dot-dump.coil`, `render-dot.sh`, `build-page.py` | The diagram pipeline and the gallery page |
 
-The first TypeScript subset and native backend are complete. The active roadmap expands the native
+The verified TypeScript subset and native backend are under active expansion. The roadmap grows the native
 `typescript-go`/Coil frontend and runtime until the complete V8 Benchmark Suite v7 runs through the
 same ideal and native pipeline. Graphs can still be built directly through the node API for focused
 compiler tests.
+
+Source-level native claims are tracked by the [Node differential conformance gate](docs/NATIVE-CONFORMANCE.md).
+It distinguishes product-path support from phase-local capability tests and correctness-qualifies
+every native benchmark before timing.
 
 ## The two things that will cost you a day
 

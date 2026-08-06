@@ -15,6 +15,8 @@ if (!Number.isSafeInteger(seed) || !Number.isSafeInteger(registers) || registers
 }
 
 const source = fs.readFileSync(input, "utf8");
+const scriptKind = input.endsWith(".ts") ? "TS-SCRIPT-TS" : "TS-SCRIPT-JS";
+const frontendSeed = seed === 0 ? 7301 : seed;
 const generated = `(module generatedtypescriptbenchmark)
 (import "frontendnative" :use *)
 (import "frontendnativegraph" :use *)
@@ -164,7 +166,7 @@ const generated = `(module generatedtypescriptbenchmark)
         register-count (if (> argc 2) (cast i64 (atoi (load (index argv 2)))) ${registers})
         source ${JSON.stringify(source)}
         filename ${JSON.stringify(input)}
-        (mut frontend) (fe-native-new-file source filename TS-SCRIPT-JS)]
+        (mut frontend) (fe-native-new-file source filename ${scriptKind})]
     (fmt (stderr) "phase=frontend-index-begin\\n")
     (if (!= (fe-native-index! (mut frontend)) FE-OK)
         (do
@@ -173,7 +175,7 @@ const generated = `(module generatedtypescriptbenchmark)
                (load (field frontend error-node)) (load (field frontend error-role)))
           (fe-native-free! (mut frontend))
           2)
-        (let [entry (frontend-native-build! (mut frontend) 7301 ${optimize ? "true" : "false"})]
+        (let [entry (frontend-native-build! (mut frontend) ${frontendSeed} ${optimize ? "true" : "false"})]
           (fmt (stderr) "phase=frontend-build-end entry={d} nodes={d}\\n" entry (n-count))
           (fe-native-free! (mut frontend))
           (if (!= (g-verify) 0)
@@ -342,7 +344,9 @@ const generated = `(module generatedtypescriptbenchmark)
                             (do (g-print-flat (stderr)) (mu-dump (stderr)) (ms-dump (stderr)) 0)
                             0)
                         (be-use-runtime-allocation! true)
-                        (if (< (be-schedule-seeded! schedule-seed) 0)
+                        (if (< (if (= schedule-seed -777)
+                                   (be-schedule!)
+                                   (be-schedule-seeded! schedule-seed)) 0)
                             (do
                               (fmt (stderr)
                                    "schedule={d} item={d} machine={d} machine-item={d} live={d} live-item={d}\\n"
@@ -350,7 +354,9 @@ const generated = `(module generatedtypescriptbenchmark)
                                    (ms-result) (ms-result-item)
                                    (ml-result) (ml-result-item))
                               6)
-                            (if (< (be-color-seeded! register-count schedule-seed) 0)
+                            (if (< (if (= schedule-seed -777)
+                                       (be-color! register-count)
+                                       (be-color-seeded! register-count schedule-seed)) 0)
                                 7
                                 (if (not (be-encode-checked!))
                                     8

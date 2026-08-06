@@ -23,6 +23,7 @@ const benchmarkArgs = ["tools/benchmark.mjs"];
 if (args[0] === "--update") benchmarkArgs.push("--publish");
 const trackedBefore = args[0] === "--update" ? null : trackedSnapshot();
 execFileSync("node", benchmarkArgs, { cwd: root, stdio: "inherit" });
+execFileSync("node", ["tools/typescript-aot-benchmarks.mjs"], { cwd: root, stdio: "inherit" });
 if (trackedBefore) assert.deepEqual(trackedSnapshot(), trackedBefore,
   "verification-only benchmark changed tracked files; use --update to publish");
 
@@ -37,6 +38,15 @@ for (const benchmark of report.benchmarks) {
 assert.equal(report.profile.specialize, true);
 assert.ok(report.profile.dominantHits * 100 >= report.profile.samples * 80);
 assert.ok(report.profile.cloneCost <= 32);
+
+const nativeReport = JSON.parse(fs.readFileSync("out/typescript-aot-benchmarks/results.json", "utf8"));
+assert.equal(nativeReport.benchmarks.length, 4);
+for (const benchmark of nativeReport.benchmarks) {
+  assert.equal(benchmark.samples.length, nativeReport.measuredSamples);
+  assert.ok(benchmark.samples.every(sample => sample.coilRuntimeNs > 0 && sample.nodeRuntimeNs > 0));
+  assert.ok(benchmark.coilCompileNs > 0 && benchmark.nodeCompileNs > 0);
+  assert.ok(Number.isFinite(benchmark.ratio) && benchmark.ratio > 0);
+}
 
 const markdown = fs.readFileSync("docs/BENCHMARKS.md", "utf8");
 assert.match(markdown, /Raw samples/);

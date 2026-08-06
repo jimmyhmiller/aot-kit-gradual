@@ -86,6 +86,14 @@ else
 fi
 
 echo
+echo "=== native source conformance ==="
+if out=$(./tools/native-source-conformance.sh 2>&1); then
+  note "native-source-conformance.sh" "$(echo "$out" | tail -1)"
+else
+  note "native-source-conformance.sh" "FAILED"; echo "$out" | tail -20; fails=$((fails+1))
+fi
+
+echo
 echo "=== performance ==="
 if out=$(./tools/benchmark-gate.sh 2>&1); then
   note "benchmark-gate.sh" "$(echo "$out" | tail -1)"

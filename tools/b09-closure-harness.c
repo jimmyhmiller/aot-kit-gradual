@@ -29,5 +29,7 @@ int main(int argc, char **argv) {
       (unsigned long long)moves);
     return 1;
   }
+  printf("result=%lld collections=%llu moves=%llu\n", (long long)five,
+    (unsigned long long)collections, (unsigned long long)moves);
   return 0;
 }
