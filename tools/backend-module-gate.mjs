@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
+import { readdir, readFile } from "node:fs/promises";
+import { fileURLToPath } from "node:url";
 
 const layers = [
   "backend_core",
@@ -42,4 +43,31 @@ const reexports = [...facade.matchAll(/\(import "(backend_[^"]+)" :reexport\)/g)
 );
 assert.deepEqual(reexports, layers, "backend facade reexports every layer in dependency order");
 
-console.log(`backend module DAG verified: ${layers.length} layers and one compatibility facade`);
+async function coilSources(directory) {
+  const files = [];
+  for (const entry of await readdir(directory, { withFileTypes: true })) {
+    const child = new URL(`${entry.name}${entry.isDirectory() ? "/" : ""}`, directory);
+    if (entry.isDirectory()) files.push(...(await coilSources(child)));
+    else if (entry.name.endsWith(".coil")) files.push(child);
+  }
+  return files;
+}
+
+let callers = 0;
+for (const root of ["../src/", "../tests/", "../tools/"]) {
+  for (const file of await coilSources(new URL(root, import.meta.url))) {
+    if (file.pathname.endsWith("/src/backend.coil")) continue;
+    const source = await readFile(file, "utf8");
+    assert.doesNotMatch(
+      source,
+      /^\(import "backend"/m,
+      `${fileURLToPath(file)} must import the phases it actually uses`,
+    );
+    const implementation = /\/src\/backend_[^/]+\.coil$/.test(file.pathname);
+    if (!implementation && /^\(import "backend_[^"]+" :use \*\)/m.test(source)) callers += 1;
+  }
+}
+
+console.log(
+  `backend module DAG verified: ${layers.length} layers, ${callers} explicit callers, one public facade`,
+);
