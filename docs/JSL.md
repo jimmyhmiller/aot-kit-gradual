@@ -612,6 +612,44 @@ edges describe the schedule that actually exists.
 `tests/native-conformance/strings-and-conversion.ts` now calls `indexOf` mid-expression, which is
 the shape that failed. Reverting the scheduler change turns that gate red.
 
+### What the conversion costs, and the one thing that would make it free
+
+`jsl-inline!` expands a definition's body into the caller's graph rather than calling it, which is
+the split Torque draws between an inlined `macro` and a called `builtin` — with the difference that
+the caller chooses, because the frontend is emitting the operation rather than invoking it. That was
+not a preference: routing Math through `jsl-call!` cost 48.9ms -> 75.9ms on
+`benchmarks/typescript-aot/math-loop.ts`, and inlining recovered it to 71.0ms.
+
+The remaining gap is a guard that will not fold. `%FloorNum` lowers to the very `OP-JSBUILTIN` the
+frontend used to emit by hand, so the library's `MathFloor` is that node plus `if (%IsInt v)`. For
+the conversion to be free, the guard has to disappear on an argument whose kind the caller knows.
+
+**Why it does not.** `box-compute` reports `dyn`, and it cannot do better. A type here is a KIND SET
+with no representation bit, so `t-flt` means "a raw double in an FP register" — precisely the wrong
+claim about a tagged word in a general-purpose one. `Box` therefore forgets, and `typetest-compute`,
+which folds the moment its input is provably inside or outside the target, never receives anything
+it can decide. The fact is one edge away, on what was boxed.
+
+**Two ways to read it there, both of which failed, and they failed for the same reason.**
+
+- In `compute`: cannot ask `n-ty-proven?` at all. It walks the input cone, the analysis is already
+  walking one, and the shared mark and stack buffers make that reentrancy a named graph corruption.
+  So a compute can only read a PROVISIONAL type.
+- In `idealize`: `n-ty-proven?` is legal there, and a unit test in `tests/node-test.coil` confirmed
+  the fold was correct in isolation — `flt` folds to false, `int` to true, `num` stays.
+
+Both turned `tools/jsl-gate.sh` and `tools/jsl-native-gate.sh` red with `VERR-ARITY`, on definitions
+that were fine before. The mechanism was never the problem: folding a `%IsInt` guard collapses an
+arm of the enclosing `if` while `jl`'s diamond is still being built, and the half-built Region and
+Phi are then left disagreeing. The prerequisite is in the LOWERING — `jl` has to tolerate a
+condition that folds under it — and it is the next piece of work here.
+
+**And it would not have helped the benchmark anyway.** The fold fires only when the boxed value's
+kind is decided. `i - 500` is `num`, which is `int|flt`: neither inside `int` nor disjoint from it,
+so either answer would be a guess. `num` is what JavaScript arithmetic produces, so the honest
+statement is that this pays off at sites where the frontend has proven a kind, and `math-loop` is
+not one. The Math conversion is kept with that cost understood rather than reverted to hide it.
+
 ---
 
 ## Reading order for the code
