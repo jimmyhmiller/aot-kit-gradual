@@ -1642,6 +1642,21 @@
     (store! cell (call-end cs))
     (call-value cs)))
 
+(defn fng-jsl-call2 [(context FngContext) (name (slice u8)) (a i64) (b i64)] (-> i64)
+  (let [buf (stack (array i64 2))
+        p (cast (ptr i64) buf)]
+    (store! (index p 0) a)
+    (store! (index p 1) b)
+    (fng-jsl-call context name (slice-new [i64] p 2))))
+
+(defn fng-jsl-call3 [(context FngContext) (name (slice u8)) (a i64) (b i64) (c i64)] (-> i64)
+  (let [buf (stack (array i64 3))
+        p (cast (ptr i64) buf)]
+    (store! (index p 0) a)
+    (store! (index p 1) b)
+    (store! (index p 2) c)
+    (fng-jsl-call context name (slice-new [i64] p 3))))
+
 (defn fng-string-call [(context FngContext) (node i64)] (-> i64)
   (let [frontend (load (field context frontend))
         ast (field frontend ast)
@@ -1692,16 +1707,24 @@
                                   (fng-expression context (ts-child ast node 2))
                                   (fng-const 0)))
                       (fng-jsl-call context "StringIndexOfFrom" (slice-new [i64] p 3)))
+                    ;; charAt, charCodeAt and slice come from lib/string/, which does its own bounds
+                    ;; and negative-index handling — the same work the C runtime was doing behind
+                    ;; the IR node. substring and substr stay hand-written: the library has no
+                    ;; definition for either yet, and `%Substring` is not one of them (substr counts
+                    ;; a LENGTH from the start, and substring SWAPS its arguments when they are out
+                    ;; of order, neither of which slice's clamping does).
                     (if (str-eq name "charCodeAt")
-                        (n-string-char-code! string start)
+                        (fng-jsl-call2 context "StringCharCodeAt" string start)
                         (if (str-eq name "charAt")
-                            (n-string-substring! string start start 3)
+                            (fng-jsl-call2 context "StringCharAt" string start)
                             (let [end
                                     (if (> argc 1)
                                         (fng-expression context (ts-child ast node 2))
                                         (n-string-length! string))
                                   mode (if (str-eq name "substring") 0 (if (str-eq name "substr") 1 2))]
-                              (n-string-substring! string start end mode))))))))))
+                              (if (str-eq name "slice")
+                                  (fng-jsl-call3 context "StringSlice" string start end)
+                                  (n-string-substring! string start end mode)))))))))))
 
 (defn fng-array-push [(context FngContext) (node i64)] (-> i64)
   (let [frontend (load (field context frontend))
