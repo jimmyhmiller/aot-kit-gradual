@@ -81,16 +81,22 @@ call. Converting them would add a name and remove nothing.
 | `isNaN(x)` | **converted** | `GlobalIsNaN` |
 | `String.fromCharCode(c)` | **converted** | `StringFromCharCode` |
 | implicit ToString at `+` | **converted** | `ToStringValue` |
-| `Number(x)` / unary `+` | not converted | — |
-| `Number.isNaN` and friends | not reachable | `NumberIsNaN` … |
+| `Number(x)` / unary `+` | **not supported by the frontend** | — |
+| `Number.isNaN` and friends | **not supported by the frontend** | `NumberIsNaN` … |
 
 `GlobalIsNaN` is `%IsNaN`, which COERCES, and that is the whole difference from `Number.isNaN`:
 `isNaN("12x")` is true because ToNumber of the argument is NaN, while `Number.isNaN("12x")` is
 false because the argument is a string rather than the NaN value. Two operations, two definitions.
 
-`Number.isNaN`, `isFinite`, `isInteger` and `isSafeInteger` are written, native-gate verified, and
-**unreachable**: the frontend has no path for `Number.*` at all. Discovered when a test using
-`Number.isNaN` crashed the emitter.
+These last two are a different category from everything else in this file, and it is worth being
+exact about it: they are not unconverted operations, they are operations the frontend cannot compile
+in the first place. There is no `FE-INTRINSIC-NUMBER`, so `Number(x)` and `Number.isNaN(x)` never
+reach any lowering, hand-written or otherwise.
+
+`NumberIsNaN`, `NumberIsFinite`, `NumberIsInteger` and `NumberIsSafeInteger` are written and
+native-gate verified against Node, and nothing can name them. Discovered when a test using
+`Number.isNaN` crashed the emitter. Reaching them means adding a frontend intrinsic — new
+functionality, not a conversion.
 
 ## Operators
 
@@ -110,6 +116,10 @@ same code units are equal, and an identity comparison would answer false for eve
 `n-string-const!`, `n-array-mark!`, `n-js-throw!` — graph construction and allocation bookkeeping,
 with no JavaScript semantics to express.
 
+`n-to-number!` also survives in two places, and it is NOT an unconverted `Number(x)`: it unboxes the
+result of a JSL Math definition, which returns a boxed integer for an integer input where
+`OP-JSBUILTIN` always returned a double. It is part of the seam, not an operation.
+
 ---
 
 ## Summary
@@ -117,16 +127,16 @@ with no JavaScript semantics to express.
 | | count |
 |---|---|
 | Converted | 27 |
-| Wiring remaining | 1 |
 | Blocked on a primitive | 4 (array resize family) |
 | Blocked on design | 1 (`split`) |
 | Not convertible | 11 (libm + `random`) |
+| Not compilable by the frontend at all | 2 (`Number(x)`, `Number.*`) |
 
-The one remaining wiring item is the `Number.*` family — `Number.isNaN`, `isFinite`, `isInteger`
-and `isSafeInteger` are written and native-gate verified, but the frontend has no path for `Number.*`
-at all, so reaching them means adding an intrinsic rather than moving a call site.
+**Every operation the frontend can compile, and that a DSL can express, is converted.** The four
+remaining rows are a missing primitive, one allocation-path design question, libm, and two things
+the frontend has never supported.
 
 The honest shape of it: **nothing is blocked by the DSL's expressiveness.** What remains is one
-missing primitive, one allocation-path design question, and one intrinsic the frontend does not
-recognise. The two things that ever genuinely blocked conversion — memory crossing the seam, and the cost
+missing primitive, one allocation-path design question, and two intrinsics the frontend
+does not recognise. The two things that ever genuinely blocked conversion — memory crossing the seam, and the cost
 of the abstraction — are both fixed, in `jsl-inline!` and in `g-fold-proven!` respectively.
