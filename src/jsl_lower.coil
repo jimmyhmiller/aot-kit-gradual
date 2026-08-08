@@ -952,7 +952,8 @@
 ;;
 ;; `ctrl-cell` is read for the control to build on and written with the control the body ended on,
 ;; which is how a body containing an `if` hands its merge back to the caller.
-(defn jsl-inline! [(ctrl-cell (ptr i64)) (name (slice u8)) (args (slice i64))] (-> i64)
+(defn jsl-inline! [(ctrl-cell (ptr i64)) (mem-cell (ptr i64))
+                   (name (slice u8)) (args (slice i64))] (-> i64)
   (let [d (jsl-find name)]
     (if (< d 0)
         (do (panic-corrupt "jsl-inline!: no such definition") 0)
@@ -960,21 +961,27 @@
     (if (!= (slice-len args) (jsl-decl-nparams d))
         (do (panic-corrupt "jsl-inline!: argument count does not match the declaration") 0)
         0)
-    ;; A definition that touches the heap synthesises its OWN entry heap, which is deliberately not
-    ;; its caller's — see the note on `heapparams`. Inlined into the frontend it would read a memory
-    ;; chain the caller never wrote, and answer from an empty heap without anything noticing. None
-    ;; of the definitions the frontend emits today touch it; this refuses rather than discovers.
-    (if (jsl-decl-uses-memory? d)
-        (do (panic-corrupt
-              "jsl-inline!: a definition that touches the heap cannot be inlined into a caller's graph")
-            0)
-        0)
+    ;; THE HEAP THREADS THROUGH; IT IS NOT REFUSED. This used to panic on any definition the checker
+    ;; found touches memory, and that was the CALL path's reasoning misapplied here.
+    ;;
+    ;; A CALLED definition works on a heap that is not its caller's: it takes one in, returns the one
+    ;; it leaves, and `heapparams` refuses an array arriving as a PARAMETER precisely because its
+    ;; contents live in a chain the callee cannot see. Inlining has no such split. The body's nodes
+    ;; ARE the caller's nodes, so there is exactly one memory chain — the caller's — and binding it
+    ;; before the body and reading it back after is the whole of it. Inlining is the answer to
+    ;; `heapparams` rather than a casualty of it.
     (let [saved-frame (jl-frame)
           saved-decl (load (field (jl) decl))
           saved-ctrl (jl-ctrl)
+          saved-mem (jl-mem-raw)
+          uses-mem (jsl-decl-uses-memory? d)
           depth (jl-depth)
           (mut k) 0]
       (jl-set-ctrl! (load ctrl-cell))
+      ;; Established BEFORE the body, for the reason `jl-lower-decl!` gives at length: a heap first
+      ;; touched inside a loop has no memory at the loop's entry, so no loop memory Phi is built and
+      ;; every iteration re-reads the entry heap instead of the previous iteration's writes.
+      (jl-set-mem! (if uses-mem (load mem-cell) NO-NODE))
       ;; Parameters are the only bindings the body may see: `jl-set-frame!` hides everything the
       ;; caller had bound, exactly as a macro expansion does.
       (jl-set-frame! depth)
@@ -985,6 +992,10 @@
       (store! (field (jl) decl) d)
       (let [v (jl-expr (jsl-decl-body d))]
         (store! ctrl-cell (jl-ctrl))
+        ;; The caller now owns whatever the body left behind. Nothing RETURNS memory here — there is
+        ;; no call to return from, which is why this needs no `VERR-LEAK` dance either.
+        (if uses-mem (store! mem-cell (jl-mem-raw)) 0)
+        (jl-set-mem! saved-mem)
         (store! (field (jl) decl) saved-decl)
         (jl-set-frame! saved-frame)
         ;; The result outlives the bindings that built it, so it is pinned across the drop.
