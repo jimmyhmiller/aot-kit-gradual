@@ -24,6 +24,12 @@ COVERED=(
   "MathAbs:1:abs:nums"
   "MathSign:1:sign:nums"
   "MathTrunc:1:trunc:nums"
+  "MathMax2:2:max:pairs"
+  "MathMin2:2:min:pairs"
+  "NumberIsNaN:1:isnan:vals"
+  "NumberIsFinite:1:isfin:vals"
+  "NumberIsInteger:1:isint:vals"
+  "NumberIsSafeInteger:1:issafe:vals"
 )
 
 covered=0

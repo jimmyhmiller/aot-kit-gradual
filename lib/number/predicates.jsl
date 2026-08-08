@@ -1,21 +1,36 @@
-;; https://tc39.es/ecma262/#sec-number.isnan etc. Every one of these is false for a NON-number, which
-;; is the whole difference between `Number.isNaN` and the global `isNaN`, so each begins with a type
-;; test rather than a coercion.
-(builtin NumberIsNaN :params [(v dyn)] :ret bool
-  (if (IsNumber v) (IsNaNValue v) false))
+;; https://tc39.es/ecma262/#sec-number.isnan and friends. Every one is false for a NON-number, which
+;; is the whole difference between these and the global `isNaN`.
+;;
+;; THE LOGIC IS IN MACROS, THE BUILTINS ARE BOXING WRAPPERS. A `builtin` returns a boxed JavaScript
+;; value, so one calling another gets a boxed bool back and cannot use it as an `if` condition
+;; without unboxing it again. Keeping the predicate itself a macro over a RAW bool means the
+;; composition is free and only the entry point boxes.
 
-(builtin NumberIsFinite :params [(v dyn)] :ret bool
-  (if (IsNumber v)
-      (if (IsNaNValue v) false
-        (if (%Eq v (Infinity)) false (%Not (%Eq v (NegInfinity)))))
-      false))
+;; A NaN is a Number, so `%IsFlt` covering it is what makes this correct rather than a special case.
+(macro IsFiniteNumber :params [(v dyn)] :ret bool
+  (if (%IsInt v) true
+    (if (%IsFlt v)
+        (let [(x (%UnboxFlt v))]
+          (if (FltIsNaN x)
+              false
+              (if (%Eq x (%Div 1.0 0.0)) false (%Not (%Eq x (%Div -1.0 0.0))))))
+        false)))
 
-;; An integral Number is one equal to its own truncation. The finiteness test comes first because
+;; An integral Number equals its own truncation. The finiteness test comes first because
 ;; `trunc(Infinity)` is `Infinity`, which would otherwise compare equal and report true.
-(builtin NumberIsInteger :transitioning true :params [(v dyn)] :ret bool
-  (if (NumberIsFinite v) (%Eq v (MathTrunc v)) false))
+(macro IsIntegerNumber :params [(v dyn)] :ret bool
+  (if (%IsInt v) true
+    (if (IsFiniteNumber v) (NumEq v (MathTrunc v)) false)))
 
-(builtin NumberIsSafeInteger :transitioning true :params [(v dyn)] :ret bool
-  (if (NumberIsInteger v)
-      (%Le (MathAbs v) 9007199254740991)
-      false))
+;; THE BOUND IS A DOUBLE, NOT A BOXED INTEGER. A NaN-boxed integer carries a 48-bit payload, so
+;; 2^53-1 does not fit one: `(%Box 9007199254740991)` truncates and every comparison against it is
+;; nonsense. Written as a float literal it is exactly representable, which is the whole reason the
+;; safe-integer bound is where it is.
+(macro IsSafeIntegerNumber :params [(v dyn)] :ret bool
+  (if (IsIntegerNumber v) (NumLe (MathAbs v) (%Box 9007199254740991.0)) false))
+
+(builtin NumberIsNaN :params [(v dyn)] :ret dyn (%Box (IsNaNNumber v)))
+(builtin NumberIsFinite :params [(v dyn)] :ret dyn (%Box (IsFiniteNumber v)))
+(builtin NumberIsInteger :transitioning true :params [(v dyn)] :ret dyn (%Box (IsIntegerNumber v)))
+(builtin NumberIsSafeInteger :transitioning true :params [(v dyn)] :ret dyn
+  (%Box (IsSafeIntegerNumber v)))

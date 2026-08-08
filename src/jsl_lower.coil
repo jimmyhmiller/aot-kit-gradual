@@ -234,8 +234,22 @@
 ;; null: a value op is ordered by its data edges and by nothing else, which is what lets the
 ;; optimiser float it. Arity came from `jsp-arity` and was checked, so an unhandled width here is
 ;; a table that grew a row without growing this dispatch.
+;; An unbox is CHECKED: `MI-JSUNBOX` traps on a tag mismatch. `OP-UNBOX` has a null control anchor,
+;; so it floats and the scheduler may place it where the guard that establishes the tag has not run
+;; — measured as a `brk` in `MathMin2` while the structurally identical `MathMax2` happened to be
+;; scheduled safely.
+;;
+;; D4's pattern is the fix: a guard is `If(TypeTest(v, T))` followed by a `Cast(T)` ON THE TAKEN
+;; EDGE, and `OP-CAST` takes a real control input. Narrowing through the Cast pins the claim to the
+;; guarded edge, after which the Unbox is floating over a value whose type is already proven and
+;; cannot trap.
+(defn jl-unbox [(target i64) (v i64)] (-> i64)
+  (n-peephole (n-new2 OP-UNBOX target NO-NODE
+                      (n-peephole (n-new2 OP-CAST target (jl-ctrl) v)))))
+
 (defn jl-prim [(id i64) (a i64) (b i64) (c i64)] (-> i64)
-  (if (jsp-touches-memory? id) (jl-prim-mem id a b c)
+  (if (or (= id JSP-UNBOXINT) (= id JSP-UNBOXFLT)) (jl-unbox (jsp-aux id) a)
+   (if (jsp-touches-memory? id) (jl-prim-mem id a b c)
     (let [op (jsp-op id)
           n (jsp-arity id)
           aux (jsp-aux id)]
@@ -243,7 +257,7 @@
         (if (= n 2) (n-peephole (n-new3 op aux NO-NODE a b))
           (if (= n 3) (n-peephole (n-new4 op aux NO-NODE a b c))
             (do (panic-corrupt "jsl lowering: a primitive arity this dispatch does not build")
-                NO-NODE)))))))
+                NO-NODE))))))))
 
 ;; A heap-reading primitive. The memory operand is supplied here rather than written in the `.jsl`
 ;; source, so `%ArrayLoad a i` in the library becomes `ArrayLoad(mem, a, i)` in the graph and the
