@@ -1478,7 +1478,39 @@
   (let [name (fng-array-builtin-name context node)]
     (or (str-eq name "push")
         (or (str-eq name "pop")
-            (or (str-eq name "shift") (str-eq name "slice"))))))
+            (or (str-eq name "shift")
+                (or (str-eq name "slice")
+                    (or (str-eq name "indexOf")
+                        (or (str-eq name "includes") (str-eq name "lastIndexOf")))))))))
+
+;; The read-only searches, straight out of lib/array/read.jsl.
+;;
+;; THESE ARE THE FIRST HEAP-TOUCHING DEFINITIONS THE FRONTEND EMITS, and they are `macro`s rather
+;; than `builtin`s for the reason that file's header gives: memory reaches a function as an OP-ARG
+;; and never as a parameter, so a called builtin would synthesise its own empty entry heap and read
+;; nothing. A macro is expanded into the caller's graph, so it reads the caller's memory —
+;; `jsl-inline!` binds it going in and publishes whatever the body left on the way out.
+;;
+;; The receiver stays a RAW array pointer, which is what `%ArrayLen` and `%ArrayLoad` expect. The
+;; search target is BOXED, because array elements are stored boxed and `%Eq` compares the stored
+;; words.
+(defn fng-array-search [(context FngContext) (node i64) (name (slice u8))] (-> i64)
+  (let [frontend (load (field context frontend))
+        ast (field frontend ast)
+        callee (ts-child ast node 0)
+        array (fng-expression context (ts-child ast callee 0))
+        argc (- (ts-child-count ast node) 1)
+        target (n-box! (if (> argc 0)
+                           (fng-expression context (ts-child ast node 1))
+                           (fng-undefined)))]
+    (if (str-eq name "includes")
+        (fng-jsl-call2 context "ArrayIncludes" array target)
+        (if (str-eq name "lastIndexOf")
+            (fng-jsl-call2 context "ArrayLastIndexOf" array target)
+            (fng-jsl-call3 context "ArrayIndexOfFrom" array target
+                           (if (> argc 1)
+                               (fng-expression context (ts-child ast node 2))
+                               (fng-const 0)))))))
 
 (defn fng-math-member-id [(context FngContext) (node i64)] (-> i64)
   (let [frontend (load (field context frontend))
@@ -1894,6 +1926,9 @@
     (cond (str-eq name "push") (fng-array-push context node)
           (str-eq name "pop") (fng-array-pop context node)
           (str-eq name "shift") (fng-array-shift context node)
+          (str-eq name "indexOf") (fng-array-search context node name)
+          (str-eq name "includes") (fng-array-search context node name)
+          (str-eq name "lastIndexOf") (fng-array-search context node name)
           :else (fng-array-slice context node))))
 
 (defn fng-owner-constructor [(frontend (ptr NativeFrontend)) (owner i64)] (-> i64)
