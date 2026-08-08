@@ -355,8 +355,121 @@ AotJsValue aot_js_builtin(AotJsValue a, AotJsValue b, uint64_t operation) {
 /* Canonical immutable UTF-16 string ABI. Mutation exists only for operation 1
    while a freshly-created literal is being initialized, and every slot may be
    written exactly once. All observable operations reject incomplete records. */
+
+/* ToNumber and ToIntegerOrInfinity, mirroring src/eval.coil's `ev-to-number-value` and
+   `ev-to-integer` exactly — the interpreter and this runtime are two implementations of one
+   semantics, and tools/jsl-gate.sh compares both against the same Node table.
+
+   StringToNumber uses the same rule the interpreter does: the token is trimmed, an empty string is
+   +0, `Infinity` is spelled exactly that way, the three integer prefixes take no sign, and anything
+   else must be a StrDecimalLiteral before strtod sees it. The gate matters — strtod accepts "nan",
+   "inf", "0x1p3" and trailing junk that JavaScript does not. */
+static double aot_js_string_to_number(const JsStringRec *rec) {
+  size_t lo = 0, hi = rec->length;
+  while (lo < hi && (rec->units[lo] == ' ' || (rec->units[lo] >= 9 && rec->units[lo] <= 13))) ++lo;
+  while (hi > lo && (rec->units[hi - 1] == ' ' || (rec->units[hi - 1] >= 9 && rec->units[hi - 1] <= 13))) --hi;
+  size_t n = hi - lo;
+  if (n == 0) return 0.0;
+  static const char *inf_names[3] = {"Infinity", "+Infinity", "-Infinity"};
+  for (int k = 0; k < 3; ++k) {
+    size_t len = strlen(inf_names[k]);
+    if (n != len) continue;
+    size_t i = 0;
+    while (i < n && rec->units[lo + i] == (uint16_t)inf_names[k][i]) ++i;
+    if (i == n) return k == 2 ? -INFINITY : INFINITY;
+  }
+  if (n > 2 && rec->units[lo] == '0') {
+    int radix = 0;
+    uint16_t p = rec->units[lo + 1];
+    if (p == 'x' || p == 'X') radix = 16;
+    else if (p == 'o' || p == 'O') radix = 8;
+    else if (p == 'b' || p == 'B') radix = 2;
+    if (radix) {
+      double acc = 0.0;
+      for (size_t i = lo + 2; i < hi; ++i) {
+        uint16_t c = rec->units[i];
+        int d = (c >= '0' && c <= '9') ? c - '0'
+              : (c >= 'a' && c <= 'z') ? c - 'a' + 10
+              : (c >= 'A' && c <= 'Z') ? c - 'A' + 10 : 99;
+        if (d >= radix) return NAN;
+        acc = acc * radix + d;
+      }
+      return acc;
+    }
+  }
+  /* StrDecimalLiteral gate: [+-]? ( digits ('.' digits?)? | '.' digits ) ([eE] [+-]? digits)? */
+  size_t i = 0, intd = 0, frac = 0;
+  if (i < n && (rec->units[lo + i] == '+' || rec->units[lo + i] == '-')) ++i;
+  while (i < n && rec->units[lo + i] >= '0' && rec->units[lo + i] <= '9') { ++intd; ++i; }
+  if (i < n && rec->units[lo + i] == '.') {
+    ++i;
+    while (i < n && rec->units[lo + i] >= '0' && rec->units[lo + i] <= '9') { ++frac; ++i; }
+  }
+  if (intd + frac == 0) return NAN;
+  if (i < n && (rec->units[lo + i] == 'e' || rec->units[lo + i] == 'E')) {
+    ++i;
+    if (i < n && (rec->units[lo + i] == '+' || rec->units[lo + i] == '-')) ++i;
+    size_t expd = 0;
+    while (i < n && rec->units[lo + i] >= '0' && rec->units[lo + i] <= '9') { ++expd; ++i; }
+    if (expd == 0) return NAN;
+  }
+  if (i != n) return NAN;
+  char buf[64];
+  if (n >= sizeof buf) return NAN;
+  for (size_t k = 0; k < n; ++k) buf[k] = (char)rec->units[lo + k];
+  buf[n] = '\0';
+  return strtod(buf, NULL);
+}
+
+/* Every value's ToNumber, as a double. `ok` is cleared for the cases the spec throws on: symbols,
+   bigints and objects needing ToPrimitive. Reporting that rather than inventing a number is the
+   same choice `ev-to-number-value` makes with EV-TYPE. */
+static double aot_js_to_number_double(AotJsValue v, int *ok) {
+  *ok = 1;
+  uint64_t tag = aot_js_tag(v);
+  if (tag == AOT_JS_UNDEFINED) return NAN;
+  if (tag == AOT_JS_NULL) return 0.0;
+  if (tag == AOT_JS_BOOLEAN) return aot_js_payload(v) ? 1.0 : 0.0;
+  if (tag == AOT_JS_INTEGER) return (double)aot_js_unbox_int(v);
+  if (tag == AOT_JS_NAN) return NAN;
+  if (tag == AOT_JS_STRING) {
+    JsStringRec *rec = js_string_lookup(aot_js_payload(v));
+    if (!rec) { *ok = 0; return NAN; }
+    return aot_js_string_to_number(rec);
+  }
+  if (!aot_js_tagged(v)) {
+    union { uint64_t bits; double number; } decoded = {v};
+    return decoded.number;
+  }
+  *ok = 0;
+  return NAN;
+}
+
+static AotJsValue aot_js_number_result(double d) {
+  if (d != d) return AOT_JS_NAN;
+  if (d >= -9007199254740992.0 && d <= 9007199254740992.0 && d == (double)(int64_t)d) {
+    int64_t t = (int64_t)d;
+    if (t >= AOT_JS_INT_MIN && t <= AOT_JS_INT_MAX) return aot_js_box_int(t);
+  }
+  union { double number; uint64_t bits; } encoded = {d};
+  return (AotJsValue)encoded.bits;
+}
+
 AotJsValue aot_js_string(uintptr_t a, int64_t b,
                          AotJsValue value, uint64_t operation) {
+  if (operation == AOT_JS_VALUE_TO_NUMBER || operation == AOT_JS_VALUE_TO_INTEGER) {
+    int ok = 0;
+    double d = aot_js_to_number_double((AotJsValue)a, &ok);
+    if (!ok) {
+      fprintf(stderr, "aot_js_string: ToNumber on a value requiring ToPrimitive\n");
+      abort();
+    }
+    if (operation == AOT_JS_VALUE_TO_NUMBER) return aot_js_number_result(d);
+    if (d != d) return aot_js_box_int(0);
+    if (d == INFINITY || d == -INFINITY) return aot_js_number_result(d);
+    double t = d < 0 ? ceil(d) : floor(d);
+    return aot_js_number_result(t);
+  }
   if (operation == AOT_JS_VALUE_STRICT_EQUAL) {
 #ifdef AOT_DEBUG_VALUE_EQUAL
     static uint64_t debug_equality_calls;

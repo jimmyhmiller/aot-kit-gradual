@@ -32,7 +32,12 @@ enum {
   AOT_JS_STRING_COMPARE = 24,
   AOT_JS_STRING_FROM_VALUE = 25,
   AOT_JS_VALUE_STRICT_EQUAL = 26,
-  AOT_JS_VALUE_TRUTHY = 27
+  AOT_JS_VALUE_TRUTHY = 27,
+  /* ToNumber and ToIntegerOrInfinity, mirroring `ev-to-number-value` and `ev-to-integer` in
+     src/eval.coil. They are value-level rather than string-level ops and are dispatched before the
+     string record is looked up, like STRICT_EQUAL and TRUTHY. */
+  AOT_JS_VALUE_TO_NUMBER = 28,
+  AOT_JS_VALUE_TO_INTEGER = 29
 };
 enum {
   AOT_JS_BUILTIN_ABS = 0, AOT_JS_BUILTIN_FLOOR = 1, AOT_JS_BUILTIN_CEIL = 2,

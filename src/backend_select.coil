@@ -2015,6 +2015,37 @@
                             fresh (ms-new-vreg!)]
                         (ms-emit! owner bid (mi-new MI-BITNOT fresh a -1 0 node))
                         (store! vr fresh))))
+;; Logical NOT over JavaScript truthiness. Two shapes, and the split matters for code quality
+                ;; rather than correctness: an operand already known to be an integer or a boolean is
+                ;; falsy exactly when it is zero, so `MI-EQ` against zero is the whole instruction and
+                ;; no runtime call is needed. Anything dynamic goes through the same
+                ;; `JSSOP-VALUE-TRUTHY` helper the If predicate and dynamic `Eq` already use, then is
+                ;; compared against zero to invert it.
+;; ToNumber and ToIntegerOrInfinity go to the runtime, which is where a correctly-rounded
+                ;; string-to-double belongs: the alternative is open-coding strtod in the compiler.
+                  OP-TONUMBER
+                (let [a (ms-select-value-at! owner (n-in node 1) bid)
+                      zero (ms-immediate! owner bid 0)]
+                  (if (< a 0) 0
+                    (store! vr (ms-jsstring! owner bid node a zero zero JSSOP-TO-NUMBER))))
+                  OP-TOINTEGER
+                (let [a (ms-select-value-at! owner (n-in node 1) bid)
+                      zero (ms-immediate! owner bid 0)]
+                  (if (< a 0) 0
+                    (store! vr (ms-jsstring! owner bid node a zero zero JSSOP-TO-INTEGER))))
+                  OP-NOT
+                (let [an (n-in node 1)
+                      a (ms-select-value-at! owner an bid)
+                      zero (ms-immediate! owner bid 0)]
+                  (if (< a 0)
+                      0
+                      (let [operand
+                              (if (or (ty-int-only? (n-ty an)) (= (ty-kinds (n-ty an)) VK-BOOL))
+                                  a
+                                  (ms-jsstring! owner bid NO-NODE a zero zero JSSOP-VALUE-TRUTHY))
+                            fresh (ms-new-vreg!)]
+                        (ms-emit! owner bid (mi-new MI-EQ fresh operand zero 0 node))
+                        (store! vr fresh))))
                   OP-MINUS
                 (let [a (ms-select-value-at! owner (n-in node 1) bid)]
                   (if (< a 0)
