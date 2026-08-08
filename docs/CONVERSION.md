@@ -52,6 +52,24 @@ The four unconverted ones all RESIZE. There is no `%ArrayResize` primitive, so t
 written today — this is the one place in this table where a new primitive is the blocker rather
 than wiring.
 
+An attempt at it got far enough to be worth recording, and was reverted rather than left half-done:
+
+- **`push` converts cleanly.** `ArrayPush1` appends one element and answers the new length; the
+  variadic part stays in the frontend as a loop, one call per argument. Conformance green, and
+  falsified two ways (wrong return length, wrong store index).
+- **`%ArrayResize` needs a THIRD operand, an ordering value.** `OP-ARRAYRESIZE`'s fifth input exists
+  for exactly this: `pop` reads the last element and then shortens the array, and nothing in the
+  memory chain forces the read to happen first, so the load floats past the write that destroys what
+  it read. Selection catches it as `MSEL-MEMORY-ORDER`. Mapping the primitive to
+  `n-array-resize-after-at!` and naming the loaded value fixed it.
+- **The frontend must record the dynamic alias BEFORE inlining, not after.** Every hand-written
+  array path does it in that order. Recording it afterwards leaves the loads and stores the body
+  already built outside the alias subsequently declared dynamic.
+- **Unresolved:** adding the mutating macros to `lib/array/build.jsl` turns `tools/jsl-native-gate.sh`
+  red with `MSEL-UNSUPPORTED`, on `String.prototype.indexOf` — a definition that touches no array and
+  calls none of the new macros. Removing the macros alone restores it. That is not understood, and
+  it is the actual blocker: the primitive and the definitions are the easy part.
+
 ## Math
 
 | Operation | Status | Definition |
