@@ -12,6 +12,11 @@ const cases = [
   { name: "call-loop", input: 5_000_000, repeats: 1 },
   { name: "bitwise-mix", input: 2_000_000, repeats: 1 },
   { name: "floating-point", input: 20_000_000, repeats: 1 },
+  // Exercises the Math builtins that lib/math/rounding.jsl now computes, so a regression from
+  // replacing an inline IR node with a call into the runtime library is visible rather than assumed.
+  { name: "math-loop", input: 2_000_000, repeats: 1 },
+  // Exercises the string operations lib/string/ now computes, for the same reason.
+  { name: "string-loop", input: 500_000, repeats: 1 },
 ];
 const measuredSamples = 9;
 const nodeWarmupIterations = Number(process.env.AOT_NODE_WARMUP_ITERATIONS ?? 1_000);

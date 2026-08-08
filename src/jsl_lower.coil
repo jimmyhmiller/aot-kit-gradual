@@ -910,6 +910,16 @@
           (let [err (jl-require-body! (jsl-decl-body d))]
             (if (!= err JSL-OK) err (jl-lower-decl! d)))))))
 
+;; Lower everything a definition CALLS, without lowering the definition itself. That is exactly what
+;; an inlined body needs: its own nodes go straight into the caller's graph, but a builtin it calls
+;; still needs a Fun to call, and a macro it uses still needs that macro's callees.
+(defn jsl-require-body-only! [(name (slice u8))] (-> i64)
+  (if (not (jsl-ok?)) (jsl-err)
+    (let [d (jsl-find name)]
+      (if (< d 0)
+          (jsl-fail! JSL-ERR-UNKNOWN-CALL name)
+          (jl-require-body! (jsl-decl-body d))))))
+
 ;; Pull one definition into the current graph by name. Idempotent: calling it twice for the same
 ;; name lowers once and the second call is free, which is what lets a caller ask on every use.
 (defn jsl-require! [(name (slice u8))] (-> i64)
@@ -926,6 +936,64 @@
 ;; Call a lowered builtin from outside. This is how a program reaches the runtime library, and it
 ;; is the seam the frontend will eventually emit through: today it is what the suite uses to run a
 ;; `.jsl` definition under the evaluator.
+;; Expand a definition's body straight into the CALLER's graph, with the caller's nodes bound to the
+;; parameters. No Fun, no Call, no return — the body's nodes simply become the caller's.
+;;
+;; WHY THIS EXISTS, MEASURED. Routing the frontend's Math builtins through `jsl-call!` cost real
+;; time: `benchmarks/typescript-aot/math-loop.ts` went from 48.9ms to 75.9ms, a 1.55x slowdown,
+;; because every `Math.abs` became a function call where it had been an inline node. The values were
+;; identical, so this is purely what the call frame costs. There is no inliner in the optimiser to
+;; recover it afterwards, so the choice has to be made here.
+;;
+;; This is the split Torque draws — a `macro` is inlined into its caller, a `builtin` is a separate
+;; code object — with one difference: the choice belongs to the CALLER, not the declaration. The
+;; same definition is a call when another library definition calls it and an inlining when the
+;; frontend emits it, because the frontend is emitting the operation itself rather than invoking it.
+;;
+;; `ctrl-cell` is read for the control to build on and written with the control the body ended on,
+;; which is how a body containing an `if` hands its merge back to the caller.
+(defn jsl-inline! [(ctrl-cell (ptr i64)) (name (slice u8)) (args (slice i64))] (-> i64)
+  (let [d (jsl-find name)]
+    (if (< d 0)
+        (do (panic-corrupt "jsl-inline!: no such definition") 0)
+        0)
+    (if (!= (slice-len args) (jsl-decl-nparams d))
+        (do (panic-corrupt "jsl-inline!: argument count does not match the declaration") 0)
+        0)
+    ;; A definition that touches the heap synthesises its OWN entry heap, which is deliberately not
+    ;; its caller's — see the note on `heapparams`. Inlined into the frontend it would read a memory
+    ;; chain the caller never wrote, and answer from an empty heap without anything noticing. None
+    ;; of the definitions the frontend emits today touch it; this refuses rather than discovers.
+    (if (jsl-decl-uses-memory? d)
+        (do (panic-corrupt
+              "jsl-inline!: a definition that touches the heap cannot be inlined into a caller's graph")
+            0)
+        0)
+    (let [saved-frame (jl-frame)
+          saved-decl (load (field (jl) decl))
+          saved-ctrl (jl-ctrl)
+          depth (jl-depth)
+          (mut k) 0]
+      (jl-set-ctrl! (load ctrl-cell))
+      ;; Parameters are the only bindings the body may see: `jl-set-frame!` hides everything the
+      ;; caller had bound, exactly as a macro expansion does.
+      (jl-set-frame! depth)
+      (loop (if (>= (load k) (slice-len args)) (break)
+              (do (jl-bind! (jsl-param-name d (load k)) (slice-get args (load k)))
+                  (store! k (+ (load k) 1))
+                  0)))
+      (store! (field (jl) decl) d)
+      (let [v (jl-expr (jsl-decl-body d))]
+        (store! ctrl-cell (jl-ctrl))
+        (store! (field (jl) decl) saved-decl)
+        (jl-set-frame! saved-frame)
+        ;; The result outlives the bindings that built it, so it is pinned across the drop.
+        (jl-keep! v)
+        (jl-drop! depth)
+        (jl-unkeep! v)
+        (jl-set-ctrl! saved-ctrl)
+        v))))
+
 (defn jsl-call! [(ctrl i64) (name (slice u8)) (args (slice i64))] (-> CallSite)
   (let [d (jsl-find name)]
     (if (< d 0)

@@ -1537,9 +1537,16 @@
       ;; libm calls, not JavaScript semantics, and there is nothing for a DSL to express about them.
       ;; Math.max and Math.min stay too, because they are variadic and MathMax2 is binary.
       ;;
+      ;; WHAT MAKES THIS FREE IS `typetest-idealize`, NOT THIS CODE. The library's MathFloor is
+      ;; `if (%IsInt v) v else (%FloorNum v)`, and `%FloorNum` lowers to the same OP-JSBUILTIN the
+      ;; hand-written form emitted — so the conversion is that node plus a guard. The guard folds
+      ;; against a boxed argument whose input type is proven, which is why the box is built here
+      ;; from a value the frontend has already typed rather than from something opaque.
+      ;;
       ;; THE RESULT GOES THROUGH ToNumber, NOT AN UNBOX TO `flt`. OP-JSBUILTIN always answers a
-      ;; double, so unboxing its result as a float is right. A JSL definition does not: `MathAbs` of
-      ;; a boxed integer returns a boxed INTEGER, and reading that as a float reinterprets the bits.
+      ;; double, so unboxing its result as a float is right. A JSL definition is not the same:
+      ;; `MathAbs` of a boxed integer returns a boxed INTEGER, and reading that as a float
+      ;; reinterprets the bits. Math.abs(-7) takes exactly that path.
       (let [jsl-name (if (= descriptor JBI-ABS) "MathAbs"
                        (if (= descriptor JBI-FLOOR) "MathFloor"
                          (if (= descriptor JBI-CEIL) "MathCeil"
@@ -1645,16 +1652,21 @@
 ;; machine integers for the same reason. Only a definition returning `dyn` needs unboxing at this
 ;; boundary, and none of the ones called here do.
 ;;
-;; The call's control edge replaces the frontend's, because a `transitioning` definition can throw
-;; and everything sequenced after it belongs on the edge where it did not.
+;; THE BODY IS INLINED, NOT CALLED, and that is a measured decision rather than a preference. Going
+;; through `jsl-call!` made `benchmarks/typescript-aot/math-loop.ts` 1.55x slower — 48.9ms to
+;; 75.9ms — because every `Math.abs` became a function call where it had been an inline node, and
+;; there is no inliner downstream to give that back. `jsl-inline!` expands the body into this graph
+;; with these argument nodes bound to the parameters, so the library costs what the hand-written
+;; node cost. It is the same split Torque draws between an inlined `macro` and a called `builtin`,
+;; except the caller chooses: the frontend is emitting the operation, not invoking it.
+;;
+;; The control cell is passed through because a body containing an `if` ends on its merge, and
+;; everything the frontend sequences afterwards belongs there.
 (defn fng-jsl-call [(context FngContext) (name (slice u8)) (args (slice i64))] (-> i64)
-  (if (!= (jsl-require! name) JSL-OK)
-      (do (panic-corrupt "frontend: a JSL definition the frontend calls did not lower") 0)
+  (if (!= (jsl-require-body-only! name) JSL-OK)
+      (do (panic-corrupt "frontend: a JSL definition the frontend emits did not resolve") 0)
       0)
-  (let [cell (load (field context ctrl))
-        cs (jsl-call! (load cell) name args)]
-    (store! cell (call-end cs))
-    (call-value cs)))
+  (jsl-inline! (load (field context ctrl)) name args))
 
 (defn fng-jsl-call1 [(context FngContext) (name (slice u8)) (a i64)] (-> i64)
   (let [buf (stack (array i64 1))
@@ -1705,9 +1717,9 @@
           (store! (load (field context memory)) (fng-preserve-active-memory context split))
           result)
         (if (str-eq name "toLowerCase")
-            (n-string-lower! string)
+            (fng-jsl-call1 context "StringToLowerCase" string)
             (if (str-eq name "toUpperCase")
-                (n-string-upper! string)
+                (fng-jsl-call1 context "StringToUpperCase" string)
                 (if (str-eq name "indexOf")
                     ;; Steps 5-7 of String.prototype.indexOf, from lib/string/index-of.jsl rather
                     ;; than a hand-written IR node. The receiver is known to be a string here (the
@@ -1727,12 +1739,11 @@
                                   (fng-expression context (ts-child ast node 2))
                                   (fng-const 0)))
                       (fng-jsl-call context "StringIndexOfFrom" (slice-new [i64] p 3)))
-                    ;; charAt, charCodeAt and slice come from lib/string/, which does its own bounds
-                    ;; and negative-index handling — the same work the C runtime was doing behind
-                    ;; the IR node. substring and substr stay hand-written: the library has no
-                    ;; definition for either yet, and `%Substring` is not one of them (substr counts
-                    ;; a LENGTH from the start, and substring SWAPS its arguments when they are out
-                    ;; of order, neither of which slice's clamping does).
+                    ;; Every remaining extractor comes from lib/string/, which does its own bounds
+                    ;; and negative-index handling — the work the C runtime used to do behind these
+                    ;; IR nodes. The three are separate definitions rather than one clamped helper
+                    ;; because they genuinely differ: substr's second argument is a COUNT, and
+                    ;; substring SWAPS out-of-order arguments where slice yields the empty string.
                     (if (str-eq name "charCodeAt")
                         (fng-jsl-call2 context "StringCharCodeAt" string start)
                         (if (str-eq name "charAt")
@@ -1741,10 +1752,10 @@
                                     (if (> argc 1)
                                         (fng-expression context (ts-child ast node 2))
                                         (n-string-length! string))
-                                  mode (if (str-eq name "substring") 0 (if (str-eq name "substr") 1 2))]
-                              (if (str-eq name "slice")
-                                  (fng-jsl-call3 context "StringSlice" string start end)
-                                  (n-string-substring! string start end mode)))))))))))
+                                  jsl-name (if (str-eq name "substring") "StringSubstring"
+                                             (if (str-eq name "substr") "StringSubstr"
+                                               "StringSlice"))]
+                              (fng-jsl-call3 context jsl-name string start end))))))))))
 
 (defn fng-array-push [(context FngContext) (node i64)] (-> i64)
   (let [frontend (load (field context frontend))
