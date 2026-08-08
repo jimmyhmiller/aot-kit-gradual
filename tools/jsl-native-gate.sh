@@ -37,6 +37,31 @@ COVERED=(
   "ProbeStrNum:1:strnum:idx:15"
 )
 
+# EVERY builtin must reach machine code, not just the value-checked ones. Coverage above is about
+# whether a definition computes the right ANSWER; this is about whether it compiles at all, and the
+# two come apart: a definition can be correct under the interpreter and still have no selection arm.
+# It matters now because the frontend pulls the whole library into a program, so one definition that
+# cannot be selected breaks every compile, not just its own test.
+#
+# The arity is read out of the source rather than listed, so a new builtin is covered the moment it
+# is written and this cannot silently check fewer than exist.
+compiled=0
+while read -r name arity; do
+  if ! "$tmp/emit" "$name" "$arity" > "$tmp/all.o" 2>"$tmp/all.err"; then
+    echo "JSL native: $name/$arity did not emit (the library is loaded per entry, so a load-time failure is reported against the first name tried): $(tr '\n' ' ' < "$tmp/all.err")" >&2
+    exit 1
+  fi
+  compiled=$((compiled + 1))
+done < <(
+  python3 - <<'PY'
+import re, glob
+for f in sorted(glob.glob('lib/*/*.jsl')):
+    for m in re.finditer(r'\(builtin\s+(\S+)(.*?):params\s+\[(.*?)\]', open(f).read(), re.S):
+        print(m.group(1), len(re.findall(r'\(\s*\S+\s+\S+?\s*\)', m.group(3))))
+PY
+)
+if [ "$compiled" -eq 0 ]; then echo "JSL native: found no builtins to compile" >&2; exit 1; fi
+
 covered=0
 for spec in "${COVERED[@]}"; do
   IFS=: read -r entry arity label table count <<<"$spec"
@@ -63,4 +88,4 @@ if [ "$missing" -ne 0 ]; then
   exit 1
 fi
 
-echo "JSL native: $(wc -l < "$tmp/native.txt" | tr -d ' ') results from $covered compiled definition(s) agree with Node"
+echo "JSL native: $(wc -l < "$tmp/native.txt" | tr -d ' ') results from $covered value-checked definition(s) agree with Node; all $compiled builtin(s) compile"

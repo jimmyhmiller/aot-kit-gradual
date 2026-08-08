@@ -858,6 +858,69 @@
         (load err)))))
 
 ; ============================================================================
+; On-demand lowering
+; ============================================================================
+;; Lower ONE definition and its transitive callees, and nothing else.
+;;
+;; WHY THIS EXISTS RATHER THAN `jsl-lower!`. The frontend links the library into programs that are
+;; also held to exact `g-render` equality against the JavaScript codegen. Lowering the whole library
+;; would put an unreachable function in the GRAPH for every definition the program never calls, so a
+;; program that touches no string builtin would stop rendering the same. Pulling definitions the way
+;; a linker pulls objects out of an archive keeps that contract, and it means adding to the library
+;; cannot change the graph built for a program that does not call the addition.
+;;
+;; It is worth being precise about what this does NOT buy: the emitted object is the same size
+;; either way, because selection already drops functions nothing reaches — `MathAbs` emits 1135
+;; bytes whether the rest of the library was lowered or not. The graph is what this keeps small,
+;; and the graph is what the frontend's acceptance test compares.
+;;
+;; `jsl-decl-fun` DOUBLES AS THE VISITED MARK and the order is what makes that work: the Fun is
+;; opened BEFORE the body is walked, so a definition that calls itself finds a node to call instead
+;; of recursing forever. A macro gets no Fun and so no mark, which is safe only because
+;; `jsl-check-macro-cycles` has already rejected macro recursion; without that this walk would not
+;; terminate on a cyclic macro.
+;;
+;; Dependencies are lowered to COMPLETION before the caller's body, not interleaved with it:
+;; `jl-lower-decl!` drives one shared `jl` state, so lowering a callee part-way through a caller
+;; would clobber the caller's bindings and control.
+(defn jl-require-body! [(x (ptr rd/Sexp))] (-> i64)
+  ;; `KVec` is walked as well as `KList` because `loop` bindings live in a vector, and a call that
+  ;; only ever appears in a loop's initialisers would otherwise never be pulled in.
+  (if (and (not (rd/sexp-list? x)) (not (rd/sexp-vec? x))) JSL-OK
+    (let [n (rd/sexp-count x) (mut i) 0 (mut err) JSL-OK]
+      (if (and (rd/sexp-list? x) (and (> n 0) (rd/sexp-sym? (rd/sexp-nth x 0))))
+          (let [name (rd/sexp-sym (rd/sexp-nth x 0))]
+            ;; A `%Prim` has no declaration to pull; it is lowered inline wherever it appears.
+            (if (jsl-prim-name? name) 0
+              (let [c (jsl-find name)]
+                (if (>= c 0) (store! err (jl-require-decl! c)) 0))))
+          0)
+      (loop (if (or (>= (load i) n) (!= (load err) JSL-OK)) (break)
+              (do (store! err (jl-require-body! (rd/sexp-nth x (load i))))
+                  (store! i (+ (load i) 1))
+                  0)))
+      (load err))))
+
+(defn jl-require-decl! [(d i64)] (-> i64)
+  ;; A macro is inlined at its call site, so it needs no Fun of its own — but whatever IT calls
+  ;; still has to be lowered, or the expansion would reference a Fun that was never opened.
+  (if (jsl-macro? d) (jl-require-body! (jsl-decl-body d))
+    (if (!= (jsl-decl-fun d) NO-NODE) JSL-OK
+      (do (jsl-decl-set-fun! d (n-fun-open! d))
+          (let [err (jl-require-body! (jsl-decl-body d))]
+            (if (!= err JSL-OK) err (jl-lower-decl! d)))))))
+
+;; Pull one definition into the current graph by name. Idempotent: calling it twice for the same
+;; name lowers once and the second call is free, which is what lets a caller ask on every use.
+(defn jsl-require! [(name (slice u8))] (-> i64)
+  (if (not (jsl-ok?)) (jsl-err)
+    (let [d (jsl-find name)]
+      (if (< d 0) (jsl-fail! JSL-ERR-UNKNOWN-CALL name)
+        (if (jsl-macro? d)
+            (jsl-fail! JSL-ERR-UNKNOWN-CALL name)
+            (jl-require-decl! d))))))
+
+; ============================================================================
 ; Linking a caller against the library
 ; ============================================================================
 ;; Call a lowered builtin from outside. This is how a program reaches the runtime library, and it
