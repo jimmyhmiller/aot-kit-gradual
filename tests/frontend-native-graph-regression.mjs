@@ -8,10 +8,16 @@ import fs from "node:fs";
 // oracle on its own terms.
 const expectedDigests = Object.freeze({
   basic: "7a8a3daf099c02d4559e4eca74fb255a20bb2e38eacc121b69d7841ad0912686",
-  call: "752cf2c895d2d0167739a75608a90822f33509d4a73027e097da08a3a5b79778",
-  control: "38f2a6309bbedede76dab9ba443dee14b3ecb4cbaf01d9e11f243d514ea4f7fa",
-  object: "cc0a96420e342bae2936f68f4e7aca290fb326716b2d45ca42402d2e5b31c59b",
-  full: "eb7674f74487b76907d2add8b6d23acab3b4d1d13d738d87e7114dc844bea27a",
+  // Repinned when g-fold-proven! began running the peephole after analysis instead of leaving what
+  // the fixpoint proved unused. EVERY fixture that moved got strictly SMALLER — call 32 -> 31,
+  // control 37 -> 33, object 39 -> 38, full 87 -> 82 — as duplicate constants collapse into the
+  // ones GVN can now see and commutative operands take their canonical order. `basic` and `bitwise`
+  // are byte-identical. Nothing grew, which is the evidence this is the peephole doing its ordinary
+  // job on more of the graph rather than a change in what the frontend builds.
+  call: "f46afc5885233e3c75f73f47749ce1db71baf193594276d48cd4c873c51c13de",
+  control: "4d77f131d42c349fbffb154f65918d20a4a0fb002418426b8cdbc832f955260d",
+  object: "625b7453c81af4af381888db86908c709bc485203898a2937e4d131bdecca0e9",
+  full: "d3a11144bc8b06a62fb3804d456a0a0b27b1056d20657a2f1f74dc2485d6669a",
   bitwise: "189e78fe00839f184bb88f682c514f3a5d97b7972da062e8aa7262d3969e17a9",
 });
 

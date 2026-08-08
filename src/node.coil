@@ -3581,6 +3581,30 @@
 (defn g-analyze-checks [] (-> i64)
   (load (field (graph) achecks)))
 
+;; FOLD WHAT ANALYSIS DECIDED.
+;;
+;; `g-analyze!` only ever calls `n-compute`. That is deliberate — it is the optimistic pass, and
+;; rewriting during it would act on provisional types. But nothing ran afterwards to USE what it
+;; proved, so a node the fixpoint decided was a constant stayed a node.
+;;
+;; The case that made this matter: `text.indexOf(needle)` lowers through `Clamp 0 0 (%StringLen s)`,
+;; whose result is a Phi that analysis proves is exactly 0. Left as a Phi it stays pinned to its
+;; Region inside the loop, so the pure, loop-invariant `%StringIndexOf` consuming it cannot be
+;; hoisted and re-scans the haystack on every iteration — 3.8ms against 79.4ms on
+;; benchmarks/typescript-aot/string-loop.ts.
+;;
+;; This is D8-compliant by construction rather than by promise: `n-peephole` already refuses to fold
+;; anything whose type is not PROVEN, so running it after the fixpoint rewrites only what the
+;; fixpoint settled. Before the fixpoint the same call folds nothing.
+(defn g-fold-proven! [] (-> i64)
+  (let [(mut i) 0]
+    (loop (if (>= (load i) (n-count))
+              (break)
+              (do (if (n-dead? (load i)) 0 (n-peephole (load i)))
+                  (store! i (+ (load i) 1))
+                  0)))
+    0))
+
 (defn g-analyze! [] (-> i64)
   (store! (field (graph) achecks) 0)
   (wl-push-live!)

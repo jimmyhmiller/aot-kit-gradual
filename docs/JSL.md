@@ -648,44 +648,45 @@ condition that folds under it — and it is the next piece of work here.
 kind is decided. `i - 500` is `num`, which is `int|flt`: neither inside `int` nor disjoint from it,
 so either answer would be a guess. `num` is what JavaScript arithmetic produces.
 
-### The string conversion's cost, traced to the exact node
+### What the conversion costs, resolved
 
-Converting the string family cost far more than Math: `benchmarks/typescript-aot/string-loop.ts`
-went 3.8ms -> 79.4ms, a factor of 20. The graphs say why. Before, the loop body is 38 nodes with one
-`If` and no `Region`, and both `StringIndexOf` nodes are pure and loop-invariant, so they are hoisted
-clean out of the loop. After, 64 nodes with five `If`s and four `Region`s — `Clamp`'s two tests per
-`indexOf`.
+Converting the string family initially cost a factor of 20 —
+`benchmarks/typescript-aot/string-loop.ts` went 3.8ms to 79.4ms. Chasing it down took three separate
+facts, and none of them was "the DSL is slow".
 
-At the site that matters the arithmetic is provably unnecessary: `text.indexOf(needle)` passes a
-constant 0, so `Clamp 0 0 (%StringLen s)` is 0. Two facts were missing and are now supplied:
+**1. `jsl-inline!` rather than `jsl-call!`.** A definition the frontend emits is expanded into the
+caller's graph, not called. This is Torque's split between an inlined `macro` and a called `builtin`,
+with the difference that the CALLER chooses. Worth 75.9ms -> 71.0ms on `math-loop`.
 
-- `%StringLen` is typed `int=[0..max]`. A length is never negative, and the old unbounded `int` left
-  `len < 0` undecidable.
-- `cmp-compute` reasons about RANGES, not only constants (`src/node.coil`). `a < b` is decided when
-  `max(a) < min(b)` or `min(a) >= max(b)`, and disjoint ranges are never equal.
+**2. Ranges decide comparisons.** `text.indexOf(needle)` lowers through `Clamp 0 0 (%StringLen s)`.
+Its first test is two constants and always folded; its second, `len < 0`, did not, because a length
+is a range rather than a constant and `cmp-compute` gave up on any non-constant operand. It now
+decides `a < b` whenever `max(a) < min(b)` or `min(a) >= max(b)`, and `%StringLen` is typed
+`int=[0..max]` because a length is never negative. Both are true independently of any benchmark.
 
-Together they decide every clamp test. The graph confirms it: `Lt : bool=0` where it was `bool`, and
-each clamp `If` now carries a dead `~ctrl` arm. Both changes are true independently of this benchmark
-and are worth having on their own.
+**3. Analysis proves; something has to ACT on the proof.** `g-analyze!` only ever calls `n-compute`
+— deliberately, since rewriting mid-fixpoint would act on provisional types. But nothing ran
+afterwards, so a node the fixpoint had decided was a constant stayed a node. The clamp's result was
+a `Phi : int=0` with a fully decided type, still pinned to its Region inside the loop, so the pure
+loop-invariant `%StringIndexOf` consuming it could not be hoisted and re-scanned the haystack every
+iteration. `g-fold-proven!` runs the peephole once the fixpoint has settled. It is D8-compliant by
+construction rather than by promise: `n-peephole` already refuses to fold an unproven type, so the
+same call before the fixpoint folds nothing.
 
-**It is still 78ms, and the last link is now identified exactly.** The surviving node is
+The result is 4.1ms against a 3.8ms baseline, and the graph is back to the pre-conversion shape — 38
+nodes and one `If`, down from 64 and five. Every pinned frontend fixture that moved got strictly
+smaller (call 32 -> 31, control 37 -> 33, object 39 -> 38, full 87 -> 82); nothing grew.
 
-    n36: Phi : int=0   <- n35 n23 n34
-    n37: StringIndexOf : int  <- _ n11 n21 n36
+**`math-loop` remains 1.45x, and that one is real.** `MathFloor` is `if (%IsInt v) v else
+(%FloorNum v)`, where `%FloorNum` lowers to the same `OP-JSBUILTIN` the hand-written form emitted —
+so the conversion is that node plus a guard, and the guard only disappears when the argument's kind
+is decided. `i - 500` is `num`, which is `int|flt`: neither inside `int` nor disjoint from it, so
+folding it either way would be a guess rather than a proof. Removing that cost means proving
+integer-ness of JavaScript arithmetic, which is a real analysis and not a peephole.
 
-The Phi's TYPE is already the constant 0 — the analysis has fully decided it — but it is still a
-Phi, and a Phi is pinned to its Region, which lives inside the loop. `StringIndexOf` therefore has a
-loop-resident input and cannot be hoisted, so it re-scans the haystack every iteration.
-
-So the remaining work is not "eliminate the diamond": it is that **a Phi whose type is a proven
-constant should fold to that constant**, after which the Region and its dead arm are unreachable and
-the pure node floats out on its own. That is one rewrite in the peephole, guarded by D8 the way
-`unbox-idealize` is, and it is the next thing to do here.
-
-A lowering-time fold in `jl-if` was tried instead and reverted: it broke
-`a_decidable_guard_folds_to_straight_line_code`, and it was the wrong place regardless — nothing is
-proven during construction, so a fold there acts on a provisional type, which is exactly what D8
-forbids.
+A lowering-time fold in `jl-if` was tried and reverted. It broke
+`a_decidable_guard_folds_to_straight_line_code`, and it was the wrong place regardless: nothing is
+proven during construction, so it necessarily acts on provisional types.
 
 ---
 
