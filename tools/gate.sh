@@ -86,6 +86,14 @@ else
 fi
 
 echo
+echo "=== JSL runtime library ==="
+if out=$(./tools/jsl-gate.sh 2>&1); then
+  note "jsl-gate.sh" "$(echo "$out" | tail -1)"
+else
+  note "jsl-gate.sh" "FAILED"; echo "$out" | tail -20; fails=$((fails+1))
+fi
+
+echo
 echo "=== native source conformance ==="
 if out=$(./tools/native-source-conformance.sh 2>&1); then
   note "native-source-conformance.sh" "$(echo "$out" | tail -1)"

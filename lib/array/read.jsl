@@ -1,0 +1,52 @@
+;; Read-only Array.prototype, over an array receiver and already-coerced arguments.
+;;
+;; EVERY ENTRY HERE IS A `macro`, AND IT HAS TO BE. Memory reaches a function as an `OP-ARG`, never
+;; as a parameter — `v-mem-producer?` decides that structurally — so a `builtin` synthesises its own
+;; entry heap and reads an EMPTY one rather than its caller's. A macro is lowered into the caller's
+;; graph, so it reads the caller's memory. `JSL-ERR-HEAP-IN-BUILTIN` refuses the other shape.
+;;
+;; These ARE verified against Node, now that `build.jsl` can allocate: a probe definition builds the
+;; array with `ArrayIota` and reads it back, all inside one function, so nothing crosses a call.
+;;
+;; MEMORY IS IMPLICIT. `%ArrayLen` and `%ArrayLoad` take the ambient heap from the lowering rather
+;; than from an operand here, so a definition reads like the spec rather than like memory SSA.
+
+;; https://tc39.es/ecma262/#sec-array.prototype.indexof, steps 6-10, from an already-clamped start.
+(macro ArrayIndexOfFrom :params [(a dyn) (target dyn) (from dyn)] :ret int
+  (let [(len (%ArrayLen a))]
+    (loop [(i from)]
+      (if (%Le len i) -1
+        (if (%Eq (%ArrayLoad a i) target) i (recur (%Add i 1)))))))
+
+;; https://tc39.es/ecma262/#sec-array.prototype.includes. It differs from `indexOf` in EXACTLY one
+;; way and it is the reason both exist: `includes` compares with SameValueZero, so it finds a NaN
+;; that `indexOf` — using strict equality — never can.
+(macro ArrayIncludes :params [(a dyn) (target dyn)] :ret bool
+  (let [(len (%ArrayLen a))]
+    (loop [(i 0)]
+      (if (%Le len i) false
+        (if (SameValueZero (%ArrayLoad a i) target) true (recur (%Add i 1)))))))
+
+;; https://tc39.es/ecma262/#sec-array.prototype.lastindexof, searching the whole array.
+(macro ArrayLastIndexOf :params [(a dyn) (target dyn)] :ret int
+  (loop [(i (%Sub (%ArrayLen a) 1))]
+    (if (%Lt i 0) -1
+      (if (%Eq (%ArrayLoad a i) target) i (recur (%Sub i 1))))))
+
+;; https://tc39.es/ecma262/#sec-array.prototype.at — a negative index counts from the end.
+(macro ArrayAt :params [(a dyn) (i dyn)] :ret dyn
+  (let [(k (RelativeIndex i (%ArrayLen a)))]
+    (if (%Lt k 0) undefined (%ArrayLoad a k))))
+
+;; https://tc39.es/ecma262/#sec-array.prototype.join.
+;;
+;; `undefined` and `null` become the EMPTY string rather than "undefined" and "null", which is the
+;; one place `join` disagrees with `String(x)` and the reason this cannot just call `%ToString`.
+(macro ArrayJoin :params [(a dyn) (sep dyn)] :ret dyn
+  (let [(len (%ArrayLen a))]
+    (loop [(i 0) (out "")]
+      (if (%Le len i) out
+        (let [(v (%ArrayLoad a i))
+              (piece (if (%Eq v undefined) "" (if (%Eq v null) "" (%ToString v))))
+              (joined (if (%Eq i 0) piece (%StringConcat out (%StringConcat sep piece))))]
+          (recur (%Add i 1) joined))))))

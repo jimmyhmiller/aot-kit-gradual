@@ -54,6 +54,8 @@ Read in this order:
    GC contract, specialisation, the backend, the tooling.
 4. **[docs/JOURNAL.md](docs/JOURNAL.md)** when you want to know *why* something looks the way it
    does, or before changing something that looks gratuitous.
+5. **[docs/JSL.md](docs/JSL.md)** for the language the JavaScript runtime library is written in,
+   and for why a builtin must stop costing an opcode plus ten dispatch arms.
 
 ## The module map
 
@@ -68,10 +70,14 @@ Read in this order:
 | `src/gtext.coil` | The textual form of a *graph*, printed and parsed |
 | `src/corpus.coil` | The shared fixtures: the verifier, the diagrams and the differential tests all use these same graphs |
 | `src/dot.coil` | Graphviz output |
+| `src/jsl.coil` | [JSL](docs/JSL.md): the runtime library language — reader, primitive table, checker |
+| `src/jsl_lower.coil` | JSL lowering into the ideal graph, and the transition check over what it built |
 | `src/typescript_native.coil` | Native `typescript-go` AST bridge |
 | `src/frontend_native.coil` | Coil-owned declaration and symbol resolution |
 | `src/frontend_native_graph.coil` | Native frontend lowering into the ideal graph |
 | `src/backend_*.coil` | Explicit, one-way [backend phase modules](docs/BACKEND-ARCHITECTURE.md) from machine IR through Mach-O emission |
+| `lib/**/*.jsl`, `lib/index` | The JavaScript runtime library, written in [JSL](docs/JSL.md) |
+| `tools/jsl-gate.sh` | Node/JSL conformance for the library, with its ToInt32 falsification |
 | `tests/*-test.coil` | One suite per area; `tools/gate.sh` runs them all |
 | `tools/dot-dump.coil`, `render-dot.sh`, `build-page.py` | The diagram pipeline and the gallery page |
 

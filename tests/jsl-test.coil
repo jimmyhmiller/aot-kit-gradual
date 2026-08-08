@@ -1,0 +1,813 @@
+;; The JSL gate: a `.jsl` definition becomes an ideal graph, and the evaluator runs it.
+;;
+;; WHAT THIS SUITE IS ACTUALLY CLAIMING. The point of JSL is that a builtin costs a definition and
+;; ZERO dispatch arms, so the claim under test is not "the reader parses" — it is that the graph a
+;; `.jsl` file lowers to is one `eval.coil` already knows how to run, with nothing added to it.
+;; Every positive case therefore ends in `ev-run-nobind` and asserts the VALUE, because a test that
+;; stopped at "the graph verified" would pass just as well against a lowering that built the wrong
+;; nodes correctly.
+;;
+;; THE NEGATIVE CASES ASSERT THE SPECIFIC CODE, following tests/shape-test.coil and text.coil's
+;; rule: "it was rejected" is satisfied by a checker that rejects everything, so the claim that
+;; matters is that a NAMED check is the one that noticed. Each negative fixture differs from a
+;; legal one in exactly the dimension its code names.
+;;
+;;   coil test tests/jsl-test.coil
+(module jsltest)
+
+(import "jsl"       :use *)
+(import "jsl_lower" :use *)
+(import "node"      :use *)
+(import "ty"        :use *)
+(import "eval"      :use *)
+(import "shape"     :use *)
+(import "jsstring"  :use *)
+(import "jsvalue"   :use *)
+(import "verify"    :use *)
+(import "coil.assert" :use *)
+(import "coil.control" :use *)
+(import "coil.slice"  :use *)
+(import "coil.alloc"  :use *)
+(import "coil.str"    :use *)
+
+; ---------------------------------------------------------------------------
+; Harness
+; ---------------------------------------------------------------------------
+(defn fresh! [(seed i64)] (-> i64)
+  (graph-reset! seed)
+  (shape-reset!)
+  (jss-reset!)
+  (jsl-reset!)
+  0)
+
+(defn sconst [(s (slice u8))] (-> i64) (n-string-const! (jss-from-utf8! s)))
+(defn kconst [(t i64)] (-> i64) (n-peephole (n-new1 OP-CONST t (g-start))))
+(defn fconst [(x f64)] (-> i64) (kconst (t-flt-con x)))
+(defn bconst [(b bool)] (-> i64) (kconst (t-bool-con b)))
+(const INF-BITS i64 9218868437227405312)
+(const NEG-INF-BITS i64 -4503599627370496)
+(defn iconst [(v i64)] (-> i64) (n-peephole (n-new1 OP-CONST (t-int-con v) (g-start))))
+
+;; Load, check and lower a unit, asserting each stage. Returns nothing useful; the assertions are
+;; the content.
+(defn build! [(src (slice u8))] (-> i64)
+  (assert (= (jsl-load! src) JSL-OK))
+  (assert (= (jsl-lower!) JSL-OK))
+  0)
+
+;; Call a lowered builtin with one integer argument from the top level and run it. The top-level
+;; Return is a def of Stop (a function body's Return belongs to its Fun instead), which is what
+;; gives the evaluator somewhere to start.
+(defn runN [(name (slice u8)) (args (slice i64))] (-> RtVal)
+  (let [cs (jsl-call! (g-start) name args)
+        ret (n-new2 OP-RETURN 0 (call-end cs) (call-value cs))]
+    (n-add-def! (g-stop) ret)
+    (n-peephole (g-stop))
+    ; `iterate!` IS THE OPTIMISER; `g-analyze!` only computes types and rewrites nothing. Running
+    ; only the latter would leave a folded-predicate If standing, so every claim below about code
+    ; that "disappears" would be a claim about a pass that never ran.
+    (iterate!)
+    (g-analyze!)
+    (assert (= (g-verify) 0))
+    (ev-reset!)
+    (ev-bind-args! 0)
+    (assert (= (ev-run-nobind 100000) EV-OK))
+    (ev-result)))
+
+(defn run1 [(name (slice u8)) (arg i64)] (-> RtVal)
+  (let [buf (stack (array i64 1))
+        p (cast (ptr i64) buf)]
+    (store! (index p 0) (iconst arg))
+    (runN name (slice-new [i64] p 1))))
+
+(defn run2n [(name (slice u8)) (a i64) (b i64)] (-> RtVal)
+  (let [buf (stack (array i64 2))
+        p (cast (ptr i64) buf)]
+    (store! (index p 0) a)
+    (store! (index p 1) b)
+    (runN name (slice-new [i64] p 2))))
+
+;; The same three-argument call, but the program must THROW rather than produce a value.
+(defn throws3n [(name (slice u8)) (a i64) (b i64) (c i64)] (-> i64)
+  (let [buf (stack (array i64 3))
+        p (cast (ptr i64) buf)]
+    (store! (index p 0) a) (store! (index p 1) b) (store! (index p 2) c)
+    (let [cs (jsl-call! (g-start) name (slice-new [i64] p 3))
+          ret (n-new2 OP-RETURN 0 (call-end cs) (call-value cs))]
+      (n-add-def! (g-stop) ret)
+      (n-peephole (g-stop))
+      (iterate!)
+      (g-analyze!)
+      (assert (= (g-verify) 0))
+      (ev-reset!)
+      (ev-bind-args! 0)
+      (assert (= (ev-run-nobind 100000) EV-THROW))
+      0)))
+
+(defn run3n [(name (slice u8)) (a i64) (b i64) (c i64)] (-> RtVal)
+  (let [buf (stack (array i64 3))
+        p (cast (ptr i64) buf)]
+    (store! (index p 0) a)
+    (store! (index p 1) b)
+    (store! (index p 2) c)
+    (runN name (slice-new [i64] p 3))))
+
+;; The library as it actually ships, loaded off disk through the index.
+(defn lib! [(seed i64)] (-> i64)
+  (fresh! seed)
+  (assert (= (jsl-load-index! "lib/index") JSL-OK))
+  (assert (= (jsl-lower!) JSL-OK))
+  0)
+
+;; A unit that must be REFUSED, and refused by the named code. `jsl-load!` runs the reader and the
+;; checker, so both classes of refusal arrive through one entry point.
+(defn refuses [(seed i64) (src (slice u8)) (code i64)] (-> i64)
+  (fresh! seed)
+  (assert (= (jsl-load! src) code))
+  (assert (= (jsl-err) code))
+  (assert (not (jsl-ok?)))
+  0)
+
+; ---------------------------------------------------------------------------
+; Fixtures
+; ---------------------------------------------------------------------------
+(const SRC-ADD1 "(builtin add1 :params [(x dyn)] :ret dyn (%Add x 1))")
+
+(const SRC-PICK
+  "(builtin pick :params [(x dyn)] :ret dyn (if (%Lt x 0) (%Neg x) x))")
+
+(const SRC-LET
+  "(builtin scale :params [(x dyn)] :ret dyn (let [(d (%Add x 3)) (e (%Mul d 10))] (%Sub e 1)))")
+
+;; Two definitions, the caller declared `:transitioning` because it contains a call. The callee is
+;; declared LATER than its use on purpose: resolution has to see the whole table, which is why
+;; `jsl-check` is a second pass over a table `jsl-load!` has already finished building.
+(const SRC-CALL
+  "(builtin twice :transitioning true :params [(x dyn)] :ret dyn (add1 (add1 x)))
+   (builtin add1 :params [(x dyn)] :ret dyn (%Add x 1))")
+
+;; The same pair with the caller's `:transitioning` removed. Nothing about the SOURCE changed shape
+;; — only the annotation — so the refusal can only come from inspecting the lowered graph.
+(const SRC-CALL-UNDECLARED
+  "(builtin twice :params [(x dyn)] :ret dyn (add1 (add1 x)))
+   (builtin add1 :params [(x dyn)] :ret dyn (%Add x 1))")
+
+(const SRC-QUOTED-TYPE
+  "(builtin narrow :params [(x \"int=[0..9]\")] :ret dyn (%Add x 1))")
+
+;; A `let` that shadows a parameter. The checker and the lowering resolve names through two
+;; different mechanisms — a name stack and a node stack — so this is the one program whose answer
+;; distinguishes their orders. Resolving parameters first in the checker and innermost-first in the
+;; lowering typechecks, verifies, and returns the wrong number.
+(const SRC-SHADOW
+  "(builtin shadow :params [(x dyn)] :ret dyn (let [(x (%Mul x 100))] (%Add x 5)))")
+
+; ---------------------------------------------------------------------------
+; Positive: the graph runs
+; ---------------------------------------------------------------------------
+(deftest a_primitive_body_lowers_to_ops_the_evaluator_already_runs
+         (fresh! 90100)
+         (build! SRC-ADD1)
+         (assert (= (jsl-decl-count) 1))
+         (assert (= (jsl-decl-nparams 0) 1))
+         (assert (!= (jsl-decl-fun 0) NO-NODE))
+         (assert (= (rt-payload (run1 "add1" 41)) 42)))
+
+;; The diamond. Both arms are exercised in separate graphs rather than in one, because a Phi whose
+;; predicate is constant folds and the surviving arm would be the only one ever built.
+(deftest an_if_lowers_to_a_diamond_and_both_arms_execute
+         (fresh! 90101)
+         (build! SRC-PICK)
+         (assert (= (rt-payload (run1 "pick" -5)) 5))
+         (fresh! 90102)
+         (build! SRC-PICK)
+         (assert (= (rt-payload (run1 "pick" 7)) 7)))
+
+;; `let` is sequential and emits no node of its own: `e` sees `d`. (x+3)*10-1 at x=1 is 39.
+(deftest let_bindings_are_sequential_ssa_values_and_emit_no_nodes
+         (fresh! 90103)
+         (build! SRC-LET)
+         (assert (= (rt-payload (run1 "scale" 1)) 39)))
+
+;; 2*100 + 5. The inner `x` wins in BOTH passes; if the checker resolved the parameter first while
+;; the lowering resolved the binding first they would still agree that the program is legal, and
+;; the only observable difference would be this number (7 rather than 205).
+(deftest a_let_shadows_a_parameter_and_both_passes_agree_which_one_wins
+         (fresh! 90108)
+         (build! SRC-SHADOW)
+         (assert (= (rt-payload (run1 "shadow" 2)) 205)))
+
+(deftest a_call_between_two_jsl_builtins_lowers_and_runs
+         (fresh! 90104)
+         (build! SRC-CALL)
+         (assert (= (jsl-decl-count) 2))
+         (assert (jsl-decl-transitioning? 0))
+         (assert (not (jsl-decl-transitioning? 1)))
+         (assert (= (rt-payload (run1 "twice" 40)) 42)))
+
+;; A type annotation given as a STRING. A bare symbol carries the bracket-free spellings; the rest
+;; of `text.coil`'s grammar arrives as a `KStr`. This asserts the annotation reaches `ty-try-parse`
+;; intact and interns to the type that spelling denotes.
+(deftest a_quoted_annotation_carries_the_full_textual_type_grammar
+         (fresh! 90105)
+         (build! SRC-QUOTED-TYPE)
+         (assert (= (jsl-param-ty 0 0) (t-int-range 0 9)))
+         (assert (= (rt-payload (run1 "narrow" 4)) 5)))
+
+;; A DECLARED PARAMETER TYPE IS NOT A FACT (D1/D8). The annotation is recorded on the declaration
+;; and is deliberately NOT injected onto the Parm, because a rewrite may only act on a PROVEN type
+;; and an injected claim is one nobody computed. This pins that: the narrow spelling above and the
+;; wide one below produce the same Parm type, so nothing downstream can act on the annotation yet.
+(deftest an_annotation_is_recorded_on_the_declaration_and_never_injected_onto_the_parm
+         (fresh! 90106)
+         (build! SRC-QUOTED-TYPE)
+         (let [narrow-parm (n-parm! (jsl-decl-fun 0) 0)
+               narrow-ty (n-ty narrow-parm)]
+           (fresh! 90107)
+           (build! SRC-ADD1)
+           (assert (= (jsl-param-ty 0 0) (t-dyn)))
+           (assert (= (n-ty (n-parm! (jsl-decl-fun 0) 0)) narrow-ty))))
+
+; ---------------------------------------------------------------------------
+; The library on disk
+; ---------------------------------------------------------------------------
+;; THE POINT OF THIS BLOCK. Everything above builds its unit from a string literal, which proves
+;; the language works but not that a LIBRARY does. These load `lib/index` — the real files, in the
+;; real order, through the real reader — and run them. `;;` comments, multi-file name resolution
+;; and the index format are all only exercised here.
+(deftest the_library_on_disk_loads_and_every_declaration_lowers
+         (lib! 90300)
+         (assert (= (jsl-decl-count) 50))
+         ; A builtin has a Fun and a macro does not, and every declaration is one or the other.
+         (let [(mut i) 0 (mut funs) 0 (mut macros) 0]
+           (loop (if (>= (load i) (jsl-decl-count)) (break)
+                   (do (if (jsl-macro? (load i))
+                           (do (assert (= (jsl-decl-fun (load i)) NO-NODE))
+                               (store! macros (+ (load macros) 1)) 0)
+                           (do (assert (!= (jsl-decl-fun (load i)) NO-NODE))
+                               (store! funs (+ (load funs) 1)) 0))
+                       (store! i (+ (load i) 1))
+                       0)))
+           (assert (= (+ (load funs) (load macros)) 50))
+           (assert (= (load macros) 21)))
+         (assert (>= (jsl-find "Clamp") 0))
+         (assert (>= (jsl-find "StringIndexOfFrom") 0))
+         (assert (>= (jsl-find "StringStartsWith") 0))
+         (assert (>= (jsl-find "StringEndsWith") 0))
+         (assert (>= (jsl-find "StringIncludesFrom") 0))
+         (assert (>= (jsl-find "String.prototype.indexOf") 0))
+         ; The iterative units, none of which was expressible before `loop`.
+         (assert (>= (jsl-find "StringRepeatCount") 0))
+         (assert (>= (jsl-find "StringLastIndexOf") 0))
+         (assert (>= (jsl-find "StringPadStart") 0))
+         (assert (jsl-macro? (jsl-find "RequireObjectCoercible"))))
+
+;; INLINING A HELPER REMOVES ITS CALLER'S ANNOTATION. `Clamp` used to be a builtin, which put an
+;; OP-CALL on `StringIndexOfFrom`'s only path and forced `:transitioning true` on it. As a macro it
+;; contributes nodes instead of a call, so the annotation came off — and the transition check,
+;; which reads the lowered graph rather than the source, is what makes that safe to rely on: if the
+;; inlining had not happened, this declaration would no longer lower.
+(deftest making_a_helper_a_macro_removes_the_call_and_the_annotation
+         (lib! 90314)
+         (assert (jsl-macro? (jsl-find "Clamp")))
+         (assert (not (jsl-decl-transitioning? (jsl-find "StringIndexOfFrom"))))
+         ; The callers that still reach a real builtin keep theirs.
+         (assert (jsl-decl-transitioning? (jsl-find "StringStartsWith")))
+         (assert (= (rt-payload (run3n "StringIndexOfFrom" (sconst "abcabc") (sconst "b") (iconst 2))) 4)))
+
+(deftest a_unit_may_call_a_definition_declared_in_another_file
+         ; `StringIndexOfFrom` calls `Clamp`, which lives in a different unit and is read first;
+         ; `StringStartsWith` calls `StringIndexOfFrom`, which is read BEFORE it. Both directions
+         ; resolve because `jsl-check` is a second pass over the finished table.
+         (lib! 90301)
+         (assert (= (rt-payload (run3n "StringIndexOfFrom" (sconst "hello world") (sconst "o") (iconst 5))) 7)))
+
+(deftest the_clamped_start_matches_the_specs_min_max_bounds
+         ; ONE RUN PER GRAPH. `runN` makes its Return a def of Stop, so two runs in one graph give
+         ; the evaluator two entry points and it reports something other than EV-OK. Every case
+         ; below therefore re-loads the library into a fresh graph.
+         (lib! 90302)   ; below zero clamps to zero
+         (assert (= (rt-payload (run3n "StringIndexOfFrom" (sconst "abcabc") (sconst "b") (iconst -99))) 1))
+         (lib! 90311)   ; past the end clamps to the length, so nothing is found
+         (assert (= (rt-payload (run3n "StringIndexOfFrom" (sconst "abcabc") (sconst "b") (iconst 99))) -1)))
+
+(deftest starts_with_and_includes_run_off_the_shared_core
+         (lib! 90303)
+         (assert (= (rt-payload (run2n "StringStartsWith" (sconst "coil") (sconst "co"))) 1))
+         (lib! 90312)
+         (assert (= (rt-payload (run2n "StringStartsWith" (sconst "coil") (sconst "il"))) 0))
+         ; The empty needle occurs at 0, so `startsWith("")` is true, as the spec says.
+         (lib! 90304)
+         (assert (= (rt-payload (run2n "StringStartsWith" (sconst "coil") (sconst ""))) 1))
+         (lib! 90305)
+         (assert (= (rt-payload (run3n "StringIncludesFrom" (sconst "coil") (sconst "il") (iconst 0))) 1))
+         (lib! 90313)
+         (assert (= (rt-payload (run3n "StringIncludesFrom" (sconst "coil") (sconst "zz") (iconst 0))) 0)))
+
+;; THE BUG lib/string/ends-with.jsl'S GUARD EXISTS FOR. A needle one code unit longer than the
+;; receiver puts the expected position at -1, and a needle that does not occur also answers -1, so
+;; without the `(%Lt at 0)` guard these two compare equal and `endsWith` reports true for a needle
+;; that cannot fit. Deleting the guard makes exactly this row fail.
+(deftest ends_with_refuses_a_needle_longer_than_the_receiver
+         (lib! 90306)
+         (assert (= (rt-payload (run2n "StringEndsWith" (sconst "oil") (sconst "coil"))) 0))
+         (lib! 90307)
+         (assert (= (rt-payload (run2n "StringEndsWith" (sconst "coil") (sconst "il"))) 1))
+         (lib! 90308)
+         (assert (= (rt-payload (run2n "StringEndsWith" (sconst "coil") (sconst "co"))) 0)))
+
+(deftest a_missing_index_and_an_empty_index_are_refused_by_name
+         (fresh! 90309)
+         (assert (= (jsl-load-index! "lib/no-such-index") JSL-ERR-NO-SUCH-FILE))
+         (fresh! 90310)
+         (assert (= (jsl-load-index! "lib/abstract") JSL-ERR-NO-SUCH-FILE)))
+
+; ---------------------------------------------------------------------------
+; Negative: each refusal is the one that noticed
+; ---------------------------------------------------------------------------
+(deftest an_unbound_symbol_is_refused_by_name
+         (refuses 90200 "(builtin f :params [(x dyn)] (%Add x y))" JSL-ERR-UNBOUND))
+
+(deftest an_unknown_primitive_is_refused_rather_than_ignored
+         (refuses 90201 "(builtin f :params [(x dyn)] (%NoSuchThing x))" JSL-ERR-UNKNOWN-PRIM))
+
+(deftest a_primitive_with_the_wrong_operand_count_is_refused
+         (refuses 90202 "(builtin f :params [(x dyn)] (%Add x))" JSL-ERR-ARITY))
+
+(deftest a_call_with_the_wrong_argument_count_is_refused
+         (refuses 90203
+                  "(builtin f :transitioning true :params [(x dyn)] (g x x))
+                   (builtin g :params [(y dyn)] (%Add y 1))"
+                  JSL-ERR-ARITY))
+
+(deftest a_call_to_an_undeclared_name_is_refused
+         (refuses 90204 "(builtin f :params [(x dyn)] (nope x))" JSL-ERR-UNKNOWN-CALL))
+
+(deftest two_definitions_of_one_name_are_refused
+         (refuses 90205
+                  "(builtin f :params [(x dyn)] x) (builtin f :params [(y dyn)] y)"
+                  JSL-ERR-DUP-NAME))
+
+;; Designed in docs/JSL.md, not built. The refusal is what stops a `.jsl` file using one of these
+;; from producing a graph; without it the head would fall through to `jsl-check-call` and be
+;; reported as an unknown call, which names the wrong problem.
+;; MEMORY CANNOT BE A PARAMETER, so a `builtin` that reads the heap reads its own synthesised
+;; entry heap rather than its caller's — an empty one. That failure is invisible: the graph
+;; verifies, the program runs, and an `ArrayIndexOf` written that way simply answers -1 for an
+;; element that is there. Measured before the rule existed. The refusal is what stops it.
+(deftest a_builtin_that_reads_the_heap_is_refused_because_memory_is_not_a_parameter
+         (refuses 91200 "(builtin f :params [(a dyn)] :ret int (%ArrayLen a))"
+                  JSL-ERR-HEAP-IN-BUILTIN)
+         ; Transitively: the caller of a heap-reading macro reads the heap too.
+         (refuses 91201
+                  "(macro m :params [(a dyn)] :ret int (%ArrayLen a))
+                   (builtin f :params [(a dyn)] :ret int (m a))"
+                  JSL-ERR-HEAP-IN-BUILTIN))
+
+;; The same definition as a `macro` is accepted, because a macro is lowered into its caller's graph
+;; and so reads its caller's memory.
+(deftest a_heap_reading_macro_is_accepted
+         (fresh! 91202)
+         (assert (= (jsl-load! "(macro m :params [(a dyn)] :ret int (%ArrayLen a))") JSL-OK))
+         (assert (jsl-decl-uses-memory? (jsl-find "m")))
+         (assert (jsl-macro? (jsl-find "m"))))
+
+;; Heap use is a FIXPOINT over the call graph, and the walk must descend into vectors: since the
+;; surface moved to brackets, a call written inside a `let` or `loop` binding lives in a `KVec`, and
+;; a walk that only entered lists reported "does not read the heap" for a definition that does.
+(deftest heap_use_is_found_inside_bracketed_bindings
+         (fresh! 91203)
+         (assert (= (jsl-load! "(macro m :params [(a dyn)] :ret int (let [(n (%ArrayLen a))] n))")
+                    JSL-OK))
+         (assert (jsl-decl-uses-memory? (jsl-find "m"))))
+
+(deftest a_designed_but_unbuilt_form_is_refused_as_unsupported
+         (refuses 90207 "(class JSArray :params [(x dyn)] x)" JSL-ERR-UNSUPPORTED))
+
+(deftest an_unparseable_annotation_is_refused_by_the_one_type_parser
+         (refuses 90208 "(builtin f :params [(x notatype)] x)" JSL-ERR-BAD-TYPE))
+
+(deftest a_parenthesised_parameter_list_is_refused_because_the_surface_is_brackets
+         ; `coil.reader` distinguishes KList from KVec, so there is one spelling and the other is a
+         ; named refusal. Before the reader grew brackets this test asserted the opposite, because
+         ; `[` and `]` came back as bare symbols and the bracketed form silently mis-parsed.
+         (refuses 90209 "(builtin f :params ((x dyn)) x)" JSL-ERR-BAD-PARAMS))
+
+(deftest a_definition_with_no_body_is_refused
+         (refuses 90210 "(builtin f :params [(x dyn)] :ret dyn)" JSL-ERR-NO-BODY))
+
+(deftest a_definition_with_two_bodies_is_refused
+         (refuses 90211 "(builtin f :params [(x dyn)] x x)" JSL-ERR-NO-BODY))
+
+(deftest a_malformed_let_binding_is_refused
+         (refuses 90212 "(builtin f :params [(x dyn)] (let [(y)] y))" JSL-ERR-BAD-LET))
+
+(deftest an_if_without_three_operands_is_refused
+         (refuses 90213 "(builtin f :params [(x dyn)] (if x 1))" JSL-ERR-BAD-IF))
+
+(deftest an_unknown_keyword_is_refused_rather_than_skipped
+         (refuses 90214 "(builtin f :nosuchkey true :params [(x dyn)] x)" JSL-ERR-BAD-KEY))
+
+(deftest a_non_boolean_flag_is_refused
+         (refuses 90215 "(builtin f :transitioning yes :params [(x dyn)] x)" JSL-ERR-BAD-BOOL))
+
+(deftest a_top_level_form_that_is_not_a_builtin_is_refused
+         (refuses 90216 "(defn f 1)" JSL-ERR-UNKNOWN-FORM)
+         (refuses 90217 "42" JSL-ERR-NOT-A-LIST))
+
+;; THE ONE THAT IS CHECKED AGAINST THE GRAPH. The source differs from SRC-CALL only by the missing
+;; annotation, so nothing syntactic distinguishes them: the refusal can only come from walking the
+;; nodes the declaration built and finding an OP-CALL in them. That is what makes this check
+;; stronger than the annotation discipline it is modelled on.
+(deftest a_call_inside_a_non_transitioning_definition_is_refused_by_the_lowered_graph
+         (fresh! 90218)
+         (assert (= (jsl-load! SRC-CALL-UNDECLARED) JSL-OK))
+         (assert (= (jsl-lower!) JSL-ERR-UNDECLARED-TRANSITION))
+         (assert (= (jsl-err) JSL-ERR-UNDECLARED-TRANSITION)))
+
+;; The falsification of the row above: the SAME two definitions with the annotation present must
+;; lower clean, or the check would be satisfied by one that always fires.
+(deftest the_transition_check_passes_when_the_annotation_is_present
+         (fresh! 90219)
+         (assert (= (jsl-load! SRC-CALL) JSL-OK))
+         (assert (= (jsl-lower!) JSL-OK))
+         (assert (jsl-ok?)))
+
+; ---------------------------------------------------------------------------
+; String.prototype.indexOf, against Node
+; ---------------------------------------------------------------------------
+;; EVERY EXPECTED VALUE HERE WAS PRODUCED BY NODE, not reasoned out. The table is the output of a
+;; script over `String.prototype.indexOf` covering the coercions the spec's steps 1-4 perform:
+;; fractional positions (truncated TOWARD ZERO), both infinities, NaN, undefined, null, booleans,
+;; numeric strings with and without whitespace, exponent and hex forms, the empty string, and a
+;; non-string search value.
+;;
+;; One run per graph, because `runN` makes its Return a def of Stop.
+;;
+;; THE `Infinity` AND `-Infinity` ROWS ARE THE POINT. `%ToInteger` is ToIntegerOrInfinity, not `|0`:
+;; `|0` answers 0 for both, so `"abc".indexOf("c", Infinity)` would find the `c` at index 2 instead
+;; of returning -1. Those two rows fail against any implementation that reached for ToInt32.
+(deftest string_prototype_indexof_agrees_with_node
+         (lib! 91000) (assert (= (rt-payload (run3n "String.prototype.indexOf" (sconst "hello world") (sconst "o") (iconst 0))) 4))
+         (lib! 91001) (assert (= (rt-payload (run3n "String.prototype.indexOf" (sconst "hello world") (sconst "o") (iconst 5))) 7))
+         (lib! 91002) (assert (= (rt-payload (run3n "String.prototype.indexOf" (sconst "hello world") (sconst "o") (iconst 99))) -1))
+         (lib! 91003) (assert (= (rt-payload (run3n "String.prototype.indexOf" (sconst "hello world") (sconst "o") (iconst -99))) 4))
+         (lib! 91004) (assert (= (rt-payload (run3n "String.prototype.indexOf" (sconst "abcabc") (sconst "b") (iconst 2))) 4))
+         ; 2.9 truncates to 2, not 3: ToIntegerOrInfinity truncates toward zero.
+         (lib! 91005) (assert (= (rt-payload (run3n "String.prototype.indexOf" (sconst "abcabc") (sconst "b") (fconst 2.9))) 4))
+         ; -2.9 truncates to -2, which clamps to 0.
+         (lib! 91006) (assert (= (rt-payload (run3n "String.prototype.indexOf" (sconst "abcabc") (sconst "b") (fconst -2.9))) 1))
+         (lib! 91007) (assert (= (rt-payload (run3n "String.prototype.indexOf" (sconst "abc") (sconst "c") (kconst (t-flt-bits INF-BITS)))) -1))
+         (lib! 91008) (assert (= (rt-payload (run3n "String.prototype.indexOf" (sconst "abc") (sconst "c") (kconst (t-flt-bits NEG-INF-BITS)))) 2))
+         (lib! 91009) (assert (= (rt-payload (run3n "String.prototype.indexOf" (sconst "abc") (sconst "c") (kconst (t-flt-bits JSV-NAN)))) 2))
+         (lib! 91010) (assert (= (rt-payload (run3n "String.prototype.indexOf" (sconst "abc") (sconst "") (iconst 0))) 0))
+         (lib! 91011) (assert (= (rt-payload (run3n "String.prototype.indexOf" (sconst "abc") (sconst "") (iconst 99))) 3))
+         (lib! 91012) (assert (= (rt-payload (run3n "String.prototype.indexOf" (sconst "abc") (sconst "zz") (iconst 0))) -1))
+         (lib! 91013) (assert (= (rt-payload (run3n "String.prototype.indexOf" (sconst "abc") (sconst "b") (kconst (t-undef)))) 1))
+         (lib! 91014) (assert (= (rt-payload (run3n "String.prototype.indexOf" (sconst "abc") (sconst "b") (kconst (t-null)))) 1))
+         (lib! 91015) (assert (= (rt-payload (run3n "String.prototype.indexOf" (sconst "abc") (sconst "b") (bconst true))) 1))
+         (lib! 91016) (assert (= (rt-payload (run3n "String.prototype.indexOf" (sconst "abc") (sconst "b") (sconst "1"))) 1))
+         (lib! 91017) (assert (= (rt-payload (run3n "String.prototype.indexOf" (sconst "abc") (sconst "b") (sconst " 1 "))) 1))
+         (lib! 91018) (assert (= (rt-payload (run3n "String.prototype.indexOf" (sconst "abc") (sconst "b") (sconst "1e0"))) 1))
+         (lib! 91019) (assert (= (rt-payload (run3n "String.prototype.indexOf" (sconst "abc") (sconst "b") (sconst "0x1"))) 1))
+         ; "" is +0 and "nonsense" is NaN; both become position 0.
+         (lib! 91020) (assert (= (rt-payload (run3n "String.prototype.indexOf" (sconst "abc") (sconst "b") (sconst ""))) 1))
+         (lib! 91021) (assert (= (rt-payload (run3n "String.prototype.indexOf" (sconst "abc") (sconst "b") (sconst "nonsense"))) 1))
+         ; Step 3 is ToString on the SEARCH value, so a number and a boolean are stringified.
+         (lib! 91022) (assert (= (rt-payload (run3n "String.prototype.indexOf" (sconst "12345") (iconst 34) (iconst 0))) 2))
+         (lib! 91023) (assert (= (rt-payload (run3n "String.prototype.indexOf" (sconst "truthy") (bconst true) (iconst 0))) -1)))
+
+;; Step 1. RequireObjectCoercible throws on a nullish receiver, and the THROW is what is asserted —
+;; the error CLASS is a documented deviation (there are no error objects until R03), so the payload
+;; is the message string rather than a TypeError.
+(deftest a_nullish_receiver_throws_at_step_one
+         (lib! 91030)
+         (throws3n "String.prototype.indexOf" (kconst (t-null)) (sconst "b") (iconst 0))
+         (lib! 91031)
+         (throws3n "String.prototype.indexOf" (kconst (t-undef)) (sconst "b") (iconst 0)))
+
+;; A JSL string literal with spaces and parens. Under the old `coil.sexp` this needed a pre-pass
+;; that encoded delimiters inside quoted runs as control bytes, because a quoted run was not a
+;; token; `coil.reader`'s `KStr` makes it ordinary.
+(deftest a_string_literal_may_contain_spaces_and_parens
+         (fresh! 91040)
+         (build! "(builtin msg :params [(x dyn)] :ret dyn \"a b (c)\")")
+         (let [r (run1 "msg" 0)]
+           (assert (= (rt-tag r) RT-STR))
+           (assert (jss-equal? (rt-payload r) (jss-from-utf8! "a b (c)")))))
+
+;; Float literals, which the reader only started distinguishing from symbols with `KFloat`. The
+;; lattice holds a float as its BIT PATTERN, so the path under test is `KFloat` -> `t-flt-bits`.
+(deftest a_float_literal_lowers_to_a_float_constant
+         (fresh! 91050)
+         (build! "(builtin half :params [(x dyn)] :ret dyn (%Mul x 0.5))")
+         (let [r (run1 "half" 7)]
+           (assert (= (rt-tag r) RT-FLT))
+           (assert (= (rt-payload r) (f64-bits 3.5)))))
+
+;; The reader's own refusal, surfaced as a named JSL failure rather than retold. `coil.reader`
+;; returns a `Diag` carrying the message and the byte range that noticed; `jsl-read!` keeps the
+;; message as the error site.
+;; SOURCE RANGES. The roadmap requires an unsupported input to fail with a stable diagnostic AND a
+;; source range, and `coil.reader` puts `lo`/`hi`/`source` on every node. The range must point at the
+;; OFFENDING FORM, not at the whole definition — a range covering the file is a range that tells a
+;; reader nothing, and it is what a naive implementation produces.
+(deftest a_refusal_carries_the_source_range_of_the_offending_form
+         (fresh! 91070)
+         ; The unbound `y` is the last thing in the text; its span must be near the end and narrow,
+         ; not the whole declaration.
+         (let [src "(builtin f :params [(x dyn)] (%Add x y))"]
+           (assert (= (jsl-load! src) JSL-ERR-UNBOUND))
+           ; `y` is the single byte at offset 37; the range is half-open, so [37,38).
+           (assert (= (jsl-err-lo) 37))
+           (assert (= (jsl-err-hi) 38))
+           ; and it names the source it came from
+           (assert (str-eq (jsl-source-path (jsl-err-src)) "<string>")))
+         ; A range from a FILE is attributed to that file's path, which is what makes a multi-unit
+         ; library's diagnostics readable at all.
+         (fresh! 91071)
+         (assert (= (jsl-load-index! "lib/index") JSL-OK))
+         (assert (> (jsl-source-count) 1))
+         (assert (str-eq (jsl-source-path 0) "lib/abstract/clamp.jsl")))
+
+(deftest a_reader_diagnostic_becomes_a_named_jsl_failure
+         (refuses 91060 "(builtin f :params [(x dyn)] (%Add x 1)" JSL-ERR-PARSE)
+         (refuses 91061 "(builtin f :params [(x dyn)] \"unterminated)" JSL-ERR-PARSE))
+
+; ---------------------------------------------------------------------------
+; Loops
+; ---------------------------------------------------------------------------
+;; A JSL loop is a TAIL-RECURSIVE BINDING GROUP: the body is an expression, and if it evaluates to
+;; `(recur …)` the loop iterates with those values, otherwise that value is the loop's value. One
+;; Phi per binding, the initialiser on the entry edge and the recur value on the back edge. There is
+;; no assignment form and no mutable local anywhere in the language, which is what lets the surface
+;; and the IR agree exactly.
+(const SRC-SUM
+  "(builtin sumto :params [(n dyn)] :ret dyn
+     (loop [(i 0) (acc 0)]
+       (if (%Lt i n) (recur (%Add i 1) (%Add acc i)) acc)))")
+
+;; Two bindings that move at different rates, so a loop carrying more than one Phi is exercised
+;; rather than assumed.
+(const SRC-REPEAT
+  "(builtin srepeat :params [(s dyn) (n dyn)] :ret dyn
+     (loop [(i 0) (out \"\")]
+       (if (%Lt i n) (recur (%Add i 1) (%StringConcat out s)) out)))")
+
+;; TWO recur sites, in different arms. The IR gives a Loop exactly one back edge, so these must be
+;; merged into a Region and each binding's back-edge value into a Phi over it. A lowering that
+;; handled only the single-recur case would build a malformed Loop here.
+(const SRC-TWO-RECUR
+  "(builtin countodd :params [(n dyn)] :ret dyn
+     (loop [(i 0) (acc 0)]
+       (if (%Lt i n)
+           (if (%Eq (%Mod i 2) 1)
+               (recur (%Add i 1) (%Add acc 1))
+               (recur (%Add i 1) acc))
+           acc)))")
+
+;; A loop inside a loop: the inner one's recurs must not be confused with the outer one's, which is
+;; what the per-loop base index into the recur arrays is for.
+(const SRC-NESTED
+  "(builtin grid :params [(n dyn)] :ret dyn
+     (loop [(i 0) (total 0)]
+       (if (%Lt i n)
+           (recur (%Add i 1)
+                  (loop [(j 0) (row total)]
+                    (if (%Lt j n) (recur (%Add j 1) (%Add row 1)) row)))
+           total)))")
+
+(deftest a_loop_lowers_to_a_loop_phi_and_counts
+         (fresh! 91100) (build! SRC-SUM)
+         (assert (= (rt-payload (run1 "sumto" 5)) 10))    ; 0+1+2+3+4
+         (fresh! 91101) (build! SRC-SUM)
+         (assert (= (rt-payload (run1 "sumto" 1)) 0))
+         ; Zero trips: the condition fails immediately and the loop's value is the initialiser.
+         (fresh! 91102) (build! SRC-SUM)
+         (assert (= (rt-payload (run1 "sumto" 0)) 0)))
+
+(deftest a_loop_carrying_two_bindings_advances_both
+         (fresh! 91103) (build! SRC-REPEAT)
+         (let [r (run2n "srepeat" (sconst "ab") (iconst 3))]
+           (assert (= (rt-tag r) RT-STR))
+           (assert (jss-equal? (rt-payload r) (jss-from-utf8! "ababab"))))
+         (fresh! 91104) (build! SRC-REPEAT)
+         (let [r (run2n "srepeat" (sconst "x") (iconst 0))]
+           (assert (jss-equal? (rt-payload r) (jss-from-utf8! "")))))
+
+(deftest two_recur_sites_merge_into_one_back_edge
+         (fresh! 91105) (build! SRC-TWO-RECUR)
+         (assert (= (rt-payload (run1 "countodd" 10)) 5))   ; 1,3,5,7,9
+         (fresh! 91106) (build! SRC-TWO-RECUR)
+         (assert (= (rt-payload (run1 "countodd" 7)) 3)))   ; 1,3,5
+
+(deftest a_nested_loop_keeps_its_recurs_separate
+         ; total = n*n: the inner loop adds 1 per column, the outer runs n rows.
+         (fresh! 91107) (build! SRC-NESTED)
+         (assert (= (rt-payload (run1 "grid" 4)) 16))
+         (fresh! 91108) (build! SRC-NESTED)
+         (assert (= (rt-payload (run1 "grid" 0)) 0)))
+
+;; A `loop` nothing recurs to would leave the Loop's back edge null; a `loop` everything recurs from
+;; cannot terminate and leaves the enclosing body with no Return. Both are named at lowering rather
+;; than left to produce a malformed graph several passes later.
+(deftest a_loop_that_cannot_iterate_or_cannot_exit_is_refused
+         (fresh! 91110)
+         (assert (= (jsl-load! "(builtin f :params [(x dyn)] :ret dyn (loop [(i 0)] i))") JSL-OK))
+         (assert (= (jsl-lower!) JSL-ERR-LOOP-NO-RECUR))
+         (fresh! 91111)
+         (assert (= (jsl-load! "(builtin f :params [(x dyn)] :ret dyn (loop [(i 0)] (recur (%Add i 1))))") JSL-OK))
+         (assert (= (jsl-lower!) JSL-ERR-LOOP-NO-EXIT)))
+
+(deftest recur_is_checked_against_its_enclosing_loop
+         (refuses 91120 "(builtin f :params [(x dyn)] (recur x))" JSL-ERR-RECUR-OUTSIDE-LOOP)
+         (refuses 91121
+                  "(builtin f :params [(n dyn)] (loop [(i 0)] (if (%Lt i n) (recur i i) i)))"
+                  JSL-ERR-BAD-RECUR)
+         (refuses 91122 "(builtin f :params [(x dyn)] (loop (i 0) x))" JSL-ERR-BAD-LOOP)
+         ; An initialiser is checked in the ENCLOSING scope, so a binding cannot see itself.
+         (refuses 91123 "(builtin f :params [(x dyn)] (loop [(i i)] (recur i)))" JSL-ERR-UNBOUND))
+
+; ---------------------------------------------------------------------------
+; Macros
+; ---------------------------------------------------------------------------
+;; How many LIVE nodes carry this op. The specialisation cases below assert absence, so this counts
+;; the whole graph rather than one cone: "no If survived anywhere" is the claim, and a cone walk
+;; would miss a node left stranded outside it.
+(defn count-op [(op i64)] (-> i64)
+  (let [n (n-count) (mut i) 0 (mut c) 0]
+    (loop (if (>= (load i) n) (break)
+            (do (if (and (not (n-dead? (load i))) (= (n-op (load i)) op))
+                    (store! c (+ (load c) 1)) 0)
+                (store! i (+ (load i) 1))
+                0)))
+    (load c)))
+
+;; `useTwice` is NOT declared `:transitioning`, and that is the assertion. A macro is expanded into
+;; the caller's graph, so if `Twice` had lowered to a call instead the transition check would see an
+;; OP-CALL among the nodes `useTwice` built and refuse the whole unit.
+(const SRC-MACRO
+  "(macro Twice :params [(x dyn)] (%Mul x 2))
+   (builtin useTwice :params [(y dyn)] :ret dyn (%Add (Twice y) 1))")
+
+;; If a macro body could see its caller's bindings, `(M x)` would read the caller's `v` and answer
+;; x*100+1. Lexically it is x+1. The two differ for every input, so the number is the whole test.
+(const SRC-MACRO-SHADOW
+  "(macro M :params [(v dyn)] (%Add v 1))
+   (builtin caller :params [(x dyn)] :ret dyn (let [(v (%Mul x 100))] (M x)))")
+
+(const SRC-MACRO-CYCLE
+  "(macro A :params [(x dyn)] (B x))
+   (macro B :params [(x dyn)] (A x))
+   (builtin c :params [(x dyn)] :ret dyn (A x))")
+
+;; A fast path with a bail-out, and a caller that says what bailing out means.
+(const SRC-LABEL
+  "(macro Positive :params [(x dyn)] :labels [Bail]
+     (if (%Lt x 0) (goto Bail) (%Mul x 10)))
+   (builtin classify :params [(x dyn)] :ret dyn
+     (Positive x :otherwise -1))")
+
+;; THE SAME MACRO, CALLED WITH A STATICALLY KNOWN ARGUMENT. This is the case the whole language
+;; exists for: the guard is decidable, so the branch folds, the bail-out never reaches the label,
+;; and the handler is never built at all.
+(const SRC-SPECIALISE
+  "(macro Positive :params [(x dyn)] :labels [Bail]
+     (if (%Lt x 0) (goto Bail) (%Mul x 10)))
+   (builtin fast :params [(y dyn)] :ret dyn
+     (Positive 7 :otherwise (%Add y 999)))")
+
+;; The falsification of the row above. Identical but for the argument, which is now opaque, so the
+;; guard, the bail-out and the handler must all survive. Without this pair, "no If in the graph"
+;; would be satisfied by a lowering that never built one.
+(const SRC-NOT-SPECIALISED
+  "(macro Positive :params [(x dyn)] :labels [Bail]
+     (if (%Lt x 0) (goto Bail) (%Mul x 10)))
+   (builtin slowpath :params [(y dyn)] :ret dyn
+     (Positive y :otherwise (%Add y 999)))")
+
+(deftest a_macro_is_inlined_rather_than_called
+         (fresh! 90400)
+         (build! SRC-MACRO)
+         (assert (jsl-macro? (jsl-find "Twice")))
+         (assert (not (jsl-macro? (jsl-find "useTwice"))))
+         ; A macro gets no Fun, because it is never called.
+         (assert (= (jsl-decl-fun (jsl-find "Twice")) NO-NODE))
+         (assert (!= (jsl-decl-fun (jsl-find "useTwice")) NO-NODE))
+         (assert (= (rt-payload (run1 "useTwice" 5)) 11)))
+
+(deftest a_macro_body_cannot_see_its_callers_bindings
+         (fresh! 90401)
+         (build! SRC-MACRO-SHADOW)
+         (assert (= (rt-payload (run1 "caller" 2)) 3)))
+
+;; A macro that reaches itself has no fixed point, so the expansion would not terminate. It has to
+;; be a named diagnostic found statically, not a depth cap that reports a legal deep nest.
+(deftest a_recursive_macro_is_refused_before_anything_is_lowered
+         (refuses 90402 SRC-MACRO-CYCLE JSL-ERR-MACRO-RECURSION)
+         (refuses 90403
+                  "(macro A :params [(x dyn)] (A x)) (builtin c :params [(x dyn)] :ret dyn (A x))"
+                  JSL-ERR-MACRO-RECURSION))
+
+(deftest a_label_and_its_otherwise_handler_both_execute
+         (fresh! 90404)
+         (build! SRC-LABEL)
+         (assert (= (rt-payload (run1 "classify" 3)) 30))
+         (fresh! 90405)
+         (build! SRC-LABEL)
+         (assert (= (rt-payload (run1 "classify" -3)) -1)))
+
+;; THE CLAIM THE LANGUAGE IS FOR. With the guard decidable, the whole of `fast` becomes the constant
+;; 70: no call, because a macro is inlined into its caller; no branch, because the guard folded; and
+;; no `%Add`, because the entire bail-out path went with it.
+;;
+;; WHICH PASS DOES IT, precisely, because the distinction matters to anyone relying on this. The
+;; LOWERING does not skip the slow path here. `%Lt 7 0` folds to `Const bool=0` at construction, but
+;; the If is still built, the `goto` still fires, and the handler is still emitted — the graph
+;; straight after lowering contains `If`, both CProj arms, `Add y 999`, and a Region/Phi merging
+;; them. It is `iterate!` that collapses all of it. `jl-macro-finish`'s no-exits path is a real
+;; optimisation, but it fires when a `goto` is unreachable in the SOURCE, not when it is merely
+;; decidable.
+;;
+;; That is still the thesis. V8 reaches this shape by speculating and keeping deopt metadata to
+;; retreat with; under D1's closed world it falls out of ordinary constant propagation, with no
+;; deoptimisation machinery anywhere.
+(deftest a_decidable_guard_folds_to_straight_line_code
+         (fresh! 90406)
+         (build! SRC-SPECIALISE)
+         (assert (= (rt-payload (run1 "fast" 1)) 70))
+         (assert (= (count-op OP-CALL) 1))   ; only the top-level call the harness makes
+         (assert (= (count-op OP-IF) 0))
+         (assert (= (count-op OP-ADD) 0))
+         (assert (= (count-op OP-MUL) 0))
+         (assert (= (count-op OP-LT) 0)))
+
+(deftest an_opaque_guard_keeps_the_branch_and_the_slow_path
+         (fresh! 90407)
+         (build! SRC-NOT-SPECIALISED)
+         (assert (= (rt-payload (run1 "slowpath" 4)) 40))
+         (assert (>= (count-op OP-IF) 1))
+         (assert (>= (count-op OP-ADD) 1))
+         (fresh! 90408)
+         (build! SRC-NOT-SPECIALISED)
+         (assert (= (rt-payload (run1 "slowpath" -4)) 995)))
+
+(deftest a_label_on_a_builtin_is_refused_because_control_cannot_cross_a_call
+         (refuses 90409 "(builtin f :labels [L] :params [(x dyn)] x)" JSL-ERR-BAD-LABELS))
+
+(deftest more_labels_than_are_supported_are_refused_by_name
+         (refuses 90410 "(macro m :labels [A B] :params [(x dyn)] x)" JSL-ERR-TOO-MANY-LABELS))
+
+(deftest a_goto_naming_no_label_of_its_own_macro_is_refused
+         (refuses 90411
+                  "(macro m :labels [Bail] :params [(x dyn)] (goto Nope))"
+                  JSL-ERR-BAD-GOTO)
+         ; A `goto` in a callable with no label at all is the same failure.
+         (refuses 90412 "(builtin f :params [(x dyn)] (goto Bail))" JSL-ERR-BAD-GOTO))
+
+(deftest a_labelled_macro_must_be_given_somewhere_to_go
+         (refuses 90413
+                  "(macro m :labels [Bail] :params [(x dyn)] (goto Bail))
+                   (builtin f :params [(x dyn)] :ret dyn (m x))"
+                  JSL-ERR-MISSING-OTHERWISE))
+
+(deftest an_otherwise_on_a_callee_with_no_label_is_refused
+         (refuses 90414
+                  "(macro m :params [(x dyn)] x)
+                   (builtin f :params [(x dyn)] :ret dyn (m x :otherwise 0))"
+                  JSL-ERR-UNEXPECTED-OTHERWISE)
+         (refuses 90415
+                  "(builtin f :params [(x dyn)] :ret dyn (%Add x 1 :otherwise 0))"
+                  JSL-ERR-UNEXPECTED-OTHERWISE))
+
+; ---------------------------------------------------------------------------
+; The primitive table
+; ---------------------------------------------------------------------------
+;; Every row is complete. A column nobody filled is a `-1`, and a `-1` op would build a node with
+;; an opcode no dispatch anywhere recognises, which is exactly the silent failure the one-function
+;; -per-column shape exists to make impossible.
+(deftest every_primitive_row_names_an_op_and_an_arity
+         (let [(mut id) 0 (mut checked) 0]
+           (loop (if (>= (load id) JSP-COUNT) (break)
+                   (do
+                     (assert (!= (jsp-op (load id)) -1))
+                     ; `%NewArray` takes no operands: it needs the current control, not a value.
+                     (assert (>= (jsp-arity (load id)) 0))
+                     (assert (<= (jsp-arity (load id)) 3))
+                     (assert (= (jsp-find (jsp-name (load id))) (load id)))
+                     (store! checked (+ (load checked) 1))
+                     (store! id (+ (load id) 1))
+                     0)))
+           ; The vacuity defence: an empty loop satisfies every assertion above.
+           (assert (= (load checked) JSP-COUNT))
+           (assert (= (jsp-find "%NotAPrimitive") JSP-NONE))))
+
+(deftest every_failure_code_has_a_distinct_name
+         (let [(mut c) 0 (mut named) 0]
+           (loop (if (> (load c) JSL-ERR-UNEXPECTED-OTHERWISE) (break)
+                   (do
+                     (assert (not (str-eq (jsl-err-name (load c)) "<unknown jsl code>")))
+                     (store! named (+ (load named) 1))
+                     (store! c (+ (load c) 1))
+                     0)))
+           (assert (= (load named) (+ JSL-ERR-UNEXPECTED-OTHERWISE 1)))))
