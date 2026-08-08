@@ -24,14 +24,11 @@ Status as of the commit that adds this file. `tools/gate.sh` green at 533 tests.
 | `toLowerCase` | **converted** | `StringToLowerCase` |
 | `toUpperCase` | **converted** | `StringToUpperCase` |
 | `split` | not converted | — |
-| `.length` | not converted | — |
+| `.length` | **converted** | `StringLength` |
 
 `split` allocates an array. `%NewArray` and `%ArrayStore` exist, so a definition is writable; the
 frontend's own split path also marks the allocation and publishes a dynamic alias, and that half has
 no counterpart in the library yet. This is the largest genuinely-open item.
-
-`.length` is a property access rather than a call, and reaches a different part of the frontend from
-the method path. `%StringLen` exists; this is wiring, not design.
 
 ## Array.prototype
 
@@ -97,15 +94,16 @@ false because the argument is a string rather than the NaN value. Two operations
 
 ## Operators
 
-| Operation | Status | Note |
+| Operation | Status | Definition |
 |---|---|---|
-| string `===` / `!==` | not converted | `%StringEq` exists |
-| string `<` `>` `<=` `>=` | not converted | `%StringCompare` exists |
-| string `+` | not converted | `%StringConcat` exists |
+| string `===` / `!==` | **converted** | `StringEquals` |
+| string `<` `>` `<=` `>=` | **converted** | `StringCompare` |
+| string `+` | **converted** | `StringConcat` |
 
-All three are wiring. Each has its primitive and needs a macro plus a call-site change; they were
-not done here only because the frontend reaches them from several places and the change is
-mechanical rather than interesting.
+All four relational operators are one `StringCompare` against zero, which is why there is one
+definition rather than four. `===` is CONTENT equality: two separately allocated strings with the
+same code units are equal, and an identity comparison would answer false for every row of
+`tests/native-conformance/string-operators.ts`.
 
 ## Not operations at all
 
@@ -118,13 +116,17 @@ with no JavaScript semantics to express.
 
 | | count |
 |---|---|
-| Converted | 21 |
-| Wiring remaining | 7 |
+| Converted | 27 |
+| Wiring remaining | 1 |
 | Blocked on a primitive | 4 (array resize family) |
 | Blocked on design | 1 (`split`) |
 | Not convertible | 11 (libm + `random`) |
 
+The one remaining wiring item is the `Number.*` family — `Number.isNaN`, `isFinite`, `isInteger`
+and `isSafeInteger` are written and native-gate verified, but the frontend has no path for `Number.*`
+at all, so reaching them means adding an intrinsic rather than moving a call site.
+
 The honest shape of it: **nothing is blocked by the DSL's expressiveness.** What remains is one
-missing primitive, one allocation-path design question, and a set of call sites nobody has moved
-yet. The two things that ever genuinely blocked conversion — memory crossing the seam, and the cost
+missing primitive, one allocation-path design question, and one intrinsic the frontend does not
+recognise. The two things that ever genuinely blocked conversion — memory crossing the seam, and the cost
 of the abstraction — are both fixed, in `jsl-inline!` and in `g-fold-proven!` respectively.
