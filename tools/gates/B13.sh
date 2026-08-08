@@ -17,8 +17,7 @@ done
 
 tools/build-typescript-go-bridge.sh >/dev/null
 archive="$PWD/.coil/build/native/typescript-go-bridge/libaot_typescript.a"
-link_flags=(--link-flag "-Wl,-force_load,$archive" --link-flag -framework \
-  --link-flag CoreFoundation --link-flag -framework --link-flag Security)
+link_flags=()  # Coil.toml [link] supplies these; the compiler applies them to every build
 coil build tools/typescript-native-b13-string-smoke.coil -o "$task_dir/string-smoke" \
   "${link_flags[@]}" >/dev/null
 "$task_dir/string-smoke"

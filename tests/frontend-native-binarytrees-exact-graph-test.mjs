@@ -46,9 +46,9 @@ try {
   const legacyExe = path.join(directory, "legacy");
   fs.writeFileSync(nativeFile, native);
   fs.writeFileSync(legacyFile, legacy);
-  const nativeBuild = spawnSync("coil", ["build", nativeFile, "-o", nativeExe,
-    "--link-flag", `-Wl,-force_load,${archive}`, "--link-flag", "-framework",
-    "--link-flag", "CoreFoundation", "--link-flag", "-framework", "--link-flag", "Security"],
+  // Coil.toml [link] already force-loads the archive and names the frameworks, and the compiler
+  // applies manifest link flags to every build, so passing them again is redundant.
+  const nativeBuild = spawnSync("coil", ["build", nativeFile, "-o", nativeExe],
   { encoding: "utf8" });
   assert.equal(nativeBuild.status, 0, `${nativeBuild.stdout}\n${nativeBuild.stderr}`);
   const legacyBuild = spawnSync("coil", ["build", legacyFile, "-o", legacyExe], { encoding: "utf8" });

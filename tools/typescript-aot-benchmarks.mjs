@@ -39,10 +39,10 @@ for (const benchmark of cases) {
   const compileStarted = process.hrtime.bigint();
   run(process.execPath, ["tools/generate-typescript-aot-benchmark.mjs", sourcePath, coilPath,
     "0", "10", benchmark.optimize === false ? "0" : "1"]);
-  run("coil", ["build", coilPath, "-o", emitterPath,
-    "--link-flag", `-Wl,-force_load,${nativeParserArchive}`,
-    "--link-flag", "-framework", "--link-flag", "CoreFoundation",
-    "--link-flag", "-framework", "--link-flag", "Security"]);
+  // Coil.toml [link] already force-loads the archive and names the frameworks, and the compiler
+  // applies manifest link flags to every build. Passing them again loads the archive twice and the
+  // link fails with ~73 duplicate symbols, each reported against itself.
+  run("coil", ["build", coilPath, "-o", emitterPath]);
   fs.writeFileSync(objectPath, run(emitterPath,
     benchmark.scheduleSeed === undefined ? [] : [String(benchmark.scheduleSeed), "10"], { encoding: null }));
   const coilCompileNs = Number(process.hrtime.bigint() - compileStarted);

@@ -57,7 +57,10 @@ try {
   const coilFile = path.join(directory, "driver.coil");
   const executable = path.join(directory, "driver");
   fs.writeFileSync(coilFile, driver);
-  const build = spawnSync("coil", ["build", coilFile, "-o", executable, "--link-flag", `-Wl,-force_load,${archive}`, "--link-flag", "-framework", "--link-flag", "CoreFoundation", "--link-flag", "-framework", "--link-flag", "Security"], {encoding:"utf8"});
+  // Coil.toml [link] already force-loads the archive and names the frameworks, and the compiler
+  // applies manifest link flags to every build. Passing them again loads the archive twice and the
+  // link fails with ~73 duplicate symbols, each reported against itself.
+  const build = spawnSync("coil", ["build", coilFile, "-o", executable], {encoding:"utf8"});
   if (build.status !== 0) throw new Error(`native frontend driver build failed:\n${build.stdout}${build.stderr}`);
   const run = spawnSync(executable, [], {encoding:"utf8", maxBuffer:2 * 1024 * 1024});
   if (run.status !== 0) {

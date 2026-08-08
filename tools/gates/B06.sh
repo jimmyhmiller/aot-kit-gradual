@@ -71,10 +71,7 @@ node tests/frontend-ir-test.mjs >/dev/null
 tools/build-typescript-go-bridge.sh >/dev/null
 archive="$PWD/.coil/build/native/typescript-go-bridge/libaot_typescript.a"
 coil build tools/typescript-native-bitwise-graph-smoke.coil \
-  -o "$tmp/native-bitwise" \
-  --link-flag "-Wl,-force_load,$archive" \
-  --link-flag -framework --link-flag CoreFoundation \
-  --link-flag -framework --link-flag Security >/dev/null
+  -o "$tmp/native-bitwise" >/dev/null
 "$tmp/native-bitwise" > "$tmp/native-bitwise.txt"
 node tests/frontend-native-bitwise-exact-graph-test.mjs "$tmp/native-bitwise.txt" >/dev/null
 

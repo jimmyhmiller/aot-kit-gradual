@@ -40,13 +40,10 @@ const run = (command, args, options = {}) => execFileSync(command, args, {
   stdio: options.stdio,
 });
 const archive = run(path.join(root, "tools", "build-typescript-go-bridge.sh"), []).trim();
-const linkFlags = [
-  "--link-flag", `-Wl,-force_load,${archive}`,
-  "--link-flag", "-framework",
-  "--link-flag", "CoreFoundation",
-  "--link-flag", "-framework",
-  "--link-flag", "Security",
-];
+// Coil.toml's [link] flags already force-load this archive and name the frameworks, and the
+// compiler applies them to every build in the project. Passing them again here loads the archive
+// twice and the link fails with ~73 duplicate symbols, each reported against itself.
+const linkFlags = [];
 
 const report = {schemaVersion: 1, extended, modes, cases: []};
 try {

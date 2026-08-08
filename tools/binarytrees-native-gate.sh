@@ -28,10 +28,7 @@ trap 'rm -rf "$tmpdir"' EXIT
 if ((typescript_frontend)); then
   node tools/generate-typescript-binarytrees.mjs --emitter "$tmpdir/emitter.coil"
   archive=$(tools/build-typescript-go-bridge.sh)
-  coil build "$tmpdir/emitter.coil" -o "$tmpdir/emitter" \
-    --link-flag "-Wl,-force_load,$archive" \
-    --link-flag -framework --link-flag CoreFoundation \
-    --link-flag -framework --link-flag Security >/dev/null
+  coil build "$tmpdir/emitter.coil" -o "$tmpdir/emitter" >/dev/null
 else
   coil build tools/emit-binarytrees-object.coil -o "$tmpdir/emitter" >/dev/null
 fi

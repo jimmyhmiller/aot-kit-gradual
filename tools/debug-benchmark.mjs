@@ -51,7 +51,10 @@ fs.mkdirSync(directory, {recursive: true});
 const manifest = {benchmark, stage, seed, registers, traceLimit, problemSize, nativeTimeout, deltaPhase, skipDestroy, directory, startedAt: new Date().toISOString(), commands: []};
 const adapted = path.join(directory, `${benchmark}.js`);
 const archive = path.join(root, ".coil", "build", "native", "typescript-go-bridge", "libaot_typescript.a");
-const linkFlags = ["--link-flag", `-Wl,-force_load,${archive}`, "--link-flag", "-framework", "--link-flag", "CoreFoundation", "--link-flag", "-framework", "--link-flag", "Security"];
+// Coil.toml's [link] flags already force-load this archive and name the frameworks, and the
+// compiler applies them to every build in the project. Passing them again here loads the archive
+// twice and the link fails with ~73 duplicate symbols, each reported against itself.
+const linkFlags = [];
 
 function usage(message) {
   if (message) console.error(message);
