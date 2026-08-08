@@ -199,7 +199,9 @@
   (fng-peep (n-new3 op 0 NO-NODE left right)))
 
 (defn fng-string-coerce [(context FngContext) (source i64) (value i64)] (-> i64)
-  (if (= (fng-infer context source FNG-DYNAMIC) FNG-STRING) value (n-to-string! value)))
+  (if (= (fng-infer context source FNG-DYNAMIC) FNG-STRING)
+      value
+      (fng-jsl-call1 context "ToStringValue" value)))
 
 (defn fng-direct-call-object-type [(value i64)] (-> i64)
   (if (and (>= value 0) (= (n-op value) OP-CALL))
@@ -1660,7 +1662,8 @@
               (do
                 (store! result
                         (n-string-concat! (load result)
-                                          (n-string-from-code-unit! (fng-expression context
+                                          (fng-jsl-call1 context "StringFromCharCode"
+                                                         (fng-expression context
                                                                                     (ts-child ast node (load index))))))
                 (store! index (+ (load index) 1)))))
     (load result)))
@@ -2385,17 +2388,22 @@
                 (let [argument (ts-child ast node 1)]
                   (if (= (fe-resolution-symbol frontend argument) FE-INTRINSIC-NAN)
                       (n-string-const! (jss-from-utf8! "NaN"))
-                      (n-to-string! (fng-expression context argument)))))
+                      (fng-jsl-call1 context "ToStringValue"
+                                     (fng-expression context argument)))))
           (= intrinsic FNG-INTRINSIC-PARSEINT)
-            (n-parse-int! (fng-expression context (ts-child ast node 1))
-                          (if (> argc 1)
-                              (fng-expression context (ts-child ast node 2))
-                              (fng-const 0)))
+            (fng-jsl-call2 context "ParseIntValue"
+                           (fng-expression context (ts-child ast node 1))
+                           (if (> argc 1)
+                               (fng-expression context (ts-child ast node 2))
+                               (fng-const 0)))
           :else
             (let [argument (ts-child ast node 1)]
               (if (= (fe-resolution-symbol frontend argument) FE-INTRINSIC-NAN)
                   (fng-bool true)
-                  (n-is-nan! (fng-expression context argument)))))))
+                  ;; The GLOBAL isNaN, which coerces before testing — see GlobalIsNaN's note on how
+                  ;; it differs from Number.isNaN.
+                  (fng-jsl-call1 context "GlobalIsNaN"
+                                 (fng-expression context argument)))))))
 
 (defn fng-call [(context FngContext) (node i64)] (-> i64)
   (let [frontend (load (field context frontend))
