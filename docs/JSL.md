@@ -644,11 +644,38 @@ arm of the enclosing `if` while `jl`'s diamond is still being built, and the hal
 Phi are then left disagreeing. The prerequisite is in the LOWERING — `jl` has to tolerate a
 condition that folds under it — and it is the next piece of work here.
 
-**And it would not have helped the benchmark anyway.** The fold fires only when the boxed value's
+**And it would not have helped `math-loop` anyway.** The fold fires only when the boxed value's
 kind is decided. `i - 500` is `num`, which is `int|flt`: neither inside `int` nor disjoint from it,
-so either answer would be a guess. `num` is what JavaScript arithmetic produces, so the honest
-statement is that this pays off at sites where the frontend has proven a kind, and `math-loop` is
-not one. The Math conversion is kept with that cost understood rather than reverted to hide it.
+so either answer would be a guess. `num` is what JavaScript arithmetic produces.
+
+### The one blocker under both problems: `jl` always materialises a diamond
+
+Converting the string family cost far more than Math did, and the measurement says so plainly:
+`benchmarks/typescript-aot/string-loop.ts` went from 3.8ms to 79.4ms, a factor of 20.
+
+The graphs say why. Before the conversion the loop body is 38 nodes with one `If` and no `Region` —
+straight-line, and both `StringIndexOf` nodes are pure and loop-invariant, so GVN and code motion
+hoist them clean out of the loop. After it, 64 nodes with five `If`s and four `Region`s. Those are
+`Clamp`'s two tests, once per `indexOf`, and a pure node that used to float out of the loop is now
+pinned between them and re-evaluated every iteration.
+
+At the call site that matters this is all avoidable arithmetic. `text.indexOf(needle)` passes a
+CONSTANT 0 for the start, so `Clamp 0 0 (%StringLen s)` is 0 — `0 < 0` is false, and `len < 0` is
+false for any length. Neither test survives to runtime in principle.
+
+They survive in practice because **`jl` builds the diamond before it ever asks what the condition
+is, and nothing downstream takes it back**. Typing `%StringLen` as non-negative was tried and
+changed the graph by exactly nothing: 5 `If`s and 4 `Region`s before and after, 64 nodes both ways.
+The refinement is true and it is not the missing piece, so it is not in the tree.
+
+This is the same wall the type-test folding hit from the other side. There, a condition that DID
+fold left the half-built Region and Phi disagreeing (`VERR-ARITY`); here, a condition that should
+fold never gets the chance. Both are one defect: `jl`'s `if` lowering has no notion of a condition
+with a known value. Fixing it makes the type test safe to fold AND removes these diamonds, which is
+why it is the next piece of work rather than one of several.
+
+Until then the conversion is kept with the cost measured and understood rather than hidden — but
+"understood" is doing real work in that sentence, and 20x is not a rounding error.
 
 ---
 
