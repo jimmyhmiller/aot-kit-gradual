@@ -33,15 +33,17 @@ COVERED=(
   "NumberIsFinite:1:isfin:vals"
   "NumberIsInteger:1:isint:vals"
   "NumberIsSafeInteger:1:issafe:vals"
+  "ProbeStrEq:1:streq:idx:15"
+  "ProbeStrNum:1:strnum:idx:15"
 )
 
 covered=0
 for spec in "${COVERED[@]}"; do
-  IFS=: read -r entry arity label table <<<"$spec"
+  IFS=: read -r entry arity label table count <<<"$spec"
   "$tmp/emit" "$entry" "$arity" > "$tmp/$entry.o"
   xcrun clang -O2 -arch arm64 -I tools -o "$tmp/$entry" \
     tools/jsl-native-harness.c "$tmp/$entry.o" tools/native-gc-runtime.c
-  "$tmp/$entry" "$label" "$table" >> "$tmp/native.txt"
+  "$tmp/$entry" "$label" "$table" ${count:-} >> "$tmp/native.txt"
   covered=$((covered + 1))
 done
 

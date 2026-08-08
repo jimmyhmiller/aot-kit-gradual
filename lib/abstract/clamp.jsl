@@ -5,7 +5,18 @@
 ;; OP-CALL in every caller, which made each of them `:transitioning` and put a call on the fast path
 ;; of `StringIndexOfFrom`. Inlined, the bound is three nodes the optimiser can fold against a known
 ;; index, and the caller needs no annotation because it no longer transitions.
-(macro Clamp
-  :params [(v dyn) (lo dyn) (hi dyn)]
-  :ret dyn
-  (if (%Lt v lo) lo (if (%Lt hi v) hi v)))
+;; UNBOXED INTS. Every index in the string library is a machine integer — `%StringLen` and
+;; `%StringIndexOf` both compute `int` — so clamping one is ordinary integer arithmetic. A version
+;; over `dyn` would compare boxed words, which is an integer compare of tagged bit patterns.
+(macro Clamp :params [(x int) (lo int) (hi int)] :ret int
+  (if (%Lt x lo) lo (if (%Lt hi x) hi x)))
+
+;; ToIntegerOrInfinity, saturated to a machine index in [0, hi]. `%ToInteger` returns a BOXED value
+;; that is an integer for anything in range and a double only for the infinities and magnitudes at
+;; or beyond 2^53 — both of which are outside any string or array length, so the double arm only has
+;; to pick an end.
+(macro ClampedIndex :params [(v dyn) (hi int)] :ret int
+  (let [(n (%ToInteger v))]
+    (if (%IsInt n)
+        (Clamp (%UnboxInt n) 0 hi)
+        (if (%Lt (%UnboxFlt n) 0.0) 0 hi))))

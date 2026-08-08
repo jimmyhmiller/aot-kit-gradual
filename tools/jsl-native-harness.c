@@ -12,6 +12,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
 #include <math.h>
 #include "js-value.h"
 
@@ -80,6 +81,14 @@ int main(int argc, char **argv) {
     for (size_t i = 0; i < VALS_N; i++) {
       snprintf(buf, sizeof buf, "%s%zu", label, i);
       print_value(buf, kernel(box_number(VALS[i]), 0));
+    }
+  } else if (!strcmp(table, "idx")) {
+    /* A plain 0..N-1 selector. The probe dispatches on it and returns a boolean or an integer, so
+       a string result can be judged without the harness reading one out of the runtime. */
+    int n = argc > 3 ? atoi(argv[3]) : 0;
+    for (int i = 0; i < n; i++) {
+      snprintf(buf, sizeof buf, "%s%d", label, i);
+      print_value(buf, kernel(aot_js_box_int(i), 0));
     }
   } else {
     fprintf(stderr, "unknown table %s\n", table);

@@ -206,4 +206,50 @@ VALS.forEach((v, i) => {
 });
 
 
+// ---------------------------------------------------------------------------
+// The native probes. tools/jsl-native-probes.jsl computes each of these in the library and returns
+// a BOOLEAN, so a string result can be judged without the harness reading one out of the runtime.
+// These lines are what tools/jsl-native-gate.sh compares its compiled output against.
+//
+// The deliberate false rows are not filler: a table of expected-true rows would pass against a
+// string comparison that always agreed.
+// ---------------------------------------------------------------------------
+const STREQ = [
+  () => "hello".substring(1, 3) === "el",
+  () => "hello".substring(1, 3) === "XX",
+  () => "  ab  ".trim() === "ab",
+  () => "  ab  ".trimStart() === "ab  ",
+  () => "  ab  ".trimEnd() === "  ab",
+  () => "ab".repeat(3) === "ababab",
+  () => "ab".repeat(0) === "",
+  () => "abc".padStart(6, "0") === "000abc",
+  () => "abc".padEnd(6, "0") === "abc000",
+  () => "abcdef".slice(1, 4) === "bcd",
+  () => "abc".charAt(1) === "b",
+  () => "abc".charAt(9) === "",
+  () => "abcabc".replaceAll("b", "X") === "aXcaXc",
+  () => "abc".replaceAll("", "-") === "-a-b-c-",
+  () => "abcdef".slice(4, 1) === "",
+];
+STREQ.forEach((f, i) => lines.push(`streq${i}=${f() ? "true" : "false"}`));
+
+const STRNUM = [
+  () => "hello world".indexOf("o", 0) === 4,
+  () => "hello world".indexOf("o", 5) === 7,
+  () => "hello world".indexOf("o", 99) === -1,
+  () => "hello".length === 5,
+  () => "abc".charCodeAt(1) === 98,
+  () => "coil".startsWith("co") === true,
+  () => "coil".startsWith("il") === false,
+  () => "coil".endsWith("il") === true,
+  () => "oil".endsWith("coil") === false,
+  () => "abcabc".lastIndexOf("b") === 4,
+  () => "abc".lastIndexOf("") === 3,
+  () => "coil".includes("il") === true,
+  () => "coil".includes("zz") === false,
+  () => "abcdef".at(-2) === "e",
+  () => "abcdef".slice(1, 4) === "bcd",
+];
+STRNUM.forEach((f, i) => lines.push(`strnum${i}=${f() ? "true" : "false"}`));
+
 process.stdout.write(lines.join("\n") + "\n");
