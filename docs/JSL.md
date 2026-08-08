@@ -583,31 +583,34 @@ passes its string straight through — boxing it would hand the library a tagged
 a pointer. `StringIndexOfFrom` takes `(s dyn) (needle dyn) (start int)` and returns `int`, which is
 exactly what the IR node it replaces took and returned, so nothing at the boundary converts.
 
-### The blocker, stated plainly
+### The scheduling bug this exposed
 
-Converting the rest of the frontend to this seam is blocked on a **backend scheduling limitation**,
-not on anything about JSL.
+Wiring the first call into the middle of an expression exposed a real backend defect, since fixed in
+`src/backend_select.coil`.
 
-A JSL call is an `OP-CALL`, and a call is pinned to its control edge. Its arguments are ordinary
-floating nodes. When a call is pinned early in a long straight-line block and one of its arguments
-is scheduled later in that same block, selection fails with `MSEL-DEPENDENCY`: the verifier requires
-a producer to precede its consumer, and here instruction 37 produced the value instruction 17
-consumed. Both instructions were in the entry block of the same function.
+A call is pinned to its control edge; its arguments are ordinary floating nodes. The within-block
+list scheduler carries three edge kinds: real data edges, memory edges, and a third class that only
+means "these two were in this order when we got here, keep them that way". That third class asks
+`before`, which reads the current instruction order — the order the scheduler was invoked to fix.
 
-It is worth being precise that this is **pre-existing and not caused by JSL**. Nothing about the
-failure mentions the library; it needs only a pinned call mid-expression whose argument the
-scheduler sinks past it. The reason it had not been seen is that the frontend emitted pure IR nodes
-for builtins, and pure nodes are ordered by data dependence alone. Adding the first call into the
-middle of an expression is what exposed it.
+A call at instruction 17 consumed a string built at instruction 37, so the effect rule added
+17 -> 37 because 17 came first, while the data edges ran 37 -> 26 -> 23 -> 20 -> 17. Nothing could be
+emitted. The block reported `MSCHED-CYCLE`, the repair path gave up, and the original order survived
+to fail verification with `MSEL-DEPENDENCY`. Note the cycle is five instructions long: refusing to
+contradict a *direct* data edge would not have been enough.
 
-The within-block topological sort in `ms-schedule-block!` does account for call arguments
-(`ms-inst-uses-vreg?` walks them), and so does GCM's earliest/latest computation — so the fix is not
-simply "teach it about arguments." Diagnosing further means finding why the sort's ordering does not
-survive, which is the next piece of work before more builtins move across.
+`ms-schedule-block!` now retries the block with the two call/effect clauses dropped. That is safe
+because they are a backstop rather than the mechanism — genuine aliasing between a call and an
+allocation is carried by the memory edges, which come from the node graph and never consult
+`before`. Store/store order and the structural constraints are untouched in both passes.
 
-Until that is fixed, an operation can be converted when its call does not land mid-block among
-floating arguments. `indexOf` is converted and covered; the rest of the string family waits on the
-scheduler.
+The retry alone was not enough. `schedule-order` still described the pre-sort order, so verification
+demanded the new schedule preserve exactly the relative order that had just been deliberately
+changed. It is refreshed after the instruction list is rebuilt, which makes the order-preserving
+edges describe the schedule that actually exists.
+
+`tests/native-conformance/strings-and-conversion.ts` now calls `indexOf` mid-expression, which is
+the shape that failed. Reverting the scheduler change turns that gate red.
 
 ---
 

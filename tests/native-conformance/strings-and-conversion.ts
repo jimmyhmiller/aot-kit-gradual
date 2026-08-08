@@ -6,5 +6,6 @@ export function main(): number {
     + String(-42).length + String(true).length + String(null).length
     + String(undefined).length + String(NaN).length + String(1 / 2).length
     + (255).toString(16).length
+    + text.indexOf('il')
     + (isNaN(undefined) ? 1 : 0) + (isNaN(null) ? 1 : 0) + (isNaN('12x') ? 1 : 0)) | 0;
 }

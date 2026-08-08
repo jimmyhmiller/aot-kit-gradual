@@ -4604,6 +4604,10 @@
                 0)))
     (load found)))
 
+;; Set only for the duration of a retried block schedule. See `ms-schedule-block!`.
+(defn ms-relax-effect-order [] (-> (ptr bool))
+  (let [flag (static bool)] flag))
+
 ; 0=no edge, 1=scalar data, 2=memory/anti, 3=fixed effect/boundary order.
 (defn ms-schedule-dependency-kind [(producer i64) (consumer i64)] (-> i64)
   (if (= producer consumer)
@@ -4613,7 +4617,12 @@
             dst (load (field p dst))
             pop (load (field p op))
             cop (load (field c op))
-            before (< (load (field p schedule-order)) (load (field c schedule-order)))]
+            before (< (load (field p schedule-order)) (load (field c schedule-order)))
+            ;; THE CALL/EFFECT ORDER EDGES ARE A HEURISTIC AND CAN CONTRADICT A REAL DEPENDENCE.
+            ;; They ask `before`, which reads the CURRENT instruction order — the very thing this
+            ;; scheduler exists to correct. `ms-schedule-block!` drops them and retries when they
+            ;; make the block uncyclable; see the note there for what goes wrong without that.
+            relax (load (ms-relax-effect-order))]
         (if (and (>= dst 0)
                  (and (ms-inst-uses-vreg? consumer dst)
                       (or (!= pop MI-COPY) before)))
@@ -4625,8 +4634,10 @@
                          (ms-memory-operands-may-alias? p c))))
                 2
                 (if (or (and before
-                             (or (and (> (mi-op-effects pop) 0) (= cop MI-CALL))
-                                 (or (and (= pop MI-CALL) (> (mi-op-effects cop) 0))
+                             (or (and (not relax)
+                                      (and (> (mi-op-effects pop) 0) (= cop MI-CALL)))
+                                 (or (and (not relax)
+                                          (and (= pop MI-CALL) (> (mi-op-effects cop) 0)))
                                      (and (= pop MI-STORE) (= cop MI-STORE)))))
                         (or (= pop MI-LABEL)
                             (or (and (or (= pop MI-ARG) (= pop MI-STACKARG))
@@ -4679,7 +4690,51 @@
                 0)))
     (load ready)))
 
+;; Schedule one block, and if the edge set has no topological order, drop the two order-preserving
+;; call/effect edges and schedule it again.
+;;
+;; WHY A RETRY RATHER THAN A SHARPER EDGE RULE. Kinds 1 and 2 are real dependences — a value and its
+;; use, a memory order — and they cannot form a cycle. Kind 3 is different: the call/effect clauses
+;; ask `before`, meaning "these two were in this order when we got here, keep them that way". When
+;; the order they are preserving is the one this scheduler was called to FIX, that answer points
+;; backwards along a chain of real data edges and closes a cycle.
+;;
+;; Concretely, from the case that motivated this: a call at instruction 17 consumed a string built
+;; at instruction 37, and the effect rule added 17 -> 37 because 17 came first. The data edges ran
+;; 37 -> 26 -> 23 -> 20 -> 17. Nothing can be emitted, `ms-schedule-block!` reported MSCHED-CYCLE,
+;; the repair in `ms-place-selected!` gave up, and the ORIGINAL order survived to fail `ms-verify!`
+;; with MSEL-DEPENDENCY. A guard against contradicting a DIRECT data edge is not enough — the cycle
+;; here is five instructions long.
+;;
+;; Dropping the clauses is safe because they are a backstop, not the mechanism: genuine aliasing
+;; between a call and an allocation is carried by the kind-2 memory edges, which are computed from
+;; the node graph and are unaffected. Store/store order is left alone in both passes, and so are the
+;; structural constraints (label first, terminator last, argument and ABI-copy placement).
+;;
+;; This is reachable whenever a call sits mid-block among floating arguments. The frontend only
+;; began emitting those when JavaScript builtins moved from pure IR nodes to calls into the JSL
+;; runtime library; a pure node is ordered by data dependence alone and never took this path.
 (defn ms-schedule-block! [(bid i64) (seed i64)] (-> bool)
+  (let [u (machine-unit)
+        mark (al-len [MInst] (load (field u schedule-work)))]
+    (if (ms-schedule-block-once! bid seed)
+        true
+        (if (!= (ms-schedule-result) MSCHED-CYCLE)
+            false
+            (do
+              ;; Roll the work list back to what it held before the failed attempt, so the retry
+              ;; republishes this block instead of appending a second copy of it.
+              (loop (if (<= (al-len [MInst] (load (field u schedule-work))) mark)
+                        (break)
+                        (do (al-pop! [MInst] (field u schedule-work)) 0)))
+              (store! (field u schedule-result) MSCHED-OK)
+              (store! (field u schedule-item) -1)
+              (store! (ms-relax-effect-order) true)
+              (let [ok (ms-schedule-block-once! bid seed)]
+                (store! (ms-relax-effect-order) false)
+                ok))))))
+
+(defn ms-schedule-block-once! [(bid i64) (seed i64)] (-> bool)
   (let [u (machine-unit)
         b (mu-block bid)
         first (load (field b inst-first))
@@ -4916,6 +4971,21 @@
                                   (al-get (load (field u schedule-work)) (load i)))
                         (store! i (+ (load i) 1))
                         0))))
+          ;; `schedule-order` is what `before` reads, and until here it still describes the order
+          ;; this pass was called to CHANGE. Verifying against it asks the new schedule to preserve
+          ;; the relative order of the very instructions that were just moved, which the block that
+          ;; retried without the call/effect edges has deliberately not done — MSCHED-DEPENDENCY on
+          ;; an edge that exists only because the stale order says it should.
+          ;;
+          ;; Refreshing makes the order-preserving edges describe the schedule that actually exists.
+          ;; They carry no independent correctness: what must not be reordered across a call is held
+          ;; by the kind-2 memory edges, which come from the node graph and do not consult `before`.
+          (let [total (be-inst-count) (mut k) 0]
+            (loop (if (>= (load k) total)
+                      (break)
+                      (do (store! (field (be-inst (load k)) schedule-order) (load k))
+                          (store! k (+ (load k) 1))
+                          0))))
           (ms-verify-schedule!)))))
 
 ;; Selection emits a dependency-topological order. This explicit scheduler computes live intervals
