@@ -314,8 +314,17 @@ AotJsValue aot_js_builtin(AotJsValue a, AotJsValue b, uint64_t operation) {
     case AOT_JS_BUILTIN_ABS: result = fabs(x); break;
     case AOT_JS_BUILTIN_FLOOR: result = floor(x); break;
     case AOT_JS_BUILTIN_CEIL: result = ceil(x); break;
-    case AOT_JS_BUILTIN_ROUND:
-      result = x < 0.0 && x >= -0.5 ? -0.0 : floor(x + 0.5); break;
+    case AOT_JS_BUILTIN_ROUND: {
+      /* NOT floor(x + 0.5). At 0.49999999999999994, the largest double below a half, the SUM
+         rounds up to exactly 1.0 and that form answers 1 where the spec answers 0. Comparing the
+         fraction against a half never forms the sum. src/jsbuiltin.coil had the identical bug —
+         which is the point: a differential test between two hand-written implementations cannot
+         see a defect present in both. Node found it. */
+      if (x < 0.0 && x >= -0.5) { result = -0.0; break; }
+      double f = floor(x);
+      result = (x - f) >= 0.5 ? f + 1.0 : f;
+      break;
+    }
     case AOT_JS_BUILTIN_EXP: result = exp(x); break;
     case AOT_JS_BUILTIN_LOG: result = log(x); break;
     case AOT_JS_BUILTIN_SIN: result = sin(x); break;
