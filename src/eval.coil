@@ -39,6 +39,11 @@
 (import "jsvalue" :use *)
 
 (extern free :cc c [(ptr i8)] (-> void))
+;; StringNumericLiteral needs a correctly-rounded decimal-to-double, which is `dtoa` in reverse and
+;; is not a thing to hand-roll. `strtod` is called ONLY after `ev-str-decimal?` has proved the token
+;; is an ECMAScript StrDecimalLiteral, because strtod accepts a good deal that JavaScript does not
+;; ("nan", "inf", "0x1p3", trailing junk) and would otherwise turn a NaN result into a number.
+(extern strtod :cc c [(ptr i8) (ptr (ptr i8))] (-> f64))
 (import "jsobject" :use *)
 (import "jsint32" :use *)
 (import "jsstring" :use *)
@@ -1014,7 +1019,9 @@
                     (ev-string-concat n) OP-STRINGCHARCODE
                     (ev-string-char-code n) OP-STRINGSUBSTRING
                     (ev-string-substring n) OP-TOSTRING
-                    (ev-to-string n) OP-PARSEINT
+                    (ev-to-string n) OP-TOINTEGER
+                    (ev-to-integer n) OP-TONUMBER
+                    (ev-to-number n) OP-PARSEINT
                     (ev-parse-int n) OP-ISNAN
                     (ev-is-nan n) OP-STRINGSPLIT
                     (ev-effect-data n) OP-STRINGFROMCODEUNIT
@@ -1662,6 +1669,189 @@
         (match (jss-parse-int string (rt-payload radix))
           (Some [value] (RInt value))
           (None [] (RFlt JSV-NAN))))))
+
+; ---------------------------------------------------------------------------
+; ToNumber and ToIntegerOrInfinity
+; ---------------------------------------------------------------------------
+;; https://tc39.es/ecma262/#sec-tonumber and #sec-tointegerorinfinity. These are the first two
+;; conversions the JSL library needs (`String.prototype.indexOf` step 4 is ToIntegerOrInfinity), and
+;; they live here rather than being open-coded in a builtin because a coercion implemented twice is
+;; a coercion that will disagree with itself.
+(const EV-INF-BITS i64 9218868437227405312)   ; +Infinity
+(const EV-NEG-INF-BITS i64 -4503599627370496) ; -Infinity
+
+(defn ev-digit-value [(unit i64) (radix i64)] (-> i64)
+  (let [v (if (and (>= unit 48) (<= unit 57)) (- unit 48)
+            (if (and (>= unit 97) (<= unit 122)) (+ (- unit 97) 10)
+              (if (and (>= unit 65) (<= unit 90)) (+ (- unit 65) 10)
+                99)))]
+    (if (< v radix) v -1)))
+
+;; A prefixed integer literal (`0x`, `0o`, `0b`). Returns the value, or -1 when the digits are not
+;; all valid for the radix. The spec allows no sign on these, which is why the caller checks the
+;; prefix before trimming a sign rather than after.
+(defn ev-radix-digits [(string i64) (from i64) (to i64) (radix i64)] (-> i64)
+  (let [(mut i) from (mut acc) 0 (mut ok) (> to from)]
+    (loop (if (or (>= (load i) to) (not (load ok))) (break)
+            (let [d (ev-digit-value (jss-code-unit string (load i)) radix)]
+              (if (< d 0) (store! ok false)
+                (do (store! acc (+ (* (load acc) radix) d))
+                    (store! i (+ (load i) 1))
+                    0)))))
+    (if (load ok) (load acc) -1)))
+
+;; Is `[from,to)` an ECMAScript StrDecimalLiteral?
+;;   [+-]? ( digits ( '.' digits? )? | '.' digits ) ( [eE] [+-]? digits )?
+;; This gate is the whole reason `strtod` is safe to call below.
+(defn ev-str-decimal? [(string i64) (from i64) (to i64)] (-> bool)
+  (let [(mut i) from (mut intd) 0 (mut frac) 0 (mut ok) true]
+    (if (< (load i) to)
+        (let [u (jss-code-unit string (load i))]
+          (if (or (= u 43) (= u 45)) (store! i (+ (load i) 1)) 0))
+        0)
+    (loop (if (>= (load i) to) (break)
+            (let [u (jss-code-unit string (load i))]
+              (if (and (>= u 48) (<= u 57))
+                  (do (store! intd (+ (load intd) 1)) (store! i (+ (load i) 1)) 0)
+                  (break)))))
+    (if (and (< (load i) to) (= (jss-code-unit string (load i)) 46))
+        (do (store! i (+ (load i) 1))
+            (loop (if (>= (load i) to) (break)
+                    (let [u (jss-code-unit string (load i))]
+                      (if (and (>= u 48) (<= u 57))
+                          (do (store! frac (+ (load frac) 1)) (store! i (+ (load i) 1)) 0)
+                          (break)))))
+            0)
+        0)
+    ; At least one digit somewhere: "." and "+." are not numbers, "1.", ".5" and "1" are.
+    (if (= (+ (load intd) (load frac)) 0) (store! ok false) 0)
+    (if (and (load ok) (< (load i) to))
+        (let [u (jss-code-unit string (load i))]
+          (if (or (= u 101) (= u 69))
+              (do (store! i (+ (load i) 1))
+                  (if (< (load i) to)
+                      (let [sg (jss-code-unit string (load i))]
+                        (if (or (= sg 43) (= sg 45)) (store! i (+ (load i) 1)) 0))
+                      0)
+                  (let [(mut expd) 0]
+                    (loop (if (>= (load i) to) (break)
+                            (let [d (jss-code-unit string (load i))]
+                              (if (and (>= d 48) (<= d 57))
+                                  (do (store! expd (+ (load expd) 1)) (store! i (+ (load i) 1)) 0)
+                                  (break)))))
+                    (if (= (load expd) 0) (store! ok false) 0))
+                  0)
+              (store! ok false)))
+        0)
+    (and (load ok) (= (load i) to))))
+
+;; The validated token, handed to libc. Code units are all ASCII by construction — `ev-str-decimal?`
+;; only accepts digits, sign, dot and `e` — so a byte-per-unit copy is exact rather than a narrowing.
+(defn ev-strtod-range [(string i64) (from i64) (to i64)] (-> f64)
+  (let [n (- to from)
+        buf (cast (ptr i8) (malloc (+ n 1)))
+        (mut i) 0]
+    (loop (if (>= (load i) n) (break)
+            (do (store! (index buf (load i))
+                        (cast i8 (jss-code-unit string (+ from (load i)))))
+                (store! i (+ (load i) 1))
+                0)))
+    (store! (index buf n) (cast i8 0))
+    (let [v (strtod buf (cast (ptr (ptr i8)) 0))]
+      (free buf)
+      v)))
+
+(defn ev-token-is? [(string i64) (from i64) (to i64) (lit (slice u8))] (-> bool)
+  (let [n (- to from)]
+    (if (!= n (slice-len lit)) false
+      (let [(mut i) 0 (mut same) true]
+        (loop (if (or (>= (load i) n) (not (load same))) (break)
+                (do (if (!= (jss-code-unit string (+ from (load i)))
+                            (cast i64 (slice-get lit (load i))))
+                        (store! same false) 0)
+                    (store! i (+ (load i) 1))
+                    0)))
+        (load same)))))
+
+;; https://tc39.es/ecma262/#sec-stringtonumber. Whitespace-trimmed; empty is +0; `Infinity` is
+;; spelled exactly that way (strtod's "inf"/"infinity" are NOT JavaScript); the three integer
+;; prefixes take no sign; everything else is a StrDecimalLiteral or NaN.
+(defn ev-string-to-number [(string i64)] (-> RtVal)
+  (let [len (jss-length string) (mut lo) 0 (mut hi) len]
+    (loop (if (or (>= (load lo) (load hi))
+                  (not (jss-ascii-space? (jss-code-unit string (load lo))))) (break)
+            (do (store! lo (+ (load lo) 1)) 0)))
+    (loop (if (or (>= (load lo) (load hi))
+                  (not (jss-ascii-space? (jss-code-unit string (- (load hi) 1))))) (break)
+            (do (store! hi (- (load hi) 1)) 0)))
+    (let [a (load lo) b (load hi)]
+      (if (= a b) (RInt 0)
+        (if (ev-token-is? string a b "Infinity") (RFlt EV-INF-BITS)
+          (if (ev-token-is? string a b "+Infinity") (RFlt EV-INF-BITS)
+            (if (ev-token-is? string a b "-Infinity") (RFlt EV-NEG-INF-BITS)
+              (let [radix (if (< (+ a 2) (+ b 1))
+                              (let [p (jss-code-unit string a)
+                                    q (jss-code-unit string (+ a 1))]
+                                (if (!= p 48) 0
+                                  (if (or (= q 120) (= q 88)) 16
+                                    (if (or (= q 111) (= q 79)) 8
+                                      (if (or (= q 98) (= q 66)) 2 0)))))
+                              0)]
+                (if (> radix 0)
+                    (let [v (ev-radix-digits string (+ a 2) b radix)]
+                      (if (< v 0) (RFlt JSV-NAN) (RInt v)))
+                  (if (ev-str-decimal? string a b)
+                      (let [d (ev-strtod-range string a b)]
+                        ; An exact integer comes back as RInt so the lattice keeps its int axis;
+                        ; anything fractional or out of range stays a double.
+                        (let [t (cast i64 d)]
+                          (if (and (primitive/fcmp-eq d (cast f64 t))
+                                   (and (> d -9007199254740992.0) (< d 9007199254740992.0)))
+                              (RInt t)
+                              (RFlt (f64-bits d)))))
+                      (RFlt JSV-NAN)))))))))))
+
+;; ToNumber over every runtime value. Objects need ToPrimitive and symbols and bigints throw, so
+;; those are a NAMED evaluator failure rather than a plausible number.
+(defn ev-to-number-value [(value RtVal) (n i64)] (-> RtVal)
+  (match value
+    (RUndef [] (RFlt JSV-NAN))
+    (RNull  [] (RInt 0))
+    (RBool  [b] (RInt (if b 1 0)))
+    (RInt   [v] (RInt v))
+    (RFlt   [bits] (RFlt bits))
+    (RStr   [s] (ev-string-to-number s))
+    (RObj   [id] (ev-fail! EV-TYPE n))
+    (RSym   [id] (ev-fail! EV-TYPE n))
+    (RBig   [v] (ev-fail! EV-TYPE n))
+    (RFun   [fidx] (ev-fail! EV-TYPE n))
+    (RMem   [ver] (ev-fail! EV-TYPE n))))
+
+;; https://tc39.es/ecma262/#sec-tointegerorinfinity: NaN and both zeros become +0, the infinities
+;; are preserved, and everything else truncates TOWARD ZERO (which is `cast i64`, not `floor`).
+(defn ev-to-number [(n i64)] (-> RtVal)
+  (let [v (ev-to-number-value (ev-data (n-in n 1)) n)]
+    (if (ev-failed?) (RUndef) v)))
+
+(defn ev-to-integer [(n i64)] (-> RtVal)
+  (let [num (ev-to-number-value (ev-data (n-in n 1)) n)]
+    (if (ev-failed?) (RUndef)
+      (match num
+        (RInt [v] (RInt v))
+        (RFlt [bits]
+              (if (f64-nan-bits? bits) (RInt 0)
+                (if (= bits EV-INF-BITS) (RFlt EV-INF-BITS)
+                  (if (= bits EV-NEG-INF-BITS) (RFlt EV-NEG-INF-BITS)
+                    ; A double at or beyond 2^53 IS already an integer, so truncation is the
+                    ; identity — and `cast i64` on 1e300 is an overflow, not a conversion. The
+                    ; result stays a double there rather than becoming a wrapped integer.
+                    (let [d (bits-f64 bits)]
+                      (if (or (>= d 9007199254740992.0) (<= d -9007199254740992.0))
+                          (RFlt bits)
+                          (RInt (cast i64 d))))))))
+        (RUndef [] (RInt 0)) (RNull [] (RInt 0)) (RBool [b] (RInt 0))
+        (RStr [s] (RInt 0)) (RObj [id] (RInt 0)) (RSym [id] (RInt 0))
+        (RBig [v] (RInt 0)) (RFun [f] (RInt 0)) (RMem [v] (RInt 0))))))
 
 (defn ev-is-nan [(n i64)] (-> RtVal)
   (let [value (ev-data (n-in n 1))]
