@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+# The JSL NATIVE gate: every covered definition is compiled to machine code, linked, run, and
+# judged by the same committed Node golden the interpreter is judged by.
+#
+# WHY IT IS SEPARATE FROM tools/jsl-gate.sh. That gate runs `eval.coil`, the IR interpreter, whose
+# RtVal is uniformly tagged — so boxing is invisible there and a definition can be right under it
+# and wrong as machine code. `MathAbs` on a boxed -5 returned -5, verified clean, and ran to
+# completion. Native is the mode that ships; the interpreter is the cross-check.
+#
+# COVERAGE IS EXPLICIT AND PARTIAL. Only the entries listed below are representation-correct today.
+# Every conversion adds a line here, and a definition that is not listed is not claimed. The count
+# is printed so the gate cannot quietly cover less than it did.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+golden=tests/jsl-string-oracle.txt
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+
+coil build tools/emit-jsl-object.coil -o "$tmp/emit" >/dev/null
+
+# entry:arity:label:table — label and table must match the Node script's naming exactly.
+COVERED=(
+  "MathAbs:1:abs:nums"
+  "MathSign:1:sign:nums"
+  "MathTrunc:1:trunc:nums"
+)
+
+covered=0
+for spec in "${COVERED[@]}"; do
+  IFS=: read -r entry arity label table <<<"$spec"
+  "$tmp/emit" "$entry" "$arity" > "$tmp/$entry.o"
+  xcrun clang -O2 -arch arm64 -I tools -o "$tmp/$entry" \
+    tools/jsl-native-harness.c "$tmp/$entry.o" tools/native-gc-runtime.c
+  "$tmp/$entry" "$label" "$table" >> "$tmp/native.txt"
+  covered=$((covered + 1))
+done
+
+# Compare only the lines the native side produced. Every one must appear in the golden verbatim.
+missing=0
+while IFS= read -r line; do
+  if ! grep -qxF "$line" "$golden"; then
+    key=${line%%=*}
+    want=$(grep -m1 "^$key=" "$golden" || echo "<absent from golden>")
+    echo "NATIVE MISMATCH: got '$line', golden has '$want'" >&2
+    missing=$((missing + 1))
+  fi
+done < "$tmp/native.txt"
+
+if [ "$missing" -ne 0 ]; then
+  echo "JSL native: $missing of $(wc -l < "$tmp/native.txt" | tr -d ' ') results disagree with Node" >&2
+  exit 1
+fi
+
+echo "JSL native: $(wc -l < "$tmp/native.txt" | tr -d ' ') results from $covered compiled definition(s) agree with Node"

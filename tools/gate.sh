@@ -94,6 +94,14 @@ else
 fi
 
 echo
+echo "=== JSL native machine code ==="
+if out=$(./tools/jsl-native-gate.sh 2>&1); then
+  note "jsl-native-gate.sh" "$(echo "$out" | tail -1)"
+else
+  note "jsl-native-gate.sh" "FAILED"; echo "$out" | tail -20; fails=$((fails+1))
+fi
+
+echo
 echo "=== native source conformance ==="
 if out=$(./tools/native-source-conformance.sh 2>&1); then
   note "native-source-conformance.sh" "$(echo "$out" | tail -1)"
