@@ -1532,7 +1532,21 @@
         arg1 (if (> argc 1) (fng-expression context (ts-child ast node 2)) (fng-undefined))]
     (if (not (jbi-valid-arity? descriptor argc))
         NO-NODE
-        (n-unbox! (n-js-builtin! descriptor (n-box! arg0) (n-box! arg1)) (t-flt)))))
+      ;; The one-argument rounding family comes from lib/math/rounding.jsl. The transcendentals
+      ;; (sqrt, pow, exp, log, the trig functions) and Math.random stay on OP-JSBUILTIN: they are
+      ;; libm calls, not JavaScript semantics, and there is nothing for a DSL to express about them.
+      ;; Math.max and Math.min stay too, because they are variadic and MathMax2 is binary.
+      ;;
+      ;; THE RESULT GOES THROUGH ToNumber, NOT AN UNBOX TO `flt`. OP-JSBUILTIN always answers a
+      ;; double, so unboxing its result as a float is right. A JSL definition does not: `MathAbs` of
+      ;; a boxed integer returns a boxed INTEGER, and reading that as a float reinterprets the bits.
+      (let [jsl-name (if (= descriptor JBI-ABS) "MathAbs"
+                       (if (= descriptor JBI-FLOOR) "MathFloor"
+                         (if (= descriptor JBI-CEIL) "MathCeil"
+                           (if (= descriptor JBI-ROUND) "MathRound" ""))))]
+        (if (= (str-len jsl-name) 0)
+            (n-unbox! (n-js-builtin! descriptor (n-box! arg0) (n-box! arg1)) (t-flt))
+            (n-to-number! (fng-jsl-call1 context jsl-name (n-box! arg0))))))))
 
 (defn fng-error-constructor? [(context FngContext) (node i64)] (-> bool)
   (let [frontend (load (field context frontend)) ast (field frontend ast)]
@@ -1641,6 +1655,12 @@
         cs (jsl-call! (load cell) name args)]
     (store! cell (call-end cs))
     (call-value cs)))
+
+(defn fng-jsl-call1 [(context FngContext) (name (slice u8)) (a i64)] (-> i64)
+  (let [buf (stack (array i64 1))
+        p (cast (ptr i64) buf)]
+    (store! (index p 0) a)
+    (fng-jsl-call context name (slice-new [i64] p 1))))
 
 (defn fng-jsl-call2 [(context FngContext) (name (slice u8)) (a i64) (b i64)] (-> i64)
   (let [buf (stack (array i64 2))
