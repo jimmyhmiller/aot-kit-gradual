@@ -648,34 +648,44 @@ condition that folds under it — and it is the next piece of work here.
 kind is decided. `i - 500` is `num`, which is `int|flt`: neither inside `int` nor disjoint from it,
 so either answer would be a guess. `num` is what JavaScript arithmetic produces.
 
-### The one blocker under both problems: `jl` always materialises a diamond
+### The string conversion's cost, traced to the exact node
 
-Converting the string family cost far more than Math did, and the measurement says so plainly:
-`benchmarks/typescript-aot/string-loop.ts` went from 3.8ms to 79.4ms, a factor of 20.
+Converting the string family cost far more than Math: `benchmarks/typescript-aot/string-loop.ts`
+went 3.8ms -> 79.4ms, a factor of 20. The graphs say why. Before, the loop body is 38 nodes with one
+`If` and no `Region`, and both `StringIndexOf` nodes are pure and loop-invariant, so they are hoisted
+clean out of the loop. After, 64 nodes with five `If`s and four `Region`s — `Clamp`'s two tests per
+`indexOf`.
 
-The graphs say why. Before the conversion the loop body is 38 nodes with one `If` and no `Region` —
-straight-line, and both `StringIndexOf` nodes are pure and loop-invariant, so GVN and code motion
-hoist them clean out of the loop. After it, 64 nodes with five `If`s and four `Region`s. Those are
-`Clamp`'s two tests, once per `indexOf`, and a pure node that used to float out of the loop is now
-pinned between them and re-evaluated every iteration.
+At the site that matters the arithmetic is provably unnecessary: `text.indexOf(needle)` passes a
+constant 0, so `Clamp 0 0 (%StringLen s)` is 0. Two facts were missing and are now supplied:
 
-At the call site that matters this is all avoidable arithmetic. `text.indexOf(needle)` passes a
-CONSTANT 0 for the start, so `Clamp 0 0 (%StringLen s)` is 0 — `0 < 0` is false, and `len < 0` is
-false for any length. Neither test survives to runtime in principle.
+- `%StringLen` is typed `int=[0..max]`. A length is never negative, and the old unbounded `int` left
+  `len < 0` undecidable.
+- `cmp-compute` reasons about RANGES, not only constants (`src/node.coil`). `a < b` is decided when
+  `max(a) < min(b)` or `min(a) >= max(b)`, and disjoint ranges are never equal.
 
-They survive in practice because **`jl` builds the diamond before it ever asks what the condition
-is, and nothing downstream takes it back**. Typing `%StringLen` as non-negative was tried and
-changed the graph by exactly nothing: 5 `If`s and 4 `Region`s before and after, 64 nodes both ways.
-The refinement is true and it is not the missing piece, so it is not in the tree.
+Together they decide every clamp test. The graph confirms it: `Lt : bool=0` where it was `bool`, and
+each clamp `If` now carries a dead `~ctrl` arm. Both changes are true independently of this benchmark
+and are worth having on their own.
 
-This is the same wall the type-test folding hit from the other side. There, a condition that DID
-fold left the half-built Region and Phi disagreeing (`VERR-ARITY`); here, a condition that should
-fold never gets the chance. Both are one defect: `jl`'s `if` lowering has no notion of a condition
-with a known value. Fixing it makes the type test safe to fold AND removes these diamonds, which is
-why it is the next piece of work rather than one of several.
+**It is still 78ms, and the last link is now identified exactly.** The surviving node is
 
-Until then the conversion is kept with the cost measured and understood rather than hidden — but
-"understood" is doing real work in that sentence, and 20x is not a rounding error.
+    n36: Phi : int=0   <- n35 n23 n34
+    n37: StringIndexOf : int  <- _ n11 n21 n36
+
+The Phi's TYPE is already the constant 0 — the analysis has fully decided it — but it is still a
+Phi, and a Phi is pinned to its Region, which lives inside the loop. `StringIndexOf` therefore has a
+loop-resident input and cannot be hoisted, so it re-scans the haystack every iteration.
+
+So the remaining work is not "eliminate the diamond": it is that **a Phi whose type is a proven
+constant should fold to that constant**, after which the Region and its dead arm are unreachable and
+the pure node floats out on its own. That is one rewrite in the peephole, guarded by D8 the way
+`unbox-idealize` is, and it is the next thing to do here.
+
+A lowering-time fold in `jl-if` was tried instead and reverted: it broke
+`a_decidable_guard_folds_to_straight_line_code`, and it was the wrong place regardless — nothing is
+proven during construction, so a fold there acts on a provisional type, which is exactly what D8
+forbids.
 
 ---
 
