@@ -560,6 +560,57 @@ and the analysis is unaffected by it, which is the safe direction to be wrong in
 
 ---
 
+## Linking the library into compiled JavaScript
+
+`jsl-call!` has always been able to call a lowered definition. What was missing was a caller: the
+TypeScript frontend built its own IR nodes for every JavaScript builtin, so the library was verified
+and unused. `String.prototype.indexOf` is the first operation the frontend actually emits through
+JSL — `tests/native-conformance/string-index-of.ts` is compiled to machine code and its answers come
+out of `lib/string/index-of.jsl`. Perturbing that `.jsl` file turns the conformance gate red, which
+is how the claim is checked rather than asserted.
+
+Two things make the seam work.
+
+**Definitions are pulled, not lowered wholesale.** `jsl-require!` lowers one definition and its
+transitive callees. Programs that call no builtin get exactly the graph they got before, which
+matters because `tests/frontend-exact-graph-test.mjs` compares the frontend's `g-render` output byte
+for byte against the JavaScript codegen.
+
+**The seam is representation, and it is narrower than "everything is NaN-boxed."** A JSL `dyn`
+parameter holds whatever representation the value already has: a string literal in a `.jsl` file
+lowers to `n-string-const!`, a raw pointer, and `%StringIndexOf` reads it as one. So the frontend
+passes its string straight through — boxing it would hand the library a tagged word where it expects
+a pointer. `StringIndexOfFrom` takes `(s dyn) (needle dyn) (start int)` and returns `int`, which is
+exactly what the IR node it replaces took and returned, so nothing at the boundary converts.
+
+### The blocker, stated plainly
+
+Converting the rest of the frontend to this seam is blocked on a **backend scheduling limitation**,
+not on anything about JSL.
+
+A JSL call is an `OP-CALL`, and a call is pinned to its control edge. Its arguments are ordinary
+floating nodes. When a call is pinned early in a long straight-line block and one of its arguments
+is scheduled later in that same block, selection fails with `MSEL-DEPENDENCY`: the verifier requires
+a producer to precede its consumer, and here instruction 37 produced the value instruction 17
+consumed. Both instructions were in the entry block of the same function.
+
+It is worth being precise that this is **pre-existing and not caused by JSL**. Nothing about the
+failure mentions the library; it needs only a pinned call mid-expression whose argument the
+scheduler sinks past it. The reason it had not been seen is that the frontend emitted pure IR nodes
+for builtins, and pure nodes are ordered by data dependence alone. Adding the first call into the
+middle of an expression is what exposed it.
+
+The within-block topological sort in `ms-schedule-block!` does account for call arguments
+(`ms-inst-uses-vreg?` walks them), and so does GCM's earliest/latest computation — so the fix is not
+simply "teach it about arguments." Diagnosing further means finding why the sort's ordering does not
+survive, which is the next piece of work before more builtins move across.
+
+Until that is fixed, an operation can be converted when its call does not land mid-block among
+floating arguments. `indexOf` is converted and covered; the rest of the string family waits on the
+scheduler.
+
+---
+
 ## Reading order for the code
 
 1. `src/jsl.coil` — the error codes first, then `jsp-*` (the primitive table), then `jsl-load!`

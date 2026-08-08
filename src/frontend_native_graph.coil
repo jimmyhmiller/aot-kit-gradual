@@ -11,6 +11,8 @@
 (import "jsstring" :use *)
 (import "jsbuiltin" :use *)
 (import "jsbuiltin_desc" :use *)
+(import "jsl" :use *)
+(import "jsl_lower" :use *)
 (import "coil.alloc" :use *)
 (import "coil.arraylist" :use *)
 (import "coil.slice" :use *)
@@ -1619,6 +1621,27 @@
                                           (or (str-eq name "toLowerCase")
                                               (str-eq name "toUpperCase")))))))))))))
 
+;; Emit a call to a JSL runtime-library definition.
+;;
+;; THE SEAM IS REPRESENTATION, and it is narrower than "everything is NaN-boxed". A JSL `dyn`
+;; parameter holds whatever the value's representation already is: a string literal inside a `.jsl`
+;; file lowers to `n-string-const!`, a raw pointer, and `%StringIndexOf` reads it as one. So a string
+;; the frontend already has is passed straight through, and boxing it here would hand the library a
+;; tagged word where it expects a pointer. Definitions whose parameters are declared `int` take raw
+;; machine integers for the same reason. Only a definition returning `dyn` needs unboxing at this
+;; boundary, and none of the ones called here do.
+;;
+;; The call's control edge replaces the frontend's, because a `transitioning` definition can throw
+;; and everything sequenced after it belongs on the edge where it did not.
+(defn fng-jsl-call [(context FngContext) (name (slice u8)) (args (slice i64))] (-> i64)
+  (if (!= (jsl-require! name) JSL-OK)
+      (do (panic-corrupt "frontend: a JSL definition the frontend calls did not lower") 0)
+      0)
+  (let [cell (load (field context ctrl))
+        cs (jsl-call! (load cell) name args)]
+    (store! cell (call-end cs))
+    (call-value cs)))
+
 (defn fng-string-call [(context FngContext) (node i64)] (-> i64)
   (let [frontend (load (field context frontend))
         ast (field frontend ast)
@@ -1651,13 +1674,24 @@
             (if (str-eq name "toUpperCase")
                 (n-string-upper! string)
                 (if (str-eq name "indexOf")
-                    (n-string-index-of! string
-                                        (if (> argc 0)
-                                            (fng-expression context (ts-child ast node 1))
-                                            (n-string-const! (jss-from-utf8! "undefined")))
-                                        (if (> argc 1)
-                                            (fng-expression context (ts-child ast node 2))
-                                            (fng-const 0)))
+                    ;; Steps 5-7 of String.prototype.indexOf, from lib/string/index-of.jsl rather
+                    ;; than a hand-written IR node. The receiver is known to be a string here (the
+                    ;; `fng-string-builtin?` guard proves it), so ToString on it is the identity and
+                    ;; the coerced core is the right entry point; the missing-argument case keeps
+                    ;; the frontend's existing `"undefined"` string, which is what ToString of an
+                    ;; absent argument produces.
+                    (let [buf (stack (array i64 3))
+                          p (cast (ptr i64) buf)]
+                      (store! (index p 0) string)
+                      (store! (index p 1)
+                              (if (> argc 0)
+                                  (fng-expression context (ts-child ast node 1))
+                                  (n-string-const! (jss-from-utf8! "undefined"))))
+                      (store! (index p 2)
+                              (if (> argc 1)
+                                  (fng-expression context (ts-child ast node 2))
+                                  (fng-const 0)))
+                      (fng-jsl-call context "StringIndexOfFrom" (slice-new [i64] p 3)))
                     (if (str-eq name "charCodeAt")
                         (n-string-char-code! string start)
                         (if (str-eq name "charAt")
@@ -4541,6 +4575,15 @@
   (graph-reset! seed)
   (shape-reset!)
   (jss-reset!)
+  ;; The JSL runtime library is READ and CHECKED here but nothing is lowered. `jsl-require!` pulls a
+  ;; definition and its callees the first time the frontend emits a call to it, so a program that
+  ;; uses no library builtin gets exactly the graph it got before this existed — which is what the
+  ;; exact-`g-render` migration oracle in tests/frontend-exact-graph-test.mjs compares.
+  (jsl-reset!)
+  (if (!= (jsl-load-index! "lib/index") JSL-OK)
+      (do (panic-corrupt "frontend: the JSL runtime library did not load") 0)
+      0)
+  (jl-reset!)
   (store! (fng-optimize-ptr) optimize)
   (let [main-index (fng-main-index frontend)
         main (al-get [FeFunction] (load (field frontend functions)) main-index)
