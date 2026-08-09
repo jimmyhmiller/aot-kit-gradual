@@ -1,6 +1,6 @@
 # Handoff: the JSL runtime library, and wiring it into the compiler
 
-32 commits, `2c0b5b0..HEAD`. `./tools/gate.sh` green at 533 tests.
+34 commits, `2c0b5b0..HEAD`. `./tools/gate.sh` green at 533 tests, conformance at 27 programs.
 
 This covers what was built, the design decisions worth knowing before changing anything, the defects
 it turned up, and what is left. Read `docs/JSL.md` for the language and `docs/CONVERSION.md` for the
@@ -16,13 +16,19 @@ JSL-specific node, op, or backend arm anywhere downstream, which is the entire p
 runs what comes out of it because it is the same graph, and `backend_select.coil` compiles it for
 the same reason.
 
-88 declarations across 25 files: 33 `builtin`, 55 `macro`.
+88 declarations across 25 files: 33 `builtin`, 55 `macro`. 70 of them are reachable from a compiled
+program; the 18 that are not are inventoried below, and none of them is a JavaScript operation.
 
-**31 JavaScript operations now get their machine code from `lib/`** rather than from a hand-written
-IR node: all of `String.prototype` except `split`, all of the read and mutate `Array.prototype`
-methods the frontend supports, the one-argument Math family plus `max`/`min`, the string operators
-(`length`, `===`, the four relational comparisons, `+`), and the global coercions (`String(x)`,
-`parseInt`, `isNaN`, `String.fromCharCode`).
+**52 JavaScript operations now get their machine code from `lib/`** rather than from a hand-written
+IR node: every `String.prototype` method the frontend supports except `split`, all of the read and
+mutate `Array.prototype` methods including `at` and `join`, the whole one-argument Math family plus
+`max`/`min` and `sign`/`trunc`, the string operators (`length`, `===`, the four relational
+comparisons, `+`), the global coercions (`String(x)`, `parseInt`, `isNaN`, `String.fromCharCode`),
+`Number(x)` with its four predicates, and ToNumber at every dynamic arithmetic operand.
+
+It was 31 two commits ago, and **twenty of the twenty-one that were added needed no new definition**
+— they were already written, spec-annotated and verified against Node, and unreachable. Read the
+reachability section before assuming an operation is missing from the library.
 
 ---
 
@@ -43,20 +49,19 @@ program compile through it". `tools/jsl-native-gate.sh` answers the first. Only
 ## The reachability inventory — half the library is dead
 
 Measured on 2026-08-09 at `f3f5efe`, as a transitive closure from the names `src/` actually passes
-to `fng-jsl-call*`. **88 declarations. 43 reachable. 45 unreachable.** No program can execute the
-45; they exist, they pass the interpreter and native gates against Node, and nothing can name them.
+to `fng-jsl-call*`: **88 declarations, 43 reachable, 45 unreachable.** No program could execute the
+45; they existed, they passed the interpreter and native gates against Node, and nothing could name
+them. `docs/CONVERSION.md` said "all of `String.prototype` except `split`", which was true only of
+the nine method names `fng-string-builtin?` recognised.
 
-This is the same trap the section above describes, still open at a larger scale than that section
-admits. `docs/CONVERSION.md` says "all of `String.prototype` except `split`". That sentence is true
-only of the **nine method names `fng-string-builtin?` recognises**
-(`src/frontend_native_graph.coil:1678`). Twelve more String methods are written and cannot be
-called.
+**Re-measured at `a446d89`: 51 roots, 70 reachable, 18 unreachable.** Twenty operations were
+reached without a single new definition being written. What is left is listed at the end of this
+section, and none of it is a JavaScript operation.
 
-### Reachable: 30 roots, 31 operations
+### Reachable: 51 roots, 70 declarations
 
-The 30 names `src/` emits, plus 13 pulled in transitively (`Clamp` `ToInt32` `SameValueZero`
-`IsNumber` `IsNaNValue` `IsNaNNumber` `FltIsNaN` `IntAbs` `FltAbs` `NumLt` `BoxedNaN` `NaN`
-`Infinity`). The per-operation table is `docs/CONVERSION.md`.
+The names `src/` emits, plus what their bodies pull in. The per-operation table is
+`docs/CONVERSION.md`.
 
 ### Unreachable: 45, in six categories
 
@@ -124,18 +129,22 @@ DSL. Covered by `math-sign-trunc.ts`, falsified twice.
 `JSSOP-VALUE-TRUTHY` runtime call while the global `isNaN` next to it compares a raw machine word.
 `fng-number-static` unboxes to `t-bool` so every predicate in the language has one representation.
 
-**D. Written to spec and deliberately bypassed — 1.** `String.prototype.indexOf`, the full entry
-with `RequireObjectCoercible` and ToString. The frontend calls the coerced core `StringIndexOfFrom`
-directly because `fng-string-builtin?` has already proven the receiver is a string.
+**D. Written to spec and deliberately bypassed — 2, still unreachable.** `String.prototype.indexOf`,
+the full entry with `RequireObjectCoercible` and ToString, plus `RequireObjectCoercible` itself,
+which nothing else calls. The frontend calls the coerced core `StringIndexOfFrom` directly because
+`fng-string-builtin?` has already proven the receiver is a string.
 
-**E. Not JavaScript operations — 3.** `ArrayIota` (a conformance-table generator), `ArrayRepeat`,
-and `ArrayMapDouble` — `map` with the callback hardcoded to doubling, because JSL has no `%Call`.
+**E. Not JavaScript operations — 3, still unreachable.** `ArrayIota` (a conformance-table
+generator), `ArrayRepeat`, and `ArrayMapDouble` — `map` with the callback hardcoded to doubling,
+because JSL has no `%Call`.
 
-**F. Dead helpers and unused abstract operations — 21.** No caller at all: `ToBoolean` `ToLength`
-`ToUint32` `ToNumberValue`. Dead because their only callers are: `ClampedIndex` `RelativeIndex`
-`IsTrimmable` `RequireObjectCoercible` `IntSign` `FltSign` `FltTrunc` `FltFloorFrom` `FltCeilFrom`
-`BoxedInf` `BoxedNegInf` `NegInfinity` `NumEq` `NumLe` `IsFiniteNumber` `IsIntegerNumber`
-`IsSafeIntegerNumber`.
+**F. Helpers and abstract operations with no live caller — 13, still unreachable.** `ToBoolean`
+`ToInt32` `ToLength` `ToUint32` `IsNumber` `ClampedIndex` `Infinity` `NegInfinity` `BoxedInf`
+`BoxedNegInf` `FltTrunc` `FltFloorFrom` `FltCeilFrom`.
+
+`IsNumber` is on that list for a reason worth knowing: it was reachable while `ToNumberValue`
+carried the spec's `(if (IsNumber v) v ...)` guard, and lost its only caller when the guard came
+back out. Restoring the guard — see the seam section below — restores it.
 
 ### The dynamic-to-number seam: an unbox where the language says a coercion
 
@@ -171,10 +180,17 @@ Two things to know before changing it:
 
 ### How to re-measure this
 
-Do not trust a prose count; the last one was wrong. The closure is: extract every
+Do not trust a prose count; the first one in this file was wrong. The closure is: extract every
 `(builtin|macro NAME` from `lib/*/*.jsl`, take as roots those `NAME`s appearing as a `"NAME"`
-literal anywhere in `src/*.coil`, then walk each root's body text for other declaration names until
-the set stops growing. Anything outside the closure is unreachable no matter what gate it passes.
+literal anywhere in `src/*.coil`, then walk each root's body for other declaration names until the
+set stops growing. Anything outside the closure is unreachable no matter what gate it passes.
+
+**Strip comments from `src/`, and strip both comments AND string literals from the bodies**, or the
+count is wrong in both directions. Measuring it with string literals left in reports 76 reachable
+instead of 70, because `RequireObjectCoercible` throws a message containing the text
+"String.prototype.indexOf" and the matcher reads that as a call. Exclude `NaN` and `Infinity` from
+the roots by hand: those two spellings are also ordinary JavaScript identifiers the frontend matches
+on, so a quoted hit is not evidence the JSL constant is emitted.
 
 ---
 
@@ -380,12 +396,10 @@ All three are LOUD (a trap or a refused compile), and all three reproduce at `f3
 Both are LOUD — a trap and a refused compile, not a wrong answer — which is why they were left and
 written down instead. Both reproduce unchanged at `e29d712`.
 
-- **An out-of-range element read traps instead of answering `undefined`.** `let xs = [10, 20];
-  xs[5] + 1` is `SIGTRAP`, from the tag check inside `JSUNBOX`: the load correctly answers
-  `undefined` and the arithmetic unboxes it as a number. Node says `NaN`, and `| 0` says 0. Nothing
-  in the corpus reads a hole or a past-the-end index into arithmetic — `arrays.ts` reads `sparse[0]`
-  and `sparse[2]`, never `sparse[1]` — which is why it has never come up. Fixing it means deciding
-  what `undefined` in arithmetic lowers to, which is `ToNumber`, which is a frontend question.
+- ~~**An out-of-range element read traps instead of answering `undefined`.**~~ **FIXED.** It was
+  the frontend emitting an `Unbox` where the language specifies a coercion; the whole ToNumber table
+  works now, not only `undefined`. See "The dynamic-to-number seam" above and
+  `tests/native-conformance/value-coercion.ts`.
 - **An unused loop-carried accumulator fails graph verification with `VERR-LEAK`.**
 
       let viaLoop = other[0];
@@ -397,17 +411,20 @@ written down instead. Both reproduce unchanged at `e29d712`.
 
 ### Remaining conversions
 
-Only ONE definition is left to write. Everything else on this list is frontend plumbing to reach
-code that already exists — see the reachability inventory above for the full 45.
+**One definition is left to write, and there is no longer a written definition a program cannot
+reach.** The twenty that were unreachable — categories A, B and C above — are all emitted now.
 
 - **`split`** — the one genuine remaining conversion. It allocates an array, and the frontend's path
   also marks the allocation and publishes a dynamic alias. `%NewArray`/`%ArrayStore` exist; the
   second half has no library counterpart.
-- **The 20 written-but-unreachable operations** (categories A, B and C above) — 14 method names, two
-  Math table entries, one frontend intrinsic. The definitions are done.
 - **libm** (`sqrt`, `pow`, trig, `random`) — not convertible, and should stay that way. `MathFloor`
   earns its place because the library adds the `if (%IsInt v)` guard around `%FloorNum`; `sqrt` would
   get no guard and no rule, only a different spelling of the same call.
+
+Beyond `split`, the next conversions are operations the FRONTEND has never supported at all rather
+than ones the library is missing: `Array.prototype.map`/`filter`/`forEach` need `%Call`, and
+`concat`, `fill`, `reverse` and `splice` need the same allocation half `split` does. Those are new
+functionality, and the reachability inventory is the wrong place to look for them.
 
 ### The one real performance gap
 

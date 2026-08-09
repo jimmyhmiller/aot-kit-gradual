@@ -7,7 +7,8 @@ from `lib/` or from a hand-written IR node.
 the machine code the program executes was generated from `lib/`. It does not mean a definition
 merely exists — several definitions existed for months while nothing could reach them.
 
-Status as of the commit that converts the array-mutation family. `tools/gate.sh` green at 533 tests.
+Status as of the commit that reaches `Math.sign`, `Math.trunc` and the four `Number` predicates.
+`tools/gate.sh` green at 533 tests, native source conformance at 27 programs.
 
 **READ THIS BEFORE READING THE TABLES.** They cover the operations the frontend can compile, which
 is not automatically the same set as the operations `lib/` implements. It was not: 45 of the
