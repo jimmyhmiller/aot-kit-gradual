@@ -2810,10 +2810,10 @@
                     (if (>= earliest 0) earliest -1)))]
         (ms-gcm-deeper-bound current dependency))))
 
-;; A WRITE MUST NOT FLOAT ABOVE THE CONTROL IT WAS ANCHORED TO. `n-array-store-at!` and its siblings
-;; take a real control input precisely to say which block the effect belongs to, and global code
-;; motion computes `earliest` from VALUE inputs alone — so an anchor deeper than every operand was
-;; simply discarded.
+;; A HEAP OPERATION MUST NOT FLOAT OFF THE CONTROL IT WAS ANCHORED TO. `n-array-store-at!` and its
+;; siblings take a real control input precisely to say which block the operation belongs to, and
+;; global code motion computed `earliest` from VALUE inputs alone — so an anchor deeper than every
+;; operand was simply discarded.
 ;;
 ;; What that cost: a store whose result vreg has no consumer gets `latest = earliest`, there being no
 ;; use to bound it from below, so GCM placed it at its earliest block. For a store in a loop body
@@ -2823,19 +2823,39 @@
 ;; in a loop was wrong by one. Nothing caught it because no gate had ever read a JSL-built array's
 ;; length back as machine code.
 ;;
-;; Only the LINEAR MEMORY EFFECTS are held here. A read is ordered by its memory edges and may still
-;; be hoisted, which is where the loop-invariant motion this pass exists for actually pays.
-(defn ms-gcm-anchor-bound [(owner i64) (at i64) (bound i64)] (-> i64)
+;; BOTH DIRECTIONS COUNT. A read that floats past a write of the same memory answers the wrong thing
+;; just as surely as a write that floats past a read: `ArrayShift` loads element 0 and then a loop
+;; moves every element down over it, and because the load's only consumers are after the loop, GCM
+;; sank it there and `shift` answered the SECOND element.
+;;
+;; So an anchor is honoured for any heap operation that HAS one. Nothing is lost by that: the
+;; `-at!`-less builders exist for the reads that genuinely may float, they pass NO-NODE, and the
+;; loop-invariant motion this pass is for is over pure ops like `%StringIndexOf`, which have no
+;; control input at all.
+(defn ms-anchored-memory-op? [(node i64)] (-> bool)
+  (let [op (n-op node)]
+    (or (ms-linear-memory-effect? node)
+        (or (= op OP-LOAD)
+            (or (= op OP-PROPLOAD)
+                (or (= op OP-ARRAYLOAD) (= op OP-ARRAYLEN)))))))
+
+;; The block a control-anchored heap operation belongs to, or -1 when it has none.
+(defn ms-inst-anchor-block [(owner i64) (at i64)] (-> i64)
   (let [n (load (field (be-inst at) node))]
-    (if (or (< bound 0) (or (< n 0) (not (ms-linear-memory-effect? n))))
-        bound
+    (if (or (< n 0) (not (ms-anchored-memory-op? n)))
+        -1
         (let [ctrl (if (> (n-nins n) 0) (n-in n 0) NO-NODE)]
           (if (< ctrl 0)
-              bound
+              -1
               (let [mapped (al-get (load (field (machine-unit) ctrl-block)) ctrl)]
-                (if (and (>= mapped 0) (= (mu-block-owner mapped) owner))
-                    (ms-selection-deeper-block bound mapped)
-                    bound)))))))
+                (if (and (>= mapped 0) (= (mu-block-owner mapped) owner)) mapped -1)))))))
+
+(defn ms-inst-anchored? [(owner i64) (at i64)] (-> bool)
+  (>= (ms-inst-anchor-block owner at) 0))
+
+(defn ms-gcm-anchor-bound [(owner i64) (at i64) (bound i64)] (-> i64)
+  (let [anchor (ms-inst-anchor-block owner at)]
+    (if (or (< bound 0) (< anchor 0)) bound anchor)))
 
 (defn ms-gcm-refresh-earliest! [(at i64)] (-> bool)
   (let [m (be-inst at)
@@ -3032,16 +3052,21 @@
                     (let [m (be-inst (load at))
                           desc (mi-desc (load (field m op)))
                           owner (load (field m owner))
-                          original (load (field m block-id))
+                          anchor (ms-inst-anchor-block owner (load at))
+                          fixed (or (mi-desc-pinned? desc) (>= anchor 0))
+                          original (if (>= anchor 0) anchor (load (field m block-id)))
                           refreshed
-                            (if (mi-desc-pinned? desc)
+                            (if fixed
                                 true
                                 (ms-gcm-refresh-earliest! (load at)))
                           earliest (load (field m earliest))]
                       (if (not refreshed)
                           (do (ms-fail! MSEL-DEPENDENCY (load at)) (store! ok false))
-                          (if (mi-desc-pinned? desc)
-                          (store! (field m latest) original)
+                          (if fixed
+                          (do (store! (field m block-id) original)
+                              (store! (field m earliest) original)
+                              (store! (field m latest) original)
+                              0)
                           (let [use-block
                                   (if (>= (load (field m dst)) 0)
                                       (ms-gcm-latest-use-block owner (load (field m dst)))
@@ -3247,10 +3272,21 @@
         (do (ms-pack-instructions!) (ms-cache-new-defs!) (ms-build-memory-anti-deps!) true)
         false)))
 
+;; THE ANTI-DEPENDENCY VECTOR HAS TO DESCRIBE THE SCHEDULE THAT EXISTS. It is built at the end of
+;; selection, and its membership rule is "every aliasing read whose block DOMINATES this write's
+;; block" — a rule stated in terms of block ids that global code motion is about to change. A read
+;; GCM hoists into a dominating block is then required by the verifier and absent from the vector
+;; the builder produced, and the block is refused with `MSEL-MEMORY-ORDER`. `ArrayShift`, whose
+;; resize follows a loop that reads the same array, could not be compiled at all.
+;;
+;; Rebuilding rather than relaxing the rule: the vector is DERIVED, not a second source of truth, so
+;; recomputing it against the final placement is what makes the verifier's question well posed. The
+;; same mistake, in the same shape, is recorded for `schedule-order` in docs/JSL.md.
 (defn ms-place-selected! [] (-> bool)
   (let [u (machine-unit)]
     (if (ms-gcm-place!)
         (do
+          (ms-build-memory-anti-deps!)
           (store! (field u phase) 2)
           ; Usually GCM's stable packing is already dependency-topological, and retaining
           ; it keeps selection dumps stable. If a cross-block move put a producer after its use,
@@ -4003,7 +4039,7 @@
         bid (load (field m block-id))
         earliest (load (field m earliest))
         latest (load (field m latest))
-        pinned (mi-op-pinned? (load (field m op)))]
+        pinned (or (mi-op-pinned? (load (field m op))) (ms-inst-anchored? owner at))]
     (if (or (< earliest 0)
             (or (< latest 0)
                 (or (!= (mu-block-owner earliest) owner)
