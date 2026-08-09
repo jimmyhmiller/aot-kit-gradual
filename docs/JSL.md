@@ -543,12 +543,14 @@ then reading its length back is a shape nothing had ever compiled.
   `MSEL-UNSUPPORTED` — reported against **`String.prototype.indexOf`**, which uses none of the new
   definitions. `jsl-decl-fidx` counts only the builtins, which takes that declaration from 66 to 29.
 
-One defect found this way is **not** fixed and is recorded rather than papered over: a single
-arithmetic expression of about twenty terms mixing boxed array elements with unboxed lengths
-miscompiles, and the answer varies between runs of the same binary — a pointer reaches the
-arithmetic while every underlying runtime call is correct. It reproduces with none of these
-operations converted. `tests/native-conformance/array-mutation.ts` accumulates into a local instead,
-and says why.
+A fourth defect found this way was recorded rather than papered over, and has since been fixed: a
+single arithmetic expression of about twenty terms mixing boxed array elements with unboxed lengths
+miscompiled, and the answer varied between runs of the same binary while every underlying runtime
+call was correct. Nothing about arrays was involved — the query that decides whether a `+` is an
+integer or a floating-point add carried eight units of fuel, so it answered "no" for any operand
+chain longer than that and the two sides of one expression disagreed about where the value lived.
+It, and the two further defects chasing it turned up, are in
+[JOURNAL.md](JOURNAL.md#the-representation-seam-three-miscompiles-a-depth-bound-was-hiding).
 
 ---
 

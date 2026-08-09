@@ -1487,3 +1487,64 @@ out-of-frame spills, bad argument locations, call targets, argument dependencies
 - The dedicated native moving-GC gate now passes raw/boxed argument, recursive root, promotion,
   barrier, OOM, and omitted-barrier witnesses. The stale handoff that still named the earlier boxed
   argument failure was removed after this verification.
+
+# The representation seam: three miscompiles a depth bound was hiding
+
+`HANDOFF.md` named one defect to chase first — an arithmetic expression of about twenty terms
+whose answer changed between runs of the same binary. Chasing it found three, all in the same
+seam, all reachable from ordinary TypeScript.
+
+**Reproducing it took a fuzzer, not a guess.** Rewriting `array-mutation.ts` as the single sum it
+had been avoiding did not reproduce anything. What did was a differential sweep: generate a program
+in that family, keep a live model of every array so no term is ever `undefined`, run it in Node, and
+compile and run it three ways looking for a wrong or an unstable answer. The first sixty programs
+produced both the unstable one and a second failure nothing had been looking for.
+
+**1. A representation query carried fuel.** `be-node-fp-value?` decides whether a `+` is an integer
+or a floating-point add, and it was a recursion carrying eight units of fuel over the operand tree.
+Past eight it answered "no" — and the answer is not a property that may depend on depth, because
+the two sides of one expression ask separately. A chain of ten additions whose first operand was a
+boxed array element selected floating-point adds for the accumulated value and then an `SCVTF` on
+the register already holding it, so the arithmetic read a general-purpose register nothing had
+written. Seven terms were correct, eight failed selection with `MLIVE-CLASS`, nine and beyond were
+silently wrong — and wrong differently on each run once several values were in flight, because the
+register it read was live. It is now a marked walk with no bound; a cycle through a loop Phi is what
+the marks are for, and it is why deeper recursion would not have been the fix.
+
+**2. `SCVTF` on a tagged word.** An accumulator seeded with `values[0]` and added to in a loop is a
+`dyn` Phi that the backedge makes floating-point. The loop-entry copy widened the boxed seed with
+`SCVTF`, which converts the tag bits, while the body unboxed its own load properly. `total` came out
+0. "Not floating-point" is not "a machine integer": `ms-fp-input!` now emits `JSUNBOX` to a number
+for a tagged word, `ml-class-for-inst` knows that lands in an FPR, and the edge-copy verifier — which
+named `SCVTF` as the one widening it would accept, the same assumption in the same shape — accepts
+either.
+
+**3. Integer arithmetic on a call's tag word.** The frontend unboxes a dynamic value before using it
+as a number but exempts call results, betting that a call returns a raw machine number. That is true
+only when the callee's return ABI is unboxed. `function tenth(v) { return v[9]; }` returns a tagged
+word, and `tenth(values) + 1` was an integer `ADD` on the tag — which comes back correct if the only
+consumer masks it to an int32, and is garbage the moment anything reads the sum as a number. The
+callee's ABI is known in selection, so the repair is there.
+
+**What the third one cost, and why it is where it is.** The first attempt unboxed any operand
+`be-box-input-already-tagged?` called boxed. That predicate reads a `dyn` LATTICE TYPE, and
+hand-written backend fixtures and the JSL library both give unconstrained machine integers that
+type; the gate went red with `SIGTRAP` in three suites and the JSL native gate, unboxing words that
+were never tagged. The second attempt asked only for `MLK-BOXED` on the call's return ABI, which is
+closed-world — and `identity(x)` returning a fixture parameter is reported boxed too. What actually
+separates them already had a name: `be-js-dynamic-boundary?`, the nodes where a value crosses the
+JavaScript-value ABI. A call is repaired when one of its returns is one of those.
+
+The fix a fixpoint would have allowed, and why it was not taken: the correct lowering for a boxed
+operand of arithmetic is a floating-point add on the unboxed double, not an integer add on the
+unboxed integer, and the integer version trades a silent wrong answer for a trap when the payload
+is a double. Choosing the floating-point path requires `be-node-fp-value?` to agree that the node is
+floating-point, which requires it to consult the call's return ABI, which consults
+`be-node-fp-value?`. That is the cycle B15 already recorded as "needs an explicit fixed point rather
+than recursive inference", and the mark array makes it a named abort rather than a wrong answer.
+
+**Coverage, and what each row of it actually catches.** `deep-arithmetic.ts` has four rows and two
+of them pass on the broken compiler by themselves — the call row because its consumer masks the
+result, the mixed row because one value in flight reads a dead register. They are in the file for
+what they contribute to the total, and the header says which is which rather than implying four
+independent witnesses. `unstable-array-sum.ts` keeps the run-to-run symptom on its own.

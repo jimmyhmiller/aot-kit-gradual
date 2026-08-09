@@ -162,21 +162,64 @@ variadic in this frontend; `jbi-max-arity` is `jbi-min-arity`).
 
 ## What is left
 
-### The one thing to chase first
+### The nondeterministic miscompile — fixed, along with two others
 
-**A nondeterministic miscompile.** A single arithmetic expression of ~20 terms mixing boxed array
-elements with unboxed lengths miscompiles, and the answer varies between runs of the same binary — a
-pointer reaches the arithmetic while every underlying runtime call is correct. It reproduces with
-none of the array work converted. `tests/native-conformance/array-mutation.ts` accumulates into a
-local to avoid it and says so. This is a nastier class than anything else here.
+It was not about arrays. `be-node-fp-value?` decides whether a `+` is an integer or a
+floating-point add, and it was a recursion carrying **eight units of fuel**; past eight it answered
+"no", and the two sides of one expression ask separately, so they disagreed about which register
+bank a value lived in. Seven terms were fine, eight failed selection, nine and beyond were silently
+wrong — and *differently* wrong on each run once enough values were in flight for the register it
+read to be a live one. Chasing it with a differential fuzzer turned up two more defects in the same
+seam: `SCVTF` applied to a tagged word when widening a loop Phi's boxed seed, and integer arithmetic
+applied to the tag word of a call that returns a boxed value. All three are written up in
+[JOURNAL.md](docs/JOURNAL.md#the-representation-seam-three-miscompiles-a-depth-bound-was-hiding),
+with what the third one cost and why the fully correct version of it needs a fixpoint the compiler
+does not have. `deep-arithmetic.ts` and `unstable-array-sum.ts` hold them; `array-mutation.ts` is
+one sum again rather than a workaround.
 
-### Known instability
+### Known instability — measured, and it is not a commit
 
-The gate is not reliably green: one run in four came back RED and did not reproduce, so the failure
-text was never captured. The reported cause is random `coil test` suites dying on **signal 9**, a
-different suite each time, each passing in isolation. **It has not been confirmed that this happens
-at a commit before this work.** Checking out `6be9e3b` and hammering the gate there would settle it,
-and it is worth settling — an intermittently red gate erodes the one contract this project runs on.
+Random `coil test` suites die on **signal 9**, a different suite each time, each passing in
+isolation. It was reproduced on 2026-08-09 and then measured rather than guessed at, and the
+measurement is the useful part:
+
+- In a roughly twenty-minute window it hit about **one suite per full sweep of the 31**, always the
+  child a `deftest` forks, always the first test to run in that suite, with no crash report — and
+  64 GB free, so it is neither jetsam nor a test this repo owns.
+- Then it stopped. **Thirteen further sweeps — about 400 suite runs — produced zero**: four in a
+  worktree at `6be9e3b`, four in a worktree at `e29d712`, three in the working tree with this work
+  applied, and three at `e29d712` in that same directory.
+
+Same directory, same toolchain, same suites, opposite results an hour apart. So it does not belong
+to a commit, and bisecting for it will waste a day. It is `coil test`'s fork-and-exec of a freshly
+written child interacting with something transient in the machine's state. Until the toolchain is
+fixed, **a suite that reports signal 9 has reported nothing** — re-run it alone before believing it,
+and do not read a gate red on signal 9 as a red gate.
+
+One thing that WAS a real staleness, found while chasing this: `coil`'s `fmt` no longer renders
+INT64_MIN as `-0`. `tests/text-test.coil` pinned that defect as a witness, so the suite went red on
+an upstream fix. The witness is now recorded as closed rather than deleted — the assertion is what
+would notice the day `{d}` loses a digit again.
+
+### Two more the fuzzer found, both pre-existing, neither fixed
+
+Both are LOUD — a trap and a refused compile, not a wrong answer — which is why they were left and
+written down instead. Both reproduce unchanged at `e29d712`.
+
+- **An out-of-range element read traps instead of answering `undefined`.** `let xs = [10, 20];
+  xs[5] + 1` is `SIGTRAP`, from the tag check inside `JSUNBOX`: the load correctly answers
+  `undefined` and the arithmetic unboxes it as a number. Node says `NaN`, and `| 0` says 0. Nothing
+  in the corpus reads a hole or a past-the-end index into arithmetic — `arrays.ts` reads `sparse[0]`
+  and `sparse[2]`, never `sparse[1]` — which is why it has never come up. Fixing it means deciding
+  what `undefined` in arithmetic lowers to, which is `ToNumber`, which is a frontend question.
+- **An unused loop-carried accumulator fails graph verification with `VERR-LEAK`.**
+
+      let viaLoop = other[0];
+      for (let i = 0; i < 3; i = i + 1) { viaLoop = viaLoop + i; }
+      return other.length | 0;      // verify=14
+
+  The Phi is live and nothing can reach it. An unused `let` bound to a call, a slice, or plain
+  arithmetic is all fine; it takes the loop. Valid TypeScript that will not compile.
 
 ### Remaining conversions
 

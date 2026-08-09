@@ -321,71 +321,107 @@
                 0)))
     (load found)))
 
-(defn be-node-fp-value-fuel? [(node i64) (excluded i64) (fuel i64)] (-> bool)
-  (if (or (= node excluded) (<= fuel 0))
-      false
-      (let [op (n-op node)]
-        (if (= op OP-MOD)
-            true
-            (if (= op OP-PARM)
-                (be-parm-fp-value? node)
-                (if (be-float-only? (n-ty node))
-                    true
-                    (if (= op OP-PHI)
-                        ;; Loop Phis are initially bounded by the declared TypeScript type. A
-                        ;; numeric backedge can nevertheless require an FPR (for example an
-                        ;; integer accumulator updated by a floating-point call result). Inspect
-                        ;; every incoming value while excluding the Phi itself to terminate the
-                        ;; loop-carried cycle.
-                        (let [(mut input) 1
-                              (mut found) false]
-                          (loop (if (or (>= (load input) (n-nins node)) (load found))
-                                    (break)
-                                    (do
-                                      (if (be-node-fp-value-fuel?
-                                            (n-in node (load input)) node (- fuel 1))
-                                          (store! found true)
-                                          0)
-                                      (store! input (+ (load input) 1))
-                                      0)))
-                          (load found))
-                        (if (or (= op OP-ADD) (or (= op OP-SUB) (or (= op OP-MUL) (= op OP-DIV))))
-                            (or (and (= op OP-DIV) (not (ty-int-only? (n-ty node))))
-                                (or (be-node-fp-value-fuel? (n-in node 1) excluded (- fuel 1))
-                                    (be-node-fp-value-fuel? (n-in node 2) excluded (- fuel 1))))
-                            (if (= op OP-MINUS)
-                                (be-node-fp-value-fuel? (n-in node 1) excluded (- fuel 1))
-                                (if (= op OP-CALL)
-                                    (let [callee (n-in node 1)
-                                          target
-                                            (if (= (n-op callee) OP-CLOSURE)
-                                                (n-in callee 0)
-                                                callee)]
-                                      (and (= (n-op target) OP-FUN)
-                                           (and (> (n-nins target) 1)
-                                                (let [(mut input) 1
-                                                      (mut found) false]
-                                                  (loop (if (or (>= (load input) (n-nins target))
-                                                                (load found))
-                                                            (break)
-                                                            (do
-                                                              (let [ret (n-in target (load input))]
-                                                                (if (and (= (n-op ret) OP-RETURN)
-                                                                         (be-node-fp-value-fuel?
-                                                                           (n-in ret 1)
-                                                                           excluded
-                                                                           (- fuel 1)))
-                                                                    (store! found true)
-                                                                    0))
-                                                              (store! input (+ (load input) 1))
-                                                              0)))
-                                                  (load found)))))
-                                    false))))))))))
+(defn be-fp-grow! [] (-> i64)
+  (let [u (machine-unit)
+        need (n-count)]
+    (loop (if (>= (al-len [i64] (load (field u fp-mark))) need)
+              (break)
+              (do (al-push! [i64] (field u fp-mark) 0) 0)))
+    0))
 
+;; A node is floating-point at the source: nothing below it needs looking at. `OP-PARM` is terminal
+;; either way — a parameter's representation comes from the actual arguments, not from its own type.
+(defn be-fp-source? [(node i64)] (-> bool)
+  (let [op (n-op node)]
+    (if (= op OP-MOD)
+        true
+        (if (= op OP-PARM)
+            (be-parm-fp-value? node)
+            (or (be-float-only? (n-ty node))
+                (and (= op OP-DIV) (not (ty-int-only? (n-ty node)))))))))
+
+;; The operands whose representation this node's own representation is derived from.
+(defn be-fp-push-operands! [(node i64)] (-> i64)
+  (let [u (machine-unit)
+        op (n-op node)]
+    (if (= op OP-PHI)
+        ;; Loop Phis are initially bounded by the declared TypeScript type. A numeric backedge can
+        ;; nevertheless require an FPR (for example an integer accumulator updated by a
+        ;; floating-point call result), so every incoming value counts. The mark array terminates
+        ;; the loop-carried cycle.
+        (let [(mut input) 1]
+          (loop (if (>= (load input) (n-nins node))
+                    (break)
+                    (do
+                      (al-push! [i64] (field u fp-stack) (n-in node (load input)))
+                      (store! input (+ (load input) 1))
+                      0)))
+          0)
+        (if (or (= op OP-ADD) (or (= op OP-SUB) (or (= op OP-MUL) (= op OP-DIV))))
+            (do
+              (al-push! [i64] (field u fp-stack) (n-in node 1))
+              (al-push! [i64] (field u fp-stack) (n-in node 2))
+              0)
+            (if (= op OP-MINUS)
+                (do (al-push! [i64] (field u fp-stack) (n-in node 1)) 0)
+                (if (= op OP-CALL)
+                    (let [callee (n-in node 1)
+                          target (if (= (n-op callee) OP-CLOSURE) (n-in callee 0) callee)]
+                      (if (= (n-op target) OP-FUN)
+                          (let [(mut input) 1]
+                            (loop (if (>= (load input) (n-nins target))
+                                      (break)
+                                      (do
+                                        (let [ret (n-in target (load input))]
+                                          (if (and (!= ret NO-NODE) (= (n-op ret) OP-RETURN))
+                                              (do
+                                                (al-push! [i64] (field u fp-stack) (n-in ret 1))
+                                                0)
+                                              0))
+                                        (store! input (+ (load input) 1))
+                                        0)))
+                            0)
+                          0))
+                    0))))))
+
+;; Does a floating-point value reach `node`? That is REACHABILITY over the operand graph, and the
+;; marked walk below answers it for an expression of any depth. It used to be a recursion carrying
+;; eight units of fuel, which answered "no" as soon as the chain was longer than that — and the
+;; answer decides the representation, so the two sides of one expression could disagree about it.
+;; A sum of ten terms whose first was a boxed array element selected floating-point ADDs for the
+;; accumulator and then an SCVTF on the register already holding it, so the arithmetic read a
+;; general-purpose register nothing had written: wrong, and differently wrong on each run. Depth is
+;; not something a representation may depend on, so there is no bound here to raise.
 (defn be-node-fp-value? [(node i64)] (-> bool)
-  ;; This is a representation query, not a graph walk. Eight edges cover the supported numeric
-  ;; expression shapes while bounding repeated queries on large, Phi-heavy programs.
-  (be-node-fp-value-fuel? node NO-NODE 8))
+  (let [u (machine-unit)]
+    ;; The mark array and the stack are ONE buffer shared by every call, so a walk inside a walk
+    ;; would truncate the outer one and answer from a graph it never finished looking at. Nothing
+    ;; reentrant calls this today, and a named abort is what keeps that true rather than remembered.
+    (if (load (field u fp-busy))
+        (do (panic-corrupt "be-node-fp-value?: reentrant operand walk; the mark and stack are shared") 0)
+        0)
+    (store! (field u fp-busy) true)
+    (be-fp-grow!)
+    (store! (field u fp-gen) (+ (load (field u fp-gen)) 1))
+    (let [gen (load (field u fp-gen))
+          (mut found) false]
+      (al-clear! [i64] (field u fp-stack))
+      (al-push! [i64] (field u fp-stack) node)
+      (loop (let [depth (al-len [i64] (load (field u fp-stack)))]
+              (if (or (load found) (= depth 0))
+                  (break)
+                  (let [m (al-get (load (field u fp-stack)) (- depth 1))]
+                    (al-pop! [i64] (field u fp-stack))
+                    (if (or (= m NO-NODE) (= (al-get (load (field u fp-mark)) m) gen))
+                        0
+                        (do
+                          (al-set! [i64] (field u fp-mark) m gen)
+                          (if (be-fp-source? m)
+                              (store! found true)
+                              (be-fp-push-operands! m))
+                          0))))))
+      (store! (field u fp-busy) false)
+      (load found))))
 
 ; Frontend dynamic values cross the JavaScript-value ABI at these nodes. Hand-written
 ; backend fixtures also use t-dyn for unconstrained machine integers, so type alone is
@@ -1549,12 +1585,93 @@
           (ms-emit! owner bid (mi-new mop fresh a b 0 node))
           fresh))))
 
+;; Widen a value to a double so it can be an operand of floating-point arithmetic.
+;;
+;; "Not floating-point" is NOT the same as "a machine integer". A `dyn` value arriving here — an
+;; array element, a property, a call result — is a TAGGED JavaScript word, and `SCVTF` on one
+;; converts the tag bits along with the payload. `JSUNBOX` with tag 0 is the conversion that reads
+;; either payload as a double and traps on anything that is not a number; it is what an explicit
+;; `Unbox : flt` in the graph selects to, and the two must agree. They did not: an accumulator
+;; seeded with `values[0]` and added to in a loop is a `dyn` Phi whose back edge makes it
+;; floating-point, so the loop-entry copy converted the boxed element with `SCVTF` while the body
+;; unboxed its own load properly. The seed was read as its own tag word and the sum came out 0.
+;;
+;; The evidence has to be that the value IS tagged, not that its lattice type admits it. A `dyn`
+;; type is not evidence — hand-written backend fixtures and the JSL library both give unconstrained
+;; machine integers that type, and unboxing one of those traps on a word nothing ever tagged. These
+;; four produce a tagged word by construction, and a call does when its return crosses the same
+;; boundary. A Phi is deliberately absent: a Phi of `dyn` machine words is exactly the fixture case.
+;;
+;; A raw managed pointer has no numeric value at all, so selection refuses it by name rather than
+;; converting something. The refusal is recorded and a well-formed instruction still emitted, so
+;; the rest of selection walks a consistent program on its way to reporting the failure.
+(defn ms-value-is-tagged? [(node i64)] (-> bool)
+  (or (= (n-op node) OP-ARRAYLOAD)
+      (or (= (n-op node) OP-PROPLOAD)
+          (or (= (n-op node) OP-BOX)
+              (ms-call-returns-tagged? node)))))
+
 (defn ms-fp-input! [(owner i64) (node i64) (vreg i64) (bid i64)] (-> i64)
   (if (be-node-fp-value? node)
       vreg
+      (let [tagged (ms-value-is-tagged? node)]
+        (if (or tagged (!= (ml-kind-for-node node) MLK-RAW-MANAGED))
+            0
+            (ms-fail! MSEL-UNSUPPORTED node))
+        (let [fresh (ms-new-vreg!)]
+          (ms-emit! owner bid
+                    (if tagged
+                        (mi-new MI-JSUNBOX fresh vreg -1 0 NO-NODE)
+                        (mi-new MI-SCVTF fresh vreg -1 0 NO-NODE)))
+          fresh))))
+
+;; Narrow a tagged JavaScript word to the machine integer that integer arithmetic needs.
+;;
+;; The frontend unboxes a dynamic value before using it as a number — `values[9] + 1` is an
+;; `Unbox : flt` and a floating-point add — but it EXEMPTS call results, betting that a call hands
+;; back a raw machine number. That is true only when the callee's return ABI is unboxed, which the
+;; frontend cannot see. `function tenth(v) { return v[9]; }` returns a tagged word, and
+;; `tenth(values) + 1` became an integer ADD on the TAG: right by accident when the only consumer
+;; masks the sum back to an int32, and garbage the moment anything reads it as a number.
+;;
+;; The callee's ABI IS known here, so the value is unboxed here. The integer tag is the one the
+;; arithmetic is being selected for; a payload that is not an integer trips the unbox's own check
+;; rather than being computed on, which is the same bargain every other `JSUNBOX` in this backend
+;; makes.
+;;
+;; ONLY a call whose result is genuinely tagged is repaired, and `MLK-BOXED` alone does not say
+;; that. Hand-written backend fixtures and the JSL library both give unconstrained MACHINE integers
+;; the `dyn` lattice type, and a callee returning one of those is reported boxed while its result
+;; was never tagged; unboxing it traps. `be-js-dynamic-boundary?` is this file's existing name for
+;; the nodes where a value actually crosses the JavaScript-value ABI, and a return through one of
+;; those is the evidence the lattice type cannot supply.
+(defn ms-call-returns-tagged? [(node i64)] (-> bool)
+  (and (= (n-op node) OP-CALL)
+       (and (= (be-call-return-kind node) MLK-BOXED)
+            (let [callee (n-in node 1)
+                  target (if (= (n-op callee) OP-CLOSURE) (n-in callee 0) callee)]
+              (and (= (n-op target) OP-FUN)
+                   (let [(mut input) 1
+                         (mut found) false]
+                     (loop (if (or (>= (load input) (n-nins target)) (load found))
+                               (break)
+                               (do
+                                 (let [ret (n-in target (load input))]
+                                   (if (and (!= ret NO-NODE)
+                                            (and (= (n-op ret) OP-RETURN)
+                                                 (be-js-dynamic-boundary? (n-in ret 1))))
+                                       (store! found true)
+                                       0))
+                                 (store! input (+ (load input) 1))
+                                 0)))
+                     (load found)))))))
+
+(defn ms-integer-input! [(owner i64) (node i64) (vreg i64) (bid i64)] (-> i64)
+  (if (ms-call-returns-tagged? node)
       (let [fresh (ms-new-vreg!)]
-        (ms-emit! owner bid (mi-new MI-SCVTF fresh vreg -1 0 NO-NODE))
-        fresh)))
+        (ms-emit! owner bid (mi-new MI-JSUNBOX fresh vreg -1 JSV-INTEGER NO-NODE))
+        fresh)
+      vreg))
 
 (defn ms-select-numeric-binary! [(owner i64) (node i64) (integer-op i64) (bid i64)] (-> i64)
   (if (or (be-node-fp-value? node)
@@ -1569,7 +1686,15 @@
                   fresh (ms-new-vreg!)]
               (ms-emit! owner bid (mi-new (be-fp-op (n-op node)) fresh a b 0 node))
               fresh)))
-      (ms-select-binary! owner node integer-op bid)))
+      (let [raw-a (ms-select-value-at! owner (n-in node 1) bid)
+            raw-b (ms-select-value-at! owner (n-in node 2) bid)]
+        (if (or (< raw-a 0) (< raw-b 0))
+            -1
+            (let [a (ms-integer-input! owner (n-in node 1) raw-a bid)
+                  b (ms-integer-input! owner (n-in node 2) raw-b bid)
+                  fresh (ms-new-vreg!)]
+              (ms-emit! owner bid (mi-new integer-op fresh a b 0 node))
+              fresh)))))
 
 (defn ms-select-mod! [(owner i64) (node i64) (bid i64)] (-> i64)
   (let [an (n-in node 1)
@@ -3435,6 +3560,8 @@
   (load (field (be-inst i) dst)))
 (defn ms-inst-a [(i i64)] (-> i64)
   (load (field (be-inst i) a)))
+(defn ms-inst-imm [(i i64)] (-> i64)
+  (load (field (be-inst i) imm)))
 (defn ms-inst-earliest [(i i64)] (-> i64)
   (load (field (be-inst i) earliest)))
 (defn ms-inst-latest [(i i64)] (-> i64)
@@ -4069,6 +4196,16 @@
                                     0))))
                     (= bid (load expected)))))))))
 
+;; The only instruction an edge copy may put between a Phi's input and the value it copies: the
+;; widening `ms-fp-input!` emits when the Phi is floating-point and the input is not. `SCVTF` for a
+;; machine integer, `JSUNBOX` to a number for a tagged JavaScript word, and nothing else — this
+;; verifier named only `SCVTF`, which is the same assumption that made the widening itself wrong.
+(defn ms-fp-widening-of? [(def i64) (input i64)] (-> bool)
+  (and (>= def 0)
+       (and (= (ms-inst-a def) input)
+            (or (= (ms-inst-op def) MI-SCVTF)
+                (and (= (ms-inst-op def) MI-JSUNBOX) (= (ms-inst-imm def) 0))))))
+
 (defn ms-edge-copies-valid? [(edge i64)] (-> bool)
   (let [u (machine-unit)
         e (mu-edge edge)
@@ -4113,9 +4250,7 @@
                                                   input (ms-vget owner (n-in phi slot))
                                                   def (ms-owner-def-inst owner src)]
                                               (and (!= src input)
-                                                   (or (< def 0)
-                                                       (or (!= (ms-inst-op def) MI-SCVTF)
-                                                           (!= (ms-inst-a def) input)))))))
+                                                   (not (ms-fp-widening-of? def input))))))
                                     (store! ok false)
                                     0))))
                       (store! i (+ (load i) 1))
@@ -4588,7 +4723,11 @@
         node (load (field m node))]
     (if (or (= op MI-FTRUTH) (= op MI-I32FROMFP))
         MRC-GPR
-        (if (ml-fp-producing-op? op)
+        ;; Unboxing to a NUMBER writes a double, whatever the tagged payload was, so it lands in an
+        ;; FPR the way SCVTF does. Every other tag unboxes to a machine word. The op alone does not
+        ;; say which; only the tag does, which is why this is not in `ml-fp-producing-op?`.
+        (if (or (ml-fp-producing-op? op)
+                (and (= op MI-JSUNBOX) (= (load (field m imm)) 0)))
             MRC-FPR
             (if (and (or (= op MI-COPY) (= op MI-ABI-COPY)) (>= a 0))
                 (al-get (load (field (machine-unit) register-class)) a)

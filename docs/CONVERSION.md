@@ -79,11 +79,16 @@ pre-placement schedule, and the closed-world function index being spent on macro
 one that made this look impossible: it surfaced as `MSEL-UNSUPPORTED` on `String.prototype.indexOf`,
 a definition that uses none of the new entries.
 
-**One defect found on the way is NOT fixed.** A single arithmetic expression of about twenty terms
-mixing boxed array elements with unboxed lengths miscompiles, and the answer varies between runs of
-the same binary — a pointer reaches the arithmetic while every underlying array runtime call is
-correct. It reproduces with none of these operations converted, so it is older than this work.
-`array-mutation.ts` accumulates into a local rather than writing one sum, and says so.
+**One defect found on the way, since fixed.** A single arithmetic expression of about twenty terms
+mixing boxed array elements with unboxed lengths miscompiled, and the answer varied between runs of
+the same binary while every underlying array runtime call was correct. The cause was not in the
+arrays: `be-node-fp-value?` decided whether a `+` is integer or floating-point by a recursion
+carrying eight units of fuel, and past eight it answered "no", so the two sides of one expression
+disagreed about the register a value lived in. It is a marked walk now, with no bound. Chasing it
+turned up two more defects in the same seam; all three are written up in
+[JOURNAL.md](JOURNAL.md#the-representation-seam-three-miscompiles-a-depth-bound-was-hiding) and
+covered by `tests/native-conformance/deep-arithmetic.ts` and `unstable-array-sum.ts`.
+`array-mutation.ts` is one sum again.
 
 ## Math
 
