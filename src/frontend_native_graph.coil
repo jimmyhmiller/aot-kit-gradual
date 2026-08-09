@@ -1713,6 +1713,13 @@
   ;; so this is the same code for both kinds and there is nothing to decide here.
   (let [cell (stack (array i64 1))
         mp (cast (ptr i64) cell)]
+    ;; DECLARED BEFORE THE BODY IS BUILT, not after it has written. Every hand-written array path
+    ;; here records the dynamic alias first, and the order is load-bearing: the nodes `jsl-inline!`
+    ;; is about to emit read and write JS-PROPERTY-ALIAS, and declaring the alias afterwards leaves
+    ;; them outside the set the merge machinery then treats as dynamic. Recording it for a
+    ;; definition that turns out not to write is harmless — the memory cell is compared below and
+    ;; an unchanged one publishes nothing.
+    (if (jsl-name-uses-memory? name) (fng-record-dynamic-alias! context JS-PROPERTY-ALIAS) 0)
     (store! (index mp 0) (fng-current-memory context JS-PROPERTY-ALIAS))
     (let [v (jsl-inline! (load (field context ctrl)) mp name args)]
       (if (!= (load (index mp 0)) (fng-current-memory context JS-PROPERTY-ALIAS))
@@ -1812,59 +1819,52 @@
                                                "StringSlice"))]
                               (fng-jsl-call3 context jsl-name string start end))))))))))
 
+;; `Array.prototype.push`, out of `ArrayPush1` in lib/array/build.jsl.
+;;
+;; THE LOOP IS OVER THE ARGUMENT SYNTAX, not over runtime values, so it stays here. JSL has no
+;; variadic signature and inventing one would buy nothing: the argument count is a property of the
+;; call site, so a variadic definition would have to be unrolled per call site anyway, and this is
+;; that unrolling written where the syntax is.
+;;
+;; The value is BOXED. Array elements are stored boxed, `%ArrayStore` writes the word it is given,
+;; and the read paths (`ArrayIndexOfFrom` and friends) compare boxed words.
 (defn fng-array-push [(context FngContext) (node i64)] (-> i64)
   (let [frontend (load (field context frontend))
         ast (field frontend ast)
         callee (ts-child ast node 0)
         array (fng-expression context (ts-child ast callee 0))
-        initial (fng-array-length! context (fng-current-memory context JS-PROPERTY-ALIAS) array)
-        (mut index) 1]
-    (fng-record-dynamic-alias! context JS-PROPERTY-ALIAS)
+        (mut index) 1
+        (mut result) NO-NODE]
     (loop (if (>= (load index) (ts-child-count ast node))
               (break)
-              (let [value (fng-expression context (ts-child ast node (load index)))
-                    position (fng-bin OP-ADD initial (fng-const (- (load index) 1)))
-                    stored
-                      (fng-array-store! context (fng-current-memory context JS-PROPERTY-ALIAS)
-                                      array
-                                      position
-                                      (n-box! value))]
-                (store! (load (field context memory)) (fng-preserve-active-memory context stored))
+              (let [value (fng-expression context (ts-child ast node (load index)))]
+                (store! result (fng-jsl-call2 context "ArrayPush1" array (n-box! value)))
                 (store! index (+ (load index) 1)))))
-    (fng-array-length! context (fng-current-memory context JS-PROPERTY-ALIAS) array)))
+    ;; `a.push()` writes nothing and answers the length. It needs its own definition rather than
+    ;; falling out of the loop, because with no argument the loop's result never exists.
+    (if (= (load result) NO-NODE)
+        (fng-jsl-call1 context "ArrayLength" array)
+        (load result))))
 
+;; `Array.prototype.pop` and `shift`, out of `ArrayPop` and `ArrayShift` in lib/array/build.jsl.
+;;
+;; Both were hand-written IR here, and both carried the empty-array case WRONG: `pop` on a length-0
+;; array resized to -1 and `shift` clamped the new length at 0 while still returning whatever the
+;; load of index 0 found. The library definitions have the spec's step-3 guard instead, so the
+;; empty case is `undefined` and the length does not move.
 (defn fng-array-pop [(context FngContext) (node i64)] (-> i64)
   (let [frontend (load (field context frontend))
         ast (field frontend ast)
         callee (ts-child ast node 0)
-        array (fng-expression context (ts-child ast callee 0))
-        memory (fng-current-memory context JS-PROPERTY-ALIAS)
-        length (fng-array-length! context memory array)
-        new-length (fng-bin OP-SUB length (fng-const 1))
-        value (fng-array-load! context memory array new-length)
-        resized (fng-array-resize-after! context memory array new-length value)]
-    (fng-record-dynamic-alias! context JS-PROPERTY-ALIAS)
-    (store! (load (field context memory)) (fng-preserve-active-memory context resized))
-    value))
+        array (fng-expression context (ts-child ast callee 0))]
+    (fng-jsl-call1 context "ArrayPop" array)))
 
 (defn fng-array-shift [(context FngContext) (node i64)] (-> i64)
   (let [frontend (load (field context frontend))
         ast (field frontend ast)
         callee (ts-child ast node 0)
-        array (fng-expression context (ts-child ast callee 0))
-        memory (fng-current-memory context JS-PROPERTY-ALIAS)
-        length (fng-array-length! context memory array)
-        value (fng-array-load! context memory array (fng-const 0))
-        copied (fng-array-copy! context memory array array (fng-const 1))
-        resized (fng-array-resize-after! context copied
-                                       array
-                                       (fng-max context
-                                                (fng-bin OP-SUB length (fng-const 1))
-                                                (fng-const 0))
-                                       value)]
-    (fng-record-dynamic-alias! context JS-PROPERTY-ALIAS)
-    (store! (load (field context memory)) (fng-preserve-active-memory context resized))
-    value))
+        array (fng-expression context (ts-child ast callee 0))]
+    (fng-jsl-call1 context "ArrayShift" array)))
 
 (defn fng-select [(context FngContext) (predicate i64) (when-true i64) (when-false i64)] (-> i64)
   (let [entry (load (load (field context ctrl)))
@@ -1898,13 +1898,21 @@
             from-start (fng-min context raw length)]
         (fng-select context negative from-end from-start))))
 
+;; `Array.prototype.slice`, out of `ArraySlice` in lib/array/build.jsl.
+;;
+;; The BOUNDS moved with the operation. They were `fng-slice-bound` here, a third implementation of
+;; the negative-index rule that `StringSlice` and `RelativeIndex` already had; the library uses the
+;; same `Clamp` the string family does, so there is one spelling of "a negative index counts from
+;; the end" rather than three that no test compares.
+;;
+;; A MISSING `end` IS THE LENGTH, and the frontend has to supply it because JSL has no optional
+;; parameter. `ArrayLength` is the definition that answers it, so even the default goes through the
+;; library.
 (defn fng-array-slice [(context FngContext) (node i64)] (-> i64)
   (let [frontend (load (field context frontend))
         ast (field frontend ast)
         callee (ts-child ast node 0)
         array (fng-expression context (ts-child ast callee 0))
-        incoming (fng-current-memory context JS-PROPERTY-ALIAS)
-        length (fng-array-length! context incoming array)
         raw-start
           (if (> (ts-child-count ast node) 1)
               (fng-expression context (ts-child ast node 1))
@@ -1912,17 +1920,8 @@
         raw-end
           (if (> (ts-child-count ast node) 2)
               (fng-expression context (ts-child ast node 2))
-              length)
-        start (fng-slice-bound context raw-start length)
-        end (fng-slice-bound context raw-end length)
-        count (fng-max context (fng-bin OP-SUB end start) (fng-const 0))
-        allocation (n-new-obj0! (load (load (field context ctrl))) SHAPE-ROOT)
-        result (n-array-mark! (n-obj-ptr allocation))]
-    (fng-record-dynamic-alias! context JS-PROPERTY-ALIAS)
-    (let [resized (fng-array-resize! context incoming result count)
-          copied (fng-array-copy! context resized array result start)]
-      (store! (load (field context memory)) (fng-preserve-active-memory context copied))
-      result)))
+              (fng-jsl-call1 context "ArrayLength" array))]
+    (fng-jsl-call3 context "ArraySlice" array raw-start raw-end)))
 
 (defn fng-array-call [(context FngContext) (node i64)] (-> i64)
   (let [name (fng-array-builtin-name context node)]

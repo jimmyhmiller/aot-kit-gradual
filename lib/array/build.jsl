@@ -5,6 +5,92 @@
 ;; `%NewArray` allocates and tags; `%ArrayStore` writes an element and yields the new heap, which
 ;; the lowering threads. Neither appears as a memory operand in the source.
 
+;; https://tc39.es/ecma262/#sec-array.prototype.push, ONE ARGUMENT AT A TIME.
+;;
+;; The spec's `push` is variadic and JSL has no variadic signature, so the frontend keeps the
+;; argument loop and calls this once per argument. That is not a workaround being tolerated: the
+;; loop is over the SYNTAX, whose length is known at compile time, so unrolling it in the frontend
+;; is what a variadic JSL definition would have had to be lowered into anyway.
+;;
+;; The length is re-read on each call rather than being carried, which is what makes the
+;; one-at-a-time factoring correct: the answer is the length AFTER this element, so `a.push(x, y)`
+;; answers len+2 by answering len+1 twice over a heap that moved in between.
+(macro ArrayPush1 :params [(a dyn) (v dyn)] :ret int
+  (let [(len (%ArrayLen a))
+        (ignored (%ArrayStore a len v))]
+    (%Add len 1)))
+
+;; `a.push()` with no arguments is the length, unchanged — and it still has to be an OPERATION,
+;; because `a.length` and `a.push()` are the same answer through two different paths and only one
+;; of them existed in the library.
+(macro ArrayLength :params [(a dyn)] :ret int (%ArrayLen a))
+
+;; https://tc39.es/ecma262/#sec-array.prototype.pop.
+;;
+;; THE THIRD OPERAND OF `%ArrayResize` IS WHY THAT PRIMITIVE HAS THREE. `v` is not data the resize
+;; consumes; it is the value whose load must happen before the write that destroys it. Written as
+;; a plain two-operand resize the load of the last element is ordered only by the memory chain,
+;; which does not say a read precedes a later write of the same memory, so the scheduler floats it
+;; past the shortening and selection refuses the block with `MSEL-MEMORY-ORDER`.
+;;
+;; SPEC STEP 3 IS THE CLAMP, NOT A BRANCH. `[].pop()` must be `undefined` and must leave the length
+;; at 0, and clamping the index to [0, len] gets both for free: on an empty array the index is 0, a
+;; load past the end already reads `undefined`, and resizing to 0 changes nothing. The hand-written
+;; path this replaces had no guard at all and resized an empty array to -1.
+;;
+;; Written as `(if (%Le len 0) undefined ...)` instead — which is the spec's own shape — it is a Phi
+;; over `Const undefined` and a boxed load, and the seam does not carry that: `popped * 10 +
+;; values[0]` then answered one low, because the Phi reaches the multiply unboxed while the sibling
+;; load does not. The branch-free form has one representation on every path, and it is also the
+;; smaller graph.
+(macro ArrayPop :params [(a dyn)] :ret dyn
+  (let [(last (Clamp (%Sub (%ArrayLen a) 1) 0 (%ArrayLen a)))
+        (v (%ArrayLoad a last))
+        (ignored (%ArrayResize a last v))]
+    v))
+
+;; https://tc39.es/ecma262/#sec-array.prototype.shift.
+;;
+;; The elements move down by one IN A LOOP, where the hand-written path emitted a single bulk
+;; `OP-ARRAYCOPY`. That is the one place this conversion changes the emitted shape rather than only
+;; its author: JSL has no bulk-copy primitive, and adding one would be a machine-surface op whose
+;; only caller is this line. The loop is the same O(n) work spelled in the language.
+;;
+;; `head` is loaded before the loop overwrites index 0, and it is also the resize's ordering value,
+;; so the read that produces the RESULT is pinned ahead of the write that shortens the array.
+;;
+;; The empty case is the same clamp `pop` uses, and for the same reason: `last` is 0, so the loop
+;; never runs, the resize is a no-op, and the load of index 0 answers `undefined`.
+(macro ArrayShift :params [(a dyn)] :ret dyn
+  (let [(last (Clamp (%Sub (%ArrayLen a) 1) 0 (%ArrayLen a)))
+        (head (%ArrayLoad a 0))
+        (moved (loop [(i 0)]
+                 (if (%Le last i) i
+                   (let [(ignored (%ArrayStore a i (%ArrayLoad a (%Add i 1))))]
+                     (recur (%Add i 1))))))
+        (ignored2 (%ArrayResize a last head))]
+    head))
+
+;; https://tc39.es/ecma262/#sec-array.prototype.slice, over a fresh array.
+;;
+;; The bounds are the SLICE rule, not the substring rule, and they are the same two lines
+;; `StringSlice` carries: a negative index maps to `len + index`, and the result is empty when the
+;; start passes the end — never swapped. Sharing `Clamp` is what keeps those two definitions from
+;; drifting apart.
+;;
+;; No `%ArrayResize` here. `%ArrayStore` past the end grows the array, so writing `hi - lo`
+;; elements into a fresh one leaves exactly that length, and a zero-width slice is the empty array
+;; `%NewArray` already produced.
+(macro ArraySlice :params [(a dyn) (start int) (end int)] :ret dyn
+  (let [(len (%ArrayLen a))
+        (lo (Clamp (if (%Lt start 0) (%Add len start) start) 0 len))
+        (hi (Clamp (if (%Lt end 0) (%Add len end) end) 0 len))
+        (out (%NewArray))]
+    (loop [(i lo)]
+      (if (%Le hi i) out
+        (let [(ignored (%ArrayStore out (%Sub i lo) (%ArrayLoad a i)))]
+          (recur (%Add i 1)))))))
+
 ;; A dense array of `n` copies of `v`. `Array.prototype.fill` over a fresh array.
 (macro ArrayRepeat :params [(n dyn) (v dyn)] :ret dyn
   (let [(a (%NewArray))]
