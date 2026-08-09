@@ -10,12 +10,12 @@ merely exists — several definitions existed for months while nothing could rea
 Status as of the commit that converts the array-mutation family. `tools/gate.sh` green at 533 tests.
 
 **READ THIS BEFORE READING THE TABLES.** They cover the operations the frontend can compile, which
-is NOT the same set as the operations `lib/` implements. 45 of the library's 88 declarations are
-unreachable from any program — including twelve more `String.prototype` methods that are written,
-spec-annotated and Node-verified, and that no TypeScript program can name. A row missing from a
-table below usually means *the frontend has never supported that syntax*, not that the library
-lacks a definition. The full inventory, with what unblocks each entry, is the reachability section
-of [../HANDOFF.md](../HANDOFF.md).
+is not automatically the same set as the operations `lib/` implements. It was not: 45 of the
+library's 88 declarations were unreachable from any program, including twelve `String.prototype`
+methods that were written, spec-annotated and Node-verified and that no TypeScript program could
+name. Twenty of those have since been reached. A row missing from a table below usually means *the
+frontend has never supported that syntax*, not that the library lacks a definition. The full
+inventory is the reachability section of [../HANDOFF.md](../HANDOFF.md).
 
 ---
 
@@ -33,13 +33,27 @@ of [../HANDOFF.md](../HANDOFF.md).
 | `toUpperCase` | **converted** | `StringToUpperCase` |
 | `split` | not converted | — |
 | `.length` | **converted** | `StringLength` |
-| `startsWith` `endsWith` `includes` `lastIndexOf` | **written, unreachable** | `StringStartsWith` `StringEndsWith` `StringIncludesFrom` `StringLastIndexOf` |
-| `padStart` `padEnd` `repeat` `replaceAll` | **written, unreachable** | `StringPadStart` `StringPadEnd` `StringRepeatCount` `StringReplaceAll` |
-| `trim` `trimStart` `trimEnd` `at` | **written, unreachable** | `StringTrim` `StringTrimStart` `StringTrimEnd` `StringAt` |
+| `startsWith` | **converted** | `StringStartsWith` |
+| `endsWith` | **converted** | `StringEndsWith` |
+| `includes` | **converted** | `StringIncludesFrom` |
+| `lastIndexOf` | **converted** | `StringLastIndexOf` |
+| `padStart` | **converted** | `StringPadStart` |
+| `padEnd` | **converted** | `StringPadEnd` |
+| `repeat` | **converted** | `StringRepeatCount` |
+| `replaceAll` | **converted** | `StringReplaceAll` |
+| `trim` | **converted** | `StringTrim` |
+| `trimStart` | **converted** | `StringTrimStart` |
+| `trimEnd` | **converted** | `StringTrimEnd` |
+| `at` | **converted** | `StringAt` |
 
-The nine rows above the divider are the nine names `fng-string-builtin?` recognises. The twelve
-**written, unreachable** ones are complete definitions that no program can call: the frontend does
-not accept the method name, so the call never reaches a lowering at all.
+The bottom twelve were written, spec-annotated and Node-verified for months while
+`fng-string-builtin?` listed nine method names and none of these were among them, so no program
+could call any of them. They are covered by `string-methods.ts` and `string-transforms.ts`.
+
+`fng-string-builtin-arity?` carries each name's supported argument counts and REFUSES the rest:
+`lastIndexOf(needle, from)` is a frontend diagnostic rather than a compile with the `fromIndex`
+dropped, because `StringLastIndexOf` has no way to honour it and a silently ignored argument is a
+wrong answer.
 
 `split` allocates an array. `%NewArray` and `%ArrayStore` exist, so a definition is writable; the
 frontend's own split path also marks the allocation and publishes a dynamic alias, and that half has
@@ -56,8 +70,8 @@ no counterpart in the library yet. This is the largest genuinely-open item.
 | `pop` | **converted** | `ArrayPop` |
 | `shift` | **converted** | `ArrayShift` |
 | `slice` | **converted** | `ArraySlice` |
-| `at` | **written, unreachable** | `ArrayAt` |
-| `join` | **written, unreachable** | `ArrayJoin` |
+| `at` | **converted** | `ArrayAt` |
+| `join` | **converted** | `ArrayJoin` |
 
 Every converted entry is a `macro`, and it has to be, for the reason `lib/array/read.jsl` states: memory
 reaches a function as an `OP-ARG` and never as a parameter, so a called `builtin` synthesises its own
@@ -117,8 +131,8 @@ covered by `tests/native-conformance/deep-arithmetic.ts` and `unstable-array-sum
 | `round` | **converted** | `MathRound` |
 | `max` | **converted** | `MathMax2` |
 | `min` | **converted** | `MathMin2` |
-| `sign` | **written, unreachable** | `MathSign` |
-| `trunc` | **written, unreachable** | `MathTrunc` |
+| `sign` | **converted** | `MathSign` |
+| `trunc` | **converted** | `MathTrunc` |
 | `sqrt`, `pow`, `exp`, `log` | **not convertible** | — |
 | `sin`, `cos`, `tan`, `asin`, `acos`, `atan` | **not convertible** | — |
 | `random` | **not convertible** | — |
@@ -138,22 +152,29 @@ call. Converting them would add a name and remove nothing.
 | `isNaN(x)` | **converted** | `GlobalIsNaN` |
 | `String.fromCharCode(c)` | **converted** | `StringFromCharCode` |
 | implicit ToString at `+` | **converted** | `ToStringValue` |
-| `Number(x)` / unary `+` | **not supported by the frontend** | — |
-| `Number.isNaN` and friends | **not supported by the frontend** | `NumberIsNaN` … |
+| `Number(x)` | **converted** | `ToNumberValue` |
+| `Number.isNaN` | **converted** | `NumberIsNaN` |
+| `Number.isFinite` | **converted** | `NumberIsFinite` |
+| `Number.isInteger` | **converted** | `NumberIsInteger` |
+| `Number.isSafeInteger` | **converted** | `NumberIsSafeInteger` |
+| ToNumber at an arithmetic operand | **converted** | `ToNumberValue` |
+| unary `+` | not supported by the frontend | — |
 
 `GlobalIsNaN` is `%IsNaN`, which COERCES, and that is the whole difference from `Number.isNaN`:
 `isNaN("12x")` is true because ToNumber of the argument is NaN, while `Number.isNaN("12x")` is
 false because the argument is a string rather than the NaN value. Two operations, two definitions.
 
-These last two are a different category from everything else in this file, and it is worth being
-exact about it: they are not unconverted operations, they are operations the frontend cannot compile
-in the first place. There is no `FE-INTRINSIC-NUMBER`, so `Number(x)` and `Number.isNaN(x)` never
-reach any lowering, hand-written or otherwise.
+`Number` is a frontend intrinsic now, which is what those five rows took. Until it was, the
+receiver had no resolution and a program naming `Number.isNaN` crashed the emitter; the four
+definitions had been written and native-gate verified the whole time.
 
-`NumberIsNaN`, `NumberIsFinite`, `NumberIsInteger` and `NumberIsSafeInteger` are written and
-native-gate verified against Node, and nothing can name them. Discovered when a test using
-`Number.isNaN` crashed the emitter. Reaching them means adding a frontend intrinsic — new
-functionality, not a conversion.
+The predicates are UNBOXED at the seam. Each `builtin` ends in `%Box`, so it answers a tagged
+boolean, and a tagged boolean used as a condition goes through the `JSSOP-VALUE-TRUTHY` runtime call
+where the global `isNaN` beside it compares a raw machine word. One expression holding both failed
+selection. `fng-number-static` unboxes to `t-bool` so every predicate has one representation.
+
+`Number()` with no argument is `+0` rather than NaN, which is the one place it differs from
+ToNumber of `undefined`.
 
 ## Operators
 
@@ -183,15 +204,19 @@ result of a JSL Math definition, which returns a boxed integer for an integer in
 
 | | count |
 |---|---|
-| Converted | 31 |
+| Converted | 52 |
 | Blocked on design | 1 (`split`) |
 | Not convertible | 11 (libm + `random`) |
-| **Written, and unreachable** | **20** (14 method names, `Math.sign`/`trunc`, four `Number.*`) |
+| Written, and unreachable | 0 |
 
-**Every operation the frontend can compile, and that a DSL can express, is converted.** That claim
-is narrower than it sounds, and the last row is why: twenty more operations are already written in
-`lib/` and cannot be reached, because the frontend does not accept the syntax that would call them.
-The remaining work is mostly not conversion — it is frontend surface.
+**Every operation the frontend can compile, and that a DSL can express, is converted, and there is
+no longer a written definition a program cannot reach.** What is left is one allocation-path design
+question (`split`) and libm.
+
+The count moved from 31 to 52 without a single new definition being written. Twenty of the
+twenty-one were already in `lib/`; what they needed was a name in a recognizer, a dispatch arm and a
+conformance program. The twenty-first is ToNumber at the arithmetic seam, which was a hand-written
+`Unbox` doing the wrong thing rather than a missing definition.
 
 The honest shape of it: **nothing is blocked by the DSL's expressiveness, and nothing is blocked on a
 missing primitive any more.** The three things that ever genuinely blocked conversion — memory

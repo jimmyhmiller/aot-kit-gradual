@@ -34,6 +34,7 @@
 (const FNG-INTRINSIC-ERROR i64 -11)
 (const FNG-INTRINSIC-ARRAY i64 -12)
 (const FNG-INTRINSIC-OBJECT i64 -13)
+(const FNG-INTRINSIC-NUMBER i64 -14)
 (const FNG-JUMP-BREAK i64 0)
 (const FNG-JUMP-CONTINUE i64 1)
 
@@ -1051,6 +1052,7 @@
         (= symbol FE-INTRINSIC-ERROR) FNG-INTRINSIC-ERROR
         (= symbol FE-INTRINSIC-ARRAY) FNG-INTRINSIC-ARRAY
         (= symbol FE-INTRINSIC-OBJECT) FNG-INTRINSIC-OBJECT
+        (= symbol FE-INTRINSIC-NUMBER) FNG-INTRINSIC-NUMBER
         :else FNG-DYNAMIC))
 
 (defn fng-declared-symbol-type [(frontend (ptr NativeFrontend)) (symbol-id i64)] (-> i64)
@@ -1169,6 +1171,13 @@
                       (if (= callee-type FNG-INTRINSIC-STRING)
                           FNG-STRING
                           (if (= callee-type FNG-INTRINSIC-ISNAN) FNG-BOOLEAN FNG-NUMBER))
+                      ;; Both of these are unboxed at their emitter — see `fng-number-static` for
+                      ;; why the predicates must be — so they are a machine bool and a machine
+                      ;; number, exactly like the global `isNaN` and `parseInt` above.
+                      (if (and (= kind TSK-CALL) (fng-number-static? context node))
+                          FNG-BOOLEAN
+                      (if (and (= kind TSK-CALL) (fng-number-convert? context node))
+                          FNG-NUMBER
                       (if (and (= kind TSK-CALL) (fng-number-to-string? context node))
                           FNG-STRING
                           (if (and (= kind TSK-CALL) (fng-string-from-char-code? context node))
@@ -1189,7 +1198,7 @@
                                                   (fe-find-function-name frontend (ts-child ast callee-node 1))
                                                   (fe-resolution-symbol frontend callee-node))]
                                       (fng-call-result-type
-                                        frontend callee (= kind TSK-NEW-EXPRESSION)))))))))))))
+                                        frontend callee (= kind TSK-NEW-EXPRESSION)))))))))))))))
               (= kind TSK-PROPERTY-ACCESS)
                 (let [owner (fng-infer context (ts-child ast node 0) FNG-DYNAMIC)
                       name-node (ts-child ast node 1)
@@ -1656,12 +1665,20 @@
       ;; double, so unboxing its result as a float is right. A JSL definition is not the same:
       ;; `MathAbs` of a boxed integer returns a boxed INTEGER, and reading that as a float
       ;; reinterprets the bits. Math.abs(-7) takes exactly that path.
-      (let [jsl-name (if (= descriptor JBI-ABS) "MathAbs"
-                       (if (= descriptor JBI-FLOOR) "MathFloor"
-                         (if (= descriptor JBI-CEIL) "MathCeil"
-                           (if (= descriptor JBI-ROUND) "MathRound"
-                             (if (= descriptor JBI-MAX) "MathMax2"
-                               (if (= descriptor JBI-MIN) "MathMin2" ""))))))]
+      ;; `sign` and `trunc` are the only two here that do not also exist as an `OP-JSBUILTIN`. The
+      ;; other four have a descriptor-runtime implementation underneath — the library's contribution
+      ;; to `MathFloor` is the `if (%IsInt v)` guard around `%FloorNum`, which is real but partial —
+      ;; where `MathSign` and `MathTrunc` are the whole operation, written in the DSL and reachable
+      ;; from a program for the first time here.
+      (let [jsl-name (cond (= descriptor JBI-ABS)   "MathAbs"
+                           (= descriptor JBI-FLOOR) "MathFloor"
+                           (= descriptor JBI-CEIL)  "MathCeil"
+                           (= descriptor JBI-ROUND) "MathRound"
+                           (= descriptor JBI-SIGN)  "MathSign"
+                           (= descriptor JBI-TRUNC) "MathTrunc"
+                           (= descriptor JBI-MAX)   "MathMax2"
+                           (= descriptor JBI-MIN)   "MathMin2"
+                           :else "")]
         (if (= (str-len jsl-name) 0)
             (n-unbox! (n-js-builtin! descriptor (n-box! arg0) (n-box! arg1)) (t-flt))
             (if (or (= descriptor JBI-MAX) (= descriptor JBI-MIN))
@@ -1694,6 +1711,73 @@
     (if (= (ts-kind ast callee) TSK-PROPERTY-ACCESS)
         (ts-text ast (ts-child ast callee 1))
         "")))
+
+;; `Number.isNaN` and its three neighbours, out of lib/number/predicates.jsl.
+;;
+;; THE DIFFERENCE FROM THE GLOBAL `isNaN` IS COERCION, and it is the reason there are two
+;; definitions rather than one: `isNaN("12x")` is true because ToNumber of the argument is NaN,
+;; while `Number.isNaN("12x")` is false because the argument is a string rather than the NaN value.
+;; `GlobalIsNaN` is `%IsNaN`, which coerces; `NumberIsNaN` is `IsNaNNumber`, which does not.
+;;
+;; The argument is BOXED. Every one of these asks about the argument's TAG before its value — that
+;; is what "is it a Number at all" means here — so it has to arrive as a tagged word, where the
+;; string methods take their receiver as the raw pointer it already is.
+;;
+;; THE RESULT IS UNBOXED BACK TO A RAW BOOL, and that is not tidiness. The four `builtin`s end in
+;; `%Box` because a builtin returns a JavaScript value, so the result is a TAGGED boolean, and a
+;; tagged boolean used as an `if` or `?:` condition goes through the `JSSOP-VALUE-TRUTHY` runtime
+;; call. The global `isNaN` next to it answers a raw machine bool and compares directly, and one
+;; expression holding both — `Number.isNaN(v) ? 1 : 0` added to `isNaN(v) ? 2 : 0` — failed
+;; selection with `MSEL-TERMINATOR`. Either predicate alone compiles. Unboxing here gives every
+;; predicate in the language the same representation, which is what the merge needs.
+(defn fng-number-static-name [(context FngContext) (node i64)] (-> (slice u8))
+  (let [frontend (load (field context frontend))
+        ast (field frontend ast)
+        callee (ts-child ast node 0)]
+    (if (and (= (ts-kind ast callee) TSK-PROPERTY-ACCESS)
+             (= (fe-resolution-symbol frontend (ts-child ast callee 0)) FE-INTRINSIC-NUMBER))
+        (let [member (ts-text ast (ts-child ast callee 1))]
+          (cond (str-eq member "isNaN")         "NumberIsNaN"
+                (str-eq member "isFinite")      "NumberIsFinite"
+                (str-eq member "isInteger")     "NumberIsInteger"
+                (str-eq member "isSafeInteger") "NumberIsSafeInteger"
+                :else ""))
+        "")))
+
+(defn fng-number-static? [(context FngContext) (node i64)] (-> bool)
+  (> (str-len (fng-number-static-name context node)) 0))
+
+(defn fng-number-static [(context FngContext) (node i64)] (-> i64)
+  (let [frontend (load (field context frontend))
+        ast (field frontend ast)
+        name (fng-number-static-name context node)
+        argument
+          (if (> (ts-child-count ast node) 1)
+              (n-box! (fng-expression context (ts-child ast node 1)))
+              ;; `Number.isNaN()` with no argument asks about `undefined`, and every one of these
+              ;; answers false for it. Boxed for the same reason the present argument is.
+              (n-box! (fng-undefined)))]
+    (n-unbox! (fng-jsl-call1 context name argument) (t-bool))))
+
+;; `Number(x)`, which is ToNumber and nothing else — the same `ToNumberValue` the arithmetic seam
+;; emits, differing only in that the result is the expression rather than an operand. Unboxed here
+;; because the frontend types the call `FNG-NUMBER`, and that means a machine number.
+(defn fng-number-convert? [(context FngContext) (node i64)] (-> bool)
+  (let [frontend (load (field context frontend))
+        ast (field frontend ast)]
+    (and (> (ts-child-count ast node) 0)
+         (= (fe-resolution-symbol frontend (ts-child ast node 0)) FE-INTRINSIC-NUMBER))))
+
+(defn fng-number-convert [(context FngContext) (node i64)] (-> i64)
+  (let [frontend (load (field context frontend))
+        ast (field frontend ast)]
+    ;; `Number()` with no argument is +0, not NaN. It is the one place this differs from ToNumber
+    ;; of `undefined`, and the spec says so explicitly.
+    (if (> (ts-child-count ast node) 1)
+        (n-unbox! (fng-jsl-call1 context "ToNumberValue"
+                                 (n-box! (fng-expression context (ts-child ast node 1))))
+                  (t-flt))
+        (fng-const 0))))
 
 (defn fng-string-from-char-code? [(context FngContext) (node i64)] (-> bool)
   (let [frontend (load (field context frontend))
@@ -3259,6 +3343,10 @@
           (= kind TSK-CALL)
             (if (fng-math-builtin? context node)
                 (fng-math-call context node)
+            (if (fng-number-static? context node)
+                (fng-number-static context node)
+            (if (fng-number-convert? context node)
+                (fng-number-convert context node)
             (if (fng-number-to-string? context node)
                 (fng-number-to-string context node)
                 (if (fng-string-from-char-code? context node)
@@ -3267,7 +3355,7 @@
                         (fng-string-call context node)
                         (if (fng-array-builtin? context node)
                             (fng-array-call context node)
-                            (fng-call context node))))))
+                            (fng-call context node))))))))
           (= kind TSK-NEW-EXPRESSION)
             (if (fng-error-constructor? context node) (fng-error-constructor context node) (fng-call context node))
           (= kind TSK-OBJECT-LITERAL)

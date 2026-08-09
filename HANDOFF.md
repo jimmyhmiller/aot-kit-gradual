@@ -106,14 +106,23 @@ it meets a tagged one:
 An index that can miss cannot be written that way, so **a `dyn`-returning definition whose arms are
 not all tagged is the bug to look for first.** `jsl-check` does not catch it; nothing does.
 
-**B. Blocked on the Math descriptor table — 2 operations.** `Math.sign` (`MathSign`) and
-`Math.trunc` (`MathTrunc`). `src/jsbuiltin_desc.coil` has 17 `JBI-` ids and neither is among them,
-so the frontend cannot compile the call at all. These two are the only Math entries that would be
-PURE JSL: `floor`/`ceil`/`round` still bottom out in `OP-JSBUILTIN` through `%FloorNum`, and
-`sign`/`trunc` would not.
+**B. Blocked on the Math descriptor table — 2 operations. BOTH ARE NOW REACHED.** `Math.sign`
+(`MathSign`) and `Math.trunc` (`MathTrunc`). `src/jsbuiltin_desc.coil` had 17 `JBI-` ids and neither
+was among them, so the frontend could not compile the call at all; it has 19 now, and
+`jbi-eval` grew a real arm for each rather than leaving the table with an id whose evaluation
+silently answers NaN. **These two are the only PURE Math conversions**: `floor`, `ceil` and `round`
+still bottom out in `OP-JSBUILTIN` through `%FloorNum`, where these are the whole operation in the
+DSL. Covered by `math-sign-trunc.ts`, falsified twice.
 
-**C. Blocked on a new frontend intrinsic — 4 operations.** `Number.isNaN`, `isFinite`, `isInteger`,
-`isSafeInteger`. Needs `FE-INTRINSIC-NUMBER` in `src/frontend_native.coil:29`.
+**C. Blocked on a new frontend intrinsic — 4 operations. ALL FOUR ARE NOW REACHED**, plus
+`Number(x)` itself, which was never a conversion because nothing could name it either.
+`FE-INTRINSIC-NUMBER` exists in `src/frontend_native.coil` and `Number(x)` emits the same
+`ToNumberValue` the arithmetic seam does. Covered by `number-statics.ts`, falsified three ways.
+
+**The predicates are unboxed at the seam and that is load-bearing.** The four `builtin`s end in
+`%Box`, so they answer a TAGGED boolean, and a tagged boolean used as a condition goes through the
+`JSSOP-VALUE-TRUTHY` runtime call while the global `isNaN` next to it compares a raw machine word.
+`fng-number-static` unboxes to `t-bool` so every predicate in the language has one representation.
 
 **D. Written to spec and deliberately bypassed — 1.** `String.prototype.indexOf`, the full entry
 with `RequireObjectCoercible` and ToString. The frontend calls the coerced core `StringIndexOfFrom`
@@ -352,6 +361,19 @@ All three are LOUD (a trap or a refused compile), and all three reproduce at `f3
   through an integer ABI and the coercion makes the expression floating-point; every program in the
   corpus ends in `| 0`, which is why it has never shown up. It is a harness convention as much as a
   defect, but a program that returns a non-integral expression is not compiled correctly today.
+- **The global `isNaN` on a dynamic array element does not compile.**
+
+      let v: any[] = ["12x"];
+      return (isNaN(v[0]) ? 2 : 0) | 0;      // select=1 machine=4, MSEL-TERMINATOR
+
+  `%IsNaN` is the coercing primitive and reaches the runtime, and a call in a ternary condition over
+  a dynamic element is the shape that fails. It is why `number-statics.ts` covers `Number.isNaN`
+  and not its coercing sibling, and it reproduces at `f3f5efe`.
+- **`a === a` answers TRUE when `a` is NaN.** `let a = Math.sign(NaN); a === a` is 1 natively and 0
+  in Node. `cmp-idealize` is not the culprit — it excludes floats by name for exactly this reason —
+  so it is the dynamic strict-equality path comparing the boxed words. `IsNaNValue` in
+  lib/abstract/conversions.jsl already documents the same fact from the library's side and routes
+  around it; nothing routes around it for user code.
 
 ### Two more the fuzzer found, both pre-existing, neither fixed
 
