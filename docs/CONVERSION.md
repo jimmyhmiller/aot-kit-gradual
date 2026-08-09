@@ -9,6 +9,14 @@ merely exists — several definitions existed for months while nothing could rea
 
 Status as of the commit that converts the array-mutation family. `tools/gate.sh` green at 533 tests.
 
+**READ THIS BEFORE READING THE TABLES.** They cover the operations the frontend can compile, which
+is NOT the same set as the operations `lib/` implements. 45 of the library's 88 declarations are
+unreachable from any program — including twelve more `String.prototype` methods that are written,
+spec-annotated and Node-verified, and that no TypeScript program can name. A row missing from a
+table below usually means *the frontend has never supported that syntax*, not that the library
+lacks a definition. The full inventory, with what unblocks each entry, is the reachability section
+of [../HANDOFF.md](../HANDOFF.md).
+
 ---
 
 ## String.prototype
@@ -25,6 +33,13 @@ Status as of the commit that converts the array-mutation family. `tools/gate.sh`
 | `toUpperCase` | **converted** | `StringToUpperCase` |
 | `split` | not converted | — |
 | `.length` | **converted** | `StringLength` |
+| `startsWith` `endsWith` `includes` `lastIndexOf` | **written, unreachable** | `StringStartsWith` `StringEndsWith` `StringIncludesFrom` `StringLastIndexOf` |
+| `padStart` `padEnd` `repeat` `replaceAll` | **written, unreachable** | `StringPadStart` `StringPadEnd` `StringRepeatCount` `StringReplaceAll` |
+| `trim` `trimStart` `trimEnd` `at` | **written, unreachable** | `StringTrim` `StringTrimStart` `StringTrimEnd` `StringAt` |
+
+The nine rows above the divider are the nine names `fng-string-builtin?` recognises. The twelve
+**written, unreachable** ones are complete definitions that no program can call: the frontend does
+not accept the method name, so the call never reaches a lowering at all.
 
 `split` allocates an array. `%NewArray` and `%ArrayStore` exist, so a definition is writable; the
 frontend's own split path also marks the allocation and publishes a dynamic alias, and that half has
@@ -41,8 +56,10 @@ no counterpart in the library yet. This is the largest genuinely-open item.
 | `pop` | **converted** | `ArrayPop` |
 | `shift` | **converted** | `ArrayShift` |
 | `slice` | **converted** | `ArraySlice` |
+| `at` | **written, unreachable** | `ArrayAt` |
+| `join` | **written, unreachable** | `ArrayJoin` |
 
-Every entry is a `macro`, and it has to be, for the reason `lib/array/read.jsl` states: memory
+Every converted entry is a `macro`, and it has to be, for the reason `lib/array/read.jsl` states: memory
 reaches a function as an `OP-ARG` and never as a parameter, so a called `builtin` synthesises its own
 empty entry heap and answers `-1` for an element that is there. A macro is expanded into the caller's
 graph and reads the caller's memory.
@@ -100,6 +117,8 @@ covered by `tests/native-conformance/deep-arithmetic.ts` and `unstable-array-sum
 | `round` | **converted** | `MathRound` |
 | `max` | **converted** | `MathMax2` |
 | `min` | **converted** | `MathMin2` |
+| `sign` | **written, unreachable** | `MathSign` |
+| `trunc` | **written, unreachable** | `MathTrunc` |
 | `sqrt`, `pow`, `exp`, `log` | **not convertible** | — |
 | `sin`, `cos`, `tan`, `asin`, `acos`, `atan` | **not convertible** | — |
 | `random` | **not convertible** | — |
@@ -167,10 +186,12 @@ result of a JSL Math definition, which returns a boxed integer for an integer in
 | Converted | 31 |
 | Blocked on design | 1 (`split`) |
 | Not convertible | 11 (libm + `random`) |
-| Not compilable by the frontend at all | 2 (`Number(x)`, `Number.*`) |
+| **Written, and unreachable** | **20** (14 method names, `Math.sign`/`trunc`, four `Number.*`) |
 
-**Every operation the frontend can compile, and that a DSL can express, is converted.** What remains
-is one allocation-path design question, libm, and two things the frontend has never supported.
+**Every operation the frontend can compile, and that a DSL can express, is converted.** That claim
+is narrower than it sounds, and the last row is why: twenty more operations are already written in
+`lib/` and cannot be reached, because the frontend does not accept the syntax that would call them.
+The remaining work is mostly not conversion — it is frontend surface.
 
 The honest shape of it: **nothing is blocked by the DSL's expressiveness, and nothing is blocked on a
 missing primitive any more.** The three things that ever genuinely blocked conversion — memory

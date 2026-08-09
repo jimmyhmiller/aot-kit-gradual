@@ -34,9 +34,16 @@
       (if (%Eq (%ArrayLoad a i) target) i (recur (%Sub i 1))))))
 
 ;; https://tc39.es/ecma262/#sec-array.prototype.at — a negative index counts from the end.
+;;
+;; `(%Box undefined)` RATHER THAN `undefined`, and the same in `StringAt`. A bare `undefined` in a
+;; JSL body is `Const : undef`, and selection materialises that as the machine word 0 — the payload
+;; without the tag, which is correct for a value the compiler knows is undefined and wrong the
+;; moment it merges with a tagged one. The other arm here is `%ArrayLoad`, which is boxed, so the
+;; Phi would be a tag on one path and a plain 0 on the other. `ArrayPop` sidesteps the same trap by
+;; being branch-free; an index that can miss cannot, so the constant is boxed to match.
 (macro ArrayAt :params [(a dyn) (i dyn)] :ret dyn
   (let [(k (RelativeIndex i (%ArrayLen a)))]
-    (if (%Lt k 0) undefined (%ArrayLoad a k))))
+    (if (%Lt k 0) (%Box undefined) (%ArrayLoad a k))))
 
 ;; https://tc39.es/ecma262/#sec-array.prototype.join.
 ;;
@@ -47,6 +54,11 @@
     (loop [(i 0) (out "")]
       (if (%Le len i) out
         (let [(v (%ArrayLoad a i))
-              (piece (if (%Eq v undefined) "" (if (%Eq v null) "" (%ToString v))))
+              ;; Boxed constants, for the reason `ArrayAt` above states: `v` is a tagged element and
+              ;; a bare `undefined` is the machine word 0, so the unboxed spelling compared a tag
+              ;; against a payload and never matched. `[1, undefined, null, 4].join(",")` came out
+              ;; as "1,undefined,null,4" — the exact case this definition exists to get right.
+              (piece (if (%Eq v (%Box undefined)) ""
+                       (if (%Eq v (%Box null)) "" (%ToString v))))
               (joined (if (%Eq i 0) piece (%StringConcat out (%StringConcat sep piece))))]
           (recur (%Add i 1) joined))))))

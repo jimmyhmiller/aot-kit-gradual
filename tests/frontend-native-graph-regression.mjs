@@ -14,10 +14,27 @@ const expectedDigests = Object.freeze({
   // ones GVN can now see and commutative operands take their canonical order. `basic` and `bitwise`
   // are byte-identical. Nothing grew, which is the evidence this is the peephole doing its ordinary
   // job on more of the graph rather than a change in what the frontend builds.
-  call: "f46afc5885233e3c75f73f47749ce1db71baf193594276d48cd4c873c51c13de",
+  // Repinned when the dynamic-to-number seam became ToNumber instead of a bare Unbox. Two changes,
+  // and the second is the one worth knowing about. `twice`'s `x * 2` reads a `number` PARAMETER,
+  // which is a tagged word like every other Parm, so `Unbox flt <- Parm` is now
+  // `Unbox flt <- ToNumber <- Parm`. That part is the point: an unbox asserts a tag and traps,
+  // where JavaScript specifies a conversion.
+  //
+  // The second: `twice` GREW A MEMORY EDGE. It now takes `Arg mem` and returns memory alongside its
+  // value, because `%ToNumber` lowers to a runtime helper and a string argument makes that a heap
+  // operation. Any function doing arithmetic on a dynamic operand threads the heap from here on.
+  // 30 nodes to 34.
+  call: "9937978e6ea2752c2be29613cc69164124e3b1c8115631b2e1f2d5a119b8f8b3",
   control: "4d77f131d42c349fbffb154f65918d20a4a0fb002418426b8cdbc832f955260d",
-  object: "625b7453c81af4af381888db86908c709bc485203898a2937e4d131bdecca0e9",
-  full: "d3a11144bc8b06a62fb3804d456a0a0b27b1056d20657a2f1f74dc2485d6669a",
+  // Repinned for the same ToNumber seam as `call`, and this one is the minimal form of it: exactly
+  // one node added — `Unbox flt <- Parm` becomes `Unbox flt <- ToNumber <- Parm` — and every later
+  // index shifted by one. 37 nodes to 38, no memory edge gained, because `Box` already threaded the
+  // heap through this fixture.
+  object: "8c19cc1ebeb4e58a6919b68cfbda7cb5b34a97228740eef91bb77592b110e680",
+  // Repinned for the ToNumber seam. Two dynamic operands in this fixture, so exactly two nodes
+  // added — 82 to 84 — plus the memory edges the functions containing them now thread, the same
+  // consequence spelled out on `call`.
+  full: "9a34d9481daa454b5c42d215cca1f33d2de2ced2b48b5daf3e27197cde29211a",
   bitwise: "189e78fe00839f184bb88f682c514f3a5d97b7972da062e8aa7262d3969e17a9",
 });
 

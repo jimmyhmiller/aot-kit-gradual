@@ -355,6 +355,48 @@
                (fng-bin OP-EQ value (n-box! (fng-undefined))))
       (fng-bin OP-EQ value (fng-null))))
 
+;; The dynamic-to-number seam, and the difference between an UNBOX and a COERCION.
+;;
+;; `Unbox : flt` asserts a representation: it strips a tag it has already been promised is there,
+;; and `MI-JSUNBOX` traps when it is not. That is the right node for a value the compiler knows is
+;; a number and the wrong one for an arbitrary JavaScript value, and the frontend used it for both.
+;; `let xs = [10, 20]; xs[5] + 1` reads a hole, correctly answers `undefined`, and then unboxed it
+;; as a number: `SIGTRAP` on a program Node runs to `NaN`. Nothing in the conformance corpus read a
+;; hole or a past-the-end index into arithmetic, which is why it survived — `arrays.ts` reads
+;; `sparse[0]` and `sparse[2]` and never `sparse[1]`.
+;;
+;; ToNumber is what JavaScript specifies here, and it already existed on both sides of the compiler:
+;; `ev-to-number-value` in eval.coil and `aot_js_to_number_double` in the runtime implement the same
+;; table (undefined is NaN, null is +0, a boolean is 0 or 1, a string parses). The graph was the only
+;; place that did not say so. `OP-TONUMBER` returns a BOXED number, so the unbox stays — but now its
+;; promise is one the producer keeps.
+;;
+;; It is emitted ONLY where the value is dynamic. A value the frontend already types as a number is
+;; unboxed directly, so nothing that was straight-line arithmetic acquires a coercion.
+;;
+;; IT COMES FROM `lib/`, THROUGH `ToNumberValue`, AND THAT IS NOT DECORATION. A bare `%ToNumber`
+;; is a runtime call on every operand, numbers included, and this is the hottest boundary the
+;; frontend has: unguarded it cost `call-loop` 9.6ms to 25.5ms and `math-loop` 73.3ms to 97.3ms.
+;; The library definition carries the spec's own steps 1 and 2 — an argument that is already a
+;; Number is returned as it is — so the call survives only for the strings and the objects.
+(defn fng-to-number-operand [(context FngContext) (value i64)] (-> i64)
+  (n-unbox! (fng-jsl-call1 context "ToNumberValue" value) (t-flt)))
+
+;; Does this operand still need ToNumber, or is it already an unboxed machine number?
+;;
+;; THE TEST IS EXACT TYPE IDENTITY WITH `dyn`, and it is deliberately not `ty-isa ... (t-num)`.
+;; This lattice puts ANY — "not analysed yet", the seed `n-new` gives every node — ABOVE every
+;; concrete type, so `ANY isa num` is true and reads exactly like a proof that the value is already
+;; a machine number. `ty-high?` cannot tell the two apart either, and ty.coil says so at length.
+;; Both were tried here: the first skipped the coercion on anything unanalysed, the second put one
+;; on the literal `1000` in `xs[0] * 1000` — a raw machine word ToNumber must never see.
+;;
+;; Extracted from the two callers below only so that the rule is stated once. `captured-cell` is a
+;; variable that lives in a heap cell because a closure writes it, which is a tagged word whatever
+;; the syntax says its type is.
+(defn fng-needs-to-number? [(value i64) (captured-cell bool)] (-> bool)
+  (or captured-cell (= (n-ty value) (t-dyn))))
+
 (defn fng-int-value [(context FngContext) (source i64) (value i64)] (-> i64)
   (let [frontend (load (field context frontend))
         ast (field frontend ast)
@@ -362,15 +404,15 @@
           (and (= (ts-kind ast source) TSK-IDENTIFIER)
                (let [symbol (fe-resolution-symbol frontend source)]
                  (and (>= symbol 0) (fng-symbol-cell? context symbol))))]
-  (if (or (= (n-ty value) (t-dyn)) captured-cell)
+  (if (fng-needs-to-number? value captured-cell)
       (if (or (= (n-op value) OP-CALL)
               (or (= (n-op value) OP-ADD)
                   (or (= (n-op value) OP-SUB)
                       (or (= (n-op value) OP-MUL)
                           (or (= (n-op value) OP-DIV) (= (n-op value) OP-MOD))))))
           value
-          (fng-bin OP-BITOR (n-unbox! value (t-flt)) (fng-const 0)))
-      (if (ty-isa (n-ty value) (t-num)) value value))))
+          (fng-bin OP-BITOR (fng-to-number-operand context value) (fng-const 0)))
+      value)))
 
 (defn fng-number-value [(context FngContext) (source i64) (value i64)] (-> i64)
   (let [frontend (load (field context frontend))
@@ -379,15 +421,15 @@
           (and (= (ts-kind ast source) TSK-IDENTIFIER)
                (let [symbol (fe-resolution-symbol frontend source)]
                  (and (>= symbol 0) (fng-symbol-cell? context symbol))))]
-  (if (or (= (n-ty value) (t-dyn)) captured-cell)
+  (if (fng-needs-to-number? value captured-cell)
       (if (or (= (n-op value) OP-CALL)
               (or (= (n-op value) OP-ADD)
                   (or (= (n-op value) OP-SUB)
                       (or (= (n-op value) OP-MUL)
                           (or (= (n-op value) OP-DIV) (= (n-op value) OP-MOD))))))
           value
-          (n-unbox! value (t-flt)))
-      (if (ty-isa (n-ty value) (t-num)) value value))))
+          (fng-to-number-operand context value))
+      value)))
 
 (defn fng-numeric-equality-peer? [(value i64)] (-> bool)
   (let [ty (n-ty value)]
@@ -1132,19 +1174,15 @@
                           (if (and (= kind TSK-CALL) (fng-string-from-char-code? context node))
                               FNG-STRING
                               (if (and (= kind TSK-CALL) (fng-string-builtin? context node))
-                                  (let [builtin (fng-string-builtin-name context node)]
-                                    (if (str-eq builtin "charCodeAt")
-                                        FNG-NUMBER
-                                        (if (str-eq builtin "indexOf")
-                                            FNG-NUMBER
-                                            (if (str-eq builtin "split") FNG-ARRAY FNG-STRING))))
+                                  (fng-string-builtin-result (fng-string-builtin-name context node))
                                   (if (and (= kind TSK-CALL) (fng-math-builtin? context node))
                                       FNG-NUMBER
                                   (if (and (= kind TSK-CALL) (fng-array-builtin? context node))
                                       (let [builtin (fng-array-builtin-name context node)]
-                                        (if (str-eq builtin "push")
-                                            FNG-NUMBER
-                                            (if (str-eq builtin "slice") FNG-ARRAY FNG-DYNAMIC)))
+                                        (cond (str-eq builtin "push") FNG-NUMBER
+                                              (str-eq builtin "slice") FNG-ARRAY
+                                              (str-eq builtin "join") FNG-STRING
+                                              :else FNG-DYNAMIC))
                                       (let [callee-node (ts-child ast node 0)
                                             callee
                                               (if (= (ts-kind ast callee-node) TSK-PROPERTY-ACCESS)
@@ -1476,6 +1514,9 @@
         (ts-text ast (ts-child ast callee 1))
         "")))
 
+;; `Array.prototype`'s recognised names, the counterpart of `fng-string-builtin-arity?`. `at` and
+;; `join` were written in lib/array/read.jsl and unreachable for the same reason the twelve string
+;; methods were: absent from this list, the call never reaches a lowering.
 (defn fng-array-builtin? [(context FngContext) (node i64)] (-> bool)
   (let [name (fng-array-builtin-name context node)]
     (or (str-eq name "push")
@@ -1483,7 +1524,37 @@
             (or (str-eq name "shift")
                 (or (str-eq name "slice")
                     (or (str-eq name "indexOf")
-                        (or (str-eq name "includes") (str-eq name "lastIndexOf")))))))))
+                        (or (str-eq name "includes")
+                            (or (str-eq name "lastIndexOf")
+                                (or (str-eq name "at") (str-eq name "join")))))))))))
+
+;; `Array.prototype.at` and `Array.prototype.join`, out of lib/array/read.jsl.
+;;
+;; Both are `macro`s and have to be, for the reason the whole array family is: they read the
+;; caller's heap through `%ArrayLoad`, and a called `builtin` receives memory as an `OP-ARG` rather
+;; than a parameter, so it would synthesise an empty entry heap and read nothing.
+;;
+;; `at` boxes its index because `RelativeIndex` runs `%ToInteger` on a tagged word. `join`'s
+;; separator defaults to "," — and its disagreement with `String(x)` is the definition's whole
+;; reason for existing: `undefined` and `null` join as the EMPTY string, not as "undefined".
+(defn fng-array-at [(context FngContext) (node i64)] (-> i64)
+  (let [frontend (load (field context frontend))
+        ast (field frontend ast)
+        callee (ts-child ast node 0)
+        array (fng-expression context (ts-child ast callee 0))
+        argc (- (ts-child-count ast node) 1)]
+    (fng-jsl-call2 context "ArrayAt" array
+                   (n-box! (if (> argc 0)
+                               (fng-expression context (ts-child ast node 1))
+                               (fng-const 0))))))
+
+(defn fng-array-join [(context FngContext) (node i64)] (-> i64)
+  (let [frontend (load (field context frontend))
+        ast (field frontend ast)
+        callee (ts-child ast node 0)
+        array (fng-expression context (ts-child ast callee 0))]
+    (fng-jsl-call2 context "ArrayJoin" array
+                   (fng-string-argument context node 1 ","))))
 
 ;; The read-only searches, straight out of lib/array/read.jsl.
 ;;
@@ -1668,6 +1739,63 @@
                 (store! index (+ (load index) 1)))))
     (load result)))
 
+;; Every `String.prototype` method the frontend accepts, with the argument counts each one supports.
+;;
+;; THIS LIST IS WHAT MAKES A DEFINITION REACHABLE, and for most of this project's history it was
+;; nine names long while `lib/string/` held twenty-one definitions. Twelve complete, spec-annotated,
+;; Node-verified definitions could not be called by any program, because a name absent here never
+;; reaches a lowering at all — `fng-expression` reports the receiver as an unsupported expression
+;; and the compile stops. Passing the JSL gates says nothing about that; only
+;; `tools/native-source-conformance.sh` does.
+;;
+;; THE ARITY IS PART OF THE ENTRY, not a detail. `lastIndexOf` takes a `fromIndex` in the language
+;; and `StringLastIndexOf` does not implement one, so the two-argument form is REFUSED here rather
+;; than compiled with the argument dropped: a silently ignored argument is a wrong answer, and a
+;; name this function rejects is a clear frontend diagnostic. Same for the three-argument `replaceAll`
+;; and for `at` with more than one.
+(defn fng-string-builtin-arity? [(name (slice u8)) (argc i64)] (-> bool)
+  (cond (str-eq name "charAt")      (<= argc 1)
+        (str-eq name "charCodeAt")  (<= argc 1)
+        (str-eq name "substring")   (<= argc 2)
+        (str-eq name "substr")      (<= argc 2)
+        (str-eq name "slice")       (<= argc 2)
+        (str-eq name "split")       (<= argc 1)
+        (str-eq name "indexOf")     (<= argc 2)
+        (str-eq name "toLowerCase") (= argc 0)
+        (str-eq name "toUpperCase") (= argc 0)
+        ;; Added with the reachability pass. Everything below already had a definition.
+        (str-eq name "startsWith")  (= argc 1)
+        (str-eq name "endsWith")    (= argc 1)
+        (str-eq name "includes")    (<= argc 2)
+        (str-eq name "lastIndexOf") (= argc 1)
+        (str-eq name "padStart")    (<= argc 2)
+        (str-eq name "padEnd")      (<= argc 2)
+        (str-eq name "repeat")      (= argc 1)
+        (str-eq name "replaceAll")  (= argc 2)
+        (str-eq name "trim")        (= argc 0)
+        (str-eq name "trimStart")   (= argc 0)
+        (str-eq name "trimEnd")     (= argc 0)
+        (str-eq name "at")          (= argc 1)
+        :else false))
+
+;; What each of those calls evaluates to, which is how the frontend types the expression around it.
+;;
+;; The three predicates are `FNG-DYNAMIC` rather than a boolean kind, and that is the definitions'
+;; doing rather than an approximation: `StringStartsWith` and its two neighbours end in `%Box`, so
+;; the value is a TAGGED boolean. `FNG-BOOLEAN` here means the raw machine word `GlobalIsNaN`
+;; returns, and claiming it for a tagged one would have the consumer read a tag as a truth value.
+;; `at` is dynamic for a different reason — out of range it is `undefined`, not a string.
+(defn fng-string-builtin-result [(name (slice u8))] (-> i64)
+  (cond (str-eq name "charCodeAt")  FNG-NUMBER
+        (str-eq name "indexOf")     FNG-NUMBER
+        (str-eq name "lastIndexOf") FNG-NUMBER
+        (str-eq name "split")       FNG-ARRAY
+        (str-eq name "startsWith")  FNG-DYNAMIC
+        (str-eq name "endsWith")    FNG-DYNAMIC
+        (str-eq name "includes")    FNG-DYNAMIC
+        (str-eq name "at")          FNG-DYNAMIC
+        :else FNG-STRING))
+
 (defn fng-string-builtin? [(context FngContext) (node i64)] (-> bool)
   (let [frontend (load (field context frontend))
         ast (field frontend ast)
@@ -1675,15 +1803,7 @@
         name (fng-string-builtin-name context node)]
     (and (= (ts-kind ast callee) TSK-PROPERTY-ACCESS)
          (and (= (fng-infer context (ts-child ast callee 0) FNG-DYNAMIC) FNG-STRING)
-              (or (str-eq name "charAt")
-                  (or (str-eq name "charCodeAt")
-                      (or (str-eq name "substring")
-                          (or (str-eq name "substr")
-                              (or (str-eq name "slice")
-                                  (or (str-eq name "split")
-                                      (or (str-eq name "indexOf")
-                                          (or (str-eq name "toLowerCase")
-                                              (str-eq name "toUpperCase")))))))))))))
+              (fng-string-builtin-arity? name (- (ts-child-count ast node) 1))))))
 
 ;; Emit a call to a JSL runtime-library definition.
 ;;
@@ -1751,6 +1871,19 @@
     (store! (index p 2) c)
     (fng-jsl-call context name (slice-new [i64] p 3))))
 
+;; A string-valued argument at `child`, or the constant a missing one coerces to.
+;;
+;; ToString of an ABSENT argument is the string "undefined", not the undefined value, and every
+;; search method here takes its needle through ToString. `"abc".indexOf()` is therefore
+;; `"abc".indexOf("undefined")` and answers -1 rather than trapping on a tag. The padding methods
+;; pass " " instead, which is their spec default rather than a coercion.
+(defn fng-string-argument [(context FngContext) (node i64) (child i64) (fallback (slice u8))] (-> i64)
+  (let [frontend (load (field context frontend))
+        ast (field frontend ast)]
+    (if (> (ts-child-count ast node) child)
+        (fng-expression context (ts-child ast node child))
+        (n-string-const! (jss-from-utf8! fallback)))))
+
 (defn fng-string-call [(context FngContext) (node i64)] (-> i64)
   (let [frontend (load (field context frontend))
         ast (field frontend ast)
@@ -1770,7 +1903,8 @@
                   (fng-expression context (ts-child ast node 1))
                   (if (str-eq name "split") (fng-undefined) (fng-const 0)))
               NO-NODE)]
-    (if (str-eq name "split")
+    (cond
+      (str-eq name "split")
         (let [incoming (fng-current-memory context JS-PROPERTY-ALIAS)
               allocation (n-new-obj0! (load (load (field context ctrl))) SHAPE-ROOT)
               result (n-array-mark! (n-obj-ptr allocation))
@@ -1778,46 +1912,79 @@
           (fng-record-dynamic-alias! context JS-PROPERTY-ALIAS)
           (store! (load (field context memory)) (fng-preserve-active-memory context split))
           result)
-        (if (str-eq name "toLowerCase")
-            (fng-jsl-call1 context "StringToLowerCase" string)
-            (if (str-eq name "toUpperCase")
-                (fng-jsl-call1 context "StringToUpperCase" string)
-                (if (str-eq name "indexOf")
-                    ;; Steps 5-7 of String.prototype.indexOf, from lib/string/index-of.jsl rather
-                    ;; than a hand-written IR node. The receiver is known to be a string here (the
-                    ;; `fng-string-builtin?` guard proves it), so ToString on it is the identity and
-                    ;; the coerced core is the right entry point; the missing-argument case keeps
-                    ;; the frontend's existing `"undefined"` string, which is what ToString of an
-                    ;; absent argument produces.
-                    (let [buf (stack (array i64 3))
-                          p (cast (ptr i64) buf)]
-                      (store! (index p 0) string)
-                      (store! (index p 1)
-                              (if (> argc 0)
-                                  (fng-expression context (ts-child ast node 1))
-                                  (n-string-const! (jss-from-utf8! "undefined"))))
-                      (store! (index p 2)
-                              (if (> argc 1)
-                                  (fng-expression context (ts-child ast node 2))
-                                  (fng-const 0)))
-                      (fng-jsl-call context "StringIndexOfFrom" (slice-new [i64] p 3)))
-                    ;; Every remaining extractor comes from lib/string/, which does its own bounds
-                    ;; and negative-index handling — the work the C runtime used to do behind these
-                    ;; IR nodes. The three are separate definitions rather than one clamped helper
-                    ;; because they genuinely differ: substr's second argument is a COUNT, and
-                    ;; substring SWAPS out-of-order arguments where slice yields the empty string.
-                    (if (str-eq name "charCodeAt")
-                        (fng-jsl-call2 context "StringCharCodeAt" string start)
-                        (if (str-eq name "charAt")
-                            (fng-jsl-call2 context "StringCharAt" string start)
-                            (let [end
-                                    (if (> argc 1)
-                                        (fng-expression context (ts-child ast node 2))
-                                        (fng-jsl-call1 context "StringLength" string))
-                                  jsl-name (if (str-eq name "substring") "StringSubstring"
-                                             (if (str-eq name "substr") "StringSubstr"
-                                               "StringSlice"))]
-                              (fng-jsl-call3 context jsl-name string start end))))))))))
+      (str-eq name "toLowerCase") (fng-jsl-call1 context "StringToLowerCase" string)
+      (str-eq name "toUpperCase") (fng-jsl-call1 context "StringToUpperCase" string)
+      (str-eq name "trim")        (fng-jsl-call1 context "StringTrim" string)
+      (str-eq name "trimStart")   (fng-jsl-call1 context "StringTrimStart" string)
+      (str-eq name "trimEnd")     (fng-jsl-call1 context "StringTrimEnd" string)
+      (str-eq name "indexOf")
+        ;; Steps 5-7 of String.prototype.indexOf, from lib/string/index-of.jsl rather than a
+        ;; hand-written IR node. The receiver is known to be a string here (the
+        ;; `fng-string-builtin?` guard proves it), so ToString on it is the identity and the
+        ;; coerced core is the right entry point; the missing-argument case keeps the frontend's
+        ;; existing `"undefined"` string, which is what ToString of an absent argument produces.
+        (fng-jsl-call3 context "StringIndexOfFrom" string
+                       (fng-string-argument context node 1 "undefined")
+                       (if (> argc 1) (fng-expression context (ts-child ast node 2)) (fng-const 0)))
+      ;; The three search predicates. Each is `StringIndexOfFrom` plus a comparison in the library,
+      ;; which is why none of them needed a primitive: `startsWith` is "first occurrence is 0",
+      ;; `endsWith` is "occurrence at len-len is exactly there" with the guard that makes an
+      ;; over-long needle answer false, and `includes` is "not -1". All three return a BOXED
+      ;; boolean, so the result is `FNG-DYNAMIC` and reaches truthiness the ordinary way.
+      (str-eq name "startsWith")
+        (fng-jsl-call2 context "StringStartsWith" string
+                       (fng-string-argument context node 1 "undefined"))
+      (str-eq name "endsWith")
+        (fng-jsl-call2 context "StringEndsWith" string
+                       (fng-string-argument context node 1 "undefined"))
+      (str-eq name "includes")
+        (fng-jsl-call3 context "StringIncludesFrom" string
+                       (fng-string-argument context node 1 "undefined")
+                       (if (> argc 1) (fng-expression context (ts-child ast node 2)) (fng-const 0)))
+      ;; `StringLastIndexOf` scans FORWARD keeping the last hit, because the primitive only searches
+      ;; forward. `fng-string-builtin-arity?` refuses the two-argument form rather than dropping the
+      ;; `fromIndex` the definition has no way to honour.
+      (str-eq name "lastIndexOf")
+        (fng-jsl-call2 context "StringLastIndexOf" string
+                       (fng-string-argument context node 1 "undefined"))
+      ;; The padding pair. The filler defaults to a single space, which is the spec's default and
+      ;; the reason the second argument is optional at all.
+      (str-eq name "padStart")
+        (fng-jsl-call3 context "StringPadStart" string
+                       (if (> argc 0) (fng-expression context (ts-child ast node 1)) (fng-const 0))
+                       (fng-string-argument context node 2 " "))
+      (str-eq name "padEnd")
+        (fng-jsl-call3 context "StringPadEnd" string
+                       (if (> argc 0) (fng-expression context (ts-child ast node 1)) (fng-const 0))
+                       (fng-string-argument context node 2 " "))
+      (str-eq name "repeat")
+        (fng-jsl-call2 context "StringRepeatCount" string
+                       (fng-expression context (ts-child ast node 1)))
+      (str-eq name "replaceAll")
+        (fng-jsl-call3 context "StringReplaceAll" string
+                       (fng-string-argument context node 1 "undefined")
+                       (fng-string-argument context node 2 "undefined"))
+      ;; `at` takes its index as a `dyn`, unlike `charAt`: `RelativeIndex` runs `%ToInteger` on it,
+      ;; which reads a TAGGED word. Boxing here is what the seam requires, and passing the raw
+      ;; machine integer `charAt` passes would hand `%ToInteger` a bit pattern nothing tagged.
+      (str-eq name "at")
+        (fng-jsl-call2 context "StringAt" string
+                       (n-box! (fng-expression context (ts-child ast node 1))))
+      (str-eq name "charCodeAt") (fng-jsl-call2 context "StringCharCodeAt" string start)
+      (str-eq name "charAt")     (fng-jsl-call2 context "StringCharAt" string start)
+      ;; Every remaining extractor comes from lib/string/, which does its own bounds and
+      ;; negative-index handling — the work the C runtime used to do behind these IR nodes. The
+      ;; three are separate definitions rather than one clamped helper because they genuinely
+      ;; differ: substr's second argument is a COUNT, and substring SWAPS out-of-order arguments
+      ;; where slice yields the empty string.
+      :else
+        (let [end (if (> argc 1)
+                      (fng-expression context (ts-child ast node 2))
+                      (fng-jsl-call1 context "StringLength" string))
+              jsl-name (cond (str-eq name "substring") "StringSubstring"
+                             (str-eq name "substr") "StringSubstr"
+                             :else "StringSlice")]
+          (fng-jsl-call3 context jsl-name string start end)))))
 
 ;; `Array.prototype.push`, out of `ArrayPush1` in lib/array/build.jsl.
 ;;
@@ -1931,6 +2098,8 @@
           (str-eq name "indexOf") (fng-array-search context node name)
           (str-eq name "includes") (fng-array-search context node name)
           (str-eq name "lastIndexOf") (fng-array-search context node name)
+          (str-eq name "at") (fng-array-at context node)
+          (str-eq name "join") (fng-array-join context node)
           :else (fng-array-slice context node))))
 
 (defn fng-owner-constructor [(frontend (ptr NativeFrontend)) (owner i64)] (-> i64)
