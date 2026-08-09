@@ -572,6 +572,33 @@
 (defn jsl-decl-label [(i i64)] (-> (slice u8)) (load (field (jsl-decl-p i) label)))
 (defn jsl-macro? [(i i64)] (-> bool) (= (jsl-decl-kind i) JSL-KIND-MACRO))
 (defn jsl-labelled? [(i i64)] (-> bool) (> (slice-len (jsl-decl-label i)) 0))
+;; THE CLOSED-WORLD FUNCTION INDEX, WHICH IS NOT THE DECLARATION INDEX.
+;;
+;; A function index is a BIT in `Val.fidxs`, a 64-bit set, and the backend reads it as one:
+;; `be-call-return-kind-fuel` matches a call's target mask against `(<< 1 (n-aux fun))` and skips
+;; any function whose index is 63 or above. So the index is a scarce resource with a hard ceiling,
+;; and spending one on a declaration that is never a function spends it for nothing.
+;;
+;; This used to be the declaration index, which meant every `macro` — 55 of the 88 entries, and none
+;; of which has an `OP-FUN` at all — consumed a bit. The library crossed 63 declarations and
+;; `StringIndexOfFrom` landed at index 66. Its bit fell outside the mask, so `be-call-return-kind`
+;; could not identify the callee of a call to it, `be-js-tag-for-value` answered -1 for the boxed
+;; result, and `String.prototype.indexOf` failed selection with `MSEL-UNSUPPORTED` — a definition
+;; that neither used nor called the array entries that had just been added. Counting only the
+;; builtins takes the same declaration from 66 to 29 and makes the index independent of how many
+;; macros the library has.
+;;
+;; It is still DERIVED FROM DECLARATION ORDER rather than allocated on demand, because two paths
+;; open a Fun — `jl-open-all!` for the whole library and `jl-require-decl!` on demand — and they
+;; must agree on the index for the same definition whichever ran.
+(defn jsl-decl-fidx [(i i64)] (-> i64)
+  (let [(mut k) 0 (mut n) 0]
+    (loop (if (>= (load k) i) (break)
+            (do (if (jsl-macro? (load k)) 0 (store! n (+ (load n) 1)))
+                (store! k (+ (load k) 1))
+                0)))
+    (load n)))
+
 (defn jsl-decl-nparams [(i i64)] (-> i64) (load (field (jsl-decl-p i) nparams)))
 (defn jsl-decl-transitioning? [(i i64)] (-> bool) (load (field (jsl-decl-p i) transitioning)))
 (defn jsl-decl-cold? [(i i64)] (-> bool) (load (field (jsl-decl-p i) cold)))
