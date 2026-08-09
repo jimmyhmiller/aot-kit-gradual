@@ -378,9 +378,15 @@
 ;; every id's debug form back through the parser therefore says exactly how much work the exact
 ;; printer is doing.
 ;;
-;; Two named witnesses follow the count, because a count alone does not say what kind of defect is
-;; being avoided. Both are cases where the debug form PARSES CLEANLY into the WRONG TYPE, which is
+;; A named witness follows the count, because a count alone does not say what kind of defect is
+;; being avoided. It is a case where the debug form PARSES CLEANLY into the WRONG TYPE, which is
 ;; worse than failing: a format that fails is a bug report, and a format that lies is a miscompile.
+;;
+;; There were two. The first was not ours: `fmt`'s `{d}` rendered INT64_MIN as "-0", so the debug
+;; form of the full function bitset decoded to the EMPTY one. Coil's formatter now writes every
+;; digit and that form round-trips, so what is checked below is that it does — a witness whose
+;; defect has been fixed elsewhere is pinned as fixed rather than deleted, because the assertion
+;; is what would notice the day `{d}` loses a digit again.
 (deftest the_debug_form_is_measurably_not_a_decodable_format
   (let [w (stdout)]
     (intern-the-samples!)
@@ -414,24 +420,25 @@
       (assert (>= (load miss) DEBUG-LOSSY-FLOOR))
       (assert (> (load wrong) 0)))
 
-    ; WITNESS ONE: `fmt`'s `{d}` renders INT64_MIN as "-0". `t-fun-con 63` is the bitset
-    ; INT64_MIN, the debug form writes `fun#-0`, and `-0` decodes to 0, which is the EMPTY
-    ; function set: a different type, reached without any error being reported.
+    ; THE CLOSED WITNESS: `t-fun-con 63` is the bitset INT64_MIN, and `fmt`'s `{d}` used to render
+    ; it as "-0", which decodes to 0 — the EMPTY function set, a different type reached without any
+    ; error being reported. `{d}` writes every digit now, so the debug form of this one is honest
+    ; and decodes back to itself. That is what is asserted: the day it does not, this fails again.
     (let [t (t-fun-con 63)
           ba (stack (array u8 256))]
       (let [d (dbg-render t (cast (ptr i8) ba) 256)
             back (ty-try-parse d)]
-        (ps w "  witness: the {d} trap, debug \"") (ps w d)
-        (fmt w "\" -> t{d}, not t{d}\n" back t)
-        (assert (str-eq d "fun#-0"))
-        (assert (!= back TY-NO-ID))          ; it parses, which is what makes it dangerous
-        (assert (!= back t))
-        (assert (= back (t-fun-set 0)))))
+        (ps w "  closed witness: the {d} trap, debug \"") (ps w d)
+        (fmt w "\" -> t{d}, and t{d}\n" back t)
+        (assert (str-eq d "fun#-9223372036854775808"))
+        (assert (!= back TY-NO-ID))
+        (assert (= back t))
+        (assert (!= back (t-fun-set 0)))))
     (expect-exact "the INT64_MIN bitset needs every digit" (t-fun-con 63)
                   "fun#-9223372036854775808")
     (expect-round-trip "the INT64_MIN bitset" (t-fun-con 63))
 
-    ; WITNESS TWO: the widening counter. A partly widened range and a fresh one differ ONLY in
+    ; THE LIVE WITNESS: the widening counter. A partly widened range and a fresh one differ ONLY in
     ; the counter, and the debug form omits it, so the debug string of `int=[0..10]` at fuel 1
     ; decodes to the same range at fuel 0: a real type, silently the wrong one. This is the whole
     ; reason the `w<n>` spelling exists, and it is the axis the corpus cannot exercise.
