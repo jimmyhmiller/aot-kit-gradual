@@ -1,6 +1,6 @@
 # Handoff: the JSL runtime library, and wiring it into the compiler
 
-34 commits, `2c0b5b0..HEAD`. `./tools/gate.sh` green at 533 tests, conformance at 27 programs.
+35 commits, `2c0b5b0..HEAD`. `./tools/gate.sh` green at 533 tests, conformance at 29 programs.
 
 This covers what was built, the design decisions worth knowing before changing anything, the defects
 it turned up, and what is left. Read `docs/JSL.md` for the language and `docs/CONVERSION.md` for the
@@ -16,19 +16,19 @@ JSL-specific node, op, or backend arm anywhere downstream, which is the entire p
 runs what comes out of it because it is the same graph, and `backend_select.coil` compiles it for
 the same reason.
 
-88 declarations across 25 files: 33 `builtin`, 55 `macro`. 70 of them are reachable from a compiled
-program; the 18 that are not are inventoried below, and none of them is a JavaScript operation.
+90 declarations across 26 files: 33 `builtin`, 57 `macro`. All but 18 are reachable from a compiled
+program; the 18 are inventoried below, and none of them is a JavaScript operation.
 
-**52 JavaScript operations now get their machine code from `lib/`** rather than from a hand-written
-IR node: every `String.prototype` method the frontend supports except `split`, all of the read and
-mutate `Array.prototype` methods including `at` and `join`, the whole one-argument Math family plus
+**53 JavaScript operations now get their machine code from `lib/`** rather than from a hand-written
+IR node: every `String.prototype` method the frontend supports, `split` included, all of the read
+and mutate `Array.prototype` methods including `at` and `join`, the whole one-argument Math family plus
 `max`/`min` and `sign`/`trunc`, the string operators (`length`, `===`, the four relational
 comparisons, `+`), the global coercions (`String(x)`, `parseInt`, `isNaN`, `String.fromCharCode`),
 `Number(x)` with its four predicates, and ToNumber at every dynamic arithmetic operand.
 
-It was 31 two commits ago, and **twenty of the twenty-one that were added needed no new definition**
-— they were already written, spec-annotated and verified against Node, and unreachable. Read the
-reachability section before assuming an operation is missing from the library.
+It was 31 three commits ago, and **twenty of the twenty-two that were added needed no new
+definition** — they were already written, spec-annotated and verified against Node, and unreachable.
+Read the reachability section before assuming an operation is missing from the library.
 
 ---
 
@@ -46,7 +46,7 @@ program compile through it". `tools/jsl-native-gate.sh` answers the first. Only
 
 ---
 
-## The reachability inventory — half the library is dead
+## The reachability inventory — half the library was dead
 
 Measured on 2026-08-09 at `f3f5efe`, as a transitive closure from the names `src/` actually passes
 to `fng-jsl-call*`: **88 declarations, 43 reachable, 45 unreachable.** No program could execute the
@@ -56,14 +56,15 @@ the nine method names `fng-string-builtin?` recognised.
 
 **Re-measured at `a446d89`: 51 roots, 70 reachable, 18 unreachable.** Twenty operations were
 reached without a single new definition being written. What is left is listed at the end of this
-section, and none of it is a JavaScript operation.
+section, and none of it is a JavaScript operation. `split` added two declarations after that
+measurement, both reachable.
 
 ### Reachable: 51 roots, 70 declarations
 
 The names `src/` emits, plus what their bodies pull in. The per-operation table is
 `docs/CONVERSION.md`.
 
-### Unreachable: 45, in six categories
+### Unreachable when measured: 45, in six categories. 18 remain, none an operation.
 
 **A. Blocked only by the frontend's method-name list — 14 operations. ALL FOURTEEN ARE NOW REACHED.**
 
@@ -359,11 +360,18 @@ would notice the day `{d}` loses a digit again.
 
 All three are LOUD (a trap or a refused compile), and all three reproduce at `f3f5efe`.
 
-- **`"ab".repeat(0)` fails verification with `VERR-ARITY`.** A literal zero count makes the
-  library's loop provably run zero times, the builder folds it mid-construction, and a Region and
-  its Phi are left disagreeing. A zero count in a VARIABLE is fine, which is what
-  `string-transforms.ts` uses instead. Same class as the `Box` type-test attempt described under
-  the performance gap below.
+- **A constant that folds a branch during construction leaves a Region and its Phi disagreeing —
+  `VERR-ARITY`.** `"ab".repeat(0)` is the small case: a literal zero count makes the library's loop
+  provably run zero times. A zero count in a VARIABLE is fine, which is what `string-transforms.ts`
+  uses. It also shaped `split`: passing the argument count in as an `int` parameter compiles for
+  every form but `"abc".split()`, where the literal 0 folds the mode arithmetic, which is why the
+  absent separator is a second definition rather than a flag. Same class as the `Box` type-test
+  attempt described under the performance gap below.
+- **A merge whose two arms BOTH wrote the heap leaves a memory Phi with no computed type**, and
+  selection refuses it with `MSEL-UNSUPPORTED` on a `Phi` still carrying ANY. Every heap-touching
+  definition in `lib/` writes on only one arm of any branch it contains, which is why nothing had
+  exercised it; `StringSplit` is written as one loop with one unconditional store to stay inside
+  that. It is the next thing to fix if the library is to grow more allocating definitions.
 - **A property read inside a non-entry function traps in arithmetic.**
 
       type T = { value: number };
@@ -411,12 +419,12 @@ written down instead. Both reproduce unchanged at `e29d712`.
 
 ### Remaining conversions
 
-**One definition is left to write, and there is no longer a written definition a program cannot
-reach.** The twenty that were unreachable — categories A, B and C above — are all emitted now.
+**Nothing is left to convert.** The twenty that were unreachable — categories A, B and C above —
+are all emitted, and `split` is written and converted, which was the last hand-written IR node in
+the frontend with JavaScript semantics in it. What made `split` look blocked was the allocation, and
+the library has had that since `ArraySlice`: `%NewArray` lowers through `n-array-mark!` on a real
+control anchor, and `fng-jsl-call` publishes the dynamic alias before the body is built.
 
-- **`split`** — the one genuine remaining conversion. It allocates an array, and the frontend's path
-  also marks the allocation and publishes a dynamic alias. `%NewArray`/`%ArrayStore` exist; the
-  second half has no library counterpart.
 - **libm** (`sqrt`, `pow`, trig, `random`) — not convertible, and should stay that way. `MathFloor`
   earns its place because the library adds the `if (%IsInt v)` guard around `%FloorNum`; `sqrt` would
   get no guard and no rule, only a different spelling of the same call.

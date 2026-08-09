@@ -7,15 +7,16 @@ from `lib/` or from a hand-written IR node.
 the machine code the program executes was generated from `lib/`. It does not mean a definition
 merely exists — several definitions existed for months while nothing could reach them.
 
-Status as of the commit that reaches `Math.sign`, `Math.trunc` and the four `Number` predicates.
-`tools/gate.sh` green at 533 tests, native source conformance at 27 programs.
+Status as of the commit that converts `String.prototype.split`, which was the last hand-written IR
+node in the frontend with JavaScript semantics in it. `tools/gate.sh` green, native source
+conformance at 29 programs.
 
 **READ THIS BEFORE READING THE TABLES.** They cover the operations the frontend can compile, which
 is not automatically the same set as the operations `lib/` implements. It was not: 45 of the
 library's 88 declarations were unreachable from any program, including twelve `String.prototype`
 methods that were written, spec-annotated and Node-verified and that no TypeScript program could
-name. Twenty of those have since been reached. A row missing from a table below usually means *the
-frontend has never supported that syntax*, not that the library lacks a definition. The full
+name. All twenty have since been reached. A row missing from a table below means *the frontend has
+never supported that syntax*, not that the library lacks a definition. The full
 inventory is the reachability section of [../HANDOFF.md](../HANDOFF.md).
 
 ---
@@ -32,7 +33,7 @@ inventory is the reachability section of [../HANDOFF.md](../HANDOFF.md).
 | `substr` | **converted** | `StringSubstr` |
 | `toLowerCase` | **converted** | `StringToLowerCase` |
 | `toUpperCase` | **converted** | `StringToUpperCase` |
-| `split` | not converted | — |
+| `split` | **converted** | `StringSplit`, `StringSplitWhole` |
 | `.length` | **converted** | `StringLength` |
 | `startsWith` | **converted** | `StringStartsWith` |
 | `endsWith` | **converted** | `StringEndsWith` |
@@ -47,7 +48,7 @@ inventory is the reachability section of [../HANDOFF.md](../HANDOFF.md).
 | `trimEnd` | **converted** | `StringTrimEnd` |
 | `at` | **converted** | `StringAt` |
 
-The bottom twelve were written, spec-annotated and Node-verified for months while
+The last twelve rows were written, spec-annotated and Node-verified for months while
 `fng-string-builtin?` listed nine method names and none of these were among them, so no program
 could call any of them. They are covered by `string-methods.ts` and `string-transforms.ts`.
 
@@ -56,9 +57,24 @@ could call any of them. They are covered by `string-methods.ts` and `string-tran
 dropped, because `StringLastIndexOf` has no way to honour it and a silently ignored argument is a
 wrong answer.
 
-`split` allocates an array. `%NewArray` and `%ArrayStore` exist, so a definition is writable; the
-frontend's own split path also marks the allocation and publishes a dynamic alias, and that half has
-no counterpart in the library yet. This is the largest genuinely-open item.
+`split` was the largest open item and the last hand-written IR node in the frontend with JavaScript
+semantics in it. What made it look blocked was the allocation — the hand-written path built its own
+`New`, marked it an array and published a dynamic alias — and the library has had that since
+`ArraySlice`: `%NewArray` lowers through `n-array-mark!` on a real control anchor, and
+`fng-jsl-call` publishes the alias for any definition `jsl-name-uses-memory?` reports, before the
+body is built rather than after.
+
+**Two definitions, chosen by argument count.** `"abc".split()` is `["abc"]` and `"abc".split("")` is
+`["a","b","c"]`, and no separator VALUE distinguishes them — comparing against `undefined` would
+compare a raw string pointer against a tagged word. Passing the count in as an `int` parameter
+compiles for every case but that one, where the literal 0 folds the library's mode arithmetic during
+construction and leaves a Region and its Phi disagreeing.
+
+**One loop and one store, and that shape is forced.** Written the readable way — a branch per case,
+each arm allocating and writing — it does not compile: a merge whose two arms both wrote the heap
+leaves a memory Phi that never gets a computed type, and selection refuses it with
+`MSEL-UNSUPPORTED` on a `Phi` still carrying ANY. Every other heap-touching definition happens to
+write on only one arm of any branch it contains, so nothing had exercised it.
 
 ## Array.prototype
 
@@ -205,14 +221,13 @@ result of a JSL Math definition, which returns a boxed integer for an integer in
 
 | | count |
 |---|---|
-| Converted | 52 |
-| Blocked on design | 1 (`split`) |
+| Converted | 53 |
+| Blocked on design | 0 |
 | Not convertible | 11 (libm + `random`) |
 | Written, and unreachable | 0 |
 
 **Every operation the frontend can compile, and that a DSL can express, is converted, and there is
-no longer a written definition a program cannot reach.** What is left is one allocation-path design
-question (`split`) and libm.
+no longer a written definition a program cannot reach.** What is left is libm.
 
 The count moved from 31 to 52 without a single new definition being written. Twenty of the
 twenty-one were already in `lib/`; what they needed was a name in a recognizer, a dispatch arm and a

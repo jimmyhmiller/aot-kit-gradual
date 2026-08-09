@@ -1976,26 +1976,36 @@
         name (fng-string-builtin-name context node)
         argc (- (ts-child-count ast node) 1)
         needs-start
-          (or (str-eq name "split")
-              (or (str-eq name "charCodeAt")
-                  (or (str-eq name "charAt")
-                      (or (str-eq name "substring")
-                          (or (str-eq name "substr") (str-eq name "slice"))))))
+          (or (str-eq name "charCodeAt")
+              (or (str-eq name "charAt")
+                  (or (str-eq name "substring")
+                      (or (str-eq name "substr") (str-eq name "slice")))))
         start
           (if needs-start
               (if (> argc 0)
                   (fng-expression context (ts-child ast node 1))
-                  (if (str-eq name "split") (fng-undefined) (fng-const 0)))
+                  (fng-const 0))
               NO-NODE)]
     (cond
+      ;; `String.prototype.split`, out of lib/string/split.jsl — the last hand-written IR node with
+      ;; JavaScript semantics in it, and the one the conversion notes called the largest open item.
+      ;;
+      ;; What made it look blocked was the allocation: the hand-written path built its own `New`,
+      ;; marked it an array and published a dynamic alias, and the library had no counterpart. It
+      ;; has had one since `ArraySlice` — `%NewArray` lowers through `n-array-mark!` on a real
+      ;; control anchor, and `fng-jsl-call` publishes the alias for any definition
+      ;; `jsl-name-uses-memory?` reports, before the body is built rather than after.
+      ;;
+      ;; TWO DEFINITIONS, CHOSEN BY ARGUMENT COUNT. `"abc".split()` is `["abc"]` and `"abc".split("")`
+      ;; is `["a","b","c"]`, and no separator VALUE distinguishes them, so the choice has to be made
+      ;; where the syntax is. Passing the count in as an argument instead compiles for every case
+      ;; but that one, where the literal 0 folds the library's mode arithmetic during construction
+      ;; and leaves a Region and its Phi disagreeing.
       (str-eq name "split")
-        (let [incoming (fng-current-memory context JS-PROPERTY-ALIAS)
-              allocation (n-new-obj0! (load (load (field context ctrl))) SHAPE-ROOT)
-              result (n-array-mark! (n-obj-ptr allocation))
-              split (n-string-split! incoming string start result)]
-          (fng-record-dynamic-alias! context JS-PROPERTY-ALIAS)
-          (store! (load (field context memory)) (fng-preserve-active-memory context split))
-          result)
+        (if (> argc 0)
+            (fng-jsl-call2 context "StringSplit" string
+                           (fng-expression context (ts-child ast node 1)))
+            (fng-jsl-call1 context "StringSplitWhole" string))
       (str-eq name "toLowerCase") (fng-jsl-call1 context "StringToLowerCase" string)
       (str-eq name "toUpperCase") (fng-jsl-call1 context "StringToUpperCase" string)
       (str-eq name "trim")        (fng-jsl-call1 context "StringTrim" string)
