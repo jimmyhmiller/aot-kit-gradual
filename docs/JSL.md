@@ -250,14 +250,16 @@ throw carries the message string and the class is wrong. The throw happens, on t
 with the right message; only the class is missing. That is recorded here and asserted by the suite,
 rather than left as a silent approximation.
 
-**The library, as it ships.** 42 declarations — 13 macros, 29 builtins — across `lib/abstract`,
-`lib/math`, `lib/number` and `lib/string`, all verified against Node by `tools/jsl-gate.sh`:
+**The library, as it ships.** 88 declarations — 55 macros, 33 builtins — across `lib/abstract`,
+`lib/math`, `lib/number`, `lib/array` and `lib/string`, all verified against Node by
+`tools/jsl-gate.sh`:
 
 | Area | Entries |
 |---|---|
 | Abstract ops | `Clamp` `ToBoolean` `ToInt32` `ToUint32` `ToLength` `SameValueZero` `IsNaNValue` `RelativeIndex` `RequireObjectCoercible` `NaN` `Infinity` `NegInfinity` |
 | `Math` | `abs` `sign` `trunc` `floor` `ceil` `round` `max` `min` |
 | `Number` | `isNaN` `isFinite` `isInteger` `isSafeInteger` |
+| `Array.prototype` | `indexOf` `includes` `lastIndexOf` `at` `join` `push` `pop` `shift` `slice` |
 | `String.prototype` | `indexOf` `lastIndexOf` `startsWith` `endsWith` `includes` `repeat` `padStart` `padEnd` `charAt` `charCodeAt` `at` `slice` `trim` `trimStart` `trimEnd` `replaceAll` |
 
 Several of these need no primitive at all, which is the point of having a language rather than a
@@ -361,6 +363,7 @@ The layer is deliberately thin, and it is the whole porting surface:
 - strings — `%StringLen %StringEq %StringConcat %StringCharCode %StringIndexOf %StringCompare
   %StringFromCode %StringLower %StringUpper`
 - conversions — `%ToString %ToInteger %ParseInt %IsNaN %NumberToString`
+- heap — `%NewArray %ArrayLen %ArrayLoad %ArrayStore %ArrayResize`
 - control — `%Throw`
 
 `%ToInteger` is the one primitive so far added *for* JSL rather than inherited. It is
@@ -458,9 +461,10 @@ them worth generating:
 
 ## The heap
 
-`lib/array/` holds `indexOf`, `includes`, `lastIndexOf`, `at`, `join` (reads) and `ArrayIota`,
-`ArrayRepeat`, `ArrayMapDouble` (allocating). All are Node-verified: a probe definition builds the
-array with `ArrayIota` and reads it back inside one function, so nothing crosses a call.
+`lib/array/` holds `indexOf`, `includes`, `lastIndexOf`, `at`, `join` (reads) and `ArrayPush1`,
+`ArrayLength`, `ArrayPop`, `ArrayShift`, `ArraySlice`, `ArrayIota`, `ArrayRepeat`, `ArrayMapDouble`
+(allocating and mutating). All are Node-verified: a probe definition builds the array with
+`ArrayIota` and reads it back inside one function, so nothing crosses a call.
 
 **Memory is implicit.** `%ArrayLen`, `%ArrayLoad`, `%ArrayStore` and `%NewArray` take the heap from
 the lowering rather than from an operand, and a store's new memory becomes current automatically.
@@ -483,6 +487,20 @@ analysis follows a parameter used directly, passed to a call, or rebound by a `l
 through a call that *returns* it is not followed, which is why this is documented rather than
 presented as a proof.
 
+**`%ArrayResize` takes three operands, and the third is an ORDERING VALUE.** `pop` loads the last
+element and then shortens the array. Nothing in the memory chain says a read precedes a later write
+of the same memory, so the load floats past the write that destroys what it read and selection
+refuses the block with `MSEL-MEMORY-ORDER`. `OP-ARRAYRESIZE`'s fifth input exists for exactly this;
+JSL has to name it because JSL has no other way to say "after". It is the only primitive so far
+whose signature carries a scheduling fact rather than data.
+
+**Two spec branches became clamps, and both are smaller and more correct than the branch.**
+`[].pop()` is `undefined` with the length left at 0, and the spec says so with a step-3 guard.
+Clamping the index to `[0, len]` gets the same answer with no `If`: on an empty array the index is 0,
+a load past the end already reads `undefined`, and resizing to 0 changes nothing. The guard version
+was tried first and is a Phi over `Const undefined` and a boxed load — a shape the representation
+seam does not carry, so `popped * 10 + values[0]` answered one low. `shift` uses the same clamp.
+
 **Four bugs the heap work produced, each now pinned:**
 
 - **Memory must be established before the body, not on first use.** A heap first touched inside a
@@ -497,6 +515,40 @@ presented as a proof.
   collects it as dead code, leaving the phi wired to a killed node.
 - **A definition that touched the heap returns its final memory.** With nothing reading the last
   store, the kill cascade collects the entire chain and `g-verify` reports `VERR-LEAK`.
+
+### Three backend defects the mutating entries exposed
+
+None of these is a JSL bug, and all three were already in the tree: writing an array in a loop and
+then reading its length back is a shape nothing had ever compiled.
+
+- **A control-anchored heap operation was not held to its anchor.** `ms-gcm-place!` derives a block
+  from value inputs, and a store's result vreg usually has no consumer — so `latest = earliest` and
+  the store landed at its earliest block, which for a store reading a loop-header memory Phi is the
+  LOOP HEADER. It then ran once per header visit rather than once per body visit, and
+  `(%ArrayLen (ArrayIota 3))` answered **4** as machine code. Reads have the same problem in the
+  other direction: `ArrayShift` loads element 0 and its only consumers are after the loop, so GCM
+  sank the load past the moves and `shift` answered the SECOND element. `n-array-load-at!` and
+  `n-array-store-at!` take a control input precisely to say where the operation belongs, and
+  `ms-inst-anchor-block` now makes that a constraint in the placer and in its verifier alike.
+- **The memory anti-dependency vector described a schedule that no longer existed.** It is built at
+  the end of selection and its membership rule names block ids — which GCM then changes. A read GCM
+  hoisted into a dominating block became required by the verifier and absent from the vector, and
+  `ArrayShift` could not be compiled at all (`MSEL-MEMORY-ORDER`). It is rebuilt after placement.
+  This is the same mistake, in the same shape, as the `schedule-order` refresh below.
+- **The closed-world function index was the DECLARATION index.** A function index is a bit in
+  `Val.fidxs`, a 64-bit set, and `be-call-return-kind-fuel` skips any function at 63 or above. Macros
+  are 55 of the library's 88 declarations and have no `OP-FUN` at all, yet each consumed a bit.
+  Adding five array entries pushed `StringIndexOfFrom` to index 66; its bit fell outside the mask, so
+  the return kind of a call to it became unknown and boxing that result failed selection with
+  `MSEL-UNSUPPORTED` — reported against **`String.prototype.indexOf`**, which uses none of the new
+  definitions. `jsl-decl-fidx` counts only the builtins, which takes that declaration from 66 to 29.
+
+One defect found this way is **not** fixed and is recorded rather than papered over: a single
+arithmetic expression of about twenty terms mixing boxed array elements with unboxed lengths
+miscompiles, and the answer varies between runs of the same binary — a pointer reaches the
+arithmetic while every underlying runtime call is correct. It reproduces with none of these
+operations converted. `tests/native-conformance/array-mutation.ts` accumulates into a local instead,
+and says why.
 
 ---
 

@@ -7,7 +7,7 @@ from `lib/` or from a hand-written IR node.
 the machine code the program executes was generated from `lib/`. It does not mean a definition
 merely exists — several definitions existed for months while nothing could reach them.
 
-Status as of the commit that adds this file. `tools/gate.sh` green at 533 tests.
+Status as of the commit that converts the array-mutation family. `tools/gate.sh` green at 533 tests.
 
 ---
 
@@ -37,38 +37,53 @@ no counterpart in the library yet. This is the largest genuinely-open item.
 | `indexOf` | **converted** | `ArrayIndexOfFrom` |
 | `includes` | **converted** | `ArrayIncludes` |
 | `lastIndexOf` | **converted** | `ArrayLastIndexOf` |
-| `push` | not converted | — |
-| `pop` | not converted | — |
-| `shift` | not converted | — |
-| `slice` | not converted | — |
+| `push` | **converted** | `ArrayPush1`, `ArrayLength` |
+| `pop` | **converted** | `ArrayPop` |
+| `shift` | **converted** | `ArrayShift` |
+| `slice` | **converted** | `ArraySlice` |
 
-The three converted ones are the first heap-touching definitions the frontend emits, and they are
-`macro`s for the reason `lib/array/read.jsl` states: memory reaches a function as an `OP-ARG` and
-never as a parameter, so a called `builtin` synthesises its own empty entry heap and answers `-1`
-for an element that is there. A macro is expanded into the caller's graph and reads the caller's
-memory.
+Every entry is a `macro`, and it has to be, for the reason `lib/array/read.jsl` states: memory
+reaches a function as an `OP-ARG` and never as a parameter, so a called `builtin` synthesises its own
+empty entry heap and answers `-1` for an element that is there. A macro is expanded into the caller's
+graph and reads the caller's memory.
 
-The four unconverted ones all RESIZE. There is no `%ArrayResize` primitive, so they cannot be
-written today — this is the one place in this table where a new primitive is the blocker rather
-than wiring.
+The mutating four are covered by `tests/native-conformance/array-mutation.ts`, which exists because
+`arrays.ts` covers none of what they got wrong: it has no `shift` at all, no zero-argument `push()`,
+and no empty receiver. Each of the four was falsified — twelve injected defects, every one of which
+turns the conformance gate red.
 
-An attempt at it got far enough to be worth recording, and was reverted rather than left half-done:
+**Three of them are better than what they replace, not merely relocated.**
 
-- **`push` converts cleanly.** `ArrayPush1` appends one element and answers the new length; the
-  variadic part stays in the frontend as a loop, one call per argument. Conformance green, and
-  falsified two ways (wrong return length, wrong store index).
-- **`%ArrayResize` needs a THIRD operand, an ordering value.** `OP-ARRAYRESIZE`'s fifth input exists
-  for exactly this: `pop` reads the last element and then shortens the array, and nothing in the
-  memory chain forces the read to happen first, so the load floats past the write that destroys what
-  it read. Selection catches it as `MSEL-MEMORY-ORDER`. Mapping the primitive to
-  `n-array-resize-after-at!` and naming the loaded value fixed it.
-- **The frontend must record the dynamic alias BEFORE inlining, not after.** Every hand-written
-  array path does it in that order. Recording it afterwards leaves the loads and stores the body
-  already built outside the alias subsequently declared dynamic.
-- **Unresolved:** adding the mutating macros to `lib/array/build.jsl` turns `tools/jsl-native-gate.sh`
-  red with `MSEL-UNSUPPORTED`, on `String.prototype.indexOf` — a definition that touches no array and
-  calls none of the new macros. Removing the macros alone restores it. That is not understood, and
-  it is the actual blocker: the primitive and the definitions are the easy part.
+- `pop` and `shift` now handle the EMPTY array. The hand-written `pop` resized a length-0 array to
+  -1; the hand-written `shift` clamped the new length at 0 but still returned whatever the load of
+  index 0 found. Spec step 3 is a CLAMP here rather than a branch — on an empty array the index is 0,
+  a load past the end already reads `undefined`, and resizing to 0 changes nothing. Written the
+  spec's own way, as `(if (%Le len 0) undefined ...)`, it is a Phi over `Const undefined` and a boxed
+  load, and the representation seam does not carry that: `popped * 10 + values[0]` answered one low.
+- `slice`'s bounds are `Clamp`, the same two lines `StringSlice` uses, where the frontend had
+  `fng-slice-bound` — a third implementation of the negative-index rule that no test compared to the
+  other two.
+
+**Two costs, both stated rather than hidden.** `shift` moves the elements down in a LOOP where the
+hand-written path emitted one bulk `OP-ARRAYCOPY`; JSL has no bulk-copy primitive and adding a
+machine-surface op whose only caller is that line would be the wrong trade. And `push` keeps its
+argument loop in the frontend, because that loop is over the SYNTAX — a variadic JSL signature would
+have to be unrolled per call site anyway.
+
+**What it took beyond the definitions.** `%ArrayResize`, whose third operand is an ORDERING value
+rather than data, and three backend defects that had nothing to do with JSL and everything to do
+with a shape nothing had compiled before — a heap write inside a loop whose length is read
+afterwards. All three are written up in [JSL.md](JSL.md#three-backend-defects-the-mutating-entries-exposed):
+global code motion ignoring a control anchor, the memory anti-dependency vector describing a
+pre-placement schedule, and the closed-world function index being spent on macros. The last is the
+one that made this look impossible: it surfaced as `MSEL-UNSUPPORTED` on `String.prototype.indexOf`,
+a definition that uses none of the new entries.
+
+**One defect found on the way is NOT fixed.** A single arithmetic expression of about twenty terms
+mixing boxed array elements with unboxed lengths miscompiles, and the answer varies between runs of
+the same binary — a pointer reaches the arithmetic while every underlying array runtime call is
+correct. It reproduces with none of these operations converted, so it is older than this work.
+`array-mutation.ts` accumulates into a local rather than writing one sum, and says so.
 
 ## Math
 
@@ -144,17 +159,15 @@ result of a JSL Math definition, which returns a boxed integer for an integer in
 
 | | count |
 |---|---|
-| Converted | 27 |
-| Blocked on a primitive | 4 (array resize family) |
+| Converted | 31 |
 | Blocked on design | 1 (`split`) |
 | Not convertible | 11 (libm + `random`) |
 | Not compilable by the frontend at all | 2 (`Number(x)`, `Number.*`) |
 
-**Every operation the frontend can compile, and that a DSL can express, is converted.** The four
-remaining rows are a missing primitive, one allocation-path design question, libm, and two things
-the frontend has never supported.
+**Every operation the frontend can compile, and that a DSL can express, is converted.** What remains
+is one allocation-path design question, libm, and two things the frontend has never supported.
 
-The honest shape of it: **nothing is blocked by the DSL's expressiveness.** What remains is one
-missing primitive, one allocation-path design question, and two intrinsics the frontend
-does not recognise. The two things that ever genuinely blocked conversion — memory crossing the seam, and the cost
-of the abstraction — are both fixed, in `jsl-inline!` and in `g-fold-proven!` respectively.
+The honest shape of it: **nothing is blocked by the DSL's expressiveness, and nothing is blocked on a
+missing primitive any more.** The three things that ever genuinely blocked conversion — memory
+crossing the seam, the cost of the abstraction, and the absence of `%ArrayResize` — are fixed, in
+`jsl-inline!`, in `g-fold-proven!`, and in the primitive table respectively.
