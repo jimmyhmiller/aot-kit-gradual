@@ -2810,6 +2810,33 @@
                     (if (>= earliest 0) earliest -1)))]
         (ms-gcm-deeper-bound current dependency))))
 
+;; A WRITE MUST NOT FLOAT ABOVE THE CONTROL IT WAS ANCHORED TO. `n-array-store-at!` and its siblings
+;; take a real control input precisely to say which block the effect belongs to, and global code
+;; motion computes `earliest` from VALUE inputs alone — so an anchor deeper than every operand was
+;; simply discarded.
+;;
+;; What that cost: a store whose result vreg has no consumer gets `latest = earliest`, there being no
+;; use to bound it from below, so GCM placed it at its earliest block. For a store in a loop body
+;; whose operands are the loop-header Phis, that block is the LOOP HEADER, and the store then ran
+;; once per header visit rather than once per body visit — one time too many, on the trip that
+;; exits. `ArrayIota 3` built an array of length four, and every JSL definition that writes an array
+;; in a loop was wrong by one. Nothing caught it because no gate had ever read a JSL-built array's
+;; length back as machine code.
+;;
+;; Only the LINEAR MEMORY EFFECTS are held here. A read is ordered by its memory edges and may still
+;; be hoisted, which is where the loop-invariant motion this pass exists for actually pays.
+(defn ms-gcm-anchor-bound [(owner i64) (at i64) (bound i64)] (-> i64)
+  (let [n (load (field (be-inst at) node))]
+    (if (or (< bound 0) (or (< n 0) (not (ms-linear-memory-effect? n))))
+        bound
+        (let [ctrl (if (> (n-nins n) 0) (n-in n 0) NO-NODE)]
+          (if (< ctrl 0)
+              bound
+              (let [mapped (al-get (load (field (machine-unit) ctrl-block)) ctrl)]
+                (if (and (>= mapped 0) (= (mu-block-owner mapped) owner))
+                    (ms-selection-deeper-block bound mapped)
+                    bound)))))))
+
 (defn ms-gcm-refresh-earliest! [(at i64)] (-> bool)
   (let [m (be-inst at)
         owner (load (field m owner))
@@ -2836,6 +2863,7 @@
                                                   (ms-inst-arg at (load arg))))
                       (store! arg (+ (load arg) 1))))))
         0)
+    (store! bound (ms-gcm-anchor-bound owner at (load bound)))
     (if (< (load bound) 0)
         false
         (do (store! (field m earliest) (load bound)) true))))
@@ -2898,6 +2926,8 @@
                                                         (store! arg (+ (load arg) 1))
                                                         0))))
                                           0)
+                                      (store! bound
+                                              (ms-gcm-anchor-bound owner (load at) (load bound)))
                                       ; A definition may have been emitted later than this use. Leave
                                       ; the use unresolved for this round; the forward fixed point will
                                       ; revisit it after the definition acquires an earliest block.
