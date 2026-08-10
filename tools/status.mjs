@@ -110,6 +110,7 @@ const OTHER = [
   ["`typeof x`", "TypeOfValue"],
   ["`x ?? y`", "IsNullishValue"],
   ["`o?.p`", "IsNullishValue"],
+  ["`o?.[i]`", "IsNullishValue"],
 ];
 
 // Not supported by the frontend at all: the call or the syntax does not compile. Grouped by what
@@ -130,7 +131,7 @@ const UNSUPPORTED = {
   "Needs new syntax in the frontend": [
     "template literals", "destructuring", "spread and rest", "default parameters",
     "`for...of` / `for...in`", "`class`", "getters and setters", "computed property names",
-    "optional calls/elements", "`try`/`catch`/`finally`",
+    "optional calls", "`try`/`catch`/`finally`",
     "arrow functions", "`instanceof` / `in` / `delete`",
   ],
   "Needs a runtime this compiler does not have": [

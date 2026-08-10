@@ -3300,6 +3300,70 @@
                          (load (field value object))
                          (load (field value key))))))
 
+(defn fng-element-load-value [(context FngContext)
+                              (object-node i64)
+                              (object i64)
+                              (key-node i64)] (-> i64)
+  (let [frontend (load (field context frontend))
+        ast (field frontend ast)]
+    (if (and (= (fng-infer context object-node FNG-DYNAMIC) FNG-ARRAY)
+             (fng-static-nonindex-key? ast key-node))
+        (do (fng-record-dynamic-alias! context JS-PROPERTY-ALIAS)
+            (fng-jsl-call2 context "GetNamedProperty"
+                           object
+                           (fng-const (shape-name-intern! (fng-nonindex-key-text ast key-node)))))
+        (let [key (fng-expression context key-node)]
+          (fng-jsl-call2 context "GetElement"
+                         object
+                         (fng-int-value context key-node key))))))
+
+(defn fng-optional-element-load [(context FngContext) (node i64)] (-> i64)
+  (let [frontend (load (field context frontend))
+        ast (field frontend ast)
+        object-node (ts-role ast node TS-ROLE-OBJECT 0)
+        key-node (ts-role ast node TS-ROLE-ELEMENT 0)
+        object (fng-expression context object-node)
+        condition (fng-jsl-call1 context "IsNullishValue" (n-box! object))
+        saved-ctrl (load (load (field context ctrl)))
+        (mut symbols) (al-new [i64] (malloc-allocator))
+        (mut active) (al-new [i64] (malloc-allocator))
+        (mut snapshots) (al-new [i64] (malloc-allocator))
+        (mut answer) NO-NODE]
+    ;; A computed key is part of the present arm. Its assignments and heap effects must not leak
+    ;; from the nullish arm, and must be merged when it does execute.
+    (fng-assigned! frontend key-node (mut symbols))
+    (fng-record-dynamic-alias! context JS-PROPERTY-ALIAS)
+    (fng-active-memory! context (mut active))
+    (fng-control-aliases! context (mut active))
+    (let [saved-start (fng-snapshot! context (mut symbols) (mut active) (mut snapshots))
+          arms (n-if-arms! (fng-peep (n-new2 OP-IF 0 saved-ctrl condition)))]
+      (store! (load (field context ctrl)) (arms-t arms))
+      (let [nullish-value (n-box! (fng-undefined))
+            nullish-ctrl (load (load (field context ctrl)))
+            nullish-start (fng-snapshot! context (mut symbols) (mut active) (mut snapshots))]
+        (fng-restore-snapshot! context (mut symbols) (mut active) (mut snapshots) saved-start)
+        (store! (load (field context ctrl)) (arms-f arms))
+        (let [present-value (n-box! (fng-element-load-value context object-node object key-node))
+              present-ctrl (load (load (field context ctrl)))
+              present-start (fng-snapshot! context (mut symbols) (mut active) (mut snapshots))]
+          (if (fng-merge-snapshots! context
+                                    nullish-ctrl nullish-start
+                                    present-ctrl present-start
+                                    (mut symbols) (mut active) (mut snapshots))
+              (cond (= nullish-ctrl NO-NODE) (store! answer present-value)
+                    (= present-ctrl NO-NODE) (store! answer nullish-value)
+                    :else
+                      (let [phi (n-new OP-PHI (t-dyn))]
+                        (n-add-def! phi (load (load (field context ctrl))))
+                        (n-add-def! phi nullish-value)
+                        (n-add-def! phi present-value)
+                        (store! answer (fng-peep phi))))
+              0))))
+    (al-free! [i64] (mut symbols))
+    (al-free! [i64] (mut active))
+    (al-free! [i64] (mut snapshots))
+    (load answer)))
+
 (defn fng-lvalue-write [(context FngContext) (target FngLValue) (new-value i64)] (-> i64)
   (if (= (load (field target kind)) FNG-LVALUE-LOCAL)
       (do (fng-set-symbol! context (load (field target symbol)) new-value) new-value)
@@ -3752,7 +3816,10 @@
                   (if (str-eq (ts-text ast node) "Math.LN2")
                       (n-new1 OP-CONST (t-flt-con 0.6931471805599453) (g-start))
                       (fng-field-load context node))))))
-          (= kind TSK-ELEMENT-ACCESS) (fng-lvalue-read context (fng-lvalue context node))
+          (= kind TSK-ELEMENT-ACCESS)
+            (if (!= (ts-role ast node TS-ROLE-OPERATOR 0) -1)
+                (fng-optional-element-load context node)
+                (fng-lvalue-read context (fng-lvalue context node)))
           :else NO-NODE)))
 
 (defn fng-ensure-memory! [(context FngContext)] (-> i64)
