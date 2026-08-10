@@ -52,7 +52,8 @@ const intrinsics = quoted(between(frontend, "(defn fe-intrinsic-name", ":else -1
 // `jsl` names the definition the frontend emits. `null` means the frontend still builds the IR
 // itself, with the reason. Anything recognised and missing from here fails the run.
 const STRING = {
-  charAt: "StringCharAt", charCodeAt: "StringCharCodeAt", indexOf: "StringIndexOfFrom",
+  charAt: "StringCharAt", charCodeAt: "StringCharCodeAt", codePointAt: "StringCodePointAt",
+  indexOf: "StringIndexOfFrom",
   slice: "StringSlice", substring: "StringSubstring", substr: "StringSubstr",
   toLowerCase: "StringToLowerCase", toUpperCase: "StringToUpperCase",
   split: "StringSplit", startsWith: "StringStartsWith", endsWith: "StringEndsWith",
@@ -101,6 +102,8 @@ const OTHER = [
   ["`Array.of(...)`", "ArrayOfAppend1"],
   ["`Array.isArray(x)`", "IsArray"],
   ["`Array.from(iterable)`", "ArrayFrom"],
+  ["`Infinity`", "Infinity"],
+  ["`Number.MAX_SAFE_INTEGER`", "MaxSafeInteger"],
 ];
 
 // Not supported by the frontend at all: the call or the syntax does not compile. Grouped by what
@@ -115,8 +118,7 @@ const UNSUPPORTED = {
   ],
   "Needs a frontend intrinsic, like the one `Number` just got": [
     "`Object.keys`/`values`/`entries`", "`Object.assign`", "`Object.freeze`",
-    "`JSON.parse`/`stringify`", "`Number.parseFloat`", "`parseFloat`", "`Number.MAX_SAFE_INTEGER`",
-    "`Infinity` as an identifier", "`String.prototype.codePointAt`", "`String.prototype.normalize`",
+    "`JSON.parse`/`stringify`", "`Number.parseFloat`", "`parseFloat`", "`String.prototype.normalize`",
     "`String.prototype.localeCompare`", "`String.raw`",
   ],
   "Needs new syntax in the frontend": [

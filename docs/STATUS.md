@@ -16,6 +16,7 @@ read out of the frontend's own tables, and every definition named here is checke
 | `at` | **done** | StringAt |
 | `charAt` | **done** | StringCharAt |
 | `charCodeAt` | **done** | StringCharCodeAt |
+| `codePointAt` | **done** | StringCodePointAt |
 | `endsWith` | **done** | StringEndsWith |
 | `includes` | **done** | StringIncludesFrom |
 | `indexOf` | **done** | StringIndexOfFrom |
@@ -118,6 +119,8 @@ spelling of the same call. **These are not a backlog.**
 | `Array.of(...)` | **done** | ArrayOfAppend1 |
 | `Array.isArray(x)` | **done** | IsArray |
 | `Array.from(iterable)` | **done** | ArrayFrom |
+| `Infinity` | **done** | Infinity |
+| `Number.MAX_SAFE_INTEGER` | **done** | MaxSafeInteger |
 
 ## Language surface that compiles
 
@@ -151,9 +154,6 @@ string literals and concatenation; `throw`; type aliases, interfaces and union a
 - `JSON.parse`/`stringify`
 - `Number.parseFloat`
 - `parseFloat`
-- `Number.MAX_SAFE_INTEGER`
-- `Infinity` as an identifier
-- `String.prototype.codePointAt`
 - `String.prototype.normalize`
 - `String.prototype.localeCompare`
 - `String.raw`

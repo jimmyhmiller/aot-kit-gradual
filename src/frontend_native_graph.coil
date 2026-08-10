@@ -1095,6 +1095,7 @@
         (= symbol FE-INTRINSIC-ISNAN) FNG-INTRINSIC-ISNAN
         (= symbol FE-INTRINSIC-UNDEFINED) FNG-VOID
         (= symbol FE-INTRINSIC-NAN) FNG-NUMBER
+        (= symbol FE-INTRINSIC-INFINITY) FNG-NUMBER
         (= symbol FE-INTRINSIC-ERROR) FNG-INTRINSIC-ERROR
         (= symbol FE-INTRINSIC-ARRAY) FNG-INTRINSIC-ARRAY
         (= symbol FE-INTRINSIC-OBJECT) FNG-INTRINSIC-OBJECT
@@ -1262,6 +1263,8 @@
                                       (fng-call-result-type
                                         frontend callee (= kind TSK-NEW-EXPRESSION))))))))))))))))))
               (= kind TSK-PROPERTY-ACCESS)
+                (if (fng-number-max-safe? context node)
+                    FNG-NUMBER
                 (let [owner (fng-infer context (ts-child ast node 0) FNG-DYNAMIC)
                       name-node (ts-child ast node 1)
                       field-index
@@ -1274,7 +1277,7 @@
                           FNG-ARRAY
                           FNG-DYNAMIC)
                       (let [field-value (al-get [FeField] (load (field frontend fields)) field-index)]
-                        (fng-type-tag frontend (load (field field-value type-node))))))
+                        (fng-type-tag frontend (load (field field-value type-node)))))))
               (= kind TSK-PREFIX-UNARY)
                 (let [text (ts-text ast node)]
                   (if (and (> (slice-len text) 0) (str-eq (substr text 0 1) "!"))
@@ -1827,6 +1830,12 @@
 (defn fng-number-static? [(context FngContext) (node i64)] (-> bool)
   (> (str-len (fng-number-static-name context node)) 0))
 
+(defn fng-number-max-safe? [(context FngContext) (node i64)] (-> bool)
+  (let [frontend (load (field context frontend)) ast (field frontend ast)]
+    (and (= (ts-kind ast node) TSK-PROPERTY-ACCESS)
+         (and (= (fe-resolution-symbol frontend (ts-child ast node 0)) FE-INTRINSIC-NUMBER)
+              (str-eq (ts-text ast (ts-child ast node 1)) "MAX_SAFE_INTEGER")))))
+
 (defn fng-number-static [(context FngContext) (node i64)] (-> i64)
   (let [frontend (load (field context frontend))
         ast (field frontend ast)
@@ -1969,6 +1978,7 @@
 (defn fng-string-builtin-arity? [(name (slice u8)) (argc i64)] (-> bool)
   (cond (str-eq name "charAt")      (<= argc 1)
         (str-eq name "charCodeAt")  (<= argc 1)
+        (str-eq name "codePointAt") (= argc 1)
         (str-eq name "substring")   (<= argc 2)
         (str-eq name "substr")      (<= argc 2)
         (str-eq name "slice")       (<= argc 2)
@@ -2000,6 +2010,7 @@
 ;; `at` is dynamic for a different reason — out of range it is `undefined`, not a string.
 (defn fng-string-builtin-result [(name (slice u8))] (-> i64)
   (cond (str-eq name "charCodeAt")  FNG-NUMBER
+        (str-eq name "codePointAt") FNG-DYNAMIC
         (str-eq name "indexOf")     FNG-NUMBER
         (str-eq name "lastIndexOf") FNG-NUMBER
         (str-eq name "split")       FNG-ARRAY
@@ -2121,9 +2132,10 @@
         argc (- (ts-child-count ast node) 1)
         needs-start
           (or (str-eq name "charCodeAt")
+              (or (str-eq name "codePointAt")
               (or (str-eq name "charAt")
                   (or (str-eq name "substring")
-                      (or (str-eq name "substr") (str-eq name "slice")))))
+                      (or (str-eq name "substr") (str-eq name "slice"))))))
         start
           (if needs-start
               (if (> argc 0)
@@ -2209,6 +2221,7 @@
         (fng-jsl-call2 context "StringAt" string
                        (n-box! (fng-expression context (ts-child ast node 1))))
       (str-eq name "charCodeAt") (fng-jsl-call2 context "StringCharCodeAt" string start)
+      (str-eq name "codePointAt") (fng-jsl-call2 context "StringCodePointAt" string start)
       (str-eq name "charAt")     (fng-jsl-call2 context "StringCharAt" string start)
       ;; Every remaining extractor comes from lib/string/, which does its own bounds and
       ;; negative-index handling — the work the C runtime used to do behind these IR nodes. The
@@ -3371,6 +3384,7 @@
             (let [symbol (fe-resolution-symbol frontend node)]
               (cond (= symbol FE-INTRINSIC-UNDEFINED) (fng-undefined)
                     (= symbol FE-INTRINSIC-NAN) (n-new1 OP-CONST (t-flt-bits JSV-NAN) (g-start))
+                    (= symbol FE-INTRINSIC-INFINITY) (fng-jsl-call0 context "Infinity")
                     (< symbol 0) NO-NODE
                     :else
                       (let [value (fng-symbol-node context symbol)]
@@ -3655,11 +3669,13 @@
           (= kind TSK-FUNCTION-EXPRESSION) (fng-closure-expression context node)
           (= kind TSK-PROPERTY-ACCESS)
             (let [math-member (fng-math-member-id context node)]
+              (if (fng-number-max-safe? context node)
+                  (fng-jsl-call0 context "MaxSafeInteger")
               (if (>= math-member 0)
                   NO-NODE
                   (if (str-eq (ts-text ast node) "Math.LN2")
                       (n-new1 OP-CONST (t-flt-con 0.6931471805599453) (g-start))
-                      (fng-field-load context node))))
+                      (fng-field-load context node)))))
           (= kind TSK-ELEMENT-ACCESS) (fng-lvalue-read context (fng-lvalue context node))
           :else NO-NODE)))
 
