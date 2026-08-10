@@ -950,6 +950,16 @@ static int js_property_array_index(AotJsValue key, int64_t *out) {
   return 1;
 }
 
+static int js_property_key_ascii_equal(AotJsValue key, const char *ascii) {
+  JsStringRec *string = js_string_lookup((uintptr_t)key);
+  if (!string) return 0;
+  size_t length = strlen(ascii);
+  if (string->length != length) return 0;
+  for (size_t i = 0; i < length; ++i)
+    if (string->units[i] != (uint8_t)ascii[i]) return 0;
+  return 1;
+}
+
 /* Canonical native PropertyKey ABI. `name` is a runtime string key (and later a Symbol), so
    compile-time names and computed names use the same content-based table. Operation 0 loads through the prototype
    chain, 1 stores an own boxed value, 2 installs a raw managed prototype, and
@@ -962,6 +972,18 @@ AotJsValue aot_js_property(uintptr_t owner, uint64_t name,
   if (!owner) return AOT_JS_UNDEFINED;
   int64_t array_index = 0;
   JsArrayRec *indexed_array = js_array(owner, 0);
+  if (indexed_array && js_property_key_ascii_equal((AotJsValue)name, "length")) {
+    if (operation == 0) return aot_js_box_int((int64_t)indexed_array->length);
+    if (operation == 1) {
+      int ok = 0;
+      double number = aot_js_to_number_double(value, &ok);
+      if (!ok || number < 0 || number > UINT32_MAX || trunc(number) != number)
+        return AOT_JS_UNDEFINED;
+      return aot_js_array(owner, (int64_t)number, value, 4);
+    }
+    if (operation == 3) return 1;
+    if (operation == 4) return 0;
+  }
   if (indexed_array && js_property_array_index((AotJsValue)name, &array_index)) {
     if (operation == 0) return aot_js_array(owner, array_index, value, 1);
     if (operation == 1) return aot_js_array(owner, array_index, value, 2);

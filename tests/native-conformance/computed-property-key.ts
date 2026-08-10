@@ -1,3 +1,7 @@
+function dynamicArrayLength(values: any): number {
+  return values.length;
+}
+
 export function main(): number {
   let object: any = { alpha: 40 };
   let key = "alpha";
@@ -24,7 +28,17 @@ export function main(): number {
   let made = {["alpha"]: 2, [beta]: 3};
   let computedNamesWork = made.alpha * 10 + made.beta === 23;
 
-  return ((computedNamesWork ? 100000000 : 0) +
+  let lengthKey = "length";
+  let genericArray: any = [1, 2, 3];
+  let initialLength = genericArray[lengthKey];
+  genericArray[lengthKey] = 1;
+  let resizedLength = genericArray.length;
+  let lengthPresent = lengthKey in genericArray;
+  let arrayLengthPropertyWorks = initialLength === 3 && resizedLength === 1 &&
+    lengthPresent && dynamicArrayLength([4, 5, 6]) === 3;
+
+  return ((arrayLengthPropertyWorks ? 200000000 : 0) +
+          (computedNamesWork ? 100000000 : 0) +
           staticAfterDynamicStore * 1000000 +
           unicodeStaticRead * 100000 +
           arrayRead * 10000 +
