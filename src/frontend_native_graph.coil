@@ -1994,6 +1994,30 @@
                    (fng-object-enumeration-name context node)
                    (n-box! (fng-expression context (ts-child ast node 1))))))
 
+(defn fng-object-assign? [(context FngContext) (node i64)] (-> bool)
+  (let [frontend (load (field context frontend)) ast (field frontend ast)
+        callee (ts-child ast node 0)]
+    (and (>= (ts-child-count ast node) 2)
+         (and (= (ts-kind ast callee) TSK-PROPERTY-ACCESS)
+              (and (= (fe-resolution-symbol frontend (ts-child ast callee 0)) FE-INTRINSIC-OBJECT)
+                   (str-eq (ts-text ast (ts-child ast callee 1)) "assign"))))))
+
+(defn fng-object-assign [(context FngContext) (node i64)] (-> i64)
+  (let [frontend (load (field context frontend)) ast (field frontend ast)
+        target
+          (fng-jsl-call1 context "ToObjectValue"
+                         (n-box! (fng-expression context (ts-child ast node 1))))
+        (mut index) 2]
+    ;; Argument evaluation remains a syntax fold in the frontend, like Array.of and variadic
+    ;; String.fromCharCode. Each semantic source step is a JSL macro.
+    (loop (if (>= (load index) (ts-child-count ast node)) (break)
+              (do (fng-jsl-call2 context "ObjectAssignSource"
+                                  target
+                                  (n-box! (fng-expression context
+                                                          (ts-child ast node (load index)))))
+                  (store! index (+ (load index) 1)))))
+    target))
+
 (defn fng-number-to-string? [(context FngContext) (node i64)] (-> bool)
   (let [frontend (load (field context frontend))
         ast (field frontend ast)
@@ -3974,13 +3998,15 @@
                     (fng-array-of context node)
                 (if (fng-object-enumeration? context node)
                     (fng-object-enumeration context node)
+                (if (fng-object-assign? context node)
+                    (fng-object-assign context node)
                 (if (fng-string-from-char-code? context node)
                     (fng-string-from-char-code context node)
                     (if (fng-string-builtin? context node)
                         (fng-string-call context node)
                         (if (fng-array-builtin? context node)
                             (fng-array-call context node)
-                            (fng-call context node)))))))))))))
+                            (fng-call context node))))))))))))))
           (= kind TSK-NEW-EXPRESSION)
             (if (fng-error-constructor? context node) (fng-error-constructor context node) (fng-call context node))
           (= kind TSK-OBJECT-LITERAL)
