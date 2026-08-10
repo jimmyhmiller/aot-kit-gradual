@@ -31,10 +31,15 @@ const expectedDigests = Object.freeze({
   // index shifted by one. 37 nodes to 38, no memory edge gained, because `Box` already threaded the
   // heap through this fixture.
   object: "8c19cc1ebeb4e58a6919b68cfbda7cb5b34a97228740eef91bb77592b110e680",
-  // Repinned for the ToNumber seam. Two dynamic operands in this fixture, so exactly two nodes
-  // added — 82 to 84 — plus the memory edges the functions containing them now thread, the same
-  // consequence spelled out on `call`.
-  full: "9a34d9481daa454b5c42d215cca1f33d2de2ced2b48b5daf3e27197cde29211a",
+  // Repinned twice. First for the ToNumber seam: two dynamic operands in this fixture, so exactly
+  // two nodes added — 82 to 84 — plus the memory edges the functions containing them now thread,
+  // the same consequence spelled out on `call`.
+  //
+  // Then once more for object-typed arguments, which is exactly one node: `Box` on the actual
+  // before the `Call`, 84 to 85. A `Parm` is a tagged JavaScript value and a callee reading a field
+  // off the declared shape unboxes it, so an object argument has to arrive tagged. It was arriving
+  // as the raw allocation pointer and trapping.
+  full: "5aa04bede276bcdf2e7767d42f06be4b93512171b374bc3e2be642735fee282d",
   bitwise: "189e78fe00839f184bb88f682c514f3a5d97b7972da062e8aa7262d3969e17a9",
 });
 

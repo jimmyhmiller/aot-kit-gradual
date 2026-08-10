@@ -372,15 +372,34 @@ All three are LOUD (a trap or a refused compile), and all three reproduce at `f3
   definition in `lib/` writes on only one arm of any branch it contains, which is why nothing had
   exercised it; `StringSplit` is written as one loop with one unconditional store to stay inside
   that. It is the next thing to fix if the library is to grow more allocating definitions.
-- **A property read inside a non-entry function traps in arithmetic.**
+- ~~**A property read inside a non-entry function traps in arithmetic.**~~ **FIXED**, and it was
+  two defects rather than one. A `Parm` is a tagged JavaScript value, so a callee reading a field
+  through the declared shape unboxes it, and `fng-call-argument` was not boxing object-typed
+  actuals — a freshly allocated object arrived as a raw pointer and `MI-JSUNBOX` trapped. Underneath
+  that, an object literal in ARGUMENT position was built with `SHAPE-ROOT` and a dynamic property
+  table because no expected type reached it, so once the trap was gone the callee's `Load#0` read a
+  field that was not there and answered 0 with no diagnostic at all. `object-parameters.ts` covers
+  both, and both are falsified.
 
-      type T = { value: number };
-      function sum(t: T): number { return t.value + 1; }
-      export function main(): number { return sum({value: 41}) | 0; }   // SIGTRAP
+  `integrated-heap-program.ts` passes objects to functions constantly and caught neither, because
+  every object it passes is ALREADY tagged — an array element or a property, which
+  `fng-tagged-dynamic-value?` recognises and leaves alone. A literal written at the call site was
+  the case nothing covered.
+- **A DYNAMIC property read off a passed object still answers 0.**
 
-  Node says 42. `integrated-heap-program.ts` does the same thing — `tree.value + sum(tree.left)` —
-  and compiles, so it is narrower than "property reads in functions". Worth pairing with the
-  `jsl-inline!`-in-a-non-entry-function limitation above; they may be one bug.
+      function get(t: any): number { return t.value; }
+      export function main(): number { return get({value: 41}) | 0; }   // 0, Node says 41
+
+  With the parameter typed `any` there is no shape, so the literal keeps its dynamic property table
+  and the callee reads it through `PropLoad` — and the dynamic property alias does not appear to
+  reach the callee's memory `Arg`. The typed-shape path above is fixed; this one is not.
+- **`.length` on an array-typed parameter answers 0.**
+
+      function f(a: number[]): number { return a.length; }   // 0, Node says 3
+
+  The caller boxes it correctly; inside the callee the parameter infers `FNG-DYNAMIC` rather than
+  `FNG-ARRAY`, so `.length` takes the generic property path instead of `ArrayLen` and misses. A
+  declared parameter type is not reaching `fng-infer` for arrays the way it does for objects.
 - **`xs[0] * 1000` without a `| 0`** answers a machine word rather than 10000. `main` returns
   through an integer ABI and the coercion makes the expression floating-point; every program in the
   corpus ends in `| 0`, which is why it has never shown up. It is a harness convention as much as a

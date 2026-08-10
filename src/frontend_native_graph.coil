@@ -317,21 +317,67 @@
                 (store! node (+ (load node) 1)))))
     0))
 
+;; The declared type of a callee's parameter, or `FNG-DYNAMIC` when there is no such parameter.
+(defn fng-parameter-type [(frontend (ptr NativeFrontend))
+                          (fn FeFunction)
+                          (ordinal i64)] (-> i64)
+  (if (or (< ordinal 0) (>= ordinal (load (field fn parameter-count))))
+      FNG-DYNAMIC
+      (let [symbol
+              (al-get [FeSymbol]
+                      (load (field frontend symbols))
+                      (+ (load (field fn parameter-start)) ordinal))]
+        (fng-type-tag frontend (load (field symbol type-node))))))
+
+;; The expected type an ARGUMENT expression is lowered under, which is only ever a structural shape.
+;;
+;; An object literal builds a different object depending on what is expected of it: with a shape it
+;; gets real field slots, and with `FNG-DYNAMIC` it gets `SHAPE-ROOT` and a dynamic property table.
+;; `let o: T = {value: 41}` already supplied the shape and an argument position did not, so
+;; `get({value: 41})` allocated a dynamic object, handed it to a callee reading `Load#0` off the
+;; declared shape, and answered 0 — silently, on three lines of ordinary TypeScript.
+;;
+;; Only shape ids are forwarded. `FNG-NUMBER` is also an expected type `fng-expression-expected`
+;; understands, and forwarding it here would change how numeric arguments are built for no reason
+;; this bug requires.
+(defn fng-argument-expected [(frontend (ptr NativeFrontend))
+                             (fn FeFunction)
+                             (ordinal i64)
+                             (known bool)] (-> i64)
+  (if (not known)
+      FNG-DYNAMIC
+      (let [declared (fng-parameter-type frontend fn ordinal)]
+        (if (>= declared 0) declared FNG-DYNAMIC))))
+
 (defn fng-call-argument [(frontend (ptr NativeFrontend))
                          (fn FeFunction)
                          (ordinal i64)
                          (value i64)] (-> i64)
   (if (or (< ordinal 0) (>= ordinal (load (field fn parameter-count))))
       value
-      (let [symbol
-              (al-get [FeSymbol]
-                      (load (field frontend symbols))
-                      (+ (load (field fn parameter-start)) ordinal))
-            parameter-type (fng-type-tag frontend (load (field symbol type-node)))]
+      (let [parameter-type (fng-parameter-type frontend fn ordinal)]
         ;; Parm nodes carry JavaScript values. Numeric consumers therefore unbox typed number
         ;; parameters just as they unbox dynamic parameters; publish numeric actuals in that same
         ;; tagged ABI instead of passing an FPR/GPR word to a callee expecting a boxed value.
-        (if (or (= parameter-type FNG-DYNAMIC) (= parameter-type FNG-NUMBER))
+        ;;
+        ;; AN OBJECT-TYPED PARAMETER IS THE SAME BARGAIN, and leaving it out was a `SIGTRAP` on
+        ;; three lines of ordinary TypeScript:
+        ;;
+        ;;     type T = { value: number };
+        ;;     function get(t: T): number { return t.value; }
+        ;;     get({value: 41})
+        ;;
+        ;; The callee reads `t.value` through the declared shape, so it emits `Unbox : obj@2` on its
+        ;; `Parm` — which is right, because a Parm is a tagged JavaScript value. The caller handed it
+        ;; the RAW object pointer the allocation produced, and `MI-JSUNBOX` traps on a word nothing
+        ;; tagged. A structural type is a shape id, which is non-negative, where every `FNG-` kind is
+        ;; negative; that is the whole test.
+        ;;
+        ;; It never showed up because the corpus passes objects that are ALREADY tagged — an array
+        ;; element in `integrated-heap-program.ts`, which `fng-tagged-dynamic-value?` recognises and
+        ;; leaves alone. A freshly allocated one is the case nothing covered.
+        (if (or (>= parameter-type 0)
+                (or (= parameter-type FNG-DYNAMIC) (= parameter-type FNG-NUMBER)))
             (if (fng-tagged-dynamic-value? value) value (fng-box-dynamic-argument! value))
             value))))
 
@@ -2565,13 +2611,18 @@
     (loop (if (>= (load index) (ts-child-count ast node))
               (break)
               (do
-                (let [value (fng-expression context (ts-child ast node (load index)))]
+                (let [ordinal (- (load index) (if explicit-call 2 1))
+                      ;; The parameter's declared shape is the argument's EXPECTED type, so an
+                      ;; object literal written at a call site is built the way the callee reads it.
+                      value (fng-expression-expected
+                              context
+                              (ts-child ast node (load index))
+                              (fng-argument-expected frontend argument-fn ordinal
+                                                     (>= argument-function-index 0)))]
                   (al-push! [i64]
                             (mut args)
                             (if (>= argument-function-index 0)
-                                (fng-call-argument frontend argument-fn
-                                                   (- (load index) (if explicit-call 2 1))
-                                                   value)
+                                (fng-call-argument frontend argument-fn ordinal value)
                                 value)))
                 (store! index (+ (load index) 1)))))
     ; JavaScript fills omitted formal parameters with undefined. Native calls use a fixed register
