@@ -134,6 +134,7 @@ primitives, analogous to Torque `extern` operations. The frontend does not const
 | `parseFloat(x)` | **done** | ParseFloatValue |
 | `Number.parseFloat(x)` | **done** | ParseFloatValue |
 | `JSON.parse(text)` | **done** | JSONParse |
+| `JSON.stringify(value)` | **done** | JSONStringify |
 | `void x` | **done** | VoidValue |
 | `typeof x` | **done** | TypeOfValue |
 | `x ?? y` | **done** | IsNullishValue |
@@ -162,7 +163,7 @@ string and template literals with interpolation and cooked escapes, concatenatio
 
 ### Needs a frontend intrinsic, like the one `Number` just got
 
-- `JSON.stringify`
+- `JSON.stringify` replacer/space overloads
 
 ### Needs new syntax in the frontend
 

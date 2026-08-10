@@ -355,6 +355,12 @@ the back edge null; a loop everything recurs from (`JSL-ERR-LOOP-NO-EXIT`) canno
 leaves the enclosing body with no Return. Both are named at lowering rather than left to produce a
 malformed graph.
 
+Recursive generated builtins are also a specialization boundary. `JSON.stringify` keeps its
+string-quoting loop inside a called `JsonStringifyPlainValue` builtin rather than expanding it at
+the top-level call site: inlining a loop after the caller has established heap memory would create
+a useless self-carried memory Phi. This mirrors Torque's split between macros for local graph
+visibility and builtins for recursive or representation-stable calling shapes.
+
 ---
 
 ## The primitive layer

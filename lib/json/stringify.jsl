@@ -1,0 +1,114 @@
+;; https://tc39.es/ecma262/#sec-json.stringify
+;;
+;; The serializer, recursive traversal, omission rules, cycle detection, and quoting live in JSL.
+;; Runtime primitives expose only representation-owned string, array, object, and own-key access.
+
+(macro JsonHexChar :params [(digit int)] :ret str
+  (%StringFromCode (if (%Lt digit 10) (%Add digit 48) (%Add digit 87))))
+
+(macro JsonEscapeCodeUnit :params [(code int)] :ret str
+  (let [(slash (%StringFromCode 92))]
+    (if (%Eq code 34) (%StringConcat slash (%StringFromCode 34))
+      (if (%Eq code 92) (%StringConcat slash slash)
+        (if (%Eq code 8) (%StringConcat slash "b")
+          (if (%Eq code 9) (%StringConcat slash "t")
+            (if (%Eq code 10) (%StringConcat slash "n")
+              (if (%Eq code 12) (%StringConcat slash "f")
+                (if (%Eq code 13) (%StringConcat slash "r")
+                  (if (%Lt code 32)
+                      (%StringConcat
+                        (%StringConcat (%StringConcat slash "u") "00")
+                        (%StringConcat
+                          (JsonHexChar (%Shr code 4))
+                          (JsonHexChar (%BitAnd code 15))))
+                      (%StringFromCode code)))))))))))
+
+(macro JsonQuoteString :params [(value dyn)] :ret str
+  (let [(quote (%StringFromCode 34))
+        (length (%StringLen value))]
+    (loop [(index 0 int) (out quote str)]
+      (if (%Le length index)
+          (%StringConcat out quote)
+          (recur (%Add index 1)
+                 (%StringConcat out
+                   (JsonEscapeCodeUnit (%StringCharCode value index))))))))
+
+(macro JsonStackContains :params [(stack dyn) (value dyn)] :ret bool
+  (let [(length (%ArrayLen stack))]
+    (loop [(index 0 int)]
+      (if (%Le length index) false
+          (if (%Eq (%ArrayLoad stack index) value)
+              true
+              (recur (%Add index 1)))))))
+
+(macro JsonCircularError :params [] :ret dyn
+  (%Throw "TypeError: Converting circular structure to JSON"))
+
+;; The plain path is deliberately separate from the replacer path. A literal "no replacer" flag
+;; would still construct the callback arm before folding, leaving an invalid call target and dead
+;; merge values in the graph. Torque uses specialized builtins for this same reason: distinct
+;; calling shapes should be distinct generated functions, not a runtime flag over an illegal arm.
+(builtin JsonStringifyPlainArray :transitioning true
+  :params [(array dyn) (stack dyn)] :ret dyn
+  (if (JsonStackContains stack array) (JsonCircularError)
+      (let [(depth (%ArrayLen stack))
+            (pushed (%ArrayStore stack depth array))
+            (length (%ArrayLen array))
+            (body
+              (loop [(index 0 int) (out "" str)]
+                (if (%Le length index) out
+                    (let [(serialized
+                            (JsonStringifyPlainValue (%ArrayLoad array index) stack))
+                          (piece (if (%IsUndefined serialized)
+                                     "null" (%UnboxString serialized)))
+                          (next (%StringConcat out
+                                  (%StringConcat (if (%Eq index 0) "" ",") piece)))]
+                      (recur (%Add index 1) next)))))
+            (result (%StringConcat (%StringConcat "[" body) "]"))
+            (popped (%ArrayResize stack depth (%Box result)))]
+        (%Box result))))
+
+(builtin JsonStringifyPlainObjectMembers :transitioning true
+  :params [(object dyn) (stack dyn) (index int) (count int) (out dyn)] :ret dyn
+  (if (%Le count index) out
+      (let [(key (%OwnKeyAt object index))
+            (serialized
+              (JsonStringifyPlainValue (%PropLoadKey object key) stack))]
+        (if (%IsUndefined serialized)
+            (JsonStringifyPlainObjectMembers object stack (%Add index 1) count out)
+            (let [(member (%StringConcat
+                            (%StringConcat (JsonQuoteString key) ":")
+                            (%UnboxString serialized)))
+                  (next (%StringConcat out
+                          (%StringConcat (if (%Eq (%StringLen out) 0) "" ",") member)))]
+              (JsonStringifyPlainObjectMembers object stack
+                                               (%Add index 1) count next))))))
+
+(builtin JsonStringifyPlainObject :transitioning true
+  :params [(object dyn) (stack dyn)] :ret dyn
+  (if (JsonStackContains stack object) (JsonCircularError)
+      (let [(depth (%ArrayLen stack))
+            (pushed (%ArrayStore stack depth object))
+            (body (JsonStringifyPlainObjectMembers
+                    object stack 0 (%OwnKeyCount object) ""))
+            (result (%StringConcat (%StringConcat "{" body) "}"))
+            (popped (%ArrayResize stack depth (%Box result)))]
+        (%Box result))))
+
+(builtin JsonStringifyPlainValue :transitioning true
+  :params [(value dyn) (stack dyn)] :ret dyn
+  (if (%IsString value) (%Box (JsonQuoteString value))
+    (if (%IsBool value) (%Box (ToStringValue value))
+      (if (%IsNull value) (%Box "null")
+        (if (IsNumber value)
+            (if (IsFiniteNumber value)
+                (%Box (ToStringValue value))
+                (%Box "null"))
+          (if (%IsArray value) (JsonStringifyPlainArray value stack)
+            (if (%IsObject value) (JsonStringifyPlainObject value stack)
+              (%Box undefined))))))))
+
+;; Internal serializer results are tagged strings, or tagged undefined for a value which the
+;; surrounding object must omit. Arrays translate that same sentinel to the JSON token `null`.
+(macro JSONStringify :params [(value dyn)] :ret dyn
+  (JsonStringifyPlainValue (%Box value) (%NewArray)))

@@ -118,6 +118,7 @@ const OTHER = [
   ["`parseFloat(x)`", "ParseFloatValue"],
   ["`Number.parseFloat(x)`", "ParseFloatValue"],
   ["`JSON.parse(text)`", "JSONParse"],
+  ["`JSON.stringify(value)`", "JSONStringify"],
   ["`void x`", "VoidValue"],
   ["`typeof x`", "TypeOfValue"],
   ["`x ?? y`", "IsNullishValue"],
@@ -133,7 +134,7 @@ const UNSUPPORTED = {
     "`String.prototype.search`", "`String.prototype.replace`", "`RegExp`",
   ],
   "Needs a frontend intrinsic, like the one `Number` just got": [
-    "`JSON.stringify`",
+    "`JSON.stringify` replacer/space overloads",
   ],
   "Needs new syntax in the frontend": [
     "tagged template literals", "destructuring", "spread and rest",
