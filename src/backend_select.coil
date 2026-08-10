@@ -1144,6 +1144,8 @@
                     (ms-push-memory-dep-tree! first (n-in node 1) (- fuel 1))
                     OP-PROPSTORE
                     (ms-push-memory-dep-tree! first (n-in node 1) (- fuel 1))
+                    OP-PROPDELETE
+                    (ms-push-memory-dep-tree! first (n-in node 1) (- fuel 1))
                     OP-SETPROTO
                     (ms-push-memory-dep-tree! first (n-in node 1) (- fuel 1))
                     OP-ARRAYSTORE
@@ -1221,6 +1223,7 @@
               (case (n-op (load current)) OP-STORE
                     (store! current (n-in (load current) 1)) OP-LOAD
                     (store! current (n-in (load current) 1)) OP-PROPSTORE
+                    (store! current (n-in (load current) 1)) OP-PROPDELETE
                     (store! current (n-in (load current) 1)) OP-SETPROTO
                     (store! current (n-in (load current) 1)) OP-PROPLOAD
                     (store! current (n-in (load current) 1)) OP-PROPHAS
@@ -1249,6 +1252,7 @@
       (case (n-op node) OP-PHI
             true OP-STORE
             (ms-memory-chain-phi? (n-in node 1)) OP-PROPSTORE
+            (ms-memory-chain-phi? (n-in node 1)) OP-PROPDELETE
             (ms-memory-chain-phi? (n-in node 1)) OP-SETPROTO
             (ms-memory-chain-phi? (n-in node 1)) OP-ARRAYSTORE
             (ms-memory-chain-phi? (n-in node 1)) OP-ARRAYRESIZE
@@ -1281,7 +1285,10 @@
               value-block
               (if (and (>= object-block 0) (!= object-block (ms-entry-block owner)))
                   object-block
-                  fallback))) OP-SETPROTO
+                  fallback))) OP-PROPDELETE
+        (let [object-block (ms-node-block owner (n-in node 2))]
+          (if (and (>= object-block 0) (!= object-block (ms-entry-block owner)))
+              object-block fallback)) OP-SETPROTO
         (let [prototype-block (ms-node-block owner (n-in node 3))
               object-block (ms-node-block owner (n-in node 2))]
           (if (and (>= prototype-block 0) (!= prototype-block (ms-entry-block owner)))
@@ -1358,10 +1365,11 @@
   (let [op (n-op node)]
     (or (= op OP-STORE)
         (or (= op OP-PROPSTORE)
-            (or (= op OP-SETPROTO)
+            (or (= op OP-PROPDELETE)
+                (or (= op OP-SETPROTO)
                 (or (= op OP-ARRAYSTORE)
                     (or (= op OP-ARRAYRESIZE)
-                        (or (= op OP-ARRAYCOPY) (= op OP-STRINGSPLIT)))))))))
+                        (or (= op OP-ARRAYCOPY) (= op OP-STRINGSPLIT))))))))))
 
 (defn ms-select-memory-at! [(owner i64) (node i64) (bid i64)] (-> bool)
   (if (ms-seen? owner node)
@@ -1442,6 +1450,17 @@
                         (let [fresh (ms-new-vreg!)
                               effect-bid bid
                               at (ms-emit! owner effect-bid (mi-new MI-JSPROP fresh object value 1 node))]
+                          (ms-add-memory-deps! at node 1 1)))))
+                OP-PROPDELETE
+              (if (not (ms-select-memory-at! owner (n-in node 1) bid))
+                  (store! ok false)
+                  (let [object (ms-select-value-at! owner (n-in node 2) bid)]
+                    (if (< object 0)
+                        (store! ok false)
+                        (let [fresh (ms-new-vreg!)
+                              effect-bid bid
+                              at (ms-emit! owner effect-bid
+                                           (mi-new MI-JSPROP fresh object object 4 node))]
                           (ms-add-memory-deps! at node 1 1)))))
                 OP-ARRAYSTORE
               (if (not (ms-select-memory-at! owner (n-in node 1) bid))
@@ -3724,6 +3743,7 @@
             true)
           OP-STORE
         (>= (ms-node-inst-before owner node at) 0) OP-PROPSTORE
+        (>= (ms-node-inst-before owner node at) 0) OP-PROPDELETE
         (>= (ms-node-inst-before owner node at) 0) OP-SETPROTO
         (>= (ms-node-inst-before owner node at) 0) OP-ARRAYSTORE
         (>= (ms-node-inst-before owner node at) 0) OP-ARRAYRESIZE

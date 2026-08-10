@@ -109,11 +109,13 @@
             (al-set! [JsProperty] (field heap properties) index (load entry)))
         (let [(mut record) (al-get [JsObject] (load (field heap objects)) object)]
           (if (load (field heap track-shapes))
-              (do
-                (store! (field record shape)
-                        (shape-transition (load (field record shape)) name (t-dyn)))
-                (al-set! [JsObject] (field heap objects) object (load record))
-                0)
+              (if (shape-has-field? (load (field record shape)) name)
+                  0
+                  (do
+                    (store! (field record shape)
+                            (shape-transition (load (field record shape)) name (t-dyn)))
+                    (al-set! [JsObject] (field heap objects) object (load record))
+                    0))
               0)
           (let [property-index (al-len [JsProperty] (load (field heap properties)))]
             (al-push! [JsProperty] (field heap properties)
@@ -122,6 +124,34 @@
             (al-set! [JsObject] (field heap objects) object (load record)))))
       (store! (field heap status) JSO-OK)
       JSO-OK))))
+
+;; Shapes record allocation/layout history and remain monotone; deletion removes the property-table
+;; entry rather than pretending its value became undefined. A later store creates a fresh entry and
+;; may reuse the already-known layout transition without making the deleted property observable.
+(defn jso-delete! [(object i64) (name (slice u8))] (-> bool)
+  (if (not (jso-valid? object)) false
+    (let [heap (jso-heap)
+          nid (shape-name-find name)]
+      (if (= nid SHAPE-NO-NAME) true
+        (let [(mut record) (al-get [JsObject] (load (field heap objects)) object)
+              (mut current) (load (field record property-head))
+              (mut prior) JSO-NONE
+              (mut done) false]
+          (loop (if (or (= (load current) JSO-NONE) (load done)) (break true)
+            (let [entry (al-get [JsProperty] (load (field heap properties)) (load current))]
+              (if (= (load (field entry name)) nid)
+                  (do
+                    (if (= (load prior) JSO-NONE)
+                        (store! (field record property-head) (load (field entry next)))
+                        (let [(mut previous)
+                                (al-get [JsProperty] (load (field heap properties)) (load prior))]
+                          (store! (field previous next) (load (field entry next)))
+                          (al-set! [JsProperty] (field heap properties) (load prior) (load previous))))
+                    (al-set! [JsObject] (field heap objects) object (load record))
+                    (store! done true))
+                  (do (store! prior (load current))
+                      (store! current (load (field entry next)))))))
+          true))))))
 
 (defn jso-load-own-nid [(object i64) (name i64)] (-> i64)
   (let [index (jso-own-index-nid object name)]

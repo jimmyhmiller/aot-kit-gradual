@@ -150,7 +150,7 @@ static void js_property_cache_rebuild(void) {
   memset(js_property_cache, 0, sizeof(js_property_cache));
   js_property_cache_complete = 1;
   for (size_t i = 0; i < js_properties_len; ++i)
-    if (!js_property_cache_insert(i)) break;
+    if (js_properties[i].owner && !js_property_cache_insert(i)) break;
 }
 
 static JsPropertyRec *js_own_property(uintptr_t owner, uint64_t name) {
@@ -913,7 +913,8 @@ AotJsValue aot_js_array(uintptr_t owner, int64_t index,
 
 /* Canonical native named-property ABI. Operation 0 loads through the prototype
    chain, 1 stores an own boxed value, 2 installs a raw managed prototype, and
-   3 tests presence through the prototype chain without conflating undefined with absence.
+   3 tests presence through the prototype chain without conflating undefined with absence,
+   and 4 deletes an own configurable property.
    Name ids are compilation-unit-local dense integers emitted by shape.coil. */
 AotJsValue aot_js_property(uintptr_t owner, uint64_t name,
                            AotJsValue value, uint64_t operation) {
@@ -971,6 +972,14 @@ AotJsValue aot_js_property(uintptr_t owner, uint64_t name,
       cursor = object ? object->prototype : 0;
     }
     return 0;
+  }
+  if (operation == 4) {
+    JsPropertyRec *property = js_own_property(owner, name);
+    if (property) {
+      property->owner = 0;
+      js_property_cache_rebuild();
+    }
+    return 1;
   }
   if (operation == 1) {
     value = js_canonical_stored_value(value);
