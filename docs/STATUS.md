@@ -123,6 +123,7 @@ spelling of the same call. **These are not a backlog.**
 | `Number.MAX_SAFE_INTEGER` | **done** | MaxSafeInteger |
 | `parseFloat(x)` | **done** | ParseFloatValue |
 | `Number.parseFloat(x)` | **done** | ParseFloatValue |
+| `void x` | **done** | VoidValue |
 
 ## Language surface that compiles
 
@@ -172,7 +173,7 @@ string literals and concatenation; `throw`; type aliases, interfaces and union a
 - nullish coalescing `??`
 - `try`/`catch`/`finally`
 - arrow functions
-- `typeof` / `instanceof` / `in` / `delete` / `void`
+- `typeof` / `instanceof` / `in` / `delete`
 
 ### Needs a runtime this compiler does not have
 
