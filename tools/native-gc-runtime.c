@@ -914,7 +914,7 @@ AotJsValue aot_js_array(uintptr_t owner, int64_t index,
 /* Canonical native named-property ABI. Operation 0 loads through the prototype
    chain, 1 stores an own boxed value, 2 installs a raw managed prototype, and
    3 tests presence through the prototype chain without conflating undefined with absence,
-   and 4 deletes an own configurable property.
+   4 deletes an own configurable property, and 5 tests prototype-chain identity.
    Name ids are compilation-unit-local dense integers emitted by shape.coil. */
 AotJsValue aot_js_property(uintptr_t owner, uint64_t name,
                            AotJsValue value, uint64_t operation) {
@@ -980,6 +980,18 @@ AotJsValue aot_js_property(uintptr_t owner, uint64_t name,
       js_property_cache_rebuild();
     }
     return 1;
+  }
+  if (operation == 5) {
+    uintptr_t target = (uintptr_t)value;
+    if (aot_js_managed(value)) target = aot_js_payload(value);
+    JsObjectRec *record = js_object(owner, 0);
+    uintptr_t cursor = record ? record->prototype : 0;
+    for (size_t depth = 0; cursor && depth <= js_objects_len; ++depth) {
+      if (cursor == target) return 1;
+      record = js_object(cursor, 0);
+      cursor = record ? record->prototype : 0;
+    }
+    return 0;
   }
   if (operation == 1) {
     value = js_canonical_stored_value(value);
