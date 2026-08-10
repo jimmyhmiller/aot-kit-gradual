@@ -86,8 +86,15 @@ const runOne = async (test, slot) => {
       ? new Function(`${transpiled.outputText}\nreturn main;`)()
       : (await import(`data:text/javascript;base64,${Buffer.from(transpiled.outputText).toString("base64")}`)).main;
     assert.equal(typeof nodeMain, "function", `${sourcePath} defines main`);
-    const expected = nodeMain(...argumentsSetForCase);
-    assert.ok(Number.isSafeInteger(expected), `${sourcePath} returns a safe integer observable`);
+    let expected;
+    let nodeThrow;
+    try { expected = nodeMain(...argumentsSetForCase); }
+    catch (error) { nodeThrow = error; }
+    if (test.throws) assert.ok(nodeThrow, `${sourcePath} throws in Node`);
+    else {
+      if (nodeThrow) throw nodeThrow;
+      assert.ok(Number.isSafeInteger(expected), `${sourcePath} returns a safe integer observable`);
+    }
     const coilPath = path.join(directory, `${test.name}.coil`);
     const emitterPath = path.join(directory, `${test.name}-emitter`);
     await runAsync(process.execPath, [path.join(root, "tools", "generate-typescript-aot-benchmark.mjs"), sourcePath, coilPath,
@@ -107,7 +114,18 @@ const runOne = async (test, slot) => {
         ? (mode.stress ? ["stress"] : [])
         : [String(argumentsSetForCase[0] ?? 0), String(mode.stress), test.warmup ? "1" : "0",
             argumentsSetForCase.length ? "1" : "0"];
-      const output = (await runAsync(binaryPath, nativeArgs)).trim();
+      let output = "";
+      let nativeThrow;
+      try { output = (await runAsync(binaryPath, nativeArgs)).trim(); }
+      catch (error) { nativeThrow = error; }
+      if (test.throws) {
+        assert.equal(nativeThrow?.code, 70, `${test.name}/${mode.name}: native execution throws`);
+        assert.equal(String(nativeThrow.stderr).trim(), "uncaught JavaScript throw",
+          `${test.name}/${mode.name}: native throw crosses the uncaught boundary`);
+        observations.push({mode: mode.name, throws: true, exitCode: nativeThrow.code});
+        continue;
+      }
+      if (nativeThrow) throw nativeThrow;
       const match = /^result=(-?\d+) collections=(\d+) moves=(\d+)$/.exec(output);
       assert.ok(match, `${test.name}/${mode.name} emitted a structured native result: ${output}`);
       const actual = Number(match[1]);
@@ -115,8 +133,9 @@ const runOne = async (test, slot) => {
       observations.push({mode: mode.name, result: actual, collections: Number(match[2]), moves: Number(match[3])});
     }
     collected[slot] = {name: test.name, file: test.file, args: argumentsSetForCase, optimize: test.optimize !== false,
-      features: test.features, node: expected, native: observations};
-    console.log(`${test.name.padEnd(30)} Node=${expected} native=${observations.map(item => item.result).join(",")}`);
+      features: test.features, node: test.throws ? {throws: nodeThrow.name} : expected, native: observations};
+    console.log(`${test.name.padEnd(30)} Node=${test.throws ? "throws" : expected} native=${
+      observations.map(item => item.throws ? "throws" : item.result).join(",")}`);
 };
 
 try {
