@@ -215,7 +215,7 @@ func stableKindCode(kind ast.Kind) int32 {
 	case ast.KindCallExpression: return 214
 	case ast.KindNewExpression: return 215
 	case ast.KindParenthesizedExpression: return 218
-	case ast.KindFunctionExpression: return 219
+	case ast.KindFunctionExpression, ast.KindArrowFunction: return 219
 	case ast.KindConditionalExpression: return 224
 	case ast.KindTemplateExpression: return 231
 	case ast.KindTemplateSpan: return 232

@@ -132,7 +132,7 @@ const UNSUPPORTED = {
     "tagged template literals", "destructuring", "spread and rest", "default parameters",
     "`for...of` / `for...in`", "`class`", "getters and setters", "computed property names",
     "optional calls", "`try`/`catch`/`finally`",
-    "arrow functions", "`instanceof` / `in` / `delete`",
+    "lexical `this` in arrow functions", "`instanceof` / `in` / `delete`",
   ],
   "Needs a runtime this compiler does not have": [
     "`Map` / `Set` / `WeakMap`", "`Promise` and `async`/`await`", "generators and iterators",
@@ -214,7 +214,7 @@ out.push("## Language surface that compiles");
 out.push("");
 out.push("Numbers and all 25 arithmetic, bitwise, comparison and logical operators including their");
 out.push("compound-assignment forms; `if`, `for`, `while`, `do`, `switch`, labels, `break`, `continue`,");
-out.push("ternaries and short-circuit operators; function declarations and expressions, closures with");
+out.push("ternaries and short-circuit operators; function declarations, function expressions and block/expression-bodied arrows, closures with");
 out.push("mutable capture, recursion, `this`, `new` and constructors; object literals, structural types,");
 out.push("prototypes, dynamic and missing properties; array literals with holes, indexing and growth;");
 out.push("string and template literals with interpolation and cooked escapes, concatenation; `throw`; type aliases, interfaces and union annotations.");
