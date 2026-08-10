@@ -124,6 +124,43 @@
       (al-free! [u16] (mut decoded))
       result)))
 
+;; Encode a string for compiler-side tables that still use UTF-8 names. Native PropertyKey storage
+;; compares UTF-16 directly; this bridge keeps the ideal evaluator observationally aligned for all
+;; Unicode scalar values while the shape table remains byte-backed.
+(defn jss-utf8! [(string i64) (out (mut (ArrayList u8)))] (-> (slice u8))
+  (al-clear! [u8] (mut out))
+  (let [(mut i) 0]
+    (loop (if (>= (load i) (jss-length string))
+              (break)
+              (let [first (jss-code-unit string (load i))
+                    (mut point) first
+                    (mut width) 1]
+                (if (and (>= first 55296)
+                         (and (<= first 56319) (< (+ (load i) 1) (jss-length string))))
+                    (let [second (jss-code-unit string (+ (load i) 1))]
+                      (if (and (>= second 56320) (<= second 57343))
+                          (do (store! point (+ 65536 (+ (<< (- first 55296) 10)
+                                                        (- second 56320))))
+                              (store! width 2))
+                          0))
+                    0)
+                (let [p (load point)]
+                  (cond (< p 128) (al-push! [u8] (mut out) (cast u8 p))
+                        (< p 2048)
+                          (do (al-push! [u8] (mut out) (cast u8 (+ 192 (>> p 6))))
+                              (al-push! [u8] (mut out) (cast u8 (+ 128 (& p 63)))))
+                        (< p 65536)
+                          (do (al-push! [u8] (mut out) (cast u8 (+ 224 (>> p 12))))
+                              (al-push! [u8] (mut out) (cast u8 (+ 128 (& (>> p 6) 63))))
+                              (al-push! [u8] (mut out) (cast u8 (+ 128 (& p 63)))))
+                        :else
+                          (do (al-push! [u8] (mut out) (cast u8 (+ 240 (>> p 18))))
+                              (al-push! [u8] (mut out) (cast u8 (+ 128 (& (>> p 12) 63))))
+                              (al-push! [u8] (mut out) (cast u8 (+ 128 (& (>> p 6) 63))))
+                              (al-push! [u8] (mut out) (cast u8 (+ 128 (& p 63)))))))
+                (store! i (+ (load i) (load width))))))
+    (slice-new [u8] (load (field out data)) (al-len [u8] (load out)))))
+
 (defn jss-equal? [(left i64) (right i64)] (-> bool)
   (if (!= (jss-length left) (jss-length right))
       false

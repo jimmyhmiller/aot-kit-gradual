@@ -1146,6 +1146,10 @@
                     (ms-push-memory-dep-tree! first (n-in node 1) (- fuel 1))
                     OP-PROPDELETE
                     (ms-push-memory-dep-tree! first (n-in node 1) (- fuel 1))
+                    OP-PROPSTOREKEY
+                    (ms-push-memory-dep-tree! first (n-in node 1) (- fuel 1))
+                    OP-PROPDELETEKEY
+                    (ms-push-memory-dep-tree! first (n-in node 1) (- fuel 1))
                     OP-SETPROTO
                     (ms-push-memory-dep-tree! first (n-in node 1) (- fuel 1))
                     OP-ARRAYSTORE
@@ -1230,6 +1234,12 @@
                     (store! current (n-in (load current) 1))
                     OP-PROTOHAS
                     (store! current (n-in (load current) 1))
+                    OP-PROPLOADKEY
+                    (store! current (n-in (load current) 1)) OP-PROPHASKEY
+                    (store! current (n-in (load current) 1))
+                    OP-PROPSTOREKEY
+                    (store! current (n-in (load current) 1)) OP-PROPDELETEKEY
+                    (store! current (n-in (load current) 1))
                     OP-ARRAYSTORE
                     (store! current (n-in (load current) 1)) OP-ARRAYRESIZE
                     (store! current (n-in (load current) 1)) OP-ARRAYLOAD
@@ -1255,6 +1265,8 @@
             true OP-STORE
             (ms-memory-chain-phi? (n-in node 1)) OP-PROPSTORE
             (ms-memory-chain-phi? (n-in node 1)) OP-PROPDELETE
+            (ms-memory-chain-phi? (n-in node 1)) OP-PROPSTOREKEY
+            (ms-memory-chain-phi? (n-in node 1)) OP-PROPDELETEKEY
             (ms-memory-chain-phi? (n-in node 1)) OP-SETPROTO
             (ms-memory-chain-phi? (n-in node 1)) OP-ARRAYSTORE
             (ms-memory-chain-phi? (n-in node 1)) OP-ARRAYRESIZE
@@ -1290,7 +1302,16 @@
                   fallback))) OP-PROPDELETE
         (let [object-block (ms-node-block owner (n-in node 2))]
           (if (and (>= object-block 0) (!= object-block (ms-entry-block owner)))
-              object-block fallback)) OP-SETPROTO
+              object-block fallback)) OP-PROPSTOREKEY
+        (let [value-block (ms-node-block owner (n-in node 4))
+              key-block (ms-node-block owner (n-in node 3))]
+          (if (and (>= value-block 0) (!= value-block (ms-entry-block owner)))
+              value-block
+              (if (and (>= key-block 0) (!= key-block (ms-entry-block owner)))
+                  key-block fallback))) OP-PROPDELETEKEY
+        (let [key-block (ms-node-block owner (n-in node 3))]
+          (if (and (>= key-block 0) (!= key-block (ms-entry-block owner)))
+              key-block fallback)) OP-SETPROTO
         (let [prototype-block (ms-node-block owner (n-in node 3))
               object-block (ms-node-block owner (n-in node 2))]
           (if (and (>= prototype-block 0) (!= prototype-block (ms-entry-block owner)))
@@ -1368,10 +1389,12 @@
     (or (= op OP-STORE)
         (or (= op OP-PROPSTORE)
             (or (= op OP-PROPDELETE)
+                (or (= op OP-PROPSTOREKEY)
+                    (or (= op OP-PROPDELETEKEY)
                 (or (= op OP-SETPROTO)
                 (or (= op OP-ARRAYSTORE)
                     (or (= op OP-ARRAYRESIZE)
-                        (or (= op OP-ARRAYCOPY) (= op OP-STRINGSPLIT))))))))))
+                        (or (= op OP-ARRAYCOPY) (= op OP-STRINGSPLIT))))))))))))
 
 (defn ms-select-memory-at! [(owner i64) (node i64) (bid i64)] (-> bool)
   (if (ms-seen? owner node)
@@ -1451,7 +1474,9 @@
                         (store! ok false)
                         (let [fresh (ms-new-vreg!)
                               effect-bid bid
+                              key (ms-select-property-key! owner node effect-bid)
                               at (ms-emit! owner effect-bid (mi-new MI-JSPROP fresh object value 1 node))]
+                          (ms-add-single-arg! at key)
                           (ms-add-memory-deps! at node 1 1)))))
                 OP-PROPDELETE
               (if (not (ms-select-memory-at! owner (n-in node 1) bid))
@@ -1461,8 +1486,35 @@
                         (store! ok false)
                         (let [fresh (ms-new-vreg!)
                               effect-bid bid
+                              key (ms-select-property-key! owner node effect-bid)
                               at (ms-emit! owner effect-bid
                                            (mi-new MI-JSPROP fresh object object 4 node))]
+                          (ms-add-single-arg! at key)
+                          (ms-add-memory-deps! at node 1 1)))))
+                OP-PROPSTOREKEY
+              (if (not (ms-select-memory-at! owner (n-in node 1) bid))
+                  (store! ok false)
+                  (let [object (ms-select-value-at! owner (n-in node 2) bid)
+                        key (ms-select-value-at! owner (n-in node 3) bid)
+                        value (ms-select-value-at! owner (n-in node 4) bid)]
+                    (if (or (< object 0) (or (< key 0) (< value 0)))
+                        (store! ok false)
+                        (let [fresh (ms-new-vreg!)
+                              at (ms-emit! owner bid
+                                           (mi-new MI-JSPROP fresh object value 1 node))]
+                          (ms-add-single-arg! at key)
+                          (ms-add-memory-deps! at node 1 1)))))
+                OP-PROPDELETEKEY
+              (if (not (ms-select-memory-at! owner (n-in node 1) bid))
+                  (store! ok false)
+                  (let [object (ms-select-value-at! owner (n-in node 2) bid)
+                        key (ms-select-value-at! owner (n-in node 3) bid)]
+                    (if (or (< object 0) (< key 0))
+                        (store! ok false)
+                        (let [fresh (ms-new-vreg!)
+                              at (ms-emit! owner bid
+                                           (mi-new MI-JSPROP fresh object object 4 node))]
+                          (ms-add-single-arg! at key)
                           (ms-add-memory-deps! at node 1 1)))))
                 OP-ARRAYSTORE
               (if (not (ms-select-memory-at! owner (n-in node 1) bid))
@@ -1571,10 +1623,12 @@
                         (store! ok false)
                         (let [fresh (ms-new-vreg!)
                               effect-bid bid
+                              key (ms-immediate! owner effect-bid 0)
                               at
                                 (ms-emit! owner
                                           effect-bid
                                           (mi-new MI-JSPROP fresh object prototype 2 node))]
+                          (ms-add-single-arg! at key)
                           (ms-add-memory-deps! at node 1 1)))))
                 OP-ARG
               0 OP-PARM
@@ -1772,8 +1826,8 @@
     (ms-add-single-arg! at value)
     fresh))
 
-(defn ms-select-string-const! [(owner i64) (node i64) (bid i64)] (-> i64)
-  (let [string (n-aux node)
+(defn ms-select-string-id! [(owner i64) (string i64) (node i64) (bid i64)] (-> i64)
+  (let [
         length (jss-length string)
         zero (ms-immediate! owner bid 0)
         length-value (ms-immediate! owner bid length)
@@ -1793,6 +1847,17 @@
                                       JSSOP-SET-UNIT))
                 (store! index (+ (load index) 1)))))
     (load result)))
+
+(defn ms-select-string-const! [(owner i64) (node i64) (bid i64)] (-> i64)
+  (ms-select-string-id! owner (n-aux node) node bid))
+
+;; Static property names enter the same runtime string-key space as computed keys. The ideal IR
+;; keeps compact interned ids in AUX; selection materializes their UTF-16 key at the call boundary.
+(defn ms-select-property-key! [(owner i64) (node i64) (bid i64)] (-> i64)
+  (ms-select-string-id! owner
+                        (jss-from-utf8! (shape-name-bytes (n-aux node)))
+                        NO-NODE
+                        bid))
 
 (defn ms-select-string-binary! [(owner i64) (node i64) (bid i64) (operation i64)] (-> i64)
   (let [left (ms-select-value-at! owner (n-in node 1) bid)
@@ -2249,10 +2314,12 @@
                       (if (< object 0)
                           (ms-fail! MSEL-UNSUPPORTED node)
                           (let [fresh (ms-new-vreg!)
+                                key (ms-select-property-key! owner node pinned-bid)
                                 at
                                   (ms-emit! owner
                                             pinned-bid
                                             (mi-new MI-JSPROP fresh object object 0 node))]
+                            (ms-add-single-arg! at key)
                             (ms-add-memory-deps! at node 1 1)
                             (store! vr fresh))))))
                   OP-PROPHAS
@@ -2264,8 +2331,10 @@
                         (if (< object 0)
                             (ms-fail! MSEL-UNSUPPORTED node)
                             (let [fresh (ms-new-vreg!)
+                                  key (ms-select-property-key! owner node pinned-bid)
                                   at (ms-emit! owner pinned-bid
                                                (mi-new MI-JSPROP fresh object object 3 node))]
+                              (ms-add-single-arg! at key)
                               (ms-add-memory-deps! at node 1 1)
                               (store! vr fresh))))))
                   OP-PROTOHAS
@@ -2278,8 +2347,40 @@
                         (if (or (< object 0) (< prototype 0))
                             (ms-fail! MSEL-UNSUPPORTED node)
                             (let [fresh (ms-new-vreg!)
+                                  key (ms-immediate! owner pinned-bid 0)
                                   at (ms-emit! owner pinned-bid
                                                (mi-new MI-JSPROP fresh object prototype 5 node))]
+                              (ms-add-single-arg! at key)
+                              (ms-add-memory-deps! at node 1 1)
+                              (store! vr fresh))))))
+                  OP-PROPLOADKEY
+                (let [pinned-bid (ms-pinned-read-block owner node bid)]
+                  (if (or (not (ms-select-control-effects! owner (n-in node 0) pinned-bid))
+                          (not (ms-select-memory-at! owner (n-in node 1) pinned-bid)))
+                      (ms-fail! MSEL-UNSUPPORTED node)
+                      (let [object (ms-select-value-at! owner (n-in node 2) pinned-bid)
+                            key (ms-select-value-at! owner (n-in node 3) pinned-bid)]
+                        (if (or (< object 0) (< key 0))
+                            (ms-fail! MSEL-UNSUPPORTED node)
+                            (let [fresh (ms-new-vreg!)
+                                  at (ms-emit! owner pinned-bid
+                                               (mi-new MI-JSPROP fresh object object 0 node))]
+                              (ms-add-single-arg! at key)
+                              (ms-add-memory-deps! at node 1 1)
+                              (store! vr fresh))))))
+                  OP-PROPHASKEY
+                (let [pinned-bid (ms-pinned-read-block owner node bid)]
+                  (if (or (not (ms-select-control-effects! owner (n-in node 0) pinned-bid))
+                          (not (ms-select-memory-at! owner (n-in node 1) pinned-bid)))
+                      (ms-fail! MSEL-UNSUPPORTED node)
+                      (let [object (ms-select-value-at! owner (n-in node 2) pinned-bid)
+                            key (ms-select-value-at! owner (n-in node 3) pinned-bid)]
+                        (if (or (< object 0) (< key 0))
+                            (ms-fail! MSEL-UNSUPPORTED node)
+                            (let [fresh (ms-new-vreg!)
+                                  at (ms-emit! owner pinned-bid
+                                               (mi-new MI-JSPROP fresh object object 3 node))]
+                              (ms-add-single-arg! at key)
                               (ms-add-memory-deps! at node 1 1)
                               (store! vr fresh))))))
                   OP-ARRAYMARK
@@ -3067,7 +3168,9 @@
             (or (= op OP-PROPLOAD)
                 (or (= op OP-PROPHAS)
                     (or (= op OP-PROTOHAS)
-                        (or (= op OP-ARRAYLOAD) (= op OP-ARRAYLEN)))))))))
+                        (or (= op OP-PROPLOADKEY)
+                            (or (= op OP-PROPHASKEY)
+                                (or (= op OP-ARRAYLOAD) (= op OP-ARRAYLEN)))))))))))
 
 ;; The block a control-anchored heap operation belongs to, or -1 when it has none.
 (defn ms-inst-anchor-block [(owner i64) (at i64)] (-> i64)
@@ -3353,14 +3456,17 @@
 
 (defn ms-machine-memory-read? [(m (ptr MInst))] (-> bool)
   (or (= (load (field m op)) MI-LOAD)
-      (or (and (= (load (field m op)) MI-JSPROP) (= (load (field m imm)) 0))
+      (or (and (= (load (field m op)) MI-JSPROP)
+               (or (= (load (field m imm)) 0)
+                   (or (= (load (field m imm)) 3) (= (load (field m imm)) 5))))
           (and (= (load (field m op)) MI-JSARRAY)
                (or (= (load (field m imm)) 1) (= (load (field m imm)) 3))))))
 
 (defn ms-machine-memory-write? [(m (ptr MInst))] (-> bool)
   (or (= (load (field m op)) MI-STORE)
       (or (and (= (load (field m op)) MI-JSPROP)
-               (or (= (load (field m imm)) 1) (= (load (field m imm)) 2)))
+               (or (= (load (field m imm)) 1)
+                   (or (= (load (field m imm)) 2) (= (load (field m imm)) 4))))
           (and (= (load (field m op)) MI-JSARRAY)
                (or (= (load (field m imm)) 2)
                    (or (= (load (field m imm)) 4) (= (load (field m imm)) 5)))))))
@@ -3761,6 +3867,8 @@
           OP-STORE
         (>= (ms-node-inst-before owner node at) 0) OP-PROPSTORE
         (>= (ms-node-inst-before owner node at) 0) OP-PROPDELETE
+        (>= (ms-node-inst-before owner node at) 0) OP-PROPSTOREKEY
+        (>= (ms-node-inst-before owner node at) 0) OP-PROPDELETEKEY
         (>= (ms-node-inst-before owner node at) 0) OP-SETPROTO
         (>= (ms-node-inst-before owner node at) 0) OP-ARRAYSTORE
         (>= (ms-node-inst-before owner node at) 0) OP-ARRAYRESIZE
@@ -3947,7 +4055,8 @@
           true MI-STACKARG
           true MI-ABI-COPY
           (ms-input-valid? at a) MI-NEW
-          true MI-JSPROP
+          (and (and (ms-input-valid? at a) (ms-input-valid? at b))
+               (ms-call-args-valid? at)) MI-JSPROP
           (and (ms-input-valid? at a) (ms-input-valid? at b)) MI-JSARRAY
           (and (and (ms-input-valid? at a) (ms-input-valid? at b))
                (ms-call-args-valid? at))

@@ -26,6 +26,7 @@
 (const FNG-LVALUE-LOCAL i64 0)
 (const FNG-LVALUE-FIELD i64 1)
 (const FNG-LVALUE-ELEMENT i64 2)
+(const FNG-LVALUE-PROPERTYKEY i64 3)
 (const FNG-ARRAY i64 -6)
 (const FNG-STRING i64 -7)
 (const FNG-INTRINSIC-STRING i64 -8)
@@ -3375,10 +3376,16 @@
                     (fng-record-dynamic-alias! context JS-PROPERTY-ALIAS)
                     0)
                   (do
-                    (store! (field value kind) FNG-LVALUE-ELEMENT)
+                    (store! (field value kind)
+                            (if (= (fng-infer context key-node FNG-DYNAMIC) FNG-NUMBER)
+                                FNG-LVALUE-ELEMENT
+                                FNG-LVALUE-PROPERTYKEY))
                     (store! (field value object) (fng-expression context object-node))
                     (let [key (fng-expression context key-node)]
-                      (store! (field value key) (fng-int-value context key-node key)))
+                      (store! (field value key)
+                              (if (= (load (field value kind)) FNG-LVALUE-ELEMENT)
+                                  (fng-int-value context key-node key)
+                                  key)))
                     0)))))
     (load value)))
 
@@ -3398,9 +3405,13 @@
                 (n-load! (fng-current-memory context (load (field value alias)))
                          cast-node
                          (load (field value alias)))))
-          (fng-jsl-call2 context "GetElement"
-                         (load (field value object))
-                         (load (field value key))))))
+          (if (= (load (field value kind)) FNG-LVALUE-ELEMENT)
+              (fng-jsl-call2 context "GetElement"
+                             (load (field value object))
+                             (load (field value key)))
+              (fng-jsl-call2 context "GetProperty"
+                             (load (field value object))
+                             (load (field value key)))))))
 
 (defn fng-element-load-value [(context FngContext)
                               (object-node i64)
@@ -3415,9 +3426,11 @@
                            object
                            (fng-const (shape-name-intern! (fng-nonindex-key-text ast key-node)))))
         (let [key (fng-expression context key-node)]
-          (fng-jsl-call2 context "GetElement"
-                         object
-                         (fng-int-value context key-node key))))))
+          (if (= (fng-infer context key-node FNG-DYNAMIC) FNG-NUMBER)
+              (fng-jsl-call2 context "GetElement"
+                             object
+                             (fng-int-value context key-node key))
+              (fng-jsl-call2 context "GetProperty" object key))))))
 
 (defn fng-optional-element-load [(context FngContext) (node i64)] (-> i64)
   (let [frontend (load (field context frontend))
@@ -3504,10 +3517,15 @@
                 (store! (load (field context memory)) (fng-merge memories))
                 (al-free! [i64] (mut memories))
                 new-value))
-          (fng-jsl-call3 context "SetElement"
-                         (load (field target object))
-                         (load (field target key))
-                         new-value))))
+          (if (= (load (field target kind)) FNG-LVALUE-ELEMENT)
+              (fng-jsl-call3 context "SetElement"
+                             (load (field target object))
+                             (load (field target key))
+                             new-value)
+              (fng-jsl-call3 context "SetProperty"
+                             (load (field target object))
+                             (load (field target key))
+                             new-value)))))
 
 (defn fng-update-local [(context FngContext) (node i64) (prefix bool)] (-> i64)
   (let [frontend (load (field context frontend))
@@ -3651,10 +3669,14 @@
             (let [target (ts-role ast node TS-ROLE-EXPRESSION 0)
                   object-node (ts-child ast target 0)
                   name-node (ts-child ast target 1)]
-              (fng-jsl-call2 context "DeleteNamedProperty"
-                             (fng-expression context object-node)
-                             (fng-const
-                               (shape-name-intern! (ts-text ast name-node)))))
+              (if (= (ts-kind ast target) TSK-PROPERTY-ACCESS)
+                  (fng-jsl-call2 context "DeleteNamedProperty"
+                                 (fng-expression context object-node)
+                                 (fng-const
+                                   (shape-name-intern! (ts-text ast name-node))))
+                  (fng-jsl-call2 context "DeleteProperty"
+                                 (fng-expression context object-node)
+                                 (fng-expression context name-node))))
           (= kind TSK-TYPEOF-EXPRESSION)
             (fng-jsl-call1 context "TypeOfValue"
                            (n-box! (fng-callback-value context
@@ -3883,10 +3905,13 @@
                                             (fng-jsl-call2 context "StringEquals" left right)
                                             (fng-equal-value context left-node left right-node right))))
                               (str-eq operator "in")
-                                (fng-jsl-call2 context "HasNamedProperty"
-                                               right
-                                               (fng-const
-                                                 (fng-static-property-name ast left-node)))
+                                (if (or (= (ts-kind ast left-node) TSK-STRING-LITERAL)
+                                        (= (ts-kind ast left-node) TSK-NUMERIC-LITERAL))
+                                    (fng-jsl-call2 context "HasNamedProperty"
+                                                   right
+                                                   (fng-const
+                                                     (fng-static-property-name ast left-node)))
+                                    (fng-jsl-call2 context "HasProperty" right left))
                               (str-eq operator "instanceof")
                                 (let [constructor (fe-find-function-name frontend right-node)]
                                   (if (>= constructor 0)

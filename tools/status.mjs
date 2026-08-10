@@ -133,7 +133,7 @@ const UNSUPPORTED = {
     "tagged template literals", "destructuring", "spread and rest",
     "`for...of` / `for...in`", "`class`", "getters and setters", "computed property names",
     "optional calls through unknown present callables (needs call descriptors/adapters)", "`try`/`catch`/`finally`",
-    "computed-key `in` and `delete`; dynamic-RHS/custom-`Symbol.hasInstance` `instanceof`",
+    "dynamic-RHS/custom-`Symbol.hasInstance` `instanceof`",
   ],
   "Needs a runtime this compiler does not have": [
     "`Map` / `Set` / `WeakMap`", "`Promise` and `async`/`await`", "generators and iterators",
@@ -171,6 +171,8 @@ missing(mathMembers, MATH, "Math");
 const forbiddenFrontendBuilders = [
   "n-js-builtin!", "n-number-to-string!", "n-js-throw!",
   "n-prop-load-at!", "n-prop-store-at!", "n-prop-delete-at!",
+  "n-prop-load-key-at!", "n-prop-store-key-at!", "n-prop-has-key-at!",
+  "n-prop-delete-key-at!",
   "n-array-load-at!", "n-array-store-at!", "n-array-length-at!",
   "n-array-resize-at!", "n-array-resize-after-at!", "n-array-copy-at!",
   "n-set-prototype-at!",
@@ -232,7 +234,7 @@ out.push("Numbers and all 25 arithmetic, bitwise, comparison and logical operato
 out.push("compound-assignment forms; `if`, `for`, `while`, `do`, `switch`, labels, `break`, `continue`,");
 out.push("ternaries, short-circuit operators and optional calls with known targets; function declarations, function expressions and block/expression-bodied arrows with lexical `this`, default parameters, closures with");
 out.push("mutable capture, recursion, `this`, `new` and constructors; object literals, structural types,");
-out.push("prototypes, dynamic and missing properties, named-key `in`, named-property `delete`, and ordinary `instanceof` with known constructors; array literals with holes, indexing and growth;");
+out.push("prototypes, dynamic and missing properties, computed string/number-key get, set, `in`, and `delete`, and ordinary `instanceof` with known constructors; array literals with holes, indexing and growth;");
 out.push("string and template literals with interpolation and cooked escapes, concatenation; `throw`; type aliases, interfaces and union annotations.");
 out.push("");
 out.push("## Not supported");

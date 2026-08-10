@@ -90,6 +90,7 @@ static size_t js_arrays_len, js_arrays_cap;
 static uint32_t js_array_cache[JS_OBJECT_CACHE_SIZE];
 static JsStringRec **js_strings;
 static size_t js_strings_len, js_strings_cap;
+static JsStringRec *js_string_lookup(uintptr_t raw);
 
 static int reserve_records(void **records, size_t *record_cap, size_t needed, size_t width) {
   if (needed <= *record_cap) return 1;
@@ -127,8 +128,28 @@ static JsObjectRec *js_object(uintptr_t owner, int create) {
   return &js_objects[js_objects_len++];
 }
 
-static size_t js_property_hash(uintptr_t owner, uint64_t name) {
-  return (size_t)(((owner >> 3) ^ (name * UINT64_C(11400714819323198485))) &
+static uint64_t js_property_key_hash(AotJsValue key) {
+  JsStringRec *string = js_string_lookup((uintptr_t)key);
+  if (!string) return (uint64_t)key;
+  uint64_t hash = UINT64_C(1469598103934665603);
+  for (size_t i = 0; i < string->length; ++i) {
+    hash ^= string->units[i];
+    hash *= UINT64_C(1099511628211);
+  }
+  return hash;
+}
+
+static int js_property_key_equal(AotJsValue left, AotJsValue right) {
+  JsStringRec *a = js_string_lookup((uintptr_t)left);
+  JsStringRec *b = js_string_lookup((uintptr_t)right);
+  if (!a || !b) return left == right;
+  return a->length == b->length &&
+         (!a->length || memcmp(a->units, b->units, a->length * sizeof(*a->units)) == 0);
+}
+
+static size_t js_property_hash(uintptr_t owner, AotJsValue key) {
+  return (size_t)(((owner >> 3) ^
+                   (js_property_key_hash(key) * UINT64_C(11400714819323198485))) &
                   (JS_PROPERTY_CACHE_SIZE - 1));
 }
 
@@ -153,14 +174,14 @@ static void js_property_cache_rebuild(void) {
     if (js_properties[i].owner && !js_property_cache_insert(i)) break;
 }
 
-static JsPropertyRec *js_own_property(uintptr_t owner, uint64_t name) {
-  size_t slot = js_property_hash(owner, name);
+static JsPropertyRec *js_own_property(uintptr_t owner, AotJsValue key) {
+  size_t slot = js_property_hash(owner, key);
   for (size_t probe = 0; probe < JS_PROPERTY_CACHE_SIZE; ++probe) {
     uint32_t cached = js_property_cache[slot];
     if (!cached) break;
     if (cached <= js_properties_len) {
       JsPropertyRec *property = &js_properties[cached - 1];
-      if (property->owner == owner && property->name == name) {
+      if (property->owner == owner && js_property_key_equal(property->name, key)) {
 #ifdef AOT_DEBUG_PROPERTY_LOOP
         ++debug_property_cache_hits;
 #endif
@@ -174,7 +195,8 @@ static JsPropertyRec *js_own_property(uintptr_t owner, uint64_t name) {
 #endif
   if (js_property_cache_complete) return NULL;
   for (size_t i = js_properties_len; i > 0; --i)
-    if (js_properties[i - 1].owner == owner && js_properties[i - 1].name == name) {
+    if (js_properties[i - 1].owner == owner &&
+        js_property_key_equal(js_properties[i - 1].name, key)) {
       return &js_properties[i - 1];
     }
   return NULL;
@@ -573,6 +595,8 @@ AotJsValue aot_js_string(uintptr_t a, int64_t b,
   }
   if (operation == AOT_JS_STRING_FROM_VALUE) {
     AotJsValue input = (AotJsValue)a;
+    JsStringRec *existing = js_string_lookup((uintptr_t)input);
+    if (existing) return (AotJsValue)(uintptr_t)existing;
     uint64_t tag = aot_js_tag(input);
     if (tag == AOT_JS_STRING) return (AotJsValue)aot_js_payload(input);
     if (tag == AOT_JS_UNDEFINED || tag == AOT_JS_NULL || tag == AOT_JS_BOOLEAN ||
@@ -911,15 +935,46 @@ AotJsValue aot_js_array(uintptr_t owner, int64_t index,
   return AOT_JS_UNDEFINED;
 }
 
-/* Canonical native named-property ABI. Operation 0 loads through the prototype
+static int js_property_array_index(AotJsValue key, int64_t *out) {
+  JsStringRec *string = js_string_lookup((uintptr_t)key);
+  if (!string || !string->length) return 0;
+  if (string->length > 1 && string->units[0] == '0') return 0;
+  uint64_t value = 0;
+  for (size_t i = 0; i < string->length; ++i) {
+    uint16_t unit = string->units[i];
+    if (unit < '0' || unit > '9') return 0;
+    value = value * 10 + (uint64_t)(unit - '0');
+    if (value >= UINT64_C(4294967295)) return 0;
+  }
+  *out = (int64_t)value;
+  return 1;
+}
+
+/* Canonical native PropertyKey ABI. `name` is a runtime string key (and later a Symbol), so
+   compile-time names and computed names use the same content-based table. Operation 0 loads through the prototype
    chain, 1 stores an own boxed value, 2 installs a raw managed prototype, and
    3 tests presence through the prototype chain without conflating undefined with absence,
    4 deletes an own configurable property, and 5 tests prototype-chain identity.
-   Name ids are compilation-unit-local dense integers emitted by shape.coil. */
+   The runtime owns string records for the duration of the compilation unit. */
 AotJsValue aot_js_property(uintptr_t owner, uint64_t name,
                            AotJsValue value, uint64_t operation) {
   if (aot_js_managed((AotJsValue)owner)) owner = aot_js_payload((AotJsValue)owner);
   if (!owner) return AOT_JS_UNDEFINED;
+  int64_t array_index = 0;
+  JsArrayRec *indexed_array = js_array(owner, 0);
+  if (indexed_array && js_property_array_index((AotJsValue)name, &array_index)) {
+    if (operation == 0) return aot_js_array(owner, array_index, value, 1);
+    if (operation == 1) return aot_js_array(owner, array_index, value, 2);
+    if (operation == 3)
+      return (size_t)array_index < indexed_array->length && indexed_array->present[array_index];
+    if (operation == 4) {
+      if ((size_t)array_index < indexed_array->length) {
+        indexed_array->present[array_index] = 0;
+        indexed_array->elements[array_index] = AOT_JS_UNDEFINED;
+      }
+      return 1;
+    }
+  }
 #ifdef AOT_DEBUG_PROPERTY_LOOP
   static size_t debug_property_events;
   static size_t debug_strength_events;
