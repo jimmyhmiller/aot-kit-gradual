@@ -1046,7 +1046,8 @@
                     (ev-prop-has-key n) OP-PROPDELETEKEY
                     (ev-prop-delete-key n) OP-OWNKEYCOUNT
                     (ev-own-key-count n) OP-OWNKEYAT
-                    (ev-own-key-at n) OP-ARRAYMARK
+                    (ev-own-key-at n) OP-OBJECTFREEZE
+                    (ev-object-freeze n) OP-ARRAYMARK
                     (ev-array-mark n) OP-ARRAYTEST
                     (ev-array-test n) OP-ARRAYUNBOX
                     (ev-array-unbox n) OP-ARRAYLOAD
@@ -1309,6 +1310,8 @@
                           (RUndef)
                           (if (= (& (hv-mask ver) (<< 1 JS-PROPERTY-ALIAS)) 0)
                               (ev-fail! EV-MEM n)
+                              (if (jso-frozen? object)
+                                  (ev-fail! EV-THROW n)
                               (do
                                 (ev-trace-event! EVT-PROPSTORE
                                                  n
@@ -1321,7 +1324,7 @@
                                 ;; Named properties are deliberately imperative in the whole-program
                                 ;; evaluator. Preserve the ordered alias token without appending an
                                 ;; unused historical value for every loop iteration.
-                                (RMem ver))))))))))))
+                                (RMem ver)))))))))))))
 
 (defn ev-prop-has [(n i64)] (-> RtVal)
   (let [mv (ev-data (n-in n 1))]
@@ -1351,9 +1354,11 @@
                     (RUndef)
                     (if (= (& (hv-mask ver) (<< 1 JS-PROPERTY-ALIAS)) 0)
                         (ev-fail! EV-MEM n)
+                        (if (jso-frozen? object)
+                            (ev-fail! EV-THROW n)
                         (do
                           (jso-delete! object (shape-name-bytes (n-aux n)))
-                          (RMem ver))))))))))
+                          (RMem ver)))))))))))
 
 (defn ev-prototype-has [(n i64)] (-> RtVal)
   (let [mv (ev-data (n-in n 1))]
@@ -1467,6 +1472,8 @@
               (mut bytes) (al-new [u8] (malloc-allocator))]
           (if (or (ev-failed?) (= (& (hv-mask ver) (<< 1 JS-PROPERTY-ALIAS)) 0))
               (do (al-free! [u8] (mut bytes)) (ev-fail! EV-MEM n))
+              (if (jso-frozen? object)
+                  (do (al-free! [u8] (mut bytes)) (ev-fail! EV-THROW n))
               (do
                 (if (and (ev-array-object? object) (ev-property-key-length? key))
                     (if (= (rt-tag vv) RT-INT)
@@ -1480,7 +1487,7 @@
                           (jso-store! object (jss-utf8! key (mut bytes)) (dyn-encode vv)))))
                 (al-free! [u8] (mut bytes))
                 (al-set! [i64] (field (ev) objs) object (jso-shape object))
-                (RMem ver)))))))
+                (RMem ver))))))))
 
 (defn ev-prop-has-key [(n i64)] (-> RtVal)
   (let [mv (ev-data (n-in n 1))
@@ -1516,6 +1523,8 @@
               (mut bytes) (al-new [u8] (malloc-allocator))]
           (if (or (ev-failed?) (= (& (hv-mask ver) (<< 1 JS-PROPERTY-ALIAS)) 0))
               (do (al-free! [u8] (mut bytes)) (ev-fail! EV-MEM n))
+              (if (jso-frozen? object)
+                  (do (al-free! [u8] (mut bytes)) (ev-fail! EV-THROW n))
               (do
                 (let [array-index
                         (if (ev-array-object? object)
@@ -1525,7 +1534,7 @@
                       (ev-array-current-delete! object array-index)
                       (do (jso-delete! object (jss-utf8! key (mut bytes))) 0)))
                 (al-free! [u8] (mut bytes))
-                  (RMem ver)))))))
+                  (RMem ver))))))))
 
 (defn ev-array-present-count [(object i64)] (-> i64)
   (let [length (ev-array-current-length object) (mut index) 0 (mut count) 0]
@@ -1588,6 +1597,14 @@
                   (ev-fail! EV-TYPE n)
                   (RUndef))))))))))
 
+(defn ev-object-freeze [(n i64)] (-> RtVal)
+  (let [mv (ev-data (n-in n 1)) ov (ev-data (n-in n 2))]
+    (if (ev-failed?) (RUndef)
+        (let [ver (rt-need-mem mv n) object (rt-need-obj ov n)]
+          (if (or (ev-failed?) (= (& (hv-mask ver) (<< 1 JS-PROPERTY-ALIAS)) 0))
+              (ev-fail! EV-MEM n)
+              (do (jso-freeze! object) (RMem ver)))))))
+
 (defn ev-set-proto [(n i64)] (-> RtVal)
   (let [mv (ev-data (n-in n 1))]
     (if (ev-failed?)
@@ -1602,7 +1619,9 @@
                           object (rt-need-obj ov n)]
                       (if (ev-failed?)
                           (RUndef)
-                          (if (= (& (hv-mask ver) (<< 1 JS-PROPERTY-ALIAS)) 0)
+                          (if (jso-frozen? object)
+                              (ev-fail! EV-THROW n)
+                              (if (= (& (hv-mask ver) (<< 1 JS-PROPERTY-ALIAS)) 0)
                               (ev-fail! EV-MEM n)
                               (if (and (!= (rt-tag pv) RT-OBJ) (!= (rt-tag pv) RT-NULL))
                                   (ev-fail! EV-TYPE n)
@@ -1622,7 +1641,7 @@
                                         (ev-fail! EV-SHAPE n)
                                         (do
                                           (jso-set-prototype! object prototype)
-                                          (RMem (hv-proto-write! ver object pv))))))))))))))))
+                                          (RMem (hv-proto-write! ver object pv)))))))))))))))))
 
 (defn ev-array-element-index [(object i64) (index i64)] (-> i64)
   (let [elements (load (field (ev) array-elements))
@@ -1772,12 +1791,14 @@
                                     object (rt-need-obj av n)]
                                 (if (ev-failed?)
                                     (RUndef)
-                                    (if (= (& (hv-mask ver) (<< 1 JS-PROPERTY-ALIAS)) 0)
+                                    (if (jso-frozen? object)
+                                        (ev-fail! EV-THROW n)
+                                        (if (= (& (hv-mask ver) (<< 1 JS-PROPERTY-ALIAS)) 0)
                                         (ev-fail! EV-MEM n)
                                         (RMem (ev-array-publish-write! ver
                                                                        object
                                                                        (rt-payload iv)
-                                                                       value)))))))))))))))
+                                                                       value))))))))))))))))
 
 (defn ev-array-length [(n i64)] (-> RtVal)
   (let [mv (ev-data (n-in n 1))]
@@ -1813,11 +1834,13 @@
                                   object (rt-need-obj av n)]
                               (if (ev-failed?)
                                   (RUndef)
-                                  (if (= (& (hv-mask ver) (<< 1 JS-PROPERTY-ALIAS)) 0)
+                                  (if (jso-frozen? object)
+                                      (ev-fail! EV-THROW n)
+                                      (if (= (& (hv-mask ver) (<< 1 JS-PROPERTY-ALIAS)) 0)
                                       (ev-fail! EV-MEM n)
                                       (let [length (if (< (rt-payload lv) 0) 0 (rt-payload lv))]
                                         (ev-array-current-resize! object length)
-                                        (RMem (hv-array-resize! ver object length)))))))))))))))
+                                        (RMem (hv-array-resize! ver object length))))))))))))))))
 
 (defn ev-array-copy [(n i64)] (-> RtVal)
   (let [mv (ev-data (n-in n 1))
@@ -1834,7 +1857,9 @@
                   start (rt-payload iv)]
               (if (ev-failed?)
                   (RUndef)
-                  (if (= (& (hv-mask ver) (<< 1 JS-PROPERTY-ALIAS)) 0)
+                  (if (jso-frozen? result)
+                      (ev-fail! EV-THROW n)
+                      (if (= (& (hv-mask ver) (<< 1 JS-PROPERTY-ALIAS)) 0)
                       (ev-fail! EV-MEM n)
                       (let [count (ev-array-current-length result)
                             (mut current) ver
@@ -1852,7 +1877,7 @@
                                           0)
                                         0)
                                     (store! index (+ (load index) 1)))))
-                        (RMem (load current))))))))))
+                        (RMem (load current)))))))))))
 
 (defn ev-need-string [(value RtVal) (n i64)] (-> i64)
   (if (= (rt-tag value) RT-STR)

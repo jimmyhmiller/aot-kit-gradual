@@ -108,6 +108,7 @@ const OTHER = [
   ["`Object.values(x)`", "ObjectValues"],
   ["`Object.entries(x)`", "ObjectEntries"],
   ["`Object.assign(target, ...sources)`", "ObjectAssignSource"],
+  ["`Object.freeze(x)`", "ObjectFreeze"],
   ["`Infinity`", "Infinity"],
   ["`Number.MAX_SAFE_INTEGER`", "MaxSafeInteger"],
   ["`parseFloat(x)`", "ParseFloatValue"],
@@ -130,7 +131,6 @@ const UNSUPPORTED = {
     "`String.prototype.search`", "`String.prototype.replace`", "`RegExp`",
   ],
   "Needs a frontend intrinsic, like the one `Number` just got": [
-    "`Object.freeze`",
     "`JSON.parse`/`stringify`", "`String.prototype.normalize`",
     "`String.prototype.localeCompare`", "`String.raw`",
   ],

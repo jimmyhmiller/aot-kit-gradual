@@ -54,6 +54,7 @@ static int array_growth_disabled;
 typedef struct {
   uintptr_t owner;
   uintptr_t prototype;
+  int frozen;
 } JsObjectRec;
 typedef struct {
   uintptr_t owner;
@@ -91,6 +92,7 @@ static uint32_t js_array_cache[JS_OBJECT_CACHE_SIZE];
 static JsStringRec **js_strings;
 static size_t js_strings_len, js_strings_cap;
 static JsStringRec *js_string_lookup(uintptr_t raw);
+static void js_throw_frozen_mutation(void);
 AotJsValue aot_js_string(uintptr_t a, int64_t b, AotJsValue value, uint64_t operation);
 
 static int reserve_records(void **records, size_t *record_cap, size_t needed, size_t width) {
@@ -124,7 +126,7 @@ static JsObjectRec *js_object(uintptr_t owner, int create) {
   if (!create || !owner ||
       !reserve_records((void **)&js_objects, &js_objects_cap,
                        js_objects_len + 1, sizeof(*js_objects))) return NULL;
-  js_objects[js_objects_len] = (JsObjectRec){owner, 0};
+  js_objects[js_objects_len] = (JsObjectRec){owner, 0, 0};
   js_object_cache[slot] = (uint32_t)(js_objects_len + 1);
   return &js_objects[js_objects_len++];
 }
@@ -857,6 +859,9 @@ AotJsValue aot_js_array(uintptr_t owner, int64_t index,
                         AotJsValue value, uint64_t operation) {
   if (aot_js_managed((AotJsValue)owner)) owner = aot_js_payload((AotJsValue)owner);
   if (!owner) return AOT_JS_UNDEFINED;
+  JsObjectRec *integrity = js_object(owner, 0);
+  if (integrity && integrity->frozen && (operation == 2 || operation == 4))
+    js_throw_frozen_mutation();
   JsArrayRec *array = js_array(owner, operation == 0 || operation == 2 || operation == 4);
 #ifdef AOT_DEBUG_ARRAY
   static uint64_t debug_array_calls;
@@ -919,6 +924,8 @@ AotJsValue aot_js_array(uintptr_t owner, int64_t index,
   if (operation == 5) {
     uintptr_t result_owner = (uintptr_t)value;
     if (aot_js_managed(value)) result_owner = aot_js_payload(value);
+    JsObjectRec *result_integrity = js_object(result_owner, 0);
+    if (result_integrity && result_integrity->frozen) js_throw_frozen_mutation();
     JsArrayRec *result = js_array(result_owner, 0);
     if (!result || index < 0) return AOT_JS_UNDEFINED;
     for (size_t j = 0; j < result->length; ++j) {
@@ -959,6 +966,12 @@ static int js_property_key_ascii_equal(AotJsValue key, const char *ascii) {
   for (size_t i = 0; i < length; ++i)
     if (string->units[i] != (uint8_t)ascii[i]) return 0;
   return 1;
+}
+
+static void js_throw_frozen_mutation(void) {
+  fputs("uncaught JavaScript throw\n", stderr);
+  fflush(stderr);
+  exit(70);
 }
 
 static size_t js_own_key_count(uintptr_t owner) {
@@ -1056,6 +1069,16 @@ AotJsValue aot_js_property(uintptr_t owner, uint64_t name,
   if (!owner) return AOT_JS_UNDEFINED;
   if (operation == 6) return (AotJsValue)js_own_key_count(owner);
   if (operation == 7) return js_own_key_at(owner, (size_t)(int64_t)name);
+  if (operation == 8) {
+    JsObjectRec *object = js_object(owner, 1);
+    if (!object) return AOT_JS_UNDEFINED;
+    object->frozen = 1;
+    return (AotJsValue)owner;
+  }
+  JsObjectRec *integrity = js_object(owner, 0);
+  if (integrity && integrity->frozen &&
+      (operation == 1 || operation == 2 || operation == 4))
+    js_throw_frozen_mutation();
   int64_t array_index = 0;
   JsArrayRec *indexed_array = js_array(owner, 0);
   if (indexed_array && js_property_key_ascii_equal((AotJsValue)name, "length")) {
