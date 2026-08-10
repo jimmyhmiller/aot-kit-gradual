@@ -124,6 +124,7 @@ spelling of the same call. **These are not a backlog.**
 | `parseFloat(x)` | **done** | ParseFloatValue |
 | `Number.parseFloat(x)` | **done** | ParseFloatValue |
 | `void x` | **done** | VoidValue |
+| `typeof x` | **done** | TypeOfValue |
 
 ## Language surface that compiles
 
@@ -173,7 +174,7 @@ string literals and concatenation; `throw`; type aliases, interfaces and union a
 - nullish coalescing `??`
 - `try`/`catch`/`finally`
 - arrow functions
-- `typeof` / `instanceof` / `in` / `delete`
+- `instanceof` / `in` / `delete`
 
 ### Needs a runtime this compiler does not have
 
