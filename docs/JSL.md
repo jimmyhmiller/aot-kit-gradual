@@ -599,18 +599,18 @@ straight-line code. It does. Given
 `fast` compiles to `Return Const int=70`. No call, because a macro is inlined into its caller; no
 branch, because the guard folded; and no `%Add`, because the whole bail-out path went with it.
 
-**Which pass does it matters, so it is stated exactly.** The lowering does *not* skip the slow path
-here. `%Lt 7 0` folds to `Const bool=0` at construction, but the `If` is still built, the `goto`
-still fires, and the handler is still emitted — the graph straight after lowering contains the `If`,
-both `CProj` arms, `Add y 999`, and a Region and Phi merging them. It is `iterate!`, the peephole
-fixpoint, that collapses all of it. `jl-macro-finish`'s no-exits path is a real optimisation, but it
-fires when a `goto` is unreachable in the *source*, not when it is merely decidable.
+**Which pass does it matters, so it is stated exactly.** `%Lt 7 0` folds to `Const bool=0` while
+constructing the predicate. JSL lowering recognizes that proven boolean and lowers only the selected
+source arm. The `goto`, its handler, and `%Add y 999` never enter the graph; this is stronger than
+building them and relying on `iterate!` to delete them later. An opaque predicate still lowers the
+ordinary `If`, both projections, and the merge.
 
-That is still the thesis rather than a weakening of it. V8 reaches this shape by speculating and
+That is still the thesis. V8 reaches this shape by speculating and
 retaining deopt metadata to retreat with; under D1's closed world it falls out of ordinary constant
 propagation, with no deoptimisation machinery anywhere. `tests/jsl-test.coil` pins both halves: the
-folded case asserts zero `If`, `Add`, `Mul` and `Lt` nodes survive, and its falsification asserts
-that the same macro with an opaque argument keeps all of them.
+folded case checks before graph iteration that no `If` or dead-arm `Add` was built, then checks the
+fully folded graph; its falsification asserts that the same macro with an opaque argument keeps the
+branch and slow path.
 
 ---
 

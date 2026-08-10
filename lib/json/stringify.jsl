@@ -44,6 +44,48 @@
 (macro JsonCircularError :params [] :ret dyn
   (%Throw "TypeError: Converting circular structure to JSON"))
 
+(macro JsonGap :params [(space dyn)] :ret str
+  (if (IsNumber space)
+      (let [(integer (%ToInteger space))
+            (count (if (%IsInt integer)
+                       (let [(raw (%UnboxInt integer))]
+                         (if (%Lt raw 0) 0 (if (%Lt 10 raw) 10 raw)))
+                       (if (%Lt (%UnboxFlt integer) 0.0) 0 10)))]
+        (loop [(index 0 int) (out "" str)]
+          (if (%Le count index) out
+              (recur (%Add index 1) (%StringConcat out " ")))))
+      (if (%IsString space)
+          (%Substring (%UnboxString space) 0
+                      (if (%Lt 10 (%StringLen space)) 10 (%StringLen space)))
+          "")))
+
+(macro JsonPropertyListContains :params [(list dyn) (key dyn)] :ret bool
+  (let [(length (%ArrayLen list))]
+    (loop [(index 0 int)]
+      (if (%Le length index) false
+          (if (StringEquals (%ArrayLoad list index) key)
+              true
+              (recur (%Add index 1)))))))
+
+(builtin JsonBuildPropertyList :transitioning true
+  :params [(replacer dyn) (index int) (length int) (out dyn)] :ret dyn
+  (if (%Le length index) out
+      (let [(item (%ArrayLoad replacer index))
+            (key (if (%IsString item) item
+                     (if (IsNumber item) (%Box (ToStringValue item)) (%Box undefined))))]
+        (if (%IsUndefined key)
+            (JsonBuildPropertyList replacer (%Add index 1) length out)
+            (if (JsonPropertyListContains out key)
+                (JsonBuildPropertyList replacer (%Add index 1) length out)
+                (let [(ignored (%ArrayStore out (%ArrayLen out) key))]
+                  (JsonBuildPropertyList replacer (%Add index 1) length out)))))))
+
+(macro JsonPropertyList :transitioning true :params [(replacer dyn)] :ret dyn
+  (if (%IsArray replacer)
+      (let [(out (%BoxArray (%NewArray)))]
+        (JsonBuildPropertyList replacer 0 (%ArrayLen replacer) out))
+      (%Box undefined)))
+
 (macro JsonApplyToJSON :transitioning true
   :params [(value dyn) (key dyn)] :ret dyn
   (if (if (%IsObject value) true (%IsArray value))
@@ -56,62 +98,99 @@
             value))
       value))
 
+(macro JsonApplyReplacer :transitioning true
+  :params [(value dyn) (key dyn) (holder obj) (replacer dyn)] :ret dyn
+  (if (%IsFunction replacer)
+      (call-dynamic-with-receiver replacer holder (%Box key) (%Box value))
+      value))
+
 ;; The plain path is deliberately separate from the replacer path. A literal "no replacer" flag
 ;; would still construct the callback arm before folding, leaving an invalid call target and dead
 ;; merge values in the graph. Torque uses specialized builtins for this same reason: distinct
 ;; calling shapes should be distinct generated functions, not a runtime flag over an illegal arm.
 (builtin JsonStringifyPlainArray :transitioning true
-  :params [(array dyn) (stack dyn)] :ret dyn
+  :params [(array dyn) (stack dyn) (replacer dyn) (propertyList dyn)
+           (gap str) (indent str)] :ret dyn
   (if (JsonStackContains stack array) (JsonCircularError)
       (let [(depth (%ArrayLen stack))
             (pushed (%ArrayStore stack depth array))
             (length (%ArrayLen array))
+            (nextIndent (%StringConcat indent gap))
             (body
               (loop [(index 0 int) (out "" str)]
                 (if (%Le length index) out
                     (let [(serialized
                             (JsonStringifyPlainValue
                               (%ArrayLoad array index)
-                              (%Box (ToStringValue (%Box index))) stack))
+                              (%Box (ToStringValue (%Box index))) (%UnboxArray array) stack
+                              replacer propertyList gap nextIndent))
                           (piece (if (%IsUndefined serialized)
                                      "null" (%UnboxString serialized)))
                           (next (%StringConcat out
-                                  (%StringConcat (if (%Eq index 0) "" ",") piece)))]
+                                  (%StringConcat
+                                    (if (%Eq (%StringLen gap) 0)
+                                        (if (%Eq index 0) "" ",")
+                                        (%StringConcat
+                                          (if (%Eq index 0) "\n" ",\n") nextIndent))
+                                    piece)))]
                       (recur (%Add index 1) next)))))
-            (result (%StringConcat (%StringConcat "[" body) "]"))
+            (result (%StringConcat
+                      (%StringConcat "[" body)
+                      (if (if (%Eq (%StringLen gap) 0) true (%Eq length 0))
+                          "]" (%StringConcat (%StringConcat "\n" indent) "]"))))
             (popped (%ArrayResize stack depth (%Box result)))]
         (%Box result))))
 
 (builtin JsonStringifyPlainObjectMembers :transitioning true
-  :params [(object dyn) (stack dyn) (index int) (count int) (out dyn)] :ret dyn
+  :params [(object dyn) (stack dyn) (replacer dyn) (propertyList dyn)
+           (gap str) (indent str) (index int) (count int) (out dyn)] :ret dyn
   (if (%Le count index) out
-      (let [(key (%OwnKeyAt object index))
+      (let [(key (if (%IsArray propertyList)
+                     (%ArrayLoad propertyList index)
+                     (%OwnKeyAt object index)))
             (serialized
-              (JsonStringifyPlainValue (%PropLoadKey object key) key stack))]
+              (JsonStringifyPlainValue (%PropLoadKey object key) key (%UnboxObj object) stack
+                                       replacer propertyList gap indent))]
         (if (%IsUndefined serialized)
-            (JsonStringifyPlainObjectMembers object stack (%Add index 1) count out)
+            (JsonStringifyPlainObjectMembers object stack replacer propertyList gap indent
+                                             (%Add index 1) count out)
             (let [(member (%StringConcat
-                            (%StringConcat (JsonQuoteString key) ":")
+                            (%StringConcat (JsonQuoteString key)
+                              (if (%Eq (%StringLen gap) 0) ":" ": "))
                             (%UnboxString serialized)))
                   (next (%StringConcat out
-                          (%StringConcat (if (%Eq (%StringLen out) 0) "" ",") member)))]
-              (JsonStringifyPlainObjectMembers object stack
+                          (%StringConcat
+                            (if (%Eq (%StringLen gap) 0)
+                                (if (%Eq (%StringLen out) 0) "" ",")
+                                (%StringConcat
+                                  (if (%Eq (%StringLen out) 0) "\n" ",\n") indent))
+                            member)))]
+              (JsonStringifyPlainObjectMembers object stack replacer propertyList gap indent
                                                (%Add index 1) count next))))))
 
 (builtin JsonStringifyPlainObject :transitioning true
-  :params [(object dyn) (stack dyn)] :ret dyn
+  :params [(object dyn) (stack dyn) (replacer dyn) (propertyList dyn)
+           (gap str) (indent str)] :ret dyn
   (if (JsonStackContains stack object) (JsonCircularError)
       (let [(depth (%ArrayLen stack))
             (pushed (%ArrayStore stack depth object))
+            (nextIndent (%StringConcat indent gap))
+            (count (if (%IsArray propertyList)
+                       (%ArrayLen propertyList) (%OwnKeyCount object)))
             (body (JsonStringifyPlainObjectMembers
-                    object stack 0 (%OwnKeyCount object) ""))
-            (result (%StringConcat (%StringConcat "{" body) "}"))
+                    object stack replacer propertyList gap nextIndent 0 count ""))
+            (result (%StringConcat
+                      (%StringConcat "{" body)
+                      (if (if (%Eq (%StringLen gap) 0) true (%Eq (%StringLen body) 0))
+                          "}" (%StringConcat (%StringConcat "\n" indent) "}"))))
             (popped (%ArrayResize stack depth (%Box result)))]
         (%Box result))))
 
 (builtin JsonStringifyPlainValue :transitioning true
-  :params [(input dyn) (key dyn) (stack dyn)] :ret dyn
-  (let [(value (JsonApplyToJSON input key))]
+  :params [(input dyn) (key dyn) (holder obj) (stack dyn) (replacer dyn)
+           (propertyList dyn) (gap str) (indent str)] :ret dyn
+  (let [(jsonValue (JsonApplyToJSON input key))
+        (value (JsonApplyReplacer jsonValue key holder replacer))]
     (if (%IsString value) (%Box (JsonQuoteString value))
       (if (%IsBool value) (%Box (ToStringValue value))
         (if (%IsNull value) (%Box "null")
@@ -119,11 +198,24 @@
               (if (IsFiniteNumber value)
                   (%Box (ToStringValue value))
                   (%Box "null"))
-            (if (%IsArray value) (JsonStringifyPlainArray value stack)
-              (if (%IsObject value) (JsonStringifyPlainObject value stack)
+            (if (%IsArray value)
+                (JsonStringifyPlainArray value stack replacer propertyList gap indent)
+              (if (%IsObject value)
+                  (JsonStringifyPlainObject value stack replacer propertyList gap indent)
                 (%Box undefined)))))))))
 
 ;; Internal serializer results are tagged strings, or tagged undefined for a value which the
 ;; surrounding object must omit. Arrays translate that same sentinel to the JSON token `null`.
-(macro JSONStringify :params [(value dyn)] :ret dyn
-  (JsonStringifyPlainValue (%Box value) (%Box "") (%BoxArray (%NewArray))))
+(macro JSONStringifyWithOptions :transitioning true
+  :params [(value dyn) (replacer dyn) (space dyn)] :ret dyn
+  (let [(holder (%NewObject))
+        (stored (%PropStoreKey holder (%Box "") (%Box value)))
+        (normalizedReplacer (%Box replacer))
+        (normalizedSpace (%Box space))
+        (propertyList (JsonPropertyList normalizedReplacer))
+        (gap (JsonGap normalizedSpace))]
+    (JsonStringifyPlainValue (%PropLoadKey holder (%Box "")) (%Box "") holder
+                             (%BoxArray (%NewArray)) normalizedReplacer propertyList gap "")))
+
+(macro JSONStringify :transitioning true :params [(value dyn)] :ret dyn
+  (JSONStringifyWithOptions value (%Box undefined) (%Box undefined)))

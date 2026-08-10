@@ -268,7 +268,7 @@
 ;; and the index format are all only exercised here.
 (deftest the_library_on_disk_loads_and_every_declaration_lowers
          (lib! 90300)
-         (assert (= (jsl-decl-count) 200))
+         (assert (= (jsl-decl-count) 206))
          ; A builtin has a Fun and a macro does not, and every declaration is one or the other.
          (let [(mut i) 0 (mut funs) 0 (mut macros) 0]
            (loop (if (>= (load i) (jsl-decl-count)) (break)
@@ -279,11 +279,11 @@
                                (store! funs (+ (load funs) 1)) 0))
                        (store! i (+ (load i) 1))
                        0)))
-           (assert (= (+ (load funs) (load macros)) 200))
+           (assert (= (+ (load funs) (load macros)) 206))
            ; Most existing heap definitions remain macros for graph visibility and historical
            ; stability; called builtins can now carry an implicit heap effect when recursion or
            ; code sharing requires one.
-           (assert (= (load macros) 147)))
+           (assert (= (load macros) 152)))
          (assert (>= (jsl-find "Clamp") 0))
          (assert (>= (jsl-find "StringIndexOfFrom") 0))
          (assert (>= (jsl-find "StringStartsWith") 0))
@@ -916,12 +916,9 @@
 ;; no `%Add`, because the entire bail-out path went with it.
 ;;
 ;; WHICH PASS DOES IT, precisely, because the distinction matters to anyone relying on this. The
-;; LOWERING does not skip the slow path here. `%Lt 7 0` folds to `Const bool=0` at construction, but
-;; the If is still built, the `goto` still fires, and the handler is still emitted — the graph
-;; straight after lowering contains `If`, both CProj arms, `Add y 999`, and a Region/Phi merging
-;; them. It is `iterate!` that collapses all of it. `jl-macro-finish`'s no-exits path is a real
-;; optimisation, but it fires when a `goto` is unreachable in the SOURCE, not when it is merely
-;; decidable.
+;; LOWERING sees that `%Lt 7 0` constructed a constant bool and lowers only the selected arm. The
+;; `goto`, its handler, and their `%Add y 999` therefore never enter the graph. The assertions before
+;; `run1` distinguish this from a later graph cleanup that merely deletes an already-built arm.
 ;;
 ;; That is still the thesis. V8 reaches this shape by speculating and keeping deopt metadata to
 ;; retreat with; under D1's closed world it falls out of ordinary constant propagation, with no
@@ -929,6 +926,9 @@
 (deftest a_decidable_guard_folds_to_straight_line_code
          (fresh! 90406)
          (build! SRC-SPECIALISE)
+         ; These are pre-iteration assertions: the dead source arm was never lowered.
+         (assert (= (count-op OP-IF) 0))
+         (assert (= (count-op OP-ADD) 0))
          (assert (= (rt-payload (run1 "fast" 1)) 70))
          (assert (= (count-op OP-CALL) 1))   ; only the top-level call the harness makes
          (assert (= (count-op OP-IF) 0))

@@ -119,6 +119,7 @@ const OTHER = [
   ["`Number.parseFloat(x)`", "ParseFloatValue"],
   ["`JSON.parse(text)`", "JSONParse"],
   ["`JSON.stringify(value)`", "JSONStringify"],
+  ["`JSON.stringify(value, replacer, space)`", "JSONStringifyWithOptions"],
   ["`void x`", "VoidValue"],
   ["`typeof x`", "TypeOfValue"],
   ["`x ?? y`", "IsNullishValue"],
@@ -132,9 +133,6 @@ const UNSUPPORTED = {
   "Needs a regular-expression engine": [
     "regex literals", "`String.prototype.match`", "`String.prototype.matchAll`",
     "`String.prototype.search`", "`String.prototype.replace`", "`RegExp`",
-  ],
-  "Needs a frontend intrinsic, like the one `Number` just got": [
-    "`JSON.stringify` replacer/space overloads",
   ],
   "Needs new syntax in the frontend": [
     "tagged template literals", "destructuring", "spread and rest",

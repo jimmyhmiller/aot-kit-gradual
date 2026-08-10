@@ -415,7 +415,7 @@
   (block :done
     (let [callee (jl-expr (rd/sexp-nth x 1))
           n (- (rd/sexp-count x) 2)
-          buf (stack (array i64 9))
+          buf (stack (array i64 17))
           p (cast (ptr i64) buf)
           (mut i) 0]
       (loop (if (>= (load i) n) (break)
@@ -458,6 +458,34 @@
               (store! node (+ (load node) 1)))))
     (load targets)))
 
+(defn jl-function-param-count [(fun i64)] (-> i64)
+  (let [(mut node) 0 (mut count) 0]
+    (loop (if (>= (load node) (n-count)) (break)
+            (do
+              (if (and (not (n-dead? (load node)))
+                       (and (= (n-op (load node)) OP-PARM)
+                            (= (n-in (load node) 0) fun)))
+                  (let [next (+ (n-aux (load node)) 1)]
+                    (if (> next (load count)) (store! count next) 0))
+                  0)
+              (store! node (+ (load node) 1)))))
+    (load count)))
+
+(defn jl-frontend-max-params [(targets i64)] (-> i64)
+  (let [(mut node) 0 (mut count) 0]
+    (loop (if (>= (load node) (n-count)) (break)
+            (do
+              (if (and (= (n-op (load node)) OP-FUN)
+                       (and (not (jl-jsl-function? (load node)))
+                            (and (>= (n-aux (load node)) 0)
+                                 (and (< (n-aux (load node)) 63)
+                                      (!= (& targets (<< 1 (n-aux (load node)))) 0)))))
+                  (let [arity (jl-function-param-count (load node))]
+                    (if (> arity (load count)) (store! count arity) 0))
+                  0)
+              (store! node (+ (load node) 1)))))
+    (load count)))
+
 (defn jl-js-call-receiver-core [(x (ptr rd/Sexp)) (dynamic bool)] (-> i64)
   (block :done
     (let [raw-callee (jl-expr (rd/sexp-nth x 1))
@@ -470,7 +498,9 @@
                 raw-callee)
           receiver (jl-expr (rd/sexp-nth x 2))
           n (- (rd/sexp-count x) 3)
-          buf (stack (array i64 9))
+          max-params (if dynamic (jl-frontend-max-params targets) (+ n 1))
+          call-n (if (and dynamic (> (- max-params 1) n)) (- max-params 1) n)
+          buf (stack (array i64 17))
           p (cast (ptr i64) buf)
           (mut i) 0]
       (if (and dynamic (= targets 0))
@@ -479,6 +509,16 @@
                   (do (store! (index p (load i)) (jl-expr (rd/sexp-nth x (+ (load i) 3))))
                       (store! i (+ (load i) 1))
                       0))))
+      ;; JavaScript permits missing arguments. The specialized native ABI does not, so dynamic
+      ;; calls materialize tagged `undefined` through the largest closed-world target arity; targets
+      ;; with fewer parameters simply ignore the surplus registers, as JavaScript requires.
+      (if (and dynamic (!= targets 0))
+          (loop (if (>= (load i) call-n) (break)
+                  (do (store! (index p (load i))
+                              (n-box! (jl-const (t-undef))))
+                      (store! i (+ (load i) 1))
+                      0)))
+          0)
       (if (jl-diverged?) (return-from :done NO-NODE) 0)
       (if (and dynamic (= targets 0))
           ; No JavaScript function exists in this closed program, so a surrounding `%IsFunction`
@@ -486,9 +526,9 @@
           ; artificial throw would itself be a live control effect in every library-only graph.
           (n-box! raw-callee)
           (do
-            (store! (index p n) (jl-mem))
+            (store! (index p call-n) (jl-mem))
             (let [cs (n-call-receiver! (jl-ctrl) callee receiver
-                                     (slice-new [i64] p (+ n 1)))
+                                     (slice-new [i64] p (+ call-n 1)))
                 end (call-end cs)]
               (if dynamic (n-set-aux! (call-value cs) CALL-ABI-DYNAMIC-RECEIVER) 0)
               (jl-set-ctrl! end)
@@ -581,9 +621,8 @@
           (jl-set-ctrl! region)
           phi)))))
 
-(defn jl-if [(x (ptr rd/Sexp))] (-> i64)
-  (let [pred (jl-expr (rd/sexp-nth x 1))
-        iff (n-peephole (n-new2 OP-IF 0 (jl-ctrl) pred))
+(defn jl-if-dynamic [(x (ptr rd/Sexp)) (pred i64)] (-> i64)
+  (let [iff (n-peephole (n-new2 OP-IF 0 (jl-ctrl) pred))
         arms (n-if-arms! iff)
         at (arms-t arms)
         af (arms-f arms)]
@@ -610,6 +649,19 @@
           (jl-unkeep! af) (jl-unkeep! at)
           r))))))
 
+(defn jl-if [(x (ptr rd/Sexp))] (-> i64)
+  (let [pred (jl-expr (rd/sexp-nth x 1))]
+    ;; The checker has already validated both arms. If construction proves the predicate, lower
+    ;; only the reachable arm: building an unreachable arm and then peepholing its If used to kill
+    ;; the control projection while leaving its values wired into the later Region/Phi.
+    (if (= (n-ty pred) (t-bool-con true))
+        (do (if (= (n-nouts pred) 0) (n-kill! pred) 0)
+            (jl-expr (rd/sexp-nth x 2)))
+        (if (= (n-ty pred) (t-bool-con false))
+            (do (if (= (n-nouts pred) 0) (n-kill! pred) 0)
+                (jl-expr (rd/sexp-nth x 3)))
+            (jl-if-dynamic x pred)))))
+
 ;; `(loop [(name init [type]) ...] BODY...)`. Built in the order D9's in-progress contract requires,
 ;; corpus.coil's `fx-loop` states and which is not negotiable: OPEN the Loop, OPEN every Phi with a
 ;; placeholder back edge, build and peephole the body INSIDE that window, CLOSE the phis, then close
@@ -623,9 +675,9 @@
   (let [binds (rd/sexp-nth x 1)
         nb (rd/sexp-count binds)
         entry (jl-ctrl)
-        buf (stack (array i64 8))
+        buf (stack (array i64 16))
         inits (cast (ptr i64) buf)
-        pbuf (stack (array i64 8))
+        pbuf (stack (array i64 16))
         phis (cast (ptr i64) pbuf)
         (mut k) 0]
     ; Initialisers run once, in the ENCLOSING scope, before the loop node exists.
@@ -796,7 +848,7 @@
 ;; the same shape `goto` uses. The destination does not exist yet: the phis are still open.
 (defn jl-recur [(x (ptr rd/Sexp))] (-> i64)
   (let [nb (load (field (jl-loop-p (- (jl-loop-depth) 1)) nbind))
-        buf (stack (array i64 8))
+        buf (stack (array i64 16))
         vals (cast (ptr i64) buf)
         (mut k) 0]
     ; ARGUMENTS FIRST, THEN THE CONTROL. An argument may move control — a nested `loop`, a call, an
@@ -847,7 +899,7 @@
 ;; The lookup frame is moved so the body cannot see the caller's bindings, and the exit list is
 ;; based so a nested expansion's `goto`s cannot be mistaken for this one's.
 (defn jl-macro-expand [(x (ptr rd/Sexp)) (callee i64) (nargs i64) (owa i64)] (-> i64)
-  (let [buf (stack (array i64 8))
+  (let [buf (stack (array i64 16))
         p (cast (ptr i64) buf)
         (mut k) 0]
     ; Arguments are lowered in the CALLER's scope, before the frame moves. Call-by-value: the macro

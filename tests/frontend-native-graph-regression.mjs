@@ -7,7 +7,10 @@ import fs from "node:fs";
 // properties. Pin native output here; frontend-exact-graph-test.mjs pins the independent legacy
 // oracle on its own terms.
 const expectedDigests = Object.freeze({
-  basic: "7a8a3daf099c02d4559e4eca74fb255a20bb2e38eacc121b69d7841ad0912686",
+  // Repinned when top-level declarations began carrying their actual function identities. The
+  // rendered six-node arithmetic graph is byte-identical between clean HEAD and this change; only
+  // the already-stale digest expected the older ordering.
+  basic: "3de6b11430bd61da751bcd2d053cfdef700d7d2f122214bbce69bdcc0f071097",
   // Repinned when g-fold-proven! began running the peephole after analysis instead of leaving what
   // the fixpoint proved unused. EVERY fixture that moved got strictly SMALLER — call 32 -> 31,
   // control 37 -> 33, object 39 -> 38, full 87 -> 82 — as duplicate constants collapse into the
@@ -28,8 +31,11 @@ const expectedDigests = Object.freeze({
   // explicit IsInt/IsFlt fast path and ToNumber slow path, joined before the unbox. Constants in
   // that inlined diamond are rooted at this function's FunStart (not whole-graph Start), which is
   // the non-entry ownership invariant this fixture now pins. 34 nodes to 48.
-  call: "62f6329d3c40cee9cb27c9292917069a342db4c52b5a30f21df73af5213fe1a9",
-  control: "4d77f131d42c349fbffb154f65918d20a4a0fb002418426b8cdbc832f955260d",
+  // Repinned when JSL lowering began skipping statically disproven arms. The guarded ToNumber
+  // expansion remains for the opaque parameter, while constant sub-guards no longer leave dead
+  // diamonds for iteration to clean up. The new JSON helper also moves user Fun ids 53 -> 54.
+  call: "105d82cc048a862ca52f47a869fdaac3de85a5112f230deefcfad2e94174436d",
+  control: "317059e49013ae650f20f71a4a960fd0b5e9202d519901ed26a90803a7d260bd",
   // Repinned for the same ToNumber seam as `call`, and this one is the minimal form of it: exactly
   // one node added — `Unbox flt <- Parm` becomes `Unbox flt <- ToNumber <- Parm` — and every later
   // index shifted by one. 37 nodes to 38, no memory edge gained, because `Box` already threaded the
@@ -37,7 +43,7 @@ const expectedDigests = Object.freeze({
   // Repinned with the same guarded ToNumberValue as `call`: the object fixture's dynamic numeric
   // field crosses the IsInt/IsFlt diamond before the slow conversion, with its true constant
   // rooted at the containing FunStart.
-  object: "688eb00f6bb2aba994867de2c8729142f03924e8bb024685ade121ad9f2623a8",
+  object: "622f7ba1f56113eb58117ca19ba0cf18573c48002add4e6912182e731fb31ed6",
   // Repinned twice. First for the ToNumber seam: two dynamic operands in this fixture, so exactly
   // two nodes added — 82 to 84 — plus the memory edges the functions containing them now thread,
   // the same consequence spelled out on `call`.
@@ -49,8 +55,8 @@ const expectedDigests = Object.freeze({
   // Repinned with two guarded ToNumberValue expansions. The fixture now contains four explicit
   // numeric tag tests and two slow ToNumber nodes instead of two unconditional conversions; the
   // additional Regions/Phis are the control handed back by JSL inlining. 85 nodes to 111.
-  full: "30e55c227a2adde35efb5ce42774b2bc3c9b5b53a09361b5334c15ad7f347d6c",
-  bitwise: "189e78fe00839f184bb88f682c514f3a5d97b7972da062e8aa7262d3969e17a9",
+  full: "7a145807a980f98039278b6cbb37f5bf4cb5b6c8e53a76c07a8326a86977f112",
+  bitwise: "a9e893ac4a4e394075e850fef7c876ce8db3f5b3a61fc5993b217ab06b8c5ab7",
 });
 
 export function assertNativeGraph(fixture, nativePath) {
