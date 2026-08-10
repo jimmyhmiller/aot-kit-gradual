@@ -49,6 +49,19 @@ else
 fi
 
 echo
+echo "=== status checklist ==="
+# docs/STATUS.md is generated, and this is what stops it going stale the way docs/CONVERSION.md did
+# — that file claimed "all of String.prototype except split" for months while twelve methods sat in
+# lib/ that no program could name. The check re-derives the recognised operations from the
+# frontend's own tables and verifies every definition it names exists in lib/ and is referenced
+# from src/, so the checklist cannot claim a conversion that is not wired up.
+if out=$(node tools/status.mjs --check 2>&1); then
+  note "status.mjs" "$out"
+else
+  note "status.mjs" "FAILED"; echo "$out" | head -20; fails=$((fails+1))
+fi
+
+echo
 echo "=== backend module boundaries ==="
 if out=$(node tools/backend-module-gate.mjs 2>&1); then
   note "backend-module-gate.mjs" "$out"

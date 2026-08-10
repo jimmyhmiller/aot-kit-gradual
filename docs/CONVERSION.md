@@ -1,25 +1,9 @@
 # What runs on the DSL, and what does not
 
-Every JavaScript operation the native frontend can compile, and whether the code that runs comes
-from `lib/` or from a hand-written IR node.
+**The checklist is [STATUS.md](STATUS.md), which is generated and gate-checked.** Go there for
+"is X done". This file is the reasoning behind the rows — why an operation is written the way it is,
+what it cost, and what it broke on the way — which is the part a generator cannot produce.
 
-**Converted** means `src/frontend_native_graph.coil` emits a JSL definition through `jsl-inline!`, so
-the machine code the program executes was generated from `lib/`. It does not mean a definition
-merely exists — several definitions existed for months while nothing could reach them.
-
-Status as of the commit that converts `String.prototype.split`, which was the last hand-written IR
-node in the frontend with JavaScript semantics in it. `tools/gate.sh` green, native source
-conformance at 29 programs.
-
-**READ THIS BEFORE READING THE TABLES.** They cover the operations the frontend can compile, which
-is not automatically the same set as the operations `lib/` implements. It was not: 45 of the
-library's 88 declarations were unreachable from any program, including twelve `String.prototype`
-methods that were written, spec-annotated and Node-verified and that no TypeScript program could
-name. All twenty have since been reached. A row missing from a table below means *the frontend has
-never supported that syntax*, not that the library lacks a definition. The full
-inventory is the reachability section of [../HANDOFF.md](../HANDOFF.md).
-
----
 
 ## String.prototype
 

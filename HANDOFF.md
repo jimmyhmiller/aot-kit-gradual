@@ -2,9 +2,15 @@
 
 35 commits, `2c0b5b0..HEAD`. `./tools/gate.sh` green at 533 tests, conformance at 29 programs.
 
-This covers what was built, the design decisions worth knowing before changing anything, the defects
-it turned up, and what is left. Read `docs/JSL.md` for the language and `docs/CONVERSION.md` for the
-per-operation table; this file is the orientation and the parts that live in neither.
+**For "is X done", read [docs/STATUS.md](docs/STATUS.md).** It is a generated checklist of every
+operation this compiler supports, whether the code that runs comes from `lib/` or from hand-written
+IR, and — grouped by what each would take — everything that does not compile at all. `tools/gate.sh`
+fails when it is out of date, and it re-derives the recognised operations from the frontend's own
+tables, so it cannot drift the way the hand-maintained table before it did.
+
+This file covers what was built, the design decisions worth knowing before changing anything, the
+defects it turned up, and what is left. Read `docs/JSL.md` for the language and
+`docs/CONVERSION.md` for the reasoning behind each conversion.
 
 ---
 
