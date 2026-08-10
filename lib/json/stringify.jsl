@@ -44,6 +44,18 @@
 (macro JsonCircularError :params [] :ret dyn
   (%Throw "TypeError: Converting circular structure to JSON"))
 
+(macro JsonApplyToJSON :transitioning true
+  :params [(value dyn) (key dyn)] :ret dyn
+  (if (if (%IsObject value) true (%IsArray value))
+      (let [(receiver (if (%IsArray value)
+                          (%UnboxArray value)
+                          (%UnboxObj value)))
+            (method (%PropLoadNamed receiver "toJSON"))]
+        (if (%IsFunction method)
+            (call-dynamic-with-receiver method receiver (%Box key))
+            value))
+      value))
+
 ;; The plain path is deliberately separate from the replacer path. A literal "no replacer" flag
 ;; would still construct the callback arm before folding, leaving an invalid call target and dead
 ;; merge values in the graph. Torque uses specialized builtins for this same reason: distinct
@@ -58,7 +70,9 @@
               (loop [(index 0 int) (out "" str)]
                 (if (%Le length index) out
                     (let [(serialized
-                            (JsonStringifyPlainValue (%ArrayLoad array index) stack))
+                            (JsonStringifyPlainValue
+                              (%ArrayLoad array index)
+                              (%Box (ToStringValue (%Box index))) stack))
                           (piece (if (%IsUndefined serialized)
                                      "null" (%UnboxString serialized)))
                           (next (%StringConcat out
@@ -73,7 +87,7 @@
   (if (%Le count index) out
       (let [(key (%OwnKeyAt object index))
             (serialized
-              (JsonStringifyPlainValue (%PropLoadKey object key) stack))]
+              (JsonStringifyPlainValue (%PropLoadKey object key) key stack))]
         (if (%IsUndefined serialized)
             (JsonStringifyPlainObjectMembers object stack (%Add index 1) count out)
             (let [(member (%StringConcat
@@ -96,19 +110,20 @@
         (%Box result))))
 
 (builtin JsonStringifyPlainValue :transitioning true
-  :params [(value dyn) (stack dyn)] :ret dyn
-  (if (%IsString value) (%Box (JsonQuoteString value))
-    (if (%IsBool value) (%Box (ToStringValue value))
-      (if (%IsNull value) (%Box "null")
-        (if (IsNumber value)
-            (if (IsFiniteNumber value)
-                (%Box (ToStringValue value))
-                (%Box "null"))
-          (if (%IsArray value) (JsonStringifyPlainArray value stack)
-            (if (%IsObject value) (JsonStringifyPlainObject value stack)
-              (%Box undefined))))))))
+  :params [(input dyn) (key dyn) (stack dyn)] :ret dyn
+  (let [(value (JsonApplyToJSON input key))]
+    (if (%IsString value) (%Box (JsonQuoteString value))
+      (if (%IsBool value) (%Box (ToStringValue value))
+        (if (%IsNull value) (%Box "null")
+          (if (IsNumber value)
+              (if (IsFiniteNumber value)
+                  (%Box (ToStringValue value))
+                  (%Box "null"))
+            (if (%IsArray value) (JsonStringifyPlainArray value stack)
+              (if (%IsObject value) (JsonStringifyPlainObject value stack)
+                (%Box undefined)))))))))
 
 ;; Internal serializer results are tagged strings, or tagged undefined for a value which the
 ;; surrounding object must omit. Arrays translate that same sentinel to the JSON token `null`.
 (macro JSONStringify :params [(value dyn)] :ret dyn
-  (JsonStringifyPlainValue (%Box value) (%NewArray)))
+  (JsonStringifyPlainValue (%Box value) (%Box "") (%BoxArray (%NewArray))))

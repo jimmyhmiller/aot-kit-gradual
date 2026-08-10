@@ -87,6 +87,8 @@
 (const OP-STORE i64 24)
 (const OP-MEMMERGE i64 25)
 (const OP-BOX i64 26)  ; (_, value) -> one dynamically represented word
+(const BOX-AUX-INFER i64 0)
+(const BOX-AUX-ARRAY i64 1) ; preserve an Array tag across recursive representation boundaries
 (const OP-UNBOX i64 27)  ; (_, boxed value), aux = required unboxed type
 (const OP-TYPETEST i64 28)  ; (_, dynamic value), aux = tested type
 (const OP-CALLEND i64 29)  ; (ctrl, call) control after a completed call
@@ -97,6 +99,7 @@
 (const OP-CLOSURE i64 34)  ; (Fun, captures...) -> callable environment
 (const CALL-ABI-LEGACY i64 0)
 (const CALL-ABI-RECEIVER i64 1)
+(const CALL-ABI-DYNAMIC-RECEIVER i64 2)
 (const CALL-ABI-CAPTURE-BASE i64 2) ; aux = base + explicit capture prefix count
 (const OP-SAFEPOINT i64 35)  ; (ctrl, live refs...) -> (ctrl, relocated refs...)
 (const OP-BARRIER i64 36)  ; (ctrl, mem, object, stored ref) -> mem
@@ -1796,6 +1799,9 @@
 (defn n-box! [(v i64)] (-> i64)
   (n-peephole (n-new2 OP-BOX 0 NO-NODE v)))
 
+(defn n-box-array! [(v i64)] (-> i64)
+  (n-peephole (n-new2 OP-BOX BOX-AUX-ARRAY NO-NODE v)))
+
 (defn n-unbox! [(v i64) (target i64)] (-> i64)
   (n-peephole (n-new2 OP-UNBOX target NO-NODE v)))
 
@@ -3055,6 +3061,11 @@
     (load found)))
 
 (defn call-idealize [(n i64)] (-> i64)
+  ;; A dynamic-receiver call's finite target set constrains dispatch; it does not replace the
+  ;; runtime callable loaded from the heap. Rewriting a singleton Cast to its Fun made the
+  ;; backend validate the raw compile-time fidx as though it were a tagged JavaScript function.
+  (if (= (n-aux n) CALL-ABI-DYNAMIC-RECEIVER)
+      NO-NODE
   (let [callee (n-in n 1)]
     (if (or (= (n-op callee) OP-FUN) (= (n-op callee) OP-CLOSURE))
         NO-NODE
@@ -3066,7 +3077,7 @@
                   (let [fun (n-find-fun-index fidx)]
                     (if (= fun NO-NODE)
                         NO-NODE
-                        (do (gvn-remove! n) (n-set-def! n 1 fun) (g-changed!) n)))))))))
+                        (do (gvn-remove! n) (n-set-def! n 1 fun) (g-changed!) n))))))))))
 
 ;; M6's deliberately conservative first inliner. It admits only a single Return directly owned by
 ;; FunStart and a pure expression tree. Branches, memory, calls (including recursion), and closures
@@ -3534,7 +3545,12 @@
           ;; turns the induction variable into its initial value and deletes the loop. `t` being a
           ;; constant is not enough on its own; see `n-ty-proven?` for why the test is transitive
           ;; and why it asks for a fixpoint rather than only for "not ANY".
-          (if (and (and (op-foldable? (n-op n)) (ty-const? t)) (n-ty-proven? n))
+          ;; A singleton function SET is constant as an analysis fact (one possible target), not
+          ;; as a runtime JavaScript value. A Cast refining a heap-loaded callable must therefore
+          ;; retain that value; replacing it with `Const fun#N` discards function/closure identity.
+          (if (and (and (and (op-foldable? (n-op n)) (ty-const? t))
+                        (= (& (ty-kinds t) VK-FUN) 0))
+                   (n-ty-proven? n))
               (let [c (n-new1 OP-CONST t (g-start))]
                 (n-set-ty! c t)
                 (let [c2 (gvn! c)]

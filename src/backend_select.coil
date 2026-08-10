@@ -262,9 +262,11 @@
                 tag)))))))
 
 (defn be-box-input-already-tagged? [(node i64)] (-> bool)
+  (if (= (n-op node) OP-BOX)
+      true
   (if (= (n-op node) OP-CALL)
       (= (be-call-return-kind node) MLK-BOXED)
-      (= (ml-kind-for-node node) MLK-BOXED)))
+      (= (ml-kind-for-node node) MLK-BOXED))))
 
 
 (defn be-vreg-count [] (-> i64)
@@ -519,22 +521,45 @@
                 0)))
     (load idx)))
 
-(defn graph-parm-abi-index [(n i64)] (-> i64)
-  (let [fun (n-in n 0)
-        want-fp (be-node-fp-value? n)
-        (mut i) 0
-        (mut idx) 0]
-    (loop (if (>= (load i) n)
-              (break)
+(defn graph-parm-position-fp? [(fun i64) (position i64)] (-> bool)
+  (block :done
+    ;; Prefer a surviving Parm. If optimization removed that parameter, recover its ABI class from
+    ;; a closed-world call argument: dead parameters still occupy their declared register slot.
+    (let [(mut i) 0]
+      (loop (if (>= (load i) (n-count)) (break)
               (do
                 (if (and (not (n-dead? (load i)))
                          (and (= (n-op (load i)) OP-PARM)
                               (and (= (n-in (load i) 0) fun)
-                                   (= (be-node-fp-value? (load i)) want-fp))))
+                                   (= (n-aux (load i)) position))))
+                    (return-from :done (be-node-fp-value? (load i)))
+                    0)
+                (store! i (+ (load i) 1))))))
+    (let [(mut call) 0]
+      (loop (if (>= (load call) (n-count)) (break)
+              (do
+                (if (and (not (n-dead? (load call))) (= (n-op (load call)) OP-CALL))
+                    (let [source (infer-parm-source (load call) fun position)]
+                      (if (!= source NO-NODE)
+                          (return-from :done (be-node-fp-value? source))
+                          0))
+                    0)
+                (store! call (+ (load call) 1))))))
+    false))
+
+(defn graph-parm-abi-index [(n i64)] (-> i64)
+  (let [fun (n-in n 0)
+        want-fp (be-node-fp-value? n)
+        limit (n-aux n)
+        (mut position) 0
+        (mut idx) 0]
+    (loop (if (>= (load position) limit)
+              (break)
+              (do
+                (if (= (graph-parm-position-fp? fun (load position)) want-fp)
                     (store! idx (+ (load idx) 1))
                     0)
-                (store! i (+ (load i) 1))
-                0)))
+                (store! position (+ (load position) 1)))))
     (load idx)))
 
 (defn graph-parm-stack-index [(n i64)] (-> i64)
@@ -776,10 +801,13 @@
                   OP-CAST
                 (store! vr (select-value! (n-in n 1))) OP-BOX
                 (let [a (select-value! (n-in n 1))
-                      tag (be-js-tag-for-value (n-in n 1))]
-                  (if (and (>= a 0)
+                      tag (if (= (n-aux n) BOX-AUX-ARRAY)
+                              JSV-ARRAY
+                              (be-js-tag-for-value (n-in n 1)))]
+                  (if (and (= (n-aux n) BOX-AUX-INFER)
+                           (and (>= a 0)
                            (and (not (be-node-fp-value? (n-in n 1)))
-                                (be-box-input-already-tagged? (n-in n 1))))
+                                (be-box-input-already-tagged? (n-in n 1)))))
                       (store! vr a)
                       (if (or (< a 0) (= tag -1))
                           (do (be-fail! BER-UNSUPPORTED-OPCODE n) 0)
@@ -2571,12 +2599,15 @@
                             (store! vr fresh))))))
                   OP-BOX
                 (let [a (ms-select-value-at! owner (n-in node 1) bid)
-                      tag (if (be-node-fp-value? (n-in node 1))
-                              0
-                              (be-js-tag-for-value (n-in node 1)))]
-                  (if (and (>= a 0)
+                      tag (if (= (n-aux node) BOX-AUX-ARRAY)
+                              JSV-ARRAY
+                              (if (be-node-fp-value? (n-in node 1))
+                                  0
+                                  (be-js-tag-for-value (n-in node 1))))]
+                  (if (and (= (n-aux node) BOX-AUX-INFER)
+                           (and (>= a 0)
                            (and (not (be-node-fp-value? (n-in node 1)))
-                                (be-box-input-already-tagged? (n-in node 1))))
+                                (be-box-input-already-tagged? (n-in node 1)))))
                       (store! vr a)
                       (if (or (< a 0) (= tag -1))
                           (do (ms-fail! MSEL-UNSUPPORTED node) 0)
@@ -2630,7 +2661,12 @@
                 (let [callee-node (n-in node 1)
                       callee (mu-direct-callee node)
                       targets (ty-fun-targets (n-ty callee-node))
-                      polymorphic (> (popcount64 targets) 1)
+                      ;; A dynamic JSL call must validate and dispatch the runtime callee even when
+                      ;; closed-world analysis finds one possible target. Treating a singleton as
+                      ;; direct silently ignored the heap-loaded value and called that target for
+                      ;; `undefined` and non-callable properties alike.
+                      polymorphic (or (= (n-aux node) CALL-ABI-DYNAMIC-RECEIVER)
+                                      (> (popcount64 targets) 1))
                       raw-argc (- (n-nins node) 2)
                       has-memory
                         (and (> raw-argc 0)
@@ -2650,12 +2686,13 @@
                              (= (n-nins callee-node) (+ capturec 2)))
                       argc (+ capturec source-argc)
                       call-bid (ms-node-block owner node)]
-                  (if (or (not (ms-select-control-effects! owner (n-in node 0) call-bid))
-                          (and has-memory
+                  (if (not (ms-select-control-effects! owner (n-in node 0) call-bid))
+                      (ms-fail! MSEL-CALL node)
+                      (if (and has-memory
                                (not (ms-select-memory-at! owner
                                                           (n-in node (- (n-nins node) 1))
-                                                          call-bid))))
-                      (ms-fail! MSEL-CALL node)
+                                                          call-bid)))
+                      (ms-fail! MSEL-CALL (n-in node (- (n-nins node) 1)))
                       (if (or (and (= callee NO-NODE) (not polymorphic)) (> argc 16))
                           (ms-fail! MSEL-CALL node)
                           (let [target (if polymorphic -1 (mu-find-function callee))
@@ -2665,7 +2702,8 @@
                                       -1)]
                             (if (or (and (not polymorphic) (< target 0))
                                     (and polymorphic (< callee-value 0)))
-                                (ms-fail! MSEL-CALL node)
+                                (ms-fail! MSEL-CALL
+                                          (if polymorphic callee-node node))
                                 (let [u (machine-unit)
                                       buf (stack (array i64 16))
                                       args (cast (ptr i64) buf)
@@ -2718,7 +2756,7 @@
                                               (ms-add-memory-deps! at node (- (n-nins node) 1) 1)
                                               0)
                                           (store! vr fresh)))
-                                      0)))))))
+                                      0))))))))
                   (ms-fail! MSEL-UNSUPPORTED node))
           (if (< (load vr) 0)
               -1

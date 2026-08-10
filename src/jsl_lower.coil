@@ -258,8 +258,18 @@
   (if (and (= (n-op key) OP-CONST)
            (and (ty-int-only? (n-aux key)) (ty-const? (n-aux key))))
       (ty-int-lo (n-aux key))
-      (do (panic-corrupt "jsl lowering: a named-property key must be a constant interned name")
-          0)))
+      (if (= (n-op key) OP-STRINGCONST)
+          (let [(mut bytes) (al-new [u8] (malloc-allocator))
+                text (jss-utf8! (n-aux key) (mut bytes))
+                name (shape-name-intern! text)]
+            ;; The spelling moves into the property's aux field; the temporary StringConst is not
+            ;; a runtime operand and would otherwise be an unreachable graph leaf.
+            (n-kill! key)
+            (al-free! [u8] (mut bytes))
+            name)
+          (do (panic-corrupt
+                "jsl lowering: a named-property key must be an interned id or string literal")
+              0))))
 
 (defn jl-prim [(id i64) (a i64) (b i64) (c i64)] (-> i64)
   ;; A throw is not a floating value. Its payload participates in expression joins so the existing
@@ -283,11 +293,12 @@
     (let [op (jsp-op id)
           n (jsp-arity id)
           aux (jsp-aux id)]
+      (if (= id JSP-BOXARRAY) (n-box-array! a)
       (if (= n 1) (n-peephole (n-new2 op aux NO-NODE a))
         (if (= n 2) (n-peephole (n-new3 op aux NO-NODE a b))
           (if (= n 3) (n-peephole (n-new4 op aux NO-NODE a b c))
             (do (panic-corrupt "jsl lowering: a primitive arity this dispatch does not build")
-                NO-NODE))))))))))
+                NO-NODE)))))))))))
 
 ;; A heap-reading primitive. The memory operand is supplied here rather than written in the `.jsl`
 ;; source, so `%ArrayLoad a i` in the library becomes `ArrayLoad(mem, a, i)` in the graph and the
@@ -391,8 +402,11 @@
                (if (str-eq name "loop") (jl-loop x)
                 (if (str-eq name "recur") (jl-recur x)
                 (if (str-eq name "call") (jl-js-call x)
+                (if (str-eq name "call-with-receiver") (jl-js-call-with-receiver x)
+                (if (str-eq name "call-dynamic-with-receiver")
+                    (jl-js-call-dynamic-with-receiver x)
                 (if (jsl-prim-name? name) (jl-prim-call x name)
-                  (jl-call x name)))))))))))))))
+                  (jl-call x name)))))))))))))))))
 
 ;; Invoke a JavaScript callback value and thread its effect through the same implicit heap cell as
 ;; the memory primitives. The pre-call heap is a trailing effect argument, never a source-level
@@ -418,6 +432,74 @@
         ;; closed-world callee uses an unboxed native return register. `Box(Call)` is the existing
         ;; representation boundary; selection removes it when the target already returns `dyn`.
         (n-box! (call-value cs))))))
+
+(defn jl-jsl-function? [(node i64)] (-> bool)
+  (let [(mut i) 0 (mut found) false]
+    (loop (if (or (>= (load i) (jsl-decl-count)) (load found)) (break)
+            (do (if (= (jsl-decl-fun (load i)) node) (store! found true) 0)
+                (store! i (+ (load i) 1)))))
+    (load found)))
+
+;; Every JavaScript function is already a closed-world Fun node. A value loaded through the heap
+;; retains its runtime payload but loses that target-set refinement, so a guarded dynamic call
+;; explicitly restores the set of frontend-visible targets. Internal JSL builtins are excluded:
+;; they are implementation functions, never JavaScript values stored in user objects.
+(defn jl-frontend-function-targets [] (-> i64)
+  (let [(mut node) 0 (mut targets) 0]
+    (loop (if (>= (load node) (n-count)) (break)
+            (do
+              (if (and (= (n-op (load node)) OP-FUN)
+                       (not (jl-jsl-function? (load node))))
+                  (let [fidx (n-aux (load node))]
+                    (if (and (>= fidx 0) (< fidx 63))
+                        (store! targets (| (load targets) (<< 1 fidx)))
+                        0))
+                  0)
+              (store! node (+ (load node) 1)))))
+    (load targets)))
+
+(defn jl-js-call-receiver-core [(x (ptr rd/Sexp)) (dynamic bool)] (-> i64)
+  (block :done
+    (let [raw-callee (jl-expr (rd/sexp-nth x 1))
+          targets (if dynamic (jl-frontend-function-targets) 0)
+          callee
+            (if (and dynamic (!= targets 0))
+                (n-peephole
+                  (n-new2 OP-CAST (t-fun-set targets)
+                          (jl-ctrl) raw-callee))
+                raw-callee)
+          receiver (jl-expr (rd/sexp-nth x 2))
+          n (- (rd/sexp-count x) 3)
+          buf (stack (array i64 9))
+          p (cast (ptr i64) buf)
+          (mut i) 0]
+      (if (and dynamic (= targets 0))
+          0
+          (loop (if (>= (load i) n) (break)
+                  (do (store! (index p (load i)) (jl-expr (rd/sexp-nth x (+ (load i) 3))))
+                      (store! i (+ (load i) 1))
+                      0))))
+      (if (jl-diverged?) (return-from :done NO-NODE) 0)
+      (if (and dynamic (= targets 0))
+          ; No JavaScript function exists in this closed program, so a surrounding `%IsFunction`
+          ; guard makes this arm uninhabited. Use an inert value and emit no zero-target call; an
+          ; artificial throw would itself be a live control effect in every library-only graph.
+          (n-box! raw-callee)
+          (do
+            (store! (index p n) (jl-mem))
+            (let [cs (n-call-receiver! (jl-ctrl) callee receiver
+                                     (slice-new [i64] p (+ n 1)))
+                end (call-end cs)]
+              (if dynamic (n-set-aux! (call-value cs) CALL-ABI-DYNAMIC-RECEIVER) 0)
+              (jl-set-ctrl! end)
+              (jl-set-mem! (n-new1 OP-ARG (t-mem-alias JS-PROPERTY-ALIAS (t-undef)) end))
+              (n-box! (call-value cs))))))))
+
+(defn jl-js-call-with-receiver [(x (ptr rd/Sexp))] (-> i64)
+  (jl-js-call-receiver-core x false))
+
+(defn jl-js-call-dynamic-with-receiver [(x (ptr rd/Sexp))] (-> i64)
+  (jl-js-call-receiver-core x true))
 
 ;; A bail-out. The current control is parked on the label's pending list and the path is marked
 ;; diverged; the destination does not exist yet, because it is built at the CALL SITE out of every

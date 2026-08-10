@@ -152,6 +152,11 @@
   "(builtin twice :params [(x dyn)] :ret dyn (add1 (add1 x)))
    (builtin add1 :params [(x dyn)] :ret dyn (%Add x 1))")
 
+(const SRC-CALL-WITH-RECEIVER
+  "(builtin invoke :transitioning true
+     :params [(fn dyn) (receiver dyn) (value dyn)] :ret dyn
+     (call-with-receiver fn receiver value))")
+
 (const SRC-QUOTED-TYPE
   "(builtin narrow :params [(x \"int=[0..9]\")] :ret dyn (%Add x 1))")
 
@@ -172,6 +177,20 @@
          (assert (= (jsl-decl-nparams 0) 1))
          (assert (!= (jsl-decl-fun 0) NO-NODE))
          (assert (= (rt-payload (run1 "add1" 41)) 42)))
+
+(deftest an_explicit_array_box_retains_its_runtime_tag_contract
+         (fresh! 10067)
+         (build! "(builtin boxed-array :params [] :ret dyn (%BoxArray (%NewArray)))")
+         (let [(mut i) 0 (mut found) false]
+           (loop (if (>= (load i) (n-count)) (break)
+                   (do
+                     (if (and (not (n-dead? (load i)))
+                              (and (= (n-op (load i)) OP-BOX)
+                                   (= (n-aux (load i)) BOX-AUX-ARRAY)))
+                         (store! found true)
+                         0)
+                     (store! i (+ (load i) 1)))))
+           (assert (load found))))
 
 ;; The diamond. Both arms are exercised in separate graphs rather than in one, because a Phi whose
 ;; predicate is constant folds and the surviving arm would be the only one ever built.
@@ -205,6 +224,18 @@
          (assert (not (jsl-decl-transitioning? 1)))
          (assert (= (rt-payload (run1 "twice" 40)) 42)))
 
+(deftest an_explicit_receiver_is_part_of_the_javascript_call_abi
+         (fresh! 90109)
+         (build! SRC-CALL-WITH-RECEIVER)
+         (let [call (first-op OP-CALL)]
+           (assert (!= call NO-NODE))
+           (assert (= (n-aux call) CALL-ABI-RECEIVER))
+           ; ctrl, callee, receiver, one positional value, and the implicit heap effect.
+           (assert (= (n-nins call) 5)))
+         (refuses 90110
+                  "(builtin bad :params [(fn dyn)] :ret dyn (call-with-receiver fn))"
+                  JSL-ERR-ARITY))
+
 ;; A type annotation given as a STRING. A bare symbol carries the bracket-free spellings; the rest
 ;; of `text.coil`'s grammar arrives as a `KStr`. This asserts the annotation reaches `ty-try-parse`
 ;; intact and interns to the type that spelling denotes.
@@ -237,7 +268,7 @@
 ;; and the index format are all only exercised here.
 (deftest the_library_on_disk_loads_and_every_declaration_lowers
          (lib! 90300)
-         (assert (= (jsl-decl-count) 199))
+         (assert (= (jsl-decl-count) 200))
          ; A builtin has a Fun and a macro does not, and every declaration is one or the other.
          (let [(mut i) 0 (mut funs) 0 (mut macros) 0]
            (loop (if (>= (load i) (jsl-decl-count)) (break)
@@ -248,11 +279,11 @@
                                (store! funs (+ (load funs) 1)) 0))
                        (store! i (+ (load i) 1))
                        0)))
-           (assert (= (+ (load funs) (load macros)) 199))
+           (assert (= (+ (load funs) (load macros)) 200))
            ; Most existing heap definitions remain macros for graph visibility and historical
            ; stability; called builtins can now carry an implicit heap effect when recursion or
            ; code sharing requires one.
-           (assert (= (load macros) 146)))
+           (assert (= (load macros) 147)))
          (assert (>= (jsl-find "Clamp") 0))
          (assert (>= (jsl-find "StringIndexOfFrom") 0))
          (assert (>= (jsl-find "StringStartsWith") 0))

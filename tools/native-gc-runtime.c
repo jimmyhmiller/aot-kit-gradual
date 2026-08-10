@@ -881,7 +881,9 @@ AotJsValue aot_js_string(uintptr_t a, int64_t b,
    Missing elements read as undefined; resize truncation clears presence. */
 AotJsValue aot_js_array(uintptr_t owner, int64_t index,
                         AotJsValue value, uint64_t operation) {
-  if (aot_js_managed((AotJsValue)owner)) owner = aot_js_payload((AotJsValue)owner);
+  if (aot_js_managed((AotJsValue)owner) ||
+      aot_js_tag((AotJsValue)owner) == AOT_JS_FUNCTION)
+    owner = aot_js_payload((AotJsValue)owner);
   if (!owner) return AOT_JS_UNDEFINED;
   JsObjectRec *integrity = js_object(owner, 0);
   if (integrity && integrity->frozen && (operation == 2 || operation == 4))
@@ -1089,7 +1091,9 @@ AotJsValue aot_js_property(uintptr_t owner, uint64_t name,
       }
     }
   }
-  if (aot_js_managed((AotJsValue)owner)) owner = aot_js_payload((AotJsValue)owner);
+  if (aot_js_managed((AotJsValue)owner) ||
+      aot_js_tag((AotJsValue)owner) == AOT_JS_FUNCTION)
+    owner = aot_js_payload((AotJsValue)owner);
   if (!owner) return AOT_JS_UNDEFINED;
   /* Generic internal-slot ABI. These slots are deliberately outside the property table. Operations
      9..13 initialize and access the array-iterator slots used by JSL; later Torque-style extern

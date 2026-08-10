@@ -201,6 +201,8 @@ the frontend, which is three partial coercion implementations that no test compa
 | `(%Prim a …)` | one primitive op, arity-checked |
 | `(Name a …)` | a call to another JSL `builtin` |
 | `(call fn a …)` | invoke a JavaScript function value, advance control, thread the heap, and box its result |
+| `(call-with-receiver fn this a …)` | invoke ECMAScript [[Call]] with an explicit receiver, threading the same control and heap effects |
+| `(call-dynamic-with-receiver fn this a …)` | invoke a callable obtained from the heap after narrowing it to the closed set of frontend-visible JavaScript functions |
 | integer, float | `OP-CONST` at `t-int-con` / `t-flt-bits` |
 | `"…"` | a string constant, interned through `jss-from-utf8!` |
 | `true` `false` `undefined` `null` | `OP-CONST` at the matching lattice constant |
@@ -379,9 +381,13 @@ The layer is deliberately thin, and it is the whole porting surface:
 - conversions — `%ToString %ToInteger %ParseInt %IsNaN %NumberToString`
 - heap — `%NewArray %ArrayLen %ArrayLoad %ArrayStore %ArrayResize %PropLoadNamed
   %PropStoreNamed`
-- representation capabilities — `%Box %UnboxInt %UnboxFlt %UnboxBool %UnboxObj %UnboxString
+- representation capabilities — `%Box %BoxArray %UnboxInt %UnboxFlt %UnboxBool %UnboxObj %UnboxString
   %IsArray %UnboxArray`
 - control — `%Throw`
+
+`%BoxArray` is the typed form of `%Box` for a raw array handle. It records the runtime Array tag
+explicitly, so recursive calls and optimization do not have to reconstruct representation
+provenance from an `ArrayMark` node that may no longer be adjacent to the boxing boundary.
 
 `%ToInteger` is the one primitive so far added *for* JSL rather than inherited. It is
 `OP-TOINTEGER`, and it is ToIntegerOrInfinity — the whole spec abstract operation as one op,

@@ -230,7 +230,8 @@
 (const JSP-INTERNALKIND     i64 87)
 (const JSP-INTERNALSETINDEX i64 88)
 (const JSP-STRINGNORMALIZE  i64 89)
-(const JSP-COUNT            i64 90)
+(const JSP-BOXARRAY         i64 90)
+(const JSP-COUNT            i64 91)
 
 (defn jsp-name [(id i64)] (-> (slice u8))
   (case id
@@ -324,6 +325,7 @@
         JSP-INTERNALKIND   "%InternalKind"
         JSP-INTERNALSETINDEX "%InternalSetIndex"
         JSP-STRINGNORMALIZE "%StringNormalize"
+        JSP-BOXARRAY       "%BoxArray"
         "<unknown jsl primitive>"))
 
 (defn jsp-op [(id i64)] (-> i64)
@@ -418,6 +420,7 @@
         JSP-INTERNALKIND   OP-INTERNALLOAD
         JSP-INTERNALSETINDEX OP-INTERNALSTORE
         JSP-STRINGNORMALIZE OP-STRINGNORMALIZE
+        JSP-BOXARRAY       OP-BOX
         -1))
 
 ;; How many OPERANDS the primitive takes. Slot 0 of every one of these ops is the ordinary control
@@ -514,6 +517,7 @@
         JSP-INTERNALKIND   1
         JSP-INTERNALSETINDEX 2
         JSP-STRINGNORMALIZE 2
+        JSP-BOXARRAY       1
         -1))
 
 ;; The aux word a primitive's node carries. Almost every op takes 0, but `OP-TYPETEST` takes the
@@ -1073,6 +1077,16 @@
           (jsl-fail! JSL-ERR-TOO-MANY-PARAMS "call")
           (jsl-check-args x d 1))))
 
+;; `(call-with-receiver fn receiver arg ...)` is the ordinary ECMAScript [[Call]] shape. Keeping
+;; it distinct from `call` makes the receiver ABI explicit in the source and lets the verifier
+;; reject a receiver accidentally shifted into the positional arguments.
+(defn jsl-check-js-call-with-receiver [(x (ptr rd/Sexp)) (d i64)] (-> i64)
+  (if (< (rd/sexp-count x) 3)
+      (jsl-fail! JSL-ERR-ARITY "call-with-receiver")
+      (if (> (- (rd/sexp-count x) 3) JSL-MAX-PARAMS)
+          (jsl-fail! JSL-ERR-TOO-MANY-PARAMS "call-with-receiver")
+          (jsl-check-args x d 1))))
+
 ;; `(loop [(name init [type]) ...] BODY...)`. The body is an expression: if it evaluates to `(recur ...)`
 ;; the loop iterates with those values, and otherwise its value is the loop's value. That is a
 ;; tail-recursive binding group, which is exactly what a loop Phi is — one phi per binding, the
@@ -1173,6 +1187,10 @@
         (if (str-eq name "loop") (return-from :done (jsl-check-loop x d)) 0)
         (if (str-eq name "recur") (return-from :done (jsl-check-recur x d)) 0)
         (if (str-eq name "call") (return-from :done (jsl-check-js-call x d)) 0)
+        (if (str-eq name "call-with-receiver")
+            (return-from :done (jsl-check-js-call-with-receiver x d)) 0)
+        (if (str-eq name "call-dynamic-with-receiver")
+            (return-from :done (jsl-check-js-call-with-receiver x d)) 0)
         (jsl-check-call x d)))))
 
 ; ============================================================================

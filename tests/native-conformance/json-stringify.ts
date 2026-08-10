@@ -1,3 +1,7 @@
+function encode(this: any, key: string): any {
+  return {seen: this.x + 1, key: key};
+}
+
 export function main(): number {
   let result = 0;
   if (JSON.stringify("A\n\"\\\u0001é") === "\"A\\n\\\"\\\\\\u0001é\"") result += 1;
@@ -7,5 +11,8 @@ export function main(): number {
   if (JSON.stringify({missing: undefined, x: 1}) === "{\"x\":1}") result += 16;
   if (JSON.stringify({nested: {x: 1}}) === "{\"nested\":{\"x\":1}}") result += 32;
   if (JSON.stringify(undefined) === undefined) result += 64;
+  if (JSON.stringify({x: 2, toJSON: encode}) === "{\"seen\":3,\"key\":\"\"}") result += 128;
+  if (JSON.stringify({nested: {x: 2, toJSON: encode}}) ===
+      "{\"nested\":{\"seen\":3,\"key\":\"nested\"}}") result += 256;
   return result;
 }

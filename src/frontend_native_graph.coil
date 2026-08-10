@@ -4325,11 +4325,17 @@
                 ; Nested declarations belong to their lexical invocation. Publishing
                 ; their function object/prototype here would embed a parent function's
                 ; allocation directly in the synthetic top-level graph.
-                (if (and (= (load (field fn parent)) -1)
-                         (= (fng-symbol-storage context (load index)) NO-NODE))
-                    (let [object (fng-empty-dynamic-object context)]
+                (if (and (!= (load (field fn id)) (load (field context owner)))
+                         (and (= (load (field fn parent)) -1)
+                              (= (fng-symbol-storage context (load index)) NO-NODE)))
+                    (let [object
+                            (al-get [i64]
+                                    (load (load (field context functions)))
+                                    (load (field fn id)))]
                       ; Publish identity before prototype materialization: a prototype method may
-                      ; capture its own constructor object.
+                      ; capture its own constructor. A top-level non-capturing declaration's Fun
+                      ; id is also its JavaScript object identity; the runtime property side table
+                      ; canonicalizes boxed and raw function ids to this same owner.
                       (fng-set-symbol! context (load index) object)
                       (let [prototype (fng-constructor-prototype! context (load index))
                           stored
@@ -5909,14 +5915,25 @@
           (store! cell-alias (shape-field-alias (load cell-shape) 0)))
         0)
     ;; All non-main function roots are opened before main Args and before bodies.
+    ;; JSL builtins and user JavaScript functions share the backend's current 63-bit callable-id
+    ;; space. They must not share an id: a heap-loaded JavaScript callback is dispatched by that
+    ;; runtime id, and the old `fn.id` assignment collided with builtin zero, silently calling the
+    ;; wrong body. Reserve the dense builtin prefix until the callable representation grows beyond
+    ;; the legacy bitset.
+    (let [js-function-base (jsl-decl-fidx (jsl-decl-count))]
+      (if (>= (+ js-function-base function-count) 63)
+          (do (panic-corrupt "frontend: JSL and JavaScript functions exceed callable-id capacity") 0)
+          0)
     (store! index 0)
     (loop (if (>= (load index) function-count)
               (break)
               (let [fn (al-get [FeFunction] (load (field frontend functions)) (load index))]
                 (if (!= (load (field fn id)) main-id)
-                    (al-set! [i64] (mut functions) (load (field fn id)) (n-fun-open! (load (field fn id))))
+                    (al-set! [i64] (mut functions) (load (field fn id))
+                             (n-fun-open! (+ js-function-base (load (field fn id)))))
                     0)
                 (store! index (+ (load index) 1)))))
+    )
     ;; Main Args are created immediately after the function roots.
     (store! index 0)
     (loop (if (>= (load index) (load (field main parameter-count)))
