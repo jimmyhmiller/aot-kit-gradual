@@ -484,22 +484,17 @@ them worth generating:
 the lowering rather than from an operand, and a store's new memory becomes current automatically.
 A definition reads like the spec rather than like memory SSA.
 
-**Memory cannot cross a call, so the heap may only be read through an object the enclosing function
-created.** `v-mem-producer?` decides what may occupy a memory slot **structurally** — "this pass runs
-before types are evidence" — and `OP-PARM` is not on its list, so memory cannot be a parameter
-however it is typed. Passing it as a call argument was tried: the verifier accepts it at the call
-(`v-need-call-args` permits a memory producer last) and then rejects it at the callee. Each function
-therefore synthesises its own entry heap, an opaque "some heap" that its own allocations layer onto
-correctly — which is why a builtin may read back its own writes.
+**Memory crosses calls as an implicit effect.** The source signature remains ordinary JavaScript
+data, but a heap-using `builtin` has one additional trailing call operand. The callee views it as a
+function-entry memory `OP-ARG`; after the call, the caller's current memory is a CallEnd-rooted
+`OP-ARG`. This is deliberately structural—no typed `OP-PARM` is smuggled into a memory slot—and it
+matches the verifier's existing rule that the final call argument may be a memory producer.
 
-Reading through an array that arrived as a **parameter** is what is unsound, and the failure survives
-review: `ArrayIndexOfFrom` written as a `builtin` answered `-1` for an element the caller had just
-stored, verified clean, and ran to completion. `jsl-check-heap-shape` computes, to a fixpoint through
-calls, which parameters reach a heap operand, and refuses any `builtin` that has one
-(`JSL-ERR-HEAP-IN-BUILTIN`). A `macro` may, because it is inlined into its caller's graph. The
-analysis follows a parameter used directly, passed to a call, or rebound by a `let`; one laundered
-through a call that *returns* it is not followed, which is why this is documented rather than
-presented as a proof.
+Memory use is inferred to a fixpoint through JSL calls, so a helper that calls a heap-using helper
+inherits the effect even if it has no primitive heap operation itself. Macros still inline directly
+against the caller's memory. Builtins now provide the code-sharing and recursion counterpart; this
+is what permits a recursive parser or object walker to live in JSL without hiding managed-object
+allocation inside a C runtime operation.
 
 **`%ArrayResize` takes three operands, and the third is an ORDERING VALUE.** `pop` loads the last
 element and then shortens the array. Nothing in the memory chain says a read precedes a later write

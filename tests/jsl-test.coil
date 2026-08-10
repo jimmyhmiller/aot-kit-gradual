@@ -249,9 +249,9 @@
                        (store! i (+ (load i) 1))
                        0)))
            (assert (= (+ (load funs) (load macros)) 169))
-           ; 57 since `StringSplit` and `StringSplitWhole` joined, both macros: they allocate and
-           ; write, and memory reaches a called function as an OP-ARG rather than a parameter, so a
-           ; builtin would fill its own empty entry heap and return an array the caller cannot see.
+           ; Most existing heap definitions remain macros for graph visibility and historical
+           ; stability; called builtins can now carry an implicit heap effect when recursion or
+           ; code sharing requires one.
            (assert (= (load macros) 125)))
          (assert (>= (jsl-find "Clamp") 0))
          (assert (>= (jsl-find "StringIndexOfFrom") 0))
@@ -353,21 +353,64 @@
                   "(builtin f :params [(x dyn)] x) (builtin f :params [(y dyn)] y)"
                   JSL-ERR-DUP-NAME))
 
-;; Designed in docs/JSL.md, not built. The refusal is what stops a `.jsl` file using one of these
-;; from producing a graph; without it the head would fall through to `jsl-check-call` and be
-;; reported as an unknown call, which names the wrong problem.
-;; MEMORY CANNOT BE A PARAMETER, so a `builtin` that reads the heap reads its own synthesised
-;; entry heap rather than its caller's — an empty one. That failure is invisible: the graph
-;; verifies, the program runs, and an `ArrayIndexOf` written that way simply answers -1 for an
-;; element that is there. Measured before the rule existed. The refusal is what stops it.
-(deftest a_builtin_that_reads_the_heap_is_refused_because_memory_is_not_a_parameter
-         (refuses 91200 "(builtin f :params [(a dyn)] :ret int (%ArrayLen a))"
-                  JSL-ERR-HEAP-IN-BUILTIN)
-         ; Transitively: the caller of a heap-reading macro reads the heap too.
-         (refuses 91201
-                  "(macro m :params [(a dyn)] :ret int (%ArrayLen a))
-                   (builtin f :params [(a dyn)] :ret int (m a))"
-                  JSL-ERR-HEAP-IN-BUILTIN))
+;; Called builtins receive an implicit trailing heap parameter and publish their returned heap at
+;; CallEnd. This is the effect convention JSON's recursive parser needs: source parameters remain
+;; ordinary JavaScript values while memory is explicit in IR and invisible in the DSL surface.
+(deftest a_builtin_reads_the_callers_heap_through_its_effect_parameter
+         (fresh! 91200)
+         (assert (= (jsl-load!
+                      "(builtin arrayLength :params [(a dyn)] :ret int (%ArrayLen a))
+                       (macro makeAndRead :params [] :ret int
+                         (let [(a (%NewArray))
+                               (stored (%ArrayStore a 0 (%Box 42)))]
+                           (arrayLength a)))")
+                    JSL-OK))
+         (assert (= (jsl-require-body-only! "makeAndRead") JSL-OK))
+         (let [ctrl (stack (array i64 1))
+               mem (stack (array i64 1))
+               cp (cast (ptr i64) ctrl)
+               mp (cast (ptr i64) mem)]
+           (store! (index cp 0) (g-start))
+           (store! (index mp 0)
+                   (n-new1 OP-ARG (t-mem-alias JS-PROPERTY-ALIAS (t-undef)) (g-start)))
+           (let [value (jsl-inline! cp mp (g-start) "makeAndRead" (slice-new [i64] cp 0))
+                 ret (n-new3 OP-RETURN 0 (load (index cp 0)) value (load (index mp 0)))]
+             (n-add-def! (g-stop) ret)
+             (iterate!)
+             (g-analyze!)
+             (assert (= (g-verify) 0))
+             (ev-reset!)
+             (assert (= (ev-run-nobind 100000) EV-OK))
+             (assert (= (rt-payload (ev-result)) 1)))))
+
+(deftest a_recursive_builtin_threads_the_heap_at_every_call
+         (fresh! 91201)
+         (assert (= (jsl-load!
+                      "(builtin sumArray :transitioning true :params [(a dyn) (i int)] :ret int
+                         (if (%Lt i (%ArrayLen a))
+                             (%Add (%UnboxInt (%ArrayLoad a i)) (sumArray a (%Add i 1)))
+                             0))
+                       (macro makeAndSum :params [] :ret int
+                         (let [(a (%NewArray))
+                               (s0 (%ArrayStore a 0 (%Box 20)))
+                               (s1 (%ArrayStore a 1 (%Box 22)))]
+                           (sumArray a 0)))")
+                    JSL-OK))
+         (assert (= (jsl-require-body-only! "makeAndSum") JSL-OK))
+         (let [ctrl (stack (array i64 1)) mem (stack (array i64 1))
+               cp (cast (ptr i64) ctrl) mp (cast (ptr i64) mem)]
+           (store! (index cp 0) (g-start))
+           (store! (index mp 0)
+                   (n-new1 OP-ARG (t-mem-alias JS-PROPERTY-ALIAS (t-undef)) (g-start)))
+           (let [value (jsl-inline! cp mp (g-start) "makeAndSum" (slice-new [i64] cp 0))
+                 ret (n-new3 OP-RETURN 0 (load (index cp 0)) value (load (index mp 0)))]
+             (n-add-def! (g-stop) ret)
+             (iterate!)
+             (g-analyze!)
+             (assert (= (g-verify) 0))
+             (ev-reset!)
+             (assert (= (ev-run-nobind 100000) EV-OK))
+             (assert (= (rt-payload (ev-result)) 42)))))
 
 ;; The same definition as a `macro` is accepted, because a macro is lowered into its caller's graph
 ;; and so reads its caller's memory.

@@ -833,7 +833,8 @@
 ;; reads it. The IR already has this convention — `v-need-call-args` permits the LAST argument of a
 ;; call to be a memory producer — so passing the heap positionally is what the verifier expects
 ;; rather than something invented here.
-(defn jsl-decl-call-arity [(i i64)] (-> i64) (jsl-decl-nparams i))
+(defn jsl-decl-call-arity [(i i64)] (-> i64)
+  (+ (jsl-decl-nparams i) (if (jsl-decl-uses-memory? i) 1 0)))
 
 ;; A store straight into the live element.
 (defn jsl-decl-set-fun! [(i i64) (fun i64)] (-> i64)
@@ -1245,27 +1246,12 @@
                   0)))
       (load found))))
 
-;; THE HEAP MAY ONLY BE READ THROUGH AN OBJECT THE ENCLOSING FUNCTION CREATED, and this is an IR
-;; fact rather than a style rule.
-;;
-;; Memory reaches a function as an `OP-ARG` carrying a memory aux — `v-mem-producer?` decides that
-;; STRUCTURALLY, and `OP-PARM` is not on its list, so memory cannot be a parameter however it is
-;; typed. Each function therefore synthesises its own entry heap: an opaque "some heap" that is NOT
-;; its caller's. Objects the function allocates itself thread through that heap correctly, so a
-;; builtin reading back its own writes is fine. What is not fine is reading through an array that
-;; arrived as a PARAMETER: its contents live in the caller's chain, so the read sees nothing. An
-;; `ArrayIndexOf` written that way answered -1 for an element the caller had just stored, verified
-;; clean, and ran to completion. Nothing downstream notices.
-;;
-;; So the refusal is about parameters, not about heap use as such. `heapparams` is the set of a
-;; definition's parameters whose value reaches the array operand of a heap primitive, computed to a
-;; fixpoint through calls; a `builtin` with any is refused. A `macro` may have them, because it is
-;; lowered into its caller's graph and therefore reads the caller's heap.
-;;
-;; KNOWN GAP: the flow analysis follows a parameter used directly and a parameter passed to a call,
-;; plus a `let` that binds one to a new name. A parameter laundered through a call that RETURNS it
-;; is not followed. That is narrower than the rule wants to be, and it is why this is documented
-;; here rather than presented as a proof.
+;; `heapparams` records which source parameters reach heap primitives, propagated through calls.
+;; It began as a safety check while called builtins could not receive their caller's heap. Heap use
+;; is now an explicit function effect instead: `jsl-resolve-memory-use!` gives such a builtin one
+;; implicit trailing memory argument, and lowering publishes its returned memory at CallEnd. Keep
+;; this analysis as useful declaration metadata and as a cross-check on the memory-use fixpoint;
+;; it no longer rejects called builtins.
 (defn jsl-param-of [(d i64) (x (ptr rd/Sexp))] (-> i64)
   (if (not (rd/sexp-sym? x)) -1 (jsl-param-index d (rd/sexp-sym x))))
 
@@ -1321,16 +1307,7 @@
     JSL-OK))
 
 (defn jsl-check-heap-shape [] (-> i64)
-  (let [r (jsl-resolve-heap-params!)]
-    (if (!= r JSL-OK) r
-      (let [n (jsl-decl-count) (mut i) 0 (mut err) JSL-OK]
-        (loop (if (or (>= (load i) n) (!= (load err) JSL-OK)) (break)
-                (do (if (and (!= (jsl-decl-heap-params (load i)) 0) (not (jsl-macro? (load i))))
-                        (store! err (jsl-fail! JSL-ERR-HEAP-IN-BUILTIN (jsl-decl-name (load i))))
-                        0)
-                    (store! i (+ (load i) 1))
-                    0)))
-        (load err)))))
+  (jsl-resolve-heap-params!))
 
 (defn jsl-resolve-memory-use! [] (-> i64)
   (let [n (jsl-decl-count) (mut changed) true (mut rounds) 0]

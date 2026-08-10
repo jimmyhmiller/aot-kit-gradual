@@ -106,12 +106,11 @@
 (defn jl-set-ctrl! [(n i64)] (-> i64) (store! (field (jl) ctrl) n) 0)
 (defn jl-diverged? [] (-> bool) (= (jl-ctrl) JL-DIVERGED))
 
-;; THE HEAP THIS DEFINITION WAS GIVEN. It arrives as a trailing PARAMETER, not as a fresh
-;; function-entry `OP-ARG`, and the difference is the whole reason the first attempt did not work:
-;; a synthesised entry memory is an opaque "some heap", so a builtin reading one could not see the
-;; array its caller had just built and answered -1 for an element that was there. Memory has to
-;; cross the call, and the IR already expects it to — `v-need-call-args` permits the LAST argument
-;; of a call to be a memory producer.
+;; THE HEAP THIS DEFINITION WAS GIVEN. A heap-using builtin's call has an implicit trailing memory
+;; argument. The callee sees that effect as its function-entry `OP-ARG`, and its caller takes the
+;; returned effect from a CallEnd-rooted `OP-ARG`. Memory therefore crosses the call without being
+;; exposed as a source parameter. The IR already reserves this convention: `v-need-call-args`
+;; permits the LAST argument of a call to be a memory producer.
 ;;
 ;; `jl-lower-decl!` binds this for any declaration the checker found reads the heap; a macro
 ;; inlined into such a declaration inherits it, which is why the fixpoint propagates memory use
@@ -841,17 +840,23 @@
 
 (defn jl-builtin-call [(x (ptr rd/Sexp)) (callee i64) (nargs i64)] (-> i64)
   (block :call
-  (let [buf (stack (array i64 9))
+  (let [buf (stack (array i64 10))
         p (cast (ptr i64) buf)
+        uses-mem (jsl-decl-uses-memory? callee)
         (mut i) 0]
     (loop (if (>= (load i) nargs) (break)
             (do (store! (index p (load i)) (jl-expr (rd/sexp-nth x (+ (load i) 1))))
                 (store! i (+ (load i) 1))
                 0)))
     (if (jl-diverged?) (return-from :call NO-NODE) 0)
+    (if uses-mem (store! (index p nargs) (jl-mem)) 0)
     (let [fun (jsl-decl-fun callee)
-          cs (n-call! (jl-ctrl) fun (slice-new [i64] p nargs))]
-      (jl-set-ctrl! (call-end cs))
+          cs (n-call! (jl-ctrl) fun (slice-new [i64] p (+ nargs (if uses-mem 1 0))))
+          end (call-end cs)]
+      (jl-set-ctrl! end)
+      (if uses-mem
+          (jl-set-mem! (n-new1 OP-ARG (t-mem-alias JS-PROPERTY-ALIAS (t-undef)) end))
+          0)
       (call-value cs)))))
 
 ; ============================================================================
@@ -1063,12 +1068,9 @@
     ;; THE HEAP THREADS THROUGH; IT IS NOT REFUSED. This used to panic on any definition the checker
     ;; found touches memory, and that was the CALL path's reasoning misapplied here.
     ;;
-    ;; A CALLED definition works on a heap that is not its caller's: it takes one in, returns the one
-    ;; it leaves, and `heapparams` refuses an array arriving as a PARAMETER precisely because its
-    ;; contents live in a chain the callee cannot see. Inlining has no such split. The body's nodes
-    ;; ARE the caller's nodes, so there is exactly one memory chain — the caller's — and binding it
-    ;; before the body and reading it back after is the whole of it. Inlining is the answer to
-    ;; `heapparams` rather than a casualty of it.
+    ;; A called heap definition takes an implicit effect and returns the effect it leaves. Inlining
+    ;; has no call boundary: the body's nodes ARE the caller's nodes, so binding the caller's memory
+    ;; before the body and reading it back afterward is the whole convention.
     (let [saved-frame (jl-frame)
           saved-decl (load (field (jl) decl))
           saved-ctrl (jl-ctrl)
@@ -1115,9 +1117,21 @@
     (if (jsl-macro? d)
         (do (panic-corrupt "jsl-call!: a macro is inlined at its call site and has no callable entry") 0)
         0)
-    ; The caller supplies the heap too when the callee reads it; `jsl-decl-call-arity` is the count
-    ; including it.
-    (if (!= (slice-len args) (jsl-decl-call-arity d))
+    ;; This public boundary accepts source arguments only. Heap effects are a lowering concern and
+    ;; stay implicit just as they do for JSL-to-JSL calls.
+    (if (!= (slice-len args) (jsl-decl-nparams d))
         (do (panic-corrupt "jsl-call!: argument count does not match the declaration") 0)
         0)
-    (n-call! ctrl (jsl-decl-fun d) args)))
+    (if (not (jsl-decl-uses-memory? d))
+        (n-call! ctrl (jsl-decl-fun d) args)
+        (let [buf (stack (array i64 10))
+              p (cast (ptr i64) buf)
+              n (slice-len args)
+              (mut i) 0]
+          (loop (if (>= (load i) n) (break)
+                  (do (store! (index p (load i)) (slice-get args (load i)))
+                      (store! i (+ (load i) 1))
+                      0)))
+          (store! (index p n)
+                  (n-new1 OP-ARG (t-mem-alias JS-PROPERTY-ALIAS (t-undef)) ctrl))
+          (n-call! ctrl (jsl-decl-fun d) (slice-new [i64] p (+ n 1)))))))
