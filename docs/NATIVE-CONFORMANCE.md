@@ -35,6 +35,10 @@ checks its result against Node before accepting samples, and records all nine na
 samples plus native/Node compilation time in `out/typescript-aot-benchmarks/results.json`.
 `tools/benchmark-gate.sh` validates that report. Timing never proceeds past a correctness mismatch.
 
-The correctness-qualified workloads cover integer and branch-heavy loops, a call-heavy loop, a
-straight-line bitwise kernel, and a floating-point kernel. Benchmarks are performance witnesses,
-while the source-conformance matrix remains the exhaustive semantic oracle for supported features.
+The correctness-qualified workloads cover integer, branch, call, bitwise, floating-point, Math,
+and string kernels plus closures, object literals and property mutation, recursive object trees,
+DSL array callbacks, and a JSON parse/mutate/stringify roundtrip. Node runs twenty untimed in-process
+warmup batches over the same code paths before the nine measured samples; native compilation and
+linking finish before timing and the AOT binary needs no tiering warmup. Benchmarks are performance
+witnesses, while the source-conformance matrix remains the exhaustive semantic oracle for supported
+features.

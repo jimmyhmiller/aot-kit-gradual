@@ -6,20 +6,35 @@ import { execFileSync } from "node:child_process";
 import ts from "typescript";
 
 const root = path.resolve(path.dirname(new URL(import.meta.url).pathname), "..");
-const cases = [
-  { name: "sum-loop", input: 20_000_000, repeats: 1 },
-  { name: "branch-loop", input: 20_000_000, repeats: 1 },
-  { name: "call-loop", input: 5_000_000, repeats: 1 },
-  { name: "bitwise-mix", input: 2_000_000, repeats: 1 },
-  { name: "floating-point", input: 20_000_000, repeats: 1 },
+const allCases = [
+  { name: "sum-loop", input: 20_000_000, repeats: 1, warmupInput: 100_000 },
+  { name: "branch-loop", input: 20_000_000, repeats: 1, warmupInput: 100_000 },
+  { name: "call-loop", input: 5_000_000, repeats: 1, warmupInput: 50_000 },
+  { name: "bitwise-mix", input: 2_000_000, repeats: 1, warmupInput: 50_000 },
+  { name: "floating-point", input: 20_000_000, repeats: 1, warmupInput: 100_000 },
   // Exercises the Math builtins that lib/math/rounding.jsl now computes, so a regression from
   // replacing an inline IR node with a call into the runtime library is visible rather than assumed.
-  { name: "math-loop", input: 2_000_000, repeats: 1 },
+  { name: "math-loop", input: 2_000_000, repeats: 1, warmupInput: 20_000 },
   // Exercises the string operations lib/string/ now computes, for the same reason.
-  { name: "string-loop", input: 500_000, repeats: 1 },
+  { name: "string-loop", input: 500_000, repeats: 1, warmupInput: 5_000 },
+  { name: "closure-loop", input: 1, repeats: 200_000, warmupInput: 1, warmupRepeats: 1_000, optimize: false },
+  { name: "object-literals", input: 1, repeats: 2_000, warmupInput: 1, warmupRepeats: 100 },
+  { name: "recursive-objects", input: 16, repeats: 1, warmupInput: 8 },
+  { name: "array-callbacks", input: 1, repeats: 200, warmupInput: 1, warmupRepeats: 20 },
+  { name: "json-roundtrip", input: 1, repeats: 50, warmupInput: 1, warmupRepeats: 5, optimize: false },
 ];
-const measuredSamples = 9;
-const nodeWarmupIterations = Number(process.env.AOT_NODE_WARMUP_ITERATIONS ?? 1_000);
+const requestedCases = process.argv.slice(2).map(arg => {
+  if (!arg.startsWith("--case=")) throw new Error("usage: typescript-aot-benchmarks.mjs [--case=NAME ...]");
+  return arg.slice("--case=".length);
+});
+const cases = requestedCases.length === 0
+  ? allCases
+  : allCases.filter(benchmark => requestedCases.includes(benchmark.name));
+if (cases.length !== (requestedCases.length || allCases.length)) throw new Error("unknown or duplicate benchmark case");
+const measuredSamples = Number(process.env.AOT_BENCHMARK_SAMPLES ?? 9);
+if (!Number.isSafeInteger(measuredSamples) || measuredSamples < 1)
+  throw new Error("AOT_BENCHMARK_SAMPLES must be a positive integer");
+const nodeWarmupIterations = Number(process.env.AOT_NODE_WARMUP_ITERATIONS ?? 20);
 if (!Number.isSafeInteger(nodeWarmupIterations) || nodeWarmupIterations < 0)
   throw new Error("AOT_NODE_WARMUP_ITERATIONS must be a non-negative integer");
 const median = values => [...values].sort((a, b) => a - b)[Math.floor(values.length / 2)];
@@ -60,13 +75,13 @@ for (const benchmark of cases) {
   const js = ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 } }).outputText;
   const module = await import(`data:text/javascript;base64,${Buffer.from(js).toString("base64")}`);
   const nodeCompileNs = Number(process.hrtime.bigint() - nodeCompileStarted);
-  const nodeRun = () => {
+  const nodeRun = (input = benchmark.input, repeats = benchmark.repeats) => {
     const started = process.hrtime.bigint();
     let result = 0;
     // Vary the argument and retain every result so V8 cannot hoist an identical pure call or
     // discard all but the final iteration. This matches the native harness's observable checksum.
-    for (let i = 0; i < benchmark.repeats; ++i)
-      result = (result ^ module.main(benchmark.input + i)) | 0;
+    for (let i = 0; i < repeats; ++i)
+      result = (result ^ module.main(input + i)) | 0;
     return { result, runtimeNs: Number(process.hrtime.bigint() - started) };
   };
   const nativeRun = () => {
@@ -74,9 +89,11 @@ for (const benchmark of cases) {
     return { result: metric(text, "result"), runtimeNs: metric(text, "runtime_ns") };
   };
 
-  // Give V8 enough in-process calls to tier up before any timed observation. Keep this distinct
-  // from `repeats`: each warmup iteration invokes the exported workload exactly as a sample does.
-  for (let i = 0; i < nodeWarmupIterations; ++i) nodeRun();
+  // Give V8 enough in-process calls to tier up before any timed observation. Warmup uses the same
+  // code paths with a smaller input so large measured kernels do not turn tiering into most of the
+  // benchmark runtime. Native binaries are AOT and receive only untimed process-level shakeouts.
+  for (let i = 0; i < nodeWarmupIterations; ++i)
+    nodeRun(benchmark.warmupInput, benchmark.warmupRepeats ?? benchmark.repeats);
   for (let i = 0; i < 3; ++i) nativeRun();
   const samples = [];
   for (let i = 0; i < measuredSamples; ++i) {
@@ -87,7 +104,7 @@ for (const benchmark of cases) {
   }
   const coilMedianNs = median(samples.map(sample => sample.coilRuntimeNs));
   const nodeMedianNs = median(samples.map(sample => sample.nodeRuntimeNs));
-  report.push({ ...benchmark, result: nativeRun().result, coilCompileNs, nodeCompileNs, coilMedianNs, nodeMedianNs,
+  report.push({ ...benchmark, nodeWarmupIterations, result: nativeRun().result, coilCompileNs, nodeCompileNs, coilMedianNs, nodeMedianNs,
     ratio: coilMedianNs / nodeMedianNs, samples });
   console.error(`${benchmark.name}: Coil ${(coilMedianNs / 1e6).toFixed(3)} ms, Node ${(nodeMedianNs / 1e6).toFixed(3)} ms`);
 }
