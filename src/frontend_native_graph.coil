@@ -3898,6 +3898,74 @@
               (n-fun-add-return! fun ret))
           ret))))
 
+;; Initialize one formal parameter after its incoming Parm has been published. Argument omission
+;; and an explicit `undefined` share the same tagged value; JSL owns that classification. The
+;; initializer is built only on the true control arm, preserving JavaScript's laziness and order.
+(defn fng-default-parameter! [(context FngContext)
+                              (fn FeFunction)
+                              (ordinal i64)] (-> i64)
+  (let [frontend (load (field context frontend))
+        ast (field frontend ast)
+        symbol (al-get [FeSymbol]
+                       (load (field frontend symbols))
+                       (+ (load (field fn parameter-start)) ordinal))
+        symbol-id (load (field symbol id))
+        parameter-type (fng-parameter-type frontend fn ordinal)
+        initializer (ts-role ast (load (field symbol node)) TS-ROLE-INITIALIZER 0)]
+    (if (= initializer -1)
+        0
+        (let [incoming (fng-symbol-node context symbol-id)
+              incoming-value
+                (if (= parameter-type FNG-NUMBER)
+                    (fng-number-value context (load (field symbol name-node)) incoming)
+                    incoming)
+              condition (fng-jsl-call1 context "IsUndefinedValue" incoming)
+              saved-ctrl (load (load (field context ctrl)))
+              (mut symbols) (al-new [i64] (malloc-allocator))
+              (mut active) (al-new [i64] (malloc-allocator))
+              (mut snapshots) (al-new [i64] (malloc-allocator))
+              (mut answer) incoming-value]
+          (fng-assigned! frontend initializer (mut symbols))
+          (fng-record-dynamic-alias! context JS-PROPERTY-ALIAS)
+          (fng-active-memory! context (mut active))
+          (fng-control-aliases! context (mut active))
+          (let [saved-start (fng-snapshot! context (mut symbols) (mut active) (mut snapshots))
+                arms (n-if-arms! (fng-peep (n-new2 OP-IF 0 saved-ctrl condition)))]
+            (store! (load (field context ctrl)) (arms-t arms))
+            (let [expected parameter-type
+                  raw-default (fng-expression-expected context initializer expected)
+                  default-value
+                    (if (= parameter-type FNG-NUMBER)
+                        raw-default
+                        (fng-call-argument frontend fn ordinal raw-default))
+                  default-ctrl (load (load (field context ctrl)))
+                  default-start (fng-snapshot! context (mut symbols) (mut active) (mut snapshots))]
+              (fng-restore-snapshot! context (mut symbols) (mut active) (mut snapshots) saved-start)
+              (store! (load (field context ctrl)) (arms-f arms))
+              (let [incoming-ctrl (load (load (field context ctrl)))
+                    incoming-start (fng-snapshot! context (mut symbols) (mut active) (mut snapshots))]
+                (if (fng-merge-snapshots! context
+                                          default-ctrl default-start
+                                          incoming-ctrl incoming-start
+                                          (mut symbols) (mut active) (mut snapshots))
+                    (cond (= default-ctrl NO-NODE) (store! answer incoming-value)
+                          (= incoming-ctrl NO-NODE) (store! answer default-value)
+                          :else
+                            (let [phi (n-new OP-PHI
+                                             (if (= parameter-type FNG-NUMBER)
+                                                 (t-num)
+                                                 (t-dyn)))]
+                              (n-add-def! phi (load (load (field context ctrl))))
+                              (n-add-def! phi default-value)
+                              (n-add-def! phi incoming-value)
+                              (store! answer (fng-peep phi))))
+                    0))))
+          (fng-set-symbol! context symbol-id (load answer))
+          (al-free! [i64] (mut symbols))
+          (al-free! [i64] (mut active))
+          (al-free! [i64] (mut snapshots))
+          0))))
+
 (defn fng-list-has [(values (ptr (ArrayList i64))) (value i64)] (-> bool)
   (let [(mut index) 0
         (mut found) false]
@@ -5387,6 +5455,22 @@
                          fun-id
                          fun
                          top-level)]
+      (if top-level
+          0
+          (do
+            (store! index 0)
+            (loop (if (>= (load index) (load (field fn parameter-count)))
+                      (break)
+                      (do
+                        (let [parameter-symbol
+                                (al-get [FeSymbol]
+                                        (load (field frontend symbols))
+                                        (+ (load (field fn parameter-start)) (load index)))]
+                          (fng-set-symbol-type! context
+                                                (load (field parameter-symbol id))
+                                                (fng-parameter-type frontend fn (load index))))
+                        (fng-default-parameter! context fn (load index))
+                        (store! index (+ (load index) 1)))))))
       (fng-initialize-locals! context)
       (if top-level (fng-top-level-initialize! context) 0)
       (let [body-node (load (field fn body-node))
