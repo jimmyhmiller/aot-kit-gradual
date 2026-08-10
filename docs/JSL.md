@@ -195,7 +195,7 @@ the frontend, which is three partial coercion implementations that no test compa
 | Form | Meaning |
 |---|---|
 | `(let [(x E) …] BODY…)` | sequential binding; a binding is an SSA value and emits no node of its own |
-| `(loop [(x init) …] BODY…)` | `OP-LOOP` plus one `OP-PHI` per binding |
+| `(loop [(x init [type]) …] BODY…)` | `OP-LOOP` plus one `OP-PHI` per binding; the optional type fixes its carried representation |
 | `(recur v …)` | iterate: park the control and the next values on the back edge, and diverge |
 | `(if C A B)` | `OP-IF`, two `OP-CPROJ` arms, `OP-REGION`, `OP-PHI` |
 | `(%Prim a …)` | one primitive op, arity-checked |
@@ -319,6 +319,11 @@ A JSL loop is a **tail-recursive binding group**. The body is an expression: if 
 (loop [(i 0) (acc 0)]
   (if (%Lt i n) (recur (%Add i 1) (%Add acc i)) acc))
 ```
+
+The optional third binding item declares a representation when inference cannot recover it across
+the back edge: `(loop [(cursor start int) (out "" str)] ...)`. This is the same job as a typed
+Torque local. It is checked by the ordinary JSL type parser and attached to the Phi; an unknown
+type or a fourth binding item is rejected instead of ignored.
 
 That shape maps one-to-one onto the IR: one `OP-PHI` per binding, the initialiser on the entry edge
 and the recur value on the back edge. So JSL needs **no assignment form and no mutable local** —
@@ -524,6 +529,9 @@ seam does not carry, so `popped * 10 + values[0]` answered one low. `shift` uses
   collects it as dead code, leaving the phi wired to a killed node.
 - **A definition that touched the heap returns its final memory.** With nothing reading the last
   store, the kill cascade collects the entire chain and `g-verify` reports `VERR-LEAK`.
+- **A loop publishes the memory on its exit edge.** The header memory Phi describes memory at the
+  start of an iteration, not after the final body. Returning the header Phi discarded stores made
+  by the last iteration; loop closing now records and publishes the exiting body's memory.
 
 ### Three backend defects the mutating entries exposed
 

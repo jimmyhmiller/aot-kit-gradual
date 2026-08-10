@@ -262,6 +262,11 @@
           0)))
 
 (defn jl-prim [(id i64) (a i64) (b i64) (c i64)] (-> i64)
+  ;; A throw is not a floating value. Its payload participates in expression joins so the existing
+  ;; exception ABI can propagate it, but the operation itself must remain in the branch that chose
+  ;; it; otherwise scheduling can hoist an untaken error path and throw unconditionally.
+  (if (= id JSP-THROW)
+      (n-peephole (n-new2 OP-JSTHROW 0 (jl-ctrl) a))
   (if (or (= id JSP-UNBOXINT)
           (or (= id JSP-UNBOXFLT)
               (or (= id JSP-UNBOXBOOL) (or (= id JSP-UNBOXOBJ) (= id JSP-UNBOXSTRING)))))
@@ -282,7 +287,7 @@
         (if (= n 2) (n-peephole (n-new3 op aux NO-NODE a b))
           (if (= n 3) (n-peephole (n-new4 op aux NO-NODE a b c))
             (do (panic-corrupt "jsl lowering: a primitive arity this dispatch does not build")
-                NO-NODE)))))))))
+                NO-NODE))))))))))
 
 ;; A heap-reading primitive. The memory operand is supplied here rather than written in the `.jsl`
 ;; source, so `%ArrayLoad a i` in the library becomes `ArrayLoad(mem, a, i)` in the graph and the
@@ -523,7 +528,7 @@
           (jl-unkeep! af) (jl-unkeep! at)
           r))))))
 
-;; `(loop [(name init) ...] BODY...)`. Built in the order D9's in-progress contract requires, which
+;; `(loop [(name init [type]) ...] BODY...)`. Built in the order D9's in-progress contract requires,
 ;; corpus.coil's `fx-loop` states and which is not negotiable: OPEN the Loop, OPEN every Phi with a
 ;; placeholder back edge, build and peephole the body INSIDE that window, CLOSE the phis, then close
 ;; the control back edge. Get the order wrong and the loop is deleted with no error reported, every
@@ -562,7 +567,11 @@
       (n-add-def! lp NO-NODE)          ; the back edge, filled in below
       (store! k 0)
       (loop (if (>= (load k) nb) (break)
-              (let [ph (n-new OP-PHI (t-dyn))]
+              (let [binding (rd/sexp-nth binds (load k))
+                    declared (if (= (rd/sexp-count binding) 3)
+                                 (jsl-type-of (rd/sexp-nth binding 2))
+                                 (t-dyn))
+                    ph (n-new OP-PHI declared)]
                 (n-add-def! ph lp)
                 (n-add-def! ph (load (index inits (load k))))
                 (n-add-def! ph NO-NODE)  ; the recur value, filled in below
@@ -602,16 +611,17 @@
                   (do (store! v (jl-expr (rd/sexp-nth x (load j))))
                       (store! j (+ (load j) 1))
                       0)))
-          (let [exit (jl-ctrl)]
+          (let [exit (jl-ctrl)
+                exitmem (jl-mem-raw)]
             (jl-keep! (load v))
             (jl-drop! depth)
             (jl-unkeep! (load v))
             (al-pop! [JslLoop] (field (jl) loops))
-            (jl-loop-close! lp phis nb rbase vbase memphi exit (load v))))))))
+            (jl-loop-close! lp phis nb rbase vbase memphi exit exitmem (load v))))))))
 
 ;; Close the phis, then the control back edge, then hand back the loop's value.
 (defn jl-loop-close! [(lp i64) (phis (ptr i64)) (nb i64) (rbase i64) (vbase i64)
-                      (memphi i64) (exit i64) (v i64)] (-> i64)
+                      (memphi i64) (exit i64) (exitmem i64) (v i64)] (-> i64)
   (let [nrec (- (jl-rctrl-count) rbase)]
     ; A loop nothing recurs to is a `let` written the long way, and would leave the Loop's back edge
     ; null. A loop everything recurs from cannot terminate and leaves the enclosing body with no
@@ -638,9 +648,10 @@
           (wl-push! lp)
           (jl-recur-drop! rbase vbase)
           (jl-set-ctrl! exit)
-          ; After the loop the heap is the one the EXIT path left, which is the memory phi: the exit
-          ; test is evaluated inside the loop, so the last thing to touch the heap was an iteration.
-          (if (= memphi NO-NODE) 0 (jl-set-mem! memphi))
+          ;; After the loop the heap is the state on its EXIT path. That may be the header phi when
+          ;; the body only reads, but a body can write before testing whether to exit; publishing
+          ;; the header phi there silently discards the final iteration's effects.
+          (if (= memphi NO-NODE) 0 (jl-set-mem! exitmem))
           v)))))
 
 ;; The memory reaching the back edge, from the memory each `recur` recorded.

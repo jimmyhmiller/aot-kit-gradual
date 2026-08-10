@@ -133,6 +133,7 @@ primitives, analogous to Torque `extern` operations. The frontend does not const
 | `Number.MAX_SAFE_INTEGER` | **done** | MaxSafeInteger |
 | `parseFloat(x)` | **done** | ParseFloatValue |
 | `Number.parseFloat(x)` | **done** | ParseFloatValue |
+| `JSON.parse(text)` | **done** | JSONParse |
 | `void x` | **done** | VoidValue |
 | `typeof x` | **done** | TypeOfValue |
 | `x ?? y` | **done** | IsNullishValue |
@@ -161,7 +162,7 @@ string and template literals with interpolation and cooked escapes, concatenatio
 
 ### Needs a frontend intrinsic, like the one `Number` just got
 
-- `JSON.parse`/`stringify`
+- `JSON.stringify`
 
 ### Needs new syntax in the frontend
 

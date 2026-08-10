@@ -237,7 +237,7 @@
 ;; and the index format are all only exercised here.
 (deftest the_library_on_disk_loads_and_every_declaration_lowers
          (lib! 90300)
-         (assert (= (jsl-decl-count) 169))
+         (assert (= (jsl-decl-count) 189))
          ; A builtin has a Fun and a macro does not, and every declaration is one or the other.
          (let [(mut i) 0 (mut funs) 0 (mut macros) 0]
            (loop (if (>= (load i) (jsl-decl-count)) (break)
@@ -248,11 +248,11 @@
                                (store! funs (+ (load funs) 1)) 0))
                        (store! i (+ (load i) 1))
                        0)))
-           (assert (= (+ (load funs) (load macros)) 169))
+           (assert (= (+ (load funs) (load macros)) 189))
            ; Most existing heap definitions remain macros for graph visibility and historical
            ; stability; called builtins can now carry an implicit heap effect when recursion or
            ; code sharing requires one.
-           (assert (= (load macros) 125)))
+           (assert (= (load macros) 140)))
          (assert (>= (jsl-find "Clamp") 0))
          (assert (>= (jsl-find "StringIndexOfFrom") 0))
          (assert (>= (jsl-find "StringStartsWith") 0))
@@ -735,6 +735,20 @@
          (let [r (run2n "srepeat" (sconst "x") (iconst 0))]
            (assert (jss-equal? (rt-payload r) (jss-from-utf8! "")))))
 
+(deftest a_loop_binding_may_declare_its_carried_representation
+         (fresh! 91109)
+         (build! "(builtin typedLoop :params [] :ret int
+                    (loop [(i 0 int)]
+                      (if (%Lt i 3) (recur (%Add i 1)) i)))")
+         (assert (= (n-aux (first-op OP-PHI)) (t-int)))
+         (assert (= (rt-payload (runN "typedLoop" (slice-new [i64] (cast (ptr i64) 0) 0))) 3))
+         (refuses 91112
+                  "(builtin f :params [] (loop [(i 0 not-a-type)] (recur i)))"
+                  JSL-ERR-BAD-TYPE)
+         (refuses 91113
+                  "(builtin f :params [] (loop [(i 0 int extra)] (recur i)))"
+                  JSL-ERR-BAD-LOOP))
+
 (deftest two_recur_sites_merge_into_one_back_edge
          (fresh! 91105) (build! SRC-TWO-RECUR)
          (assert (= (rt-payload (run1 "countodd" 10)) 5))   ; 1,3,5,7,9
@@ -782,6 +796,15 @@
                 (store! i (+ (load i) 1))
                 0)))
     (load c)))
+
+(defn first-op [(op i64)] (-> i64)
+  (block :found
+    (let [n (n-count) (mut i) 0]
+      (loop (if (>= (load i) n) (break)
+              (do (if (and (not (n-dead? (load i))) (= (n-op (load i)) op))
+                      (return-from :found (load i)) 0)
+                  (store! i (+ (load i) 1)) 0)))
+      NO-NODE)))
 
 ;; `useTwice` is NOT declared `:transitioning`, and that is the assertion. A macro is expanded into
 ;; the caller's graph, so if `Twice` had lowered to a call instead the transition check would see an
