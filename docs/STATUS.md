@@ -125,6 +125,7 @@ spelling of the same call. **These are not a backlog.**
 | `Number.parseFloat(x)` | **done** | ParseFloatValue |
 | `void x` | **done** | VoidValue |
 | `typeof x` | **done** | TypeOfValue |
+| `x ?? y` | **done** | IsNullishValue |
 
 ## Language surface that compiles
 
@@ -171,7 +172,6 @@ string literals and concatenation; `throw`; type aliases, interfaces and union a
 - getters and setters
 - computed property names
 - optional chaining `?.`
-- nullish coalescing `??`
 - `try`/`catch`/`finally`
 - arrow functions
 - `instanceof` / `in` / `delete`

@@ -108,6 +108,7 @@ const OTHER = [
   ["`Number.parseFloat(x)`", "ParseFloatValue"],
   ["`void x`", "VoidValue"],
   ["`typeof x`", "TypeOfValue"],
+  ["`x ?? y`", "IsNullishValue"],
 ];
 
 // Not supported by the frontend at all: the call or the syntax does not compile. Grouped by what
@@ -128,7 +129,7 @@ const UNSUPPORTED = {
   "Needs new syntax in the frontend": [
     "template literals", "destructuring", "spread and rest", "default parameters",
     "`for...of` / `for...in`", "`class`", "getters and setters", "computed property names",
-    "optional chaining `?.`", "nullish coalescing `??`", "`try`/`catch`/`finally`",
+    "optional chaining `?.`", "`try`/`catch`/`finally`",
     "arrow functions", "`instanceof` / `in` / `delete`",
   ],
   "Needs a runtime this compiler does not have": [

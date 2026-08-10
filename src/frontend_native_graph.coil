@@ -3319,7 +3319,8 @@
                              (then-node i64)
                              (then-fixed i64)
                              (else-node i64)
-                             (else-fixed i64)] (-> i64)
+                             (else-fixed i64)
+                             (box-arms bool)] (-> i64)
   (let [frontend (load (field context frontend))
         (mut changed) (al-new [i64] (malloc-allocator))
         (mut saved-values) (al-new [i64] (malloc-allocator))
@@ -3341,7 +3342,8 @@
                 (store! index (+ (load index) 1)))))
     (let [arms (n-if-arms! (fng-peep (n-new2 OP-IF 0 saved-ctrl condition)))]
       (store! (load (field context ctrl)) (arms-t arms))
-      (let [then-value (if (= then-node -1) then-fixed (fng-expression context then-node))
+      (let [raw-then-value (if (= then-node -1) then-fixed (fng-expression context then-node))
+            then-value (if box-arms (n-box! raw-then-value) raw-then-value)
             then-ctrl (load (load (field context ctrl)))]
         (store! index 0)
         (loop (if (>= (load index) (al-len [i64] (load changed)))
@@ -3355,7 +3357,8 @@
         (store! (load (field context memory)) saved-memory)
         (store! (load (field context ctrl)) (arms-f arms))
         (fng-restore-values! context changed saved-values)
-        (let [else-value (if (= else-node -1) else-fixed (fng-expression context else-node))
+        (let [raw-else-value (if (= else-node -1) else-fixed (fng-expression context else-node))
+              else-value (if box-arms (n-box! raw-else-value) raw-else-value)
               else-ctrl (load (load (field context ctrl)))
               region (n-new OP-REGION 0)
               value-phi (n-new OP-PHI (t-dyn))]
@@ -3460,13 +3463,22 @@
                   then-node (ts-role ast node TS-ROLE-WHEN-TRUE 0)
                   else-node (ts-role ast node TS-ROLE-WHEN-FALSE 0)
                   condition (fng-condition-expression context condition-node)]
-              (fng-branch-expression context condition then-node NO-NODE else-node NO-NODE))
+              (fng-branch-expression context condition then-node NO-NODE else-node NO-NODE false))
           (= kind TSK-BINARY)
             (let [left-node (ts-child ast node 0)
                   operator (ts-text ast (ts-child ast node 1))
                   right-node (ts-child ast node 2)]
-              (if (or (str-eq operator "&&") (str-eq operator "||"))
+              (if (or (str-eq operator "&&")
+                      (or (str-eq operator "||") (str-eq operator "??")))
                   (let [left (fng-expression context left-node)]
+                    (if (str-eq operator "??")
+                        (fng-branch-expression context
+                                               (fng-jsl-call1 context "IsNullishValue" (n-box! left))
+                                               right-node
+                                               NO-NODE
+                                               -1
+                                               left
+                                               true)
                     (if (str-eq operator "&&")
                         (fng-branch-expression context
                                                (if (= (fng-infer context left-node FNG-DYNAMIC) FNG-STRING)
@@ -3475,7 +3487,8 @@
                                                right-node
                                                NO-NODE
                                                -1
-                                               left)
+                                               left
+                                               false)
                         (fng-branch-expression context
                                                (if (= (fng-infer context left-node FNG-DYNAMIC) FNG-STRING)
                                                    (fng-jsl-call1 context "StringLength" left)
@@ -3483,7 +3496,8 @@
                                                -1
                                                left
                                                right-node
-                                               NO-NODE)))
+                                               NO-NODE
+                                               false))))
                   (if (or (str-eq operator "=")
                           (or (str-eq operator "+=")
                               (or (str-eq operator "-=")
