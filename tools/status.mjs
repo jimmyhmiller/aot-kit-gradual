@@ -118,6 +118,7 @@ const OTHER = [
   ["`parseFloat(x)`", "ParseFloatValue"],
   ["`Number.parseFloat(x)`", "ParseFloatValue"],
   ["`JSON.parse(text)`", "JSONParse"],
+  ["`JSON.parse(text, reviver)`", "JSONParseWithReviver"],
   ["`JSON.stringify(value)`", "JSONStringify"],
   ["`JSON.stringify(value, replacer, space)`", "JSONStringifyWithOptions"],
   ["`void x`", "VoidValue"],

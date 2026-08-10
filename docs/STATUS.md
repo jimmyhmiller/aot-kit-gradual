@@ -134,6 +134,7 @@ primitives, analogous to Torque `extern` operations. The frontend does not const
 | `parseFloat(x)` | **done** | ParseFloatValue |
 | `Number.parseFloat(x)` | **done** | ParseFloatValue |
 | `JSON.parse(text)` | **done** | JSONParse |
+| `JSON.parse(text, reviver)` | **done** | JSONParseWithReviver |
 | `JSON.stringify(value)` | **done** | JSONStringify |
 | `JSON.stringify(value, replacer, space)` | **done** | JSONStringifyWithOptions |
 | `void x` | **done** | VoidValue |

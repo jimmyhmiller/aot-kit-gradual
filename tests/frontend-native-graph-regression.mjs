@@ -33,7 +33,7 @@ const expectedDigests = Object.freeze({
   // the non-entry ownership invariant this fixture now pins. 34 nodes to 48.
   // Repinned when JSL lowering began skipping statically disproven arms. The guarded ToNumber
   // expansion remains for the opaque parameter, while constant sub-guards no longer leave dead
-  // diamonds for iteration to clean up. The new JSON helper also moves user Fun ids 53 -> 54.
+  // diamonds for iteration to clean up. The generated JSON helpers move user Fun ids 53 -> 54.
   call: "105d82cc048a862ca52f47a869fdaac3de85a5112f230deefcfad2e94174436d",
   control: "317059e49013ae650f20f71a4a960fd0b5e9202d519901ed26a90803a7d260bd",
   // Repinned for the same ToNumber seam as `call`, and this one is the minimal form of it: exactly

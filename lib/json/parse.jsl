@@ -196,7 +196,7 @@
                     (JsonSkipWhitespace text (%Add after 1)) out (%Add element 1))
                   (JsonSyntaxError)))))))
 
-(builtin JsonParseArray :transitioning true :params [(text dyn) (index int)] :ret dyn
+(macro JsonParseArray :transitioning true :params [(text dyn) (index int)] :ret dyn
   (let [(out (%NewArray))
         (start (JsonSkipWhitespace text (%Add index 1)))
         (end
@@ -235,7 +235,7 @@
             (JsonSyntaxError)))
       (JsonSyntaxError)))
 
-(builtin JsonParseObject :transitioning true :params [(text dyn) (index int)] :ret dyn
+(macro JsonParseObject :transitioning true :params [(text dyn) (index int)] :ret dyn
   (let [(out (%Box (%NewObject)))
         (start (JsonSkipWhitespace text (%Add index 1)))
         (end
@@ -259,6 +259,48 @@
                                   (if (if (%Eq code 45) true (JsonIsDigit code))
                                       (JsonParseNumber text cursor)
                                       (JsonSyntaxError))))))))))))
+
+;; InternalizeJSONProperty walks children before invoking the reviver. Object keys are copied before
+;; traversal because a child callback may delete a sibling or add a new property; neither operation
+;; changes the spec's snapshot. Parsed arrays begin dense, so their copied enumerable index keys are
+;; also the spec's initial `[0, length)` list and retain future indices if an earlier callback deletes
+;; them.
+
+(builtin JsonReviveObjectKeys :transitioning true
+  :params [(object dyn) (reviver dyn) (keys dyn) (index int) (count int)] :ret dyn
+  (if (%Le count index) object
+      (let [(key (%ArrayLoad keys index))
+            (revived (JsonReviveProperty object key reviver))]
+        (if (%IsUndefined revived)
+            (let [(ignored (if (%IsArray object)
+                               (%PropDeleteKey (%UnboxArray object) key)
+                               (%PropDeleteKey object key)))]
+              (JsonReviveObjectKeys object reviver keys (%Add index 1) count))
+            (let [(ignored (%PropStoreKey object key revived))]
+              (JsonReviveObjectKeys object reviver keys (%Add index 1) count))))))
+
+(builtin JsonReviveProperty :transitioning true
+  :params [(holder dyn) (key dyn) (reviver dyn)] :ret dyn
+  (let [(value (%PropLoadKey holder key))
+        (walked
+          (if (%IsArray value)
+              (let [(keys (ObjectKeys value))]
+                (JsonReviveObjectKeys value reviver keys 0 (%ArrayLen keys)))
+              (if (%IsObject value)
+                  (let [(keys (ObjectKeys value))]
+                    (JsonReviveObjectKeys value reviver keys 0 (%ArrayLen keys)))
+                  value)))]
+    (call-dynamic-with-receiver reviver holder key walked)))
+
+(macro JSONParseWithReviver :transitioning true
+  :params [(value dyn) (reviver dyn)] :ret dyn
+  (let [(callback (%Box reviver))
+        (parsed (JSONParse value))]
+    (if (%IsFunction callback)
+        (let [(holder (%Box (%NewObject)))
+              (stored (%PropStoreKey holder (%Box "") parsed))]
+          (JsonReviveProperty holder (%Box "") callback))
+        parsed)))
 
 (macro JSONParse :params [(value dyn)] :ret dyn
   (let [(text (ToStringValue (%Box value)))

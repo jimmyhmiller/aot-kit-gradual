@@ -211,6 +211,10 @@ the frontend, which is three partial coercion implementations that no test compa
 Every other head symbol is an error with a name. `class` remains declared unimplemented and refused
 by `JSL-ERR-UNSUPPORTED`; there is no accepted-and-approximated path.
 
+The receiver operand is the tagged JavaScript value seen as `this`, not an internal raw object or
+array pointer. Generated call adapters may unbox it for a specialized callee ABI, but doing that in
+the DSL changes observable behavior such as `Array.isArray(this)`.
+
 ---
 
 ## The library on disk
