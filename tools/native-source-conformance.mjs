@@ -108,6 +108,7 @@ const runOne = async (test, slot) => {
       fs.writeFileSync(objectPath, await runAsync(emitterPath, [String(scheduleSeed), String(test.registers ?? mode.registers)], {binary: true}));
       await runAsync("xcrun", ["clang", "-arch", "arm64", "-O1", "-fno-omit-frame-pointer",
         path.join(root, "tools", "native-gc-runtime.c"),
+        path.join(root, "native", "unicode_runtime.c"), "-framework", "CoreFoundation",
         path.join(root, "tools", "native-gc-trampoline.S"),
         path.join(root, "tools", test.harness ?? "native-conformance-harness.c"), objectPath, "-o", binaryPath]);
       const nativeArgs = test.harness

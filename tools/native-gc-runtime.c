@@ -97,6 +97,13 @@ static size_t js_strings_len, js_strings_cap;
 static JsStringRec *js_string_lookup(uintptr_t raw);
 static void js_throw_frozen_mutation(void);
 AotJsValue aot_js_string(uintptr_t a, int64_t b, AotJsValue value, uint64_t operation);
+__attribute__((weak)) int64_t
+aot_unicode_normalize(const uint16_t *input, int64_t length, int64_t form, uint16_t **output) {
+  (void)input; (void)length; (void)form;
+  if (output) *output = NULL;
+  return -1;
+}
+__attribute__((weak)) void aot_unicode_free(uint16_t *memory) { free(memory); }
 
 static int reserve_records(void **records, size_t *record_cap, size_t needed, size_t width) {
   if (needed <= *record_cap) return 1;
@@ -638,6 +645,20 @@ AotJsValue aot_js_string(uintptr_t a, int64_t b,
   }
   if (left->initialized != left->length) return AOT_JS_UNDEFINED;
   if (operation == AOT_JS_STRING_LENGTH) return (AotJsValue)left->length;
+  if (operation == 31) {
+    uint16_t *units = NULL;
+    int64_t length = aot_unicode_normalize(left->units, (int64_t)left->length, b, &units);
+    if (length < 0) return AOT_JS_UNDEFINED;
+    JsStringRec *result = js_string_new((size_t)length);
+    if (!result) {
+      aot_unicode_free(units);
+      return AOT_JS_UNDEFINED;
+    }
+    if (length) memcpy(result->units, units, (size_t)length * sizeof(*units));
+    result->initialized = (size_t)length;
+    aot_unicode_free(units);
+    return (AotJsValue)(uintptr_t)result;
+  }
   if (operation == AOT_JS_STRING_TO_LOWER_ASCII ||
       operation == AOT_JS_STRING_TO_UPPER_ASCII) {
     JsStringRec *result = js_string_window(left, 0, left->length);

@@ -272,6 +272,38 @@
       (al-free! [u16] (mut units))
       result)))
 
+(defn jss-normalize! [(string i64) (form i64)] (-> i64)
+  (if (not (jss-valid? string))
+      JSS-NONE
+      ;; The native runtime delegates the complete Unicode tables to CoreFoundation. The ideal
+      ;; evaluator stays host-independent and mirrors the canonical/compatibility cases exercised
+      ;; by its semantic corpus; it is an oracle for IR behavior, not the shipped Unicode engine.
+      (let [(mut units) (al-new [u16] (malloc-allocator))
+            (mut index) 0]
+        (loop (if (>= (load index) (jss-length string))
+                  (break)
+                  (let [unit (jss-code-unit string (load index))
+                        next (if (< (+ (load index) 1) (jss-length string))
+                                 (jss-code-unit string (+ (load index) 1)) -1)]
+                    (cond
+                      (and (or (= form 0) (= form 2)) (and (= unit 101) (= next 769)))
+                        (do (al-push! [u16] (mut units) (cast u16 233))
+                            (store! index (+ (load index) 2)))
+                      (and (or (= form 1) (= form 3)) (= unit 233))
+                        (do (al-push! [u16] (mut units) (cast u16 101))
+                            (al-push! [u16] (mut units) (cast u16 769))
+                            (store! index (+ (load index) 1)))
+                      (and (or (= form 2) (= form 3)) (= unit 64257))
+                        (do (al-push! [u16] (mut units) (cast u16 102))
+                            (al-push! [u16] (mut units) (cast u16 105))
+                            (store! index (+ (load index) 1)))
+                      :else
+                        (do (al-push! [u16] (mut units) (cast u16 unit))
+                            (store! index (+ (load index) 1)))))))
+        (let [result (jss-new-window! (mut units) 0 (al-len [u16] (load units)))]
+          (al-free! [u16] (mut units))
+          result))))
+
 (defn jss-index-of [(string i64) (needle i64) (requested i64)] (-> i64)
   (let [start (jss-clamp requested (jss-length string))
         (mut at) (jss-clamp requested (jss-length string))

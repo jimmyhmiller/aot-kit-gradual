@@ -62,6 +62,7 @@ const STRING = {
   replaceAll: "StringReplaceAll", trim: "StringTrim", trimStart: "StringTrimStart",
   trimEnd: "StringTrimEnd", at: "StringAt",
   localeCompare: "StringLocaleCompare",
+  normalize: "StringNormalize",
 };
 const ARRAY = {
   push: "ArrayPush1", pop: "ArrayPop", shift: "ArrayShift", slice: "ArraySlice",
@@ -131,7 +132,7 @@ const UNSUPPORTED = {
     "`String.prototype.search`", "`String.prototype.replace`", "`RegExp`",
   ],
   "Needs a frontend intrinsic, like the one `Number` just got": [
-    "`JSON.parse`/`stringify`", "`String.prototype.normalize`",
+    "`JSON.parse`/`stringify`",
   ],
   "Needs new syntax in the frontend": [
     "tagged template literals", "destructuring", "spread and rest",

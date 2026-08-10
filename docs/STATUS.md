@@ -22,6 +22,7 @@ read out of the frontend's own tables, and every definition named here is checke
 | `indexOf` | **done** | StringIndexOfFrom |
 | `lastIndexOf` | **done** | StringLastIndexOf |
 | `localeCompare` | **done** | StringLocaleCompare |
+| `normalize` | **done** | StringNormalize |
 | `padEnd` | **done** | StringPadEnd |
 | `padStart` | **done** | StringPadStart |
 | `repeat` | **done** | StringRepeatCount |
@@ -161,7 +162,6 @@ string and template literals with interpolation and cooked escapes, concatenatio
 ### Needs a frontend intrinsic, like the one `Number` just got
 
 - `JSON.parse`/`stringify`
-- `String.prototype.normalize`
 
 ### Needs new syntax in the frontend
 
