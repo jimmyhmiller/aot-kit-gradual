@@ -1226,6 +1226,8 @@
                           FNG-NUMBER
                       (if (and (= kind TSK-CALL) (fng-number-to-string? context node))
                           FNG-STRING
+                          (if (and (= kind TSK-CALL) (fng-array-of? context node))
+                              FNG-ARRAY
                           (if (and (= kind TSK-CALL) (fng-string-from-char-code? context node))
                               FNG-STRING
                               (if (and (= kind TSK-CALL) (fng-string-builtin? context node))
@@ -1236,10 +1238,11 @@
                                       (let [builtin (fng-array-builtin-name context node)]
                                         (cond (str-eq builtin "push") FNG-NUMBER
                                               (or (str-eq builtin "slice")
+                                                  (or (str-eq builtin "splice")
                                                   (or (str-eq builtin "map")
                                                       (or (str-eq builtin "filter")
                                                           (or (str-eq builtin "sort")
-                                                              (str-eq builtin "flatMap"))))) FNG-ARRAY
+                                                              (str-eq builtin "flatMap")))))) FNG-ARRAY
                                               (str-eq builtin "join") FNG-STRING
                                               (or (str-eq builtin "some")
                                                   (str-eq builtin "every")) FNG-BOOLEAN
@@ -1251,7 +1254,7 @@
                                                   (fe-find-function-name frontend (ts-child ast callee-node 1))
                                                   (fe-resolution-symbol frontend callee-node))]
                                       (fng-call-result-type
-                                        frontend callee (= kind TSK-NEW-EXPRESSION)))))))))))))))
+                                        frontend callee (= kind TSK-NEW-EXPRESSION))))))))))))))))
               (= kind TSK-PROPERTY-ACCESS)
                 (let [owner (fng-infer context (ts-child ast node 0) FNG-DYNAMIC)
                       name-node (ts-child ast node 1)
@@ -1581,6 +1584,7 @@
 ;; methods were: absent from this list, the call never reaches a lowering.
 (defn fng-array-builtin? [(context FngContext) (node i64)] (-> bool)
   (let [name (fng-array-builtin-name context node)]
+    (or (str-eq name "splice")
     (or (str-eq name "fill")
         (or (str-eq name "reverse")
             (or (str-eq name "unshift")
@@ -1603,7 +1607,7 @@
                                                                     (or (str-eq name "some")
                                                                         (or (str-eq name "every")
                                                                             (or (str-eq name "sort")
-                                                                                (str-eq name "flatMap")))))))))))))))))))))))))
+                                                                                (str-eq name "flatMap"))))))))))))))))))))))))))
 
 ;; `Array.prototype.at` and `Array.prototype.join`, out of lib/array/read.jsl.
 ;;
@@ -1853,7 +1857,23 @@
         callee (ts-child ast node 0)]
     (and (= (ts-kind ast callee) TSK-PROPERTY-ACCESS)
          (and (= (fe-resolution-symbol frontend (ts-child ast callee 0)) FE-INTRINSIC-STRING)
-              (str-eq (ts-text ast (ts-child ast callee 1)) "fromCharCode")))))
+         (str-eq (ts-text ast (ts-child ast callee 1)) "fromCharCode")))))
+
+(defn fng-array-of? [(context FngContext) (node i64)] (-> bool)
+  (let [frontend (load (field context frontend)) ast (field frontend ast)
+        callee (ts-child ast node 0)]
+    (and (= (ts-kind ast callee) TSK-PROPERTY-ACCESS)
+         (and (= (fe-resolution-symbol frontend (ts-child ast callee 0)) FE-INTRINSIC-ARRAY)
+              (str-eq (ts-text ast (ts-child ast callee 1)) "of")))))
+
+(defn fng-array-of [(context FngContext) (node i64)] (-> i64)
+  (let [frontend (load (field context frontend)) ast (field frontend ast)
+        array (fng-jsl-call0 context "NewArray") (mut i) 1]
+    (loop (if (>= (load i) (ts-child-count ast node)) (break)
+            (do (fng-jsl-call2 context "ArrayOfAppend1" array
+                               (n-box! (fng-expression context (ts-child ast node (load i)))))
+                (store! i (+ (load i) 1)))))
+    array))
 
 (defn fng-number-to-string? [(context FngContext) (node i64)] (-> bool)
   (let [frontend (load (field context frontend))
@@ -2005,6 +2025,9 @@
               0)
           0)
       v)))
+
+(defn fng-jsl-call0 [(context FngContext) (name (slice u8))] (-> i64)
+  (fng-jsl-call context name (slice-new [i64] (cast (ptr i64) 0) 0)))
 
 (defn fng-jsl-call1 [(context FngContext) (name (slice u8)) (a i64)] (-> i64)
   (let [buf (stack (array i64 1))
@@ -2238,6 +2261,30 @@
                 (fng-jsl-call1 context "ArrayLength" array))]
     (fng-jsl-call4 context "ArrayFill" array value start end)))
 
+(defn fng-array-splice [(context FngContext) (node i64)] (-> i64)
+  (let [frontend (load (field context frontend)) ast (field frontend ast)
+        callee (ts-child ast node 0) array (fng-expression context (ts-child ast callee 0))
+        argc (- (ts-child-count ast node) 1)
+        raw-start (if (> argc 0) (fng-expression context (ts-child ast node 1)) (fng-const 0))
+        raw-delete (if (> argc 1) (fng-expression context (ts-child ast node 2))
+                       (if (= argc 0) (fng-const 0) (fng-const -1)))
+        (mut values) (al-new [i64] (malloc-allocator)) (mut i) 3]
+    ;; All syntax arguments are evaluated before splice performs its first observable mutation.
+    (loop (if (>= (load i) (ts-child-count ast node)) (break)
+            (do (al-push! [i64] (mut values)
+                          (n-box! (fng-expression context (ts-child ast node (load i)))))
+                (store! i (+ (load i) 1)))))
+    (let [start (fng-jsl-call2 context "ArraySpliceStart" array raw-start)
+          deleted (fng-jsl-call3 context "ArraySpliceDelete" array start raw-delete)
+          (mut inserted) 0]
+      (loop (if (>= (load inserted) (al-len [i64] (load values))) (break)
+              (do (fng-jsl-call4 context "ArraySpliceInsert1" array start
+                                 (fng-const (load inserted))
+                                 (al-get [i64] (load values) (load inserted)))
+                  (store! inserted (+ (load inserted) 1)))))
+      (al-free! [i64] (mut values))
+      deleted)))
+
 (defn fng-select [(context FngContext) (predicate i64) (when-true i64) (when-false i64)] (-> i64)
   (let [entry (load (load (field context ctrl)))
         arms (n-if-arms! (fng-peep (n-new2 OP-IF 0 entry predicate)))
@@ -2337,6 +2384,7 @@
           (str-eq name "shift") (fng-array-shift context node)
           (str-eq name "unshift") (fng-array-unshift context node)
           (str-eq name "fill") (fng-array-fill context node)
+          (str-eq name "splice") (fng-array-splice context node)
           (str-eq name "reverse")
             (let [callee (ts-child ast node 0)
                   array (fng-expression context (ts-child ast callee 0))]
@@ -3517,13 +3565,15 @@
                 (fng-number-convert context node)
             (if (fng-number-to-string? context node)
                 (fng-number-to-string context node)
+                (if (fng-array-of? context node)
+                    (fng-array-of context node)
                 (if (fng-string-from-char-code? context node)
                     (fng-string-from-char-code context node)
                     (if (fng-string-builtin? context node)
                         (fng-string-call context node)
                         (if (fng-array-builtin? context node)
                             (fng-array-call context node)
-                            (fng-call context node))))))))
+                            (fng-call context node)))))))))
           (= kind TSK-NEW-EXPRESSION)
             (if (fng-error-constructor? context node) (fng-error-constructor context node) (fng-call context node))
           (= kind TSK-OBJECT-LITERAL)

@@ -5,6 +5,8 @@
 ;; `%NewArray` allocates and tags; `%ArrayStore` writes an element and yields the new heap, which
 ;; the lowering threads. Neither appears as a memory operand in the source.
 
+(macro NewArray :params [] :ret dyn (%NewArray))
+
 ;; https://tc39.es/ecma262/#sec-array.prototype.push, ONE ARGUMENT AT A TIME.
 ;;
 ;; The spec's `push` is variadic and JSL has no variadic signature, so the frontend keeps the
@@ -114,6 +116,62 @@
       (if (%Le hi i) a
         (let [(stored (%ArrayStore a i value))]
           (recur (%Add i 1)))))))
+
+;; The normalized insertion/deletion point shared by splice's deletion and the frontend's
+;; syntax-argument insertion loop. Keeping it named in JSL prevents the two halves of variadic
+;; splice from acquiring different negative-index rules.
+(macro ArraySpliceStart :params [(a dyn) (start int)] :ret int
+  (let [(len (%ArrayLen a))]
+    (Clamp (if (%Lt start 0) (%Add len start) start) 0 len)))
+
+;; Delete a range and close the gap. A negative count is the frontend's explicit "argument was
+;; absent" sentinel and means the remainder; an actual negative JavaScript deleteCount clamps to
+;; zero before it reaches this definition.
+(macro ArraySpliceDelete :params [(a dyn) (start int) (count int)] :ret dyn
+  (let [(len (%ArrayLen a))
+        (n (if (%Lt count 0) (%Sub len start) (Clamp count 0 (%Sub len start))))
+        (out (%NewArray))
+        (tail (%NewArray))
+        (deleted
+          (loop [(i 0)]
+            (if (%Le n i) i
+              (let [(stored (%ArrayStore out i (%ArrayLoad a (%Add start i))))]
+                (recur (%Add i 1))))))
+        (tail-len (%Sub len (%Add start n)))
+        (copied
+          (loop [(i 0)]
+            (if (%Le tail-len i) i
+              (let [(stored (%ArrayStore tail i (%ArrayLoad a (%Add (%Add start n) i))))]
+                (recur (%Add i 1))))))
+        (closed
+          (loop [(i 0)]
+            (if (%Le tail-len i) i
+              (let [(stored (%ArrayStore a (%Add start i) (%ArrayLoad tail i)))]
+                (recur (%Add i 1))))))
+        (ordered (%ArrayLoad out 0))
+        (resized (%ArrayResize a (%Sub len n) ordered))]
+    out))
+
+;; Insert one already-evaluated syntax argument. The frontend invokes this left-to-right after
+;; deletion; a scratch copy prevents destructive right shifts from overtaking their source reads.
+(macro ArraySpliceInsert1 :params [(a dyn) (start int) (offset int) (value dyn)] :ret dyn
+  (let [(at (%Add start offset))
+        (len (%ArrayLen a))
+        (tail (%NewArray))
+        (tail-len (%Sub len at))
+        (copied
+          (loop [(i 0)]
+            (if (%Le tail-len i) i
+              (let [(stored (%ArrayStore tail i (%ArrayLoad a (%Add at i))))]
+                (recur (%Add i 1))))))
+        (inserted (%ArrayStore a at value))]
+    (loop [(i 0)]
+      (if (%Le tail-len i) a
+        (let [(stored (%ArrayStore a (%Add (%Add at i) 1) (%ArrayLoad tail i)))]
+          (recur (%Add i 1)))))))
+
+(macro ArrayOfAppend1 :params [(a dyn) (value dyn)] :ret dyn
+  (let [(stored (%ArrayStore a (%ArrayLen a) value))] a))
 
 ;; https://tc39.es/ecma262/#sec-array.prototype.slice, over a fresh array.
 ;;

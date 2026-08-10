@@ -61,6 +61,7 @@ read out of the frontend's own tables, and every definition named here is checke
 | `slice` | **done** | ArraySlice |
 | `some` | **done** | ArraySome |
 | `sort` | **done** | ArraySort |
+| `splice` | **done** | ArraySpliceDelete |
 | `unshift` | **done** | ArrayUnshift1 |
 
 ## Math
@@ -112,6 +113,7 @@ spelling of the same call. **These are not a backlog.**
 | string `+` | **done** | StringConcat |
 | `s.length` | **done** | StringLength |
 | `a.length` | **done** | ArrayLength |
+| `Array.of(...)` | **done** | ArrayOfAppend1 |
 
 ## Language surface that compiles
 
@@ -127,11 +129,9 @@ string literals and concatenation; `throw`; type aliases, interfaces and union a
 ### Needs the allocating-definition shape `split` now has
 
 - `Array.prototype.concat`
-- `Array.prototype.splice`
 - `Array.prototype.flat`
 - `Array.prototype.keys`/`values`/`entries`
 - `Array.from`
-- `Array.of`
 - `Array.isArray`
 
 ### Needs a regular-expression engine
