@@ -126,6 +126,7 @@ spelling of the same call. **These are not a backlog.**
 | `void x` | **done** | VoidValue |
 | `typeof x` | **done** | TypeOfValue |
 | `x ?? y` | **done** | IsNullishValue |
+| `o?.p` | **done** | IsNullishValue |
 
 ## Language surface that compiles
 
@@ -171,7 +172,7 @@ string literals and concatenation; `throw`; type aliases, interfaces and union a
 - `class`
 - getters and setters
 - computed property names
-- optional chaining `?.`
+- optional calls/elements
 - `try`/`catch`/`finally`
 - arrow functions
 - `instanceof` / `in` / `delete`

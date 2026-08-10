@@ -463,6 +463,9 @@ func roleNode(n *ast.Node, role int32, index int32) *ast.Node {
 		if n.Kind == ast.KindBinaryExpression && index == 0 { return n.AsBinaryExpression().Left }
 	case 7: // operator token (binary operators have concrete token nodes)
 		if n.Kind == ast.KindBinaryExpression && index == 0 { return n.AsBinaryExpression().OperatorToken }
+		if n.Kind == ast.KindPropertyAccessExpression && index == 0 { return n.AsPropertyAccessExpression().QuestionDotToken }
+		if n.Kind == ast.KindElementAccessExpression && index == 0 { return n.AsElementAccessExpression().QuestionDotToken }
+		if n.Kind == ast.KindCallExpression && index == 0 { return n.AsCallExpression().QuestionDotToken }
 	case 8: // right
 		if n.Kind == ast.KindBinaryExpression && index == 0 { return n.AsBinaryExpression().Right }
 	case 9: // condition

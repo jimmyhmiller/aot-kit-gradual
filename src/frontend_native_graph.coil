@@ -1269,8 +1269,8 @@
               (= kind TSK-PROPERTY-ACCESS)
                 (if (fng-number-max-safe? context node)
                     FNG-NUMBER
-                (let [owner (fng-infer context (ts-child ast node 0) FNG-DYNAMIC)
-                      name-node (ts-child ast node 1)
+                (let [owner (fng-infer context (ts-role ast node TS-ROLE-OBJECT 0) FNG-DYNAMIC)
+                      name-node (ts-role ast node TS-ROLE-PROPERTY 0)
                       field-index
                         (if (= owner FNG-DYNAMIC)
                             -1
@@ -3123,13 +3123,14 @@
       (store! (load (field context memory)) (fng-preserve-active-memory context resized)))
     array))
 
-(defn fng-field-load [(context FngContext) (node i64)] (-> i64)
+(defn fng-field-load-value [(context FngContext)
+                            (node i64)
+                            (object-node i64)
+                            (name-node i64)
+                            (raw-object i64)] (-> i64)
   (let [frontend (load (field context frontend))
         ast (field frontend ast)
-        object-node (ts-child ast node 0)
-        name-node (ts-child ast node 1)
         owner (fng-infer context object-node FNG-DYNAMIC)
-        raw-object (fng-expression context object-node)
         field-index
           (if (< owner 0)
               (fng-unique-field-index frontend name-node)
@@ -3159,6 +3160,57 @@
                       shape (al-get [i64] (load (load (field context shapes))) field-owner)
                       cast-node (n-new2 OP-CAST (t-obj-shape shape) (load (load (field context ctrl))) object)]
                   (n-load! (fng-current-memory context alias) cast-node alias)))))))
+
+(defn fng-field-load [(context FngContext) (node i64)] (-> i64)
+  (let [frontend (load (field context frontend))
+        ast (field frontend ast)
+        object-node (ts-role ast node TS-ROLE-OBJECT 0)
+        name-node (ts-role ast node TS-ROLE-PROPERTY 0)]
+    (fng-field-load-value context node object-node name-node (fng-expression context object-node))))
+
+(defn fng-optional-field-load [(context FngContext) (node i64)] (-> i64)
+  (let [frontend (load (field context frontend))
+        ast (field frontend ast)
+        object-node (ts-role ast node TS-ROLE-OBJECT 0)
+        name-node (ts-role ast node TS-ROLE-PROPERTY 0)
+        object (fng-expression context object-node)
+        condition (fng-jsl-call1 context "IsNullishValue" (n-box! object))
+        saved-ctrl (load (load (field context ctrl)))
+        (mut symbols) (al-new [i64] (malloc-allocator))
+        (mut active) (al-new [i64] (malloc-allocator))
+        (mut snapshots) (al-new [i64] (malloc-allocator))
+        (mut answer) NO-NODE]
+    (fng-record-dynamic-alias! context JS-PROPERTY-ALIAS)
+    (fng-active-memory! context (mut active))
+    (fng-control-aliases! context (mut active))
+    (let [saved-start (fng-snapshot! context (mut symbols) (mut active) (mut snapshots))
+          arms (n-if-arms! (fng-peep (n-new2 OP-IF 0 saved-ctrl condition)))]
+      (store! (load (field context ctrl)) (arms-t arms))
+      (let [nullish-value (n-box! (fng-undefined))
+            nullish-ctrl (load (load (field context ctrl)))
+            nullish-start (fng-snapshot! context (mut symbols) (mut active) (mut snapshots))]
+        (fng-restore-snapshot! context (mut symbols) (mut active) (mut snapshots) saved-start)
+        (store! (load (field context ctrl)) (arms-f arms))
+        (let [present-value (n-box! (fng-field-load-value context node object-node name-node object))
+              present-ctrl (load (load (field context ctrl)))
+              present-start (fng-snapshot! context (mut symbols) (mut active) (mut snapshots))]
+          (if (fng-merge-snapshots! context
+                                    nullish-ctrl nullish-start
+                                    present-ctrl present-start
+                                    (mut symbols) (mut active) (mut snapshots))
+              (cond (= nullish-ctrl NO-NODE) (store! answer present-value)
+                    (= present-ctrl NO-NODE) (store! answer nullish-value)
+                    :else
+                      (let [phi (n-new OP-PHI (t-dyn))]
+                        (n-add-def! phi (load (load (field context ctrl))))
+                        (n-add-def! phi nullish-value)
+                        (n-add-def! phi present-value)
+                        (store! answer (fng-peep phi))))
+              0))))
+    (al-free! [i64] (mut symbols))
+    (al-free! [i64] (mut active))
+    (al-free! [i64] (mut snapshots))
+    (load answer)))
 
 (defn fng-static-nonindex-key? [(ast TsAst) (node i64)] (-> bool)
   (let [kind (ts-kind ast node)]
@@ -3690,6 +3742,8 @@
           (= kind TSK-ARRAY-LITERAL) (fng-array-literal context node)
           (= kind TSK-FUNCTION-EXPRESSION) (fng-closure-expression context node)
           (= kind TSK-PROPERTY-ACCESS)
+            (if (!= (ts-role ast node TS-ROLE-OPERATOR 0) -1)
+                (fng-optional-field-load context node)
             (let [math-member (fng-math-member-id context node)]
               (if (fng-number-max-safe? context node)
                   (fng-jsl-call0 context "MaxSafeInteger")
@@ -3697,7 +3751,7 @@
                   NO-NODE
                   (if (str-eq (ts-text ast node) "Math.LN2")
                       (n-new1 OP-CONST (t-flt-con 0.6931471805599453) (g-start))
-                      (fng-field-load context node)))))
+                      (fng-field-load context node))))))
           (= kind TSK-ELEMENT-ACCESS) (fng-lvalue-read context (fng-lvalue context node))
           :else NO-NODE)))
 
