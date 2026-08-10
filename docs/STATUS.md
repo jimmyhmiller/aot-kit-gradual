@@ -40,11 +40,13 @@ read out of the frontend's own tables, and every definition named here is checke
 | Operation | Status | Definition |
 |---|---|---|
 | `at` | **done** | ArrayAt |
+| `concat` | **done** | ArrayConcatValue |
 | `every` | **done** | ArrayEvery |
 | `fill` | **done** | ArrayFill |
 | `filter` | **done** | ArrayFilter |
 | `find` | **done** | ArrayFind |
 | `findIndex` | **done** | ArrayFindIndex |
+| `flat` | **done** | ArrayFlat |
 | `flatMap` | **done** | ArrayFlatMap |
 | `forEach` | **done** | ArrayForEach |
 | `includes` | **done** | ArrayIncludes |
@@ -114,6 +116,7 @@ spelling of the same call. **These are not a backlog.**
 | `s.length` | **done** | StringLength |
 | `a.length` | **done** | ArrayLength |
 | `Array.of(...)` | **done** | ArrayOfAppend1 |
+| `Array.isArray(x)` | **done** | IsArray |
 
 ## Language surface that compiles
 
@@ -128,11 +131,8 @@ string literals and concatenation; `throw`; type aliases, interfaces and union a
 
 ### Needs the allocating-definition shape `split` now has
 
-- `Array.prototype.concat`
-- `Array.prototype.flat`
 - `Array.prototype.keys`/`values`/`entries`
 - `Array.from`
-- `Array.isArray`
 
 ### Needs a regular-expression engine
 

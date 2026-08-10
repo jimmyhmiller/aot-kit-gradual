@@ -6,6 +6,54 @@
 ;; the lowering threads. Neither appears as a memory operand in the source.
 
 (macro NewArray :params [] :ret dyn (%NewArray))
+(macro IsArray :params [(value dyn)] :ret bool (%IsArray value))
+
+;; Append one concat argument, spreading it exactly when its runtime tag is Array.
+(macro ArrayConcatValue :params [(out dyn) (value dyn)] :ret dyn
+  (if (%IsArray value)
+      (let [(array (%UnboxArray value))
+            (len (%ArrayLen array))]
+        (loop [(i 0)]
+          (if (%Le len i) out
+            (let [(stored (%ArrayStore out (%ArrayLen out) (%ArrayLoad array i)))]
+              (recur (%Add i 1))))))
+      (let [(stored (%ArrayStore out (%ArrayLen out) value))] out)))
+
+;; Iterative depth-first flattening. The explicit value/depth stacks are the DSL equivalent of
+;; Torque builtins using a work list: recursion remains a source-level policy, not compiler
+;; recursion that would infinitely expand an inlined macro.
+(macro ArrayFlat :params [(source dyn) (depth int)] :ret dyn
+  (let [(out (%NewArray))
+        (values (%NewArray))
+        (depths (%NewArray))
+        (seed-len (%ArrayLen source))
+        (seeded
+          (loop [(i seed-len)]
+            (if (%Le i 0) i
+              (let [(j (%Sub i 1))
+                    (sv (%ArrayStore values (%ArrayLen values) (%ArrayLoad source j)))
+                    (sd (%ArrayStore depths (%ArrayLen depths) (%Box depth)))]
+                (recur j)))))]
+    (loop [(remaining seed-len)]
+      (if (%Le remaining 0) out
+        (let [(slot (%Sub (%ArrayLen values) 1))
+              (value (%ArrayLoad values slot))
+              (d (%UnboxInt (%ArrayLoad depths slot)))
+              (rv (%ArrayResize values slot value))
+              (rd (%ArrayResize depths slot (%Box d)))]
+          (if (if (%Lt 0 d) (%IsArray value) false)
+              (let [(array (%UnboxArray value))
+                    (n (%ArrayLen array))
+                    (pushed
+                      (loop [(i n)]
+                        (if (%Le i 0) i
+                          (let [(j (%Sub i 1))
+                                (sv (%ArrayStore values (%ArrayLen values) (%ArrayLoad array j)))
+                                (sd (%ArrayStore depths (%ArrayLen depths) (%Box (%Sub d 1))))]
+                            (recur j)))))]
+                (recur (%Add (%Sub remaining 1) n)))
+              (let [(stored (%ArrayStore out (%ArrayLen out) value))]
+                (recur (%Sub remaining 1)))))))))
 
 ;; https://tc39.es/ecma262/#sec-array.prototype.push, ONE ARGUMENT AT A TIME.
 ;;

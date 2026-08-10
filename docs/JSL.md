@@ -363,7 +363,10 @@ The layer is deliberately thin, and it is the whole porting surface:
 - strings — `%StringLen %StringEq %StringConcat %StringCharCode %StringIndexOf %StringCompare
   %StringFromCode %StringLower %StringUpper`
 - conversions — `%ToString %ToInteger %ParseInt %IsNaN %NumberToString`
-- heap — `%NewArray %ArrayLen %ArrayLoad %ArrayStore %ArrayResize`
+- heap — `%NewArray %ArrayLen %ArrayLoad %ArrayStore %ArrayResize %PropLoadNamed
+  %PropStoreNamed`
+- representation capabilities — `%Box %UnboxInt %UnboxFlt %UnboxBool %UnboxObj
+  %IsArray %UnboxArray`
 - control — `%Throw`
 
 `%ToInteger` is the one primitive so far added *for* JSL rather than inherited. It is
@@ -374,10 +377,18 @@ that could disagree. Adding it cost arms in `node.coil`, `verify.coil`, `gtext.c
 the evaluator and fails native selection with `MSEL-UNSUPPORTED` rather than miscompiling. That is
 the machine surface growing, which is the design's expectation, not the ECMAScript surface growing.
 
-Memory, allocation, calls into JavaScript, and the safepoint and barrier primitives are the next
-tranche. They are not in the table yet, and `jsp-find` returns `JSP-NONE` for them, which the
-checker turns into `JSL-ERR-UNKNOWN-PRIM` naming the primitive. An unimplemented primitive cannot
-be reached by accident.
+`%IsArray` and `%UnboxArray` deliberately form a pair. The former consumes a tagged JavaScript
+value and proves the Array runtime tag; the latter consumes that proven tagged representation and
+produces the raw managed pointer required by `%ArrayLen` and `%ArrayLoad`. Arrays and ordinary
+objects intentionally share the `t-obj` lattice kind, so weakening `%UnboxObj` to accept both tags
+would erase a representation check. This is the same boundary Torque expresses with a type guard
+followed by a cast to `JSArray`: a semantic definition chooses the branch, while a small extern-like
+capability performs the representation transition.
+
+Memory, allocation, and JavaScript callback calls are now expressible and threaded by the lowerer.
+Safepoints and write barriers remain backend-generated implementation details rather than library
+semantics. An unimplemented `%Name` still becomes `JSL-ERR-UNKNOWN-PRIM`; it cannot be reached by
+accident.
 
 ---
 

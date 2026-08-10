@@ -616,6 +616,7 @@
         (do (ev-heap-panic "ev-obj-new!: static and dynamic object identities diverged") 0))
     (al-push! [i64] (field p objs) shape)
     (al-push! [i64] (field p array-lengths) 0)
+    (al-push! [bool] (field p array-kinds) false)
     (al-push! [i64] (field p latest-array) -1)
     (let [(mut alias) 0]
       (loop (if (>= (load alias) JS-PROPERTY-ALIAS)
@@ -652,6 +653,7 @@
    (hvk (ArrayList i64))  ; a MemMerge's children, addressed by (koff, klen)
    (objs (ArrayList i64))  ; object id -> its shape
    (array-lengths (ArrayList i64))  ; object id -> current observable array length
+   (array-kinds (ArrayList bool))  ; object id -> was its identity passed through ArrayMark
    (array-elements (ArrayList EvArrayElement))  ; imperative indexed payload, keyed by object id
    (latest-fixed (ArrayList i64))  ; (object * 63 + alias) -> latest executed fixed-field write
    (latest-array (ArrayList i64))  ; object id -> latest executed array write/resize
@@ -692,6 +694,7 @@
           (store! (field p hvk) (al-new [i64] (malloc-allocator)))
           (store! (field p objs) (al-new [i64] (malloc-allocator)))
           (store! (field p array-lengths) (al-new [i64] (malloc-allocator)))
+          (store! (field p array-kinds) (al-new [bool] (malloc-allocator)))
           (store! (field p array-elements) (al-new [EvArrayElement] (malloc-allocator)))
           (store! (field p latest-fixed) (al-new [i64] (malloc-allocator)))
           (store! (field p latest-array) (al-new [i64] (malloc-allocator)))
@@ -728,6 +731,7 @@
     (al-clear! [i64] (field p hvk))
     (al-clear! [i64] (field p objs))
     (al-clear! [i64] (field p array-lengths))
+    (al-clear! [bool] (field p array-kinds))
     (al-clear! [EvArrayElement] (field p array-elements))
     (al-clear! [i64] (field p latest-fixed))
     (al-clear! [i64] (field p latest-array))
@@ -1007,7 +1011,9 @@
                     (ev-prop-load n) OP-PROPSTORE
                     (ev-effect-data n) OP-SETPROTO
                     (ev-effect-data n) OP-ARRAYMARK
-                    (ev-data (n-in n 1)) OP-ARRAYLOAD
+                    (ev-array-mark n) OP-ARRAYTEST
+                    (ev-array-test n) OP-ARRAYUNBOX
+                    (ev-array-unbox n) OP-ARRAYLOAD
                     (ev-array-load n) OP-ARRAYSTORE
                     (ev-effect-data n) OP-ARRAYLEN
                     (ev-array-length n) OP-ARRAYRESIZE
@@ -2173,6 +2179,27 @@
 (defn ev-typetest [(n i64)] (-> RtVal)
   (let [v (ev-data (n-in n 1))]
     (if (ev-failed?) v (RBool (ty-isa (rt-ty v) (n-aux n))))))
+
+(defn ev-array-mark [(n i64)] (-> RtVal)
+  (let [v (ev-data (n-in n 1))]
+    (if (ev-failed?) v
+      (if (= (rt-tag v) RT-OBJ)
+          (do (al-set! [bool] (field (ev) array-kinds) (rt-payload v) true) v)
+          (ev-fail! EV-TYPE n)))))
+
+(defn ev-array-test [(n i64)] (-> RtVal)
+  (let [v (ev-data (n-in n 1))]
+    (if (ev-failed?) v
+      (RBool (and (= (rt-tag v) RT-OBJ)
+                  (al-get [bool] (load (field (ev) array-kinds)) (rt-payload v)))))))
+
+(defn ev-array-unbox [(n i64)] (-> RtVal)
+  (let [v (ev-data (n-in n 1))]
+    (if (ev-failed?) v
+      (if (and (= (rt-tag v) RT-OBJ)
+               (al-get [bool] (load (field (ev) array-kinds)) (rt-payload v)))
+          v
+          (ev-fail! EV-UNBOX n)))))
 
 ; ---------------------------------------------------------------------------
 ; Direct calls
