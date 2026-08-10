@@ -237,7 +237,7 @@
 ;; and the index format are all only exercised here.
 (deftest the_library_on_disk_loads_and_every_declaration_lowers
          (lib! 90300)
-         (assert (= (jsl-decl-count) 152))
+         (assert (= (jsl-decl-count) 153))
          ; A builtin has a Fun and a macro does not, and every declaration is one or the other.
          (let [(mut i) 0 (mut funs) 0 (mut macros) 0]
            (loop (if (>= (load i) (jsl-decl-count)) (break)
@@ -248,11 +248,11 @@
                                (store! funs (+ (load funs) 1)) 0))
                        (store! i (+ (load i) 1))
                        0)))
-           (assert (= (+ (load funs) (load macros)) 152))
+           (assert (= (+ (load funs) (load macros)) 153))
            ; 57 since `StringSplit` and `StringSplitWhole` joined, both macros: they allocate and
            ; write, and memory reaches a called function as an OP-ARG rather than a parameter, so a
            ; builtin would fill its own empty entry heap and return an array the caller cannot see.
-           (assert (= (load macros) 108)))
+           (assert (= (load macros) 109)))
          (assert (>= (jsl-find "Clamp") 0))
          (assert (>= (jsl-find "StringIndexOfFrom") 0))
          (assert (>= (jsl-find "StringStartsWith") 0))
@@ -416,6 +416,34 @@
              (assert (= (g-verify) 0))
              (assert (= (n-op (load (index mp 0))) OP-PHI))
              (assert (ty-mem? (n-ty (load (index mp 0))))))))
+
+(deftest an_ordinary_object_can_be_allocated_and_populated_entirely_in_jsl
+         (fresh! 91205)
+         (assert (= (jsl-load!
+                      "(macro makeObject :params [] :ret dyn
+                         (let [(object (%NewObject))
+                               (ignored (%PropStoreKey object \"answer\" (%Box 42)))]
+                           (%PropLoadKey object \"answer\")))")
+                    JSL-OK))
+         (let [ctrl (stack (array i64 1))
+               mem (stack (array i64 1))
+               cp (cast (ptr i64) ctrl)
+               mp (cast (ptr i64) mem)
+               argv (stack (array i64 1))]
+           (store! (index cp 0) (g-start))
+           (store! (index mp 0)
+                   (n-new1 OP-ARG (t-mem-alias JS-PROPERTY-ALIAS (t-undef)) (g-start)))
+           (let [value (jsl-inline! cp mp (g-start) "makeObject"
+                                    (slice-new [i64] (cast (ptr i64) argv) 0))
+                 ret (n-new3 OP-RETURN 0 (load (index cp 0)) value (load (index mp 0)))]
+             (n-add-def! (g-stop) ret)
+             (iterate!)
+             (g-analyze!)
+             (assert (= (g-verify) 0))
+             (ev-reset!)
+             (ev-bind-args! 0)
+             (assert (= (ev-run-nobind 10000) EV-OK))
+             (assert (rt-eq? (ev-result) (RInt 42))))))
 
 (deftest a_designed_but_unbuilt_form_is_refused_as_unsupported
          (refuses 90207 "(class JSArray :params [(x dyn)] x)" JSL-ERR-UNSUPPORTED))

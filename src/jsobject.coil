@@ -2,6 +2,7 @@
 
 (import "coil.arraylist" :use *)
 (import "coil.alloc" :use *)
+(import "coil.slice" :use *)
 (import "shape" :use *)
 (import "ty" :use *)
 (import "jsvalue" :use *)
@@ -97,6 +98,91 @@
 (defn jso-own? [(object i64) (name (slice u8))] (-> bool)
   (let [nid (shape-name-find name)]
     (and (!= nid SHAPE-NO-NAME) (!= (jso-own-index-nid object nid) JSO-NONE))))
+
+;; ECMAScript's ordinary own-key order: canonical array-index strings in ascending numeric order,
+;; then the remaining strings in insertion order. Symbols become a third partition when the
+;; runtime gains them. These are Torque-style runtime intrinsics: JSL owns the Object.keys loop,
+;; while the heap representation owns how an ordinal is resolved to a key.
+(defn jso-name-array-index [(name i64)] (-> i64)
+  (let [bytes (shape-name-bytes name)
+        length (slice-len bytes)
+        (mut at) 0
+        (mut value) 0
+        (mut valid) (> length 0)]
+    (if (and (> length 1) (= (cast i64 (slice-get bytes 0)) 48)) (store! valid false) 0)
+    (loop (if (or (>= (load at) length) (not (load valid)))
+              (break)
+              (let [byte (cast i64 (slice-get bytes (load at)))]
+                (if (or (< byte 48) (> byte 57))
+                    (store! valid false)
+                    (do (store! value (+ (* (load value) 10) (- byte 48)))
+                        (if (>= (load value) 4294967295) (store! valid false) 0)))
+                (store! at (+ (load at) 1)))))
+    (if (load valid) (load value) -1)))
+
+(defn jso-own-key-count [(object i64)] (-> i64)
+  (if (not (jso-valid? object)) 0
+      (let [properties (load (field (jso-heap) properties))
+            record (al-get [JsObject] (load (field (jso-heap) objects)) object)
+            (mut current) (load (field record property-head))
+            (mut count) 0]
+        (loop (if (= (load current) JSO-NONE) (break)
+                  (let [entry (al-get [JsProperty] properties (load current))]
+                    (store! count (+ (load count) 1))
+                    (store! current (load (field entry next))))))
+        (load count))))
+
+;; Returns an interned shape-name id, or SHAPE-NO-NAME when ordinal is out of range.
+(defn jso-own-key-at [(object i64) (ordinal i64)] (-> i64)
+  (if (or (not (jso-valid? object)) (< ordinal 0)) SHAPE-NO-NAME
+      (let [properties (load (field (jso-heap) properties))
+            record (al-get [JsObject] (load (field (jso-heap) objects)) object)
+            head (load (field record property-head))
+            (mut current) head
+            (mut numeric-count) 0]
+        (loop (if (= (load current) JSO-NONE) (break)
+                  (let [entry (al-get [JsProperty] properties (load current))]
+                    (if (>= (jso-name-array-index (load (field entry name))) 0)
+                        (store! numeric-count (+ (load numeric-count) 1)) 0)
+                    (store! current (load (field entry next))))))
+        (if (< ordinal (load numeric-count))
+            ;; Find the numeric key whose number of smaller numeric keys equals `ordinal`.
+            (let [(mut candidate) head (mut answer) SHAPE-NO-NAME]
+              (loop (if (or (= (load candidate) JSO-NONE)
+                            (!= (load answer) SHAPE-NO-NAME))
+                        (break)
+                        (let [entry (al-get [JsProperty] properties (load candidate))
+                              name (load (field entry name))
+                              index (jso-name-array-index name)]
+                          (if (>= index 0)
+                              (let [(mut scan) head (mut rank) 0]
+                                (loop (if (= (load scan) JSO-NONE) (break)
+                                          (let [other (al-get [JsProperty] properties (load scan))
+                                                other-index
+                                                  (jso-name-array-index (load (field other name)))]
+                                            (if (and (>= other-index 0) (< other-index index))
+                                                (store! rank (+ (load rank) 1)) 0)
+                                            (store! scan (load (field other next))))))
+                                (if (= (load rank) ordinal) (store! answer name) 0)) 0)
+                          (store! candidate (load (field entry next))))))
+              (load answer))
+            ;; The list is newest-first, so reverse only the non-index string partition.
+            (let [string-ordinal (- ordinal (load numeric-count))
+                  string-count (- (jso-own-key-count object) (load numeric-count))
+                  target (- (- string-count 1) string-ordinal)
+                  (mut seen) 0
+                  (mut scan) head
+                  (mut answer) SHAPE-NO-NAME]
+              (loop (if (or (= (load scan) JSO-NONE)
+                            (!= (load answer) SHAPE-NO-NAME))
+                        (break)
+                        (let [entry (al-get [JsProperty] properties (load scan))]
+                          (if (< (jso-name-array-index (load (field entry name))) 0)
+                              (do (if (= (load seen) target)
+                                      (store! answer (load (field entry name))) 0)
+                                  (store! seen (+ (load seen) 1))) 0)
+                          (store! scan (load (field entry next))))))
+              (load answer))))))
 
 (defn jso-store! [(object i64) (name (slice u8)) (value i64)] (-> i64)
   (let [heap (jso-heap)]
