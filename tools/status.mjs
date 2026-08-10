@@ -68,7 +68,8 @@ const ARRAY = {
   map: "ArrayMap", filter: "ArrayFilter", forEach: "ArrayForEach",
   reduce: "ArrayReduce", reduceRight: "ArrayReduceRight", find: "ArrayFind",
   findIndex: "ArrayFindIndex", some: "ArraySome", every: "ArrayEvery",
-  sort: "ArraySort", flatMap: "ArrayFlatMap",
+  sort: "ArraySort", flatMap: "ArrayFlatMap", fill: "ArrayFill",
+  reverse: "ArrayReverse", unshift: "ArrayUnshift1",
 };
 const MATH = {
   abs: "MathAbs", floor: "MathFloor", ceil: "MathCeil", round: "MathRound",
@@ -102,8 +103,7 @@ const OTHER = [
 // each would take, because that is the only useful thing to know about an item on this list.
 const UNSUPPORTED = {
   "Needs the allocating-definition shape `split` now has": [
-    "`Array.prototype.concat`", "`Array.prototype.fill`", "`Array.prototype.reverse`",
-    "`Array.prototype.splice`", "`Array.prototype.unshift`", "`Array.prototype.flat`",
+    "`Array.prototype.concat`", "`Array.prototype.splice`", "`Array.prototype.flat`",
     "`Array.prototype.keys`/`values`/`entries`", "`Array.from`", "`Array.of`", "`Array.isArray`",
   ],
   "Needs a regular-expression engine": [

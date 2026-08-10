@@ -1581,6 +1581,9 @@
 ;; methods were: absent from this list, the call never reaches a lowering.
 (defn fng-array-builtin? [(context FngContext) (node i64)] (-> bool)
   (let [name (fng-array-builtin-name context node)]
+    (or (str-eq name "fill")
+        (or (str-eq name "reverse")
+            (or (str-eq name "unshift")
     (or (str-eq name "push")
         (or (str-eq name "pop")
             (or (str-eq name "shift")
@@ -1600,7 +1603,7 @@
                                                                     (or (str-eq name "some")
                                                                         (or (str-eq name "every")
                                                                             (or (str-eq name "sort")
-                                                                                (str-eq name "flatMap"))))))))))))))))))))))
+                                                                                (str-eq name "flatMap")))))))))))))))))))))))))
 
 ;; `Array.prototype.at` and `Array.prototype.join`, out of lib/array/read.jsl.
 ;;
@@ -2024,6 +2027,15 @@
     (store! (index p 2) c)
     (fng-jsl-call context name (slice-new [i64] p 3))))
 
+(defn fng-jsl-call4 [(context FngContext) (name (slice u8))
+                      (a i64) (b i64) (c i64) (d i64)] (-> i64)
+  (let [buf (stack (array i64 4)) p (cast (ptr i64) buf)]
+    (store! (index p 0) a)
+    (store! (index p 1) b)
+    (store! (index p 2) c)
+    (store! (index p 3) d)
+    (fng-jsl-call context name (slice-new [i64] p 4))))
+
 ;; A string-valued argument at `child`, or the constant a missing one coerces to.
 ;;
 ;; ToString of an ABSENT argument is the string "undefined", not the undefined value, and every
@@ -2196,6 +2208,36 @@
         array (fng-expression context (ts-child ast callee 0))]
     (fng-jsl-call1 context "ArrayShift" array)))
 
+(defn fng-array-unshift [(context FngContext) (node i64)] (-> i64)
+  (let [frontend (load (field context frontend)) ast (field frontend ast)
+        callee (ts-child ast node 0) array (fng-expression context (ts-child ast callee 0))
+        (mut values) (al-new [i64] (malloc-allocator)) (mut i) 1 (mut result) NO-NODE]
+    ;; Evaluate arguments left-to-right, then apply the one-element definition right-to-left.
+    (loop (if (>= (load i) (ts-child-count ast node)) (break)
+            (do (al-push! [i64] (mut values)
+                          (n-box! (fng-expression context (ts-child ast node (load i)))))
+                (store! i (+ (load i) 1)))))
+    (store! i (al-len [i64] (load values)))
+    (loop (if (<= (load i) 0) (break)
+            (do (store! i (- (load i) 1))
+                (store! result (fng-jsl-call2 context "ArrayUnshift1" array
+                                               (al-get [i64] (load values) (load i)))))))
+    (al-free! [i64] (mut values))
+    (if (= (load result) NO-NODE) (fng-jsl-call1 context "ArrayLength" array) (load result))))
+
+(defn fng-array-fill [(context FngContext) (node i64)] (-> i64)
+  (let [frontend (load (field context frontend)) ast (field frontend ast)
+        callee (ts-child ast node 0) array (fng-expression context (ts-child ast callee 0))
+        value (if (> (ts-child-count ast node) 1)
+                  (n-box! (fng-expression context (ts-child ast node 1)))
+                  (n-box! (fng-undefined)))
+        start (if (> (ts-child-count ast node) 2)
+                  (fng-expression context (ts-child ast node 2)) (fng-const 0))
+        end (if (> (ts-child-count ast node) 3)
+                (fng-expression context (ts-child ast node 3))
+                (fng-jsl-call1 context "ArrayLength" array))]
+    (fng-jsl-call4 context "ArrayFill" array value start end)))
+
 (defn fng-select [(context FngContext) (predicate i64) (when-true i64) (when-false i64)] (-> i64)
   (let [entry (load (load (field context ctrl)))
         arms (n-if-arms! (fng-peep (n-new2 OP-IF 0 entry predicate)))
@@ -2293,6 +2335,12 @@
     (cond (str-eq name "push") (fng-array-push context node)
           (str-eq name "pop") (fng-array-pop context node)
           (str-eq name "shift") (fng-array-shift context node)
+          (str-eq name "unshift") (fng-array-unshift context node)
+          (str-eq name "fill") (fng-array-fill context node)
+          (str-eq name "reverse")
+            (let [callee (ts-child ast node 0)
+                  array (fng-expression context (ts-child ast callee 0))]
+              (fng-jsl-call1 context "ArrayReverse" array))
           (str-eq name "indexOf") (fng-array-search context node name)
           (str-eq name "includes") (fng-array-search context node name)
           (str-eq name "lastIndexOf") (fng-array-search context node name)

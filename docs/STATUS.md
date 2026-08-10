@@ -41,6 +41,7 @@ read out of the frontend's own tables, and every definition named here is checke
 |---|---|---|
 | `at` | **done** | ArrayAt |
 | `every` | **done** | ArrayEvery |
+| `fill` | **done** | ArrayFill |
 | `filter` | **done** | ArrayFilter |
 | `find` | **done** | ArrayFind |
 | `findIndex` | **done** | ArrayFindIndex |
@@ -55,10 +56,12 @@ read out of the frontend's own tables, and every definition named here is checke
 | `push` | **done** | ArrayPush1 |
 | `reduce` | **done** | ArrayReduce |
 | `reduceRight` | **done** | ArrayReduceRight |
+| `reverse` | **done** | ArrayReverse |
 | `shift` | **done** | ArrayShift |
 | `slice` | **done** | ArraySlice |
 | `some` | **done** | ArraySome |
 | `sort` | **done** | ArraySort |
+| `unshift` | **done** | ArrayUnshift1 |
 
 ## Math
 
@@ -124,10 +127,7 @@ string literals and concatenation; `throw`; type aliases, interfaces and union a
 ### Needs the allocating-definition shape `split` now has
 
 - `Array.prototype.concat`
-- `Array.prototype.fill`
-- `Array.prototype.reverse`
 - `Array.prototype.splice`
-- `Array.prototype.unshift`
 - `Array.prototype.flat`
 - `Array.prototype.keys`/`values`/`entries`
 - `Array.from`
