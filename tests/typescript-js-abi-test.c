@@ -105,7 +105,7 @@ int main(int argc, char **argv) {
   require(aot_ts_script_kind(js) == AOT_TS_SCRIPT_JS && aot_ts_script_kind(ts) == AOT_TS_SCRIPT_TS, "mode retained");
   aot_ts_parse_delete(js); aot_ts_parse_delete(ts);
 
-  const char *operators = "var x=1,o={}; x += 2; ++x; x--; typeof x; delete o.x; void (x += 3); o?.x; o?.[x]; `plain`; true; null;";
+  const char *operators = "var x=1,o={}; x += 2; ++x; x--; typeof x; delete o.x; void (x += 3); o?.x; o?.[x]; `plain`; `a${x}b`; true; null;";
   AotTsParse operator_parse = aot_ts_parse_ex(operators, (int32_t)strlen(operators), "operators.js", 12, AOT_TS_SCRIPT_JS);
   require(find_operator(operator_parse, "PlusEquals") >= 0, "assignment operator API");
   require(find_operator(operator_parse, "PlusPlus") >= 0, "prefix update operator API");
@@ -121,6 +121,17 @@ int main(int argc, char **argv) {
   AotTsNode template_literal = find_kind(operator_parse, "NoSubstitutionTemplateLiteral", 0);
   require(template_literal >= 0 && aot_ts_node_literal_kind(operator_parse, template_literal) == AOT_TS_LITERAL_STRING,
     "no-substitution template literal category");
+  AotTsNode template_expression = find_kind(operator_parse, "TemplateExpression", 0);
+  AotTsNode template_head = find_kind(operator_parse, "TemplateHead", 0);
+  AotTsNode template_span = find_kind(operator_parse, "TemplateSpan", 0);
+  AotTsNode template_tail = find_kind(operator_parse, "TemplateTail", 0);
+  require(template_expression >= 0 && aot_ts_node_kind(operator_parse, template_expression) == 231 &&
+          template_span >= 0 && aot_ts_node_kind(operator_parse, template_span) == 232,
+    "stable interpolated-template structure");
+  require(template_head >= 0 && template_tail >= 0 &&
+          aot_ts_node_literal_kind(operator_parse, template_head) == AOT_TS_LITERAL_STRING &&
+          aot_ts_node_literal_kind(operator_parse, template_tail) == AOT_TS_LITERAL_STRING,
+    "interpolated template cooked literal categories");
   AotTsNode boolean = find_kind(operator_parse, "TrueKeyword", 0);
   AotTsNode null_value = find_kind(operator_parse, "NullKeyword", 0);
   require(boolean >= 0 && aot_ts_node_literal_kind(operator_parse, boolean) == AOT_TS_LITERAL_BOOLEAN, "boolean literal category");

@@ -187,6 +187,9 @@ func stableKindCode(kind ast.Kind) int32 {
 	case ast.KindNumericLiteral: return 8
 	case ast.KindStringLiteral, ast.KindNoSubstitutionTemplateLiteral: return 11
 	case ast.KindRegularExpressionLiteral: return 14
+	case ast.KindTemplateHead: return 15
+	case ast.KindTemplateMiddle: return 16
+	case ast.KindTemplateTail: return 17
 	case ast.KindIdentifier: return 79
 	case ast.KindFalseKeyword: return 96
 	case ast.KindNewKeyword: return 104
@@ -214,6 +217,8 @@ func stableKindCode(kind ast.Kind) int32 {
 	case ast.KindParenthesizedExpression: return 218
 	case ast.KindFunctionExpression: return 219
 	case ast.KindConditionalExpression: return 224
+	case ast.KindTemplateExpression: return 231
+	case ast.KindTemplateSpan: return 232
 	case ast.KindPrefixUnaryExpression: return 225
 	case ast.KindPostfixUnaryExpression: return 226
 	case ast.KindBinaryExpression: return 227
@@ -367,7 +372,8 @@ func aot_ts_node_literal_kind(raw C.uintptr_t, id C.int32_t) C.int32_t {
 	n := node(result(raw), id); if n == nil { return -1 }
 	switch n.Kind {
 	case ast.KindNumericLiteral: return 1
-	case ast.KindStringLiteral, ast.KindNoSubstitutionTemplateLiteral: return 2
+	case ast.KindStringLiteral, ast.KindNoSubstitutionTemplateLiteral,
+		ast.KindTemplateHead, ast.KindTemplateMiddle, ast.KindTemplateTail: return 2
 	case ast.KindTrueKeyword, ast.KindFalseKeyword: return 3
 	case ast.KindNullKeyword: return 4
 	case ast.KindRegularExpressionLiteral: return 5

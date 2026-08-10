@@ -129,7 +129,7 @@ const UNSUPPORTED = {
     "`String.prototype.localeCompare`", "`String.raw`",
   ],
   "Needs new syntax in the frontend": [
-    "interpolated/tagged template literals", "destructuring", "spread and rest", "default parameters",
+    "tagged template literals", "destructuring", "spread and rest", "default parameters",
     "`for...of` / `for...in`", "`class`", "getters and setters", "computed property names",
     "optional calls", "`try`/`catch`/`finally`",
     "arrow functions", "`instanceof` / `in` / `delete`",
@@ -217,7 +217,7 @@ out.push("compound-assignment forms; `if`, `for`, `while`, `do`, `switch`, label
 out.push("ternaries and short-circuit operators; function declarations and expressions, closures with");
 out.push("mutable capture, recursion, `this`, `new` and constructors; object literals, structural types,");
 out.push("prototypes, dynamic and missing properties; array literals with holes, indexing and growth;");
-out.push("string and no-substitution template literals, concatenation; `throw`; type aliases, interfaces and union annotations.");
+out.push("string and template literals with interpolation and cooked escapes, concatenation; `throw`; type aliases, interfaces and union annotations.");
 out.push("");
 out.push("## Not supported");
 out.push("");

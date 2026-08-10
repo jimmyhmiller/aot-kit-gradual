@@ -136,7 +136,7 @@ compound-assignment forms; `if`, `for`, `while`, `do`, `switch`, labels, `break`
 ternaries and short-circuit operators; function declarations and expressions, closures with
 mutable capture, recursion, `this`, `new` and constructors; object literals, structural types,
 prototypes, dynamic and missing properties; array literals with holes, indexing and growth;
-string and no-substitution template literals, concatenation; `throw`; type aliases, interfaces and union annotations.
+string and template literals with interpolation and cooked escapes, concatenation; `throw`; type aliases, interfaces and union annotations.
 
 ## Not supported
 
@@ -165,7 +165,7 @@ string and no-substitution template literals, concatenation; `throw`; type alias
 
 ### Needs new syntax in the frontend
 
-- interpolated/tagged template literals
+- tagged template literals
 - destructuring
 - spread and rest
 - default parameters

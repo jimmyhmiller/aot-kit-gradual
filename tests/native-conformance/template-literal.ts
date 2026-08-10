@@ -1,4 +1,5 @@
 export function main(): number {
-  const value = `a\nb`;
-  return (value.length * 100 + value.charCodeAt(1)) | 0;
+  let order = 0;
+  const value = `x${true}${null}${undefined}${(order = order * 10 + 1)}:${(order = order * 10 + 2)}`;
+  return (value.length * 100 + order) | 0;
 }
