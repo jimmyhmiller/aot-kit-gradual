@@ -197,14 +197,14 @@ the frontend, which is three partial coercion implementations that no test compa
 | `(if C A B)` | `OP-IF`, two `OP-CPROJ` arms, `OP-REGION`, `OP-PHI` |
 | `(%Prim a …)` | one primitive op, arity-checked |
 | `(Name a …)` | a call to another JSL `builtin` |
+| `(call fn a …)` | invoke a JavaScript function value, advance control, thread the heap, and box its result |
 | integer, float | `OP-CONST` at `t-int-con` / `t-flt-bits` |
 | `"…"` | a string constant, interned through `jss-from-utf8!` |
 | `true` `false` `undefined` `null` | `OP-CONST` at the matching lattice constant |
 | symbol | a parameter or a `let` binding |
 
-Every other head symbol is an error with a name. `loop` and `class` are **declared unimplemented and
-refused by `JSL-ERR-UNSUPPORTED`**, which reports the offending form. They are not accepted-and-approximated, and there is no path by which a `.jsl` file
-using one of them produces a graph.
+Every other head symbol is an error with a name. `class` remains declared unimplemented and refused
+by `JSL-ERR-UNSUPPORTED`; there is no accepted-and-approximated path.
 
 ---
 
@@ -292,10 +292,10 @@ conformance table precisely because the bug is invisible without it.
 - **The Unicode whitespace set.** `StringTrim` removes the ASCII whitespace, NBSP and ZWNBSP. The
   rest of the Zs category needs a table this runtime does not have, so it is a named gap rather than
   a `<= 0x20` approximation that would trim the wrong things.
-- **Anything needing a call into JavaScript.** `Array.prototype.map` with a real callback, `split`,
-  and `replace` with a function all need `%Call`. `ArrayMapDouble` is `map` with the mapping fixed to
-  a macro: it shows the shape — allocate, loop, read the source, write the result — that a real `map`
-  will have once a function can be a value.
+- **Callback receivers.** `(call fn args...)` now implements the callback array family and carries
+  the caller's heap through `CallEnd`. The remaining ABI work is explicit `thisArg`: source
+  functions currently omit the receiver slot when they do not reference `this`, so JSL cannot yet
+  use one uniform receiver-bearing call for every target.
 - **`Math.pow`, `sqrt` and the trigonometric functions** stay `jsbuiltin_desc.coil` descriptors:
   they are libc calls, not compositions of the primitives JSL has.
 
@@ -587,10 +587,9 @@ that the same macro with an opaque argument keeps all of them.
 
 ## What is deliberately not here
 
-**`loop` and `class` are refused, not approximated.** A JSL `loop` needs a `OP-LOOP` with loop Phis
-and a closed back edge, and `class` needs to mint `shape-transition` chains. Both are designed above
-and neither is built, so both report `JSL-ERR-UNSUPPORTED` naming the form. There is no path by
-which a `.jsl` file using one produces a graph.
+**`class` is refused, not approximated.** A JSL class needs to mint `shape-transition` chains. That
+form remains designed but unbuilt, so it reports `JSL-ERR-UNSUPPORTED` by name. `loop` is built:
+it lowers to `OP-LOOP`, value Phis, and an implicit memory Phi when its body touches the heap.
 
 **Not everything belongs in JSL.** V8 keeps Date, JSON, the irregexp engine, `dtoa` and Intl in
 C++ and does not pretend otherwise; the same holds here. Those arrive as declared foreign calls

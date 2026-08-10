@@ -25,11 +25,9 @@ export function main(): number {
   total = total + "abcd".padStart(2, "0").length * 100000000;
 
   total = total + "ab".repeat(3).length * 1000000000;
-  // `"ab".repeat(0)` belongs here and is NOT here: a literal zero count makes the library's loop
-  // provably run zero times, the builder folds it mid-construction, and the graph fails
-  // verification with VERR-ARITY — a Region and its Phi left disagreeing. It is a refused compile
-  // rather than a wrong answer, it reproduces without any of this work, and it is written up under
-  // "Known defects" in HANDOFF.md. A variable count of zero is fine, which is what this row is.
+  // Literal counts exercise construction-time branch folding: the Region and every attached Phi
+  // must lose the dead loop arm together.
+  total = total + "ab".repeat(0).length * 100000000000000;
   total = total + "ab".repeat(zero()).length * 10000000000;
 
   total = total + "a-b-c".replaceAll("-", "+").charCodeAt(3) * 100000000000;

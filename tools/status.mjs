@@ -65,6 +65,10 @@ const ARRAY = {
   push: "ArrayPush1", pop: "ArrayPop", shift: "ArrayShift", slice: "ArraySlice",
   indexOf: "ArrayIndexOfFrom", includes: "ArrayIncludes", lastIndexOf: "ArrayLastIndexOf",
   at: "ArrayAt", join: "ArrayJoin",
+  map: "ArrayMap", filter: "ArrayFilter", forEach: "ArrayForEach",
+  reduce: "ArrayReduce", reduceRight: "ArrayReduceRight", find: "ArrayFind",
+  findIndex: "ArrayFindIndex", some: "ArraySome", every: "ArrayEvery",
+  sort: "ArraySort", flatMap: "ArrayFlatMap",
 };
 const MATH = {
   abs: "MathAbs", floor: "MathFloor", ceil: "MathCeil", round: "MathRound",
@@ -97,12 +101,6 @@ const OTHER = [
 // Not supported by the frontend at all: the call or the syntax does not compile. Grouped by what
 // each would take, because that is the only useful thing to know about an item on this list.
 const UNSUPPORTED = {
-  "Needs `%Call` — JSL cannot take a function as an argument": [
-    "`Array.prototype.map`", "`Array.prototype.filter`", "`Array.prototype.forEach`",
-    "`Array.prototype.reduce`", "`Array.prototype.reduceRight`", "`Array.prototype.find`",
-    "`Array.prototype.findIndex`", "`Array.prototype.some`", "`Array.prototype.every`",
-    "`Array.prototype.sort`", "`Array.prototype.flatMap`",
-  ],
   "Needs the allocating-definition shape `split` now has": [
     "`Array.prototype.concat`", "`Array.prototype.fill`", "`Array.prototype.reverse`",
     "`Array.prototype.splice`", "`Array.prototype.unshift`", "`Array.prototype.flat`",

@@ -40,14 +40,25 @@ read out of the frontend's own tables, and every definition named here is checke
 | Operation | Status | Definition |
 |---|---|---|
 | `at` | **done** | ArrayAt |
+| `every` | **done** | ArrayEvery |
+| `filter` | **done** | ArrayFilter |
+| `find` | **done** | ArrayFind |
+| `findIndex` | **done** | ArrayFindIndex |
+| `flatMap` | **done** | ArrayFlatMap |
+| `forEach` | **done** | ArrayForEach |
 | `includes` | **done** | ArrayIncludes |
 | `indexOf` | **done** | ArrayIndexOfFrom |
 | `join` | **done** | ArrayJoin |
 | `lastIndexOf` | **done** | ArrayLastIndexOf |
+| `map` | **done** | ArrayMap |
 | `pop` | **done** | ArrayPop |
 | `push` | **done** | ArrayPush1 |
+| `reduce` | **done** | ArrayReduce |
+| `reduceRight` | **done** | ArrayReduceRight |
 | `shift` | **done** | ArrayShift |
 | `slice` | **done** | ArraySlice |
+| `some` | **done** | ArraySome |
+| `sort` | **done** | ArraySort |
 
 ## Math
 
@@ -109,20 +120,6 @@ prototypes, dynamic and missing properties; array literals with holes, indexing 
 string literals and concatenation; `throw`; type aliases, interfaces and union annotations.
 
 ## Not supported
-
-### Needs `%Call` — JSL cannot take a function as an argument
-
-- `Array.prototype.map`
-- `Array.prototype.filter`
-- `Array.prototype.forEach`
-- `Array.prototype.reduce`
-- `Array.prototype.reduceRight`
-- `Array.prototype.find`
-- `Array.prototype.findIndex`
-- `Array.prototype.some`
-- `Array.prototype.every`
-- `Array.prototype.sort`
-- `Array.prototype.flatMap`
 
 ### Needs the allocating-definition shape `split` now has
 

@@ -24,13 +24,20 @@ const expectedDigests = Object.freeze({
   // value, because `%ToNumber` lowers to a runtime helper and a string argument makes that a heap
   // operation. Any function doing arithmetic on a dynamic operand threads the heap from here on.
   // 30 nodes to 34.
-  call: "9937978e6ea2752c2be29613cc69164124e3b1c8115631b2e1f2d5a119b8f8b3",
+  // Repinned when `ToNumberValue` regained its spec guard. The former single ToNumber is now the
+  // explicit IsInt/IsFlt fast path and ToNumber slow path, joined before the unbox. Constants in
+  // that inlined diamond are rooted at this function's FunStart (not whole-graph Start), which is
+  // the non-entry ownership invariant this fixture now pins. 34 nodes to 48.
+  call: "62f6329d3c40cee9cb27c9292917069a342db4c52b5a30f21df73af5213fe1a9",
   control: "4d77f131d42c349fbffb154f65918d20a4a0fb002418426b8cdbc832f955260d",
   // Repinned for the same ToNumber seam as `call`, and this one is the minimal form of it: exactly
   // one node added — `Unbox flt <- Parm` becomes `Unbox flt <- ToNumber <- Parm` — and every later
   // index shifted by one. 37 nodes to 38, no memory edge gained, because `Box` already threaded the
   // heap through this fixture.
-  object: "8c19cc1ebeb4e58a6919b68cfbda7cb5b34a97228740eef91bb77592b110e680",
+  // Repinned with the same guarded ToNumberValue as `call`: the object fixture's dynamic numeric
+  // field crosses the IsInt/IsFlt diamond before the slow conversion, with its true constant
+  // rooted at the containing FunStart.
+  object: "688eb00f6bb2aba994867de2c8729142f03924e8bb024685ade121ad9f2623a8",
   // Repinned twice. First for the ToNumber seam: two dynamic operands in this fixture, so exactly
   // two nodes added — 82 to 84 — plus the memory edges the functions containing them now thread,
   // the same consequence spelled out on `call`.
@@ -39,7 +46,10 @@ const expectedDigests = Object.freeze({
   // before the `Call`, 84 to 85. A `Parm` is a tagged JavaScript value and a callee reading a field
   // off the declared shape unboxes it, so an object argument has to arrive tagged. It was arriving
   // as the raw allocation pointer and trapping.
-  full: "5aa04bede276bcdf2e7767d42f06be4b93512171b374bc3e2be642735fee282d",
+  // Repinned with two guarded ToNumberValue expansions. The fixture now contains four explicit
+  // numeric tag tests and two slow ToNumber nodes instead of two unconditional conversions; the
+  // additional Regions/Phis are the control handed back by JSL inlining. 85 nodes to 111.
+  full: "30e55c227a2adde35efb5ce42774b2bc3c9b5b53a09361b5334c15ad7f347d6c",
   bitwise: "189e78fe00839f184bb88f682c514f3a5d97b7972da062e8aa7262d3969e17a9",
 });
 

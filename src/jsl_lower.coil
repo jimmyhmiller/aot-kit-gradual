@@ -61,6 +61,7 @@
    (rmem   (ArrayList i64))   ; and the heap each `recur` left, one per recur
    (ctrl   i64)               ; the control the next effectful form hangs off, or JL-DIVERGED
    (mem    i64)               ; the current JS property memory, or NO-NODE before it is needed
+   (anchor i64)               ; Start/FunStart of the CFG owner receiving newly rooted constants
    (frame  i64)               ; lookup floor: a macro body cannot see its caller's bindings
    (decl   i64)               ; which declaration is being lowered, for diagnostics
    (fun    i64)               ; its OP-FUN
@@ -78,6 +79,7 @@
           (store! (field p rmem) (al-new [i64] (malloc-allocator)))
           (store! (field p ctrl) NO-NODE)
           (store! (field p mem) NO-NODE)
+          (store! (field p anchor) NO-NODE)
           (store! (field p frame) 0)
           (store! (field p decl) -1)
           (store! (field p fun) NO-NODE)
@@ -94,6 +96,7 @@
     (al-clear! [i64] (field p rmem))
     (store! (field p ctrl) NO-NODE)
     (store! (field p mem) NO-NODE)
+    (store! (field p anchor) NO-NODE)
     (store! (field p frame) 0)
     (store! (field p decl) -1)
     (store! (field p fun) NO-NODE)
@@ -208,7 +211,7 @@
 ; Leaves
 ; ============================================================================
 (defn jl-const [(t i64)] (-> i64)
-  (n-peephole (n-new1 OP-CONST t (g-start))))
+  (n-peephole (n-new1 OP-CONST t (load (field (jl) anchor)))))
 
 ;; A bare symbol: a literal, or a binding. Parameters are bindings too — `jl-lower-decl!` creates
 ;; one `OP-PARM` per parameter at entry and binds it by name.
@@ -248,7 +251,8 @@
                       (n-peephole (n-new2 OP-CAST target (jl-ctrl) v)))))
 
 (defn jl-prim [(id i64) (a i64) (b i64) (c i64)] (-> i64)
-  (if (or (= id JSP-UNBOXINT) (or (= id JSP-UNBOXFLT) (= id JSP-UNBOXBOOL)))
+  (if (or (= id JSP-UNBOXINT)
+          (or (= id JSP-UNBOXFLT) (or (= id JSP-UNBOXBOOL) (= id JSP-UNBOXOBJ))))
       (jl-unbox (jsp-aux id) a)
    ;; `OP-JSBUILTIN` always carries two operands; the unary descriptors ignore the second, so the
    ;; argument is passed twice rather than inventing a placeholder node.
@@ -321,8 +325,34 @@
               (if (str-eq name "goto") (jl-goto x)
                (if (str-eq name "loop") (jl-loop x)
                 (if (str-eq name "recur") (jl-recur x)
+                (if (str-eq name "call") (jl-js-call x)
                 (if (jsl-prim-name? name) (jl-prim-call x name)
-                  (jl-call x name))))))))))))))
+                  (jl-call x name)))))))))))))))
+
+;; Invoke a JavaScript callback value and thread its effect through the same implicit heap cell as
+;; the memory primitives. The pre-call heap is a trailing effect argument, never a source-level
+;; JavaScript argument; the CallEnd-rooted Arg is the opaque heap the callback returned.
+(defn jl-js-call [(x (ptr rd/Sexp))] (-> i64)
+  (block :done
+    (let [callee (jl-expr (rd/sexp-nth x 1))
+          n (- (rd/sexp-count x) 2)
+          buf (stack (array i64 9))
+          p (cast (ptr i64) buf)
+          (mut i) 0]
+      (loop (if (>= (load i) n) (break)
+              (do (store! (index p (load i)) (jl-expr (rd/sexp-nth x (+ (load i) 2))))
+                  (store! i (+ (load i) 1))
+                  0)))
+      (if (jl-diverged?) (return-from :done NO-NODE) 0)
+      (store! (index p n) (jl-mem))
+      (let [cs (n-call! (jl-ctrl) callee (slice-new [i64] p (+ n 1)))
+            end (call-end cs)]
+        (jl-set-ctrl! end)
+        (jl-set-mem! (n-new1 OP-ARG (t-mem-alias JS-PROPERTY-ALIAS (t-undef)) end))
+        ;; A JavaScript call expression always yields a tagged language value even when the
+        ;; closed-world callee uses an unboxed native return register. `Box(Call)` is the existing
+        ;; representation boundary; selection removes it when the target already returns `dyn`.
+        (n-box! (call-value cs))))))
 
 ;; A bail-out. The current control is parked on the label's pending list and the path is marked
 ;; diverged; the destination does not exist yet, because it is built at the CALL SITE out of every
@@ -814,6 +844,7 @@
     (store! (field p decl) d)
     (store! (field p fun) fun)
     (store! (field p ctrl) (n-fun-entry fun))
+    (store! (field p anchor) (n-fun-entry fun))
     ; Parameters are the outermost bindings, created ONCE each. `jl-lookup` searches innermost
     ; first, so a `let` may shadow a parameter, and the checker resolves in the same order.
     (let [np (jsl-decl-nparams d) (mut k) 0]
@@ -959,7 +990,7 @@
 ;;
 ;; `ctrl-cell` is read for the control to build on and written with the control the body ended on,
 ;; which is how a body containing an `if` hands its merge back to the caller.
-(defn jsl-inline! [(ctrl-cell (ptr i64)) (mem-cell (ptr i64))
+(defn jsl-inline! [(ctrl-cell (ptr i64)) (mem-cell (ptr i64)) (owner-entry i64)
                    (name (slice u8)) (args (slice i64))] (-> i64)
   (let [d (jsl-find name)]
     (if (< d 0)
@@ -981,10 +1012,12 @@
           saved-decl (load (field (jl) decl))
           saved-ctrl (jl-ctrl)
           saved-mem (jl-mem-raw)
+          saved-anchor (load (field (jl) anchor))
           uses-mem (jsl-decl-uses-memory? d)
           depth (jl-depth)
           (mut k) 0]
       (jl-set-ctrl! (load ctrl-cell))
+      (store! (field (jl) anchor) owner-entry)
       ;; Established BEFORE the body, for the reason `jl-lower-decl!` gives at length: a heap first
       ;; touched inside a loop has no memory at the loop's entry, so no loop memory Phi is built and
       ;; every iteration re-reads the entry heap instead of the previous iteration's writes.
@@ -1003,6 +1036,7 @@
         ;; no call to return from, which is why this needs no `VERR-LEAK` dance either.
         (if uses-mem (store! mem-cell (jl-mem-raw)) 0)
         (jl-set-mem! saved-mem)
+        (store! (field (jl) anchor) saved-anchor)
         (store! (field (jl) decl) saved-decl)
         (jl-set-frame! saved-frame)
         ;; The result outlives the bindings that built it, so it is pinned across the drop.

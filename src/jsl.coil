@@ -189,7 +189,8 @@
 ;; refuses the block with `MSEL-MEMORY-ORDER`. `OP-ARRAYRESIZE`'s fifth input exists for exactly
 ;; this, and JSL has to name it because JSL has no other way to say "after".
 (const JSP-ARRAYRESIZE      i64 48)
-(const JSP-COUNT            i64 49)
+(const JSP-UNBOXOBJ         i64 49)
+(const JSP-COUNT            i64 50)
 
 (defn jsp-name [(id i64)] (-> (slice u8))
   (case id
@@ -242,6 +243,7 @@
         JSP-ROUNDNUM       "%RoundNum"
         JSP-UNBOXBOOL      "%UnboxBool"
         JSP-ARRAYRESIZE    "%ArrayResize"
+        JSP-UNBOXOBJ       "%UnboxObj"
         "<unknown jsl primitive>"))
 
 (defn jsp-op [(id i64)] (-> i64)
@@ -295,6 +297,7 @@
         JSP-ROUNDNUM       OP-JSBUILTIN
         JSP-UNBOXBOOL      OP-UNBOX
         JSP-ARRAYRESIZE    OP-ARRAYRESIZE
+        JSP-UNBOXOBJ       OP-UNBOX
         -1))
 
 ;; How many OPERANDS the primitive takes. Slot 0 of every one of these ops is the ordinary control
@@ -350,6 +353,7 @@
         JSP-ROUNDNUM       1
         JSP-UNBOXBOOL      1
         JSP-ARRAYRESIZE    3
+        JSP-UNBOXOBJ       1
         -1))
 
 ;; The aux word a primitive's node carries. Almost every op takes 0, but `OP-TYPETEST` takes the
@@ -397,6 +401,7 @@
         JSP-UNBOXINT (t-int)
         JSP-UNBOXFLT (t-flt)
         JSP-UNBOXBOOL (t-bool)
+        JSP-UNBOXOBJ  (t-obj)
         ;; The descriptor id the `OP-JSBUILTIN` runtime dispatches on. Rounding a double needs a
         ;; real rounding operation, which is the machine surface rather than something JSL can
         ;; compose; the descriptor table already has libc behind it and both execution modes take
@@ -854,6 +859,18 @@
               (store! err (jsl-check-expr (rd/sexp-nth x (+ owa 1)) d)) 0)
           (load err))))))
 
+;; `(call fn arg ...)` invokes a JavaScript function value. It is a control/effect form rather
+;; than a `%` primitive: calls have variable arity, produce a CallEnd control, and invalidate the
+;; heap. The receiver ABI is deliberately separate; this form implements ordinary callback calls
+;; with an undefined/unused receiver, while the universal JavaScript receiver convention is
+;; standardised independently.
+(defn jsl-check-js-call [(x (ptr rd/Sexp)) (d i64)] (-> i64)
+  (if (< (rd/sexp-count x) 2)
+      (jsl-fail! JSL-ERR-ARITY "call")
+      (if (> (- (rd/sexp-count x) 2) JSL-MAX-PARAMS)
+          (jsl-fail! JSL-ERR-TOO-MANY-PARAMS "call")
+          (jsl-check-args x d 1))))
+
 ;; `(loop [(name init) ...] BODY...)`. The body is an expression: if it evaluates to `(recur ...)`
 ;; the loop iterates with those values, and otherwise its value is the loop's value. That is a
 ;; tail-recursive binding group, which is exactly what a loop Phi is — one phi per binding, the
@@ -948,6 +965,7 @@
         (if (str-eq name "goto") (return-from :done (jsl-check-goto x d)) 0)
         (if (str-eq name "loop") (return-from :done (jsl-check-loop x d)) 0)
         (if (str-eq name "recur") (return-from :done (jsl-check-recur x d)) 0)
+        (if (str-eq name "call") (return-from :done (jsl-check-js-call x d)) 0)
         (jsl-check-call x d)))))
 
 ; ============================================================================
@@ -1012,11 +1030,13 @@
     (let [n (rd/sexp-count x) (mut i) 0 (mut found) false]
       (if (and (rd/sexp-list? x) (and (> n 0) (rd/sexp-sym? (rd/sexp-nth x 0))))
           (let [name (rd/sexp-sym (rd/sexp-nth x 0))]
-            (if (jsl-prim-name? name)
+            (if (str-eq name "call")
+                (store! found true)
+              (if (jsl-prim-name? name)
                 (let [id (jsp-find name)]
                   (if (and (!= id JSP-NONE) (jsp-reads-memory? id)) (store! found true) 0))
               (let [c (jsl-find name)]
-                (if (and (>= c 0) (jsl-decl-uses-memory? c)) (store! found true) 0))))
+                (if (and (>= c 0) (jsl-decl-uses-memory? c)) (store! found true) 0)))))
           0)
       (loop (if (or (>= (load i) n) (load found)) (break)
               (do (if (jsl-body-reads-memory? (rd/sexp-nth x (load i))) (store! found true) 0)

@@ -1235,8 +1235,15 @@
                                   (if (and (= kind TSK-CALL) (fng-array-builtin? context node))
                                       (let [builtin (fng-array-builtin-name context node)]
                                         (cond (str-eq builtin "push") FNG-NUMBER
-                                              (str-eq builtin "slice") FNG-ARRAY
+                                              (or (str-eq builtin "slice")
+                                                  (or (str-eq builtin "map")
+                                                      (or (str-eq builtin "filter")
+                                                          (or (str-eq builtin "sort")
+                                                              (str-eq builtin "flatMap"))))) FNG-ARRAY
                                               (str-eq builtin "join") FNG-STRING
+                                              (or (str-eq builtin "some")
+                                                  (str-eq builtin "every")) FNG-BOOLEAN
+                                              (str-eq builtin "findIndex") FNG-NUMBER
                                               :else FNG-DYNAMIC))
                                       (let [callee-node (ts-child ast node 0)
                                             callee
@@ -1581,7 +1588,19 @@
                     (or (str-eq name "indexOf")
                         (or (str-eq name "includes")
                             (or (str-eq name "lastIndexOf")
-                                (or (str-eq name "at") (str-eq name "join")))))))))))
+                                (or (str-eq name "at")
+                                    (or (str-eq name "join")
+                                        (or (str-eq name "map")
+                                            (or (str-eq name "filter")
+                                                (or (str-eq name "forEach")
+                                                    (or (str-eq name "reduce")
+                                                        (or (str-eq name "reduceRight")
+                                                            (or (str-eq name "find")
+                                                                (or (str-eq name "findIndex")
+                                                                    (or (str-eq name "some")
+                                                                        (or (str-eq name "every")
+                                                                            (or (str-eq name "sort")
+                                                                                (str-eq name "flatMap"))))))))))))))))))))))
 
 ;; `Array.prototype.at` and `Array.prototype.join`, out of lib/array/read.jsl.
 ;;
@@ -1971,7 +1990,10 @@
     ;; an unchanged one publishes nothing.
     (if (jsl-name-uses-memory? name) (fng-record-dynamic-alias! context JS-PROPERTY-ALIAS) 0)
     (store! (index mp 0) (fng-current-memory context JS-PROPERTY-ALIAS))
-    (let [v (jsl-inline! (load (field context ctrl)) mp name args)]
+    (let [owner-entry (if (load (field context top-level))
+                          (g-start)
+                          (n-fun-entry (load (field context fun))))
+          v (jsl-inline! (load (field context ctrl)) mp owner-entry name args)]
       (if (!= (load (index mp 0)) (fng-current-memory context JS-PROPERTY-ALIAS))
           (do (fng-record-dynamic-alias! context JS-PROPERTY-ALIAS)
               (store! (load (field context memory))
@@ -2230,8 +2252,43 @@
               (fng-jsl-call1 context "ArrayLength" array))]
     (fng-jsl-call3 context "ArraySlice" array raw-start raw-end)))
 
+(defn fng-callback-value [(context FngContext) (node i64)] (-> i64)
+  (let [frontend (load (field context frontend))
+        symbol (fe-resolution-symbol frontend node)
+        index (fng-function-index frontend symbol)]
+    (if (and (>= index 0) (= (fng-capture-count frontend index) 0))
+        (al-get [i64] (load (load (field context functions))) index)
+        (fng-expression context node))))
+
+(defn fng-array-callback-call [(context FngContext) (node i64) (name (slice u8))] (-> i64)
+  (let [frontend (load (field context frontend))
+        ast (field frontend ast)
+        callee (ts-child ast node 0)
+        array (fng-expression context (ts-child ast callee 0))
+        callback (fng-callback-value context (ts-child ast node 1))]
+    (cond (str-eq name "map") (fng-jsl-call2 context "ArrayMap" array callback)
+          (str-eq name "filter") (fng-jsl-call2 context "ArrayFilter" array callback)
+          (str-eq name "forEach") (fng-jsl-call2 context "ArrayForEach" array callback)
+          (str-eq name "find") (fng-jsl-call2 context "ArrayFind" array callback)
+          (str-eq name "findIndex") (fng-jsl-call2 context "ArrayFindIndex" array callback)
+          (str-eq name "some") (fng-jsl-call2 context "ArraySome" array callback)
+          (str-eq name "every") (fng-jsl-call2 context "ArrayEvery" array callback)
+          (str-eq name "flatMap") (fng-jsl-call2 context "ArrayFlatMap" array callback)
+          (str-eq name "reduce")
+            (if (> (ts-child-count ast node) 2)
+                (fng-jsl-call3 context "ArrayReduceInitial" array callback
+                               (n-box! (fng-expression context (ts-child ast node 2))))
+                (fng-jsl-call2 context "ArrayReduce" array callback))
+          :else
+            (if (> (ts-child-count ast node) 2)
+                (fng-jsl-call3 context "ArrayReduceRightInitial" array callback
+                               (n-box! (fng-expression context (ts-child ast node 2))))
+                (fng-jsl-call2 context "ArrayReduceRight" array callback)))))
+
 (defn fng-array-call [(context FngContext) (node i64)] (-> i64)
-  (let [name (fng-array-builtin-name context node)]
+  (let [frontend (load (field context frontend))
+        ast (field frontend ast)
+        name (fng-array-builtin-name context node)]
     (cond (str-eq name "push") (fng-array-push context node)
           (str-eq name "pop") (fng-array-pop context node)
           (str-eq name "shift") (fng-array-shift context node)
@@ -2240,6 +2297,24 @@
           (str-eq name "lastIndexOf") (fng-array-search context node name)
           (str-eq name "at") (fng-array-at context node)
           (str-eq name "join") (fng-array-join context node)
+          (or (str-eq name "map")
+              (or (str-eq name "filter")
+                  (or (str-eq name "forEach")
+                      (or (str-eq name "reduce")
+                          (or (str-eq name "reduceRight")
+                              (or (str-eq name "find")
+                                  (or (str-eq name "findIndex")
+                                      (or (str-eq name "some")
+                                          (or (str-eq name "every")
+                                              (str-eq name "flatMap"))))))))))
+            (fng-array-callback-call context node name)
+          (str-eq name "sort")
+            (let [callee (ts-child ast node 0)
+                  array (fng-expression context (ts-child ast callee 0))]
+              (if (> (ts-child-count ast node) 1)
+                  (fng-jsl-call2 context "ArraySort" array
+                                 (fng-callback-value context (ts-child ast node 1)))
+                  (fng-jsl-call1 context "ArraySortDefault" array)))
           :else (fng-array-slice context node))))
 
 (defn fng-owner-constructor [(frontend (ptr NativeFrontend)) (owner i64)] (-> i64)
