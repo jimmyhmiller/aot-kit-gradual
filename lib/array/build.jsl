@@ -221,6 +221,41 @@
 (macro ArrayOfAppend1 :params [(a dyn) (value dyn)] :ret dyn
   (let [(stored (%ArrayStore a (%ArrayLen a) value))] a))
 
+;; https://tc39.es/ecma262/#sec-array.from for the iterable kinds this runtime represents today.
+;; String iteration is by Unicode code point, not UTF-16 code unit: a valid surrogate pair is
+;; concatenated into one element and advances by two units.
+(macro ArrayFrom :params [(source dyn)] :ret dyn
+  (let [(out (%NewArray))]
+    (if (%IsArray source)
+        (let [(array (%UnboxArray source))
+              (len (%ArrayLen array))]
+          (loop [(i 0)]
+            (if (%Le len i) out
+              (let [(stored (%ArrayStore out i (%ArrayLoad array i)))]
+                (recur (%Add i 1))))))
+        (if (%IsString source)
+            (let [(string (%UnboxString source))
+                  (len (%StringLen string))]
+              (loop [(i 0) (at 0)]
+                (if (%Le len i) out
+                  (let [(first (%StringCharCode string i))
+                        (paired
+                          (if (if (%Le 55296 first) (%Le first 56319) false)
+                              (if (%Lt (%Add i 1) len)
+                                  (let [(second (%StringCharCode string (%Add i 1)))]
+                                    (if (if (%Le 56320 second) (%Le second 57343) false)
+                                        true false))
+                                  false)
+                              false))
+                        (character
+                          (if paired
+                              (%StringConcat (%StringFromCode first)
+                                             (%StringFromCode (%StringCharCode string (%Add i 1))))
+                              (%StringFromCode first)))
+                        (stored (%ArrayStore out at (%Box character)))]
+                    (recur (%Add i (if paired 2 1)) (%Add at 1))))))
+            (%Throw "TypeError: Array.from source is not iterable")))))
+
 ;; https://tc39.es/ecma262/#sec-array.prototype.slice, over a fresh array.
 ;;
 ;; The bounds are the SLICE rule, not the substring rule, and they are the same two lines

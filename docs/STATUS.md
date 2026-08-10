@@ -117,6 +117,7 @@ spelling of the same call. **These are not a backlog.**
 | `a.length` | **done** | ArrayLength |
 | `Array.of(...)` | **done** | ArrayOfAppend1 |
 | `Array.isArray(x)` | **done** | IsArray |
+| `Array.from(iterable)` | **done** | ArrayFrom |
 
 ## Language surface that compiles
 
@@ -132,7 +133,6 @@ string literals and concatenation; `throw`; type aliases, interfaces and union a
 ### Needs the allocating-definition shape `split` now has
 
 - `Array.prototype.keys`/`values`/`entries`
-- `Array.from`
 
 ### Needs a regular-expression engine
 

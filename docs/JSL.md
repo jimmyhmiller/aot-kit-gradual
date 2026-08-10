@@ -365,7 +365,7 @@ The layer is deliberately thin, and it is the whole porting surface:
 - conversions — `%ToString %ToInteger %ParseInt %IsNaN %NumberToString`
 - heap — `%NewArray %ArrayLen %ArrayLoad %ArrayStore %ArrayResize %PropLoadNamed
   %PropStoreNamed`
-- representation capabilities — `%Box %UnboxInt %UnboxFlt %UnboxBool %UnboxObj
+- representation capabilities — `%Box %UnboxInt %UnboxFlt %UnboxBool %UnboxObj %UnboxString
   %IsArray %UnboxArray`
 - control — `%Throw`
 

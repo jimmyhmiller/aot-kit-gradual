@@ -100,13 +100,14 @@ const OTHER = [
   ["`a.length`", "ArrayLength"],
   ["`Array.of(...)`", "ArrayOfAppend1"],
   ["`Array.isArray(x)`", "IsArray"],
+  ["`Array.from(iterable)`", "ArrayFrom"],
 ];
 
 // Not supported by the frontend at all: the call or the syntax does not compile. Grouped by what
 // each would take, because that is the only useful thing to know about an item on this list.
 const UNSUPPORTED = {
   "Needs the allocating-definition shape `split` now has": [
-    "`Array.prototype.keys`/`values`/`entries`", "`Array.from`",
+    "`Array.prototype.keys`/`values`/`entries`",
   ],
   "Needs a regular-expression engine": [
     "regex literals", "`String.prototype.match`", "`String.prototype.matchAll`",
