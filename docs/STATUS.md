@@ -72,29 +72,27 @@ read out of the frontend's own tables, and every definition named here is checke
 | Operation | Status | Definition |
 |---|---|---|
 | `abs` | **done** | MathAbs |
-| `acos` | hand-written | — |
-| `asin` | hand-written | — |
-| `atan` | hand-written | — |
+| `acos` | **done** | MathAcos |
+| `asin` | **done** | MathAsin |
+| `atan` | **done** | MathAtan |
 | `ceil` | **done** | MathCeil |
-| `cos` | hand-written | — |
-| `exp` | hand-written | — |
+| `cos` | **done** | MathCos |
+| `exp` | **done** | MathExp |
 | `floor` | **done** | MathFloor |
-| `log` | hand-written | — |
+| `log` | **done** | MathLog |
 | `max` | **done** | MathMax2 |
 | `min` | **done** | MathMin2 |
-| `pow` | hand-written | — |
-| `random` | hand-written | — |
+| `pow` | **done** | MathPow |
+| `random` | **done** | MathRandom |
 | `round` | **done** | MathRound |
 | `sign` | **done** | MathSign |
-| `sin` | hand-written | — |
-| `sqrt` | hand-written | — |
-| `tan` | hand-written | — |
+| `sin` | **done** | MathSin |
+| `sqrt` | **done** | MathSqrt |
+| `tan` | **done** | MathTan |
 | `trunc` | **done** | MathTrunc |
 
-The hand-written rows are libm calls and a PRNG, not JavaScript semantics: there is no
-algorithm for a DSL to express. `MathFloor` earns its place because the library adds the
-`if (%IsInt v)` guard around `%FloorNum`; `sqrt` would get no guard and no rule, only a different
-spelling of the same call. **These are not a backlog.**
+Transcendental functions and random are DSL definitions over explicit platform
+primitives, analogous to Torque `extern` operations. The frontend does not construct their result IR.
 
 ## Globals, coercions and operators
 

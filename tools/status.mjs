@@ -76,10 +76,11 @@ const ARRAY = {
 const MATH = {
   abs: "MathAbs", floor: "MathFloor", ceil: "MathCeil", round: "MathRound",
   max: "MathMax2", min: "MathMin2", sign: "MathSign", trunc: "MathTrunc",
-  sqrt: null, pow: null, exp: null, log: null, sin: null, cos: null, tan: null,
-  asin: null, acos: null, atan: null, random: null,
+  sqrt: "MathSqrt", pow: "MathPow", exp: "MathExp", log: "MathLog",
+  sin: "MathSin", cos: "MathCos", tan: "MathTan", asin: "MathAsin",
+  acos: "MathAcos", atan: "MathAtan", random: "MathRandom",
 };
-const LIBM_NOTE = "The hand-written rows are libm calls and a PRNG, not JavaScript semantics: there is no\nalgorithm for a DSL to express. `MathFloor` earns its place because the library adds the\n`if (%IsInt v)` guard around `%FloorNum`; `sqrt` would get no guard and no rule, only a different\nspelling of the same call. **These are not a backlog.**";
+const LIBM_NOTE = "Transcendental functions and random are DSL definitions over explicit platform\nprimitives, analogous to Torque `extern` operations. The frontend does not construct their result IR.";
 
 // Operations that are not a method on a receiver.
 const OTHER = [
