@@ -2883,7 +2883,56 @@
                   (fng-expression context callee-node)))
         (mut args) (al-new [i64] (malloc-allocator))
         (mut call-captures) (al-new [i64] (malloc-allocator))
-        (mut index) (if explicit-call 2 1)]
+        optional-call
+          (and (not construct) (!= (ts-role ast node TS-ROLE-OPERATOR 0) -1))
+        conditional-optional (and optional-call (< function-index 0))
+        argument-start (if explicit-call 2 (if optional-call 2 1))
+        (mut index) argument-start
+        (mut optional-symbols) (al-new [i64] (malloc-allocator))
+        (mut optional-active) (al-new [i64] (malloc-allocator))
+        (mut optional-snapshots) (al-new [i64] (malloc-allocator))
+        (mut optional-nullish-ctrl) NO-NODE
+        (mut optional-nullish-start) 0]
+    ;; The callee (and a method receiver/property lookup) has already been evaluated exactly once.
+    ;; Only arguments and invocation belong to the present arm of `?.(`.
+    (if conditional-optional
+        (do
+          (let [(mut argument-index) argument-start]
+            (loop (if (>= (load argument-index) (ts-child-count ast node))
+                      (break)
+                      (do
+                        (fng-assigned! frontend
+                                       (ts-child ast node (load argument-index))
+                                       (mut optional-symbols))
+                        (store! argument-index (+ (load argument-index) 1))))))
+          (fng-record-dynamic-alias! context JS-PROPERTY-ALIAS)
+          (fng-active-memory! context (mut optional-active))
+          (fng-control-aliases! context (mut optional-active))
+          (let [condition
+                  (if (>= function-index 0)
+                      (fng-bool false)
+                      (fng-jsl-call1 context "IsNullishCallable" target))
+                saved-ctrl (load (load (field context ctrl)))
+                saved-start
+                  (fng-snapshot! context
+                                 (mut optional-symbols)
+                                 (mut optional-active)
+                                 (mut optional-snapshots))
+                arms (n-if-arms! (fng-peep (n-new2 OP-IF 0 saved-ctrl condition)))]
+            (store! (load (field context ctrl)) (arms-t arms))
+            (store! optional-nullish-ctrl (load (load (field context ctrl))))
+            (store! optional-nullish-start
+                    (fng-snapshot! context
+                                   (mut optional-symbols)
+                                   (mut optional-active)
+                                   (mut optional-snapshots)))
+            (fng-restore-snapshot! context
+                                   (mut optional-symbols)
+                                   (mut optional-active)
+                                   (mut optional-snapshots)
+                                   saved-start)
+            (store! (load (field context ctrl)) (arms-f arms))))
+        0)
     (if (and construct (and (= receiver-type FE-RECEIVER-DYNAMIC) (>= callee 0)))
         (let [prototype (fng-constructor-prototype! context callee)
               linked
@@ -2910,7 +2959,7 @@
     (loop (if (>= (load index) (ts-child-count ast node))
               (break)
               (do
-                (let [ordinal (- (load index) (if explicit-call 2 1))
+                (let [ordinal (- (load index) argument-start)
                       ;; The parameter's declared shape is the argument's EXPECTED type, so an
                       ;; object literal written at a call site is built the way the callee reads it.
                       value (fng-expression-expected
@@ -2940,41 +2989,81 @@
     (if (!= (load (load (field context memory))) NO-NODE)
         (al-push! [i64] (mut args) (load (load (field context memory))))
         0)
-    (let [call
+    (let [callable-target
+            (if conditional-optional
+                (n-new2 OP-CAST (t-fun) (load (load (field context ctrl))) target)
+                target)
+          call
             (if receiver-aware
                 (if (> (al-len [i64] (load call-captures)) 0)
                     (n-call-captured-receiver! (load (load (field context ctrl)))
-                                               target
+                                               callable-target
                                                (al-slice [i64] (load call-captures))
                                                receiver
                                                (al-slice [i64] (load args)))
                     (n-call-receiver! (load (load (field context ctrl)))
-                                      target
+                                      callable-target
                                       receiver
                                       (al-slice [i64] (load args))))
                 (n-call! (load (load (field context ctrl)))
-                         target
+                         callable-target
                          (al-slice [i64] (load args))))
           value (call-value call)]
       (store! (load (field context ctrl)) (call-end call))
       ;; The callee may have changed any active alias. Re-anchor subsequent alias reads at the
       ;; CallEnd instead of reusing a pre-call memory node.
       (store! (load (field context memory)) NO-NODE)
-      (al-free! [i64] (mut args))
-      (al-free! [i64] (mut call-captures))
-      (if construct
-          (let [result-owner
-                  (if (>= function-index 0)
-                      (fe-type-index-for-node frontend (load (field fn result-node)))
-                      -1)]
-            (if (>= result-owner 0)
-                (n-new2 OP-CAST
-                        (t-obj-shape
-                          (al-get [i64] (load (load (field context shapes))) result-owner))
-                        (load (load (field context ctrl)))
-                        value)
-                (fng-pin-after-call! context value receiver)))
-          value))))
+      (let [ordinary-value
+              (if construct
+                  (let [result-owner
+                          (if (>= function-index 0)
+                              (fe-type-index-for-node frontend (load (field fn result-node)))
+                              -1)]
+                    (if (>= result-owner 0)
+                        (n-new2 OP-CAST
+                                (t-obj-shape
+                                  (al-get [i64]
+                                          (load (load (field context shapes)))
+                                          result-owner))
+                                (load (load (field context ctrl)))
+                                value)
+                        (fng-pin-after-call! context value receiver)))
+                  value)
+            (mut answer) ordinary-value]
+        (if conditional-optional
+            (let [present-value (fng-box-dynamic-argument! ordinary-value)
+                  present-ctrl (load (load (field context ctrl)))
+                  present-start
+                    (fng-snapshot! context
+                                   (mut optional-symbols)
+                                   (mut optional-active)
+                                   (mut optional-snapshots))]
+              (if (fng-merge-snapshots! context
+                                        (load optional-nullish-ctrl)
+                                        (load optional-nullish-start)
+                                        present-ctrl
+                                        present-start
+                                        (mut optional-symbols)
+                                        (mut optional-active)
+                                        (mut optional-snapshots))
+                  (cond (= (load optional-nullish-ctrl) NO-NODE)
+                          (store! answer present-value)
+                        (= present-ctrl NO-NODE)
+                          (store! answer (n-box! (fng-undefined)))
+                        :else
+                          (let [phi (n-new OP-PHI (t-dyn))]
+                            (n-add-def! phi (load (load (field context ctrl))))
+                            (n-add-def! phi (n-box! (fng-undefined)))
+                            (n-add-def! phi present-value)
+                            (store! answer (fng-peep phi))))
+                  0))
+            0)
+        (al-free! [i64] (mut args))
+        (al-free! [i64] (mut call-captures))
+        (al-free! [i64] (mut optional-symbols))
+        (al-free! [i64] (mut optional-active))
+        (al-free! [i64] (mut optional-snapshots))
+        (load answer)))))
 
 (defn fng-intrinsic-call [(context FngContext) (node i64) (intrinsic i64)] (-> i64)
   (let [frontend (load (field context frontend))
