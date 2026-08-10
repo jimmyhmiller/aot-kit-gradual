@@ -1154,6 +1154,8 @@
                     (ms-push-memory-dep-tree! first (n-in node 1) (- fuel 1))
                     OP-OBJECTFREEZE
                     (ms-push-memory-dep-tree! first (n-in node 1) (- fuel 1))
+                    OP-INTERNALSTORE
+                    (ms-push-memory-dep-tree! first (n-in node 1) (- fuel 1))
                     OP-ARRAYSTORE
                     (ms-push-memory-dep-tree! first (n-in node 1) (- fuel 1))
                     OP-ARRAYRESIZE
@@ -1247,6 +1249,9 @@
                     (store! current (n-in (load current) 1))
                     OP-OBJECTFREEZE
                     (store! current (n-in (load current) 1))
+                    OP-INTERNALLOAD
+                    (store! current (n-in (load current) 1)) OP-INTERNALSTORE
+                    (store! current (n-in (load current) 1))
                     OP-ARRAYSTORE
                     (store! current (n-in (load current) 1)) OP-ARRAYRESIZE
                     (store! current (n-in (load current) 1)) OP-ARRAYLOAD
@@ -1276,6 +1281,7 @@
             (ms-memory-chain-phi? (n-in node 1)) OP-PROPDELETEKEY
             (ms-memory-chain-phi? (n-in node 1)) OP-SETPROTO
             (ms-memory-chain-phi? (n-in node 1)) OP-OBJECTFREEZE
+            (ms-memory-chain-phi? (n-in node 1)) OP-INTERNALSTORE
             (ms-memory-chain-phi? (n-in node 1)) OP-ARRAYSTORE
             (ms-memory-chain-phi? (n-in node 1)) OP-ARRAYRESIZE
             (ms-memory-chain-phi? (n-in node 1)) OP-ARRAYCOPY
@@ -1328,6 +1334,14 @@
                   object-block
                   fallback)))
           OP-OBJECTFREEZE
+        (let [object-block (ms-node-block owner (n-in node 2))]
+          (if (and (>= object-block 0) (!= object-block (ms-entry-block owner)))
+              object-block fallback))
+          OP-INTERNALLOAD
+        (let [object-block (ms-node-block owner (n-in node 2))]
+          (if (and (>= object-block 0) (!= object-block (ms-entry-block owner)))
+              object-block fallback))
+          OP-INTERNALSTORE
         (let [object-block (ms-node-block owner (n-in node 2))]
           (if (and (>= object-block 0) (!= object-block (ms-entry-block owner)))
               object-block fallback))
@@ -1397,17 +1411,19 @@
           (if (and (>= mapped 0) (= (mu-block-owner mapped) owner)) mapped fallback)))))
 
 (defn ms-linear-memory-effect? [(node i64)] (-> bool)
-  (let [op (n-op node)]
-    (or (= op OP-STORE)
-        (or (= op OP-PROPSTORE)
-            (or (= op OP-PROPDELETE)
-                (or (= op OP-PROPSTOREKEY)
-                    (or (= op OP-PROPDELETEKEY)
-                (or (= op OP-SETPROTO)
-                (or (= op OP-OBJECTFREEZE)
-                (or (= op OP-ARRAYSTORE)
-                    (or (= op OP-ARRAYRESIZE)
-                        (or (= op OP-ARRAYCOPY) (= op OP-STRINGSPLIT)))))))))))))
+  (case (n-op node) OP-STORE true
+        OP-PROPSTORE true
+        OP-PROPDELETE true
+        OP-PROPSTOREKEY true
+        OP-PROPDELETEKEY true
+        OP-SETPROTO true
+        OP-OBJECTFREEZE true
+        OP-INTERNALSTORE true
+        OP-ARRAYSTORE true
+        OP-ARRAYRESIZE true
+        OP-ARRAYCOPY true
+        OP-STRINGSPLIT true
+        false))
 
 (defn ms-select-memory-at! [(owner i64) (node i64) (bid i64)] (-> bool)
   (if (ms-seen? owner node)
@@ -1653,6 +1669,25 @@
                               key (ms-immediate! owner bid 0)
                               at (ms-emit! owner bid
                                            (mi-new MI-JSPROP fresh object object 8 node))]
+                          (ms-add-single-arg! at key)
+                          (ms-add-memory-deps! at node 1 1)))))
+                OP-INTERNALSTORE
+              (if (not (ms-select-memory-at! owner (n-in node 1) bid))
+                  (store! ok false)
+                  (let [object (ms-select-value-at! owner (n-in node 2) bid)
+                        value (ms-select-value-at! owner (n-in node 3) bid)
+                        extra (if (= (n-aux node) INTERNAL-INIT)
+                                  (ms-select-value-at! owner (n-in node 4) bid)
+                                  value)]
+                    (if (or (< object 0) (or (< value 0) (< extra 0)))
+                        (store! ok false)
+                        (let [fresh (ms-new-vreg!)
+                              operation (if (= (n-aux node) INTERNAL-INIT) 9 13)
+                              key (if (= (n-aux node) INTERNAL-INIT)
+                                      value
+                                      (ms-immediate! owner bid 0))
+                              at (ms-emit! owner bid
+                                           (mi-new MI-JSPROP fresh object extra operation node))]
                           (ms-add-single-arg! at key)
                           (ms-add-memory-deps! at node 1 1)))))
                 OP-ARG
@@ -2436,6 +2471,22 @@
                                   at (ms-emit! owner pinned-bid
                                                (mi-new MI-JSPROP fresh object object 7 node))]
                               (ms-add-single-arg! at ordinal)
+                              (ms-add-memory-deps! at node 1 1)
+                              (store! vr fresh))))))
+                  OP-INTERNALLOAD
+                (let [pinned-bid (ms-pinned-read-block owner node bid)]
+                  (if (or (not (ms-select-control-effects! owner (n-in node 0) pinned-bid))
+                          (not (ms-select-memory-at! owner (n-in node 1) pinned-bid)))
+                      (ms-fail! MSEL-UNSUPPORTED node)
+                      (let [object (ms-select-value-at! owner (n-in node 2) pinned-bid)]
+                        (if (< object 0)
+                            (ms-fail! MSEL-UNSUPPORTED node)
+                            (let [fresh (ms-new-vreg!)
+                                  zero (ms-immediate! owner pinned-bid 0)
+                                  operation (+ 10 (n-aux node))
+                                  at (ms-emit! owner pinned-bid
+                                               (mi-new MI-JSPROP fresh object object operation node))]
+                              (ms-add-single-arg! at zero)
                               (ms-add-memory-deps! at node 1 1)
                               (store! vr fresh))))))
                   OP-ARRAYMARK
@@ -3225,7 +3276,8 @@
                     (or (= op OP-PROTOHAS)
                         (or (= op OP-PROPLOADKEY)
                             (or (= op OP-PROPHASKEY)
-                                (or (= op OP-ARRAYLOAD) (= op OP-ARRAYLEN)))))))))))
+                                (or (= op OP-INTERNALLOAD)
+                                    (or (= op OP-ARRAYLOAD) (= op OP-ARRAYLEN))))))))))))
 
 ;; The block a control-anchored heap operation belongs to, or -1 when it has none.
 (defn ms-inst-anchor-block [(owner i64) (at i64)] (-> i64)
@@ -3929,6 +3981,7 @@
         (>= (ms-node-inst-before owner node at) 0) OP-PROPDELETEKEY
         (>= (ms-node-inst-before owner node at) 0) OP-SETPROTO
         (>= (ms-node-inst-before owner node at) 0) OP-OBJECTFREEZE
+        (>= (ms-node-inst-before owner node at) 0) OP-INTERNALSTORE
         (>= (ms-node-inst-before owner node at) 0) OP-ARRAYSTORE
         (>= (ms-node-inst-before owner node at) 0) OP-ARRAYRESIZE
         (>= (ms-node-inst-before owner node at) 0) OP-ARRAYCOPY

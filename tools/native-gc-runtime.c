@@ -55,6 +55,9 @@ typedef struct {
   uintptr_t owner;
   uintptr_t prototype;
   int frozen;
+  int internal_kind;
+  AotJsValue internal_target;
+  int64_t internal_index;
 } JsObjectRec;
 typedef struct {
   uintptr_t owner;
@@ -126,7 +129,7 @@ static JsObjectRec *js_object(uintptr_t owner, int create) {
   if (!create || !owner ||
       !reserve_records((void **)&js_objects, &js_objects_cap,
                        js_objects_len + 1, sizeof(*js_objects))) return NULL;
-  js_objects[js_objects_len] = (JsObjectRec){owner, 0, 0};
+  js_objects[js_objects_len] = (JsObjectRec){owner, 0, 0, -1, AOT_JS_UNDEFINED, 0};
   js_object_cache[slot] = (uint32_t)(js_objects_len + 1);
   return &js_objects[js_objects_len++];
 }
@@ -1067,6 +1070,31 @@ AotJsValue aot_js_property(uintptr_t owner, uint64_t name,
   }
   if (aot_js_managed((AotJsValue)owner)) owner = aot_js_payload((AotJsValue)owner);
   if (!owner) return AOT_JS_UNDEFINED;
+  /* Generic internal-slot ABI. These slots are deliberately outside the property table. Operations
+     9..13 initialize and access the array-iterator slots used by JSL; later Torque-style extern
+     classes can share the same representation seam without exposing their state as JS properties. */
+  if (operation == 9) {
+    JsObjectRec *object = js_object(owner, 1);
+    if (!object) return AOT_JS_UNDEFINED;
+    object->internal_target = js_canonical_stored_value((AotJsValue)name);
+    object->internal_kind = (int)(int64_t)value;
+    object->internal_index = 0;
+    if (aot_js_managed(object->internal_target))
+      js_write_barrier(owner, aot_js_payload(object->internal_target));
+    return (AotJsValue)owner;
+  }
+  if (operation >= 10 && operation <= 13) {
+    JsObjectRec *object = js_object(owner, 0);
+    if (!object || object->internal_kind < 0) {
+      fputs("uncaught JavaScript throw\n", stderr);
+      exit(70);
+    }
+    if (operation == 10) return object->internal_target;
+    if (operation == 11) return (AotJsValue)object->internal_index;
+    if (operation == 12) return (AotJsValue)object->internal_kind;
+    object->internal_index = (int64_t)value;
+    return (AotJsValue)owner;
+  }
   if (operation == 6) return (AotJsValue)js_own_key_count(owner);
   if (operation == 7) return js_own_key_at(owner, (size_t)(int64_t)name);
   if (operation == 8) {
@@ -1442,16 +1470,26 @@ static int side_owner_live(uintptr_t *owner) {
 static int relocate_side_edges(int scan_old_side, int *next_remembered_dirty) {
   for (size_t i = 0; i < js_objects_len; ++i) {
     JsObjectRec *object = &js_objects[i];
-    if (!side_owner_live(&object->owner) || !object->prototype) continue;
+    if (!side_owner_live(&object->owner)) continue;
     if (!scan_old_side && object->owner >= (uintptr_t)old_space &&
         object->owner < (uintptr_t)(old_space + collection_old_boundary)) continue;
-    uintptr_t moved = relocate(object->prototype);
-    if (!moved) return 0;
-    object->prototype = moved;
-    if (object->owner >= (uintptr_t)old_space &&
-        object->owner < (uintptr_t)(old_space + old_used) &&
-        moved >= (uintptr_t)to_start && moved < (uintptr_t)(to_start + capacity))
-      *next_remembered_dirty = 1;
+    if (object->prototype) {
+      uintptr_t moved = relocate(object->prototype);
+      if (!moved) return 0;
+      object->prototype = moved;
+      if (object->owner >= (uintptr_t)old_space &&
+          object->owner < (uintptr_t)(old_space + old_used) &&
+          moved >= (uintptr_t)to_start && moved < (uintptr_t)(to_start + capacity))
+        *next_remembered_dirty = 1;
+    }
+    if (!relocate_boxed((uintptr_t *)&object->internal_target)) return 0;
+    if (aot_js_managed(object->internal_target)) {
+      uintptr_t target = aot_js_payload(object->internal_target);
+      if (object->owner >= (uintptr_t)old_space &&
+          object->owner < (uintptr_t)(old_space + old_used) &&
+          target >= (uintptr_t)to_start && target < (uintptr_t)(to_start + capacity))
+        *next_remembered_dirty = 1;
+    }
   }
   for (size_t i = 0; i < js_properties_len; ++i) {
     JsPropertyRec *property = &js_properties[i];
@@ -1553,6 +1591,15 @@ static int verify_heap(void) {
     for (size_t j = 0; j < 2; ++j) {
       uintptr_t ref = values[j];
       if (!ref && j == 1) continue;
+      int young = ref >= (uintptr_t)spaces[active_space] &&
+                  ref < (uintptr_t)(spaces[active_space] + used);
+      int old = ref >= (uintptr_t)old_space && ref < (uintptr_t)(old_space + old_used);
+      if (!young && !old) return 0;
+    }
+    AotJsValue target = js_objects[i].internal_target;
+    if (!aot_js_well_formed(target)) return 0;
+    if (aot_js_managed(target)) {
+      uintptr_t ref = aot_js_payload(target);
       int young = ref >= (uintptr_t)spaces[active_space] &&
                   ref < (uintptr_t)(spaces[active_space] + used);
       int old = ref >= (uintptr_t)old_space && ref < (uintptr_t)(old_space + old_used);

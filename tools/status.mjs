@@ -72,6 +72,7 @@ const ARRAY = {
   sort: "ArraySort", flatMap: "ArrayFlatMap", fill: "ArrayFill",
   reverse: "ArrayReverse", unshift: "ArrayUnshift1", splice: "ArraySpliceDelete",
   concat: "ArrayConcatValue", flat: "ArrayFlat",
+  keys: "ArrayKeys", values: "ArrayValues", entries: "ArrayEntries",
 };
 const MATH = {
   abs: "MathAbs", floor: "MathFloor", ceil: "MathCeil", round: "MathRound",
@@ -124,9 +125,6 @@ const OTHER = [
 // Not supported by the frontend at all: the call or the syntax does not compile. Grouped by what
 // each would take, because that is the only useful thing to know about an item on this list.
 const UNSUPPORTED = {
-  "Needs the allocating-definition shape `split` now has": [
-    "`Array.prototype.keys`/`values`/`entries`",
-  ],
   "Needs a regular-expression engine": [
     "regex literals", "`String.prototype.match`", "`String.prototype.matchAll`",
     "`String.prototype.search`", "`String.prototype.replace`", "`RegExp`",

@@ -42,6 +42,7 @@ read out of the frontend's own tables, and every definition named here is checke
 |---|---|---|
 | `at` | **done** | ArrayAt |
 | `concat` | **done** | ArrayConcatValue |
+| `entries` | **done** | ArrayEntries |
 | `every` | **done** | ArrayEvery |
 | `fill` | **done** | ArrayFill |
 | `filter` | **done** | ArrayFilter |
@@ -53,6 +54,7 @@ read out of the frontend's own tables, and every definition named here is checke
 | `includes` | **done** | ArrayIncludes |
 | `indexOf` | **done** | ArrayIndexOfFrom |
 | `join` | **done** | ArrayJoin |
+| `keys` | **done** | ArrayKeys |
 | `lastIndexOf` | **done** | ArrayLastIndexOf |
 | `map` | **done** | ArrayMap |
 | `pop` | **done** | ArrayPop |
@@ -66,6 +68,7 @@ read out of the frontend's own tables, and every definition named here is checke
 | `sort` | **done** | ArraySort |
 | `splice` | **done** | ArraySpliceDelete |
 | `unshift` | **done** | ArrayUnshift1 |
+| `values` | **done** | ArrayValues |
 
 ## Math
 
@@ -144,10 +147,6 @@ prototypes, dynamic and missing properties, computed string/number-key get, set,
 string and template literals with interpolation and cooked escapes, concatenation; `throw`; type aliases, interfaces and union annotations.
 
 ## Not supported
-
-### Needs the allocating-definition shape `split` now has
-
-- `Array.prototype.keys`/`values`/`entries`
 
 ### Needs a regular-expression engine
 

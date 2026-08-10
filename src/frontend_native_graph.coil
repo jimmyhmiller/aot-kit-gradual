@@ -37,6 +37,7 @@
 (const FNG-INTRINSIC-OBJECT i64 -13)
 (const FNG-INTRINSIC-NUMBER i64 -14)
 (const FNG-INTRINSIC-PARSEFLOAT i64 -15)
+(const FNG-ITERATOR i64 -16)
 (const FNG-JUMP-BREAK i64 0)
 (const FNG-JUMP-CONTINUE i64 1)
 
@@ -1240,6 +1241,8 @@
                               FNG-BOOLEAN
                           (if (and (= kind TSK-CALL) (fng-array-of? context node))
                               FNG-ARRAY
+                          (if (and (= kind TSK-CALL) (fng-array-iterator-next? context node))
+                              FNG-DYNAMIC
                           (if (and (= kind TSK-CALL) (fng-object-enumeration? context node))
                               FNG-ARRAY
                           (if (and (= kind TSK-CALL) (fng-string-raw? context node))
@@ -1253,6 +1256,9 @@
                                   (if (and (= kind TSK-CALL) (fng-array-builtin? context node))
                                       (let [builtin (fng-array-builtin-name context node)]
                                         (cond (str-eq builtin "push") FNG-NUMBER
+                                              (or (str-eq builtin "keys")
+                                                  (or (str-eq builtin "values")
+                                                      (str-eq builtin "entries"))) FNG-ITERATOR
                                               (or (str-eq builtin "concat")
                                               (or (str-eq builtin "flat")
                                               (or (str-eq builtin "slice")
@@ -1272,7 +1278,7 @@
                                                   (fe-find-function-name frontend (ts-child ast callee-node 1))
                                                   (fe-resolution-symbol frontend callee-node))]
                                       (fng-call-result-type
-                                        frontend callee (= kind TSK-NEW-EXPRESSION)))))))))))))))))))))
+                                        frontend callee (= kind TSK-NEW-EXPRESSION))))))))))))))))))))))
               (= kind TSK-PROPERTY-ACCESS)
                 (if (fng-number-max-safe? context node)
                     FNG-NUMBER
@@ -1610,14 +1616,14 @@
 ;; `Array.prototype`'s recognised names, the counterpart of `fng-string-builtin-arity?`. `at` and
 ;; `join` were written in lib/array/read.jsl and unreachable for the same reason the twelve string
 ;; methods were: absent from this list, the call never reaches a lowering.
-(defn fng-array-builtin? [(context FngContext) (node i64)] (-> bool)
+(defn fng-array-builtin-legacy? [(context FngContext) (node i64)] (-> bool)
   (let [name (fng-array-builtin-name context node)]
     (or (str-eq name "concat")
     (or (str-eq name "flat")
     (or (str-eq name "splice")
     (or (str-eq name "fill")
         (or (str-eq name "reverse")
-            (or (str-eq name "unshift")
+            (or (str-eq name "unshift")))))))
     (or (str-eq name "push")
         (or (str-eq name "pop")
             (or (str-eq name "shift")
@@ -1637,7 +1643,42 @@
                                                                     (or (str-eq name "some")
                                                                         (or (str-eq name "every")
                                                                             (or (str-eq name "sort")
-                                                                                (str-eq name "flatMap"))))))))))))))))))))))))))))
+                                                                                (or (str-eq name "flatMap")
+                                                                                    (or (str-eq name "keys")
+                                                                                        (or (str-eq name "values")
+                                                                                            (str-eq name "entries")))))))))))))))))))))))))
+
+(defn fng-array-builtin? [(context FngContext) (node i64)] (-> bool)
+  (let [name (fng-array-builtin-name context node)]
+    (cond (str-eq name "concat") true (str-eq name "flat") true
+          (str-eq name "splice") true (str-eq name "fill") true
+          (str-eq name "reverse") true (str-eq name "unshift") true
+          (str-eq name "push") true (str-eq name "pop") true
+          (str-eq name "shift") true (str-eq name "slice") true
+          (str-eq name "indexOf") true (str-eq name "includes") true
+          (str-eq name "lastIndexOf") true (str-eq name "at") true
+          (str-eq name "join") true (str-eq name "map") true
+          (str-eq name "filter") true (str-eq name "forEach") true
+          (str-eq name "reduce") true (str-eq name "reduceRight") true
+          (str-eq name "find") true (str-eq name "findIndex") true
+          (str-eq name "some") true (str-eq name "every") true
+          (str-eq name "sort") true (str-eq name "flatMap") true
+          (str-eq name "keys") true (str-eq name "values") true
+          (str-eq name "entries") true :else false)))
+
+(defn fng-array-iterator-next? [(context FngContext) (node i64)] (-> bool)
+  (let [frontend (load (field context frontend)) ast (field frontend ast)
+        callee (ts-child ast node 0)]
+    (and (= (ts-child-count ast node) 1)
+         (and (= (ts-kind ast callee) TSK-PROPERTY-ACCESS)
+              (and (= (fng-infer context (ts-child ast callee 0) FNG-DYNAMIC) FNG-ITERATOR)
+                   (str-eq (ts-text ast (ts-child ast callee 1)) "next"))))))
+
+(defn fng-array-iterator-next [(context FngContext) (node i64)] (-> i64)
+  (let [frontend (load (field context frontend)) ast (field frontend ast)
+        callee (ts-child ast node 0)]
+    (fng-jsl-call1 context "ArrayIteratorNext"
+                   (n-box! (fng-expression context (ts-child ast callee 0))))))
 
 ;; `Array.prototype.at` and `Array.prototype.join`, out of lib/array/read.jsl.
 ;;
@@ -2600,6 +2641,12 @@
             (let [callee (ts-child ast node 0)
                   array (fng-expression context (ts-child ast callee 0))]
               (fng-jsl-call1 context "ArrayReverse" array))
+          (or (str-eq name "keys") (or (str-eq name "values") (str-eq name "entries")))
+            (let [callee (ts-child ast node 0)
+                  array (fng-expression context (ts-child ast callee 0))]
+              (cond (str-eq name "keys") (fng-jsl-call1 context "ArrayKeys" array)
+                    (str-eq name "values") (fng-jsl-call1 context "ArrayValues" array)
+                    :else (fng-jsl-call1 context "ArrayEntries" array)))
           (str-eq name "indexOf") (fng-array-search context node name)
           (str-eq name "includes") (fng-array-search context node name)
           (str-eq name "lastIndexOf") (fng-array-search context node name)
@@ -4033,6 +4080,8 @@
                     (fng-array-is-array context node)
                 (if (fng-array-of? context node)
                     (fng-array-of context node)
+                (if (fng-array-iterator-next? context node)
+                    (fng-array-iterator-next context node)
                 (if (fng-object-enumeration? context node)
                     (fng-object-enumeration context node)
                 (if (fng-object-assign? context node)
@@ -4047,7 +4096,7 @@
                         (fng-string-call context node)
                         (if (fng-array-builtin? context node)
                             (fng-array-call context node)
-                            (fng-call context node))))))))))))))))
+                            (fng-call context node)))))))))))))))))
           (= kind TSK-NEW-EXPRESSION)
             (if (fng-error-constructor? context node) (fng-error-constructor context node) (fng-call context node))
           (= kind TSK-OBJECT-LITERAL)
