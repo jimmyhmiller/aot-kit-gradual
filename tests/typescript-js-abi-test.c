@@ -105,7 +105,7 @@ int main(int argc, char **argv) {
   require(aot_ts_script_kind(js) == AOT_TS_SCRIPT_JS && aot_ts_script_kind(ts) == AOT_TS_SCRIPT_TS, "mode retained");
   aot_ts_parse_delete(js); aot_ts_parse_delete(ts);
 
-  const char *operators = "var x=1,o={}; x += 2; ++x; x--; typeof x; delete o.x; void (x += 3); o?.x; o?.[x]; true; null;";
+  const char *operators = "var x=1,o={}; x += 2; ++x; x--; typeof x; delete o.x; void (x += 3); o?.x; o?.[x]; `plain`; true; null;";
   AotTsParse operator_parse = aot_ts_parse_ex(operators, (int32_t)strlen(operators), "operators.js", 12, AOT_TS_SCRIPT_JS);
   require(find_operator(operator_parse, "PlusEquals") >= 0, "assignment operator API");
   require(find_operator(operator_parse, "PlusPlus") >= 0, "prefix update operator API");
@@ -118,6 +118,9 @@ int main(int argc, char **argv) {
   AotTsNode optional_property = find_kind_with_role(operator_parse, "PropertyAccessExpression", AOT_TS_ROLE_OPERATOR);
   AotTsNode optional_element = find_kind_with_role(operator_parse, "ElementAccessExpression", AOT_TS_ROLE_OPERATOR);
   require(optional_property >= 0 && optional_element >= 0, "optional access question-dot role API");
+  AotTsNode template_literal = find_kind(operator_parse, "NoSubstitutionTemplateLiteral", 0);
+  require(template_literal >= 0 && aot_ts_node_literal_kind(operator_parse, template_literal) == AOT_TS_LITERAL_STRING,
+    "no-substitution template literal category");
   AotTsNode boolean = find_kind(operator_parse, "TrueKeyword", 0);
   AotTsNode null_value = find_kind(operator_parse, "NullKeyword", 0);
   require(boolean >= 0 && aot_ts_node_literal_kind(operator_parse, boolean) == AOT_TS_LITERAL_BOOLEAN, "boolean literal category");

@@ -185,7 +185,7 @@ func stableKindCode(kind ast.Kind) int32 {
 	switch kind {
 	case ast.KindEndOfFile: return 1
 	case ast.KindNumericLiteral: return 8
-	case ast.KindStringLiteral: return 11
+	case ast.KindStringLiteral, ast.KindNoSubstitutionTemplateLiteral: return 11
 	case ast.KindRegularExpressionLiteral: return 14
 	case ast.KindIdentifier: return 79
 	case ast.KindFalseKeyword: return 96
