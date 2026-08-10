@@ -349,7 +349,8 @@ Same directory, same toolchain, same suites, opposite results an hour apart. So 
 to a commit, and bisecting for it will waste a day. It is `coil test`'s fork-and-exec of a freshly
 written child interacting with something transient in the machine's state. Until the toolchain is
 fixed, **a suite that reports signal 9 has reported nothing** — re-run it alone before believing it,
-and do not read a gate red on signal 9 as a red gate.
+and do not read a gate red on signal 9 as a red gate. `tools/gate.sh` now does that re-running
+itself, up to three attempts, matching on the output text rather than the exit code.
 
 One thing that WAS a real staleness, found while chasing this: `coil`'s `fmt` no longer renders
 INT64_MIN as `-0`. `tests/text-test.coil` pinned that defect as a witness, so the suite went red on
@@ -474,7 +475,19 @@ already walking.
 ## Working in this repo
 
 - **Commit on `main`.** No feature branches; the gate is the safety mechanism.
-- **`./tools/gate.sh` green before every commit.** Nothing is marked done while it is red.
+- **`./tools/gate.sh` green before every commit.** Nothing is marked done while it is red. It takes
+  about **150 seconds**; if it takes longer than that something has regressed in the gate itself,
+  which is worth chasing, because a gate people avoid running is not a gate.
+- **The benchmark gate is opt-in — `./tools/gate.sh --bench`.** It was 242 seconds of a 700-second
+  gate and it fails on nothing: it prints a table and exits 0 whatever the timings say. Run it when
+  you care about a number, not on every commit.
+- **The suites, the typechecks and the conformance corpus run in PARALLEL.** Getting there was
+  mostly two mistakes worth not repeating. A worker pool around `execFileSync` buys nothing, because
+  it blocks the single Node thread — 233s serial, 217s "concurrent", 43s once the calls were
+  actually async. And a suite that dies on signal 9 does NOT exit 137: `coil test` survives its own
+  child, prints `FAILED (signal 9)` and exits 1, so the retry has to match the output text. Under
+  parallel load that flake went from about one per sweep to five, so the retry is now part of the
+  gate rather than advice in this file.
 - The gates: `jsl-gate.sh` (322 interpreter cases vs Node, with two falsifications built in),
   `jsl-native-gate.sh` (compiles every builtin to machine code, value-checks 14 against a committed
   golden), `native-source-conformance.sh` (whole programs through the real pipeline — **the one that
