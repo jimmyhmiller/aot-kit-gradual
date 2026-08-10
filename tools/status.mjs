@@ -133,7 +133,7 @@ const UNSUPPORTED = {
     "tagged template literals", "destructuring", "spread and rest",
     "`for...of` / `for...in`", "`class`", "getters and setters",
     "optional calls through unknown present callables (needs call descriptors/adapters)", "`try`/`catch`/`finally`",
-    "dynamic-RHS/custom-`Symbol.hasInstance` `instanceof`",
+    "custom-`Symbol.hasInstance` `instanceof`",
   ],
   "Needs a runtime this compiler does not have": [
     "`Map` / `Set` / `WeakMap`", "`Promise` and `async`/`await`", "generators and iterators",

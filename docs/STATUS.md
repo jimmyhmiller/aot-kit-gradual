@@ -171,7 +171,7 @@ string and template literals with interpolation and cooked escapes, concatenatio
 - getters and setters
 - optional calls through unknown present callables (needs call descriptors/adapters)
 - `try`/`catch`/`finally`
-- dynamic-RHS/custom-`Symbol.hasInstance` `instanceof`
+- custom-`Symbol.hasInstance` `instanceof`
 
 ### Needs a runtime this compiler does not have
 
