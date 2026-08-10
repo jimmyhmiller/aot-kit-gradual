@@ -61,6 +61,7 @@ const STRING = {
   padStart: "StringPadStart", padEnd: "StringPadEnd", repeat: "StringRepeatCount",
   replaceAll: "StringReplaceAll", trim: "StringTrim", trimStart: "StringTrimStart",
   trimEnd: "StringTrimEnd", at: "StringAt",
+  localeCompare: "StringLocaleCompare",
 };
 const ARRAY = {
   push: "ArrayPush1", pop: "ArrayPop", shift: "ArrayShift", slice: "ArraySlice",
@@ -131,7 +132,6 @@ const UNSUPPORTED = {
   ],
   "Needs a frontend intrinsic, like the one `Number` just got": [
     "`JSON.parse`/`stringify`", "`String.prototype.normalize`",
-    "`String.prototype.localeCompare`",
   ],
   "Needs new syntax in the frontend": [
     "tagged template literals", "destructuring", "spread and rest",

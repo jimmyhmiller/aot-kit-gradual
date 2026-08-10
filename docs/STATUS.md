@@ -21,6 +21,7 @@ read out of the frontend's own tables, and every definition named here is checke
 | `includes` | **done** | StringIncludesFrom |
 | `indexOf` | **done** | StringIndexOfFrom |
 | `lastIndexOf` | **done** | StringLastIndexOf |
+| `localeCompare` | **done** | StringLocaleCompare |
 | `padEnd` | **done** | StringPadEnd |
 | `padStart` | **done** | StringPadStart |
 | `repeat` | **done** | StringRepeatCount |
@@ -161,7 +162,6 @@ string and template literals with interpolation and cooked escapes, concatenatio
 
 - `JSON.parse`/`stringify`
 - `String.prototype.normalize`
-- `String.prototype.localeCompare`
 
 ### Needs new syntax in the frontend
 
