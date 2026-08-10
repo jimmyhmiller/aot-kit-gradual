@@ -3323,86 +3323,60 @@
                              (box-arms bool)] (-> i64)
   (let [frontend (load (field context frontend))
         (mut changed) (al-new [i64] (malloc-allocator))
-        (mut saved-values) (al-new [i64] (malloc-allocator))
-        (mut then-values) (al-new [i64] (malloc-allocator))
         (mut active) (al-new [i64] (malloc-allocator))
-        (mut memory-phis) (al-new [i64] (malloc-allocator))
+        (mut snapshots) (al-new [i64] (malloc-allocator))
         saved-ctrl (load (load (field context ctrl)))
-        saved-memory (load (load (field context memory)))
-        (mut index) 0]
+        heap-arms
+          (or (and (!= then-node -1)
+                   (or (fng-node-has-kind frontend then-node TSK-CALL)
+                       (or (fng-node-has-kind frontend then-node TSK-NEW-EXPRESSION)
+                           (or (fng-node-has-kind frontend then-node TSK-PROPERTY-ACCESS)
+                               (fng-node-has-kind frontend then-node TSK-ELEMENT-ACCESS)))))
+              (and (!= else-node -1)
+                   (or (fng-node-has-kind frontend else-node TSK-CALL)
+                       (or (fng-node-has-kind frontend else-node TSK-NEW-EXPRESSION)
+                           (or (fng-node-has-kind frontend else-node TSK-PROPERTY-ACCESS)
+                               (fng-node-has-kind frontend else-node TSK-ELEMENT-ACCESS))))))
+        (mut answer) NO-NODE]
     (if (!= then-node -1) (fng-assigned! frontend then-node (mut changed)) 0)
     (if (!= else-node -1) (fng-assigned! frontend else-node (mut changed)) 0)
-    (loop (if (>= (load index) (al-len [i64] (load changed)))
-              (break)
-              (do
-                (al-push! [i64]
-                          (mut saved-values)
-                          (fng-symbol-node context
-                                           (al-get [i64] (load changed) (load index))))
-                (store! index (+ (load index) 1)))))
-    (let [arms (n-if-arms! (fng-peep (n-new2 OP-IF 0 saved-ctrl condition)))]
+    ;; Expression arms can call any transitioning JSL macro. Snapshot the same conservative alias
+    ;; set as statement `if`, including the runtime property/array heap, before either arm exists.
+    (if heap-arms
+        (do (fng-record-dynamic-alias! context JS-PROPERTY-ALIAS)
+            (fng-active-memory! context (mut active))
+            (fng-control-aliases! context (mut active)))
+        0)
+    (let [saved-start (fng-snapshot! context (mut changed) (mut active) (mut snapshots))
+          arms (n-if-arms! (fng-peep (n-new2 OP-IF 0 saved-ctrl condition)))]
       (store! (load (field context ctrl)) (arms-t arms))
       (let [raw-then-value (if (= then-node -1) then-fixed (fng-expression context then-node))
             then-value (if box-arms (n-box! raw-then-value) raw-then-value)
-            then-ctrl (load (load (field context ctrl)))]
-        (store! index 0)
-        (loop (if (>= (load index) (al-len [i64] (load changed)))
-                  (break)
-                  (do
-                    (al-push! [i64]
-                              (mut then-values)
-                              (fng-symbol-node context
-                                               (al-get [i64] (load changed) (load index))))
-                    (store! index (+ (load index) 1)))))
-        (store! (load (field context memory)) saved-memory)
+            then-ctrl (load (load (field context ctrl)))
+            then-start (fng-snapshot! context (mut changed) (mut active) (mut snapshots))]
+        (fng-restore-snapshot! context (mut changed) (mut active) (mut snapshots) saved-start)
         (store! (load (field context ctrl)) (arms-f arms))
-        (fng-restore-values! context changed saved-values)
         (let [raw-else-value (if (= else-node -1) else-fixed (fng-expression context else-node))
               else-value (if box-arms (n-box! raw-else-value) raw-else-value)
               else-ctrl (load (load (field context ctrl)))
-              region (n-new OP-REGION 0)
-              value-phi (n-new OP-PHI (t-dyn))]
-          (n-add-def! region NO-NODE)
-          (n-add-def! region then-ctrl)
-          (n-add-def! region else-ctrl)
-          (n-add-def! value-phi region)
-          (n-add-def! value-phi then-value)
-          (n-add-def! value-phi else-value)
-          (store! index 0)
-          (loop (if (>= (load index) (al-len [i64] (load changed)))
-                    (break)
-                    (let [symbol (al-get [i64] (load changed) (load index))
-                          phi (n-new OP-PHI (fng-symbol-coil-type context symbol))]
-                      (n-add-def! phi region)
-                      (n-add-def! phi (al-get [i64] (load then-values) (load index)))
-                      (n-add-def! phi
-                                  (fng-symbol-node context
-                                                   (al-get [i64] (load changed) (load index))))
-                      (fng-set-symbol! context symbol phi)
-                      (store! index (+ (load index) 1)))))
-          (fng-active-memory! context (mut active))
-          (store! index 0)
-          (loop (if (>= (load index) (al-len [i64] (load active)))
-                    (break)
-                    (let [field-index (al-get [i64] (load active) (load index))
-                          alias (al-get [i64] (load (load (field context aliases))) field-index)
-                          phi (n-new OP-PHI (t-mem-alias alias (t-undef)))]
-                      (n-add-def! phi region)
-                      (n-add-def! phi (fng-memory then-ctrl alias))
-                      (n-add-def! phi (fng-memory else-ctrl alias))
-                      (al-push! [i64] (mut memory-phis) phi)
-                      (store! index (+ (load index) 1)))))
-          (store! (load (field context memory))
-                  (if (> (al-len [i64] (load memory-phis)) 0)
-                      (fng-merge memory-phis)
-                      saved-memory))
-          (store! (load (field context ctrl)) region)
-          (al-free! [i64] (mut changed))
-          (al-free! [i64] (mut saved-values))
-          (al-free! [i64] (mut then-values))
-          (al-free! [i64] (mut active))
-          (al-free! [i64] (mut memory-phis))
-          (fng-peep value-phi))))))
+              else-start (fng-snapshot! context (mut changed) (mut active) (mut snapshots))]
+          (if (fng-merge-snapshots! context
+                                    then-ctrl then-start
+                                    else-ctrl else-start
+                                    (mut changed) (mut active) (mut snapshots))
+              (cond (= then-ctrl NO-NODE) (store! answer else-value)
+                    (= else-ctrl NO-NODE) (store! answer then-value)
+                    :else
+                      (let [value-phi (n-new OP-PHI (t-dyn))]
+                        (n-add-def! value-phi (load (load (field context ctrl))))
+                        (n-add-def! value-phi then-value)
+                        (n-add-def! value-phi else-value)
+                        (store! answer (fng-peep value-phi))))
+              0))))
+    (al-free! [i64] (mut changed))
+    (al-free! [i64] (mut active))
+    (al-free! [i64] (mut snapshots))
+    (load answer)))
 
 (defn fng-expression-expected [(context FngContext) (node i64) (expected i64)] (-> i64)
   (let [frontend (load (field context frontend))
