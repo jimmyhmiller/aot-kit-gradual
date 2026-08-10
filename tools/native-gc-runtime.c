@@ -977,8 +977,10 @@ AotJsValue aot_js_property(uintptr_t owner, uint64_t name,
     if (operation == 1) {
       int ok = 0;
       double number = aot_js_to_number_double(value, &ok);
-      if (!ok || number < 0 || number > UINT32_MAX || trunc(number) != number)
-        return AOT_JS_UNDEFINED;
+      if (!ok || number < 0 || number > UINT32_MAX || trunc(number) != number) {
+        fputs("uncaught JavaScript throw\n", stderr);
+        exit(70);
+      }
       return aot_js_array(owner, (int64_t)number, value, 4);
     }
     if (operation == 3) return 1;
