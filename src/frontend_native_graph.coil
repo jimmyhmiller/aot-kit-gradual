@@ -1881,10 +1881,11 @@
               (break)
               (do
                 (store! result
-                        (n-string-concat! (load result)
-                                          (fng-jsl-call1 context "StringFromCharCode"
-                                                         (fng-expression context
-                                                                                    (ts-child ast node (load index))))))
+                        (fng-jsl-call2 context "StringConcat"
+                                      (load result)
+                                      (fng-jsl-call1 context "StringFromCharCode"
+                                                     (fng-expression context
+                                                       (ts-child ast node (load index))))))
                 (store! index (+ (load index) 1)))))
     (load result)))
 
@@ -2948,15 +2949,11 @@
     (if (and (= owner FNG-STRING) (str-eq (ts-text ast name-node) "length"))
         (fng-jsl-call1 context "StringLength" object)
         (if (and (= owner FNG-ARRAY) (str-eq (ts-text ast name-node) "length"))
-            (do
-              (fng-record-dynamic-alias! context JS-PROPERTY-ALIAS)
-              (fng-array-length! context (fng-current-memory context JS-PROPERTY-ALIAS) object))
+            (fng-jsl-call1 context "ArrayLength" object)
             (if (= field-index -1)
-                (do
-                  (fng-record-dynamic-alias! context JS-PROPERTY-ALIAS)
-                  (fng-prop-load! context (fng-current-memory context JS-PROPERTY-ALIAS)
-                                object
-                                (ts-text ast name-node)))
+                (fng-jsl-call2 context "GetNamedProperty"
+                               object
+                               (fng-const (shape-name-intern! (ts-text ast name-node))))
                 (let [alias (al-get [i64] (load (load (field context aliases))) field-index)
                       shape (al-get [i64] (load (load (field context shapes))) field-owner)
                       cast-node (n-new2 OP-CAST (t-obj-shape shape) (load (load (field context ctrl))) object)]
@@ -3035,11 +3032,9 @@
       (fng-symbol-node context (load (field value symbol)))
       (if (= (load (field value kind)) FNG-LVALUE-FIELD)
           (if (= (load (field value shape)) -1)
-              (n-peephole (n-new3 OP-PROPLOAD
-                                  (load (field value key))
-                                  (load (load (field context ctrl)))
-                                  (fng-current-memory context JS-PROPERTY-ALIAS)
-                                  (load (field value object))))
+              (fng-jsl-call2 context "GetNamedProperty"
+                             (load (field value object))
+                             (fng-const (load (field value key))))
               (let [cast-node
                       (n-new2 OP-CAST
                               (t-obj-shape (load (field value shape)))
@@ -3048,26 +3043,19 @@
                 (n-load! (fng-current-memory context (load (field value alias)))
                          cast-node
                          (load (field value alias)))))
-          (do
-            (fng-record-dynamic-alias! context JS-PROPERTY-ALIAS)
-            (fng-array-load! context (fng-current-memory context JS-PROPERTY-ALIAS)
-                           (load (field value object))
-                           (load (field value key)))))))
+          (fng-jsl-call2 context "GetElement"
+                         (load (field value object))
+                         (load (field value key))))))
 
 (defn fng-lvalue-write [(context FngContext) (target FngLValue) (new-value i64)] (-> i64)
   (if (= (load (field target kind)) FNG-LVALUE-LOCAL)
       (do (fng-set-symbol! context (load (field target symbol)) new-value) new-value)
       (if (= (load (field target kind)) FNG-LVALUE-FIELD)
           (if (= (load (field target shape)) -1)
-              (let [stored
-                      (n-peephole (n-new4 OP-PROPSTORE
-                                          (load (field target key))
-                                          (load (load (field context ctrl)))
-                                          (fng-current-memory context JS-PROPERTY-ALIAS)
-                                          (load (field target object))
-                                          (n-box! new-value)))]
-                (store! (load (field context memory)) (fng-preserve-active-memory context stored))
-                new-value)
+              (fng-jsl-call3 context "SetNamedProperty"
+                             (load (field target object))
+                             (fng-const (load (field target key)))
+                             new-value)
               (let [alias (load (field target alias))
                     cast-node
                       (n-new2 OP-CAST
@@ -3097,14 +3085,10 @@
                 (store! (load (field context memory)) (fng-merge memories))
                 (al-free! [i64] (mut memories))
                 new-value))
-          (let [stored
-                  (fng-array-store! context (fng-current-memory context JS-PROPERTY-ALIAS)
-                                  (load (field target object))
-                                  (load (field target key))
-                                  (n-box! new-value))]
-            (fng-record-dynamic-alias! context JS-PROPERTY-ALIAS)
-            (store! (load (field context memory)) (fng-preserve-active-memory context stored))
-            new-value))))
+          (fng-jsl-call3 context "SetElement"
+                         (load (field target object))
+                         (load (field target key))
+                         new-value))))
 
 (defn fng-update-local [(context FngContext) (node i64) (prefix bool)] (-> i64)
   (let [frontend (load (field context frontend))

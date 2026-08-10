@@ -250,6 +250,18 @@
   (n-peephole (n-new2 OP-UNBOX target NO-NODE
                       (n-peephole (n-new2 OP-CAST target (jl-ctrl) v)))))
 
+;; Named-property IR stores the interned property-name id in AUX, not as a data input. The JSL
+;; surface therefore accepts a key operand so frontend call sites remain ordinary macro calls, but
+;; that operand must be a compile-time integer constant. This is deliberately a separate primitive
+;; from the eventual dynamic `PropertyKey` operation: silently accepting a runtime key here would
+;; bake whatever happened to be in a non-Const node's aux word into the graph.
+(defn jl-static-property-key [(key i64)] (-> i64)
+  (if (and (= (n-op key) OP-CONST)
+           (and (ty-int-only? (n-aux key)) (ty-const? (n-aux key))))
+      (ty-int-lo (n-aux key))
+      (do (panic-corrupt "jsl lowering: a named-property key must be a constant interned name")
+          0)))
+
 (defn jl-prim [(id i64) (a i64) (b i64) (c i64)] (-> i64)
   (if (or (= id JSP-UNBOXINT)
           (or (= id JSP-UNBOXFLT) (or (= id JSP-UNBOXBOOL) (= id JSP-UNBOXOBJ))))
@@ -280,6 +292,13 @@
     ;; to say which trip it belongs to. Anchoring pins it to the block it was written in.
     (if (= op OP-ARRAYLEN) (n-array-length-at! (jl-ctrl) (jl-mem) a)
       (if (= op OP-ARRAYLOAD) (n-array-load-at! (jl-ctrl) (jl-mem) a b)
+        (if (= op OP-PROPLOAD)
+            (n-peephole (n-new3 OP-PROPLOAD (jl-static-property-key b)
+                                (jl-ctrl) (jl-mem) a))
+        (if (= op OP-PROPSTORE)
+            (do (jl-set-mem! (n-peephole (n-new4 OP-PROPSTORE (jl-static-property-key b)
+                                                   (jl-ctrl) (jl-mem) a c)))
+                (jl-const (t-undef)))
         (if (= op OP-NEW)
             ; SHAPE-ROOT, then the Array tag. The allocation's control input is real — an allocation
             ; happening twice is two objects — so it hangs off the current control rather than
@@ -299,7 +318,7 @@
                 (do (jl-set-mem! (n-array-resize-after-at! (jl-ctrl) (jl-mem) a b c))
                     (jl-const (t-undef)))
               (do (panic-corrupt "jsl lowering: a memory primitive this dispatch does not build")
-                  NO-NODE))))))))
+                  NO-NODE))))))))))
 
 ;; NOTHING IS BUILT ON A DIVERGED PATH. After a `goto` there is no control to hang a node off, so
 ;; every remaining form on that path lowers to nothing. Guarding here rather than at each construct
