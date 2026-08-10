@@ -95,6 +95,7 @@ const OTHER = [
   ["`Number.isSafeInteger`", "NumberIsSafeInteger"],
   ["ToNumber at an arithmetic operand", "ToNumberValue"],
   ["implicit ToString at `+`", "ToStringValue"],
+  ["strict equality (`===` / `!==`)", "StrictEqual"],
   ["string `===` / `!==`", "StringEquals"],
   ["string `<` `>` `<=` `>=`", "StringCompare"],
   ["string `+`", "StringConcat"],

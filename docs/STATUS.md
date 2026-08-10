@@ -109,6 +109,7 @@ primitives, analogous to Torque `extern` operations. The frontend does not const
 | `Number.isSafeInteger` | **done** | NumberIsSafeInteger |
 | ToNumber at an arithmetic operand | **done** | ToNumberValue |
 | implicit ToString at `+` | **done** | ToStringValue |
+| strict equality (`===` / `!==`) | **done** | StrictEqual |
 | string `===` / `!==` | **done** | StringEquals |
 | string `<` `>` `<=` `>=` | **done** | StringCompare |
 | string `+` | **done** | StringConcat |

@@ -22,10 +22,10 @@ export function main(): number {
   total = total + (Math.sign(-4.5) + 2) * 1000;
   total = total + (Math.sign(4.5) + 2) * 10000;
   // NaN reaches arithmetic and dies there, so `| 0` is 0 for a correct sign and 5 for one that
-  // folded NaN into the zero arm. Written this way rather than as `sign(NaN) === sign(NaN)`, which
-  // is the natural spelling and answers TRUE natively — a separate miscompile, recorded under
-  // known defects in HANDOFF.md and not this file's business.
+  // folded NaN into the zero arm.
   total = total + (7 - ((Math.sign(NaN) + 5) | 0)) * 100000;
+  let signedNaN = Math.sign(NaN);
+  total = total + (signedNaN !== signedNaN ? 8 : 0);
 
   total = total + Math.trunc(4.9) * 1000000;
   total = total + (Math.trunc(-4.9) + 9) * 10000000;
