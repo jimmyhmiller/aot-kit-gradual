@@ -37,7 +37,8 @@ enum {
      src/eval.coil. They are value-level rather than string-level ops and are dispatched before the
      string record is looked up, like STRICT_EQUAL and TRUTHY. */
   AOT_JS_VALUE_TO_NUMBER = 28,
-  AOT_JS_VALUE_TO_INTEGER = 29
+  AOT_JS_VALUE_TO_INTEGER = 29,
+  AOT_JS_STRING_PARSE_FLOAT = 30
 };
 enum {
   AOT_JS_BUILTIN_ABS = 0, AOT_JS_BUILTIN_FLOOR = 1, AOT_JS_BUILTIN_CEIL = 2,

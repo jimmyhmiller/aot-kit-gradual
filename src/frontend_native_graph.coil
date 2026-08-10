@@ -35,6 +35,7 @@
 (const FNG-INTRINSIC-ARRAY i64 -12)
 (const FNG-INTRINSIC-OBJECT i64 -13)
 (const FNG-INTRINSIC-NUMBER i64 -14)
+(const FNG-INTRINSIC-PARSEFLOAT i64 -15)
 (const FNG-JUMP-BREAK i64 0)
 (const FNG-JUMP-CONTINUE i64 1)
 
@@ -1100,6 +1101,7 @@
         (= symbol FE-INTRINSIC-ARRAY) FNG-INTRINSIC-ARRAY
         (= symbol FE-INTRINSIC-OBJECT) FNG-INTRINSIC-OBJECT
         (= symbol FE-INTRINSIC-NUMBER) FNG-INTRINSIC-NUMBER
+        (= symbol FE-INTRINSIC-PARSEFLOAT) FNG-INTRINSIC-PARSEFLOAT
         :else FNG-DYNAMIC))
 
 (defn fng-declared-symbol-type [(frontend (ptr NativeFrontend)) (symbol-id i64)] (-> i64)
@@ -1223,6 +1225,8 @@
                       ;; number, exactly like the global `isNaN` and `parseInt` above.
                       (if (and (= kind TSK-CALL) (fng-number-static? context node))
                           FNG-BOOLEAN
+                      (if (and (= kind TSK-CALL) (fng-parse-float? context node))
+                          FNG-NUMBER
                       (if (and (= kind TSK-CALL) (fng-number-convert? context node))
                           FNG-NUMBER
                       (if (and (= kind TSK-CALL) (fng-number-to-string? context node))
@@ -1261,7 +1265,7 @@
                                                   (fe-find-function-name frontend (ts-child ast callee-node 1))
                                                   (fe-resolution-symbol frontend callee-node))]
                                       (fng-call-result-type
-                                        frontend callee (= kind TSK-NEW-EXPRESSION))))))))))))))))))
+                                        frontend callee (= kind TSK-NEW-EXPRESSION)))))))))))))))))))
               (= kind TSK-PROPERTY-ACCESS)
                 (if (fng-number-max-safe? context node)
                     FNG-NUMBER
@@ -1867,6 +1871,25 @@
                                  (n-box! (fng-expression context (ts-child ast node 1))))
                   (t-flt))
         (fng-const 0))))
+
+(defn fng-parse-float? [(context FngContext) (node i64)] (-> bool)
+  (let [frontend (load (field context frontend)) ast (field frontend ast)
+        callee (ts-child ast node 0)]
+    (or (= (fe-resolution-symbol frontend callee) FE-INTRINSIC-PARSEFLOAT)
+        (and (= (ts-kind ast callee) TSK-PROPERTY-ACCESS)
+             (and (= (fe-resolution-symbol frontend (ts-child ast callee 0)) FE-INTRINSIC-NUMBER)
+                  (str-eq (ts-text ast (ts-child ast callee 1)) "parseFloat"))))))
+
+(defn fng-parse-float [(context FngContext) (node i64)] (-> i64)
+  (let [frontend (load (field context frontend)) ast (field frontend ast)
+        first (if (> (ts-child-count ast node) 1)
+                  (n-box! (fng-expression context (ts-child ast node 1)))
+                  (n-box! (fng-undefined)))
+        (mut i) 2]
+    (loop (if (>= (load i) (ts-child-count ast node)) (break)
+            (do (fng-expression context (ts-child ast node (load i)))
+                (store! i (+ (load i) 1)))))
+    (n-unbox! (fng-jsl-call1 context "ParseFloatValue" first) (t-flt))))
 
 (defn fng-string-from-char-code? [(context FngContext) (node i64)] (-> bool)
   (let [frontend (load (field context frontend))
@@ -3642,6 +3665,8 @@
                 (fng-math-call context node)
             (if (fng-number-static? context node)
                 (fng-number-static context node)
+            (if (fng-parse-float? context node)
+                (fng-parse-float context node)
             (if (fng-number-convert? context node)
                 (fng-number-convert context node)
             (if (fng-number-to-string? context node)
@@ -3658,7 +3683,7 @@
                         (fng-string-call context node)
                         (if (fng-array-builtin? context node)
                             (fng-array-call context node)
-                            (fng-call context node)))))))))))
+                            (fng-call context node))))))))))))
           (= kind TSK-NEW-EXPRESSION)
             (if (fng-error-constructor? context node) (fng-error-constructor context node) (fng-call context node))
           (= kind TSK-OBJECT-LITERAL)

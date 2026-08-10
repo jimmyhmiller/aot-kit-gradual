@@ -621,6 +621,52 @@ AotJsValue aot_js_string(uintptr_t a, int64_t b,
     }
     return (AotJsValue)(uintptr_t)result;
   }
+  if (operation == AOT_JS_STRING_PARSE_FLOAT) {
+    size_t start = 0;
+    while (start < left->length && (left->units[start] == ' ' ||
+           (left->units[start] >= 9 && left->units[start] <= 13))) ++start;
+    size_t at = start;
+    int negative = 0;
+    if (at < left->length && (left->units[at] == '+' || left->units[at] == '-')) {
+      negative = left->units[at] == '-'; ++at;
+    }
+    static const char infinity[] = "Infinity";
+    int is_infinity = at + 8 <= left->length;
+    for (size_t i = 0; is_infinity && i < 8; ++i)
+      if (left->units[at + i] != (uint16_t)infinity[i]) is_infinity = 0;
+    if (is_infinity) return js_builtin_bits(negative ? -INFINITY : INFINITY);
+
+    size_t int_digits = 0, frac_digits = 0;
+    while (at < left->length && left->units[at] >= '0' && left->units[at] <= '9') {
+      ++at; ++int_digits;
+    }
+    if (at < left->length && left->units[at] == '.') {
+      ++at;
+      while (at < left->length && left->units[at] >= '0' && left->units[at] <= '9') {
+        ++at; ++frac_digits;
+      }
+    }
+    if (!int_digits && !frac_digits) return AOT_JS_NAN;
+    size_t mantissa_end = at;
+    if (at < left->length && (left->units[at] == 'e' || left->units[at] == 'E')) {
+      size_t exponent = at++;
+      if (at < left->length && (left->units[at] == '+' || left->units[at] == '-')) ++at;
+      size_t exponent_digits = at;
+      while (at < left->length && left->units[at] >= '0' && left->units[at] <= '9') ++at;
+      if (at == exponent_digits) at = exponent;
+    } else {
+      at = mantissa_end;
+    }
+    size_t length = at - start;
+    char *text = malloc(length + 1);
+    if (!text) return AOT_JS_NAN;
+    for (size_t i = 0; i < length; ++i) text[i] = (char)left->units[start + i];
+    text[length] = 0;
+    char *end = NULL;
+    double result = strtod(text, &end);
+    free(text);
+    return end ? js_builtin_bits(result) : AOT_JS_NAN;
+  }
   if (operation == AOT_JS_STRING_PARSE_INT) {
     int64_t radix = b == 0 ? 10 : b, sign = 1, parsed = 0;
     size_t at = 0, digits = 0;

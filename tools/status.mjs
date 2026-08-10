@@ -104,6 +104,8 @@ const OTHER = [
   ["`Array.from(iterable)`", "ArrayFrom"],
   ["`Infinity`", "Infinity"],
   ["`Number.MAX_SAFE_INTEGER`", "MaxSafeInteger"],
+  ["`parseFloat(x)`", "ParseFloatValue"],
+  ["`Number.parseFloat(x)`", "ParseFloatValue"],
 ];
 
 // Not supported by the frontend at all: the call or the syntax does not compile. Grouped by what
@@ -118,7 +120,7 @@ const UNSUPPORTED = {
   ],
   "Needs a frontend intrinsic, like the one `Number` just got": [
     "`Object.keys`/`values`/`entries`", "`Object.assign`", "`Object.freeze`",
-    "`JSON.parse`/`stringify`", "`Number.parseFloat`", "`parseFloat`", "`String.prototype.normalize`",
+    "`JSON.parse`/`stringify`", "`String.prototype.normalize`",
     "`String.prototype.localeCompare`", "`String.raw`",
   ],
   "Needs new syntax in the frontend": [

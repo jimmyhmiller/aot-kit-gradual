@@ -1028,7 +1028,8 @@
                     (ev-to-string n) OP-TOINTEGER
                     (ev-to-integer n) OP-TONUMBER
                     (ev-to-number n) OP-PARSEINT
-                    (ev-parse-int n) OP-ISNAN
+                    (ev-parse-int n) OP-PARSEFLOAT
+                    (ev-parse-float n) OP-ISNAN
                     (ev-is-nan n) OP-STRINGSPLIT
                     (ev-effect-data n) OP-STRINGFROMCODEUNIT
                     (ev-string-from-code-unit n) OP-NUMBERTOSTRING
@@ -1675,6 +1676,33 @@
         (match (jss-parse-int string (rt-payload radix))
           (Some [value] (RInt value))
           (None [] (RFlt JSV-NAN))))))
+
+(defn ev-decimal-result [(string i64) (from i64) (to i64)] (-> RtVal)
+  (RFlt (f64-bits (ev-strtod-range string from to))))
+
+;; parseFloat consumes the longest valid decimal prefix after leading whitespace. Trying suffix
+;; endpoints from longest to shortest reuses the exact StringNumericLiteral validator and keeps
+;; this oracle intentionally simple; native code uses the equivalent single-pass scanner.
+(defn ev-parse-float [(n i64)] (-> RtVal)
+  (let [string (ev-to-string-value (ev-data (n-in n 1)) n)
+        len (if (ev-failed?) 0 (jss-length string))
+        (mut lo) 0]
+    (loop (if (or (>= (load lo) len)
+                  (not (jss-ascii-space? (jss-code-unit string (load lo))))) (break)
+            (store! lo (+ (load lo) 1))))
+    (let [start (load lo)
+          sign-len (if (and (< start len)
+                            (let [u (jss-code-unit string start)] (or (= u 43) (= u 45)))) 1 0)
+          inf-end (+ (+ start sign-len) 8)]
+      (if (and (<= inf-end len)
+               (ev-token-is? string (+ start sign-len) inf-end "Infinity"))
+          (if (and (= sign-len 1) (= (jss-code-unit string start) 45))
+              (RFlt EV-NEG-INF-BITS) (RFlt EV-INF-BITS))
+          (let [(mut hi) len (mut found) false]
+            (loop (if (or (<= (load hi) start) (load found)) (break)
+                    (do (if (ev-str-decimal? string start (load hi)) (store! found true) 0)
+                        (if (not (load found)) (store! hi (- (load hi) 1)) 0))))
+            (if (load found) (ev-decimal-result string start (load hi)) (RFlt JSV-NAN)))))))
 
 ; ---------------------------------------------------------------------------
 ; ToNumber and ToIntegerOrInfinity

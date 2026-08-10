@@ -121,6 +121,8 @@ spelling of the same call. **These are not a backlog.**
 | `Array.from(iterable)` | **done** | ArrayFrom |
 | `Infinity` | **done** | Infinity |
 | `Number.MAX_SAFE_INTEGER` | **done** | MaxSafeInteger |
+| `parseFloat(x)` | **done** | ParseFloatValue |
+| `Number.parseFloat(x)` | **done** | ParseFloatValue |
 
 ## Language surface that compiles
 
@@ -152,8 +154,6 @@ string literals and concatenation; `throw`; type aliases, interfaces and union a
 - `Object.assign`
 - `Object.freeze`
 - `JSON.parse`/`stringify`
-- `Number.parseFloat`
-- `parseFloat`
 - `String.prototype.normalize`
 - `String.prototype.localeCompare`
 - `String.raw`
