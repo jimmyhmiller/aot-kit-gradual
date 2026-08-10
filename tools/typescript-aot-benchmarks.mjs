@@ -19,6 +19,7 @@ const allCases = [
   { name: "string-loop", input: 500_000, repeats: 1, warmupInput: 5_000 },
   { name: "closure-loop", input: 1, repeats: 200_000, warmupInput: 1, warmupRepeats: 1_000, optimize: false },
   { name: "object-literals", input: 1, repeats: 2_000, warmupInput: 1, warmupRepeats: 100 },
+  { name: "dynamic-object-literals", input: 1, repeats: 2_000, warmupInput: 1, warmupRepeats: 100 },
   { name: "recursive-objects", input: 16, repeats: 1, warmupInput: 8 },
   { name: "array-callbacks", input: 1, repeats: 200, warmupInput: 1, warmupRepeats: 20 },
   { name: "json-roundtrip", input: 1, repeats: 50, warmupInput: 1, warmupRepeats: 5, optimize: false },

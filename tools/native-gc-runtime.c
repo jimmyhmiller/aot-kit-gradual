@@ -94,6 +94,8 @@ static size_t js_arrays_len, js_arrays_cap;
 static uint32_t js_array_cache[JS_OBJECT_CACHE_SIZE];
 static JsStringRec **js_strings;
 static size_t js_strings_len, js_strings_cap;
+#define JS_STRING_CACHE_SIZE 65536u
+static uint32_t js_string_cache[JS_STRING_CACHE_SIZE];
 static JsStringRec *js_string_lookup(uintptr_t raw);
 static void js_throw_frozen_mutation(void);
 AotJsValue aot_js_string(uintptr_t a, int64_t b, AotJsValue value, uint64_t operation);
@@ -263,6 +265,16 @@ static int js_array_reserve(JsArrayRec *array, size_t needed) {
 static JsStringRec *js_string_lookup(uintptr_t raw) {
   if (aot_js_tag((AotJsValue)raw) == AOT_JS_STRING)
     raw = aot_js_payload((AotJsValue)raw);
+  size_t slot = (size_t)((raw >> 3) & (JS_STRING_CACHE_SIZE - 1));
+  for (size_t probe = 0; probe < JS_STRING_CACHE_SIZE; ++probe) {
+    uint32_t cached = js_string_cache[slot];
+    if (!cached) return NULL;
+    if (cached <= js_strings_len && (uintptr_t)js_strings[cached - 1] == raw)
+      return js_strings[cached - 1];
+    slot = (slot + 1) & (JS_STRING_CACHE_SIZE - 1);
+  }
+  // Once the fixed cache is saturated, later strings remain valid registry members even though
+  // they have no cache slot. This cold fallback preserves correctness for unusually large heaps.
   for (size_t i = 0; i < js_strings_len; ++i)
     if ((uintptr_t)js_strings[i] == raw) return js_strings[i];
   return NULL;
@@ -276,7 +288,16 @@ static JsStringRec *js_string_new(size_t length) {
   string->units = length ? calloc(length, sizeof(*string->units)) : NULL;
   if (length && !string->units) { free(string); return NULL; }
   string->length = length;
-  js_strings[js_strings_len++] = string;
+  size_t index = js_strings_len++;
+  js_strings[index] = string;
+  size_t slot = (size_t)(((uintptr_t)string >> 3) & (JS_STRING_CACHE_SIZE - 1));
+  for (size_t probe = 0; probe < JS_STRING_CACHE_SIZE; ++probe) {
+    if (!js_string_cache[slot]) {
+      js_string_cache[slot] = (uint32_t)(index + 1);
+      break;
+    }
+    slot = (slot + 1) & (JS_STRING_CACHE_SIZE - 1);
+  }
   return string;
 }
 
@@ -1845,6 +1866,7 @@ int aot_gc_configure(size_t bytes, int stress) {
   js_property_cache_complete = 1;
   memset(js_array_cache, 0, sizeof(js_array_cache));
   js_arrays_len = 0;
+  memset(js_string_cache, 0, sizeof(js_string_cache));
   js_strings_len = 0;
   return spaces[0] && spaces[1] && old_space;
 }
