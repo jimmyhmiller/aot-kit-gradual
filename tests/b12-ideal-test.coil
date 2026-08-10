@@ -4,6 +4,7 @@
 (import "shape" :use *)
 (import "ty" :use *)
 (import "eval" :use *)
+(import "jsstring" :use *)
 (import "verify" :use *)
 (import "coil.assert" :use *)
 
@@ -90,6 +91,66 @@
          (ev-bind-args! 0)
          (assert (= (ev-run-nobind 10000) EV-OK))
          (assert (= (rt-tag (ev-result)) RT-UNDEF)))
+
+(defn build-property-key-array-result [(operation i64)] (-> i64)
+  (graph-reset! 11203)
+  (shape-reset!)
+  (let [shape (shape-transition SHAPE-ROOT "keep" (t-int))
+        alias (shape-field-alias shape 0)
+        allocation (n-new-obj1! (g-start) shape (am alias))
+        array (n-array-mark! (n-obj-ptr allocation))
+        property-memory (am JS-PROPERTY-ALIAS)
+        zero (n-string-const! (jss-from-utf8! "0"))
+        stored (n-prop-store-key-at! (g-start) property-memory array zero (n-box! (ac 17)))
+        result-memory
+          (if (= operation 3)
+              (n-prop-delete-key-at! (g-start) stored array zero)
+              stored)
+        value
+          (case operation 0
+                (n-prop-load-key-at! (g-start) result-memory array zero) 1
+                (n-prop-load-key-at! (g-start)
+                                     result-memory
+                                     array
+                                     (n-string-const! (jss-from-utf8! "length")))
+                  2
+                (n-prop-has-key-at! (g-start) result-memory array zero) 3
+                (n-prop-has-key-at! (g-start) result-memory array zero)
+                  (n-prop-load-key-at! (g-start) result-memory array zero))
+        memory (n-memmerge2! (n-obj-mem allocation 0) result-memory)
+        ret (n-new3 OP-RETURN 0 (g-start) value memory)]
+    (n-add-def! (g-stop) ret)
+    (g-analyze!)
+    value))
+
+(deftest canonical_property_keys_observe_array_payload
+         (build-property-key-array-result 0)
+         (assert (= (g-verify) 0))
+         (ev-reset!)
+         (ev-bind-args! 0)
+         (assert (= (ev-run-nobind 10000) EV-OK))
+         (assert (rt-eq? (ev-result) (RInt 17)))
+
+         (build-property-key-array-result 1)
+         (assert (= (g-verify) 0))
+         (ev-reset!)
+         (ev-bind-args! 0)
+         (assert (= (ev-run-nobind 10000) EV-OK))
+         (assert (rt-eq? (ev-result) (RInt 1)))
+
+         (build-property-key-array-result 2)
+         (assert (= (g-verify) 0))
+         (ev-reset!)
+         (ev-bind-args! 0)
+         (assert (= (ev-run-nobind 10000) EV-OK))
+         (assert (rt-eq? (ev-result) (RBool true)))
+
+         (build-property-key-array-result 3)
+         (assert (= (g-verify) 0))
+         (ev-reset!)
+         (ev-bind-args! 0)
+         (assert (= (ev-run-nobind 10000) EV-OK))
+         (assert (rt-eq? (ev-result) (RBool false))))
 
 (deftest array_copy_preserves_source_holes
          (graph-reset! 11202)
