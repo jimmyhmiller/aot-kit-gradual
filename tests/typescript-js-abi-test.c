@@ -135,9 +135,9 @@ int main(int argc, char **argv) {
           aot_ts_node_literal_kind(operator_parse, template_tail) == AOT_TS_LITERAL_STRING,
     "interpolated template cooked literal categories");
   AotTsNode arrow = find_kind_with_role(operator_parse, "ArrowFunction", AOT_TS_ROLE_BODY);
-  require(arrow >= 0 && aot_ts_node_kind(operator_parse, arrow) == 219 &&
+  require(arrow >= 0 && aot_ts_node_kind(operator_parse, arrow) == 220 &&
           aot_ts_node_role(operator_parse, arrow, AOT_TS_ROLE_PARAMETER, 0) >= 0,
-    "arrow function shares stable function-expression ABI");
+    "arrow function has a distinct stable kind and parameter ABI");
   AotTsNode boolean = find_kind(operator_parse, "TrueKeyword", 0);
   AotTsNode null_value = find_kind(operator_parse, "NullKeyword", 0);
   require(boolean >= 0 && aot_ts_node_literal_kind(operator_parse, boolean) == AOT_TS_LITERAL_BOOLEAN, "boolean literal category");

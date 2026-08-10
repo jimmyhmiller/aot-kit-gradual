@@ -873,7 +873,8 @@
     (if (< index 0)
         false
         (let [fn (al-get [FeFunction] (load (field frontend functions)) index)]
-          (!= (load (field fn receiver-type-node)) -1)))))
+          (and (not (load (field fn arrow)))
+               (!= (load (field fn receiver-type-node)) -1))))))
 
 (defn fng-static-global-expression? [(frontend (ptr NativeFrontend)) (node i64) (fuel i64)] (-> bool)
   (if (<= fuel 0)
@@ -938,7 +939,7 @@
 (defn fng-runtime-capture? [(frontend (ptr NativeFrontend)) (capture FeCapture)] (-> bool)
   (not (fng-static-global-symbol? frontend (load (field capture symbol)))))
 
-(defn fng-capture-count [(frontend (ptr NativeFrontend)) (function-id i64)] (-> i64)
+(defn fng-symbol-capture-count [(frontend (ptr NativeFrontend)) (function-id i64)] (-> i64)
   (let [(mut index) 0
         (mut count) 0]
     (loop (if (>= (load index) (al-len [FeCapture] (load (field frontend captures))))
@@ -950,6 +951,14 @@
                     0)
                 (store! index (+ (load index) 1)))))
     (load count)))
+
+(defn fng-lexical-this? [(frontend (ptr NativeFrontend)) (function-id i64)] (-> bool)
+  (load (field (index (load (field (field frontend functions) data)) function-id)
+               lexical-this)))
+
+(defn fng-capture-count [(frontend (ptr NativeFrontend)) (function-id i64)] (-> i64)
+  (+ (fng-symbol-capture-count frontend function-id)
+     (if (fng-lexical-this? frontend function-id) 1 0)))
 
 (defn fng-capture-symbol [(frontend (ptr NativeFrontend)) (function-id i64) (ordinal i64)] (-> i64)
   (let [(mut rank) 0
@@ -1346,7 +1355,7 @@
         target (al-get [i64] (load (load (field context functions))) function-id)
         (mut captures) (al-new [i64] (malloc-allocator))
         (mut index) 0]
-    (loop (if (>= (load index) (fng-capture-count frontend function-id))
+    (loop (if (>= (load index) (fng-symbol-capture-count frontend function-id))
               (break)
               (let [symbol (fng-capture-symbol frontend function-id (load index))]
                 (al-push! [i64]
@@ -1355,6 +1364,9 @@
                               (fng-symbol-node context symbol)
                               (fng-symbol-storage context symbol)))
                 (store! index (+ (load index) 1)))))
+    (if (fng-lexical-this? frontend function-id)
+        (al-push! [i64] (mut captures) (load (field context receiver)))
+        0)
     (let [closure
             (if (= (al-len [i64] (load captures)) 0)
                 target
@@ -2637,7 +2649,7 @@
               value (ts-child ast node 2)]
           (if (and (= (fe-resolution-symbol frontend base) receiver-symbol)
                    (str-eq (ts-text ast (ts-child ast left 1)) name))
-              (if (= (ts-kind ast value) TSK-FUNCTION-EXPRESSION)
+              (if (fe-function-expression-kind? (ts-kind ast value))
                   (let [function-index (fe-function-for-node frontend value)]
                     (if (>= function-index 0)
                         (load (field (index (load (field (field frontend functions) data)) function-index) id))
@@ -2665,7 +2677,7 @@
     (if (and (= (ts-kind ast node) TSK-BINARY)
              (str-eq (ts-text ast (ts-child ast node 1)) "=")
              (= (ts-kind ast (ts-child ast node 0)) TSK-PROPERTY-ACCESS)
-             (= (ts-kind ast (ts-child ast node 2)) TSK-FUNCTION-EXPRESSION))
+             (fe-function-expression-kind? (ts-kind ast (ts-child ast node 2))))
         (let [function-index (fe-function-for-node frontend (ts-child ast node 2))]
           (if (and (>= function-index 0)
                    (= (load (field (index (load (field (field frontend functions) data))
@@ -2746,7 +2758,7 @@
                           count (ts-child-count ast declaration)
                           initializer (if (> count 1) (ts-child ast declaration (- count 1)) -1)]
                       (if (and (>= initializer 0)
-                               (= (ts-kind ast initializer) TSK-FUNCTION-EXPRESSION))
+                               (fe-function-expression-kind? (ts-kind ast initializer)))
                           (let [function-index (fe-function-for-node frontend initializer)]
                             (if (>= function-index 0)
                                 (store! answer
@@ -3916,7 +3928,7 @@
                 (fng-dynamic-object context node)
                 (fng-object context node expected))
           (= kind TSK-ARRAY-LITERAL) (fng-array-literal context node)
-          (= kind TSK-FUNCTION-EXPRESSION) (fng-closure-expression context node)
+          (fe-function-expression-kind? kind) (fng-closure-expression context node)
           (= kind TSK-PROPERTY-ACCESS)
             (if (!= (ts-role ast node TS-ROLE-OPERATOR 0) -1)
                 (fng-optional-field-load context node)
@@ -5495,8 +5507,9 @@
         (mut index) 0]
     (if top-level
         0
-        (let [capture-count (fng-capture-count frontend fun-id)]
-          (loop (if (>= (load index) capture-count)
+        (let [symbol-capture-count (fng-symbol-capture-count frontend fun-id)
+              capture-count (fng-capture-count frontend fun-id)]
+          (loop (if (>= (load index) symbol-capture-count)
                     (break)
                     (let [symbol (fng-capture-symbol frontend fun-id (load index))]
                       (al-push! [i64] (mut saved-capture-symbols) symbol)
@@ -5505,7 +5518,14 @@
                                 (al-get [i64] (load values) symbol))
                       (al-set! [i64] (mut values) symbol (n-parm! fun (load index)))
                       (store! index (+ (load index) 1)))))
-          (let [receiver-count (if (= (load (field fn receiver-type-node)) -1) 0 1)]
+          (if (fng-lexical-this? frontend fun-id)
+              (store! receiver (n-parm! fun symbol-capture-count))
+              0)
+          (let [receiver-count
+                  (if (and (not (load (field fn arrow)))
+                           (!= (load (field fn receiver-type-node)) -1))
+                      1
+                      0)]
             (if (= receiver-count 1) (store! receiver (n-parm! fun capture-count)) 0)
             (store! index 0)
             (loop (if (>= (load index) (load (field fn parameter-count)))

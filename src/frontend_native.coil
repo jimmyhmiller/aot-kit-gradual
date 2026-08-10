@@ -43,6 +43,9 @@
 (const FE-INTRINSIC-INFINITY i64 -20)
 (const FE-INTRINSIC-PARSEFLOAT i64 -21)
 
+(defn fe-function-expression-kind? [(kind i64)] (-> bool)
+  (or (= kind TSK-FUNCTION-EXPRESSION) (= kind TSK-ARROW-FUNCTION)))
+
 (defn fe-intrinsic-name [(name (slice u8))] (-> i64)
   (cond (str-eq name "String") FE-INTRINSIC-STRING
         (str-eq name "parseInt") FE-INTRINSIC-PARSEINT
@@ -66,6 +69,8 @@
    (body-node i64)
    (result-node i64)
    (receiver-type-node i64)
+   (arrow bool)
+   (lexical-this bool)
    (parameter-start i64)
    (parameter-count i64)])
 
@@ -110,6 +115,8 @@
                         (body i64)
                         (result i64)
                         (receiver-type i64)
+                        (arrow bool)
+                        (lexical-this bool)
                         (parameter-start i64)
                         (parameter-count i64)] (-> FeFunction)
   (let [(mut fn) (zeroed FeFunction)]
@@ -120,6 +127,8 @@
     (store! (field fn body-node) body)
     (store! (field fn result-node) result)
     (store! (field fn receiver-type-node) receiver-type)
+    (store! (field fn arrow) arrow)
+    (store! (field fn lexical-this) lexical-this)
     (store! (field fn parameter-start) parameter-start)
     (store! (field fn parameter-count) parameter-count)
     (load fn)))
@@ -343,7 +352,7 @@
                                 (fe-validate-node! (mut frontend) child (mut targets))))
                           (store! index (+ (load index) 1)))))
               0)
-          (= kind TSK-FUNCTION-EXPRESSION)
+          (fe-function-expression-kind? kind)
             (let [(mut nested-targets) (al-new [FeTarget] (malloc-allocator))
                   body (ts-role ast node TS-ROLE-BODY 0)]
               ;; Abrupt-control targets never cross a function boundary.
@@ -628,7 +637,7 @@
                             (if (= right -1) -1
                               (if (= (ts-kind ast right) TSK-IDENTIFIER)
                                   (fe-find-function-name frontend right)
-                                  (if (= (ts-kind ast right) TSK-FUNCTION-EXPRESSION)
+                                  (if (fe-function-expression-kind? (ts-kind ast right))
                                       (let [function-index (fe-function-for-node frontend right)]
                                         (if (>= function-index 0)
                                             (load (field (index (load (field (field frontend functions) data))
@@ -657,7 +666,7 @@
                     0))
               0))
         0)
-    (if (or (= kind TSK-FUNCTION-DECLARATION) (= kind TSK-FUNCTION-EXPRESSION))
+    (if (or (= kind TSK-FUNCTION-DECLARATION) (fe-function-expression-kind? kind))
         0
         (let [(mut index) 0]
           (loop (if (>= (load index) (ts-child-count ast node))
@@ -684,7 +693,7 @@
               0))
         0)
     (if (or (= (ts-kind ast node) TSK-FUNCTION-DECLARATION)
-            (= (ts-kind ast node) TSK-FUNCTION-EXPRESSION))
+            (fe-function-expression-kind? (ts-kind ast node)))
         0
         (let [(mut index) 0]
           (loop (if (>= (load index) (ts-child-count ast node))
@@ -787,6 +796,7 @@
   (let [kind (ts-kind ast node)]
     (if (= kind TSK-THIS)
         true
+        ; Arrows inherit `this`, so they remain transparent to the enclosing receiver scan.
         (if (or (= kind TSK-FUNCTION-DECLARATION) (= kind TSK-FUNCTION-EXPRESSION))
             false
             (let [(mut index) 0
@@ -834,10 +844,22 @@
                             (store! parameter-count (+ (load parameter-count) 1)))))
                     0)
                 (store! index (+ (load index) 1)))))
-    (if (and (= (load receiver-type) -1)
-             (and (!= (load body) -1) (fe-uses-implicit-this? ast (load body))))
-        (store! receiver-type FE-RECEIVER-DYNAMIC)
-        0)
+    (let [arrow (= (ts-kind ast node) TSK-ARROW-FUNCTION)
+          lexical-this (and arrow
+                            (and (!= (load body) -1)
+                                 (fe-uses-implicit-this? ast (load body))))]
+      ; The lexical receiver keeps its enclosing static type even though it is transported as a
+      ; closure capture rather than as this function's receiver ABI slot.
+      (if (and lexical-this (>= parent 0))
+          (store! receiver-type
+                  (load (field (index (load (field (field frontend functions) data)) parent)
+                               receiver-type-node)))
+          0)
+      (if (and (= (load receiver-type) -1)
+               (and (not arrow)
+                    (and (!= (load body) -1) (fe-uses-implicit-this? ast (load body)))))
+          (store! receiver-type FE-RECEIVER-DYNAMIC)
+          0)
     (al-push! [FeFunction]
               (mut (field frontend functions))
               (fe-function-make id
@@ -847,8 +869,10 @@
                                 (load body)
                                 (load result)
                                 (load receiver-type)
+                                arrow
+                                lexical-this
                                 (load parameter-start)
-                                (load parameter-count)))
+                                (load parameter-count))))
     0))
 
 ;; Function identities are allocated in syntax preorder before any parameter or local identity.
@@ -857,7 +881,8 @@
   (let [ast (field frontend ast)
         kind (ts-kind ast node)
         (mut child-parent) parent]
-    (if (or (= kind TSK-FUNCTION-DECLARATION) (= kind TSK-FUNCTION-EXPRESSION))
+    (if (or (= kind TSK-FUNCTION-DECLARATION)
+            (or (= kind TSK-FUNCTION-EXPRESSION) (= kind TSK-ARROW-FUNCTION)))
         (let [id (al-len [FeFunction] (load (field frontend functions)))]
           (fe-find-function-parts! (mut frontend) node id parent)
           (store! child-parent id))
@@ -883,7 +908,8 @@
                     (mut (field frontend symbols))
                     (fe-symbol-make sid node name owner FE-ROLE-LOCAL maybe-type)))
         0)
-    (if (= (ts-kind ast node) TSK-FUNCTION-EXPRESSION)
+    (if (or (= (ts-kind ast node) TSK-FUNCTION-EXPRESSION)
+            (= (ts-kind ast node) TSK-ARROW-FUNCTION))
         0
         (let [(mut index) 0]
           (loop (if (>= (load index) (ts-child-count ast node))
@@ -1040,7 +1066,7 @@
         kind (ts-kind ast node)]
     (cond (= (load (field frontend status)) FE-UNBOUND) 0
           (= kind TSK-IDENTIFIER) (do (fe-resolve-name! (mut frontend) bindings node owner) 0)
-          (= kind TSK-FUNCTION-EXPRESSION)
+          (fe-function-expression-kind? kind)
             (let [function-index (fe-function-for-node frontend node)
                   fn (al-get [FeFunction] (load (field frontend functions)) function-index)
                   saved (al-len [FeBinding] (load bindings))
@@ -1364,7 +1390,7 @@
                                 (store! method-index (+ (load method-index) 1)))))))
                 :else 0))
         0)
-    (if (or (= kind TSK-FUNCTION-DECLARATION) (= kind TSK-FUNCTION-EXPRESSION))
+    (if (or (= kind TSK-FUNCTION-DECLARATION) (fe-function-expression-kind? kind))
         0
         (let [(mut index) 0]
           (loop (if (>= (load index) (ts-child-count ast node))

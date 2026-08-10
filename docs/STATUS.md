@@ -133,7 +133,7 @@ spelling of the same call. **These are not a backlog.**
 
 Numbers and all 25 arithmetic, bitwise, comparison and logical operators including their
 compound-assignment forms; `if`, `for`, `while`, `do`, `switch`, labels, `break`, `continue`,
-ternaries, short-circuit operators and optional calls with known targets; function declarations, function expressions and block/expression-bodied arrows, default parameters, closures with
+ternaries, short-circuit operators and optional calls with known targets; function declarations, function expressions and block/expression-bodied arrows with lexical `this`, default parameters, closures with
 mutable capture, recursion, `this`, `new` and constructors; object literals, structural types,
 prototypes, dynamic and missing properties; array literals with holes, indexing and growth;
 string and template literals with interpolation and cooked escapes, concatenation; `throw`; type aliases, interfaces and union annotations.
@@ -174,7 +174,6 @@ string and template literals with interpolation and cooked escapes, concatenatio
 - computed property names
 - optional calls through unknown present callables (needs call descriptors/adapters)
 - `try`/`catch`/`finally`
-- lexical `this` in arrow functions
 - `instanceof` / `in` / `delete`
 
 ### Needs a runtime this compiler does not have
