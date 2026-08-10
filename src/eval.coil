@@ -1044,7 +1044,9 @@
                     (ev-prop-load-key n) OP-PROPSTOREKEY
                     (ev-prop-store-key n) OP-PROPHASKEY
                     (ev-prop-has-key n) OP-PROPDELETEKEY
-                    (ev-prop-delete-key n) OP-ARRAYMARK
+                    (ev-prop-delete-key n) OP-OWNKEYCOUNT
+                    (ev-own-key-count n) OP-OWNKEYAT
+                    (ev-own-key-at n) OP-ARRAYMARK
                     (ev-array-mark n) OP-ARRAYTEST
                     (ev-array-test n) OP-ARRAYUNBOX
                     (ev-array-unbox n) OP-ARRAYLOAD
@@ -1425,18 +1427,28 @@
           (if (ev-failed?)
               (RUndef)
               (let [ver (rt-need-mem mv n)
-                    object (rt-need-obj ov n)
                     key (ev-need-string kv n)
                     (mut bytes) (al-new [u8] (malloc-allocator))]
                 (if (or (ev-failed?) (= (& (hv-mask ver) (<< 1 JS-PROPERTY-ALIAS)) 0))
                     (do (al-free! [u8] (mut bytes)) (ev-fail! EV-MEM n))
-                    (let [array-index (if (ev-array-object? object) (ev-property-key-index key) -1)
-                          answer
-                            (if (and (ev-array-object? object) (ev-property-key-length? key))
-                                (RInt (ev-array-current-length object))
-                                (if (>= array-index 0)
-                                    (ev-array-current-load object array-index)
-                                    (dyn-decode (jso-load object (jss-utf8! key (mut bytes))))))]
+                    (let [answer
+                            (if (= (rt-tag ov) RT-STR)
+                                (let [string (rt-payload ov) index (ev-property-key-index key)]
+                                  (if (ev-property-key-length? key)
+                                      (RInt (jss-length string))
+                                      (if (and (>= index 0) (< index (jss-length string)))
+                                          (RStr (jss-char-at! string index))
+                                          (RUndef))))
+                                (let [object (rt-need-obj ov n)
+                                      array-index
+                                        (if (ev-array-object? object)
+                                            (ev-property-key-index key) -1)]
+                                  (if (and (ev-array-object? object) (ev-property-key-length? key))
+                                      (RInt (ev-array-current-length object))
+                                      (if (>= array-index 0)
+                                          (ev-array-current-load object array-index)
+                                          (dyn-decode
+                                            (jso-load object (jss-utf8! key (mut bytes))))))))]
                       (al-free! [u8] (mut bytes))
                       (al-set! [bool] (field p hasenv) n true)
                       (al-set! [RtVal] (field p env) n answer)
@@ -1513,7 +1525,68 @@
                       (ev-array-current-delete! object array-index)
                       (do (jso-delete! object (jss-utf8! key (mut bytes))) 0)))
                 (al-free! [u8] (mut bytes))
-                (RMem ver)))))))
+                  (RMem ver)))))))
+
+(defn ev-array-present-count [(object i64)] (-> i64)
+  (let [length (ev-array-current-length object) (mut index) 0 (mut count) 0]
+    (loop (if (>= (load index) length) (break)
+              (do (if (ev-array-current-present? object (load index))
+                      (store! count (+ (load count) 1)) 0)
+                  (store! index (+ (load index) 1)))))
+    (load count)))
+
+(defn ev-own-key-count [(n i64)] (-> RtVal)
+  (let [mv (ev-data (n-in n 1)) ov (ev-data (n-in n 2))]
+    (if (ev-failed?) (RUndef)
+        (let [ver (rt-need-mem mv n)]
+          (if (or (ev-failed?) (= (& (hv-mask ver) (<< 1 JS-PROPERTY-ALIAS)) 0))
+              (ev-fail! EV-MEM n)
+              (match ov
+                (RObj [object]
+                  (RInt (+ (jso-own-key-count object)
+                           (if (ev-array-object? object) (ev-array-present-count object) 0))))
+                (RStr [string] (RInt (jss-length string)))
+                (RInt [value] (RInt 0)) (RFlt [bits] (RInt 0))
+                (RBool [value] (RInt 0)) (RBig [value] (RInt 0))
+                (RSym [value] (RInt 0)) (RFun [value] (RInt 0))
+                (RUndef [] (ev-fail! EV-TYPE n))
+                (RNull [] (ev-fail! EV-TYPE n))
+                (RMem [value] (ev-fail! EV-TYPE n))))))))
+
+(defn ev-own-key-at [(n i64)] (-> RtVal)
+  (let [mv (ev-data (n-in n 1)) ov (ev-data (n-in n 2)) iv (ev-data (n-in n 3))]
+    (if (ev-failed?) (RUndef)
+        (let [ver (rt-need-mem mv n) ordinal (rt-payload iv)]
+          (if (or (ev-failed?) (!= (rt-tag iv) RT-INT))
+              (ev-fail! EV-TYPE n)
+          (if (= (& (hv-mask ver) (<< 1 JS-PROPERTY-ALIAS)) 0)
+              (ev-fail! EV-MEM n)
+              (if (= (rt-tag ov) RT-STR)
+                  (if (and (>= ordinal 0) (< ordinal (jss-length (rt-payload ov))))
+                      (RStr (jss-from-int-radix! ordinal 10))
+                      (RUndef))
+              (if (= (rt-tag ov) RT-OBJ)
+              (let [object (rt-payload ov)
+                    array-count (if (ev-array-object? object)
+                                    (ev-array-present-count object) 0)]
+                (if (< ordinal array-count)
+                    (let [length (ev-array-current-length object)
+                          (mut index) 0 (mut seen) 0 (mut answer) -1]
+                      (loop (if (or (>= (load index) length) (>= (load answer) 0)) (break)
+                                (do (if (ev-array-current-present? object (load index))
+                                        (do (if (= (load seen) ordinal)
+                                                (store! answer (load index)) 0)
+                                            (store! seen (+ (load seen) 1))) 0)
+                                    (store! index (+ (load index) 1)))))
+                      (if (>= (load answer) 0)
+                          (RStr (jss-from-int-radix! (load answer) 10))
+                          (RUndef)))
+                    (let [name (jso-own-key-at object (- ordinal array-count))]
+                      (if (= name SHAPE-NO-NAME) (RUndef)
+                          (RStr (jss-from-utf8! (shape-name-bytes name)))))))
+              (if (or (= (rt-tag ov) RT-NULL) (= (rt-tag ov) RT-UNDEF))
+                  (ev-fail! EV-TYPE n)
+                  (RUndef))))))))))
 
 (defn ev-set-proto [(n i64)] (-> RtVal)
   (let [mv (ev-data (n-in n 1))]

@@ -118,6 +118,9 @@ primitives, analogous to Torque `extern` operations. The frontend does not const
 | `Array.of(...)` | **done** | ArrayOfAppend1 |
 | `Array.isArray(x)` | **done** | IsArray |
 | `Array.from(iterable)` | **done** | ArrayFrom |
+| `Object.keys(x)` | **done** | ObjectKeys |
+| `Object.values(x)` | **done** | ObjectValues |
+| `Object.entries(x)` | **done** | ObjectEntries |
 | `Infinity` | **done** | Infinity |
 | `Number.MAX_SAFE_INTEGER` | **done** | MaxSafeInteger |
 | `parseFloat(x)` | **done** | ParseFloatValue |
@@ -154,7 +157,6 @@ string and template literals with interpolation and cooked escapes, concatenatio
 
 ### Needs a frontend intrinsic, like the one `Number` just got
 
-- `Object.keys`/`values`/`entries`
 - `Object.assign`
 - `Object.freeze`
 - `JSON.parse`/`stringify`

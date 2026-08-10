@@ -237,7 +237,7 @@
 ;; and the index format are all only exercised here.
 (deftest the_library_on_disk_loads_and_every_declaration_lowers
          (lib! 90300)
-         (assert (= (jsl-decl-count) 153))
+         (assert (= (jsl-decl-count) 157))
          ; A builtin has a Fun and a macro does not, and every declaration is one or the other.
          (let [(mut i) 0 (mut funs) 0 (mut macros) 0]
            (loop (if (>= (load i) (jsl-decl-count)) (break)
@@ -248,11 +248,11 @@
                                (store! funs (+ (load funs) 1)) 0))
                        (store! i (+ (load i) 1))
                        0)))
-           (assert (= (+ (load funs) (load macros)) 153))
+           (assert (= (+ (load funs) (load macros)) 157))
            ; 57 since `StringSplit` and `StringSplitWhole` joined, both macros: they allocate and
            ; write, and memory reaches a called function as an OP-ARG rather than a parameter, so a
            ; builtin would fill its own empty entry heap and return an array the caller cannot see.
-           (assert (= (load macros) 109)))
+           (assert (= (load macros) 113)))
          (assert (>= (jsl-find "Clamp") 0))
          (assert (>= (jsl-find "StringIndexOfFrom") 0))
          (assert (>= (jsl-find "StringStartsWith") 0))
@@ -444,6 +444,39 @@
              (ev-bind-args! 0)
              (assert (= (ev-run-nobind 10000) EV-OK))
              (assert (rt-eq? (ev-result) (RInt 42))))))
+
+(deftest own_key_primitives_are_ordered_memory_aware_heap_reads
+         (fresh! 91206)
+         (assert (= (jsl-load!
+                      "(macro firstOwnKey :params [] :ret bool
+                         (let [(object (%NewObject))
+                               (a (%PropStoreKey object \"later\" (%Box 1)))
+                               (b (%PropStoreKey object \"10\" (%Box 2)))
+                               (c (%PropStoreKey object \"2\" (%Box 3)))
+                               (count (%OwnKeyCount object))]
+                           (if (%Eq count 3)
+                               (%StringEq (%OwnKeyAt object 0) \"2\")
+                               false)))")
+                    JSL-OK))
+         (let [ctrl (stack (array i64 1))
+               mem (stack (array i64 1))
+               argv (stack (array i64 1))
+               cp (cast (ptr i64) ctrl)
+               mp (cast (ptr i64) mem)]
+           (store! (index cp 0) (g-start))
+           (store! (index mp 0)
+                   (n-new1 OP-ARG (t-mem-alias JS-PROPERTY-ALIAS (t-undef)) (g-start)))
+           (let [value (jsl-inline! cp mp (g-start) "firstOwnKey"
+                                    (slice-new [i64] (cast (ptr i64) argv) 0))
+                 ret (n-new3 OP-RETURN 0 (load (index cp 0)) value (load (index mp 0)))]
+             (n-add-def! (g-stop) ret)
+             (iterate!)
+             (g-analyze!)
+             (assert (= (g-verify) 0))
+             (ev-reset!)
+             (ev-bind-args! 0)
+             (assert (= (ev-run-nobind 10000) EV-OK))
+             (assert (rt-eq? (ev-result) (RBool true))))))
 
 (deftest a_designed_but_unbuilt_form_is_refused_as_unsupported
          (refuses 90207 "(class JSArray :params [(x dyn)] x)" JSL-ERR-UNSUPPORTED))

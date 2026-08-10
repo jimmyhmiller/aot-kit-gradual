@@ -104,6 +104,9 @@ const OTHER = [
   ["`Array.of(...)`", "ArrayOfAppend1"],
   ["`Array.isArray(x)`", "IsArray"],
   ["`Array.from(iterable)`", "ArrayFrom"],
+  ["`Object.keys(x)`", "ObjectKeys"],
+  ["`Object.values(x)`", "ObjectValues"],
+  ["`Object.entries(x)`", "ObjectEntries"],
   ["`Infinity`", "Infinity"],
   ["`Number.MAX_SAFE_INTEGER`", "MaxSafeInteger"],
   ["`parseFloat(x)`", "ParseFloatValue"],
@@ -126,7 +129,7 @@ const UNSUPPORTED = {
     "`String.prototype.search`", "`String.prototype.replace`", "`RegExp`",
   ],
   "Needs a frontend intrinsic, like the one `Number` just got": [
-    "`Object.keys`/`values`/`entries`", "`Object.assign`", "`Object.freeze`",
+    "`Object.assign`", "`Object.freeze`",
     "`JSON.parse`/`stringify`", "`String.prototype.normalize`",
     "`String.prototype.localeCompare`", "`String.raw`",
   ],
