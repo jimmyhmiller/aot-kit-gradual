@@ -22,6 +22,9 @@ const allCases = [
   { name: "dynamic-object-literals", input: 1, repeats: 2_000, warmupInput: 1, warmupRepeats: 100 },
   { name: "recursive-objects", input: 16, repeats: 1, warmupInput: 8 },
   { name: "array-callbacks", input: 1, repeats: 200, warmupInput: 1, warmupRepeats: 20 },
+  { name: "array-map", input: 1, repeats: 1_000, warmupInput: 1, warmupRepeats: 50 },
+  { name: "array-filter", input: 1, repeats: 1_000, warmupInput: 1, warmupRepeats: 50 },
+  { name: "array-reduce", input: 1, repeats: 1_000, warmupInput: 1, warmupRepeats: 50 },
   { name: "json-roundtrip", input: 1, repeats: 50, warmupInput: 1, warmupRepeats: 5, optimize: false },
 ];
 const requestedCases = process.argv.slice(2).map(arg => {
