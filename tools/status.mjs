@@ -88,6 +88,7 @@ const OTHER = [
   ["`parseInt(s, radix)`", "ParseIntValue"],
   ["`isNaN(x)`", "GlobalIsNaN"],
   ["`String.fromCharCode(c)`", "StringFromCharCode"],
+  ["`String.raw(template, ...substitutions)`", "StringRaw"],
   ["`Number(x)`", "ToNumberValue"],
   ["`Number.isNaN`", "NumberIsNaN"],
   ["`Number.isFinite`", "NumberIsFinite"],
@@ -132,7 +133,7 @@ const UNSUPPORTED = {
   ],
   "Needs a frontend intrinsic, like the one `Number` just got": [
     "`JSON.parse`/`stringify`", "`String.prototype.normalize`",
-    "`String.prototype.localeCompare`", "`String.raw`",
+    "`String.prototype.localeCompare`",
   ],
   "Needs new syntax in the frontend": [
     "tagged template literals", "destructuring", "spread and rest",

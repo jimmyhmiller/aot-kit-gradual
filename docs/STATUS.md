@@ -102,6 +102,7 @@ primitives, analogous to Torque `extern` operations. The frontend does not const
 | `parseInt(s, radix)` | **done** | ParseIntValue |
 | `isNaN(x)` | **done** | GlobalIsNaN |
 | `String.fromCharCode(c)` | **done** | StringFromCharCode |
+| `String.raw(template, ...substitutions)` | **done** | StringRaw |
 | `Number(x)` | **done** | ToNumberValue |
 | `Number.isNaN` | **done** | NumberIsNaN |
 | `Number.isFinite` | **done** | NumberIsFinite |
@@ -162,7 +163,6 @@ string and template literals with interpolation and cooked escapes, concatenatio
 - `JSON.parse`/`stringify`
 - `String.prototype.normalize`
 - `String.prototype.localeCompare`
-- `String.raw`
 
 ### Needs new syntax in the frontend
 
