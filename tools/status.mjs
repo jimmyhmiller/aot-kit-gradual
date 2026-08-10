@@ -131,7 +131,7 @@ const UNSUPPORTED = {
   ],
   "Needs new syntax in the frontend": [
     "tagged template literals", "destructuring", "spread and rest",
-    "`for...of` / `for...in`", "`class`", "getters and setters", "computed property names",
+    "`for...of` / `for...in`", "`class`", "getters and setters",
     "optional calls through unknown present callables (needs call descriptors/adapters)", "`try`/`catch`/`finally`",
     "dynamic-RHS/custom-`Symbol.hasInstance` `instanceof`",
   ],
@@ -233,7 +233,7 @@ out.push("");
 out.push("Numbers and all 25 arithmetic, bitwise, comparison and logical operators including their");
 out.push("compound-assignment forms; `if`, `for`, `while`, `do`, `switch`, labels, `break`, `continue`,");
 out.push("ternaries, short-circuit operators and optional calls with known targets; function declarations, function expressions and block/expression-bodied arrows with lexical `this`, default parameters, closures with");
-out.push("mutable capture, recursion, `this`, `new` and constructors; object literals, structural types,");
+out.push("mutable capture, recursion, `this`, `new` and constructors; object literals with computed property names, structural types,");
 out.push("prototypes, dynamic and missing properties, computed string/number-key get, set, `in`, and `delete`, and ordinary `instanceof` with known constructors; array literals with holes, indexing and growth;");
 out.push("string and template literals with interpolation and cooked escapes, concatenation; `throw`; type aliases, interfaces and union annotations.");
 out.push("");

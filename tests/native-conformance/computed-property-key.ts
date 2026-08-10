@@ -20,7 +20,12 @@ export function main(): number {
   let arrayRemoved = delete array[zero];
   let arrayAbsent = !(zero in array);
 
-  return (staticAfterDynamicStore * 1000000 +
+  let beta = "beta";
+  let made = {["alpha"]: 2, [beta]: 3};
+  let computedNamesWork = made.alpha * 10 + made.beta === 23;
+
+  return ((computedNamesWork ? 100000000 : 0) +
+          staticAfterDynamicStore * 1000000 +
           unicodeStaticRead * 100000 +
           arrayRead * 10000 +
           (present ? 1000 : 0) +
