@@ -568,13 +568,18 @@ then reading its length back is a shape nothing had ever compiled.
   hoisted into a dominating block became required by the verifier and absent from the vector, and
   `ArrayShift` could not be compiled at all (`MSEL-MEMORY-ORDER`). It is rebuilt after placement.
   This is the same mistake, in the same shape, as the `schedule-order` refresh below.
-- **The closed-world function index was the DECLARATION index.** A function index is a bit in
-  `Val.fidxs`, a 64-bit set, and `be-call-return-kind-fuel` skips any function at 63 or above. Macros
-  are 55 of the library's 88 declarations and have no `OP-FUN` at all, yet each consumed a bit.
-  Adding five array entries pushed `StringIndexOfFrom` to index 66; its bit fell outside the mask, so
-  the return kind of a call to it became unknown and boxing that result failed selection with
-  `MSEL-UNSUPPORTED` — reported against **`String.prototype.indexOf`**, which uses none of the new
-  definitions. `jsl-decl-fidx` counts only the builtins, which takes that declaration from 66 to 29.
+- **The closed-world function index was the DECLARATION index, then shared one finite namespace.**
+  `Val.fidxs` is a 63-bit optimization summary for JavaScript-visible function identities. Macros
+  have no `OP-FUN` and therefore stopped consuming indices first, but a growing library could still
+  exhaust the same mask merely by being linked beside user functions. The frontend now assigns
+  JavaScript functions low identities and starts internal JSL builtins in a disjoint namespace
+  above them. JavaScript identity zero is reserved as the runtime's invalid side-table owner, so
+  source function `id` becomes callable identity `id + 1`. A direct high-id builtin keeps exact
+  identity on its `OP-FUN`; its type is the generic callable type rather than a wrapped bit, and
+  inference, selection, parameter representation, and return representation consult that exact
+  node. Only JavaScript values that can participate in
+  finite runtime dispatch consume `Val.fidxs` bits. The `callable-namespace` native case links more
+  than 63 combined functions and exercises a direct high-id JSL call.
 
 A fourth defect found this way was recorded rather than papered over, and has since been fixed: a
 single arithmetic expression of about twenty terms mixing boxed array elements with unboxed lengths

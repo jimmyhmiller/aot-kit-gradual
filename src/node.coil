@@ -907,6 +907,20 @@
     (n-add-dep! callee call)
     (ty-fun-targets (n-ty callee))))
 
+(defn infer-direct-callee-fun [(call i64)] (-> i64)
+  (let [callee (n-in call 1)]
+    (case (n-op callee) OP-FUN callee OP-CLOSURE (n-in callee 0) NO-NODE)))
+
+;; `Val.fidxs` is only a finite optimization summary. Exact direct identity remains available on a
+;; Fun/Closure even when its internal id lives outside that summary's 63 bits.
+(defn infer-call-reaches-fun? [(call i64) (fun i64)] (-> bool)
+  (let [direct (infer-direct-callee-fun call)
+        fidx (n-aux fun)]
+    (if (!= direct NO-NODE)
+        (= direct fun)
+        (and (>= fidx 0)
+             (and (< fidx 63) (!= (& (infer-call-targets call) (<< 1 fidx)) 0))))))
+
 (defn infer-parm-source [(call i64) (fun i64) (idx i64)] (-> i64)
   (let [callee (n-in call 1)]
     (if (= (n-op callee) OP-CLOSURE)
@@ -932,7 +946,7 @@
                 (let [call (load i)]
                   (if (or (n-dead? call) (!= (n-op call) OP-CALL))
                       0
-                      (if (= (& (infer-call-targets call) (<< 1 fidx)) 0)
+                      (if (not (infer-call-reaches-fun? call fun))
                           0
                           (let [src (infer-parm-source call fun idx)]
                             (if (= src NO-NODE)
@@ -965,13 +979,17 @@
 
 (defn infer-call-compute [(call i64)] (-> i64)
   (let [targets (infer-call-targets call)
+        direct (infer-direct-callee-fun call)
         (mut fidx) 0
         (mut acc) (t-top)
         (mut seen) false]
+    (if (!= direct NO-NODE)
+        (infer-meet-fun-returns! direct call (mut acc) (mut seen))
+        0)
     (loop (if (>= (load fidx) 64)
               (break)
               (do
-                (if (= (& targets (<< 1 (load fidx))) 0)
+                (if (or (!= direct NO-NODE) (= (& targets (<< 1 (load fidx))) 0))
                     0
                     (let [fun (n-find-fun-index (load fidx))]
                       (if (= fun NO-NODE) 0 (infer-meet-fun-returns! fun call (mut acc) (mut seen)))))
@@ -1034,7 +1052,10 @@
         (unbox-compute n) OP-TYPETEST
         (typetest-compute n) OP-CALLEND
         (if (ty-high? (n-in-ty n 0)) (t-top) (n-in-ty n 0)) OP-FUN
-        (t-fun-con (n-aux n)) OP-PARM
+        ;; Only JavaScript-visible function identities fit in Val.fidxs. Internal JSL functions
+        ;; may use the disjoint high namespace; their exact identity remains on this OP-FUN node.
+        ;; Give those a generic callable type instead of wrapping the shift and aliasing a low id.
+        (if (< (n-aux n) 63) (t-fun-con (n-aux n)) (t-fun)) OP-PARM
         (if (load (field (graph) infer)) (infer-parm-compute n) (t-dyn)) OP-CALL
         (if (load (field (graph) infer)) (infer-call-compute n) (t-dyn)) OP-FUNSTART
         (t-ctrl) OP-CLOSURE
@@ -3779,7 +3800,11 @@
                 (let [call (load i)]
                   (if (or (n-dead? call) (!= (n-op call) OP-CALL))
                       0
-                      (store! edges (+ (load edges) (popcount64 (ty-fun-targets (n-in-ty call 1)))))))
+                      (store! edges
+                              (+ (load edges)
+                                 (if (!= (infer-direct-callee-fun call) NO-NODE)
+                                     1
+                                     (popcount64 (ty-fun-targets (n-in-ty call 1))))))))
                 (store! i (+ (load i) 1))
                 0)))
     (load edges)))

@@ -25,6 +25,14 @@ Torque avoids this ambiguity with call descriptors and generated adapters. JSL n
 separation: JavaScript calls have one tagged boundary ABI; optimized internal functions retain
 specialized ABIs behind generated adapter thunks.
 
+The namespace half of that separation is implemented. JavaScript-visible functions own the low,
+nonzero identity range summarized by `Val.fidxs` (zero is the invalid side-table owner); internal
+JSL builtins are assigned disjoint higher ids.
+Direct calls retain exact `OP-FUN` identity even when no target bit can represent it. This removes
+the combined 63-function ceiling without pretending an internal builtin is a runtime JavaScript
+function. It is only the foundation: open dispatch, tagged adapters, and exception projections
+described below remain required for arbitrary callable values.
+
 ## DSL surface
 
 The intended control/effect form is:
@@ -132,4 +140,3 @@ Implementation is incomplete until native conformance agrees with Node for:
 
 Falsification must replace one adapter return tag and one dispatch identity. Each defect must turn a
 native-source case red. The existing optional-call case remains the oracle for the pre-call branch.
-

@@ -34,7 +34,11 @@ const expectedDigests = Object.freeze({
   // Repinned when JSL lowering began skipping statically disproven arms. The guarded ToNumber
   // expansion remains for the opaque parameter, while constant sub-guards no longer leave dead
   // diamonds for iteration to clean up. The generated JSON helpers move user Fun ids 53 -> 54.
-  call: "105d82cc048a862ca52f47a869fdaac3de85a5112f230deefcfad2e94174436d",
+  // Repinned when JavaScript-visible identities and internal JSL builtin identities became
+  // disjoint. The sole user function is now correctly `Fun.1` instead of inheriting the linked
+  // library's builtin count; zero is reserved as the runtime side-table's invalid owner. The call
+  // structure and every non-identity node remain unchanged.
+  call: "511138d336ac0a0e6aab558ec8304ac930b735caca7e202e57662f4488901312",
   control: "317059e49013ae650f20f71a4a960fd0b5e9202d519901ed26a90803a7d260bd",
   // Repinned for the same ToNumber seam as `call`, and this one is the minimal form of it: exactly
   // one node added — `Unbox flt <- Parm` becomes `Unbox flt <- ToNumber <- Parm` — and every later
@@ -43,7 +47,9 @@ const expectedDigests = Object.freeze({
   // Repinned with the same guarded ToNumberValue as `call`: the object fixture's dynamic numeric
   // field crosses the IsInt/IsFlt diamond before the slow conversion, with its true constant
   // rooted at the containing FunStart.
-  object: "622f7ba1f56113eb58117ca19ba0cf18573c48002add4e6912182e731fb31ed6",
+  // Repinned for the disjoint callable namespace described on `call`; its one user function is
+  // now `Fun.1`, with no structural graph change.
+  object: "a3b22ae04130ba27ee7e122e25b9d1d5183d8ca53c61951711b62068ffb93cd5",
   // Repinned twice. First for the ToNumber seam: two dynamic operands in this fixture, so exactly
   // two nodes added — 82 to 84 — plus the memory edges the functions containing them now thread,
   // the same consequence spelled out on `call`.
@@ -55,7 +61,9 @@ const expectedDigests = Object.freeze({
   // Repinned with two guarded ToNumberValue expansions. The fixture now contains four explicit
   // numeric tag tests and two slow ToNumber nodes instead of two unconditional conversions; the
   // additional Regions/Phis are the control handed back by JSL inlining. 85 nodes to 111.
-  full: "7a145807a980f98039278b6cbb37f5bf4cb5b6c8e53a76c07a8326a86977f112",
+  // Repinned for the disjoint callable namespace: its two user functions become `Fun.1` and
+  // `Fun.2`; node count and all non-identity structure are unchanged.
+  full: "784bf03564ecdbb47f25fd13f9527af727a3c959c99d8cc7cd7949ad9cdc977d",
   bitwise: "a9e893ac4a4e394075e850fef7c876ce8db3f5b3a61fc5993b217ab06b8c5ab7",
 });
 

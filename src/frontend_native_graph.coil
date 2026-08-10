@@ -5929,26 +5929,23 @@
           (store! cell-shape (shape-transition SHAPE-ROOT "__closure_cell" (t-dyn)))
           (store! cell-alias (shape-field-alias (load cell-shape) 0)))
         0)
-    ;; All non-main function roots are opened before main Args and before bodies.
-    ;; JSL builtins and user JavaScript functions share the backend's current 63-bit callable-id
-    ;; space. They must not share an id: a heap-loaded JavaScript callback is dispatched by that
-    ;; runtime id, and the old `fn.id` assignment collided with builtin zero, silently calling the
-    ;; wrong body. Reserve the dense builtin prefix until the callable representation grows beyond
-    ;; the legacy bitset.
-    (let [js-function-base (jsl-decl-fidx (jsl-decl-count))]
-      (if (>= (+ js-function-base function-count) 63)
-          (do (panic-corrupt "frontend: JSL and JavaScript functions exceed callable-id capacity") 0)
-          0)
+    ;; JavaScript values use nonzero low finite-target ids because those identities cross the
+    ;; tagged call boundary. Zero remains the runtime side-table's invalid-owner sentinel. Internal
+    ;; JSL builtins occupy a disjoint namespace above them and are reached directly by their Fun
+    ;; nodes; they do not consume dynamic-dispatch bits.
+    (if (>= function-count 62)
+        (do (panic-corrupt "frontend: JavaScript functions exceed finite callable summary capacity") 0)
+        0)
+    (jsl-set-fidx-base! (+ function-count 1))
     (store! index 0)
     (loop (if (>= (load index) function-count)
               (break)
               (let [fn (al-get [FeFunction] (load (field frontend functions)) (load index))]
                 (if (!= (load (field fn id)) main-id)
                     (al-set! [i64] (mut functions) (load (field fn id))
-                             (n-fun-open! (+ js-function-base (load (field fn id)))))
+                             (n-fun-open! (+ (load (field fn id)) 1)))
                     0)
                 (store! index (+ (load index) 1)))))
-    )
     ;; Main Args are created immediately after the function roots.
     (store! index 0)
     (loop (if (>= (load index) (load (field main parameter-count)))
