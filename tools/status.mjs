@@ -165,6 +165,21 @@ missing(stringMethods, STRING, "String.prototype");
 missing(arrayMethods, ARRAY, "Array.prototype");
 missing(mathMembers, MATH, "Math");
 
+// The frontend may allocate literals and construct graph/control plumbing, but it must not bypass
+// lib/ for JavaScript heap, conversion, throw, or platform-Math results. This is the handoff's
+// central invariant made executable rather than left as an audit someone has to remember.
+const forbiddenFrontendBuilders = [
+  "n-js-builtin!", "n-number-to-string!", "n-js-throw!",
+  "n-prop-load-at!", "n-prop-store-at!", "n-prop-delete-at!",
+  "n-array-load-at!", "n-array-store-at!", "n-array-length-at!",
+  "n-array-resize-at!", "n-array-resize-after-at!", "n-array-copy-at!",
+  "n-set-prototype-at!",
+];
+for (const builder of forbiddenFrontendBuilders) {
+  if (graph.includes(`(${builder}`))
+    problems.push(`frontend bypasses lib/ through ${builder}`);
+}
+
 // Every declaration in lib/ is either reachable from src/ or has to be named here as knowingly not.
 const KNOWN_UNREACHED = new Set([
   "ArrayIota", "ArrayRepeat", "ArrayMapDouble",           // conformance fixtures, not operations

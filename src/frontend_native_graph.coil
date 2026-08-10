@@ -723,49 +723,6 @@
 (defn fng-control [(context FngContext)] (-> i64)
   (load (load (field context ctrl))))
 
-(defn fng-prop-load! [(context FngContext) (mem i64) (ptr i64) (name (slice u8))] (-> i64)
-  (n-prop-load-at! (fng-control context) mem ptr name))
-
-(defn fng-prop-store! [(context FngContext)
-                        (mem i64)
-                        (ptr i64)
-                        (value i64)
-                        (name (slice u8))] (-> i64)
-  (n-prop-store-at! (fng-control context) mem ptr value name))
-
-(defn fng-set-prototype! [(context FngContext) (mem i64) (ptr i64) (prototype i64)] (-> i64)
-  (n-set-prototype-at! (fng-control context) mem ptr prototype))
-
-(defn fng-array-load! [(context FngContext) (mem i64) (ptr i64) (index i64)] (-> i64)
-  (n-array-load-at! (fng-control context) mem ptr index))
-
-(defn fng-array-store! [(context FngContext)
-                         (mem i64)
-                         (ptr i64)
-                         (index i64)
-                         (value i64)] (-> i64)
-  (n-array-store-at! (fng-control context) mem ptr index value))
-
-(defn fng-array-length! [(context FngContext) (mem i64) (ptr i64)] (-> i64)
-  (n-array-length-at! (fng-control context) mem ptr))
-
-(defn fng-array-resize! [(context FngContext) (mem i64) (ptr i64) (length i64)] (-> i64)
-  (n-array-resize-at! (fng-control context) mem ptr length))
-
-(defn fng-array-resize-after! [(context FngContext)
-                                (mem i64)
-                                (ptr i64)
-                                (length i64)
-                                (value i64)] (-> i64)
-  (n-array-resize-after-at! (fng-control context) mem ptr length value))
-
-(defn fng-array-copy! [(context FngContext)
-                        (mem i64)
-                        (source i64)
-                        (result i64)
-                        (start i64)] (-> i64)
-  (n-array-copy-at! (fng-control context) mem source result start))
-
 (defn fng-effect? [(context FngContext) (owner i64)] (-> bool)
   (let [function-id (load (field context owner))
         type-count (load (field context type-count))]
@@ -1592,10 +1549,9 @@
               (mut index) 0]
           (if (>= parent 0)
               (let [linked
-                      (fng-set-prototype! context (fng-current-memory context JS-PROPERTY-ALIAS)
-                                        object
-                                        (fng-constructor-prototype! context parent))]
-                (store! (load (field context memory)) (fng-preserve-active-memory context linked)))
+                      (fng-jsl-call2 context "SetObjectPrototype" object
+                                     (fng-constructor-prototype! context parent))]
+                0)
               0)
           (loop (if (>= (load index)
                         (al-len [FePrototypeMethod] (load (field frontend prototype-methods))))
@@ -1625,11 +1581,13 @@
                                           (load (load (field context functions)))
                                           (load (field method target)))
                                 stored
-                                  (fng-prop-store! context (fng-current-memory context JS-PROPERTY-ALIAS)
+                                  (fng-jsl-call3 context "SetNamedProperty"
                                                  object
-                                                 (n-box! target)
-                                                 (ts-text ast (load (field method name-node))))]
-                            (store! (load (field context memory)) (fng-preserve-active-memory context stored)))
+                                                 (fng-const
+                                                   (shape-name-intern!
+                                                     (ts-text ast (load (field method name-node)))))
+                                                 target)]
+                            0)
                           0)
                       (store! index (+ (load index) 1)))))
           (al-set! [i64] (mut (load (field context prototypes))) constructor object)
@@ -1849,10 +1807,9 @@
               (fng-expression context (ts-child ast node 1))
               (n-string-const! (jss-from-utf8! "")))
         stored
-          (fng-prop-store! context (fng-current-memory context JS-PROPERTY-ALIAS)
-                         object (n-box! message) "message")]
+          (fng-jsl-call3 context "SetNamedProperty" object
+                         (fng-const (shape-name-intern! "message")) message)]
     (fng-record-dynamic-alias! context JS-PROPERTY-ALIAS)
-    (store! (load (field context memory)) (fng-preserve-active-memory context stored))
     object))
 
 (defn fng-string-builtin-name [(context FngContext) (node i64)] (-> (slice u8))
@@ -2028,7 +1985,7 @@
           (if (> (ts-child-count ast node) 1)
               (fng-expression context (ts-child ast node 1))
               (fng-const 10))]
-    (n-number-to-string! value radix)))
+    (fng-jsl-call2 context "NumberToStringValue" value radix)))
 
 (defn fng-string-from-char-code [(context FngContext) (node i64)] (-> i64)
   (let [frontend (load (field context frontend))
@@ -2912,9 +2869,10 @@
                   (do
                     (fng-record-dynamic-alias! context JS-PROPERTY-ALIAS)
                     (let [loaded
-                            (fng-prop-load! context (fng-current-memory context JS-PROPERTY-ALIAS)
-                                          receiver
-                                          (ts-text ast (ts-child ast callee-node 1)))
+                            (fng-jsl-call2 context "GetNamedProperty" receiver
+                                           (fng-const
+                                             (shape-name-intern!
+                                               (ts-text ast (ts-child ast callee-node 1)))))
                           targets method-targets]
                       (if (> targets 0)
                           (n-new2 OP-CAST (t-fun-set targets)
@@ -2976,10 +2934,8 @@
     (if (and construct (and (= receiver-type FE-RECEIVER-DYNAMIC) (>= callee 0)))
         (let [prototype (fng-constructor-prototype! context callee)
               linked
-                (fng-set-prototype! context (fng-current-memory context JS-PROPERTY-ALIAS)
-                                  receiver
-                                  prototype)]
-          (store! (load (field context memory)) (fng-preserve-active-memory context linked)))
+                (fng-jsl-call2 context "SetObjectPrototype" receiver prototype)]
+          0)
         0)
     (if (> method-targets 0)
         (let [representative (fng-first-function-target method-targets)
@@ -3116,11 +3072,10 @@
               (fng-record-dynamic-alias! context JS-PROPERTY-ALIAS)
               (if (> argc 0)
                   (let [resized
-                          (fng-array-resize! context (fng-current-memory context JS-PROPERTY-ALIAS)
-                                           array
-                                           (fng-expression context (ts-child ast node 1)))]
-                    (store! (load (field context memory))
-                            (fng-preserve-active-memory context resized)))
+                          (fng-jsl-call3 context "ResizeArray" array
+                                         (fng-expression context (ts-child ast node 1))
+                                         array)]
+                    0)
                   0)
               array)
           (= intrinsic FNG-INTRINSIC-STRING)
@@ -3239,11 +3194,10 @@
                     value-node (ts-child ast property (- (ts-child-count ast property) 1))
                     value (fng-expression context value-node)
                     stored
-                      (fng-prop-store! context (fng-current-memory context JS-PROPERTY-ALIAS)
-                                     object
-                                     (n-box! value)
-                                     (ts-text ast name-node))]
-                (store! (load (field context memory)) (fng-preserve-active-memory context stored))
+                      (fng-jsl-call3 context "SetNamedProperty" object
+                                     (fng-const
+                                       (shape-name-intern! (ts-text ast name-node)))
+                                     value)]
                 (store! index (+ (load index) 1)))))
     object))
 
@@ -3260,18 +3214,15 @@
                 (if (!= (ts-kind ast element) 0)
                     (let [value (fng-expression context element)
                           stored
-                            (fng-array-store! context (fng-current-memory context JS-PROPERTY-ALIAS)
-                                            array
-                                            (fng-const (load index))
-                                            (n-box! value))]
-                      (store! (load (field context memory)) (fng-preserve-active-memory context stored)))
+                            (fng-jsl-call3 context "SetElement" array
+                                           (fng-const (load index)) value)]
+                      0)
                     0)
                 (store! index (+ (load index) 1)))))
     (let [resized
-            (fng-array-resize! context (fng-current-memory context JS-PROPERTY-ALIAS)
-                             array
-                             (fng-const (ts-child-count ast node)))]
-      (store! (load (field context memory)) (fng-preserve-active-memory context resized)))
+            (fng-jsl-call3 context "ResizeArray" array
+                           (fng-const (ts-child-count ast node)) array)]
+      0)
     array))
 
 (defn fng-field-load-value [(context FngContext)
@@ -5373,7 +5324,11 @@
               false)
           (= kind TSK-THROW)
             (do
-              (fng-add-return! context (n-js-throw! (n-box! (fng-expression context (ts-child ast node 0)))))
+              (fng-add-return! context
+                               (fng-jsl-call1 context "ThrowValue"
+                                              (n-box!
+                                                (fng-expression context
+                                                                (ts-child ast node 0)))))
               false)
           :else false)))
 
