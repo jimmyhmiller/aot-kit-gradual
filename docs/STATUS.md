@@ -172,7 +172,7 @@ string and template literals with interpolation and cooked escapes, concatenatio
 - `class`
 - getters and setters
 - computed property names
-- optional calls through unknown present callables
+- optional calls through unknown present callables (needs call descriptors/adapters)
 - `try`/`catch`/`finally`
 - lexical `this` in arrow functions
 - `instanceof` / `in` / `delete`

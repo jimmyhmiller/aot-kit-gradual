@@ -1,5 +1,8 @@
 # JSL: the JavaScript library language
 
+Dynamic JavaScript calls require descriptor-driven adapters rather than raw indirect calls. See
+[JavaScript call descriptors in JSL](CALL_DESCRIPTORS.md) for the DSL and ABI contract.
+
 **STATUS: PARTIAL.** Built: the reader, the checker, the expression core, `builtin`, `macro` with
 inlining, `:labels`/`goto`/`:otherwise`, `loop`/`recur`, multi-file loading through `lib/index`,
 ranged diagnostics, and the transition check over the lowered graph (`src/jsl.coil`, `src/jsl_lower.coil`, `lib/`,

@@ -131,7 +131,7 @@ const UNSUPPORTED = {
   "Needs new syntax in the frontend": [
     "tagged template literals", "destructuring", "spread and rest",
     "`for...of` / `for...in`", "`class`", "getters and setters", "computed property names",
-    "optional calls through unknown present callables", "`try`/`catch`/`finally`",
+    "optional calls through unknown present callables (needs call descriptors/adapters)", "`try`/`catch`/`finally`",
     "lexical `this` in arrow functions", "`instanceof` / `in` / `delete`",
   ],
   "Needs a runtime this compiler does not have": [
