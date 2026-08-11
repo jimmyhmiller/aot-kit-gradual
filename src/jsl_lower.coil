@@ -59,6 +59,7 @@
    (rctrl  (ArrayList i64))   ; one control per `recur` reached
    (rvals  (ArrayList i64))   ; nbind values per `recur`, in the same order
    (rmem   (ArrayList i64))   ; and the heap each `recur` left, one per recur
+   (callback-calls (ArrayList i64)) ; dynamic JS calls emitted by callback macros
    (ctrl   i64)               ; the control the next effectful form hangs off, or JL-DIVERGED
    (mem    i64)               ; the current JS property memory, or NO-NODE before it is needed
    (anchor i64)               ; Start/FunStart of the CFG owner receiving newly rooted constants
@@ -77,6 +78,7 @@
           (store! (field p rctrl) (al-new [i64] (malloc-allocator)))
           (store! (field p rvals) (al-new [i64] (malloc-allocator)))
           (store! (field p rmem) (al-new [i64] (malloc-allocator)))
+          (store! (field p callback-calls) (al-new [i64] (malloc-allocator)))
           (store! (field p ctrl) NO-NODE)
           (store! (field p mem) NO-NODE)
           (store! (field p anchor) NO-NODE)
@@ -94,6 +96,7 @@
     (al-clear! [i64] (field p rctrl))
     (al-clear! [i64] (field p rvals))
     (al-clear! [i64] (field p rmem))
+    (al-clear! [i64] (field p callback-calls))
     (store! (field p ctrl) NO-NODE)
     (store! (field p mem) NO-NODE)
     (store! (field p anchor) NO-NODE)
@@ -426,6 +429,7 @@
       (store! (index p n) (jl-mem))
       (let [cs (n-call! (jl-ctrl) callee (slice-new [i64] p (+ n 1)))
             end (call-end cs)]
+        (al-push! [i64] (field (jl) callback-calls) (call-value cs))
         (jl-set-ctrl! end)
         (jl-set-mem! (n-new1 OP-ARG (t-mem-alias JS-PROPERTY-ALIAS (t-undef)) end))
         ;; A JavaScript call expression always yields a tagged language value even when the
@@ -1007,7 +1011,20 @@
       (if uses-mem
           (jl-set-mem! (n-new1 OP-ARG (t-mem-alias JS-PROPERTY-ALIAS (t-undef)) end))
           0)
-      (call-value cs)))))
+        (call-value cs)))))
+
+;; Inline only calls introduced by JSL's JavaScript-callback form. This deliberately excludes
+;; ordinary source calls: callback macros expose hot per-element calls, while global inlining can
+;; perturb unrelated recursive/control-heavy functions and their register pressure.
+(defn jl-inline-callback-calls! [] (-> i64)
+  (let [calls (load (field (jl) callback-calls))
+        (mut index) 0 (mut count) 0]
+    (loop (if (>= (load index) (al-len [i64] calls))
+              (break)
+              (do (if (inline-one-call! (al-get [i64] calls (load index)))
+                      (store! count (+ (load count) 1)) 0)
+                  (store! index (+ (load index) 1)))))
+    (load count)))
 
 ; ============================================================================
 ; Declarations

@@ -78,6 +78,7 @@ typedef struct {
 
 static JsObjectRec *js_objects;
 static size_t js_objects_len, js_objects_cap;
+static int js_any_frozen;
 #define JS_OBJECT_CACHE_SIZE 65536u
 static uint32_t js_object_cache[JS_OBJECT_CACHE_SIZE];
 static JsPropertyRec *js_properties;
@@ -247,17 +248,20 @@ static AotJsValue js_canonical_stored_value(AotJsValue value);
 static int js_array_reserve(JsArrayRec *array, size_t needed) {
   if (needed <= array->capacity) return 1;
   if (array_growth_disabled) return 0;
-  size_t next = array->capacity ? array->capacity * 2 : 4;
+  /* Literals and callback results overwhelmingly contain at least eight elements. Start there,
+     and keep values plus presence bits in one allocation to avoid two allocator round trips and
+     the otherwise guaranteed 4 -> 8 copy for that common case. */
+  size_t next = array->capacity ? array->capacity * 2 : 8;
   while (next < needed) next *= 2;
-  AotJsValue *elements = malloc(next * sizeof(*elements));
-  uint8_t *present = calloc(next, sizeof(*present));
-  if (!elements || !present) { free(elements); free(present); return 0; }
+  AotJsValue *elements = calloc(1, next * sizeof(*elements) + next * sizeof(uint8_t));
+  if (!elements) return 0;
+  uint8_t *present = (uint8_t *)(elements + next);
   for (size_t i = 0; i < next; ++i) elements[i] = AOT_JS_UNDEFINED;
   if (array->capacity) {
     memcpy(elements, array->elements, array->capacity * sizeof(*elements));
     memcpy(present, array->present, array->capacity * sizeof(*present));
   }
-  free(array->elements); free(array->present);
+  free(array->elements);
   array->elements = elements; array->present = present; array->capacity = next;
   return 1;
 }
@@ -906,9 +910,6 @@ AotJsValue aot_js_array(uintptr_t owner, int64_t index,
       aot_js_tag((AotJsValue)owner) == AOT_JS_FUNCTION)
     owner = aot_js_payload((AotJsValue)owner);
   if (!owner) return AOT_JS_UNDEFINED;
-  JsObjectRec *integrity = js_object(owner, 0);
-  if (integrity && integrity->frozen && (operation == 2 || operation == 4))
-    js_throw_frozen_mutation();
   JsArrayRec *array = js_array(owner, operation == 0 || operation == 2 || operation == 4);
 #ifdef AOT_DEBUG_ARRAY
   static uint64_t debug_array_calls;
@@ -929,6 +930,13 @@ AotJsValue aot_js_array(uintptr_t owner, int64_t index,
 #endif
     return result;
   }
+  /* Reads never consult object integrity. Keep the overwhelmingly common callback-loop length
+     path beside element loads and avoid a second side-table lookup on every operation. */
+  if (operation == 3)
+    return (AotJsValue)array->length;
+  JsObjectRec *integrity = js_any_frozen ? js_object(owner, 0) : NULL;
+  if (integrity && integrity->frozen && (operation == 2 || operation == 4))
+    js_throw_frozen_mutation();
   if (operation == 2) {
     value = js_canonical_stored_value(value);
     if (index < 0 || !aot_js_well_formed(value) ||
@@ -943,14 +951,6 @@ AotJsValue aot_js_array(uintptr_t owner, int64_t index,
               debug_array_call, owner, index, debug_array_before, array->length, value);
 #endif
     return value;
-  }
-  if (operation == 3) {
-#ifdef AOT_DEBUG_ARRAY
-    if (debug_array_call <= UINT64_C(20000))
-      fprintf(stderr, "array call=%" PRIu64 " op=length owner=%" PRIxPTR
-                      " length=%zu\n", debug_array_call, owner, array->length);
-#endif
-    return (AotJsValue)array->length;
   }
   if (operation == 4) {
     size_t next = index < 0 ? 0 : (size_t)index;
@@ -971,7 +971,7 @@ AotJsValue aot_js_array(uintptr_t owner, int64_t index,
   if (operation == 5) {
     uintptr_t result_owner = (uintptr_t)value;
     if (aot_js_managed(value)) result_owner = aot_js_payload(value);
-    JsObjectRec *result_integrity = js_object(result_owner, 0);
+    JsObjectRec *result_integrity = js_any_frozen ? js_object(result_owner, 0) : NULL;
     if (result_integrity && result_integrity->frozen) js_throw_frozen_mutation();
     JsArrayRec *result = js_array(result_owner, 0);
     if (!result || index < 0) return AOT_JS_UNDEFINED;
@@ -988,6 +988,51 @@ AotJsValue aot_js_array(uintptr_t owner, int64_t index,
     return (AotJsValue)result_owner;
   }
   return AOT_JS_UNDEFINED;
+}
+
+/* Hot read-only entry points retain the four-register array ABI while avoiding
+   the generic operation dispatcher. */
+AotJsValue aot_arr_load(uintptr_t owner, int64_t index,
+                        AotJsValue unused_value, uint64_t unused_operation) {
+  (void)unused_value; (void)unused_operation;
+  if (aot_js_managed((AotJsValue)owner) ||
+      aot_js_tag((AotJsValue)owner) == AOT_JS_FUNCTION)
+    owner = aot_js_payload((AotJsValue)owner);
+  if (!owner) return AOT_JS_UNDEFINED;
+  JsArrayRec *array = js_array(owner, 0);
+  return array && index >= 0 && (size_t)index < array->length && array->present[index]
+           ? array->elements[index] : AOT_JS_UNDEFINED;
+}
+
+AotJsValue aot_arr_len(uintptr_t owner, int64_t unused_index,
+                       AotJsValue unused_value, uint64_t unused_operation) {
+  (void)unused_index; (void)unused_value; (void)unused_operation;
+  if (aot_js_managed((AotJsValue)owner) ||
+      aot_js_tag((AotJsValue)owner) == AOT_JS_FUNCTION)
+    owner = aot_js_payload((AotJsValue)owner);
+  if (!owner) return 0;
+  JsArrayRec *array = js_array(owner, 0);
+  return array ? (AotJsValue)array->length : 0;
+}
+
+AotJsValue aot_arr_store(uintptr_t owner, int64_t index,
+                         AotJsValue value, uint64_t unused_operation) {
+  (void)unused_operation;
+  if (aot_js_managed((AotJsValue)owner) ||
+      aot_js_tag((AotJsValue)owner) == AOT_JS_FUNCTION)
+    owner = aot_js_payload((AotJsValue)owner);
+  if (!owner || index < 0) return AOT_JS_UNDEFINED;
+  JsArrayRec *array = js_array(owner, 1);
+  JsObjectRec *integrity = js_any_frozen ? js_object(owner, 0) : NULL;
+  if (integrity && integrity->frozen) js_throw_frozen_mutation();
+  value = js_canonical_stored_value(value);
+  if (!array || !aot_js_well_formed(value) ||
+      !js_array_reserve(array, (size_t)index + 1)) return AOT_JS_UNDEFINED;
+  array->elements[index] = value;
+  array->present[index] = 1;
+  if ((size_t)index >= array->length) array->length = (size_t)index + 1;
+  if (aot_js_managed(value)) js_write_barrier(owner, aot_js_payload(value));
+  return value;
 }
 
 static int js_property_array_index(AotJsValue key, int64_t *out) {
@@ -1147,6 +1192,7 @@ AotJsValue aot_js_property(uintptr_t owner, uint64_t name,
     JsObjectRec *object = js_object(owner, 1);
     if (!object) return AOT_JS_UNDEFINED;
     object->frozen = 1;
+    js_any_frozen = 1;
     return (AotJsValue)owner;
   }
   JsObjectRec *integrity = js_object(owner, 0);
@@ -1193,10 +1239,18 @@ AotJsValue aot_js_property(uintptr_t owner, uint64_t name,
             debug_property_calls, operation, name, owner, js_objects_len, js_properties_len,
             debug_property_cache_hits, debug_property_cache_misses,
             debug_object_cache_hits, debug_object_cache_misses);
-  if ((name == 16 || name == 20) && debug_property_events++ < 512)
-    fprintf(stderr, "property op=%" PRIu64 " name=%" PRIu64
-                    " owner=%" PRIxPTR " value=%016" PRIx64 "\n",
-            operation, name, owner, value);
+  if (debug_property_events++ < 512)
+    {
+      fprintf(stderr, "property op=%" PRIu64 " name=%" PRIu64,
+              operation, name);
+      JsStringRec *debug_name = js_string_lookup((uintptr_t)name);
+      if (debug_name) {
+        fputs(" text=", stderr);
+        for (size_t i = 0; i < debug_name->length; ++i)
+          fputc(debug_name->units[i] < 128 ? (char)debug_name->units[i] : '?', stderr);
+      }
+      fprintf(stderr, " owner=%" PRIxPTR " value=%016" PRIx64 "\n", owner, value);
+    }
   if ((name == 2 || name == 8 || name == 18 || name == 22 || name == 26 || name == 27 || name == 28 || name == 38) && debug_strength_events++ < 2048)
     fprintf(stderr, "strength-property op=%" PRIu64 " name=%" PRIu64
                     " owner=%" PRIxPTR " value=%016" PRIx64 "\n",
@@ -1208,7 +1262,7 @@ AotJsValue aot_js_property(uintptr_t owner, uint64_t name,
       JsPropertyRec *property = js_own_property(cursor, name);
       if (property) {
 #ifdef AOT_DEBUG_PROPERTY_LOOP
-        if (name == 16 || name == 20)
+        if (debug_property_events < 512)
           fprintf(stderr, "property result name=%" PRIu64 " owner=%" PRIxPTR
                           " cursor=%" PRIxPTR " result=%016" PRIx64 "\n",
                   name, owner, cursor, property->value);
@@ -1590,7 +1644,7 @@ static void discard_dead_side_records(void) {
   out = 0;
   for (size_t i = 0; i < js_arrays_len; ++i) {
     if (!side_owner_live(&js_arrays[i].owner)) {
-      free(js_arrays[i].elements); free(js_arrays[i].present); continue;
+      free(js_arrays[i].elements); continue;
     }
     js_arrays[out++] = js_arrays[i];
   }
@@ -1855,12 +1909,13 @@ int aot_gc_configure(size_t bytes, int stress) {
   array_scan_disabled = 0;
   array_growth_disabled = 0;
   for (size_t i = 0; i < js_arrays_len; ++i) {
-    free(js_arrays[i].elements); free(js_arrays[i].present);
+    free(js_arrays[i].elements);
   }
   for (size_t i = 0; i < js_strings_len; ++i) {
     free(js_strings[i]->units); free(js_strings[i]);
   }
   js_objects_len = js_properties_len = 0;
+  js_any_frozen = 0;
   memset(js_object_cache, 0, sizeof(js_object_cache));
   memset(js_property_cache, 0, sizeof(js_property_cache));
   js_property_cache_complete = 1;

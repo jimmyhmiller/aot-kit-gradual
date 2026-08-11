@@ -118,11 +118,24 @@
                 0)))
     (load found)))
 
+(defn mobj-has-jsarray-imm? [(wanted i64)] (-> bool)
+  (let [(mut at) 0 (mut found) false]
+    (loop (if (or (>= (load at) (be-inst-count)) (load found))
+              (break)
+              (do (if (and (= (ms-inst-op (load at)) MI-JSARRAY)
+                           (= (load (field (be-inst (load at)) imm)) wanted))
+                      (store! found true) 0)
+                  (store! at (+ (load at) 1)))))
+    (load found)))
+
 (defn mobj-external-symbol-count [] (-> i64)
   (+ (if (mobj-has-external-op? MI-NEW) 1 0)
      (+ (if (mobj-has-external-op? MI-JSPROP) 1 0)
         (+ (if (mobj-has-external-op? MI-JSARRAY) 1 0)
-           (if (mobj-has-external-op? MI-JSSTRING) 1 0)))))
+           (+ (if (mobj-has-jsarray-imm? 1) 1 0)
+              (+ (if (mobj-has-jsarray-imm? 2) 1 0)
+                 (+ (if (mobj-has-jsarray-imm? 3) 1 0)
+                    (if (mobj-has-external-op? MI-JSSTRING) 1 0))))))))
 
 (defn mobj-external-symbol [(basesyms i64) (op i64)] (-> i64)
   (if (= op MI-NEW)
@@ -136,7 +149,19 @@
               (+ basesyms
                  (+ (if (mobj-has-external-op? MI-NEW) 1 0)
                     (+ (if (mobj-has-external-op? MI-JSPROP) 1 0)
-                       (if (mobj-has-external-op? MI-JSARRAY) 1 0))))))))
+                       (+ (if (mobj-has-external-op? MI-JSARRAY) 1 0)
+                          (+ (if (mobj-has-jsarray-imm? 1) 1 0)
+                             (+ (if (mobj-has-jsarray-imm? 2) 1 0)
+                                (if (mobj-has-jsarray-imm? 3) 1 0)))))))))))
+
+(defn mobj-jsarray-external-symbol [(basesyms i64) (operation i64)] (-> i64)
+  (let [generic (mobj-external-symbol basesyms MI-JSARRAY)]
+    (cond (= operation 1) (+ generic 1)
+          (= operation 2) (+ (+ generic 1) (if (mobj-has-jsarray-imm? 1) 1 0))
+          (= operation 3) (+ (+ generic 1)
+                             (+ (if (mobj-has-jsarray-imm? 1) 1 0)
+                                (if (mobj-has-jsarray-imm? 2) 1 0)))
+          :else generic)))
 
 (defn mobj-new-branch-pc [(at i64)] (-> i64)
   (let [m (be-inst at)
@@ -167,10 +192,10 @@
              (+ (if (< (be-reg-of (load (field m b))) 0) 1 0)
                 (if (< (be-reg-of value) 0) 1 0)))]
     (+ (load (field m first))
-       (* 4 (+ spill-loads (+ 7 (be-mov-words (load (field m imm)))))))))
+       (* 4 (+ spill-loads (+ 6 (be-mov-words (load (field m imm)))))))))
 
 (defn mobj-jsstring-branch-pc [(at i64)] (-> i64)
-  (+ (mobj-jsarray-branch-pc at)
+  (+ (+ (mobj-jsarray-branch-pc at) 4)
      (if (= (load (field (be-inst at) imm)) JSSOP-FROM-DOUBLE-BITS) 4 0)))
 
 (defn mobj-safepoint-pc [(at i64)] (-> i64)
@@ -694,7 +719,10 @@
              (+ (if (mobj-has-external-op? MI-NEW) 16 0)
                 (+ (if (mobj-has-external-op? MI-JSPROP) 17 0)
                    (+ (if (mobj-has-external-op? MI-JSARRAY) 14 0)
-                      (if (mobj-has-external-op? MI-JSSTRING) 15 0)))))]
+                      (+ (if (mobj-has-jsarray-imm? 1) 14 0)
+                         (+ (if (mobj-has-jsarray-imm? 2) 15 0)
+                            (+ (if (mobj-has-jsarray-imm? 3) 13 0)
+                               (if (mobj-has-external-op? MI-JSSTRING) 15 0))))))))]
     (al-clear! [u8] (field p obj))
     ; mach_header_64
     (obj-u32! 4277009103)
@@ -810,7 +838,9 @@
                   (if (= (ms-inst-op (load at)) MI-JSARRAY)
                       (do
                         (obj-u32! (mobj-jsarray-branch-pc (load at)))
-                        (obj-u32! (mobj-branch-reloc-info (mobj-external-symbol basesyms MI-JSARRAY)))
+                        (obj-u32! (mobj-branch-reloc-info
+                                    (mobj-jsarray-external-symbol
+                                      basesyms (load (field (be-inst (load at)) imm)))))
                         0)
                       0)
                   (if (= (ms-inst-op (load at)) MI-JSSTRING)
@@ -879,6 +909,27 @@
             (store! external-strx (+ (load external-strx) 14))
             0)
           0)
+      (if (mobj-has-jsarray-imm? 1)
+          (do
+            (obj-u32! (load external-strx))
+            (obj-u8! 1) (obj-u8! 0) (obj-u8! 0) (obj-u8! 0) (obj-u64! 0)
+            (store! external-strx (+ (load external-strx) 14))
+            0)
+          0)
+      (if (mobj-has-jsarray-imm? 2)
+          (do
+            (obj-u32! (load external-strx))
+            (obj-u8! 1) (obj-u8! 0) (obj-u8! 0) (obj-u8! 0) (obj-u64! 0)
+            (store! external-strx (+ (load external-strx) 15))
+            0)
+          0)
+      (if (mobj-has-jsarray-imm? 3)
+          (do
+            (obj-u32! (load external-strx))
+            (obj-u8! 1) (obj-u8! 0) (obj-u8! 0) (obj-u8! 0) (obj-u64! 0)
+            (store! external-strx (+ (load external-strx) 13))
+            0)
+          0)
       (if (mobj-has-external-op? MI-JSSTRING)
           (do
             (obj-u32! (load external-strx))
@@ -909,6 +960,15 @@
         0)
     (if (mobj-has-external-op? MI-JSARRAY)
         (do (obj-ascii! "_aot_js_array") (obj-u8! 0) 0)
+        0)
+    (if (mobj-has-jsarray-imm? 1)
+        (do (obj-ascii! "_aot_arr_load") (obj-u8! 0) 0)
+        0)
+    (if (mobj-has-jsarray-imm? 2)
+        (do (obj-ascii! "_aot_arr_store") (obj-u8! 0) 0)
+        0)
+    (if (mobj-has-jsarray-imm? 3)
+        (do (obj-ascii! "_aot_arr_len") (obj-u8! 0) 0)
         0)
     (if (mobj-has-external-op? MI-JSSTRING)
         (do (obj-ascii! "_aot_js_string") (obj-u8! 0) 0)

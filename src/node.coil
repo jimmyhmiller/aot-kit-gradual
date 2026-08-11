@@ -3026,7 +3026,47 @@
                                         (n-set-def! n 1 mm)
                                         (g-store-elim!)
                                         (g-changed!)
-                                        n))))))))))))
+                                      n))))))))))))
+
+;; Forward a constant-index dense-array read through its dominating store chain. This is the array
+;; analogue of field load forwarding: a different constant index cannot alias, while an unknown
+;; index stops the walk. Literal callback expansion exposes exactly these constant reads and lets
+;; ordinary dead-node cleanup scalar-replace arrays that never escape.
+(defn arrayload-idealize [(n i64)] (-> i64)
+  (let [owner (n-in n 2)
+        index (n-in n 3)
+        (mut memory) (n-in n 1)
+        (mut fuel) 64
+        (mut answer) NO-NODE]
+    (loop (if (or (!= (load answer) NO-NODE)
+                  (or (<= (load fuel) 0) (= (load memory) NO-NODE)))
+              (break)
+              (let [m (load memory)]
+                (if (= (n-op m) OP-ARRAYRESIZE)
+                    (let [resized-owner (n-in m 2)
+                          resized-length (n-in m 3)]
+                      (if (and (= resized-owner owner)
+                               (and (= (n-op resized-length) OP-CONST)
+                                    (and (= (n-op index) OP-CONST)
+                                         (< (ty-int-lo (n-aux index))
+                                            (ty-int-lo (n-aux resized-length))))))
+                          (store! memory (n-in m 1))
+                          (store! fuel 0)))
+                    (if (!= (n-op m) OP-ARRAYSTORE)
+                        (store! fuel 0)
+                        (let [stored-owner (n-in m 2)
+                          stored-index (n-in m 3)]
+                          (if (!= stored-owner owner)
+                              (store! memory (n-in m 1))
+                              (if (= stored-index index)
+                                  (store! answer (n-in m 4))
+                                  (if (and (= (n-op stored-index) OP-CONST)
+                                           (and (= (n-op index) OP-CONST)
+                                                (!= (n-aux stored-index) (n-aux index))))
+                                      (store! memory (n-in m 1))
+                                      (store! fuel 0)))))))
+                (store! fuel (- (load fuel) 1)))))
+    (load answer)))
 
 ; ============================================================================
 ; idealize: local rewrites
@@ -3053,7 +3093,8 @@
         (cmp-idealize n) OP-LE
         (cmp-idealize n) OP-LOAD
         (load-idealize n) OP-STORE
-        (store-idealize n) NO-NODE))
+        (store-idealize n) OP-ARRAYLOAD
+        (arrayload-idealize n) NO-NODE))
 
 (defn callend-idealize [(n i64)] (-> i64)
   (let [ctrl (n-in n 0)]
@@ -3136,6 +3177,34 @@
               OP-LE
             (and (inline-clonable? (n-in x 1) fun call (- fuel 1))
                  (inline-clonable? (n-in x 2) fun call (- fuel 1)))
+              OP-MOD
+            (and (inline-clonable? (n-in x 1) fun call (- fuel 1))
+                 (inline-clonable? (n-in x 2) fun call (- fuel 1)))
+              OP-BITAND
+            (and (inline-clonable? (n-in x 1) fun call (- fuel 1))
+                 (inline-clonable? (n-in x 2) fun call (- fuel 1)))
+              OP-BITOR
+            (and (inline-clonable? (n-in x 1) fun call (- fuel 1))
+                 (inline-clonable? (n-in x 2) fun call (- fuel 1)))
+              OP-BITXOR
+            (and (inline-clonable? (n-in x 1) fun call (- fuel 1))
+                 (inline-clonable? (n-in x 2) fun call (- fuel 1)))
+              OP-SHL
+            (and (inline-clonable? (n-in x 1) fun call (- fuel 1))
+                 (inline-clonable? (n-in x 2) fun call (- fuel 1)))
+              OP-SHR
+            (and (inline-clonable? (n-in x 1) fun call (- fuel 1))
+                 (inline-clonable? (n-in x 2) fun call (- fuel 1)))
+              OP-USHR
+            (and (inline-clonable? (n-in x 1) fun call (- fuel 1))
+                 (inline-clonable? (n-in x 2) fun call (- fuel 1)))
+              OP-ARG
+            (= (n-in x 0) (n-fun-entry fun))
+              OP-ARRAYLOAD
+            (and (= (n-in x 0) (n-fun-entry fun))
+                 (and (inline-clonable? (n-in x 1) fun call (- fuel 1))
+                      (and (inline-clonable? (n-in x 2) fun call (- fuel 1))
+                           (inline-clonable? (n-in x 3) fun call (- fuel 1)))))
               false)))
 
 (defn inline-clone! [(x i64) (fun i64) (call i64)] (-> i64)
@@ -3161,6 +3230,29 @@
         (n-peephole (n-new3 OP-LT 0 NO-NODE (inline-clone! (n-in x 1) fun call) (inline-clone! (n-in x 2) fun call)))
           OP-LE
         (n-peephole (n-new3 OP-LE 0 NO-NODE (inline-clone! (n-in x 1) fun call) (inline-clone! (n-in x 2) fun call)))
+          OP-MOD
+        (n-peephole (n-new3 OP-MOD 0 NO-NODE (inline-clone! (n-in x 1) fun call) (inline-clone! (n-in x 2) fun call)))
+          OP-BITAND
+        (n-peephole (n-new3 OP-BITAND 0 NO-NODE (inline-clone! (n-in x 1) fun call) (inline-clone! (n-in x 2) fun call)))
+          OP-BITOR
+        (n-peephole (n-new3 OP-BITOR 0 NO-NODE (inline-clone! (n-in x 1) fun call) (inline-clone! (n-in x 2) fun call)))
+          OP-BITXOR
+        (n-peephole (n-new3 OP-BITXOR 0 NO-NODE (inline-clone! (n-in x 1) fun call) (inline-clone! (n-in x 2) fun call)))
+          OP-SHL
+        (n-peephole (n-new3 OP-SHL 0 NO-NODE (inline-clone! (n-in x 1) fun call) (inline-clone! (n-in x 2) fun call)))
+          OP-SHR
+        (n-peephole (n-new3 OP-SHR 0 NO-NODE (inline-clone! (n-in x 1) fun call) (inline-clone! (n-in x 2) fun call)))
+          OP-USHR
+        (n-peephole (n-new3 OP-USHR 0 NO-NODE (inline-clone! (n-in x 1) fun call) (inline-clone! (n-in x 2) fun call)))
+          OP-ARG
+        (n-in call (- (n-nins call) 1))
+          OP-ARRAYLOAD
+        (n-peephole
+          (n-new4 OP-ARRAYLOAD (n-aux x)
+                  (n-in call 0)
+                  (inline-clone! (n-in x 1) fun call)
+                  (inline-clone! (n-in x 2) fun call)
+                  (inline-clone! (n-in x 3) fun call)))
           NO-NODE))
 
 (defn call-callend [(call i64)] (-> i64)
@@ -3182,8 +3274,14 @@
 (defn inline-one-call! [(call i64)] (-> bool)
   (if (or (n-dead? call) (!= (n-op call) OP-CALL))
       false
-      (let [fun (n-in call 1)]
-        (if (or (!= (n-op fun) OP-FUN) (!= (n-nins fun) 2))
+      (let [callee (n-in call 1)
+            fun (infer-direct-callee-fun call)]
+        ;; A top-level source callback is represented as a capture-free Closure,
+        ;; while JSL-local calls name Fun directly. Both have the same argument
+        ;; mapping and are safe for this straight-line inliner.
+        (if (or (= fun NO-NODE)
+                (or (and (= (n-op callee) OP-CLOSURE) (!= (n-nins callee) 1))
+                    (!= (n-nins fun) 2)))
             false
             (let [ret (n-in fun 1)
                   end (call-callend call)]
@@ -3196,6 +3294,17 @@
                         value (inline-clone! (n-in ret 1) fun call)]
                     (n-keep! ctrl)
                     (n-keep! value)
+                    ;; Callback calls carry the current heap as their trailing argument. A pure
+                    ;; inlined body returns that same heap; replace CallEnd-rooted memory Args
+                    ;; before removing the control boundary so sequential DSL stores remain linked.
+                    (let [(mut out-index) 0
+                          incoming-memory (n-in call (- (n-nins call) 1))]
+                      (loop (if (>= (load out-index) (n-nouts end))
+                                (break)
+                                (let [use (n-out end (load out-index))]
+                                  (if (and (not (n-dead? use)) (= (n-op use) OP-ARG))
+                                      (n-subsume! use incoming-memory) 0)
+                                  (store! out-index (+ (load out-index) 1))))))
                     (n-subsume! end ctrl)
                     (n-subsume! call value)
                     (n-unkeep! value)
@@ -3215,6 +3324,47 @@
                 (store! i (+ (load i) 1))
                 0)))
     (load count)))
+
+;; Remove a local dense array after every observing load has forwarded away and the owner has not
+;; escaped. Its stores and resize nodes then carry only sequencing tokens; bypassing them exposes
+;; the allocation to ordinary dead-node cleanup.
+(defn g-eliminate-dead-local-arrays! [] (-> i64)
+  (let [limit (n-count)
+        (mut owner) 0
+        (mut removed) 0]
+    (loop (if (>= (load owner) limit)
+              (break)
+              (do
+                (if (and (not (n-dead? (load owner))) (= (n-op (load owner)) OP-ARRAYMARK))
+                    (let [(mut use-index) 0
+                          (mut local) true]
+                      (loop (if (or (not (load local))
+                                    (>= (load use-index) (n-nouts (load owner))))
+                                (break)
+                                (let [use (n-out (load owner) (load use-index))
+                                      op (n-op use)]
+                                  (if (and (or (= op OP-ARRAYSTORE) (= op OP-ARRAYRESIZE))
+                                           (= (n-in use 2) (load owner)))
+                                      0
+                                      (store! local false))
+                                  (store! use-index (+ (load use-index) 1)))))
+                      (if (load local)
+                          (let [(mut node) 0]
+                            (loop (if (>= (load node) limit)
+                                      (break)
+                                      (do
+                                        (if (and (not (n-dead? (load node)))
+                                                 (and (or (= (n-op (load node)) OP-ARRAYSTORE)
+                                                          (= (n-op (load node)) OP-ARRAYRESIZE))
+                                                      (= (n-in (load node) 2) (load owner))))
+                                            (do (n-subsume! (load node) (n-in (load node) 1))
+                                                (store! removed (+ (load removed) 1))) 0)
+                                        (store! node (+ (load node) 1))))))
+                          0))
+                    0)
+                (store! owner (+ (load owner) 1)))))
+    (if (> (load removed) 0) (g-changed!) 0)
+    (load removed)))
 
 (defn fun-parm-count [(fun i64)] (-> i64)
   (let [len (n-nouts fun)

@@ -1,265 +1,348 @@
-# Handoff: getting the last of it out of hand-written IR and into `lib/`
+# Handoff: V8 benchmark support, DSL coverage, and runtime performance
 
-`./tools/gate.sh` green at 533 tests in about 150 seconds, conformance at 30 programs.
+Last updated: 2026-08-10
 
-**The goal in one sentence: nothing in `src/frontend_native_graph.coil` computes a JavaScript
-result.** The frontend's job is to turn syntax into a graph; the semantics of every operation that
-graph performs should come from a definition in `lib/`. We are most of the way there, and the rest
-is described here in the order it has to happen.
+## Goal
 
-**For "is X done", read [docs/STATUS.md](docs/STATUS.md)** — generated, gate-checked, and derived
-from the frontend's own tables. This file is the plan. [docs/JSL.md](docs/JSL.md) is the language,
-[docs/CONVERSION.md](docs/CONVERSION.md) is the reasoning behind each conversion already made, and
-[docs/JOURNAL.md](docs/JOURNAL.md) has the history.
+Make every non-RegExp benchmark in the current V8 v7 corpus compile and run correctly through the
+AOT pipeline, then compare runtime performance with a properly warmed Node/V8 baseline.
 
----
+The authoritative benchmark list is:
 
-## What is actually left
+- Richards
+- DeltaBlue
+- Crypto
+- RayTrace
+- EarleyBoyer
+- Splay
+- NavierStokes
 
-Six things, and only six. This list was read out of `src/frontend_native_graph.coil` rather than
-remembered — every remaining call to an IR constructor that computes a JavaScript result:
+RegExp is intentionally excluded for now. “Supported” means the original benchmark executes its
+own correctness checks successfully; merely parsing, emitting an object file, or avoiding a crash
+does not count.
 
-| What | Where | Why it is still here |
+The broader project goal remains to express JavaScript semantics in the JSL DSL under `lib/`, with
+the compiler/runtime providing mechanisms rather than benchmark-specific behavior. If the DSL
+cannot express a required operation, extend it using a Torque-like design: typed low-level
+primitives, explicit control/effect flow, calls, allocation, and stable runtime ABIs. Do not add
+benchmark-specific hard-coded answers.
+
+## Current verified status
+
+| Benchmark | Current status | Evidence / blocker |
 |---|---|---|
-| 11 Math functions | `n-js-builtin!`, one site | `sqrt`, `pow`, `exp`, `log`, six trig, `random` |
-| Element read and write | `fng-array-load!` ×1, `fng-array-store!` ×2 | `xs[i]` and `xs[i] = v` — the spec's `[[Get]]`/`[[Set]]` |
-| Property read and write | `fng-prop-load!` ×2, `fng-prop-store!` ×3 | `o.p` and `o.p = v`, including the dynamic path |
-| `a.length` | `fng-array-length!` ×1 | reads the header directly |
-| Array resize | `fng-array-resize!` ×2 | assignment past the end, growing the array |
-| Multi-argument `String.fromCharCode` | `n-string-concat!` ×1 | a fold over the argument syntax |
+| Richards | Runs and passes its benchmark check | Last verified output: `result=0 collections=0 moves=0`. Current diagnostic build takes roughly 80 seconds. Reverify after the callable-ID changes described below. |
+| DeltaBlue | Parses and builds a graph; does not emit executable code | Fails graph verification with `VERR-CALL-ARITY`, currently around call node `n7094` depending on graph changes. The concrete target has hidden capture parameters that the generic call does not carry. |
+| Crypto | Not yet probed end-to-end in the current worktree | Waiting on the shared call ABI fix. |
+| RayTrace | Not yet probed end-to-end in the current worktree | Waiting on the shared call ABI fix. |
+| EarleyBoyer | Not yet probed end-to-end in the current worktree | Earlier notes mention legacy parser diagnostics; must be reprobed from current state. |
+| Splay | Not yet probed end-to-end in the current worktree | Waiting on the shared call ABI fix. |
+| NavierStokes | Not yet probed end-to-end in the current worktree | Waiting on the shared call ABI fix. |
 
-Plus 60 operations that do not compile at all. Those are not "hand-written" — there is nothing to
-move — but they are the bulk of the remaining work and the second half of this plan.
+There is no valid full benchmark/Node comparison table yet. Do not report performance numbers for
+a benchmark until its native result passes the benchmark's correctness checks.
 
-`n-string-const!`, `n-array-mark!` and `n-new-obj!` stay. They are allocation and graph
-construction, not semantics: there is no JavaScript behaviour in "this literal is a string" that a
-definition could express.
+## What was fixed during the benchmark work
 
----
+### Richards
 
-## Four blockers, and everything else waits on them
+Richards originally failed in polymorphic/dynamic method handling. The following areas were fixed
+or substantially advanced:
 
-These are not a backlog to work through in any order. Each is currently forcing a definition to be
-written around it, and three were discovered by trying. **Fix these first.** Each has a minimal
-reproducer that fits on one screen; start by making it fail.
+- Polymorphic method return values are normalized at indirect call boundaries.
+- Loose equality now treats `null` and `undefined` as nullish based on the actual runtime
+  representation rather than only the source declaration.
+- Function/call target lookup was corrected in several paths.
+- Dynamic and statically known object fields with globally incompatible layouts now consistently
+  use the generic `PropertyKey` storage path.
+- Receiver calls accept boxed function objects where JavaScript permits them.
+- Missing JavaScript arguments are explicitly materialized as `undefined` for statically known
+  callees.
 
-### 1. `jsl-inline!` cannot emit control flow inside a non-entry function
+Richards then completed with:
 
-    // integrated-heap-program.ts, with the guarded ToNumberValue restored
-    function sum(tree: Tree): number { return tree.value + sum(tree.left); }
-    // BER-MALFORMED-GRAPH: a New anchored at Start, MSEL-DEPENDENCY
+```text
+result=0 collections=0 moves=0
+```
 
-A definition containing an `if` expands fine in `main` and does not survive selection inside another
-function. It is why `ToNumberValue` is one bare `%ToNumber` node instead of the spec's own
-`(if (IsNumber v) v (%ToNumber v))` — which costs `call-loop` 9.6ms → 25.5ms and `math-loop` 73.3ms
-→ 97.3ms, on every dynamic arithmetic operand in the program.
+Its current runtime is not acceptable as a final performance result. Generic property lookup is a
+major contributor, and the build used extensive diagnostic paths.
 
-**What it unlocks:** the guard, and every future definition with a branch emitted anywhere but the
-entry function — which is most of them. **This is the highest-value fix in the file.** Start with
-the `New` anchored at `Start`: `jl-const` pins constants to `(g-start)`, which is the whole graph's
-start rather than the containing function's, and see whether that is what puts the allocation in the
-wrong owner.
+### Object literals and array chains
 
-### 2. A merge whose two arms both write the heap leaves an untyped memory Phi
+Earlier work in this worktree improved object literal construction, dynamic property handling, and
+array `map`/`filter`/`reduce` paths. The user’s performance target is:
 
-    (if c (let [(i (%ArrayStore a 0 x))] a)
-          (let [(i (%ArrayStore a 0 y))] a))
-    // MSEL-UNSUPPORTED on a Phi still carrying ANY
+- Every listed microbenchmark below 10x Node.
+- Ideally the `map`/`filter`/`reduce` chain below 3x Node.
 
-`jl-mem-phi` builds the merge and its type is never computed. Every heap-touching definition in
-`lib/` today happens to write on only one arm of any branch it contains, which is why nothing had
-exercised it — and why `StringSplit` had to be rewritten as one loop with one unconditional store.
-That is a real constraint on how a definition may be phrased, not a style note.
+Those optimizations and their tests are part of the existing dirty worktree. They must be preserved
+and revalidated after the benchmark ABI work.
 
-**What it unlocks:** `concat`, `fill`, `reverse`, `splice`, `unshift`, `flat`, `Array.from` — every
-allocating definition that wants a branch. Ten operations directly, and the shape of every one
-written after.
+## DeltaBlue: exact current failure
 
-### 3. A constant that folds a branch during construction desynchronises a Region and its Phi
+DeltaBlue heavily uses the old V8 benchmark inheritance idiom:
 
-    "ab".repeat(0)     // VERR-ARITY
-    "abc".split()      // VERR-ARITY, when the argument count is passed in as an int
+```js
+UnaryConstraint.superConstructor.call(this, strength);
+ScaleConstraint.superConstructor.prototype.addToGraph.call(this);
+```
 
-A literal that makes a branch provably dead is folded while the graph is still being built, and the
-Region loses an input the Phi still has. It is why `split` is two definitions chosen by argument
-count rather than one taking a flag.
+The frontend builds functions with hidden parameters in this order:
 
-**What it unlocks:** flags and counts as parameters, which is the natural way to write half the
-remaining definitions. It also removes a class of "works with a variable, fails with a literal" bug
-that will keep costing debugging time.
+1. lexical/runtime captures,
+2. receiver when present,
+3. explicit JavaScript parameters.
 
-### 4. JSL has no `%Call`
+Calls have corresponding captured and receiver-aware ABIs. This works when the frontend has an
+exact target or a finite target set. It breaks for generic property calls whose concrete target is
+only discovered by later property folding.
 
-`ArrayMapDouble` exists in `lib/` with the callback hardcoded to doubling, as a placeholder for the
-shape a real `map` will have. A definition cannot take a function as an argument.
+The failing graph has the shape:
 
-**What it unlocks:** `map`, `filter`, `forEach`, `reduce`, `reduceRight`, `find`, `findIndex`,
-`some`, `every`, `sort`, `flatMap` — eleven operations, and the largest single block on the
-not-supported list. This is a language feature rather than a bug fix: it needs a primitive, a
-calling convention through `jsl-inline!`, and a decision about whether the callback is inlined at
-the call site. It can be — the frontend knows the function statically in the common case.
+```text
+n7094: Call : dyn <- ... n148 ...
+n148: Fun ...
+```
 
----
+`n148` has eight live `Parm` nodes while the call supplies only the receiver/ordinary arguments.
+The extra parameters are global/cell captures. Verification correctly reports
+`VERR-CALL-ARITY`—weakening the verifier would allow shifted or uninitialized registers and produce
+incorrect execution.
 
-## Then, in this order
+### Root architectural issue
 
-Each step says what "done" means, because "converted" has meant three different things in this repo
-and only one of them is true.
+Script globals are currently propagated as variable-length lexical capture prefixes. Generic
+JavaScript calls cannot know which prefix to construct. Function target summaries are finite
+(63 usable identities in an `i64` bit set), while DeltaBlue has enough functions/methods to exceed
+that width.
 
-**Done means: `docs/STATUS.md` moves a row to `done`, a program in `tests/native-conformance/`
-exercises it, and an injected defect in the definition turns that program red.** The third clause is
-not optional — see the rules below.
+A temporary pass, `fe-prioritize-prototype-functions!`, attempted to renumber dynamically
+published methods into the finite range. It caused semantic identity mismatches among:
 
-### A. The heap accessors — `xs[i]`, `xs[i] = v`, `o.p`, `o.p = v`, `a.length`, resize
+- `FeFunction.id`,
+- lexical declaration/symbol IDs,
+- prototype parent/method tables,
+- capture ownership,
+- graph `OP-FUN` identities,
+- function objects stored in properties.
 
-These are six of the remaining hand-written operations and they are one family: the spec's `[[Get]]`
-and `[[Set]]`. `%ArrayLoad`, `%ArrayStore`, `%ArrayLen` and `%ArrayResize` already exist, and
-`ArrayAt`, `ArrayPop` and `ArraySlice` already use them, so the definitions are short. What makes it
-worth doing is not the code moved but what the definitions can then say in one place: a hole reads
-`undefined`, a negative index is a property and not an element, a write past the end grows. Those
-rules are spread across the frontend today.
+The pass is currently disabled at the call site in `src/frontend_native.coil`. Exact callable IDs
+remain stable; large target sets should use generic runtime dispatch rather than semantic
+renumbering. The pass itself still exists and can be removed or redesigned later.
 
-Do this after blocker 2 — an element write that may or may not grow the array is exactly a branch
-with a heap write on both arms.
+### Unsuccessful workaround that was removed
 
-### B. Multi-argument `String.fromCharCode`
+Padding every call to the maximum source parameter count with boxed `undefined` advanced some
+verifier failures but was incorrect. It does not know the hidden capture count or placement, so it
+can shift the receiver and explicit arguments into capture slots. That code was removed.
 
-The smallest item on the list. The single-argument case already goes through `StringFromCharCode`;
-the loop over additional arguments folds with `n-string-concat!`. It is a fold over the argument
-SYNTAX, like `push`, so the loop stays in the frontend — but each step should call `StringConcat`
-rather than build the node.
+An exact-target omitted-argument fallback remains in `fng-user-call`; it recovers the frontend
+function from `OP-FUN.aux - 1` and is valid for exact non-generic calls.
 
-### C. The 60 that do not compile
+## Recommended next implementation
 
-Ordered by what each group needs, which is how `docs/STATUS.md` groups them:
+Implement a fixed script/global environment ABI.
 
-1. **After blocker 4** — the eleven callback methods. Biggest single win, and the most-used
-   JavaScript in real code.
-2. **After blocker 2** — the ten allocating array methods.
-3. **Frontend intrinsics** (12) — `Object.keys`, `JSON`, `parseFloat`, `Infinity` as an identifier,
-   `codePointAt`. Each is the `Number` pattern: a constant in `fe-intrinsic-name`, a recognizer, a
-   dispatch arm, a definition. `Number` took an afternoon and four of its definitions already
-   existed, so this is the cheapest block per operation.
-4. **New syntax** (13) — template literals, destructuring, spread, `for...of`, `class`,
-   `try`/`catch`, arrow functions, `typeof`. Frontend work with little or no library component;
-   `try`/`catch` needs the throw path to become a real unwind.
-5. **A regex engine** (6) and **a bigger runtime** (8) — `Map`, `Set`, `Promise`, generators,
-   `Symbol`, `BigInt`, `Date`, modules. These are projects, not tasks.
+The clean design is:
 
-### D. libm, last, and only if you want it
+- Every user function that can access script globals receives one fixed hidden environment value.
+- The environment contains shared cells for mutable globals and ordinary values/cells for immutable
+  bindings as appropriate.
+- Global reads and writes use that environment instead of adding a different capture parameter for
+  each referenced global.
+- True lexical captures from nested functions remain closure-specific.
+- Generic calls can therefore use one stable descriptor regardless of the target.
+- The call descriptor should eventually carry explicit argument count (`argc`), allowing callee
+  prologues to materialize missing parameters as `undefined`, matching JavaScript without padding
+  all call sites.
 
-The 11 hand-written Math functions are the only rows on `docs/STATUS.md` that compile and are not
-from `lib/` — the whole `hand-written` column, and nothing else in the compiler is in it. Moving them means one of two things, and neither is a conversion in the sense the other
-rows are:
+This resembles V8/Torque’s separation between a stable function context and ordinary JavaScript
+arguments. It also scales beyond the finite target-summary width and is a prerequisite for robust
+generic calls across the remaining benchmarks.
 
-- **A rename.** There is no `%SqrtNum` — the primitive table stops at `%FloorNum`, `%CeilNum` and
-  `%RoundNum` — so this means ADDING one per function, each lowering to the same `OP-JSBUILTIN` the
-  frontend emits today, and wrapping it. `MathFloor` earns its wrapper because the library adds the
-  `if (%IsInt v)` guard; `sqrt` has no guard and no rule. Eighteen new primitives, five table edits
-  each, to make the checklist read `done` without changing a single instruction that runs.
-- **The actual algorithms in JSL.** A Newton iteration for `sqrt`, range reduction and a polynomial
-  for `exp`/`log`/trig, written in the DSL over `flt`. This is what "everything runs out of `lib/`"
-  honestly means, and the DSL can nearly express it already: `%Add`/`%Sub`/`%Mul`/`%Div` and the
-  comparisons all work over `flt`, and `%FloorNum` gives you range reduction. What is missing is bit
-  access to the exponent — the standard way to get a good initial estimate and to scale by a power
-  of two — so expect to want a `frexp`/`ldexp` pair or raw f64 bit moves.
+Likely implementation sequence:
 
-  The hard part is not the algorithm, it is the last bit. `tools/jsl-gate.sh` compares against Node
-  exactly, and a correctly-rounded libm is a research-grade problem. Budget for either matching
-  Node's exact bits or changing that gate to an ULP tolerance, and decide which BEFORE writing the
-  first polynomial.
+1. Separate global captures from lexical captures in `FeCapture` queries. Helpers are concentrated
+   around `fe-copy-global-captures!`, `fe-propagate-call-captures!`,
+   `fng-runtime-capture?`, `fng-symbol-capture-count`, and `fng-capture-symbol`.
+2. Allocate one script environment in the synthetic top-level/main graph.
+3. Add a fixed environment slot to user function/call ABI construction.
+4. Route `FE-ROLE-GLOBAL` storage through environment fields/cells.
+5. Stop copying global symbols into per-target capture lists.
+6. Keep local/nested lexical closure captures unchanged.
+7. Make DeltaBlue emit, link, run, and pass `chainTest` plus `projectionTest`.
+8. Re-run Richards immediately to catch ABI regressions.
 
-**Recommendation: the second or neither.** The first is bookkeeping that makes the checklist lie. If
-you take the second, do `sqrt` alone first and find out what the last-bit disagreement costs before
-committing to the trig functions.
+Do not solve this by making every dynamic call carry the union of all global captures. That would
+be correct only with a globally normalized ordering and would impose a large, growing call prefix;
+the fixed environment is simpler and scales properly.
 
----
+## Callable/source identity work currently present
 
-## Rules that must not be broken
+`FeFunction` now contains both `id` and `source-id`. This was introduced while diagnosing callable
+renumbering. Relevant changes include:
 
-Each was learned by breaking it, and each cost hours.
+- `fng-function-source-index`.
+- Function declaration publication through `source-id`.
+- Direct call target selection using callable `id`.
+- Capture ownership remapping code inside the now-disabled prioritization pass.
 
-**A `dyn`-returning definition must have the same representation on every arm.** A bare `undefined`
-or `null` in a JSL body is `Const : undef`, which selection materialises as the machine word 0 — the
-payload with no tag. Merge that with a boxed value and the Phi is a tag on one path and a plain
-integer on the other, which verifies clean and is read as whichever the consumer assumes. It cost
-`StringAt`, `ArrayAt` and `ArrayJoin` — the last of which answered `"1,undefined,null,4"` where Node
-says `"1,,,4"`. Write `(%Box undefined)`. `jsl-check` does not catch this; nothing does.
+With prioritization disabled, `source-id` usually equals the original function ID. Audit this split
+after DeltaBlue works; remove it if it no longer serves a real invariant, or populate it from the
+exact declaration symbol rather than name heuristics.
 
-**Every gate must be able to fail, and you must prove it by making it fail.** Not "the assertion
-looks right" — inject the defect and watch the gate go red. This caught worthless coverage six
-separate times, most recently on `split`, where two injected defects survived the first test file
-and needed a second one that reads the pieces back rather than counting them.
+There is also a temporary identifier-expression fallback that prefers a matching function
+declaration over stored symbol state. This helps declaration resolution but may bypass mutable
+reassignment semantics. It must be replaced with a principled binding/callable distinction before
+claiming complete JavaScript function semantics.
 
-**An operation the frontend does not name is unreachable no matter what gate it passes.** Twenty
-definitions sat in `lib/`, spec-annotated and verified against Node, that no program could call.
-`tools/jsl-native-gate.sh` says a definition compiles; only `tools/native-source-conformance.sh`
-says a program reaches it. `docs/STATUS.md` is generated and gate-checked so this cannot silently
-recur.
+## DSL status and hard-coded mechanisms
 
-**Put the arity in the recognizer.** `fng-string-builtin-arity?` refuses `lastIndexOf(needle, from)`
-because `StringLastIndexOf` cannot honour a `fromIndex`. A dropped argument is a wrong answer; a
-refused name is a message.
+The intended boundary is:
 
-**Types describe REPRESENTATION, not just the value set.** `box-compute` reports `dyn` and not
-`flt`, because a type carries a register class. And `n-ty` is not a proof while the graph is being
-built: ANY means "not analysed yet" and sits above every concrete type, so `ty-isa ANY num` is true
-and reads exactly like a proof that a value is already a machine number.
+- JavaScript algorithms and observable semantics belong in JSL definitions under `lib/`.
+- Allocation, raw memory access, GC barriers, machine representation changes, indirect call
+  mechanics, unwind support, and platform code generation are compiler/runtime primitives.
+- Frontend syntax lowering may choose a DSL definition, but should not independently compute the
+  JavaScript result.
 
-**A `Parm` is a tagged JavaScript value.** Anything handed to a callee that reads it through a
-declared type has to arrive boxed, and an object literal written in argument position has to be
-built with the parameter's shape or the callee's `Load#0` reads a field that is not there. Both were
-`SIGTRAP` and a silent 0 respectively, on three lines of ordinary TypeScript.
+Much array/string/conversion behavior is already expressed in JSL. Current unavoidable or
+unfinished hard-coded areas include:
 
-**Every corpus program ends in `| 0`.** `main` returns through an integer ABI. A test that returns a
-non-integral expression compares garbage.
+- Generic property/element access mechanisms and shape transitions.
+- Function/closure construction and call ABI.
+- GC/runtime allocation and write barriers.
+- Several Math operations lowered to native/runtime builtins.
+- JSON parsing/stringifying, which should ultimately be optimized native/JSL runtime code rather
+  than a slow generic user-level implementation.
+- Unsupported syntax/runtime families documented in `docs/STATUS.md`.
 
----
+The previous version of this handoff described four important DSL infrastructure gaps that remain
+relevant after benchmark correctness:
 
-## Known defects — all reproduce at `f3f5efe`, none fixed
+1. `jsl-inline!` control flow inside non-entry functions.
+2. Heap-writing control-flow merges leaving untyped memory Phis.
+3. Construction-time folded branches desynchronizing Regions and Phis.
+4. A general JSL `%Call` capability for callback-taking definitions.
 
-- **`a === a` is true when `a` is NaN.** `let a = Math.sign(NaN); a === a` is 1 natively, 0 in Node.
-  `cmp-idealize` excludes floats by name for exactly this reason, so it is the dynamic
-  strict-equality path comparing boxed words. `IsNaNValue` in `lib/abstract/conversions.jsl`
-  documents the same fact from the library's side and routes around it; nothing routes around it for
-  user code.
-- **The global `isNaN` on a dynamic array element does not compile.** `isNaN(v[0])` inside a ternary
-  is `MSEL-TERMINATOR`. `%IsNaN` is the coercing primitive and reaches the runtime; a call in a
-  ternary condition over a dynamic element is the shape that fails.
-- **A dynamic property read off a passed object answers 0.** `function get(t: any) { return t.value; }`
-  called with an object literal. The typed-shape path is fixed; this one needs the dynamic property
-  alias to reach the callee's memory `Arg`.
-- **`.length` on an array-typed parameter answers 0.** The declared type does not reach `fng-infer`
-  inside the callee, so it takes the generic property path instead of `ArrayLen`.
-- **An unused loop-carried accumulator fails verification with `VERR-LEAK`.** The Phi is live and
-  nothing can reach it; it takes a loop, and an unused `let` bound to anything else is fine.
-- **Random `coil test` suites die on signal 9.** Measured, not guessed: not a commit, not jetsam —
-  `coil test`'s fork-and-exec of a freshly written child. `tools/gate.sh` re-runs a suite that
-  reports it, up to three times, matching on the OUTPUT text, because `coil test` survives its own
-  child and exits 1 like any assertion failure.
+These are necessary for moving more semantics—especially callback array methods—fully into the
+DSL. Do not lose them while fixing the runtime ABI.
 
----
+## Benchmark and Node timing requirements
 
-## Working in this repo
+Once all runnable benchmarks pass correctness:
 
-- **Commit on `main`.** No feature branches; the gate is the safety mechanism.
-- **`./tools/gate.sh` green before every commit.** It takes about 150 seconds. If it takes materially
-  longer, something has regressed in the gate itself, and that is worth chasing: a gate people avoid
-  running is not a gate.
-- **The benchmark gate is opt-in: `./tools/gate.sh --bench`.** It was 242 seconds of a 700-second
-  gate and it fails on nothing.
-- **Regenerate the checklist when you change what compiles:** `node tools/status.mjs`. The gate
-  fails if you forget.
-- The gates: `jsl-gate.sh` (322 interpreter cases vs Node, two falsifications built in),
-  `jsl-native-gate.sh` (compiles every builtin, value-checks 14 against a golden),
-  `native-source-conformance.sh` (**the one that proves a conversion is reached**), `ts-gate.sh`,
-  `status.mjs --check`.
-- **Adding a primitive** means five tables in `src/jsl.coil` (const with `JSP-COUNT` bumped, name,
-  op, arity, `jsp-mem`), a branch in `jl-prim-mem` in `src/jsl_lower.coil`, and the declaration
-  counts in `tests/jsl-test.coil`.
-- **Adding a definition** means a file, a line in `lib/index` (**the order is part of the format** —
-  a declaration's position becomes its closed-world function index), and the counts in
-  `tests/jsl-test.coil`.
-- The emitter's `selection-item-node=N` diagnostic indexes the node array with a MACHINE instruction
-  index. It is meaningless; ignore it and instrument `ms-fail!`. The emitter's `-999` seed dumps the
-  ideal graph, which is usually what you actually want.
+- Measure runtime only, not compile time.
+- Node must receive real warmup. A minimum of 1,000 benchmark invocations is required before its
+  measured samples; use more for very small workloads.
+- AOT binaries do not require JIT warmup, but should still be sampled repeatedly and measured over
+  enough work to escape timer noise.
+- Validate outputs before timing.
+- Report every benchmark in one table with native time, warmed Node time, and native/Node ratio.
+- Do not call a small outer sample count “iterations”; distinguish warmup invocations, timed
+  invocations per sample, and sample count.
+
+Existing harness work includes:
+
+- `tools/v8-node-performance.mjs`
+- `tools/v8-performance-harness.c`
+- modifications to `tools/typescript-aot-benchmarks.mjs`
+- modifications to `tools/generate-typescript-aot-benchmark.mjs`
+
+Audit these before trusting results. Confirm the Node path performs at least 1,000 actual benchmark
+calls, not merely 20 outer timing rounds.
+
+## Useful commands and artifacts
+
+Current DeltaBlue diagnostic directory:
+
+```text
+.coil/debug/deltablue/declaration-precedence/
+```
+
+Rebuild and reproduce emission failure:
+
+```sh
+coil build .coil/debug/deltablue/declaration-precedence/deltablue.coil \
+  -o .coil/debug/deltablue/declaration-precedence/deltablue-emitter
+
+.coil/debug/deltablue/declaration-precedence/deltablue-emitter 0 10 \
+  > .coil/debug/deltablue/declaration-precedence/deltablue.o \
+  2> /tmp/deltablue-emitter.err
+
+rg 'verify=|^n7094:|Parm .*<- n148$' /tmp/deltablue-emitter.err
+```
+
+The exact node numbers can move after any graph change. Use the `verify=<code> node=<id>` line as
+the authority.
+
+Richards’ last known-correct binary was:
+
+```text
+.coil/debug/richards/nullish-fix/richards
+```
+
+Run formatting/diff hygiene after edits:
+
+```sh
+git diff --check
+git status --short
+```
+
+The full project gate was previously documented as:
+
+```sh
+./tools/gate.sh
+```
+
+Run focused tests while iterating, then the complete gate before declaring the benchmark work
+finished.
+
+## Worktree warning
+
+The worktree is intentionally dirty and contains substantial changes from earlier DSL,
+performance, runtime, backend, and benchmark work. Do not reset or discard unrelated changes.
+
+At the time of this handoff, modified/untracked paths included:
+
+```text
+lib/array/build.jsl
+src/backend_aarch64.coil
+src/backend_macho.coil
+src/backend_select.coil
+src/frontend_native.coil
+src/frontend_native_graph.coil
+src/jsl_lower.coil
+src/node.coil
+src/shape.coil
+src/verify.coil
+tests/jsl-test.coil
+tests/shape-test.coil
+tools/b15-adapt.mjs
+tools/generate-typescript-aot-benchmark.mjs
+tools/native-gc-runtime.c
+tools/typescript-aot-benchmarks.mjs
+tools/v8-node-performance.mjs
+tools/v8-performance-harness.c
+```
+
+Always inspect current diffs before modifying overlapping code.
+
+## Completion checklist
+
+Do not call this effort complete until all of the following are evidenced from the current
+worktree:
+
+- Richards passes correctness after the final ABI design.
+- DeltaBlue passes both benchmark correctness tests.
+- Crypto passes.
+- RayTrace passes.
+- EarleyBoyer passes.
+- Splay passes.
+- NavierStokes passes.
+- RegExp is clearly labeled excluded rather than silently omitted.
+- The full relevant test gate is green.
+- No benchmark-specific hard-coded result or semantic shortcut was introduced.
+- The DSL/compiler/runtime boundary is documented for every newly required primitive.
+- Properly warmed Node comparisons are run and reported in one complete table.

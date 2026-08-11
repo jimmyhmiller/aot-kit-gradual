@@ -478,14 +478,19 @@
 ; ============================================================================
 ; Transitions
 ; ============================================================================
-;; The memo lookup: the edge index for `(from, name)`, or -1. Linear, deterministic, and the reason
-;; `shape-transition` is idempotent.
-(defn shape-edge-find [(from i64) (nid i64)] (-> i64)
+;; The memo lookup: the edge index for `(from, name, representation)`, or -1. JavaScript objects
+;; may use the same visible key while different statically known layouts store that key in a raw
+;; numeric slot or a tagged slot. Those are distinct hidden-class transitions, just as they are in
+;; V8; source-visible field identity remains the name inside the resulting shape.
+(defn shape-edge-find [(from i64) (nid i64) (ty i64)] (-> i64)
   (let [p (shapes) n (shape-edge-count) (mut i) 0 (mut found) -1]
     (loop
       (if (or (>= (load i) n) (!= (load found) -1)) (break)
         (do (let [e (al-get (load (field p edges)) (load i))]
-              (if (and (= (se-from e) from) (= (se-name e) nid)) (store! found (load i)) 0))
+              (if (and (= (se-from e) from)
+                       (and (= (se-name e) nid) (= (se-ty e) ty)))
+                  (store! found (load i))
+                  0))
             (store! i (+ (load i) 1))
             0)))
     (load found)))
@@ -502,9 +507,9 @@
 ;;   - the chain already carries `name`: JavaScript's `o.x = 1` twice is a STORE, not a transition,
 ;;     and the front end must not reach here for it. Picking either the old or the new declared type
 ;;     would silently change which word a later load reads.
-;;   - an existing edge whose declared type differs: two call sites disagree about the program.
-;;     Meeting the two types is a decision about the source language, not about the table, and one
-;;     made here would be invisible.
+;; Multiple outgoing edges with the same name and different representations are valid: their
+;; descendants are different hidden classes. A repeated transition with the same representation
+;; remains idempotent.
 ;;
 ;; The declared type is required to be a lattice element the memory type can hold, for the same
 ;; reason `t-mem` requires it: a field holds one NaN-boxed value, so a field declared `ctrl` or a
@@ -515,15 +520,12 @@
   (if (ty-mem-contents-ok? ty) 0
     (do (shape-panic "shape-transition: a field's declared type must be a value, ANY or ALL") 0))
   (let [nid (shape-name-intern! name)
-        hit (shape-edge-find s nid)]
+        hit (shape-edge-find s nid ty)]
     (if (!= hit -1)
         ; MEMOISED. The same edge, so the same descendant, the same alias and the same offset,
         ; however many times the program adds the field. Nothing is appended, which is what the
         ; side-array-does-not-grow gate measures.
-        (let [e (shape-edge-at hit)]
-          (if (= (se-ty e) ty) 0
-            (do (shape-panic "shape-transition: an existing transition edge for this field declares a different type") 0))
-          (se-to e))
+        (se-to (shape-edge-at hit))
       (do (if (= (shape-find-field-nid s nid) SHAPE-NO-FIELD) 0
               (do (shape-panic "shape-transition: this shape already carries a field with that name") 0))
           (shape-transition-new! s nid ty)))))

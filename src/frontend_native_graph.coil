@@ -9,6 +9,7 @@
 (import "node" :use *)
 (import "shape" :use *)
 (import "jsstring" :use *)
+(import "jsvalue" :use *)
 (import "jsbuiltin" :use *)
 (import "jsbuiltin_desc" :use *)
 (import "jsl" :use *)
@@ -429,7 +430,10 @@
              (= (fe-resolution-symbol frontend node) FE-INTRINSIC-UNDEFINED)))))
 
 (defn fng-nullish-equal [(context FngContext) (source i64) (value i64)] (-> i64)
-  (if (= (fng-infer context source FNG-DYNAMIC) FNG-DYNAMIC)
+  ;; Property inference may know the declared class field while the actual load still crosses the
+  ;; tagged PropertyKey ABI. Choose the comparison from the value representation, not only the
+  ;; source-level declaration, so `undefined == null` remains true after a generic field load.
+  (if (or (= (n-ty value) (t-dyn)) (fng-tagged-dynamic-value? value))
       (fng-bin OP-BITOR
                (fng-bin OP-EQ value (n-box! (fng-null)))
                (fng-bin OP-EQ value (n-box! (fng-undefined))))
@@ -497,11 +501,19 @@
 (defn fng-number-value [(context FngContext) (source i64) (value i64)] (-> i64)
   (let [frontend (load (field context frontend))
         ast (field frontend ast)
+        declared-number-element
+          (and (= (ts-kind ast source) TSK-ELEMENT-ACCESS)
+               (let [base (ts-child ast source 0)]
+                 (and (= (ts-kind ast base) TSK-IDENTIFIER)
+                      (fng-number-array-symbol? frontend
+                                                (fe-resolution-symbol frontend base)))))
         captured-cell
           (and (= (ts-kind ast source) TSK-IDENTIFIER)
                (let [symbol (fe-resolution-symbol frontend source)]
                  (and (>= symbol 0) (fng-symbol-cell? context symbol))))]
-  (if (fng-needs-to-number? value captured-cell)
+  (if declared-number-element
+      (n-unbox! value (t-flt))
+      (if (fng-needs-to-number? value captured-cell)
       (if (or (= (n-op value) OP-CALL)
               (or (= (n-op value) OP-ADD)
                   (or (= (n-op value) OP-SUB)
@@ -509,7 +521,7 @@
                           (or (= (n-op value) OP-DIV) (= (n-op value) OP-MOD))))))
           value
           (fng-to-number-operand context value))
-      value)))
+      value))))
 
 (defn fng-numeric-equality-peer? [(value i64)] (-> bool)
   (let [ty (n-ty value)]
@@ -556,9 +568,12 @@
             named (fe-type-index-for-node frontend type-node)]
         (cond (!= named -1) named
               (= kind TSK-NUMBER) FNG-NUMBER
+              (= kind TSK-NUMERIC-LITERAL) FNG-NUMBER
               (= kind TSK-BOOLEAN) FNG-BOOLEAN
+              (or (= kind TSK-TRUE) (= kind TSK-FALSE)) FNG-BOOLEAN
               (= kind TSK-NULL) FNG-NULL
               (= kind TSK-STRING) FNG-STRING
+              (= kind TSK-STRING-LITERAL) FNG-STRING
               (= kind TSK-ARRAY-LITERAL) FNG-ARRAY
               (= kind TSK-VOID) FNG-VOID
               :else FNG-DYNAMIC))))
@@ -614,17 +629,46 @@
   (let [ast (field frontend ast)
         name (ts-text ast name-node)
         (mut index) 0
-        (mut answer) -1]
+        (mut answer) -1
+        (mut local) -1
+        (mut compatible) true]
     (loop (if (>= (load index) (al-len [FeField] (load (field frontend fields))))
               (break)
               (let [field-value (al-get [FeField] (load (field frontend fields)) (load index))]
                 (if (str-eq name (fe-field-name frontend (load index)))
-                    (if (= (load answer) -1)
-                        (store! answer (load index))
-                        (store! answer -2))
+                    (let [owner (load (field field-value owner))
+                          type (al-get [FeTypeDecl] (load (field frontend types)) owner)
+                          candidate-local (- (load index) (load (field type field-start)))]
+                      (if (= (load answer) -1)
+                          (do (store! answer (load index))
+                              (store! local candidate-local))
+                          (if (!= (load local) candidate-local)
+                              (store! compatible false)
+                              0)))
                     0)
                 (store! index (+ (load index) 1)))))
-    (if (= (load answer) -2) -1 (load answer))))
+    (if (load compatible) (load answer) -1)))
+
+(defn fng-compatible-field-memory [(context FngContext) (name-node i64) (representative i64)] (-> i64)
+  (let [frontend (load (field context frontend))
+        ast (field frontend ast)
+        name (ts-text ast name-node)
+        fields (load (field frontend fields))
+        (mut memories) (al-new [i64] (malloc-allocator))
+        (mut index) 0]
+    (loop (if (>= (load index) (al-len [FeField] fields))
+              (break)
+              (do
+                (if (str-eq name (fe-field-name frontend (load index)))
+                    (let [alias (al-get [i64] (load (load (field context aliases))) (load index))]
+                      (al-push! [i64] (mut memories) (fng-current-memory context alias)))
+                    0)
+                (store! index (+ (load index) 1)))))
+    (let [memory (if (= (al-len [i64] (load memories)) 1)
+                     (al-get [i64] (load memories) 0)
+                     (fng-merge memories))]
+      (al-free! [i64] (mut memories))
+      memory)))
 
 (defn fng-field-local-index [(frontend (ptr NativeFrontend)) (field-index i64)] (-> i64)
   (let [field-value (al-get [FeField] (load (field frontend fields)) field-index)
@@ -827,6 +871,17 @@
               (break)
               (let [fn (al-get [FeFunction] (load (field frontend functions)) (load index))]
                 (if (= (load (field fn id)) id) (store! answer (load index)) 0)
+                (store! index (+ (load index) 1)))))
+    (load answer)))
+
+(defn fng-function-source-index [(frontend (ptr NativeFrontend)) (source-id i64)] (-> i64)
+  (let [(mut index) 0 (mut answer) -1]
+    (loop (if (or (>= (load index) (al-len [FeFunction] (load (field frontend functions))))
+                  (!= (load answer) -1))
+              (break)
+              (let [fn (al-get [FeFunction] (load (field frontend functions)) (load index))]
+                (if (= (load (field fn source-id)) source-id)
+                    (store! answer (load index)) 0)
                 (store! index (+ (load index) 1)))))
     (load answer)))
 
@@ -1120,6 +1175,28 @@
                 (store! index (+ (load index) 1)))))
     (load answer)))
 
+(defn fng-number-array-symbol? [(frontend (ptr NativeFrontend)) (symbol-id i64)] (-> bool)
+  (let [(mut index) 0 (mut answer) false]
+    (loop (if (or (load answer)
+                  (>= (load index) (al-len [FeSymbol] (load (field frontend symbols)))))
+              (break)
+              (let [symbol (al-get [FeSymbol] (load (field frontend symbols)) (load index))]
+                (if (= (load (field symbol id)) symbol-id)
+                    (let [type-node (load (field symbol type-node))]
+                      (if (>= type-node 0)
+                          (let [text (ts-text (field frontend ast) type-node)
+                                length (slice-len text)]
+                            (if (and (>= length 2)
+                                     (and (str-eq (substr text (- length 2) length) "[]")
+                                          (or (= (fng-type-tag frontend
+                                                               (ts-child (field frontend ast)
+                                                                         type-node 0))
+                                                 FNG-NUMBER)
+                                              (str-eq text "number[]"))))
+                                (store! answer true) 0)) 0)) 0)
+                (store! index (+ (load index) 1)))))
+    (load answer)))
+
 ; Closed-world JavaScript field inference. A dynamic property is array-valued only
 ; when every direct assignment to that property in the compilation unit creates an
 ; array. State: 0 = unseen, 1 = array-only, 2 = conflicting/non-array assignment.
@@ -1204,6 +1281,14 @@
               (or (= kind TSK-TRUE) (= kind TSK-FALSE)) FNG-BOOLEAN
               (= kind TSK-NULL) FNG-NULL
               (= kind TSK-ARRAY-LITERAL) FNG-ARRAY
+              (= kind TSK-ELEMENT-ACCESS)
+                (let [base (ts-child ast node 0)]
+                  (if (and (= (ts-kind ast base) TSK-IDENTIFIER)
+                           (fng-number-array-symbol? frontend
+                                                     (fe-resolution-symbol frontend base)))
+                      FNG-NUMBER
+                      FNG-DYNAMIC))
+              (= kind TSK-OBJECT-LITERAL) (fe-type-index-for-decl-node frontend node)
               (or (= kind TSK-CALL) (= kind TSK-NEW-EXPRESSION))
                 (if (and (= kind TSK-NEW-EXPRESSION)
                          (= (fe-resolution-symbol frontend (ts-child ast node 0)) FE-INTRINSIC-OBJECT))
@@ -1520,13 +1605,18 @@
                               (load index))
                     target (load (field method target))]
                 (if (str-eq name (ts-text ast (load (field method name-node))))
-                    (let [count (fng-capture-count frontend target)]
-                      (if (or (< target 0) (>= target 63))
+                    (let [count (fng-capture-count frontend target)
+                          ;; Function payload zero is reserved by the runtime, so graph Fun nodes
+                          ;; and boxed function values use source id + 1. Target summaries must use
+                          ;; that same identity; otherwise polymorphic dispatch selects the method
+                          ;; immediately preceding the one stored in the object.
+                          runtime-target (+ target 1)]
+                      (if (or (< target 0) (>= runtime-target 63))
                           (store! valid false)
                           (if (= (load captures) -1)
                               (store! captures count)
                               (if (!= (load captures) count) (store! valid false) 0)))
-                      (store! targets (| (load targets) (<< 1 target))))
+                      (store! targets (| (load targets) (<< 1 runtime-target))))
                     0)
                 (store! index (+ (load index) 1)))))
     (if (load valid) (load targets) 0)))
@@ -2331,6 +2421,22 @@
     (store! (index p 3) d)
     (fng-jsl-call context name (slice-new [i64] p 4))))
 
+(defn fng-jsl-call5 [(context FngContext) (name (slice u8))
+                      (a i64) (b i64) (c i64) (d i64) (e i64)] (-> i64)
+  (let [buf (stack (array i64 5)) p (cast (ptr i64) buf)]
+    (store! (index p 0) a) (store! (index p 1) b) (store! (index p 2) c)
+    (store! (index p 3) d) (store! (index p 4) e)
+    (fng-jsl-call context name (slice-new [i64] p 5))))
+
+(defn fng-jsl-call9 [(context FngContext) (name (slice u8))
+                      (a i64) (b i64) (c i64) (d i64) (e i64)
+                      (f i64) (g i64) (h i64) (i i64)] (-> i64)
+  (let [buf (stack (array i64 9)) p (cast (ptr i64) buf)]
+    (store! (index p 0) a) (store! (index p 1) b) (store! (index p 2) c)
+    (store! (index p 3) d) (store! (index p 4) e) (store! (index p 5) f)
+    (store! (index p 6) g) (store! (index p 7) h) (store! (index p 8) i)
+    (fng-jsl-call context name (slice-new [i64] p 9))))
+
 ;; A string-valued argument at `child`, or the constant a missing one coerces to.
 ;;
 ;; ToString of an ABSENT argument is the string "undefined", not the undefined value, and every
@@ -2655,13 +2761,96 @@
         (al-get [i64] (load (load (field context functions))) index)
         (fng-expression context node))))
 
+(defn fng-array-callback-function? [(frontend (ptr NativeFrontend)) (node i64) (fun-id i64)] (-> bool)
+  (let [ast (field frontend ast)
+        kind (ts-kind ast node)
+        (mut found) false
+        (mut index) 0]
+    (if (and (= kind TSK-CALL) (> (ts-child-count ast node) 1))
+        (let [callee (ts-child ast node 0)]
+          (if (and (= (ts-kind ast callee) TSK-PROPERTY-ACCESS)
+                   (let [name (ts-text ast (ts-child ast callee 1))]
+                     (and (or (str-eq name "map")
+                              (or (str-eq name "filter")
+                                  (or (str-eq name "reduce") (str-eq name "reduceRight"))))
+                          (= (fe-resolution-symbol frontend (ts-child ast node 1)) fun-id))))
+              (store! found true) 0)) 0)
+    (loop (if (or (load found) (>= (load index) (ts-child-count ast node)))
+              (break)
+              (do (store! found
+                          (fng-array-callback-function? frontend
+                                                        (ts-child ast node (load index)) fun-id))
+                  (store! index (+ (load index) 1)))))
+    (load found)))
+
 (defn fng-array-callback-call [(context FngContext) (node i64) (name (slice u8))] (-> i64)
   (let [frontend (load (field context frontend))
         ast (field frontend ast)
         callee (ts-child ast node 0)
-        array (fng-expression context (ts-child ast callee 0))
-        callback (fng-callback-value context (ts-child ast node 1))]
-    (cond (str-eq name "map") (fng-jsl-call2 context "ArrayMap" array callback)
+        source-node (ts-child ast callee 0)
+        literal (= (ts-kind ast source-node) TSK-ARRAY-LITERAL)
+        literal-count (if literal (ts-child-count ast source-node) 0)
+        callback-node (ts-child ast node 1)
+        callback-symbol (fe-resolution-symbol frontend callback-node)
+        callback-index (fng-function-index frontend callback-symbol)
+        callback-parameters
+          (if (>= callback-index 0)
+              (load (field (index (load (field (field frontend functions) data)) callback-index)
+                           parameter-count))
+              99)
+        value-specialized
+          (and literal
+               (or (and (= literal-count 8)
+                        (and (str-eq name "filter") (< callback-parameters 3)))
+                   (and (str-eq name "reduce") (< callback-parameters 4))))
+        (mut literal-values) (al-new [i64] (malloc-allocator))
+        array (if value-specialized NO-NODE (fng-expression context source-node))
+        callback (fng-callback-value context callback-node)]
+    ;; Preserve array-literal evaluation order even when the allocation itself is proven
+    ;; unobservable to this closed callback signature.
+    (if value-specialized
+        (let [(mut value-index) 0]
+          (loop (if (>= (load value-index) literal-count)
+                    (break)
+                    (do (al-push! [i64] (mut literal-values)
+                                  (n-box! (fng-expression context
+                                                         (ts-child ast source-node
+                                                                   (load value-index)))))
+                        (store! value-index (+ (load value-index) 1)))))) 0)
+    (let [answer
+    (cond (and literal (str-eq name "map"))
+            (let [(mut out) (fng-jsl-call0 context "NewArray")
+                  (mut index) 0]
+              (loop (if (>= (load index) literal-count)
+                        (break)
+                        (do (store! out (fng-jsl-call4 context "ArrayMapAt" array callback
+                                                       (load out) (fng-const (load index))))
+                            (store! index (+ (load index) 1)))))
+              (load out))
+          (and value-specialized (str-eq name "filter"))
+            (fng-jsl-call9 context "ArrayFilterLiteral8" callback
+                           (al-get [i64] (load literal-values) 0)
+                           (al-get [i64] (load literal-values) 1)
+                           (al-get [i64] (load literal-values) 2)
+                           (al-get [i64] (load literal-values) 3)
+                           (al-get [i64] (load literal-values) 4)
+                           (al-get [i64] (load literal-values) 5)
+                           (al-get [i64] (load literal-values) 6)
+                           (al-get [i64] (load literal-values) 7))
+          (and value-specialized (str-eq name "reduce") (> (ts-child-count ast node) 2))
+            (let [(mut accumulator)
+                    (n-box! (fng-expression context (ts-child ast node 2)))
+                  (mut index) 0]
+              (loop (if (>= (load index) literal-count)
+                        (break)
+                        (do (store! accumulator
+                                    (fng-jsl-call4 context "ArrayReduceValueAt"
+                                                   (al-get [i64] (load literal-values) (load index))
+                                                   callback
+                                                   (load accumulator) (fng-const (load index))))
+                            (store! index (+ (load index) 1)))))
+              (load accumulator))
+          (str-eq name "map") (fng-jsl-call2 context "ArrayMap" array callback)
           (str-eq name "filter") (fng-jsl-call2 context "ArrayFilter" array callback)
           (str-eq name "forEach") (fng-jsl-call2 context "ArrayForEach" array callback)
           (str-eq name "find") (fng-jsl-call2 context "ArrayFind" array callback)
@@ -2678,7 +2867,9 @@
             (if (> (ts-child-count ast node) 2)
                 (fng-jsl-call3 context "ArrayReduceRightInitial" array callback
                                (n-box! (fng-expression context (ts-child ast node 2))))
-                (fng-jsl-call2 context "ArrayReduceRight" array callback)))))
+                (fng-jsl-call2 context "ArrayReduceRight" array callback)))]
+      (al-free! [i64] (mut literal-values))
+      answer)))
 
 (defn fng-array-call [(context FngContext) (node i64)] (-> i64)
   (let [frontend (load (field context frontend))
@@ -2749,7 +2940,7 @@
               (break)
               (do
                 (if (!= (& targets (<< 1 (load index))) 0)
-                    (store! answer (load index))
+                    (store! answer (- (load index) 1))
                     0)
                 (store! index (+ (load index) 1)))))
     (load answer)))
@@ -2762,14 +2953,15 @@
               (break)
               (do
                 (if (!= (& targets (<< 1 (load index))) 0)
-                    (let [function-index (fng-function-index frontend (load index))]
+                    (let [source-target (- (load index) 1)
+                          function-index (fng-function-index frontend source-target)]
                       (if (>= function-index 0)
                           (let [fn (al-get [FeFunction]
                                            (load (field frontend functions))
                                            function-index)
                                 count (load (field fn parameter-count))]
                             (if (> count (load widest))
-                                (do (store! answer (load index)) (store! widest count))
+                                (do (store! answer source-target) (store! widest count))
                                 0))
                           0))
                     0)
@@ -2985,8 +3177,10 @@
                         inherited
                         (if (>= unique 0) unique typed))))
               (let [resolved (fe-resolution-symbol frontend callee-node)
-                    local-target (fng-local-function-target frontend callee-node)]
-                (if (>= local-target 0) local-target resolved))))
+                    local-target (fng-local-function-target frontend callee-node)
+                    declaration-target (fe-find-function-name frontend callee-node)]
+                (if (>= declaration-target 0) declaration-target
+                    (if (>= local-target 0) local-target resolved)))))
         ;; A property-call syntax does not by itself add a receiver slot to a statically resolved
         ;; function. Static namespace helpers such as Strength.stronger(s1, s2) do not compile a
         ;; `this` Parm; passing the base object shifts every explicit argument by one. Unresolved
@@ -3039,21 +3233,23 @@
                       (fng-undefined))
                   NO-NODE)))
         receiver
-          (if (and (not construct)
-                   (and (>= receiver-owner 0)
-                        (= (n-ty raw-receiver) (t-dyn))))
-              (n-unbox! raw-receiver
-                        (t-obj-shape
-                          (al-get [i64] (load (load (field context shapes))) receiver-owner)))
+          (if (and (not construct) (!= raw-receiver NO-NODE))
+              (if (!= (& (ty-kinds (n-ty raw-receiver)) VK-FUN) 0)
+                  (n-box! raw-receiver)
+                  (if (and (>= receiver-owner 0) (= (n-ty raw-receiver) (t-dyn)))
+                      (n-unbox! raw-receiver
+                                (t-obj-shape
+                                  (al-get [i64] (load (load (field context shapes))) receiver-owner)))
+                      raw-receiver))
               raw-receiver)
         target
-          (if (and (>= callee 0)
-                   (< callee (al-len [FeFunction] (load (field frontend functions)))))
+          (if (>= function-index 0)
+                  (let [function-id (load (field fn id))]
                   (if (> method-targets 0)
-                  (al-get [i64] (load (load (field context functions))) callee)
-                  (if (> (fng-capture-count frontend callee) 0)
+                  (al-get [i64] (load (load (field context functions))) function-id)
+                  (if (> (fng-capture-count frontend function-id) 0)
                   (fng-expression context callee-node)
-                  (al-get [i64] (load (load (field context functions))) callee)))
+                  (al-get [i64] (load (load (field context functions))) function-id))))
               (if (and receiver-call (< function-index 0))
                   (do
                     (fng-record-dynamic-alias! context JS-PROPERTY-ALIAS)
@@ -3126,8 +3322,14 @@
                 (fng-jsl-call2 context "SetObjectPrototype" receiver prototype)]
           0)
         0)
-    (if (> method-targets 0)
-        (let [representative (fng-first-function-target method-targets)
+    (if (or (> method-targets 0)
+            (or (and explicit-call (>= function-index 0)) (= (n-op target) OP-FUN)))
+        (let [representative
+                (if (> method-targets 0)
+                    (fng-first-function-target method-targets)
+                    (if (and explicit-call (>= function-index 0))
+                        (load (field fn id))
+                        (- (n-aux target) 1)))
               count (fng-capture-count frontend representative)
               (mut capture-index) 0]
           (loop (if (>= (load capture-index) count)
@@ -3168,6 +3370,28 @@
                               (mut args)
                               (fng-call-argument frontend argument-fn ordinal (fng-undefined))))))
         0)
+    ;; Name/symbol resolution and callable dispatch use separate id spaces.  A call can therefore
+    ;; reach an exact Fun even when the source-level lookup above could not recover its FeFunction.
+    ;; Recover that identity from the graph target before freezing the native call descriptor, so
+    ;; omitted JavaScript arguments still arrive as `undefined` instead of uninitialised registers.
+    (if (and (< argument-function-index 0) (= (n-op target) OP-FUN))
+        ;; OP-FUN reserves callable identity zero as invalid, so its aux is FeFunction.id + 1.
+        (let [target-function-index (fng-function-index frontend (- (n-aux target) 1))]
+          (if (>= target-function-index 0)
+              (let [target-fn
+                      (al-get [FeFunction]
+                              (load (field frontend functions))
+                              target-function-index)]
+                (loop (if (>= (al-len [i64] (load args))
+                                (load (field target-fn parameter-count)))
+                          (break)
+                          (let [ordinal (al-len [i64] (load args))]
+                            (al-push! [i64]
+                                      (mut args)
+                                      (fng-call-argument frontend target-fn ordinal
+                                                         (fng-undefined)))))))
+              0))
+        0)
     ;; A trailing memory input is an effect token, not a JavaScript argument. It publishes all
     ;; stores that precede the call and lets the callee's memory Args inherit that heap version.
     (fng-ensure-memory! context)
@@ -3175,9 +3399,10 @@
         (al-push! [i64] (mut args) (load (load (field context memory))))
         0)
     (let [callable-target
-            (if conditional-optional
-                (n-new2 OP-CAST (t-fun) (load (load (field context ctrl))) target)
-                target)
+            (let [resolved-target (if (= target NO-NODE) (fng-undefined) target)]
+              (if conditional-optional
+                  (n-new2 OP-CAST (t-fun) (load (load (field context ctrl))) resolved-target)
+                  resolved-target))
           call
             (if receiver-aware
                 (if (> (al-len [i64] (load call-captures)) 0)
@@ -3426,10 +3651,16 @@
   (let [frontend (load (field context frontend))
         ast (field frontend ast)
         owner (fng-infer context object-node FNG-DYNAMIC)
+        globally-compatible (fng-unique-field-index frontend name-node)
         field-index
-          (if (< owner 0)
-              (fng-unique-field-index frontend name-node)
-              (fng-field-index frontend owner name-node))
+          ;; A property name must use one representation throughout the closed world. If classes
+          ;; assign the same name at incompatible offsets, prototype methods with a dynamic `this`
+          ;; cannot address a shape slot soundly; route even statically-known constructor writes
+          ;; through the PropertyKey table instead.
+          (if (= globally-compatible -1)
+              -1
+              (if (< owner 0) globally-compatible
+                  (fng-field-index frontend owner name-node)))
         field-owner
           (if (< field-index 0)
               owner
@@ -3454,7 +3685,10 @@
                 (let [alias (al-get [i64] (load (load (field context aliases))) field-index)
                       shape (al-get [i64] (load (load (field context shapes))) field-owner)
                       cast-node (n-new2 OP-CAST (t-obj-shape shape) (load (load (field context ctrl))) object)]
-                  (n-load! (fng-current-memory context alias) cast-node alias)))))))
+                  (n-load! (if (< owner 0)
+                               (fng-compatible-field-memory context name-node field-index)
+                               (fng-current-memory context alias))
+                           cast-node alias)))))))
 
 (defn fng-field-load [(context FngContext) (node i64)] (-> i64)
   (let [frontend (load (field context frontend))
@@ -3538,7 +3772,17 @@
             (let [object-node (ts-child ast node 0)
                   name-node (ts-child ast node 1)
                   owner (fng-infer context object-node FNG-DYNAMIC)
-                  field-index (if (< owner 0) -1 (fng-field-index frontend owner name-node))]
+                  globally-compatible (fng-unique-field-index frontend name-node)
+                  field-index
+                    (if (= globally-compatible -1)
+                        -1
+                        (if (< owner 0) globally-compatible
+                            (fng-field-index frontend owner name-node)))
+                  field-owner
+                    (if (< field-index 0)
+                        owner
+                        (load (field (index (load (field (field frontend fields) data)) field-index)
+                                     owner)))]
               (store! (field value kind) FNG-LVALUE-FIELD)
               (store! (field value object) (fng-expression context object-node))
               (if (= field-index -1)
@@ -3553,7 +3797,7 @@
                     (store! (field value alias)
                             (al-get [i64] (load (load (field context aliases))) field-index))
                     (store! (field value shape)
-                            (al-get [i64] (load (load (field context shapes))) owner))
+                            (al-get [i64] (load (load (field context shapes))) field-owner))
                     0)))
             (let [object-node (ts-child ast node 0)
                   key-node (ts-child ast node 1)]
@@ -3818,7 +4062,12 @@
                     (= symbol FE-INTRINSIC-INFINITY) (fng-jsl-call0 context "Infinity")
                     (< symbol 0) NO-NODE
                     :else
-                      (let [value (fng-symbol-node context symbol)]
+                      (let [stored (fng-symbol-node context symbol)
+                            declaration (fe-find-function-name frontend node)
+                            value
+                              (if (>= declaration 0)
+                                  (al-get [i64] (load (load (field context functions))) declaration)
+                                  stored)]
                         ;; Parameter nodes use the tagged JavaScript call ABI. When a typed
                         ;; context consumes a numeric identifier directly (object fields,
                         ;; annotated initializers, and returns), make the representation boundary
@@ -4065,20 +4314,32 @@
                                              (fng-number-value context right-node right)
                                              (fng-number-value context left-node left)))
                               (str-eq operator "===")
-                                (if (and (= (fng-infer context left-node FNG-DYNAMIC) FNG-STRING)
-                                         (= (fng-infer context right-node FNG-DYNAMIC) FNG-STRING))
-                                    (fng-jsl-call2 context "StringEquals" left right)
-                                    (fng-jsl-call2 context "StrictEqual"
-                                                   (fng-box-dynamic-argument! left)
-                                                   (fng-box-dynamic-argument! right)))
+                                (cond (and (= (fng-infer context left-node FNG-DYNAMIC) FNG-NUMBER)
+                                           (and (= (fng-infer context right-node FNG-DYNAMIC) FNG-NUMBER)
+                                                (and (!= (n-ty left) (t-dyn))
+                                                     (!= (n-ty right) (t-dyn)))))
+                                        (fng-bin OP-EQ left right)
+                                      (and (= (fng-infer context left-node FNG-DYNAMIC) FNG-STRING)
+                                           (= (fng-infer context right-node FNG-DYNAMIC) FNG-STRING))
+                                        (fng-jsl-call2 context "StringEquals" left right)
+                                      :else
+                                        (fng-jsl-call2 context "StrictEqual"
+                                                       (fng-box-dynamic-argument! left)
+                                                       (fng-box-dynamic-argument! right)))
                               (str-eq operator "!==")
                                 (let [equal
-                                        (if (and (= (fng-infer context left-node FNG-DYNAMIC) FNG-STRING)
-                                                 (= (fng-infer context right-node FNG-DYNAMIC) FNG-STRING))
-                                            (fng-jsl-call2 context "StringEquals" left right)
-                                            (fng-jsl-call2 context "StrictEqual"
-                                                           (fng-box-dynamic-argument! left)
-                                                           (fng-box-dynamic-argument! right)))]
+                                        (cond (and (= (fng-infer context left-node FNG-DYNAMIC) FNG-NUMBER)
+                                                   (and (= (fng-infer context right-node FNG-DYNAMIC) FNG-NUMBER)
+                                                        (and (!= (n-ty left) (t-dyn))
+                                                             (!= (n-ty right) (t-dyn)))))
+                                                (fng-bin OP-EQ left right)
+                                              (and (= (fng-infer context left-node FNG-DYNAMIC) FNG-STRING)
+                                                   (= (fng-infer context right-node FNG-DYNAMIC) FNG-STRING))
+                                                (fng-jsl-call2 context "StringEquals" left right)
+                                              :else
+                                                (fng-jsl-call2 context "StrictEqual"
+                                                               (fng-box-dynamic-argument! left)
+                                                               (fng-box-dynamic-argument! right)))]
                                   (fng-bin OP-EQ equal (fng-const 0)))
                               (str-eq operator "!=")
                                 (let [equal
@@ -4159,9 +4420,10 @@
           (= kind TSK-NEW-EXPRESSION)
             (if (fng-error-constructor? context node) (fng-error-constructor context node) (fng-call context node))
           (= kind TSK-OBJECT-LITERAL)
-            (if (= expected FNG-DYNAMIC)
+            (let [inferred (fe-type-index-for-decl-node frontend node)]
+            (if (and (= expected FNG-DYNAMIC) (< inferred 0))
                 (fng-dynamic-object context node)
-                (fng-object context node expected))
+                (fng-object context node (if (= expected FNG-DYNAMIC) inferred expected))))
           (= kind TSK-ARRAY-LITERAL) (fng-array-literal context node)
           (fe-function-expression-kind? kind) (fng-closure-expression context node)
           (= kind TSK-PROPERTY-ACCESS)
@@ -4340,9 +4602,9 @@
                 ; Nested declarations belong to their lexical invocation. Publishing
                 ; their function object/prototype here would embed a parent function's
                 ; allocation directly in the synthetic top-level graph.
-                (if (and (!= (load (field fn id)) (load (field context owner)))
-                         (and (= (load (field fn parent)) -1)
-                              (= (fng-symbol-storage context (load index)) NO-NODE)))
+                (if (and (= (ts-kind ast (load (field fn node))) TSK-FUNCTION-DECLARATION)
+                         (and (!= (load (field fn id)) (load (field context owner)))
+                              (= (load (field fn parent)) -1)))
                     (let [object
                             (al-get [i64]
                                     (load (load (field context functions)))
@@ -4351,8 +4613,8 @@
                       ; capture its own constructor. A top-level non-capturing declaration's Fun
                       ; id is also its JavaScript object identity; the runtime property side table
                       ; canonicalizes boxed and raw function ids to this same owner.
-                      (fng-set-symbol! context (load index) object)
-                      (let [prototype (fng-constructor-prototype! context (load index))
+                      (fng-set-symbol! context (load (field fn source-id)) object)
+                      (let [prototype (fng-constructor-prototype! context (load (field fn id)))
                           stored
                             (n-peephole
                               (n-new4 OP-PROPSTORE
@@ -5779,10 +6041,26 @@
                               (al-get [FeSymbol]
                                       (load (field frontend symbols))
                                       (+ (load (field fn parameter-start)) (load index)))]
-                        (al-set! [i64]
-                                 (mut values)
-                                 (load (field symbol id))
-                                 (n-parm! fun (+ (+ capture-count receiver-count) (load index))))
+                        (let [parameter
+                                (n-parm! fun (+ (+ capture-count receiver-count) (load index)))
+                              declared (fng-parameter-type frontend fn (load index))]
+                          ;; A declared `number` parameter already has a tagged-number ABI at every
+                          ;; statically typed call boundary. Publish its machine value directly;
+                          ;; rebuilding JavaScript's generic ToNumber control diamond in the callee
+                          ;; made tiny callbacks impossible to inline and repeated work the caller's
+                          ;; type contract had already established.
+                          (al-set! [i64]
+                                   (mut values)
+                                   (load (field symbol id))
+                                   (if (and (= declared FNG-NUMBER)
+                                            (and (fng-array-callback-function?
+                                                   frontend (ts-root (field frontend ast)) fun-id)
+                                            (= (ts-role (field frontend ast)
+                                                        (load (field symbol node))
+                                                        TS-ROLE-INITIALIZER 0)
+                                               -1)))
+                                       (n-unbox! parameter (t-flt))
+                                       parameter)))
                         (store! index (+ (load index) 1))))))))
     (let [context
             (fng-context frontend
@@ -5933,9 +6211,10 @@
     ;; tagged call boundary. Zero remains the runtime side-table's invalid-owner sentinel. Internal
     ;; JSL builtins occupy a disjoint namespace above them and are reached directly by their Fun
     ;; nodes; they do not consume dynamic-dispatch bits.
-    (if (>= function-count 62)
-        (do (panic-corrupt "frontend: JavaScript functions exceed finite callable summary capacity") 0)
-        0)
+    ;; `FeFunction.id` is an exact identity and may exceed the finite target-summary width.
+    ;; `fe-prioritize-prototype-functions!` has already moved dynamically published prototype
+    ;; methods into the low summary namespace; all later functions are reached through exact
+    ;; Fun/Closure identity and therefore do not consume a summary bit.
     (jsl-set-fidx-base! (+ function-count 1))
     (store! index 0)
     (loop (if (>= (load index) function-count)
@@ -6020,7 +6299,15 @@
                            main-index
                            true)
     (fng-distribute-deferred-phi-boxes!)
-    (if analyze (do (fng-discard-memory-scaffolding!) (fng-analyze-fresh!)) 0)
+    (if analyze
+        (do
+          (fng-discard-memory-scaffolding!)
+          (fng-analyze-fresh!)
+          (if (and optimize (> (jl-inline-callback-calls!) 0))
+              (do (fng-analyze-fresh!)
+                  (if (> (g-eliminate-dead-local-arrays!) 0)
+                      (fng-analyze-fresh!) 0)) 0))
+        0)
     (fng-discard-unused!)
     (let [first (al-get [FeSymbol] (load (field frontend symbols)) (load (field main parameter-start)))
           answer

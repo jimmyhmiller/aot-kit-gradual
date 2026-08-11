@@ -38,9 +38,9 @@ if (cases.length !== (requestedCases.length || allCases.length)) throw new Error
 const measuredSamples = Number(process.env.AOT_BENCHMARK_SAMPLES ?? 9);
 if (!Number.isSafeInteger(measuredSamples) || measuredSamples < 1)
   throw new Error("AOT_BENCHMARK_SAMPLES must be a positive integer");
-const nodeWarmupIterations = Number(process.env.AOT_NODE_WARMUP_ITERATIONS ?? 20);
-if (!Number.isSafeInteger(nodeWarmupIterations) || nodeWarmupIterations < 0)
-  throw new Error("AOT_NODE_WARMUP_ITERATIONS must be a non-negative integer");
+const nodeWarmupCalls = Number(process.env.AOT_NODE_WARMUP_CALLS ?? 1_000);
+if (!Number.isSafeInteger(nodeWarmupCalls) || nodeWarmupCalls < 1_000)
+  throw new Error("AOT_NODE_WARMUP_CALLS must be an integer of at least 1000");
 const median = values => [...values].sort((a, b) => a - b)[Math.floor(values.length / 2)];
 const run = (command, args, options = {}) => execFileSync(command, args, { cwd: root, encoding: "utf8", ...options });
 const metric = (text, name) => {
@@ -96,8 +96,11 @@ for (const benchmark of cases) {
   // Give V8 enough in-process calls to tier up before any timed observation. Warmup uses the same
   // code paths with a smaller input so large measured kernels do not turn tiering into most of the
   // benchmark runtime. Native binaries are AOT and receive only untimed process-level shakeouts.
-  for (let i = 0; i < nodeWarmupIterations; ++i)
-    nodeRun(benchmark.warmupInput, benchmark.warmupRepeats ?? benchmark.repeats);
+  const warmupCallsPerRound = benchmark.warmupRepeats ?? benchmark.repeats;
+  const nodeWarmupRounds = Math.ceil(nodeWarmupCalls / warmupCallsPerRound);
+  const actualNodeWarmupCalls = nodeWarmupRounds * warmupCallsPerRound;
+  for (let i = 0; i < nodeWarmupRounds; ++i)
+    nodeRun(benchmark.warmupInput, warmupCallsPerRound);
   for (let i = 0; i < 3; ++i) nativeRun();
   const samples = [];
   for (let i = 0; i < measuredSamples; ++i) {
@@ -108,14 +111,15 @@ for (const benchmark of cases) {
   }
   const coilMedianNs = median(samples.map(sample => sample.coilRuntimeNs));
   const nodeMedianNs = median(samples.map(sample => sample.nodeRuntimeNs));
-  report.push({ ...benchmark, nodeWarmupIterations, result: nativeRun().result, coilCompileNs, nodeCompileNs, coilMedianNs, nodeMedianNs,
+  report.push({ ...benchmark, nodeWarmupCalls: actualNodeWarmupCalls, nodeWarmupRounds,
+    result: nativeRun().result, coilCompileNs, nodeCompileNs, coilMedianNs, nodeMedianNs,
     ratio: coilMedianNs / nodeMedianNs, samples });
   console.error(`${benchmark.name}: Coil ${(coilMedianNs / 1e6).toFixed(3)} ms, Node ${(nodeMedianNs / 1e6).toFixed(3)} ms`);
 }
 
 fs.writeFileSync(path.join(output, "results.json"), `${JSON.stringify({
   generatedAt: new Date().toISOString(), platform: `${os.platform()} ${os.arch()}`,
-  node: process.version, nodeWarmupIterations, measuredSamples, benchmarks: report,
+  node: process.version, minimumNodeWarmupCalls: nodeWarmupCalls, measuredSamples, benchmarks: report,
 }, null, 2)}\n`);
 console.log("\n| Benchmark | Coil median | Node median | Coil / Node |");
 console.log("|---|---:|---:|---:|");

@@ -424,6 +424,13 @@
   (and (= (load (field m op)) MI-CALL) (< (load (field m imm)) 0)))
 (defn be-poly-call-targets [(m (ptr MInst))] (-> i64)
   (if (be-poly-call? m) (^ (load (field m imm)) -1) 0))
+(defn be-poly-return-code [(owner i64)] (-> i64)
+  (let [kind (be-function-return-kind owner)]
+    (if (= kind MLK-BOXED)
+        -4
+        (if (and (= kind MLK-SCALAR) (be-function-fp-return? owner))
+            -3
+            (be-function-return-tag owner)))))
 (defn be-poly-call-dispatch-words [(m (ptr MInst))] (-> i64)
   (let [targets (be-poly-call-targets m)
         (mut fidx) 0
@@ -432,7 +439,11 @@
               (break)
               (do
                 (if (!= (& targets (<< 1 (load fidx))) 0)
-                    (store! words (+ (load words) (+ (be-mov-words (load fidx)) 3)))
+                    (let [owner (mu-find-function-symbol (load fidx))
+                          code (if (< owner 0) -4 (be-poly-return-code owner))]
+                      (store! words (+ (load words)
+                                       (+ (be-mov-words (load fidx))
+                                          (+ 4 (be-mov-words code))))))
                     0)
                 (store! fidx (+ (load fidx) 1)))))
     (load words)))
@@ -510,15 +521,19 @@
                 2 MI-CALL
                 (let [area (be-call-area
                              (+ (load (field m arg-count))
-                                (if (be-poly-call? m) 1 0)))]
-                  (+ (+ (if (be-poly-call? m)
-                            (+ 15
+                                (if (be-poly-call? m) 1 0)))
+                      poly-words
+                        (if (be-poly-call? m)
+                            (+ 28
                                (+ (if (< (be-reg-of (load (field m a))) 0) 1 0)
                                   (+ (be-mov-words JSV-TAG-MASK)
                                      (+ (be-mov-words JSV-FUNCTION)
                                         (+ (be-mov-words JSV-PAYLOAD-MASK)
-                                           (be-poly-call-dispatch-words m))))))
-                            5)
+                                           (+ (be-mov-words -3)
+                                              (+ (be-mov-words -4)
+                                                 (be-poly-call-dispatch-words m))))))))
+                            5)]
+                  (+ (+ poly-words
                         (* 2 (- (be-sp-adjust-words area) 1)))
                      (+ (load (field m arg-count))
                         (+ (be-call-register-loads m)
@@ -532,7 +547,7 @@
                                       (load (field m arg-first)))]
                         (if (< (be-reg-of key) 0) 1 0))))
                   MI-JSARRAY
-                (+ 11
+                (+ 9
                    (+ (be-mov-words (load (field m imm)))
                       (let [value
                               (al-get (load (field (machine-unit) call-args))
@@ -1092,6 +1107,7 @@
                                   (be-mov-imm! 17 JSV-PAYLOAD-MASK)
                                   (be-u32! (a64-and-reg 16 16 17))
                                   (be-u32! (a64-add-reg 13 31 31))
+                                  (be-u32! (a64-add-reg 12 31 31))
                                   (loop (if (>= (load fidx) 63)
                                             (break)
                                             (do
@@ -1110,12 +1126,32 @@
                                                     (if (< target-off 0)
                                                         (be-u32! (a64-brk))
                                                         (be-u32! (a64-adr 17 (- target-off (be-code-len)))))
-                                                    (be-u32! (a64-csel 13 17 13 0)))
+                                                    (be-u32! (a64-csel 13 17 13 0))
+                                                    (let [return-code
+                                                            (if (< target-owner 0)
+                                                                -4
+                                                                (be-poly-return-code target-owner))]
+                                                      (be-mov-imm! 15 return-code)
+                                                      (be-u32! (a64-csel 12 15 12 0))))
                                                   0)
                                               (store! fidx (+ (load fidx) 1)))))
                                   (be-u32! (a64-cbnz 13 2))
                                   (be-u32! (a64-brk))
-                                  (be-u32! (a64-blr 13)))
+                                  (be-u32! (a64-str 12 31 (* argc 8)))
+                                  (be-u32! (a64-blr 13))
+                                  (be-u32! (a64-ldr 12 31 (* argc 8)))
+                                  ;; Box the selected target's natural return representation. -4
+                                  ;; means it was already tagged; -3 means the result is in d0.
+                                  (be-mov-imm! 17 JSV-PAYLOAD-MASK)
+                                  (be-u32! (a64-and-reg 15 0 17))
+                                  (be-u32! (a64-orr-reg 15 15 12))
+                                  (be-u32! (a64-fmov-x-d 16 0))
+                                  (be-mov-imm! 17 -3)
+                                  (be-u32! (a64-cmp-reg 12 17))
+                                  (be-u32! (a64-csel 15 16 15 0))
+                                  (be-mov-imm! 17 -4)
+                                  (be-u32! (a64-cmp-reg 12 17))
+                                  (be-u32! (a64-csel 0 0 15 0)))
                                 (let [spill-loads (be-call-spill-loads m)
                                       register-loads (be-call-register-loads m)
                                       stack-moves (* 2 (be-call-stack-count m))
@@ -1158,18 +1194,17 @@
                           (let [value (ms-inst-arg (load i) 0)
                                 rv (be-read-value! value 17)]
                             ; x0=owner, x1=dynamic integer index, x2=boxed value,
-                            ; x3=operation. Preserve every source before assigning ABI registers.
-                            (be-u32! (a64-sub-imm 31 31 32))
-                            (be-u32! (a64-str ra 31 0))
-                            (be-u32! (a64-str rb 31 8))
-                            (be-u32! (a64-str rv 31 16))
-                            (be-u32! (a64-ldr 0 31 0))
-                            (be-u32! (a64-ldr 1 31 8))
-                            (be-u32! (a64-ldr 2 31 16))
+                            ; x3=operation. Three caller-saved temporaries implement the parallel
+                            ; ABI move without a stack frame around every dense-array access.
+                            (be-u32! (a64-add-reg 14 ra 31))
+                            (be-u32! (a64-add-reg 15 rb 31))
+                            (be-u32! (a64-add-reg 16 rv 31))
+                            (be-u32! (a64-add-reg 0 14 31))
+                            (be-u32! (a64-add-reg 1 15 31))
+                            (be-u32! (a64-add-reg 2 16 31))
                             (be-mov-imm! 3 (load (field m imm)))
                             (be-u32! (a64-bl 0))
                             (be-u32! (a64-add-reg 14 0 31))
-                            (be-u32! (a64-add-imm 31 31 32))
                             (be-u32! (a64-add-reg rd 14 31))
                             0)
                             MI-JSSTRING
