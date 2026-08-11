@@ -170,7 +170,15 @@ static int js_object_index_rebuild(void) {
   return 1;
 }
 
+/* Owners can arrive RAW (a materialized allocation) or TAGGED (an object/array/function
+   value loaded from a cell or the heap). Every side-table record is keyed by the raw
+   pointer, so canonicalize once here: raw heap pointers never carry high tag bits. */
+static inline uintptr_t js_canonical_owner(uintptr_t owner) {
+  return (owner >> 48) ? (owner & 0x0000FFFFFFFFFFFFull) : owner;
+}
+
 static JsObjectRec *js_object(uintptr_t owner, int create) {
+  owner = js_canonical_owner(owner);
   if (js_object_index.cap) {
     size_t slot = side_index_slot(&js_object_index, owner >> 3);
     for (;;) {
@@ -297,6 +305,7 @@ static int js_array_index_rebuild(void) {
 }
 
 static JsArrayRec *js_array(uintptr_t owner, int create) {
+  owner = js_canonical_owner(owner);
   if (js_array_index.cap) {
     size_t slot = side_index_slot(&js_array_index, owner >> 3);
     for (;;) {
@@ -1015,6 +1024,8 @@ AotJsValue aot_js_string(uintptr_t a, int64_t b,
    Missing elements read as undefined; resize truncation clears presence. */
 AotJsValue aot_js_array(uintptr_t owner, int64_t index,
                         AotJsValue value, uint64_t operation) {
+  if (getenv("AOT_TRACE_ARR")) fprintf(stderr, "js_array owner=%p idx=%lld op=%llu value=%llx\n", (void*)owner, (long long)index, (unsigned long long)operation, (unsigned long long)value);
+  owner = js_canonical_owner(owner);
   if (aot_js_managed((AotJsValue)owner) ||
       aot_js_tag((AotJsValue)owner) == AOT_JS_FUNCTION)
     owner = aot_js_payload((AotJsValue)owner);
@@ -1103,6 +1114,8 @@ AotJsValue aot_js_array(uintptr_t owner, int64_t index,
    the generic operation dispatcher. */
 AotJsValue aot_arr_load(uintptr_t owner, int64_t index,
                         AotJsValue unused_value, uint64_t unused_operation) {
+  if (getenv("AOT_TRACE_ARR")) fprintf(stderr, "arr_load owner=%p index=%lld\n", (void*)owner, (long long)index);
+  owner = js_canonical_owner(owner);
   (void)unused_value; (void)unused_operation;
   if (aot_js_managed((AotJsValue)owner) ||
       aot_js_tag((AotJsValue)owner) == AOT_JS_FUNCTION)
@@ -1126,6 +1139,8 @@ AotJsValue aot_arr_len(uintptr_t owner, int64_t unused_index,
 
 AotJsValue aot_arr_store(uintptr_t owner, int64_t index,
                          AotJsValue value, uint64_t unused_operation) {
+  if (getenv("AOT_TRACE_ARR")) fprintf(stderr, "arr_store owner=%p index=%lld value=%llx\n", (void*)owner, (long long)index, (unsigned long long)value);
+  owner = js_canonical_owner(owner);
   (void)unused_operation;
   if (aot_js_managed((AotJsValue)owner) ||
       aot_js_tag((AotJsValue)owner) == AOT_JS_FUNCTION)
@@ -1244,6 +1259,7 @@ static AotJsValue js_own_key_at(uintptr_t owner, size_t ordinal) {
    The runtime owns string records for the duration of the compilation unit. */
 AotJsValue aot_js_property(uintptr_t owner, uint64_t name,
                            AotJsValue value, uint64_t operation) {
+  owner = js_canonical_owner(owner);
   JsStringRec *receiver_string = js_string_lookup(owner);
   if (receiver_string) {
     if (operation == 6) return (AotJsValue)receiver_string->length;
@@ -1310,6 +1326,9 @@ AotJsValue aot_js_property(uintptr_t owner, uint64_t name,
     js_throw_frozen_mutation();
   int64_t array_index = 0;
   JsArrayRec *indexed_array = js_array(owner, 0);
+  if (getenv("AOT_TRACE_ARR"))
+    fprintf(stderr, "js_property owner=%p op=%llu indexed=%d value=%llx\n", (void *)owner,
+            (unsigned long long)operation, indexed_array != NULL, (unsigned long long)value);
   if (indexed_array && js_property_key_ascii_equal((AotJsValue)name, "length")) {
     if (operation == 0) return aot_js_box_int((int64_t)indexed_array->length);
     if (operation == 1) {
@@ -1323,6 +1342,13 @@ AotJsValue aot_js_property(uintptr_t owner, uint64_t name,
     }
     if (operation == 3) return 1;
     if (operation == 4) return 0;
+  }
+  if (getenv("AOT_TRACE_ARR") && indexed_array) {
+    JsStringRec *ks = js_string_lookup(js_canonical_owner((uintptr_t)name));
+    fprintf(stderr, "  key name=%llx parses=%d idx=%lld len=%zu first=%c\n",
+            (unsigned long long)name, js_property_array_index((AotJsValue)name, &array_index),
+            (long long)array_index, ks ? ks->length : (size_t)999,
+            ks && ks->length ? (char)ks->units[0] : '?');
   }
   if (indexed_array && js_property_array_index((AotJsValue)name, &array_index)) {
     if (operation == 0) return aot_js_array(owner, array_index, value, 1);
