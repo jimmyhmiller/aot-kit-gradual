@@ -26,15 +26,20 @@ the compiler/runtime providing mechanisms rather than benchmark-specific behavio
 
 ## Current verified status
 
+All five remaining benchmarks were probed end-to-end on 2026-08-11 with single-run adapted
+sources (suite registration stripped, `main()` appended; all five adaptations validated under
+Node first — NavierStokes was given a density-checksum `main` since upstream v7 has no self-check;
+Node expects 2762). Every blocker below is reproduced and specific.
+
 | Benchmark | Current status | Evidence / blocker |
 |---|---|---|
-| Richards | Runs and passes | `result=0 collections=0 moves=0`, re-verified after every change below. |
-| DeltaBlue | Runs and passes | `result=0 collections=0 moves=0` (chainTest(100) + projectionTest(100); `alert` throws on any check failure, and the run exits 0). Runtime is ~200 s — see the performance-debt section. |
-| Crypto | Not yet probed end-to-end | Reprobe with the current pipeline; the call-ABI blocker is gone. |
-| RayTrace | Not yet probed end-to-end | Same. |
-| EarleyBoyer | Not yet probed end-to-end | Same; earlier notes mention legacy parser diagnostics. |
-| Splay | Not yet probed end-to-end | Same. |
-| NavierStokes | Not yet probed end-to-end | Same. |
+| Richards | Runs and passes | `result=0 collections=0 moves=0`; ~29 ms/run steady state. |
+| DeltaBlue | Runs and passes | `result=0 collections=0 moves=0`; ~65 ms/run steady state. |
+| NavierStokes | Frontend rejects: nested function-declaration parameters unbound | `FE-CODE-UNBOUND-NAME` on `x` = a parameter of `addFields`, a function declaration nested inside `FluidField`. Minimal repro (`function outer(n){ function addFields(x,s){return x+s;} return addFields(n,2);}`) fails identically, so the resolver never binds nested declarations' parameters. Likely the closest to passing. |
+| Splay | Frontend rejects namespaced constructors | `FE-CODE-UNBOUND-NAME` on `Node` from the `SplayTree.Node` pattern. A minimal namespaced-constructor repro gets further — frontend passes, then `MSEL-CALL` because `X.Y.prototype.method =` publications are not indexed as prototype methods, so instance method calls have no targets. Both halves needed. |
+| Crypto | Frontend rejects implicit globals | `FE-CODE-UNBOUND-NAME` on `setupEngine` (`setupEngine = function(...)` with no `var`), and `nValue`…`coeffValue` are likewise assigned-without-declaration; also uses bare `alert` (adapter shim needed, as DeltaBlue's). Needs sloppy-mode implicit-global creation in the resolver; unknown further blockers behind it (BigInteger is string/array heavy). |
+| RayTrace | Needs `arguments` + `Function.prototype.apply` | Built entirely on the Prototype.js idiom `this.initialize.apply(this, arguments)` — every class instantiation forwards variadic arguments. Real feature work, not a resolver gap. |
+| EarleyBoyer | TS parser rejects the source | 78 parse diagnostics, all `Octal escape sequences are not allowed` from the scheme2js character tables ("\\000" etc.). Adapter-rewritable to `\\xNN` losslessly; unknown depth behind it (4,684 lines of scheme2js output — exceptions, apply, string machinery). |
 
 There is still no valid benchmark/Node comparison table. Do not report performance numbers for a
 benchmark until its native result passes the benchmark's correctness checks and the perf debt
