@@ -1246,6 +1246,52 @@
           false
           (>= (ms-select-value-at! owner (n-in ctrl 1) bid) 0))))
 
+;; The nearest control anchor a VALUE is pinned under: its own control input when it has one,
+;; through Proj to the allocation, else the deepest anchor among its inputs. Floating chains
+;; (constants, pure arithmetic over Parms) answer -1 and constrain nothing.
+(defn ms-value-anchor-block [(owner i64) (node i64) (fuel i64)] (-> i64)
+  (if (or (= node NO-NODE) (<= fuel 0))
+      -1
+      (if (= (n-op node) OP-PROJ)
+          (ms-value-anchor-block owner (n-in node 0) (- fuel 1))
+          (if (and (> (n-nins node) 0) (!= (n-in node 0) NO-NODE))
+              (ms-node-block owner node)
+              (let [(mut best) -1 (mut i) 1]
+                (loop (if (>= (load i) (n-nins node))
+                          (break)
+                          (do
+                            (let [ib (ms-value-anchor-block owner (n-in node (load i)) (- fuel 1))]
+                              (if (and (>= ib 0)
+                                       (or (< (load best) 0)
+                                           (and (!= ib (load best))
+                                                (mu-dominates? (load best) ib))))
+                                  (store! best ib)
+                                  0))
+                            (store! i (+ (load i) 1))
+                            0)))
+                (load best))))))
+
+;; A floating memory op's chain root can DOMINATE one of its value operands — NavierStokes
+;; stores each `new Array` allocation into a capture cell whose alias chain roots at function
+;; entry, so the Store's chain block sat ABOVE the allocation it stores. The op cannot execute
+;; before its operands exist; lower the placement to the deepest operand anchor the chain block
+;; dominates.
+(defn ms-memory-operand-bound [(owner i64) (node i64) (chain i64)] (-> i64)
+  (if (< chain 0)
+      chain
+      (let [(mut best) chain (mut i) 2]
+        (loop (if (>= (load i) (n-nins node))
+                  (break)
+                  (do
+                    (let [ib (ms-value-anchor-block owner (n-in node (load i)) 16)]
+                      (if (and (>= ib 0)
+                               (and (!= ib (load best)) (mu-dominates? (load best) ib)))
+                          (store! best ib)
+                          0))
+                    (store! i (+ (load i) 1))
+                    0)))
+        (load best))))
+
 (defn ms-memory-block [(owner i64) (node i64)] (-> i64)
   ;; Memory operations put their memory dependency, not control, in input 0. Placing one from
   ;; ms-node-block would therefore confuse a loop Memory Phi with the operation's control block
@@ -1303,7 +1349,13 @@
                       (do
                         (store! answer (ms-node-block owner (load current)))
                         (store! done true)))))
-    (load answer)))
+    ; Only shaped cell/field stores take the operand bound: their alias chains legitimately
+    ; root at function entry while the stored allocation is pinned deeper. Property-table ops
+    ; can carry values from a SIBLING branch arm (the value crosses the merge in a register),
+    ; and lowering them to that arm breaks the memory Phi they feed.
+    (if (or (>= pinned 0) (!= (n-op node) OP-STORE))
+        (load answer)
+        (ms-memory-operand-bound owner node (load answer)))))
 
 (defn ms-memory-chain-phi? [(node i64)] (-> bool)
   (if (< node 0)

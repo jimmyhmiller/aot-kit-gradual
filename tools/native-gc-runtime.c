@@ -1436,6 +1436,11 @@ AotJsValue aot_js_property(uintptr_t owner, uint64_t name,
     uintptr_t prototype = (uintptr_t)value;
     if (aot_js_managed(value) || aot_js_tag(value) == AOT_JS_FUNCTION)
       prototype = aot_js_payload(value);
+    /* Tagged undefined/null (or any non-pointer tagged word) means NO prototype. Storing the
+       tagged word raw planted a nonsense "pointer" that survived until a stressed collection's
+       heap verification tripped over it. Raw heap pointers never carry high tag bits. */
+    else if (prototype >> 48)
+      prototype = 0;
     JsObjectRec *object = js_object(owner, 1);
     if (!object || prototype == owner) return AOT_JS_UNDEFINED;
     uintptr_t cursor = prototype;
@@ -1776,25 +1781,44 @@ static int verify_heap(void) {
     size_t cursor = 0;
     while (cursor < bytes) {
       const LayoutRec *layout = layout_for(*(uint64_t *)(base + cursor));
-      if (!layout || !layout->size || cursor + layout->size > bytes) return 0;
-      if (layout->reference_bitmap & layout->boxed_bitmap) return 0;
+      if (!layout || !layout->size || cursor + layout->size > bytes) {
+        fprintf(stderr, "heap verify bad layout gen=%u cursor=%zu shape=%llx\n", generation,
+                cursor, (unsigned long long)*(uint64_t *)(base + cursor));
+        return 0;
+      }
+      if (layout->reference_bitmap & layout->boxed_bitmap) {
+        fprintf(stderr, "heap verify overlapping bitmaps gen=%u cursor=%zu\n", generation, cursor);
+        return 0;
+      }
       for (uint32_t i = 0; i < layout->field_count && i < 64; ++i) {
         uint64_t bit = 1ull << i;
         uintptr_t value = *(uintptr_t *)(base + cursor + 8 + i * 8);
         uintptr_t ref = value;
         if (layout->boxed_bitmap & bit) {
-          if (!aot_js_well_formed((AotJsValue)value)) return 0;
+          if (!aot_js_well_formed((AotJsValue)value)) {
+            fprintf(stderr, "heap verify malformed boxed gen=%u cursor=%zu field=%u value=%llx\n",
+                    generation, cursor, i, (unsigned long long)value);
+            return 0;
+          }
           if (!aot_js_managed((AotJsValue)value)) continue;
           ref = aot_js_payload((AotJsValue)value);
         } else if (!(layout->reference_bitmap & bit)) continue;
         int young = ref >= (uintptr_t)spaces[active_space] &&
                     ref < (uintptr_t)(spaces[active_space] + used);
         int old = ref >= (uintptr_t)old_space && ref < (uintptr_t)(old_space + old_used);
-        if (ref && !young && !old) return 0;
+        if (ref && !young && !old) {
+          fprintf(stderr, "heap verify stale ref gen=%u cursor=%zu field=%u value=%llx ref=%p\n",
+                  generation, cursor, i, (unsigned long long)value, (void *)ref);
+          return 0;
+        }
       }
       cursor += (layout->size + 7u) & ~7u;
     }
-    if (cursor != bytes) return 0;
+    if (cursor != bytes) {
+      fprintf(stderr, "heap verify ragged end gen=%u cursor=%zu bytes=%zu\n", generation, cursor,
+              bytes);
+      return 0;
+    }
   }
   for (size_t i = 0; i < js_objects_len; ++i) {
     uintptr_t values[2] = {js_objects[i].owner, js_objects[i].prototype};
@@ -1804,16 +1828,27 @@ static int verify_heap(void) {
       int young = ref >= (uintptr_t)spaces[active_space] &&
                   ref < (uintptr_t)(spaces[active_space] + used);
       int old = ref >= (uintptr_t)old_space && ref < (uintptr_t)(old_space + old_used);
-      if (!young && !old) return 0;
+      if (!young && !old) {
+        fprintf(stderr, "object verify stale %s i=%zu ref=%p\n", j == 0 ? "owner" : "prototype",
+                i, (void *)ref);
+        return 0;
+      }
     }
     AotJsValue target = js_objects[i].internal_target;
-    if (!aot_js_well_formed(target)) return 0;
+    if (!aot_js_well_formed(target)) {
+      fprintf(stderr, "object verify malformed internal_target i=%zu value=%llx\n", i,
+              (unsigned long long)target);
+      return 0;
+    }
     if (aot_js_managed(target)) {
       uintptr_t ref = aot_js_payload(target);
       int young = ref >= (uintptr_t)spaces[active_space] &&
                   ref < (uintptr_t)(spaces[active_space] + used);
       int old = ref >= (uintptr_t)old_space && ref < (uintptr_t)(old_space + old_used);
-      if (!young && !old) return 0;
+      if (!young && !old) {
+        fprintf(stderr, "object verify stale internal_target i=%zu ref=%p\n", i, (void *)ref);
+        return 0;
+      }
     }
   }
   for (size_t i = 0; i < js_properties_len; ++i) {
@@ -1821,13 +1856,21 @@ static int verify_heap(void) {
     int owner_young = owner >= (uintptr_t)spaces[active_space] &&
                       owner < (uintptr_t)(spaces[active_space] + used);
     int owner_old = owner >= (uintptr_t)old_space && owner < (uintptr_t)(old_space + old_used);
-    if ((!owner_young && !owner_old) || !aot_js_well_formed(js_properties[i].value)) return 0;
+    if ((!owner_young && !owner_old) || !aot_js_well_formed(js_properties[i].value)) {
+      fprintf(stderr, "property verify failed i=%zu owner=%p value=%llx\n", i, (void *)owner,
+              (unsigned long long)js_properties[i].value);
+      return 0;
+    }
     if (aot_js_managed(js_properties[i].value)) {
       uintptr_t ref = aot_js_payload(js_properties[i].value);
       int young = ref >= (uintptr_t)spaces[active_space] &&
                   ref < (uintptr_t)(spaces[active_space] + used);
       int old = ref >= (uintptr_t)old_space && ref < (uintptr_t)(old_space + old_used);
-      if (!young && !old) return 0;
+      if (!young && !old) {
+        fprintf(stderr, "property verify stale value i=%zu value=%llx ref=%p\n", i,
+                (unsigned long long)js_properties[i].value, (void *)ref);
+        return 0;
+      }
     }
   }
   for (size_t i = 0; i < js_arrays_len; ++i) {
