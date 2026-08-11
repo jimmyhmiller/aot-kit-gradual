@@ -119,32 +119,47 @@ use array callbacks.
   never match, ending every method lookup at depth 1. The prototype value now canonicalizes
   exactly like the owner argument (managed/function tag → payload).
 
-## Known performance debt (deliberate, per "do not gate on benchmarks")
+## Performance: current numbers and remaining debt
 
-DeltaBlue runs ~200 s (Node: ~ms). Known contributors, in likely order of impact:
+The 200-second DeltaBlue catastrophe is fixed. It was NOT the compiler: every side-table registry
+(strings, objects, properties, arrays) sat behind a fixed 65536-slot cache that silently
+saturated, after which each lookup fell back to a linear scan of the growing registry —
+`js_string_lookup` alone was 56% of DeltaBlue's runtime, and repeated in-process runs (the perf
+harness re-enters `kernel` per iteration) made every iteration slower than the last. All four are
+now growing open-addressed identity indexes, rebuilt on GC compaction, cleared on reset; the
+property-key content hash is memoized per string record.
 
-- Every script-global access is a full side-table property call (`aot_js_property` → hash + cache),
-  and every dynamic property/method access already was. `js_own_property` degrades to a linear scan
-  of the whole table on cache miss; the cache stops accepting entries once full
-  (`js_property_cache_complete`).
+Steady-state numbers on this machine (perf harness, 9 samples x 20 iterations; Node = 1,000
+warmup calls then median of 9 samples x 10 iterations via `tools/v8-node-performance.mjs`):
+
+| Benchmark | Native per run | Warmed Node | Ratio |
+|---|---:|---:|---:|
+| Richards | ~29 ms | 2.46 ms | ~12x |
+| DeltaBlue | ~65 ms | 2.14 ms | ~30x |
+
+Native "per run" includes whole-program re-entry (prototype publication and globals init), which
+is the honest AOT analogue of one suite `run()`.
+
+Remaining debt, in likely order of impact:
+
+- Every field, method, and script-global access on prototype-based objects is a generic
+  side-table property call (hash + probe + prototype-chain walk). Closing the 12–30x gap means
+  shaped storage or inline caches for these, not more table tuning.
 - Each `new` of a top-level constructor performs a `.prototype` property load plus a SetPrototype
   runtime call.
-- Dispatch chains are linear compare ladders per call site; method lookup walks the prototype chain
-  through the side table per call.
+- Dispatch chains are linear compare ladders per call site.
 - The chain emits per-alias memory phis per arm (`fng-active-memory!` = every declared field
   alias), which bloats graphs at polymorphic sites.
+- String records are never pruned (the registry only grows), and per-iteration times still creep
+  a few percent across a long in-process run — GC scans walk every live side record.
 
-A fast path for script globals (e.g. a static slot table with GC roots, which the earlier handoff's
-environment design would also have needed) and an inline/property-cache for method loads are the
-obvious next perf steps once all seven benchmarks pass.
+## Gate status
 
-## Pre-existing breakage to be aware of
-
-- `coil check` at the project root fails with 5 pre-existing unbound-variable errors in TEST files
-  (`tests/eval-test.coil` `JSV-NEGATIVE-ZERO`, `tests/backend-call-test.coil` `JSV-INTEGER`,
-  `tests/b13-ideal-test.coil` `JSV-NAN`). These exist on the committed tree before this work
-  (verified via `git stash`) — presumably from the earlier jsvalue constant reshuffle. Fix or
-  update these tests; they mask the gate.
+`tools/gate.sh --quick` is GREEN (548 tests). The three test files that failed to compile after
+the jsvalue module split now import it; the `receivers-and-constructors` conformance SIGSEGV was
+the receiver conversion boxing anything that COULD be a function (which is every dyn value),
+shadowing the unbox arm for shaped callees — boxing now applies only to purely-function-typed
+values. All 74 native conformance programs agree with Node.
 
 ## Callable/source identity work currently present
 
@@ -211,8 +226,8 @@ Gate:
 - [ ] Splay passes.
 - [ ] NavierStokes passes.
 - [x] RegExp is clearly labeled excluded rather than silently omitted.
-- [ ] The full relevant test gate is green (blocked by the pre-existing test-file errors above).
+- [x] The full relevant test gate is green (548 tests).
 - [x] No benchmark-specific hard-coded result or semantic shortcut was introduced.
 - [x] The DSL/compiler/runtime boundary is documented for every newly required primitive.
-- [ ] Properly warmed Node comparisons are run and reported in one complete table (blocked on
-      performance debt; a 200 s DeltaBlue makes ratios meaningless).
+- [ ] Properly warmed Node comparisons in one complete table — Richards and DeltaBlue are
+      measured (see the performance section); the other five await correctness first.

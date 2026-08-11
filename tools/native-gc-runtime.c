@@ -83,20 +83,25 @@ typedef struct {
 static JsObjectRec *js_objects;
 static size_t js_objects_len, js_objects_cap;
 static int js_any_frozen;
-#define JS_OBJECT_CACHE_SIZE 65536u
-static uint32_t js_object_cache[JS_OBJECT_CACHE_SIZE];
+/* Growing open-addressed identity indexes over the side-table registries. Each maps a key to
+   record-index-plus-one; zero means empty. The previous fixed-size direct-mapped caches silently
+   degraded to linear registry scans once a long run had accumulated more records than slots,
+   which made every repeated in-process benchmark iteration slower than the one before it. */
+typedef struct {
+  uint32_t *slots;
+  size_t cap; /* power of two, 0 = unallocated */
+} SideIndex;
+static SideIndex js_object_index;
+static SideIndex js_array_index;
+static SideIndex js_property_index;
 static JsPropertyRec *js_properties;
 static size_t js_properties_len, js_properties_cap;
-#define JS_PROPERTY_CACHE_SIZE 65536u
-static uint32_t js_property_cache[JS_PROPERTY_CACHE_SIZE];
-static int js_property_cache_complete;
 #ifdef AOT_DEBUG_PROPERTY_LOOP
 static uint64_t debug_property_cache_hits, debug_property_cache_misses;
 static uint64_t debug_object_cache_hits, debug_object_cache_misses;
 #endif
 static JsArrayRec *js_arrays;
 static size_t js_arrays_len, js_arrays_cap;
-static uint32_t js_array_cache[JS_OBJECT_CACHE_SIZE];
 static JsStringRec **js_strings;
 static size_t js_strings_len, js_strings_cap;
 /* Identity index over js_strings: answers "is this pointer a registered string record" in
@@ -126,30 +131,76 @@ static int reserve_records(void **records, size_t *record_cap, size_t needed, si
   return 1;
 }
 
+static size_t side_index_slot(const SideIndex *index, uint64_t key) {
+  return (size_t)((key * UINT64_C(11400714819323198485)) & (index->cap - 1));
+}
+
+static void side_index_put(SideIndex *index, uint64_t key, uint32_t index_plus_one) {
+  size_t slot = side_index_slot(index, key);
+  while (index->slots[slot])
+    slot = (slot + 1) & (index->cap - 1);
+  index->slots[slot] = index_plus_one;
+}
+
+/* Ensure capacity for `needed` live entries at under 70% load. Returns 0 on allocation failure,
+   1 if the table was reused unchanged, 2 if it was (re)allocated and must be repopulated. */
+static int side_index_reserve(SideIndex *index, size_t needed) {
+  if (index->slots && needed * 10 < index->cap * 7) return 1;
+  size_t cap = index->cap ? index->cap : 131072u;
+  while (needed * 10 >= cap * 7) cap *= 2;
+  uint32_t *next = calloc(cap, sizeof(*next));
+  if (!next) return 0;
+  free(index->slots);
+  index->slots = next;
+  index->cap = cap;
+  return 2;
+}
+
+static void side_index_clear(SideIndex *index) {
+  if (index->slots) memset(index->slots, 0, index->cap * sizeof(*index->slots));
+}
+
+static int js_object_index_rebuild(void) {
+  int state = side_index_reserve(&js_object_index, js_objects_len + 1);
+  if (!state) return 0;
+  side_index_clear(&js_object_index);
+  for (size_t i = 0; i < js_objects_len; ++i)
+    if (js_objects[i].owner)
+      side_index_put(&js_object_index, js_objects[i].owner >> 3, (uint32_t)(i + 1));
+  return 1;
+}
+
 static JsObjectRec *js_object(uintptr_t owner, int create) {
-  size_t slot = (size_t)((owner >> 3) & (JS_OBJECT_CACHE_SIZE - 1));
-  uint32_t cached = js_object_cache[slot];
-  if (cached && cached <= js_objects_len && js_objects[cached - 1].owner == owner)
-  {
+  if (js_object_index.cap) {
+    size_t slot = side_index_slot(&js_object_index, owner >> 3);
+    for (;;) {
+      uint32_t cached = js_object_index.slots[slot];
+      if (!cached) break;
+      if (cached <= js_objects_len && js_objects[cached - 1].owner == owner) {
 #ifdef AOT_DEBUG_PROPERTY_LOOP
-    ++debug_object_cache_hits;
+        ++debug_object_cache_hits;
 #endif
-    return &js_objects[cached - 1];
+        return &js_objects[cached - 1];
+      }
+      slot = (slot + 1) & (js_object_index.cap - 1);
+    }
   }
 #ifdef AOT_DEBUG_PROPERTY_LOOP
   ++debug_object_cache_misses;
 #endif
-  for (size_t i = js_objects_len; i > 0; --i)
-    if (js_objects[i - 1].owner == owner) {
-      js_object_cache[slot] = (uint32_t)i;
-      return &js_objects[i - 1];
-    }
   if (!create || !owner ||
       !reserve_records((void **)&js_objects, &js_objects_cap,
                        js_objects_len + 1, sizeof(*js_objects))) return NULL;
+  int state = side_index_reserve(&js_object_index, js_objects_len + 1);
+  if (!state) return NULL;
   js_objects[js_objects_len] = (JsObjectRec){owner, 0, 0, -1, AOT_JS_UNDEFINED, 0};
-  js_object_cache[slot] = (uint32_t)(js_objects_len + 1);
-  return &js_objects[js_objects_len++];
+  ++js_objects_len;
+  if (state == 2) {
+    if (!js_object_index_rebuild()) return NULL;
+  } else {
+    side_index_put(&js_object_index, owner >> 3, (uint32_t)js_objects_len);
+  }
+  return &js_objects[js_objects_len - 1];
 }
 
 static uint64_t js_property_key_hash(AotJsValue key) {
@@ -179,37 +230,42 @@ static int js_property_key_equal(AotJsValue left, AotJsValue right) {
          (!a->length || memcmp(a->units, b->units, a->length * sizeof(*a->units)) == 0);
 }
 
-static size_t js_property_hash(uintptr_t owner, AotJsValue key) {
-  return (size_t)(((owner >> 3) ^
-                   (js_property_key_hash(key) * UINT64_C(11400714819323198485))) &
-                  (JS_PROPERTY_CACHE_SIZE - 1));
+static uint64_t js_property_hash(uintptr_t owner, AotJsValue key) {
+  return (uint64_t)(owner >> 3) ^
+         (js_property_key_hash(key) * UINT64_C(11400714819323198485));
 }
+
+static void js_property_cache_rebuild(void);
 
 static int js_property_cache_insert(size_t index) {
   JsPropertyRec *property = &js_properties[index];
-  size_t slot = js_property_hash(property->owner, property->name);
-  for (size_t probe = 0; probe < JS_PROPERTY_CACHE_SIZE; ++probe) {
-    if (!js_property_cache[slot]) {
-      js_property_cache[slot] = (uint32_t)(index + 1);
-      return 1;
-    }
-    slot = (slot + 1) & (JS_PROPERTY_CACHE_SIZE - 1);
+  int state = side_index_reserve(&js_property_index, js_properties_len + 1);
+  if (!state) return 0;
+  if (state == 2) {
+    js_property_cache_rebuild();
+    return 1;
   }
-  js_property_cache_complete = 0;
-  return 0;
+  side_index_put(&js_property_index,
+                 js_property_hash(property->owner, property->name),
+                 (uint32_t)(index + 1));
+  return 1;
 }
 
 static void js_property_cache_rebuild(void) {
-  memset(js_property_cache, 0, sizeof(js_property_cache));
-  js_property_cache_complete = 1;
+  if (!side_index_reserve(&js_property_index, js_properties_len + 1)) return;
+  side_index_clear(&js_property_index);
   for (size_t i = 0; i < js_properties_len; ++i)
-    if (js_properties[i].owner && !js_property_cache_insert(i)) break;
+    if (js_properties[i].owner)
+      side_index_put(&js_property_index,
+                     js_property_hash(js_properties[i].owner, js_properties[i].name),
+                     (uint32_t)(i + 1));
 }
 
 static JsPropertyRec *js_own_property(uintptr_t owner, AotJsValue key) {
-  size_t slot = js_property_hash(owner, key);
-  for (size_t probe = 0; probe < JS_PROPERTY_CACHE_SIZE; ++probe) {
-    uint32_t cached = js_property_cache[slot];
+  if (!js_property_index.cap) return NULL;
+  size_t slot = side_index_slot(&js_property_index, js_property_hash(owner, key));
+  for (;;) {
+    uint32_t cached = js_property_index.slots[slot];
     if (!cached) break;
     if (cached <= js_properties_len) {
       JsPropertyRec *property = &js_properties[cached - 1];
@@ -220,38 +276,50 @@ static JsPropertyRec *js_own_property(uintptr_t owner, AotJsValue key) {
         return property;
       }
     }
-    slot = (slot + 1) & (JS_PROPERTY_CACHE_SIZE - 1);
+    slot = (slot + 1) & (js_property_index.cap - 1);
   }
 #ifdef AOT_DEBUG_PROPERTY_LOOP
   ++debug_property_cache_misses;
 #endif
-  if (js_property_cache_complete) return NULL;
-  for (size_t i = js_properties_len; i > 0; --i)
-    if (js_properties[i - 1].owner == owner &&
-        js_property_key_equal(js_properties[i - 1].name, key)) {
-      return &js_properties[i - 1];
-    }
   return NULL;
 }
 
 static void js_write_barrier(uintptr_t owner, uintptr_t target);
 
+static int js_array_index_rebuild(void) {
+  int state = side_index_reserve(&js_array_index, js_arrays_len + 1);
+  if (!state) return 0;
+  side_index_clear(&js_array_index);
+  for (size_t i = 0; i < js_arrays_len; ++i)
+    if (js_arrays[i].owner)
+      side_index_put(&js_array_index, js_arrays[i].owner >> 3, (uint32_t)(i + 1));
+  return 1;
+}
+
 static JsArrayRec *js_array(uintptr_t owner, int create) {
-  size_t slot = (size_t)((owner >> 3) & (JS_OBJECT_CACHE_SIZE - 1));
-  uint32_t cached = js_array_cache[slot];
-  if (cached && cached <= js_arrays_len && js_arrays[cached - 1].owner == owner)
-    return &js_arrays[cached - 1];
-  for (size_t i = js_arrays_len; i > 0; --i)
-    if (js_arrays[i - 1].owner == owner) {
-      js_array_cache[slot] = (uint32_t)i;
-      return &js_arrays[i - 1];
+  if (js_array_index.cap) {
+    size_t slot = side_index_slot(&js_array_index, owner >> 3);
+    for (;;) {
+      uint32_t cached = js_array_index.slots[slot];
+      if (!cached) break;
+      if (cached <= js_arrays_len && js_arrays[cached - 1].owner == owner)
+        return &js_arrays[cached - 1];
+      slot = (slot + 1) & (js_array_index.cap - 1);
     }
+  }
   if (!create || !owner ||
       !reserve_records((void **)&js_arrays, &js_arrays_cap,
                        js_arrays_len + 1, sizeof(*js_arrays))) return NULL;
+  int state = side_index_reserve(&js_array_index, js_arrays_len + 1);
+  if (!state) return NULL;
   js_arrays[js_arrays_len] = (JsArrayRec){owner, 0, 0, NULL, NULL};
-  js_array_cache[slot] = (uint32_t)(js_arrays_len + 1);
-  return &js_arrays[js_arrays_len++];
+  ++js_arrays_len;
+  if (state == 2) {
+    if (!js_array_index_rebuild()) return NULL;
+  } else {
+    side_index_put(&js_array_index, owner >> 3, (uint32_t)js_arrays_len);
+  }
+  return &js_arrays[js_arrays_len - 1];
 }
 
 /* Generated code normally boxes managed references before crossing a dynamic
@@ -1668,14 +1736,14 @@ static int relocate_side_edges(int scan_old_side, int *next_remembered_dirty) {
 }
 
 static void discard_dead_side_records(void) {
-  memset(js_object_cache, 0, sizeof(js_object_cache));
-  memset(js_array_cache, 0, sizeof(js_array_cache));
   size_t out = 0;
   for (size_t i = 0; i < js_objects_len; ++i) {
     if (!side_owner_live(&js_objects[i].owner)) continue;
     js_objects[out++] = js_objects[i];
   }
-  js_objects_len = out; out = 0;
+  js_objects_len = out;
+  js_object_index_rebuild();
+  out = 0;
   for (size_t i = 0; i < js_properties_len; ++i) {
     if (!side_owner_live(&js_properties[i].owner)) continue;
     js_properties[out++] = js_properties[i];
@@ -1690,6 +1758,7 @@ static void discard_dead_side_records(void) {
     js_arrays[out++] = js_arrays[i];
   }
   js_arrays_len = out;
+  js_array_index_rebuild();
 }
 
 static const SiteRec *site_for(void *return_pc) {
@@ -1957,10 +2026,9 @@ int aot_gc_configure(size_t bytes, int stress) {
   }
   js_objects_len = js_properties_len = 0;
   js_any_frozen = 0;
-  memset(js_object_cache, 0, sizeof(js_object_cache));
-  memset(js_property_cache, 0, sizeof(js_property_cache));
-  js_property_cache_complete = 1;
-  memset(js_array_cache, 0, sizeof(js_array_cache));
+  side_index_clear(&js_object_index);
+  side_index_clear(&js_property_index);
+  side_index_clear(&js_array_index);
   js_arrays_len = 0;
   if (js_string_index) memset(js_string_index, 0, js_string_index_cap * sizeof(*js_string_index));
   js_strings_len = 0;
