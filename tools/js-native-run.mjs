@@ -1,0 +1,135 @@
+#!/usr/bin/env node
+// One-command native-vs-Node runner for a single JavaScript/TypeScript file.
+//
+//   node tools/js-native-run.mjs FILE.js [HEAP_BYTES]
+//
+// The expensive part of the old loop was that every source change rebuilt the whole compiler,
+// because the generated harness bakes the source in as a string constant. This tool builds ONE
+// resident emitter (generate-typescript-aot-benchmark.mjs --resident) that reads its source
+// from argv at runtime, caches it under .coil/build/js-resident/, and rebuilds it only when the
+// compiler sources change. After the first build, iterating on a source file costs seconds.
+//
+// The program must define `main()`; the native harness prints `result=<n>`; this tool runs the
+// same file under Node and reports MATCH/MISMATCH. Integer-tagged native results (0x7ffc<<48)
+// are decoded before comparison so a tagged return still compares by value.
+import crypto from "node:crypto";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import process from "node:process";
+import { execFileSync, spawnSync } from "node:child_process";
+
+const root = path.resolve(path.dirname(new URL(import.meta.url).pathname), "..");
+const args = process.argv.slice(2).filter(argument => argument !== "--keep");
+const keep = process.argv.includes("--keep");
+const [inputArgument, heapText] = args;
+if (!inputArgument) {
+  console.error("usage: js-native-run.mjs FILE.js|FILE.ts [HEAP_BYTES] [--keep]");
+  process.exit(2);
+}
+const input = path.resolve(inputArgument);
+const heapBytes = heapText ? Number.parseInt(heapText, 10) : 268435456;
+
+const cacheDirectory = path.join(root, ".coil", "build", "js-resident");
+fs.mkdirSync(cacheDirectory, { recursive: true });
+const emitter = path.join(cacheDirectory, "emitter");
+const stampPath = path.join(cacheDirectory, "emitter.stamp");
+
+// The emitter embeds the whole compiler, so it is stale whenever any compiler input is.
+const stampInputs = [];
+const collect = directory => {
+  for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+    const target = path.join(directory, entry.name);
+    if (entry.isDirectory()) collect(target);
+    else if (/\.(coil|jsl)$/.test(entry.name)) stampInputs.push(target);
+  }
+};
+collect(path.join(root, "src"));
+collect(path.join(root, "lib"));
+stampInputs.push(path.join(root, "Coil.toml"));
+stampInputs.push(path.join(root, "tools", "generate-typescript-aot-benchmark.mjs"));
+stampInputs.sort();
+const hash = crypto.createHash("sha256");
+for (const file of stampInputs) {
+  hash.update(file);
+  hash.update(fs.readFileSync(file));
+}
+const stamp = hash.digest("hex");
+
+if (!fs.existsSync(emitter) || !fs.existsSync(stampPath) ||
+    fs.readFileSync(stampPath, "utf8") !== stamp) {
+  console.error("compiler changed; rebuilding resident emitter (~minutes, then cached)...");
+  const harness = path.join(cacheDirectory, "resident.coil");
+  execFileSync("node", [path.join(root, "tools", "generate-typescript-aot-benchmark.mjs"),
+                        "--resident", harness], { cwd: root, stdio: "inherit" });
+  execFileSync("coil", ["build", harness, "-o", emitter], { cwd: root, stdio: "inherit" });
+  fs.writeFileSync(stampPath, stamp);
+}
+
+// TypeScript arrives as plain JavaScript at the emitter; transpile like the conformance runner.
+let sourcePath = input;
+if (input.endsWith(".ts")) {
+  const ts = (await import("typescript")).default;
+  const transpiled = ts.transpileModule(fs.readFileSync(input, "utf8"), {
+    compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 },
+    fileName: input,
+  }).outputText.replace(/^export /gm, "");
+  sourcePath = path.join(cacheDirectory, `${path.basename(input, ".ts")}.js`);
+  fs.writeFileSync(sourcePath, transpiled);
+}
+
+const work = keep
+  ? fs.mkdtempSync(path.join(os.tmpdir(), "js-native-run-"))
+  : fs.mkdtempSync(path.join(os.tmpdir(), "js-native-run-"));
+const object = path.join(work, "program.o");
+const binary = path.join(work, "program");
+
+const emitted = spawnSync(emitter, [sourcePath, "0", "10"], { maxBuffer: 256 * 1024 * 1024 });
+if (emitted.status !== 0) {
+  process.stderr.write(emitted.stderr ?? "");
+  console.error(`emitter failed with status ${emitted.status}`);
+  process.exit(1);
+}
+fs.writeFileSync(object, emitted.stdout);
+execFileSync("xcrun", ["clang", "-arch", "arm64", "-O1",
+  path.join(root, "tools", "native-gc-runtime.c"),
+  path.join(root, "tools", "native-gc-trampoline.S"),
+  path.join(root, "tools", "v8-native-harness.c"),
+  object, "-o", binary], { stdio: "inherit" });
+
+const native = spawnSync(binary, [String(heapBytes)], { encoding: "utf8" });
+process.stdout.write(native.stdout);
+process.stderr.write(native.stderr);
+const nativeMatch = /result=(-?\d+)/.exec(native.stdout);
+let nativeValue = nativeMatch ? BigInt(nativeMatch[1]) : null;
+// Decode an integer-tagged result (JSV-INTEGER = 0x7ffc << 48) to its payload.
+if (nativeValue !== null && (BigInt.asUintN(64, nativeValue) >> 48n) === 0x7ffcn) {
+  nativeValue = BigInt.asIntN(48, BigInt.asUintN(64, nativeValue));
+  console.log(`native result was integer-tagged; payload = ${nativeValue}`);
+}
+
+let nodeValue = null;
+try {
+  const script = `${fs.readFileSync(sourcePath, "utf8")}\nconsole.log(String(main()));`;
+  const nodeRun = spawnSync("node", ["--input-type=module", "-e", script], { encoding: "utf8" });
+  const lines = nodeRun.stdout.trim().split("\n");
+  nodeValue = BigInt(lines[lines.length - 1]);
+  console.log(`node result=${nodeValue}`);
+} catch {
+  console.log("node run failed or returned a non-integer; compare manually");
+}
+
+if (!keep) fs.rmSync(work, { recursive: true, force: true });
+else console.log(`artifacts kept in ${work}`);
+
+if (native.status !== 0) {
+  console.log(`VERDICT: native exited ${native.status} (signal ${native.signal ?? "none"})`);
+  process.exit(1);
+}
+if (nativeValue !== null && nodeValue !== null) {
+  const verdict = nativeValue === nodeValue ? "MATCH" : "MISMATCH";
+  console.log(`VERDICT: ${verdict} (native=${nativeValue} node=${nodeValue})`);
+  process.exit(verdict === "MATCH" ? 0 : 1);
+}
+console.log("VERDICT: incomparable (missing a result)");
+process.exit(1);

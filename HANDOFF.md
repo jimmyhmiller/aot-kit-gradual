@@ -45,6 +45,43 @@ There is still no valid benchmark/Node comparison table. Do not report performan
 benchmark until its native result passes the benchmark's correctness checks and the perf debt
 below is at least triaged.
 
+## The systematic hardening plan (agreed 2026-08-11; work in phases, gate-green at every step)
+
+A retrospective over the NavierStokes campaign found four systemic causes behind nearly every
+bug: (1) value REPRESENTATION (tagged/raw/cell) is an unchecked convention on every edge;
+(2) frontend lowering branches on seed types that inference has not computed
+(`(= (n-ty x) (t-dyn))` — three separate bugs from this one idiom); (3) closed-world analyses
+(captures, dispatch targets, unit reachability) have no soundness backstop, so wrong analysis =
+runtime mystery; (4) silent failure modes cost ~10x what loud ones do. The phases:
+
+- **Phase 0 — fast iteration (DONE).** `tools/js-native-run.mjs FILE.js` compiles a file
+  natively, runs it AND Node, and prints MATCH/MISMATCH — ~0.6s per iteration after a one-time
+  cached resident-emitter build (`generate-typescript-aot-benchmark.mjs --resident`; the
+  emitter reads its source from argv instead of baking it in; staleness-stamped against
+  src/lib). Runtime tracing stays behind `AOT_TRACE_ARR=1`. Debug builds: `coil build -O0` is
+  ~6x faster when the emitter itself is under test.
+- **Phase 1 — representation verifier.** New verify pass computing every value edge's
+  representation STRUCTURALLY (Box→tagged, Proj/alloc→raw, Load→its alias's declared content,
+  Call→boxed, Parm→ABI table) and checking each consumer's requirement; new
+  `VERR-REPRESENTATION`. Write the call ABI as one table and make the receiver representation
+  unconditional (tagged everywhere), deleting the structural carve-outs. Fix
+  `fng-env-shape-of` typing by-value capture slots as cells.
+- **Phase 2 — kill type-seed lies.** Audit the 7 remaining exact `(= (n-ty ...))` tests in
+  frontend lowering; replace with structural predicates or explicit inference-ran gates; debug
+  tripwire on reading seed types during lowering.
+- **Phase 3 — soundness backstops.** Target-summary dispatch as a FAST PATH falling through to
+  the universal chain (recovers the deliberate 2.5x dispatch regression soundly);
+  `fe-scope-inside?` satisfiability as a hard frontend error; emit-time assert that every
+  `__closure_target`/boxed-Fun fidx exists in the unit.
+- **Phase 4 — differential testing.** Conformance mode running Node vs the ideal-graph
+  evaluator (`ev-run`) vs native to localize silent wrongs; then a small generator over the
+  axes that actually broke (nested closures x mutated captures x arrays x dispatch x numeric
+  coercions). Every runtime bug becomes a conformance case (`nested-field-closures.ts` is the
+  first, distilled from the NavierStokes campaign).
+- **Phase 5 — loud failures.** Classify the ~36 `return AOT_JS_UNDEFINED` sites in
+  tools/native-gc-runtime.c: spec-legitimate stays; internal-error-swallowing becomes
+  trap-with-message.
+
 ## The DeltaBlue call-ABI problem and how it was actually solved
 
 The previous handoff recommended threading one hidden script-environment parameter through every

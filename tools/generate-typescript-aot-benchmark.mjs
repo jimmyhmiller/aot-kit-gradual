@@ -3,9 +3,13 @@ import fs from "node:fs";
 
 const [input, output, seedText = "0", registersText = "10", optimizeText = "1"] = process.argv.slice(2);
 if (!input || !output) {
-  console.error("usage: generate-typescript-aot-benchmark.mjs INPUT.js OUTPUT.coil [SEED] [REGISTERS] [OPTIMIZE]");
+  console.error("usage: generate-typescript-aot-benchmark.mjs INPUT.js|--resident OUTPUT.coil [SEED] [REGISTERS] [OPTIMIZE]");
   process.exit(2);
 }
+// --resident: the emitter reads its JavaScript source from argv at RUNTIME instead of baking it
+// in. One compiler build then serves every source file — the iteration loop for source-side
+// debugging drops from a full compiler rebuild to seconds. Resident argv: SOURCE.js [SEED] [REGS].
+const resident = input === "--resident";
 
 const seed = Number.parseInt(seedText, 10);
 const registers = Number.parseInt(registersText, 10);
@@ -14,9 +18,21 @@ if (!Number.isSafeInteger(seed) || !Number.isSafeInteger(registers) || registers
   throw new Error("seed and registers must be valid integers, with registers positive");
 }
 
-const source = fs.readFileSync(input, "utf8");
-const scriptKind = input.endsWith(".ts") ? "TS-SCRIPT-TS" : "TS-SCRIPT-JS";
+const source = resident ? "" : fs.readFileSync(input, "utf8");
+const scriptKind = !resident && input.endsWith(".ts") ? "TS-SCRIPT-TS" : "TS-SCRIPT-JS";
 const frontendSeed = seed === 0 ? 7301 : seed;
+const residentHelper = String.raw`
+(defn resident-source [(argc i32) (argv (ptr (ptr i8)))] (-> (slice u8))
+  (if (< argc 2)
+      (do (fmt (stderr) "usage: emitter SOURCE.js [SEED] [REGISTERS]\n") (os/_exit 2) "")
+      (match (read-file (malloc-allocator) (cstr->str (load (index argv 1))))
+        (Ok [src] src)
+        (Err [e]
+          (do (fmt (stderr) "cannot read source {s}\n" (cstr->str (load (index argv 1))))
+              (os/_exit 2)
+              "")))))
+`;
+
 const generated = `(module generatedtypescriptbenchmark)
 (import "frontendnative" :use *)
 (import "frontendnativegraph" :use *)
@@ -35,6 +51,10 @@ const generated = `(module generatedtypescriptbenchmark)
 (import "backend_macho" :use *)
 (import "coil.io" :use *)
 (import "coil.fmt" :use *)
+(import "coil.fs" :use *)
+(import "coil.str" :use *)
+(import "coil.alloc" :use *)
+(import "coil.os" :as os)
 
 (extern write :cc c [i32 (ptr u8) i64] (-> i64))
 (extern atoi :cc c [(ptr i8)] (-> i32))
@@ -161,11 +181,15 @@ const generated = `(module generatedtypescriptbenchmark)
                   0))))
     0))
 
+${resident ? residentHelper : ""}
 (defn main [(argc i32) (argv (ptr (ptr i8)))] (-> i64)
-  (let [schedule-seed (if (> argc 1) (cast i64 (atoi (load (index argv 1)))) ${seed})
+  (let [${resident ? `schedule-seed (if (> argc 2) (cast i64 (atoi (load (index argv 2)))) 0)
+        register-count (if (> argc 3) (cast i64 (atoi (load (index argv 3)))) 10)
+        source (resident-source argc argv)
+        filename (if (< argc 2) "" (cstr->str (load (index argv 1))))` : `schedule-seed (if (> argc 1) (cast i64 (atoi (load (index argv 1)))) ${seed})
         register-count (if (> argc 2) (cast i64 (atoi (load (index argv 2)))) ${registers})
         source ${JSON.stringify(source)}
-        filename ${JSON.stringify(input)}
+        filename ${JSON.stringify(input)}`}
         (mut frontend) (fe-native-new-file source filename ${scriptKind})]
     (fmt (stderr) "phase=frontend-index-begin\\n")
     (if (!= (fe-native-index! (mut frontend)) FE-OK)
