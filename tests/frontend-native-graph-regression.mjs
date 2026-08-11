@@ -63,7 +63,12 @@ const expectedDigests = Object.freeze({
   // additional Regions/Phis are the control handed back by JSL inlining. 85 nodes to 111.
   // Repinned for the disjoint callable namespace: its two user functions become `Fun.1` and
   // `Fun.2`; node count and all non-identity structure are unchanged.
-  full: "784bf03564ecdbb47f25fd13f9527af727a3c959c99d8cc7cd7949ad9cdc977d",
+  // Repinned when the loop test stopped pinning itself to the Loop node. A condition that emits
+  // control (this fixture's guarded ToNumberValue diamond) leaves its merge Region as the current
+  // control, and the loop's If must anchor THERE: two Ifs on one control node is not a CFG. The
+  // diff is exactly one input on one node — `If <- Loop` became `If <- Region` — with node count
+  // and every other structure unchanged.
+  full: "a8a70f57d65777f2eb86089c4f77f2bebc257199efa26b990e7303c9d016ba41",
   bitwise: "a9e893ac4a4e394075e850fef7c876ce8db3f5b3a61fc5993b217ab06b8c5ab7",
 });
 

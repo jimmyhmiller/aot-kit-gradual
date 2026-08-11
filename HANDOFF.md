@@ -1,6 +1,6 @@
 # Handoff: V8 benchmark support, DSL coverage, and runtime performance
 
-Last updated: 2026-08-10
+Last updated: 2026-08-11
 
 ## Goal
 
@@ -22,327 +22,197 @@ own correctness checks successfully; merely parsing, emitting an object file, or
 does not count.
 
 The broader project goal remains to express JavaScript semantics in the JSL DSL under `lib/`, with
-the compiler/runtime providing mechanisms rather than benchmark-specific behavior. If the DSL
-cannot express a required operation, extend it using a Torque-like design: typed low-level
-primitives, explicit control/effect flow, calls, allocation, and stable runtime ABIs. Do not add
-benchmark-specific hard-coded answers.
+the compiler/runtime providing mechanisms rather than benchmark-specific behavior.
 
 ## Current verified status
 
 | Benchmark | Current status | Evidence / blocker |
 |---|---|---|
-| Richards | Runs and passes its benchmark check | Last verified output: `result=0 collections=0 moves=0`. Current diagnostic build takes roughly 80 seconds. Reverify after the callable-ID changes described below. |
-| DeltaBlue | Parses and builds a graph; does not emit executable code | Fails graph verification with `VERR-CALL-ARITY`, currently around call node `n7094` depending on graph changes. The concrete target has hidden capture parameters that the generic call does not carry. |
-| Crypto | Not yet probed end-to-end in the current worktree | Waiting on the shared call ABI fix. |
-| RayTrace | Not yet probed end-to-end in the current worktree | Waiting on the shared call ABI fix. |
-| EarleyBoyer | Not yet probed end-to-end in the current worktree | Earlier notes mention legacy parser diagnostics; must be reprobed from current state. |
-| Splay | Not yet probed end-to-end in the current worktree | Waiting on the shared call ABI fix. |
-| NavierStokes | Not yet probed end-to-end in the current worktree | Waiting on the shared call ABI fix. |
+| Richards | Runs and passes | `result=0 collections=0 moves=0`, re-verified after every change below. |
+| DeltaBlue | Runs and passes | `result=0 collections=0 moves=0` (chainTest(100) + projectionTest(100); `alert` throws on any check failure, and the run exits 0). Runtime is ~200 s — see the performance-debt section. |
+| Crypto | Not yet probed end-to-end | Reprobe with the current pipeline; the call-ABI blocker is gone. |
+| RayTrace | Not yet probed end-to-end | Same. |
+| EarleyBoyer | Not yet probed end-to-end | Same; earlier notes mention legacy parser diagnostics. |
+| Splay | Not yet probed end-to-end | Same. |
+| NavierStokes | Not yet probed end-to-end | Same. |
 
-There is no valid full benchmark/Node comparison table yet. Do not report performance numbers for
-a benchmark until its native result passes the benchmark's correctness checks.
+There is still no valid benchmark/Node comparison table. Do not report performance numbers for a
+benchmark until its native result passes the benchmark's correctness checks and the perf debt
+below is at least triaged.
 
-## What was fixed during the benchmark work
+## The DeltaBlue call-ABI problem and how it was actually solved
 
-### Richards
+The previous handoff recommended threading one hidden script-environment parameter through every
+user function and call. That design was NOT implemented, for a concrete reason discovered during
+implementation: JSL's dynamic callback path (`%DynamicCallReceiver` in `jl-js-call-receiver-core`)
+and the zero-capture callback fast path (`fng-callback-value`) would both need the environment
+threaded through the JSL ABI as well, which is invasive and would have regressed the array-callback
+pipelines. The architectural goal — one stable generic call descriptor independent of the target —
+was reached instead with two frontend-local mechanisms:
 
-Richards originally failed in polymorphic/dynamic method handling. The following areas were fixed
-or substantially advanced:
+1. **Script globals live in the runtime property side table.** Owner id is `main-id + 1`
+   (`fng-script-owner-id`): main is never opened as a Fun, so that integer is provably unused by
+   every JS and JSL callable, and the side table treats small-int owners as permanently live. A
+   captured, non-static `FE-ROLE-GLOBAL` symbol reads via `OP-PROPLOAD` and writes via
+   `OP-PROPSTORE` under interned name keys (`fng-script-global-load` / `fng-script-global-store!`,
+   dispatched from `fng-symbol-node` / `fng-set-symbol!`). The GC already relocates side-table
+   values, so no new root machinery was needed. Globals used only by the top level keep SSA;
+   provably-constant globals keep `fng-initialize-static-globals!`.
+2. **Globals and top-level function identities are no longer captures.** `fng-runtime-capture?`
+   now excludes `FE-ROLE-GLOBAL` symbols and top-level function-declaration identities (their
+   values are graph constants everywhere). Prototype methods therefore have zero capture
+   parameters, and the generic `[receiver, args...]` descriptor lines up with every target. The
+   `fe-copy-global-captures!` / `fe-propagate-call-captures!` passes still run — their records now
+   serve only as analysis data (who references what, mutability for the static-global check).
 
-- Polymorphic method return values are normalized at indirect call boundaries.
-- Loose equality now treats `null` and `undefined` as nullish based on the actual runtime
-  representation rather than only the source declaration.
-- Function/call target lookup was corrected in several paths.
-- Dynamic and statically known object fields with globally incompatible layouts now consistently
-  use the generic `PropertyKey` storage path.
-- Receiver calls accept boxed function objects where JavaScript permits them.
-- Missing JavaScript arguments are explicitly materialized as `undefined` for statically known
-  callees.
+`VERR-CALL-ARITY` on DeltaBlue is gone, and Richards’ ABI was re-verified after the change.
 
-Richards then completed with:
+### Dispatch beyond the 63-bit target summary
 
-```text
-result=0 collections=0 moves=0
-```
+DeltaBlue has 76 functions, so method-name target sets overflow the finite `i64` summary
+(`fng-prototype-method-targets` returns 0 when any candidate’s runtime id is ≥ 63). Such calls now
+go through a **graph-level identity-compare dispatch chain** (`fng-method-chain!`, candidates from
+`fng-method-candidates!`): the loaded callee value is compared with `OP-EQ` against each
+candidate's boxed Fun constant (tag bits make raw 64-bit equality exactly JavaScript function
+identity for capture-free targets), each arm makes an exact receiver call with per-target argument
+conversion/undefined-fill, arms merge through a region with per-alias memory phis and one boxed
+value phi, and the fallthrough throws
+`TypeError: dynamic method call matched no known function target` — loud, never a shifted register
+file. The old `t-fun-set` path is untouched and still used whenever the summary fits, so Richards
+compiles exactly as before.
 
-Its current runtime is not acceptable as a final performance result. Generic property lookup is a
-major contributor, and the build used extensive diagnostic paths.
+JSL's own dynamic-callback target mask (`jl-frontend-function-targets`) still saturates at 63 —
+programs with >62 functions that pass callbacks into JSL array builtins will mis-dispatch at
+runtime (`brk`). None of Richards/DeltaBlue hits this; fix it before Crypto/EarleyBoyer if they
+use array callbacks.
 
-### Object literals and array chains
+### Bugs fixed along the way (all latent, all exposed by DeltaBlue)
 
-Earlier work in this worktree improved object literal construction, dynamic property handling, and
-array `map`/`filter`/`reduce` paths. The user’s performance target is:
+- **`fng-loop` anchored the loop-test `If` at the Loop node itself.** A condition that emits
+  control (a ToNumber diamond, a short-circuit merge, an inlined JSL call, a dispatch chain) left
+  two `If`s on one control node and broke CFG construction (`be-ctrl-succ` requires a unique
+  control successor). The loop test now anchors at the control the condition left behind.
+- **`ms-gcm-compute-earliest!` had no convergence break** and ran `be-inst-count + 1` full rounds,
+  each with linear def scans — hours on DeltaBlue-sized programs. A round that changes nothing now
+  ends the fixed point. `ms-owner-def-inst` is still a linear scan per query; if selection gets
+  slow again, index vreg→def-inst.
+- **Exact-`t-dyn` identity tests miss refined dyn types.** Two consumers bit:
+  - The chain's value phi was consumed raw (an always-true loop bound) because
+    `fng-needs-to-number?` tests `(= (n-ty v) (t-dyn))`. The chain now publishes its result with
+    exact `(t-dyn)` (`n-set-ty!` after peephole; analysis recomputes later).
+  - `fng-nullish-equal` compared a mixed-return callee's result against the raw null constant
+    (which materializes as 0) while the backend had boxed every return of that callee
+    (`Constraint.satisfy` returns both `null` and an object). When the compared value has no
+    numeric kind, the raw branch now also tests the boxed null/undefined constants — exact, since
+    a raw object pointer can never equal a tagged constant and a tagged object can never equal 0.
+    Numeric kinds keep the raw-only compare so `0` never looks nullish.
+- **Prototype materialization inside functions.** Lazily memoized per-function prototypes could be
+  reused from a non-dominating branch arm (an `MSEL-DEPENDENCY` failure), and the first fix —
+  materializing per `new` site — rebuilt whole method tables inside hot loops and drowned the side
+  table (~200 s → property-cache collapse). Final design: the top level materializes and publishes
+  each constructor's `.prototype` once (as before), and a function body **loads** it
+  (`GetNamedProperty(Fun-const, "prototype")`) — dominance-safe anywhere, allocation-free, and one
+  prototype identity program-wide. Nested (non-top-level) constructors keep per-site
+  materialization.
+- **`aot_js_property` operation 2 (SetPrototype) stored the prototype argument raw.** A tagged
+  `.prototype` load stored tagged bits that the operation-0 walk (which compares raw owners) could
+  never match, ending every method lookup at depth 1. The prototype value now canonicalizes
+  exactly like the owner argument (managed/function tag → payload).
 
-- Every listed microbenchmark below 10x Node.
-- Ideally the `map`/`filter`/`reduce` chain below 3x Node.
+## Known performance debt (deliberate, per "do not gate on benchmarks")
 
-Those optimizations and their tests are part of the existing dirty worktree. They must be preserved
-and revalidated after the benchmark ABI work.
+DeltaBlue runs ~200 s (Node: ~ms). Known contributors, in likely order of impact:
 
-## DeltaBlue: exact current failure
+- Every script-global access is a full side-table property call (`aot_js_property` → hash + cache),
+  and every dynamic property/method access already was. `js_own_property` degrades to a linear scan
+  of the whole table on cache miss; the cache stops accepting entries once full
+  (`js_property_cache_complete`).
+- Each `new` of a top-level constructor performs a `.prototype` property load plus a SetPrototype
+  runtime call.
+- Dispatch chains are linear compare ladders per call site; method lookup walks the prototype chain
+  through the side table per call.
+- The chain emits per-alias memory phis per arm (`fng-active-memory!` = every declared field
+  alias), which bloats graphs at polymorphic sites.
 
-DeltaBlue heavily uses the old V8 benchmark inheritance idiom:
+A fast path for script globals (e.g. a static slot table with GC roots, which the earlier handoff's
+environment design would also have needed) and an inline/property-cache for method loads are the
+obvious next perf steps once all seven benchmarks pass.
 
-```js
-UnaryConstraint.superConstructor.call(this, strength);
-ScaleConstraint.superConstructor.prototype.addToGraph.call(this);
-```
+## Pre-existing breakage to be aware of
 
-The frontend builds functions with hidden parameters in this order:
-
-1. lexical/runtime captures,
-2. receiver when present,
-3. explicit JavaScript parameters.
-
-Calls have corresponding captured and receiver-aware ABIs. This works when the frontend has an
-exact target or a finite target set. It breaks for generic property calls whose concrete target is
-only discovered by later property folding.
-
-The failing graph has the shape:
-
-```text
-n7094: Call : dyn <- ... n148 ...
-n148: Fun ...
-```
-
-`n148` has eight live `Parm` nodes while the call supplies only the receiver/ordinary arguments.
-The extra parameters are global/cell captures. Verification correctly reports
-`VERR-CALL-ARITY`—weakening the verifier would allow shifted or uninitialized registers and produce
-incorrect execution.
-
-### Root architectural issue
-
-Script globals are currently propagated as variable-length lexical capture prefixes. Generic
-JavaScript calls cannot know which prefix to construct. Function target summaries are finite
-(63 usable identities in an `i64` bit set), while DeltaBlue has enough functions/methods to exceed
-that width.
-
-A temporary pass, `fe-prioritize-prototype-functions!`, attempted to renumber dynamically
-published methods into the finite range. It caused semantic identity mismatches among:
-
-- `FeFunction.id`,
-- lexical declaration/symbol IDs,
-- prototype parent/method tables,
-- capture ownership,
-- graph `OP-FUN` identities,
-- function objects stored in properties.
-
-The pass is currently disabled at the call site in `src/frontend_native.coil`. Exact callable IDs
-remain stable; large target sets should use generic runtime dispatch rather than semantic
-renumbering. The pass itself still exists and can be removed or redesigned later.
-
-### Unsuccessful workaround that was removed
-
-Padding every call to the maximum source parameter count with boxed `undefined` advanced some
-verifier failures but was incorrect. It does not know the hidden capture count or placement, so it
-can shift the receiver and explicit arguments into capture slots. That code was removed.
-
-An exact-target omitted-argument fallback remains in `fng-user-call`; it recovers the frontend
-function from `OP-FUN.aux - 1` and is valid for exact non-generic calls.
-
-## Recommended next implementation
-
-Implement a fixed script/global environment ABI.
-
-The clean design is:
-
-- Every user function that can access script globals receives one fixed hidden environment value.
-- The environment contains shared cells for mutable globals and ordinary values/cells for immutable
-  bindings as appropriate.
-- Global reads and writes use that environment instead of adding a different capture parameter for
-  each referenced global.
-- True lexical captures from nested functions remain closure-specific.
-- Generic calls can therefore use one stable descriptor regardless of the target.
-- The call descriptor should eventually carry explicit argument count (`argc`), allowing callee
-  prologues to materialize missing parameters as `undefined`, matching JavaScript without padding
-  all call sites.
-
-This resembles V8/Torque’s separation between a stable function context and ordinary JavaScript
-arguments. It also scales beyond the finite target-summary width and is a prerequisite for robust
-generic calls across the remaining benchmarks.
-
-Likely implementation sequence:
-
-1. Separate global captures from lexical captures in `FeCapture` queries. Helpers are concentrated
-   around `fe-copy-global-captures!`, `fe-propagate-call-captures!`,
-   `fng-runtime-capture?`, `fng-symbol-capture-count`, and `fng-capture-symbol`.
-2. Allocate one script environment in the synthetic top-level/main graph.
-3. Add a fixed environment slot to user function/call ABI construction.
-4. Route `FE-ROLE-GLOBAL` storage through environment fields/cells.
-5. Stop copying global symbols into per-target capture lists.
-6. Keep local/nested lexical closure captures unchanged.
-7. Make DeltaBlue emit, link, run, and pass `chainTest` plus `projectionTest`.
-8. Re-run Richards immediately to catch ABI regressions.
-
-Do not solve this by making every dynamic call carry the union of all global captures. That would
-be correct only with a globally normalized ordering and would impose a large, growing call prefix;
-the fixed environment is simpler and scales properly.
+- `coil check` at the project root fails with 5 pre-existing unbound-variable errors in TEST files
+  (`tests/eval-test.coil` `JSV-NEGATIVE-ZERO`, `tests/backend-call-test.coil` `JSV-INTEGER`,
+  `tests/b13-ideal-test.coil` `JSV-NAN`). These exist on the committed tree before this work
+  (verified via `git stash`) — presumably from the earlier jsvalue constant reshuffle. Fix or
+  update these tests; they mask the gate.
 
 ## Callable/source identity work currently present
 
-`FeFunction` now contains both `id` and `source-id`. This was introduced while diagnosing callable
-renumbering. Relevant changes include:
-
-- `fng-function-source-index`.
-- Function declaration publication through `source-id`.
-- Direct call target selection using callable `id`.
-- Capture ownership remapping code inside the now-disabled prioritization pass.
-
-With prioritization disabled, `source-id` usually equals the original function ID. Audit this split
-after DeltaBlue works; remove it if it no longer serves a real invariant, or populate it from the
-exact declaration symbol rather than name heuristics.
-
-There is also a temporary identifier-expression fallback that prefers a matching function
-declaration over stored symbol state. This helps declaration resolution but may bypass mutable
-reassignment semantics. It must be replaced with a principled binding/callable distinction before
-claiming complete JavaScript function semantics.
+`FeFunction` still contains both `id` and `source-id`; with prioritization disabled they are
+usually equal. The disabled `fe-prioritize-prototype-functions!` pass still exists and can be
+removed. The identifier-expression fallback that prefers a function declaration over stored symbol
+state also still exists; function-name reassignment semantics remain unimplemented (a reassignment
+inside a function now degrades to function-local SSA — previously it was a differently-wrong shared
+cell). Replace with a principled binding/callable distinction before claiming complete function
+semantics.
 
 ## DSL status and hard-coded mechanisms
 
-The intended boundary is:
-
-- JavaScript algorithms and observable semantics belong in JSL definitions under `lib/`.
-- Allocation, raw memory access, GC barriers, machine representation changes, indirect call
-  mechanics, unwind support, and platform code generation are compiler/runtime primitives.
-- Frontend syntax lowering may choose a DSL definition, but should not independently compute the
-  JavaScript result.
-
-Much array/string/conversion behavior is already expressed in JSL. Current unavoidable or
-unfinished hard-coded areas include:
-
-- Generic property/element access mechanisms and shape transitions.
-- Function/closure construction and call ABI.
-- GC/runtime allocation and write barriers.
-- Several Math operations lowered to native/runtime builtins.
-- JSON parsing/stringifying, which should ultimately be optimized native/JSL runtime code rather
-  than a slow generic user-level implementation.
-- Unsupported syntax/runtime families documented in `docs/STATUS.md`.
-
-The previous version of this handoff described four important DSL infrastructure gaps that remain
-relevant after benchmark correctness:
-
-1. `jsl-inline!` control flow inside non-entry functions.
-2. Heap-writing control-flow merges leaving untyped memory Phis.
-3. Construction-time folded branches desynchronizing Regions and Phis.
-4. A general JSL `%Call` capability for callback-taking definitions.
-
-These are necessary for moving more semantics—especially callback array methods—fully into the
-DSL. Do not lose them while fixing the runtime ABI.
+Unchanged from the previous handoff: property/element access mechanisms, function/closure
+construction and call ABI, GC/allocation/write barriers, several Math builtins, and JSON remain
+compiler/runtime mechanisms; the four DSL infrastructure gaps (`jsl-inline!` control flow in
+non-entry functions, heap-writing merges leaving untyped memory Phis, construction-time folded
+branches desynchronizing Regions/Phis, and a general JSL `%Call` capability) are still open and
+still needed for moving callback array methods fully into the DSL.
 
 ## Benchmark and Node timing requirements
 
-Once all runnable benchmarks pass correctness:
-
-- Measure runtime only, not compile time.
-- Node must receive real warmup. A minimum of 1,000 benchmark invocations is required before its
-  measured samples; use more for very small workloads.
-- AOT binaries do not require JIT warmup, but should still be sampled repeatedly and measured over
-  enough work to escape timer noise.
-- Validate outputs before timing.
-- Report every benchmark in one table with native time, warmed Node time, and native/Node ratio.
-- Do not call a small outer sample count “iterations”; distinguish warmup invocations, timed
-  invocations per sample, and sample count.
-
-Existing harness work includes:
-
-- `tools/v8-node-performance.mjs`
-- `tools/v8-performance-harness.c`
-- modifications to `tools/typescript-aot-benchmarks.mjs`
-- modifications to `tools/generate-typescript-aot-benchmark.mjs`
-
-Audit these before trusting results. Confirm the Node path performs at least 1,000 actual benchmark
-calls, not merely 20 outer timing rounds.
+Unchanged: measure runtime only; ≥1,000 real warmup invocations for Node; validate outputs before
+timing; one table with native time, warmed Node time, and native/Node ratio; distinguish warmup
+invocations, timed invocations per sample, and sample count. Audit
+`tools/v8-node-performance.mjs`, `tools/v8-performance-harness.c`,
+`tools/typescript-aot-benchmarks.mjs`, `tools/generate-typescript-aot-benchmark.mjs` before
+trusting results.
 
 ## Useful commands and artifacts
 
-Current DeltaBlue diagnostic directory:
-
-```text
-.coil/debug/deltablue/declaration-precedence/
-```
-
-Rebuild and reproduce emission failure:
+Debug pipeline for any benchmark source (the pattern used throughout):
 
 ```sh
-coil build .coil/debug/deltablue/declaration-precedence/deltablue.coil \
-  -o .coil/debug/deltablue/declaration-precedence/deltablue-emitter
-
-.coil/debug/deltablue/declaration-precedence/deltablue-emitter 0 10 \
-  > .coil/debug/deltablue/declaration-precedence/deltablue.o \
-  2> /tmp/deltablue-emitter.err
-
-rg 'verify=|^n7094:|Parm .*<- n148$' /tmp/deltablue-emitter.err
+node tools/generate-typescript-aot-benchmark.mjs SRC.js OUT.coil 0 10 1
+coil build OUT.coil -o OUT-emitter          # ~2 min; embeds the JS source
+./OUT-emitter 0 10 > OUT.o 2> emitter.err   # frontend + verify + select + emit
+xcrun clang -O2 -arch arm64 -fno-omit-frame-pointer \
+  tools/v8-native-harness.c tools/native-gc-runtime.c tools/native-gc-trampoline.S \
+  OUT.o -o OUT
+./OUT                                        # expects: result=0 collections=... moves=...
 ```
 
-The exact node numbers can move after any graph change. Use the `verify=<code> node=<id>` line as
-the authority.
+Runtime debugging: compile the harness with `-DAOT_DEBUG_PROPERTY_LOOP` and/or `-DAOT_DEBUG_ARRAY`
+(add `-I tools`) to trace property/array traffic; the first 512 events print with resolved name
+text. The current DeltaBlue/Richards debug trees are
+`.coil/debug/deltablue/declaration-precedence/` and `.coil/debug/richards/nullish-fix/`; both
+harness `.coil` files carry extra failure diagnostics (block/ctrl-user dumps on selection
+failures).
 
-Richards’ last known-correct binary was:
-
-```text
-.coil/debug/richards/nullish-fix/richards
-```
-
-Run formatting/diff hygiene after edits:
+Gate:
 
 ```sh
-git diff --check
-git status --short
+./tools/gate.sh --quick
 ```
-
-The full project gate was previously documented as:
-
-```sh
-./tools/gate.sh
-```
-
-Run focused tests while iterating, then the complete gate before declaring the benchmark work
-finished.
-
-## Worktree warning
-
-The worktree is intentionally dirty and contains substantial changes from earlier DSL,
-performance, runtime, backend, and benchmark work. Do not reset or discard unrelated changes.
-
-At the time of this handoff, modified/untracked paths included:
-
-```text
-lib/array/build.jsl
-src/backend_aarch64.coil
-src/backend_macho.coil
-src/backend_select.coil
-src/frontend_native.coil
-src/frontend_native_graph.coil
-src/jsl_lower.coil
-src/node.coil
-src/shape.coil
-src/verify.coil
-tests/jsl-test.coil
-tests/shape-test.coil
-tools/b15-adapt.mjs
-tools/generate-typescript-aot-benchmark.mjs
-tools/native-gc-runtime.c
-tools/typescript-aot-benchmarks.mjs
-tools/v8-node-performance.mjs
-tools/v8-performance-harness.c
-```
-
-Always inspect current diffs before modifying overlapping code.
 
 ## Completion checklist
 
-Do not call this effort complete until all of the following are evidenced from the current
-worktree:
-
-- Richards passes correctness after the final ABI design.
-- DeltaBlue passes both benchmark correctness tests.
-- Crypto passes.
-- RayTrace passes.
-- EarleyBoyer passes.
-- Splay passes.
-- NavierStokes passes.
-- RegExp is clearly labeled excluded rather than silently omitted.
-- The full relevant test gate is green.
-- No benchmark-specific hard-coded result or semantic shortcut was introduced.
-- The DSL/compiler/runtime boundary is documented for every newly required primitive.
-- Properly warmed Node comparisons are run and reported in one complete table.
+- [x] Richards passes correctness after the final ABI design.
+- [x] DeltaBlue passes both benchmark correctness tests.
+- [ ] Crypto passes.
+- [ ] RayTrace passes.
+- [ ] EarleyBoyer passes.
+- [ ] Splay passes.
+- [ ] NavierStokes passes.
+- [x] RegExp is clearly labeled excluded rather than silently omitted.
+- [ ] The full relevant test gate is green (blocked by the pre-existing test-file errors above).
+- [x] No benchmark-specific hard-coded result or semantic shortcut was introduced.
+- [x] The DSL/compiler/runtime boundary is documented for every newly required primitive.
+- [ ] Properly warmed Node comparisons are run and reported in one complete table (blocked on
+      performance debt; a 200 s DeltaBlue makes ratios meaningless).

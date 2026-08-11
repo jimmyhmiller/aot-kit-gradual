@@ -3381,6 +3381,7 @@
 (defn ms-gcm-compute-earliest! [] (-> bool)
   (let [n (be-inst-count)
         (mut round) 0
+        (mut changed) true
         (mut ok) true]
     (let [(mut at) 0]
       (loop (if (>= (load at) n)
@@ -3390,9 +3391,13 @@
                   (store! (field (be-inst (load at)) latest) -1)
                   (store! at (+ (load at) 1))))))
     ; A few forward fixed-point rounds also cover definitions emitted out of textual order.
-    (loop (if (or (>= (load round) (+ n 1)) (not (load ok)))
+    ; The round bound is a backstop; the fixed point converges within a handful of rounds, and a
+    ; round that changes nothing proves every later round would change nothing too. Without this
+    ; break the pass ran be-inst-count full rounds — hours on DeltaBlue-sized programs.
+    (loop (if (or (>= (load round) (+ n 1)) (or (not (load ok)) (not (load changed))))
               (break)
               (do
+                (store! changed false)
                 (let [(mut at) 0]
                   (loop (if (or (>= (load at) n) (not (load ok)))
                             (break)
@@ -3402,7 +3407,10 @@
                                     op (load (field m op))
                                     bid (load (field m block-id))]
                                 (if (mi-op-pinned? op)
-                                    (store! (field m earliest) bid)
+                                    (if (!= (load (field m earliest)) bid)
+                                        (do (store! (field m earliest) bid)
+                                            (store! changed true))
+                                        0)
                                     (let [(mut bound) (ms-entry-block owner)
                                           inputs (mi-op-inputs op)]
                                       (if (> inputs 0)
@@ -3441,8 +3449,10 @@
                                       ; A definition may have been emitted later than this use. Leave
                                       ; the use unresolved for this round; the forward fixed point will
                                       ; revisit it after the definition acquires an earliest block.
-                                      (if (>= (load bound) 0)
-                                          (store! (field m earliest) (load bound))
+                                      (if (and (>= (load bound) 0)
+                                               (!= (load (field m earliest)) (load bound)))
+                                          (do (store! (field m earliest) (load bound))
+                                              (store! changed true))
                                           0))))
                               (store! at (+ (load at) 1))
                               0))))

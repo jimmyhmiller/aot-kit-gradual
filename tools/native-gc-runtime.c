@@ -1326,7 +1326,12 @@ AotJsValue aot_js_property(uintptr_t owner, uint64_t name,
     return value;
   }
   if (operation == 2) {
+    /* The prototype may arrive raw (a materialized allocation) or tagged (a `.prototype`
+       property load). Canonicalize exactly like the owner argument: the walk in operation 0
+       compares raw owners, so a tagged pointer stored here would silently end every lookup. */
     uintptr_t prototype = (uintptr_t)value;
+    if (aot_js_managed(value) || aot_js_tag(value) == AOT_JS_FUNCTION)
+      prototype = aot_js_payload(value);
     JsObjectRec *object = js_object(owner, 1);
     if (!object || prototype == owner) return AOT_JS_UNDEFINED;
     uintptr_t cursor = prototype;
