@@ -74,6 +74,10 @@ typedef struct {
   size_t length;
   uint16_t *units;
   size_t initialized;
+  /* Memoized FNV-1a of units, 0 = not yet computed (a real zero hash is stored as 1).
+     Property keys arrive as distinct records with equal content, so every side-table probe
+     used to rehash the full string; this makes the hash a one-time cost per record. */
+  uint64_t content_hash;
 } JsStringRec;
 
 static JsObjectRec *js_objects;
@@ -95,8 +99,12 @@ static size_t js_arrays_len, js_arrays_cap;
 static uint32_t js_array_cache[JS_OBJECT_CACHE_SIZE];
 static JsStringRec **js_strings;
 static size_t js_strings_len, js_strings_cap;
-#define JS_STRING_CACHE_SIZE 65536u
-static uint32_t js_string_cache[JS_STRING_CACHE_SIZE];
+/* Identity index over js_strings: answers "is this pointer a registered string record" in
+   O(1). It GROWS with the registry — the previous fixed-size cache silently saturated once a
+   long-running program had created 65536 strings, after which every lookup fell back to a linear
+   scan of the whole registry and property-heavy programs collapsed quadratically. */
+static uint32_t *js_string_index;
+static size_t js_string_index_cap;
 static JsStringRec *js_string_lookup(uintptr_t raw);
 static void js_throw_frozen_mutation(void);
 AotJsValue aot_js_string(uintptr_t a, int64_t b, AotJsValue value, uint64_t operation);
@@ -147,18 +155,26 @@ static JsObjectRec *js_object(uintptr_t owner, int create) {
 static uint64_t js_property_key_hash(AotJsValue key) {
   JsStringRec *string = js_string_lookup((uintptr_t)key);
   if (!string) return (uint64_t)key;
+  if (string->content_hash) return string->content_hash;
   uint64_t hash = UINT64_C(1469598103934665603);
   for (size_t i = 0; i < string->length; ++i) {
     hash ^= string->units[i];
     hash *= UINT64_C(1099511628211);
   }
+  if (!hash) hash = 1;
+  /* `initialized` counts filled units; content is final only once every unit is written.
+     Memoizing earlier would freeze the hash of a string still being appended to. */
+  if (string->initialized == string->length) string->content_hash = hash;
   return hash;
 }
 
 static int js_property_key_equal(AotJsValue left, AotJsValue right) {
+  if (left == right) return 1;
   JsStringRec *a = js_string_lookup((uintptr_t)left);
   JsStringRec *b = js_string_lookup((uintptr_t)right);
   if (!a || !b) return left == right;
+  if (a == b) return 1;
+  if (a->content_hash && b->content_hash && a->content_hash != b->content_hash) return 0;
   return a->length == b->length &&
          (!a->length || memcmp(a->units, b->units, a->length * sizeof(*a->units)) == 0);
 }
@@ -266,22 +282,44 @@ static int js_array_reserve(JsArrayRec *array, size_t needed) {
   return 1;
 }
 
+static size_t js_string_index_slot(uintptr_t raw) {
+  return (size_t)(((raw >> 3) * UINT64_C(11400714819323198485)) &
+                  (js_string_index_cap - 1));
+}
+
+static void js_string_index_insert(uintptr_t raw, uint32_t index_plus_one) {
+  size_t slot = js_string_index_slot(raw);
+  while (js_string_index[slot])
+    slot = (slot + 1) & (js_string_index_cap - 1);
+  js_string_index[slot] = index_plus_one;
+}
+
+static int js_string_index_reserve(size_t needed) {
+  if (js_string_index && needed * 10 < js_string_index_cap * 7) return 1;
+  size_t cap = js_string_index_cap ? js_string_index_cap : 131072u;
+  while (needed * 10 >= cap * 7) cap *= 2;
+  uint32_t *next = calloc(cap, sizeof(*next));
+  if (!next) return 0;
+  free(js_string_index);
+  js_string_index = next;
+  js_string_index_cap = cap;
+  for (size_t i = 0; i < js_strings_len; ++i)
+    if (js_strings[i]) js_string_index_insert((uintptr_t)js_strings[i], (uint32_t)(i + 1));
+  return 1;
+}
+
 static JsStringRec *js_string_lookup(uintptr_t raw) {
   if (aot_js_tag((AotJsValue)raw) == AOT_JS_STRING)
     raw = aot_js_payload((AotJsValue)raw);
-  size_t slot = (size_t)((raw >> 3) & (JS_STRING_CACHE_SIZE - 1));
-  for (size_t probe = 0; probe < JS_STRING_CACHE_SIZE; ++probe) {
-    uint32_t cached = js_string_cache[slot];
+  if (!js_string_index_cap) return NULL;
+  size_t slot = js_string_index_slot(raw);
+  for (;;) {
+    uint32_t cached = js_string_index[slot];
     if (!cached) return NULL;
     if (cached <= js_strings_len && (uintptr_t)js_strings[cached - 1] == raw)
       return js_strings[cached - 1];
-    slot = (slot + 1) & (JS_STRING_CACHE_SIZE - 1);
+    slot = (slot + 1) & (js_string_index_cap - 1);
   }
-  // Once the fixed cache is saturated, later strings remain valid registry members even though
-  // they have no cache slot. This cold fallback preserves correctness for unusually large heaps.
-  for (size_t i = 0; i < js_strings_len; ++i)
-    if ((uintptr_t)js_strings[i] == raw) return js_strings[i];
-  return NULL;
 }
 
 static JsStringRec *js_string_new(size_t length) {
@@ -292,16 +330,14 @@ static JsStringRec *js_string_new(size_t length) {
   string->units = length ? calloc(length, sizeof(*string->units)) : NULL;
   if (length && !string->units) { free(string); return NULL; }
   string->length = length;
+  if (!js_string_index_reserve(js_strings_len + 1)) {
+    free(string->units);
+    free(string);
+    return NULL;
+  }
   size_t index = js_strings_len++;
   js_strings[index] = string;
-  size_t slot = (size_t)(((uintptr_t)string >> 3) & (JS_STRING_CACHE_SIZE - 1));
-  for (size_t probe = 0; probe < JS_STRING_CACHE_SIZE; ++probe) {
-    if (!js_string_cache[slot]) {
-      js_string_cache[slot] = (uint32_t)(index + 1);
-      break;
-    }
-    slot = (slot + 1) & (JS_STRING_CACHE_SIZE - 1);
-  }
+  js_string_index_insert((uintptr_t)string, (uint32_t)(index + 1));
   return string;
 }
 
@@ -1926,7 +1962,7 @@ int aot_gc_configure(size_t bytes, int stress) {
   js_property_cache_complete = 1;
   memset(js_array_cache, 0, sizeof(js_array_cache));
   js_arrays_len = 0;
-  memset(js_string_cache, 0, sizeof(js_string_cache));
+  if (js_string_index) memset(js_string_index, 0, js_string_index_cap * sizeof(*js_string_index));
   js_strings_len = 0;
   return spaces[0] && spaces[1] && old_space;
 }
