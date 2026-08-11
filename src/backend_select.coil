@@ -243,6 +243,12 @@
   (be-call-return-tag-fuel call 32))
 
 (defn be-js-tag-for-value [(node i64)] (-> i64)
+  ;; A materialized closure's VALUE is its environment object pointer; boxing it must produce
+  ;; an OBJECT-tagged word. The generic dispatcher recognizes that tag and reads the callable
+  ;; id from the environment's __closure_target field — a function tag here would send the env
+  ;; pointer down the bare-function payload path.
+  (if (and (= (n-op node) OP-CLOSURE) (= (n-nins node) (+ (n-aux node) 2)))
+      JSV-OBJECT
   (if (be-array-value? node 64)
       JSV-ARRAY
       (if (ml-raw-nullable-value? node 32)
@@ -260,7 +266,7 @@
             ;; a sound numeric join as unboxable.
             (if (and (= tag -1) (ty-numeric? (n-ty node)))
                 (if (be-node-fp-value? node) 0 JSV-INTEGER)
-                tag)))))))
+                tag))))))))
 
 (defn be-box-input-already-tagged? [(node i64)] (-> bool)
   (if (= (n-op node) OP-BOX)
@@ -2535,17 +2541,28 @@
                                  (= (n-op (n-in ptr 0)) OP-NEW))
                             (n-in ptr 0)
                             ptr)
-                      mark-bid (ms-node-block owner source)
-                      object (ms-select-value-at! owner (n-in node 1) mark-bid)]
-                  (if (< object 0)
-                      (ms-fail! MSEL-UNSUPPORTED node)
-                      (let [fresh (ms-new-vreg!)
-                            at
-                              (ms-emit! owner
-                                        mark-bid
-                                        (mi-new MI-JSARRAY fresh object object 0 node))]
-                        (ms-add-single-arg! at object)
-                        (store! vr fresh))))
+                      ; Prefer the mark's own control anchor; fall back to the allocation's
+                      ; block for hand-built graphs that still float it.
+                      mark-bid
+                        (if (!= (n-in node 0) NO-NODE)
+                            (ms-node-block owner node)
+                            (ms-node-block owner source))
+                      ; CLAIM THE VREG BEFORE SELECTING THE INPUT. Selecting the allocation
+                      ; walks its memory chain, which can reach an ArrayStore whose array
+                      ; input is THIS mark; without the early registration that re-entry
+                      ; selected the mark a second time, and two instructions defining one
+                      ; node cannot be scheduled.
+                      fresh (ms-new-vreg!)]
+                  (ms-vset! owner node fresh)
+                  (let [object (ms-select-value-at! owner (n-in node 1) mark-bid)]
+                    (if (< object 0)
+                        (ms-fail! MSEL-UNSUPPORTED node)
+                        (let [at
+                                (ms-emit! owner
+                                          mark-bid
+                                          (mi-new MI-JSARRAY fresh object object 0 node))]
+                          (ms-add-single-arg! at object)
+                          (store! vr fresh)))))
                   OP-ARRAYLOAD
                 (let [pinned-bid (ms-pinned-read-block owner node bid)]
                 (if (or (not (ms-select-control-effects! owner (n-in node 0) pinned-bid))
@@ -2680,7 +2697,12 @@
                       explicit-captures (>= (n-aux node) CALL-ABI-CAPTURE-BASE)
                       capturec
                         (if (and (= (n-op callee-node) OP-CLOSURE)
-                                 (not explicit-captures))
+                                 (and (not explicit-captures)
+                                      ; The uniform receiver ABI passes captures through the
+                                      ; hidden environment argument; prepending the Closure's
+                                      ; capture inputs as registers would shift the receiver
+                                      ; and every declared argument.
+                                      (!= (n-aux node) CALL-ABI-RECEIVER)))
                             (n-aux callee-node)
                             0)
                       materialized

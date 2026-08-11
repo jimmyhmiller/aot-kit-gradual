@@ -1541,6 +1541,36 @@
 (defn fng-expression [(context FngContext) (node i64)] (-> i64)
   (fng-expression-expected context node FNG-DYNAMIC))
 
+;; The closure environment ABI. Field 0 is the runtime callable id (`fidx = FeFunction.id + 1`)
+;; so a closure VALUE loaded from the heap can be dispatched generically: the polymorphic call
+;; sequence reads it and selects the target, then passes the environment itself as the callee's
+;; hidden first parameter. Fields 1..N are the captured cells, and a lexical `this` rides as the
+;; final field. Creator and callee both derive the layout from this one function, so the shapes
+;; agree by construction.
+(defn fng-env-shape-of [(frontend (ptr NativeFrontend))
+                        (cell-shape i64)
+                        (function-id i64)] (-> i64)
+  (let [count (fng-symbol-capture-count frontend function-id)
+        (mut shape) (shape-transition SHAPE-ROOT "__closure_target" (t-int))
+        (mut i) 0]
+    (loop (if (>= (load i) count)
+              (break)
+              (do
+                (store! shape
+                        (shape-transition (load shape)
+                                          (fng-capture-field-name (load i))
+                                          (t-obj-shape cell-shape)))
+                (store! i (+ (load i) 1)))))
+    (if (fng-lexical-this? frontend function-id)
+        (store! shape (shape-transition (load shape) "__closure_this" (t-dyn)))
+        0)
+    (load shape)))
+
+(defn fng-env-shape [(context FngContext) (function-id i64)] (-> i64)
+  (fng-env-shape-of (load (field context frontend))
+                    (load (field context cell-shape))
+                    function-id))
+
 (defn fng-closure-expression [(context FngContext) (node i64)] (-> i64)
   (let [frontend (load (field context frontend))
         function-index (fng-function-node-index frontend node)
@@ -1559,51 +1589,48 @@
                               (fng-symbol-storage context symbol)))
                 (store! index (+ (load index) 1)))))
     (if (fng-lexical-this? frontend function-id)
-        (al-push! [i64] (mut captures) (load (field context receiver)))
+        (al-push! [i64]
+                  (mut captures)
+                  (fng-box-dynamic-argument! (load (field context receiver))))
         0)
     (let [closure
             (if (= (al-len [i64] (load captures)) 0)
                 target
                 (if (load (fng-capture-by-value-ptr))
                     (n-closure! target (al-slice [i64] (load captures)))
-                (let [(mut shape) SHAPE-ROOT
+                (let [shape (fng-env-shape context function-id)
                       (mut incoming) (al-new [i64] (malloc-allocator))
                       (mut stores) (al-new [i64] (malloc-allocator))
                       (mut i) 0]
-                  ; Captures are shared cell pointers. A shape per ordered symbol list gives the moving
-                  ; collector an exact pointer layout for the environment object.
-                  (loop (if (>= (load i) (al-len [i64] (load captures)))
-                            (break)
-                            (do
-                              (store! shape
-                                      (shape-transition (load shape)
-                                                        (fng-capture-field-name (load i))
-                                                        (t-obj-shape (load (field context cell-shape)))))
-                              (store! i (+ (load i) 1)))))
-                  (store! i 0)
-                  (loop (if (>= (load i) (shape-field-count (load shape)))
+                  (loop (if (>= (load i) (shape-field-count shape))
                             (break)
                             (let [alias
                                     (fng-record-dynamic-alias! context
-                                                               (shape-field-alias (load shape) (load i)))]
+                                                               (shape-field-alias shape (load i)))]
                               (al-push! [i64] (mut incoming) (fng-current-memory context alias))
                               (store! i (+ (load i) 1))
                               0)))
                   (let [nw
                           (n-new-obj! (load (load (field context ctrl)))
-                                      (load shape)
+                                      shape
                                       (al-slice [i64] (load incoming)))
                         object (n-obj-ptr nw)]
+                    (al-push! [i64]
+                              (mut stores)
+                              (n-store! (n-obj-mem nw 0)
+                                        object
+                                        (fng-const (+ function-id 1))
+                                        (shape-field-alias shape 0)))
                     (store! i 0)
                     (loop (if (>= (load i) (al-len [i64] (load captures)))
                               (break)
                               (do
                                 (al-push! [i64]
                                           (mut stores)
-                                          (n-store! (n-obj-mem nw (load i))
+                                          (n-store! (n-obj-mem nw (+ (load i) 1))
                                                     object
                                                     (al-get [i64] (load captures) (load i))
-                                                    (shape-field-alias (load shape) (load i))))
+                                                    (shape-field-alias shape (+ (load i) 1))))
                                 (store! i (+ (load i) 1))
                                 0)))
                     (store! (load (field context memory))
@@ -1730,17 +1757,17 @@
                               (load index))
                     target (load (field method target))]
                 (if (str-eq name (ts-text ast (load (field method name-node))))
-                    (let [count (fng-capture-count frontend target)
-                          ;; Function payload zero is reserved by the runtime, so graph Fun nodes
-                          ;; and boxed function values use source id + 1. Target summaries must use
-                          ;; that same identity; otherwise polymorphic dispatch selects the method
-                          ;; immediately preceding the one stored in the object.
-                          runtime-target (+ target 1)]
+                    ;; Function payload zero is reserved by the runtime, so graph Fun nodes
+                    ;; and boxed function values use source id + 1. Target summaries must use
+                    ;; that same identity; otherwise polymorphic dispatch selects the method
+                    ;; immediately preceding the one stored in the object. Capture counts no
+                    ;; longer restrict the set: every callable reserves the same single hidden
+                    ;; environment slot, so mixed capture-free and capturing targets share one
+                    ;; call descriptor.
+                    (let [runtime-target (+ target 1)]
                       (if (or (< target 0) (>= runtime-target 63))
                           (store! valid false)
-                          (if (= (load captures) -1)
-                              (store! captures count)
-                              (if (!= (load captures) count) (store! valid false) 0)))
+                          0)
                       (store! targets (| (load targets) (<< 1 runtime-target))))
                     0)
                 (store! index (+ (load index) 1)))))
@@ -1763,8 +1790,12 @@
                               (load (field frontend prototype-methods))
                               (load index))
                     target (load (field method target))]
+                ; Identity comparison against a boxed Fun constant only means something for a
+                ; capture-free target; a capturing method's runtime value is a per-construction
+                ; closure object and dispatches through the finite target summary instead.
                 (if (and (str-eq name (ts-text ast (load (field method name-node))))
-                         (>= target 0))
+                         (and (>= target 0)
+                              (= (fng-capture-count frontend target) 0)))
                     (let [(mut scan) 0
                           (mut seen) false]
                       (loop (if (or (>= (load scan) (al-len [i64] (load out))) (load seen))
@@ -1843,8 +1874,14 @@
                       ; in source order, so a child override is stored after its ancestor's value.
                       ; This prevents an early instance lookup from observing a recursively-created
                       ; ancestor whose initialization was locally scheduled too late.
-                      (if (fng-constructor-descends-from?
-                            frontend constructor (load (field method constructor)))
+                      ; A capture-carrying method's callable value is a closure materialized when
+                      ; its constructor runs, stored directly on the instance. The bare Fun would
+                      ; be missing its environment; publishing it on the prototype would turn a
+                      ; pre-assignment lookup into a silent wrong-environment call, so it is
+                      ; deliberately absent and such a lookup traps in the callee's unbox instead.
+                      (if (and (fng-constructor-descends-from?
+                                 frontend constructor (load (field method constructor)))
+                               (= (fng-capture-count frontend (load (field method target))) 0))
                           (let [target-index
                                   (fng-function-index frontend (load (field method target)))
                                 target-function
@@ -2541,6 +2578,20 @@
   (if (!= (jsl-require-body-only! name) JSL-OK)
       (do (panic-corrupt "frontend: a JSL definition the frontend emits did not resolve") 0)
       0)
+  ;; A NO-NODE argument binds a JSL parameter to nothing and surfaces later as a baffling
+  ;; "unbound symbol" panic deep in lowering. Refuse it here, where the callee name is known.
+  (let [(mut probe) 0]
+    (loop (if (>= (load probe) (slice-len args))
+              (break)
+              (do
+                (if (= (slice-get args (load probe)) NO-NODE)
+                    (do
+                      (if (= (load probe) 0) (panic-corrupt "jsl argument 0 is NO-NODE") 0)
+                      (if (= (load probe) 1) (panic-corrupt "jsl argument 1 is NO-NODE") 0)
+                      (panic-corrupt "jsl argument 2+ is NO-NODE")
+                      0)
+                    0)
+                (store! probe (+ (load probe) 1))))))
   ;; The heap goes in and comes back out. A definition that does not touch it leaves the cell alone,
   ;; so this is the same code for both kinds and there is nothing to decide here.
   (let [cell (stack (array i64 1))
@@ -3377,8 +3428,11 @@
                 (if (!= (load (load (field context memory))) NO-NODE)
                     (al-push! [i64] (mut call-args) (load (load (field context memory))))
                     0)
+                ; Chain candidates are capture-free (identity comparison against a boxed Fun
+                ; constant is only meaningful for them), so the environment slot is undefined.
                 (let [call (n-call-receiver! (load (load (field context ctrl)))
                                              fun-node
+                                             (fng-undefined)
                                              receiver
                                              (al-slice [i64] (load call-args)))]
                   (store! (load (field context ctrl)) (call-end call))
@@ -3522,7 +3576,17 @@
         receiver-aware (or explicit-call
                            (or (fng-function-receiver-aware? frontend callee)
                                (and receiver-call (< (fng-function-index frontend callee) 0))))
-        function-index (fng-function-index frontend callee)
+        ;; A method or superConstructor target that CAPTURES cannot be called off its bare Fun:
+        ;; its hidden environment is the closure VALUE stored in the property, so the call must
+        ;; dispatch through that loaded value. Demote to the generic path, which passes the
+        ;; callee value as the environment.
+        function-index
+          (let [statically (fng-function-index frontend callee)]
+            (if (and (>= statically 0)
+                     (and (or receiver-call explicit-call)
+                          (> (fng-capture-count frontend callee) 0)))
+                -1
+                statically))
         method-targets
           (if receiver-call
               (fng-prototype-method-targets frontend (ts-child ast callee-node 1))
@@ -3567,9 +3631,11 @@
           (if construct
               (if (>= receiver-owner 0)
                   (fng-empty-object context receiver-owner)
-                  (if (= receiver-type FE-RECEIVER-DYNAMIC)
-                      (fng-empty-dynamic-object context)
-                      NO-NODE))
+                  ; `new F()` allocates a fresh object even when F's body never reads `this`
+                  ; (receiver-type -1). NO-NODE here compiled a silently-broken store whenever
+                  ; the result was USED — DeltaBlue's inheritsFrom body, dead at runtime only
+                  ; because its calls are intercepted, was the first thing loud enough to notice.
+                  (fng-empty-dynamic-object context))
               (if explicit-call
                   (fng-expression context (ts-child ast node 1))
                   (if receiver-aware
@@ -3598,12 +3664,7 @@
               raw-receiver)
         target
           (if (>= function-index 0)
-                  (let [function-id (load (field fn id))]
-                  (if (> method-targets 0)
-                  (al-get [i64] (load (load (field context functions))) function-id)
-                  (if (> (fng-capture-count frontend function-id) 0)
-                  (fng-expression context callee-node)
-                  (al-get [i64] (load (load (field context functions))) function-id))))
+              (al-get [i64] (load (load (field context functions))) (load (field fn id)))
               (if (and receiver-call (< function-index 0))
                   (do
                     (fng-record-dynamic-alias! context JS-PROPERTY-ALIAS)
@@ -3618,6 +3679,22 @@
                                   (load (load (field context ctrl))) loaded)
                           loaded)))
                   (fng-expression context callee-node)))
+        ;; A syntactically direct Fun/Closure callee stays an EXACT call even when name
+        ;; resolution failed (an IIFE, a local closure value): its raw node gives the backend
+        ;; the target for a direct branch and reachability, where a boxed value would force
+        ;; runtime dispatch against a function the unit never built.
+        direct-value-callee
+          (and (< function-index 0)
+               (or (= (n-op target) OP-FUN) (= (n-op target) OP-CLOSURE)))
+        ;; The hidden environment argument. A generic site passes the callee value itself — a
+        ;; closure is its own environment and a bare function ignores the slot. An exact site
+        ;; passes the boxed closure value for a capture-carrying target and undefined otherwise.
+        call-env
+          (if (>= function-index 0)
+              (if (> (fng-capture-count frontend (load (field fn id))) 0)
+                  (fng-box-dynamic-argument! (fng-expression context callee-node))
+                  (fng-undefined))
+              (if direct-value-callee (n-box! target) target))
         (mut args) (al-new [i64] (malloc-allocator))
         (mut call-captures) (al-new [i64] (malloc-allocator))
         optional-call
@@ -3676,27 +3753,6 @@
                 (fng-jsl-call2 context "SetObjectPrototype" receiver prototype)]
           0)
         0)
-    (if (or (> method-targets 0)
-            (or (and explicit-call (>= function-index 0)) (= (n-op target) OP-FUN)))
-        (let [representative
-                (if (> method-targets 0)
-                    (fng-first-function-target method-targets)
-                    (if (and explicit-call (>= function-index 0))
-                        (load (field fn id))
-                        (- (n-aux target) 1)))
-              count (fng-capture-count frontend representative)
-              (mut capture-index) 0]
-          (loop (if (>= (load capture-index) count)
-                    (break)
-                    (do
-                      (al-push! [i64]
-                                (mut call-captures)
-                                (fng-symbol-storage
-                                  context
-                                  (fng-capture-symbol frontend representative
-                                                      (load capture-index))))
-                      (store! capture-index (+ (load capture-index) 1))))))
-        0)
     (loop (if (>= (load index) (ts-child-count ast node))
               (break)
               (do
@@ -3728,9 +3784,12 @@
     ;; reach an exact Fun even when the source-level lookup above could not recover its FeFunction.
     ;; Recover that identity from the graph target before freezing the native call descriptor, so
     ;; omitted JavaScript arguments still arrive as `undefined` instead of uninitialised registers.
-    (if (and (< argument-function-index 0) (= (n-op target) OP-FUN))
+    (if (and (< argument-function-index 0)
+             (or (= (n-op target) OP-FUN) (= (n-op target) OP-CLOSURE)))
         ;; OP-FUN reserves callable identity zero as invalid, so its aux is FeFunction.id + 1.
-        (let [target-function-index (fng-function-index frontend (- (n-aux target) 1))]
+        ;; A Closure's function identity is its input 0.
+        (let [target-fun (if (= (n-op target) OP-CLOSURE) (n-in target 0) target)
+              target-function-index (fng-function-index frontend (- (n-aux target-fun) 1))]
           (if (>= target-function-index 0)
               (let [target-fn
                       (al-get [FeFunction]
@@ -3768,43 +3827,20 @@
               (if conditional-optional
                   (n-new2 OP-CAST (t-fun) (load (load (field context ctrl))) resolved-target)
                   resolved-target))
+          ; Every JavaScript call uses the receiver form — a plain `f(x)` passes undefined in the
+          ; reserved receiver slot. A call whose target is not statically known is marked DYNAMIC
+          ; so selection always dispatches the runtime callee value.
           call
-            (if receiver-aware
-                (if (> (al-len [i64] (load call-captures)) 0)
-                    (n-call-captured-receiver! (load (load (field context ctrl)))
-                                               callable-target
-                                               (al-slice [i64] (load call-captures))
-                                               receiver
-                                               (al-slice [i64] (load args)))
-                    (n-call-receiver! (load (load (field context ctrl)))
-                                      callable-target
-                                      receiver
-                                      (al-slice [i64] (load args))))
-                ; A receiverless capture-carrying target (a nested declaration called by name)
-                ; reads its capture cells as leading parameters; the memory token stays last
-                ; because it is already the final element of `args`.
-                (if (> (al-len [i64] (load call-captures)) 0)
-                    (let [(mut prefixed) (al-new [i64] (malloc-allocator))
-                          (mut copy) 0]
-                      (loop (if (>= (load copy) (al-len [i64] (load call-captures)))
-                                (break)
-                                (do (al-push! [i64] (mut prefixed)
-                                              (al-get [i64] (load call-captures) (load copy)))
-                                    (store! copy (+ (load copy) 1)))))
-                      (store! copy 0)
-                      (loop (if (>= (load copy) (al-len [i64] (load args)))
-                                (break)
-                                (do (al-push! [i64] (mut prefixed)
-                                              (al-get [i64] (load args) (load copy)))
-                                    (store! copy (+ (load copy) 1)))))
-                      (let [site (n-call! (load (load (field context ctrl)))
-                                          callable-target
-                                          (al-slice [i64] (load prefixed)))]
-                        (al-free! [i64] (mut prefixed))
-                        (load site)))
-                    (n-call! (load (load (field context ctrl)))
-                             callable-target
-                             (al-slice [i64] (load args)))))
+            (let [site (n-call-receiver! (load (load (field context ctrl)))
+                                         callable-target
+                                         call-env
+                                         (if (= receiver NO-NODE) (fng-undefined) receiver)
+                                         (al-slice [i64] (load args)))]
+              (if (and (< function-index 0)
+                       (and (not conditional-optional) (not direct-value-callee)))
+                  (do (n-set-aux! (call-value site) CALL-ABI-DYNAMIC-RECEIVER) 0)
+                  0)
+              (load site))
           value (call-value call)]
       (store! (load (field context ctrl)) (call-end call))
       ;; The callee may have changed any active alias. Re-anchor subsequent alias reads at the
@@ -3870,7 +3906,8 @@
     (cond (= intrinsic FNG-INTRINSIC-OBJECT) (fng-empty-dynamic-object context)
           (= intrinsic FNG-INTRINSIC-ARRAY)
             (let [allocation (n-new-obj0! (load (load (field context ctrl))) SHAPE-ROOT)
-                  array (n-array-mark! (n-obj-ptr allocation))]
+                  array (n-array-mark! (load (load (field context ctrl)))
+                                        (n-obj-ptr allocation))]
               (fng-record-dynamic-alias! context JS-PROPERTY-ALIAS)
               (if (> argc 0)
                   (let [resized
@@ -3997,6 +4034,9 @@
                     computed (= (ts-kind ast name-node) TSK-COMPUTED-PROPERTY-NAME)
                     key (if computed (fng-expression context (ts-child ast name-node 0)) NO-NODE)
                     value (fng-expression context value-node)
+                    probe (if (= value NO-NODE)
+                              (panic-corrupt (ts-text ast name-node))
+                              0)
                     stored
                       (if computed
                           (fng-jsl-call3 context "SetProperty" object key value)
@@ -4011,7 +4051,7 @@
   (let [frontend (load (field context frontend))
         ast (field frontend ast)
         allocation (n-new-obj0! (load (load (field context ctrl))) SHAPE-ROOT)
-        array (n-array-mark! (n-obj-ptr allocation))
+        array (n-array-mark! (load (load (field context ctrl))) (n-obj-ptr allocation))
         (mut index) 0]
     (fng-record-dynamic-alias! context JS-PROPERTY-ALIAS)
     (loop (if (>= (load index) (ts-child-count ast node))
@@ -4053,11 +4093,23 @@
           (if (< field-index 0)
               owner
               (load (field (index (load (field (field frontend fields) data)) field-index) owner)))
+        ;; `this` reaching here as the receiver Parm is a RAW shaped pointer (exact sites pass
+        ;; the receiver unboxed), so unboxing it would trap. A LEXICAL `this` is different: the
+        ;; closure environment stores the receiver as a TAGGED value, so an arrow's `this`
+        ;; arrives as an env-field load and must be unboxed before shaped access like any other
+        ;; dynamic object. That decision is STRUCTURAL (which node produced `this`), not a type
+        ;; test: a fresh Load's value type is not computed until inference runs, so comparing it
+        ;; against the interned `(t-dyn)` never matches here.
+        lexical-this
+          (and (= (ts-kind ast object-node) TSK-THIS)
+               (and (!= (n-op raw-object) OP-PARM)
+                    (!= (n-op raw-object) OP-CAST)))
         object
           (if (and (>= field-owner 0)
-                   (and (= (n-ty raw-object) (t-dyn))
-                        (and (!= (n-op raw-object) OP-CAST)
-                             (!= (ts-kind ast object-node) TSK-THIS))))
+                   (or lexical-this
+                       (and (= (n-ty raw-object) (t-dyn))
+                            (and (!= (n-op raw-object) OP-CAST)
+                                 (!= (ts-kind ast object-node) TSK-THIS)))))
               (n-unbox! raw-object
                         (t-obj-shape
                           (al-get [i64] (load (load (field context shapes))) field-owner)))
@@ -4452,9 +4504,16 @@
                     :else
                       (let [stored (fng-symbol-node context symbol)
                             declaration (fe-find-function-name frontend node)
+                            ; The stored binding wins whenever it holds a value: a nested
+                            ; declaration's binding is its materialized CLOSURE, and preferring
+                            ; the bare Fun here handed callers an environment-less callable.
+                            ; The declaration is only the hoisting fallback for a name read
+                            ; before its statement was reached.
                             value
-                              (if (>= declaration 0)
-                                  (al-get [i64] (load (load (field context functions))) declaration)
+                              (if (= stored NO-NODE)
+                                  (if (>= declaration 0)
+                                      (al-get [i64] (load (load (field context functions))) declaration)
+                                      stored)
                                   stored)]
                         ;; Parameter nodes use the tagged JavaScript call ABI. When a typed
                         ;; context consumes a numeric identifier directly (object fields,
@@ -4620,6 +4679,9 @@
                                       (fng-bin OP-USHR
                                                (fng-int-value context left-node left)
                                                (fng-int-value context right-node right)))]
+                        (if (= value NO-NODE)
+                            (do (panic-corrupt (ts-text ast node)) 0)
+                            0)
                         (fng-lvalue-write context target value))
                       (let [left (fng-expression context left-node)
                             right (fng-expression context right-node)]
@@ -6113,6 +6175,9 @@
         value (if has-value
                   (fng-expression-expected context value-node declared)
                   (fng-symbol-node context symbol))]
+    (if (and has-value (= value NO-NODE))
+        (do (panic-corrupt "declaration initializer evaluated to NO-NODE") 0)
+        0)
     (if has-value
         (do
           (fng-set-symbol! context symbol value)
@@ -6480,26 +6545,54 @@
         (mut index) 0]
     (if top-level
         0
+        ;; The uniform callable ABI: parameter 0 is the hidden closure environment (dead for a
+        ;; capture-free function, but the slot is always reserved so every generic call places
+        ;; the receiver and arguments identically), the receiver sits at parameter 1, and the
+        ;; declared parameters follow. Captured state arrives as cell pointers loaded from the
+        ;; environment's fields at entry, and a lexical `this` is the environment's last field.
         (let [symbol-capture-count (fng-symbol-capture-count frontend fun-id)
               capture-count (fng-capture-count frontend fun-id)]
-          (loop (if (>= (load index) symbol-capture-count)
-                    (break)
-                    (let [symbol (fng-capture-symbol frontend fun-id (load index))]
-                      (al-push! [i64] (mut saved-capture-symbols) symbol)
-                      (al-push! [i64]
-                                (mut saved-capture-values)
-                                (al-get [i64] (load values) symbol))
-                      (al-set! [i64] (mut values) symbol (n-parm! fun (load index)))
-                      (store! index (+ (load index) 1)))))
-          (if (fng-lexical-this? frontend fun-id)
-              (store! receiver (n-parm! fun symbol-capture-count))
+          (if (> capture-count 0)
+              (let [entry (n-fun-entry fun)
+                    env-shape (fng-env-shape-of frontend cell-shape fun-id)
+                    ; The environment arrives as a TAGGED closure value — exact call sites box
+                    ; it and generic call sites pass the callee value itself. Unbox, don't cast:
+                    ; a wrong-tag value must trap here, not read garbage fields.
+                    env (n-unbox! (n-parm! fun 0) (t-obj-shape env-shape))]
+                ; The incoming memory's CONTENT type must be the field's declared type, not
+                ; undefined: a `(t-undef)` content told inference the loads were provably
+                ; undefined and the fold pass replaced every capture cell with a constant.
+                (loop (if (>= (load index) symbol-capture-count)
+                          (break)
+                          (let [symbol (fng-capture-symbol frontend fun-id (load index))
+                                alias (shape-field-alias env-shape (+ (load index) 1))
+                                incoming (n-new1 OP-ARG
+                                                 (t-mem-alias alias (shape-alias-ty alias))
+                                                 entry)]
+                            (al-push! [i64] (mut saved-capture-symbols) symbol)
+                            (al-push! [i64]
+                                      (mut saved-capture-values)
+                                      (al-get [i64] (load values) symbol))
+                            (al-set! [i64] (mut values) symbol (n-load! incoming env alias))
+                            (store! index (+ (load index) 1)))))
+                (if (fng-lexical-this? frontend fun-id)
+                    (let [alias (shape-field-alias env-shape (+ symbol-capture-count 1))
+                          incoming (n-new1 OP-ARG
+                                           (t-mem-alias alias (shape-alias-ty alias))
+                                           entry)]
+                      (store! receiver (n-load! incoming env alias))
+                      0)
+                    0))
               0)
+          ; The receiver slot is reserved for EVERY callable — a function that never reads `this`
+          ; simply leaves parameter 1 dead — so a value call needs no knowledge of its target's
+          ; receiver-awareness: [env, receiver, arguments...] is the whole convention.
           (let [receiver-count
                   (if (and (not (load (field fn arrow)))
                            (!= (load (field fn receiver-type-node)) -1))
                       1
                       0)]
-            (if (= receiver-count 1) (store! receiver (n-parm! fun capture-count)) 0)
+            (if (= receiver-count 1) (store! receiver (n-parm! fun 1)) 0)
             (store! index 0)
             (loop (if (>= (load index) (load (field fn parameter-count)))
                       (break)
@@ -6508,7 +6601,7 @@
                                       (load (field frontend symbols))
                                       (+ (load (field fn parameter-start)) (load index)))]
                         (let [parameter
-                                (n-parm! fun (+ (+ capture-count receiver-count) (load index)))
+                                (n-parm! fun (+ 2 (load index)))
                               declared (fng-parameter-type frontend fn (load index))]
                           ;; A declared `number` parameter already has a tagged-number ABI at every
                           ;; statically typed call boundary. Publish its machine value directly;

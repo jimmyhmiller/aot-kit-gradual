@@ -1718,8 +1718,11 @@
 (defn n-set-prototype-at! [(ctrl i64) (mem i64) (ptr i64) (prototype i64)] (-> i64)
   (n-peephole (n-new4 OP-SETPROTO 0 ctrl mem ptr prototype)))
 
-(defn n-array-mark! [(ptr i64)] (-> i64)
-  (n-peephole (n-new2 OP-ARRAYMARK 0 NO-NODE ptr)))
+;; The mark lowers to a runtime call, so it must not float: demand-driven selection placed one
+;; in whichever consumer's block asked first, which can sit after (or fail to dominate) another
+;; consumer. Anchor it to the control point of its allocation.
+(defn n-array-mark! [(ctrl i64) (ptr i64)] (-> i64)
+  (n-peephole (n-new2 OP-ARRAYMARK 0 ctrl ptr)))
 
 (defn n-array-load! [(mem i64) (ptr i64) (index i64)] (-> i64)
   (n-peephole (n-new4 OP-ARRAYLOAD 0 NO-NODE mem ptr index)))
@@ -1972,14 +1975,17 @@
     (store! (field r end) (n-peephole (n-new2 OP-CALLEND 0 ctrl (load (field r value)))))
     (load r)))
 
-(defn n-call-receiver! [(ctrl i64) (callee i64) (receiver i64) (args (slice i64))] (-> CallSite)
-  ; Receiver is the first source argument and is marked in aux so verifiers can distinguish the
-  ; JavaScript ABI from legacy/internal calls.
+(defn n-call-receiver! [(ctrl i64) (callee i64) (env i64) (receiver i64) (args (slice i64))] (-> CallSite)
+  ; The JavaScript receiver ABI: input 2 is the hidden closure environment (the callee VALUE at
+  ; generic sites — a closure is its own environment — or a boxed closure/undefined at exact
+  ; sites), input 3 is the receiver, and explicit arguments follow. Aux distinguishes this
+  ; layout from legacy/internal calls.
   (let [call (n-new OP-CALL CALL-ABI-RECEIVER)
         (mut i) 0
         (mut r) (zeroed CallSite)]
     (n-add-def! call ctrl)
     (n-add-def! call callee)
+    (n-add-def! call env)
     (n-add-def! call receiver)
     (loop (if (>= (load i) (slice-len args))
               (break)

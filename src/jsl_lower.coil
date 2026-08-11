@@ -229,7 +229,8 @@
     (if (!= lit TY-NO-ID) (jl-const lit)
       (let [b (jl-lookup s)]
         (if (!= b NO-NODE) b
-          (do (panic-corrupt "jsl lowering: unbound symbol reached lowering; the checker should have refused it")
+          (do (panic-corrupt s)
+              (panic-corrupt "jsl lowering: unbound symbol reached lowering; the checker should have refused it")
               NO-NODE))))))
 
 ; ============================================================================
@@ -363,7 +364,7 @@
             ; happening twice is two objects — so it hangs off the current control rather than
             ; floating like a value op.
             (let [object (n-obj-ptr (n-new-obj0! (jl-ctrl) SHAPE-ROOT))]
-              (if (= id JSP-NEWARRAY) (n-array-mark! object) object))
+              (if (= id JSP-NEWARRAY) (n-array-mark! (jl-ctrl) object) object))
           (if (= op OP-ARRAYSTORE)
               ; The store PRODUCES the new memory, which becomes current. Its JSL value is
               ; `undefined`: a store is an effect, and giving it the stored value back would invite
@@ -427,8 +428,21 @@
                   0)))
       (if (jl-diverged?) (return-from :done NO-NODE) 0)
       (store! (index p n) (jl-mem))
-      (let [cs (n-call! (jl-ctrl) callee (slice-new [i64] p (+ n 1)))
+      ;; The callee value doubles as the hidden environment, and a bare `f(...)` call runs with an
+      ;; undefined receiver — the uniform closure-call ABI, same layout `inline-clone!` maps
+      ;; parameters against.
+      ;; A syntactically direct Fun/Closure callee stays an exact call — its raw materialized
+      ;; value is a bare function index, which the polymorphic dispatcher would reject as an
+      ;; untagged callable. Exact sites pass the BOXED closure as the hidden environment (the
+      ;; callee prologue unboxes parameter 0); only a runtime-value callee needs tag dispatch,
+      ;; and there the tagged callee value doubles as the environment.
+      (let [direct (or (= (n-op callee) OP-FUN) (= (n-op callee) OP-CLOSURE))
+            cs (n-call-receiver! (jl-ctrl) callee
+                                 (if direct (n-box! callee) callee)
+                                 (n-box! (jl-const (t-undef)))
+                                 (slice-new [i64] p (+ n 1)))
             end (call-end cs)]
+        (if direct 0 (do (n-set-aux! (call-value cs) CALL-ABI-DYNAMIC-RECEIVER) 0))
         (al-push! [i64] (field (jl) callback-calls) (call-value cs))
         (jl-set-ctrl! end)
         (jl-set-mem! (n-new1 OP-ARG (t-mem-alias JS-PROPERTY-ALIAS (t-undef)) end))
@@ -504,8 +518,10 @@
                        raw-callee
                        (jl-expr (rd/sexp-nth x 2)))
           n (- (rd/sexp-count x) 3)
-          max-params (if dynamic (jl-frontend-max-params targets) (+ n 1))
-          call-n (if (and dynamic (> (- max-params 1) n)) (- max-params 1) n)
+          max-params (if dynamic (jl-frontend-max-params targets) (+ n 2))
+          ;; Parameter indices now include the hidden environment (0) and the receiver (1), so
+          ;; the widest explicit-argument count is two less than the widest parameter index + 1.
+          call-n (if (and dynamic (> (- max-params 2) n)) (- max-params 2) n)
           buf (stack (array i64 17))
           p (cast (ptr i64) buf)
           (mut i) 0]
@@ -536,7 +552,9 @@
           raw-callee
           (do
             (store! (index p call-n) (jl-mem))
-            (let [cs (n-call-receiver! (jl-ctrl) callee receiver
+            ;; The callee value doubles as the hidden environment: a closure is its own
+            ;; environment object, and a bare function ignores the slot entirely.
+            (let [cs (n-call-receiver! (jl-ctrl) callee callee receiver
                                      (slice-new [i64] p (+ call-n 1)))
                 end (call-end cs)]
               (if dynamic (n-set-aux! (call-value cs) CALL-ABI-DYNAMIC-RECEIVER) 0)

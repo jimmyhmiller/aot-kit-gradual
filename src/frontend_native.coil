@@ -796,9 +796,19 @@
 ;; target must carry the receiver slot even when its body never reads `this` — the same rule the
 ;; prototype indexer states. Unlike prototype indexing this walks into function bodies, because
 ;; constructor-style publication happens inside the constructor.
-(defn fe-mark-property-published-functions! [(frontend (mut NativeFrontend)) (node i64)] (-> i64)
+(defn fe-mark-property-published-functions! [(frontend (mut NativeFrontend))
+                                             (node i64)
+                                             (enclosing i64)] (-> i64)
   (let [ast (field frontend ast)
-        kind (ts-kind ast node)]
+        kind (ts-kind ast node)
+        (mut child-enclosing) enclosing]
+    (if (or (= kind TSK-FUNCTION-DECLARATION) (fe-function-expression-kind? kind))
+        (let [function-index (fe-function-for-node frontend node)]
+          (if (>= function-index 0)
+              (let [fn (al-get [FeFunction] (load (field frontend functions)) function-index)]
+                (store! child-enclosing (load (field fn id))))
+              0))
+        0)
     (if (= kind TSK-BINARY)
         (let [operator-node (ts-role ast node TS-ROLE-OPERATOR 0)
               left (ts-role ast node TS-ROLE-LEFT 0)
@@ -808,19 +818,42 @@
                         (and (!= left -1)
                              (and (= (ts-kind ast left) TSK-PROPERTY-ACCESS)
                                   (and (!= right -1)
-                                       (and (= (ts-kind ast right) TSK-IDENTIFIER)
-                                            (!= (ts-kind ast (ts-child ast left 0))
-                                                TSK-PROPERTY-ACCESS)))))))
-              (let [target (fe-find-function-name frontend right)]
-                (if (and (>= target 0)
-                         (= (load (field (index (load (field (field frontend functions) data))
+                                       (!= (ts-kind ast (ts-child ast left 0))
+                                           TSK-PROPERTY-ACCESS))))))
+              (let [target
+                      (if (= (ts-kind ast right) TSK-IDENTIFIER)
+                          (fe-find-function-name frontend right)
+                          (if (fe-function-expression-kind? (ts-kind ast right))
+                              (let [function-index (fe-function-for-node frontend right)]
+                                (if (>= function-index 0)
+                                    (load (field (index (load (field (field frontend functions)
+                                                                     data))
+                                                        function-index)
+                                                 id))
+                                    -1))
+                              -1))]
+                (if (>= target 0)
+                    (do
+                      (if (= (load (field (index (load (field (field frontend functions) data))
+                                                 target)
+                                          receiver-type-node))
+                             -1)
+                          (store! (field (index (load (field (field frontend functions) data))
                                                 target)
-                                         receiver-type-node))
-                            -1))
-                    (store! (field (index (load (field (field frontend functions) data))
-                                          target)
-                                   receiver-type-node)
-                            FE-RECEIVER-DYNAMIC)
+                                         receiver-type-node)
+                                  FE-RECEIVER-DYNAMIC)
+                          0)
+                      ; `this.NAME = f` inside constructor F publishes a method of F: record it
+                      ; so name-keyed dispatch (finite target summaries and the identity chain)
+                      ; knows this name can reach this target at runtime.
+                      (if (and (>= enclosing 0)
+                               (= (ts-kind ast (ts-child ast left 0)) TSK-THIS))
+                          (al-push! [FePrototypeMethod]
+                                    (mut (field frontend prototype-methods))
+                                    (fe-prototype-method-make enclosing
+                                                              (ts-child ast left 1)
+                                                              target))
+                          0))
                     0))
               0))
         0)
@@ -829,7 +862,8 @@
                 (break)
                 (do
                   (fe-mark-property-published-functions! (mut frontend)
-                                                         (ts-child ast node (load index)))
+                                                         (ts-child ast node (load index))
+                                                         (load child-enclosing))
                   (store! index (+ (load index) 1))))))
     0))
 
@@ -1754,7 +1788,7 @@
                             (fe-index-prototype-method! (mut frontend) (ts-child ast root (load index)))
                             (fe-index-prototype-parent! (mut frontend) (ts-child ast root (load index)))
                             (store! index (+ (load index) 1)))))
-                (fe-mark-property-published-functions! (mut frontend) root)
+                (fe-mark-property-published-functions! (mut frontend) root -1)
                 ;; Keep semantic callable identities stable. Finite target masks are only an
                 ;; optimization summary; methods beyond their width retain exact runtime IDs and
                 ;; are dispatched generically instead of renumbering every declaration/capture

@@ -435,17 +435,31 @@
   (let [targets (be-poly-call-targets m)
         (mut fidx) 0
         (mut words) 0]
-    (loop (if (>= (load fidx) 63)
-              (break)
-              (do
-                (if (!= (& targets (<< 1 (load fidx))) 0)
-                    (let [owner (mu-find-function-symbol (load fidx))
-                          code (if (< owner 0) -4 (be-poly-return-code owner))]
-                      (store! words (+ (load words)
-                                       (+ (be-mov-words (load fidx))
-                                          (+ 4 (be-mov-words code))))))
-                    0)
-                (store! fidx (+ (load fidx) 1)))))
+    (if (= targets 0)
+        ; An empty summary means the callee's target set was never narrowed. Dispatch over every
+        ; function in the unit: a JavaScript value can only carry a JavaScript callable id, so
+        ; the extra candidates (JSL internals) simply never match.
+        (let [(mut owner) 0]
+          (loop (if (>= (load owner) (mu-function-count))
+                    (break)
+                    (let [symbol (al-get (load (field (machine-unit) symbols)) (load owner))]
+                      (if (>= symbol 1)
+                          (store! words (+ (load words)
+                                           (+ (be-mov-words symbol)
+                                              (+ 4 (be-mov-words (be-poly-return-code (load owner)))))))
+                          0)
+                      (store! owner (+ (load owner) 1))))))
+        (loop (if (>= (load fidx) 63)
+                  (break)
+                  (do
+                    (if (!= (& targets (<< 1 (load fidx))) 0)
+                        (let [owner (mu-find-function-symbol (load fidx))
+                              code (if (< owner 0) -4 (be-poly-return-code owner))]
+                          (store! words (+ (load words)
+                                           (+ (be-mov-words (load fidx))
+                                              (+ 4 (be-mov-words code))))))
+                        0)
+                    (store! fidx (+ (load fidx) 1))))))
     (load words)))
 
 (defn be-inst-words [(m (ptr MInst))] (-> i64)
@@ -524,14 +538,18 @@
                                 (if (be-poly-call? m) 1 0)))
                       poly-words
                         (if (be-poly-call? m)
-                            (+ 28
+                            ; +5 fixed words and one extra mov over the function-only sequence:
+                            ; the dispatcher now also accepts an object-tagged closure and reads
+                            ; its __closure_target field for the callable id.
+                            (+ 33
                                (+ (if (< (be-reg-of (load (field m a))) 0) 1 0)
                                   (+ (be-mov-words JSV-TAG-MASK)
                                      (+ (be-mov-words JSV-FUNCTION)
-                                        (+ (be-mov-words JSV-PAYLOAD-MASK)
-                                           (+ (be-mov-words -3)
-                                              (+ (be-mov-words -4)
-                                                 (be-poly-call-dispatch-words m))))))))
+                                        (+ (be-mov-words JSV-OBJECT)
+                                           (+ (be-mov-words JSV-PAYLOAD-MASK)
+                                              (+ (be-mov-words -3)
+                                                 (+ (be-mov-words -4)
+                                                    (be-poly-call-dispatch-words m)))))))))
                             5)]
                   (+ (+ poly-words
                         (* 2 (- (be-sp-adjust-words area) 1)))
@@ -1097,18 +1115,59 @@
                             (if polymorphic
                                 (let [targets (be-poly-call-targets m)
                                       (mut fidx) 0]
+                                  ; The callee value dispatches by tag: a bare function's payload
+                                  ; IS the callable id, and an object-tagged closure carries its
+                                  ; id in the environment's __closure_target field (field 0 lives
+                                  ; just past the shape header word). Anything else traps loudly.
+                                  ; The environment itself needs no synthesis here — the call site
+                                  ; already passed the callee value in the environment slot.
                                   (be-u32! (a64-ldr 16 31 (* argc 8)))
                                   (be-mov-imm! 17 JSV-TAG-MASK)
                                   (be-u32! (a64-and-reg 17 16 17))
                                   (be-mov-imm! 15 JSV-FUNCTION)
+                                  (be-mov-imm! 14 JSV-OBJECT)
+                                  (be-mov-imm! 13 JSV-PAYLOAD-MASK)
                                   (be-u32! (a64-cmp-reg 17 15))
+                                  (be-u32! (a64-bcond 0 7))
+                                  (be-u32! (a64-cmp-reg 17 14))
                                   (be-u32! (a64-bcond 0 2))
                                   (be-u32! (a64-brk))
-                                  (be-mov-imm! 17 JSV-PAYLOAD-MASK)
-                                  (be-u32! (a64-and-reg 16 16 17))
+                                  (be-u32! (a64-and-reg 16 16 13))
+                                  (be-u32! (a64-ldr 16 16 8))
+                                  (be-u32! (a64-b 2))
+                                  (be-u32! (a64-and-reg 16 16 13))
                                   (be-u32! (a64-add-reg 13 31 31))
                                   (be-u32! (a64-add-reg 12 31 31))
-                                  (loop (if (>= (load fidx) 63)
+                                  (if (= targets 0)
+                                      ; No summary: dispatch over every function in the unit.
+                                      ; A JavaScript value only carries a JavaScript callable id,
+                                      ; so JSL internals in the chain simply never match.
+                                      (let [(mut owner-i) 0]
+                                        (loop (if (>= (load owner-i) (mu-function-count))
+                                                  (break)
+                                                  (let [symbol
+                                                          (al-get (load (field (machine-unit)
+                                                                              symbols))
+                                                                  (load owner-i))]
+                                                    (if (>= symbol 1)
+                                                        (let [target-block
+                                                                (mu-function-block (load owner-i) 0)
+                                                              target-off
+                                                                (if (< target-block 0)
+                                                                    -1
+                                                                    (be-label-off target-block))]
+                                                          (be-mov-imm! 15 symbol)
+                                                          (be-u32! (a64-cmp-reg 16 15))
+                                                          (if (< target-off 0)
+                                                              (be-u32! (a64-brk))
+                                                              (be-u32! (a64-adr 17 (- target-off (be-code-len)))))
+                                                          (be-u32! (a64-csel 13 17 13 0))
+                                                          (be-mov-imm! 15 (be-poly-return-code (load owner-i)))
+                                                          (be-u32! (a64-csel 12 15 12 0))
+                                                          0)
+                                                        0)
+                                                    (store! owner-i (+ (load owner-i) 1))))))
+                                      (loop (if (>= (load fidx) 63)
                                             (break)
                                             (do
                                               (if (!= (& targets (<< 1 (load fidx))) 0)
@@ -1134,7 +1193,7 @@
                                                       (be-mov-imm! 15 return-code)
                                                       (be-u32! (a64-csel 12 15 12 0))))
                                                   0)
-                                              (store! fidx (+ (load fidx) 1)))))
+                                              (store! fidx (+ (load fidx) 1))))))
                                   (be-u32! (a64-cbnz 13 2))
                                   (be-u32! (a64-brk))
                                   (be-u32! (a64-str 12 31 (* argc 8)))

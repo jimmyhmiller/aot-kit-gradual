@@ -35,7 +35,7 @@ Node expects 2762). Every blocker below is reproduced and specific.
 |---|---|---|
 | Richards | Runs and passes | `result=0 collections=0 moves=0`; ~29 ms/run steady state. |
 | DeltaBlue | Runs and passes | `result=0 collections=0 moves=0`; ~65 ms/run steady state. |
-| NavierStokes | Blocked on the runtime closure-call ABI (see below) | Five real fixes landed on the way (nested-declaration resolution/hoisting, capture threading through sibling calls, arity-guarded devirtualization, 32-slot calls). The remaining wall: `this.setDensity = function(x,y,d){...}` methods CAPTURE FluidField's locals, so the instance property holds a materialized closure object — and nothing can call a runtime closure value generically. The env object does not even record its target id, and polymorphic dispatch only decodes bare function tags. |
+| NavierStokes | Closure-call ABI done; blocked on one backend scheduling bug | The uniform closure-call ABI (below) removed the former wall: runtime closure values now dispatch generically. The remaining blocker is `MSEL-DEPENDENCY` on an `ArrayMark` during machine verification: `ms-repair-late-memory-deps!` appears to bail (move budget) on a large block where GCM's provisional order puts array-op instructions before dependencies. Diagnosis state is in the scratch harness (`navier-stokes.coil` with fresh-verify snapshot prints); the emitted `select=1 node=<ArrayMark>` failure reproduces in ~3 min via that harness. |
 | Splay | Frontend rejects namespaced constructors | `FE-CODE-UNBOUND-NAME` on `Node` from the `SplayTree.Node` pattern. A minimal namespaced-constructor repro gets further — frontend passes, then `MSEL-CALL` because `X.Y.prototype.method =` publications are not indexed as prototype methods, so instance method calls have no targets. Both halves needed. |
 | Crypto | Frontend rejects implicit globals | `FE-CODE-UNBOUND-NAME` on `setupEngine` (`setupEngine = function(...)` with no `var`), and `nValue`…`coeffValue` are likewise assigned-without-declaration; also uses bare `alert` (adapter shim needed, as DeltaBlue's). Needs sloppy-mode implicit-global creation in the resolver; unknown further blockers behind it (BigInteger is string/array heavy). |
 | RayTrace | Needs `arguments` + `Function.prototype.apply` | Built entirely on the Prototype.js idiom `this.initialize.apply(this, arguments)` — every class instantiation forwards variadic arguments. Real feature work, not a resolver gap. |
@@ -133,27 +133,47 @@ collections and pass; a run that lands under enough memory pressure to collect c
 such flake was observed). Worth a dedicated stress-mode debugging session before trusting long
 heap-heavy runs.
 
-## The next required design: calling a runtime closure value
+## The uniform closure-call ABI (design A) — IMPLEMENTED, gate green
 
-NavierStokes (and RayTrace via `apply`, and likely EarleyBoyer) need to CALL a value that is a
-materialized closure loaded from the heap. Today that is unimplemented end to end: closure env
-objects carry only capture cells (no target id), and the polymorphic dispatch sequence decodes
-only bare `JSV-FUNCTION` payloads. Two candidate designs:
+Every JavaScript callable now reserves **parameter 0 = hidden closure environment** (a tagged
+value; capture-bearing functions unbox it to their env shape, capture-free functions leave it
+dead) and **parameter 1 = receiver** (always reserved, dead when unused); declared parameters
+start at parameter 2. Every call is built with `n-call-receiver!` — inputs
+`[ctrl, callee, env, receiver, args..., mem]`. Aux `CALL-ABI-RECEIVER` is the exact form; aux
+`CALL-ABI-DYNAMIC-RECEIVER` makes selection dispatch the runtime callee value by tag.
 
-- **A. Uniform hidden env slot** — every JS function's ABI becomes `[env, this?, params...]`;
-  capture-free functions ignore the slot; a closure's env object gains a `__target` fidx field;
-  generic dispatch extracts `(fidx, env)` from either tag; per-target capture prefixes disappear
-  entirely. This is the previous handoff's "fixed environment" design, now motivated by lexical
-  captures rather than globals (globals stay in the side table — that part is done and working).
-  Blast radius: call construction, parameter layout, JSL `%DynamicCallReceiver`, poly dispatch
-  emission, verify's receiver-slot math. Big, principled, and it deletes the capture-threading
-  machinery afterwards.
-- **B. Per-function closure entry stubs** — the backend emits an alternate entry that unpacks the
-  env into capture registers and shuffles receiver/args into place; dispatch branches to closure
-  entries for closure-tagged callees. No frontend ABI change, but the register/stack shuffling is
-  intricate and it leaves the per-target prefix machinery alive.
+Key invariants, each of which was a bug when violated:
 
-A is recommended; it should be its own focused session.
+- **Env representation**: exact sites pass the BOXED closure (or undefined for capture-free
+  targets); generic sites pass the callee value itself (a closure is its own environment). The
+  env object's field 0 is `__closure_target` (runtime fidx = FeFunction.id + 1 at byte offset 8);
+  capture cells follow; a lexical `this` is the last field, stored TAGGED.
+- **Receiver representation**: `this` as the receiver Parm is RAW (exact sites pass shaped
+  receivers unboxed). A LEXICAL `this` loaded from an env field is TAGGED and is unboxed at use
+  (`fng-field-load-value` decides STRUCTURALLY — Parm vs env-load — because a fresh Load's value
+  type is not computed until inference runs; comparing against interned `(t-dyn)` never matches).
+- **Dynamic callee values must be tagged**: polymorphic dispatch tag-tests FUNCTION (payload =
+  fidx) and OBJECT (payload → `ldr [ptr,#8]` = `__closure_target`), else `brk`. A syntactically
+  direct Fun/Closure callee materializes UNTAGGED, so such calls stay EXACT even when name
+  resolution fails (IIFEs, local closure values): raw callee for devirt/reachability, boxed
+  closure as env, no DYNAMIC aux (`direct-value-callee` in `fng-user-call`).
+- **No capture prepending under the receiver ABI**: select's legacy path prepended a Closure
+  callee's capture inputs as argument registers; captures now travel in the env object, so
+  `capturec` is forced 0 for `CALL-ABI-RECEIVER` calls.
+- **JSL callbacks**: `jl-js-call` (the JSL `(call f ...)` form used by every `lib/array`
+  callback) emits the receiver form with env = callee and receiver = boxed undefined; direct
+  Fun/Closure callees stay exact, runtime values get the DYNAMIC aux. `inline-clone!`'s
+  parm→input mapping `(+ 2 aux)` matches this layout exactly (it was silently wrong for the old
+  shape — the array-from conformance failure).
+- **Selection re-entrancy**: `OP-ARRAYMARK` claims its vreg (`ms-vset!`) BEFORE selecting the
+  allocation input; selecting that input can walk a memory chain back to an ArrayStore whose
+  array input is the mark itself, and the re-entry used to emit a second instruction for the
+  same node.
+
+Machine-unit reachability for dynamic sites: targets come from the callee's `t-fun-set` when the
+summary fits, else the aarch64 dispatch falls back to an identity chain over ALL machine-unit
+functions — which is why direct-value callees must stay exact (a function reachable only through
+a boxed value would otherwise never be built). `mu-direct-callee` looks through `OP-CLOSURE`.
 
 ## Performance: current numbers and remaining debt
 

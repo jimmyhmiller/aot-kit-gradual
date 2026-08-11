@@ -38,7 +38,13 @@ const expectedDigests = Object.freeze({
   // disjoint. The sole user function is now correctly `Fun.1` instead of inheriting the linked
   // library's builtin count; zero is reserved as the runtime side-table's invalid owner. The call
   // structure and every non-identity node remain unchanged.
-  call: "511138d336ac0a0e6aab558ec8304ac930b735caca7e202e57662f4488901312",
+  // Repinned for the uniform closure-call ABI: every call carries a hidden environment input
+  // before the receiver (the callee value at generic sites; boxed closure or undefined at exact
+  // sites), every callable reserves parameter 0 for it and parameter 1 for the receiver, and
+  // declared parameters start at 2. Only the call-bearing fixtures moved — `basic`, `control`,
+  // and `bitwise` are byte-identical, which is the evidence this is the call convention and
+  // nothing else.
+  call: "08b3b90c1b8f742725ad8da7420f53575e188c94d7376b201cb3540bfe92c26a",
   control: "317059e49013ae650f20f71a4a960fd0b5e9202d519901ed26a90803a7d260bd",
   // Repinned for the same ToNumber seam as `call`, and this one is the minimal form of it: exactly
   // one node added — `Unbox flt <- Parm` becomes `Unbox flt <- ToNumber <- Parm` — and every later
@@ -49,7 +55,8 @@ const expectedDigests = Object.freeze({
   // rooted at the containing FunStart.
   // Repinned for the disjoint callable namespace described on `call`; its one user function is
   // now `Fun.1`, with no structural graph change.
-  object: "a3b22ae04130ba27ee7e122e25b9d1d5183d8ca53c61951711b62068ffb93cd5",
+  // Repinned for the uniform closure-call ABI (see `call`).
+  object: "694c914820861f3240fef927c7b86274a78f98cb9491ce5a42c506854f9dff28",
   // Repinned twice. First for the ToNumber seam: two dynamic operands in this fixture, so exactly
   // two nodes added — 82 to 84 — plus the memory edges the functions containing them now thread,
   // the same consequence spelled out on `call`.
@@ -68,7 +75,8 @@ const expectedDigests = Object.freeze({
   // control, and the loop's If must anchor THERE: two Ifs on one control node is not a CFG. The
   // diff is exactly one input on one node — `If <- Loop` became `If <- Region` — with node count
   // and every other structure unchanged.
-  full: "a8a70f57d65777f2eb86089c4f77f2bebc257199efa26b990e7303c9d016ba41",
+  // Repinned for the uniform closure-call ABI (see `call`).
+  full: "a85616a2aa6533219083dc09027af67705aa129ac52d7375efc4def7f953eb8c",
   bitwise: "a9e893ac4a4e394075e850fef7c876ce8db3f5b3a61fc5993b217ab06b8c5ab7",
 });
 
