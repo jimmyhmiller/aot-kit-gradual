@@ -35,7 +35,7 @@ Node expects 2762). Every blocker below is reproduced and specific.
 |---|---|---|
 | Richards | Runs and passes | `result=0 collections=0 moves=0`; ~29 ms/run steady state. |
 | DeltaBlue | Runs and passes | `result=0 collections=0 moves=0`; ~65 ms/run steady state. |
-| NavierStokes | Closure-call ABI done; blocked on one backend scheduling bug | The uniform closure-call ABI (below) removed the former wall: runtime closure values now dispatch generically. The remaining blocker is `MSEL-DEPENDENCY` on an `ArrayMark` during machine verification: `ms-repair-late-memory-deps!` appears to bail (move budget) on a large block where GCM's provisional order puts array-op instructions before dependencies. Diagnosis state is in the scratch harness (`navier-stokes.coil` with fresh-verify snapshot prints); the emitted `select=1 node=<ArrayMark>` failure reproduces in ~3 min via that harness. |
+| NavierStokes | COMPILES AND EMITS; runtime trap remains | The whole compile pipeline now succeeds (graph verifies, machine select passes, 154KB object emits and links). Five deep bugs were fixed to get here (loop memory phis, floating-store placement, self-backedge phi leaks, phi content types, transitive/identity capture propagation — see "Loop memory and nested-closure captures" below). The remaining blocker is a RUNTIME trap early in FluidField: an unbox-to-object of a value that is tagged undefined, read from a stack slot (`aot_2 + ~944`, called from top level). Likely another cell/closure-identity value read before its store, or a capture cell seeded undefined and read through a path that skips the materialized closure. Repro: scratch harness `navier-stokes.coil` → build emitter (~3 min) → link with tools/native-gc-runtime.c + trampoline + v8-native-harness → run with DEFAULT heap (no args — `ns-bin 0 10` means a ZERO-BYTE heap and exits 86 via the OOM trap). Expected checksum 2762. |
 | Splay | Frontend rejects namespaced constructors | `FE-CODE-UNBOUND-NAME` on `Node` from the `SplayTree.Node` pattern. A minimal namespaced-constructor repro gets further — frontend passes, then `MSEL-CALL` because `X.Y.prototype.method =` publications are not indexed as prototype methods, so instance method calls have no targets. Both halves needed. |
 | Crypto | Frontend rejects implicit globals | `FE-CODE-UNBOUND-NAME` on `setupEngine` (`setupEngine = function(...)` with no `var`), and `nValue`…`coeffValue` are likewise assigned-without-declaration; also uses bare `alert` (adapter shim needed, as DeltaBlue's). Needs sloppy-mode implicit-global creation in the resolver; unknown further blockers behind it (BigInteger is string/array heavy). |
 | RayTrace | Needs `arguments` + `Function.prototype.apply` | Built entirely on the Prototype.js idiom `this.initialize.apply(this, arguments)` — every class instantiation forwards variadic arguments. Real feature work, not a resolver gap. |
@@ -124,14 +124,40 @@ use array callbacks.
   never match, ending every method lookup at depth 1. The prototype value now canonicalizes
   exactly like the owner argument (managed/function tag → payload).
 
-## Latent bug: GC verification fails under stress
+## FIXED: GC verification under stress
 
-`deltablue 16777216 1` (16 MB heap, stress mode) dies with
-`native GC verification failed after collection 28` — reproduced identically on the committed
-tree before any of this session's changes, so it is pre-existing. Normal runs do zero
-collections and pass; a run that lands under enough memory pressure to collect can abort (one
-such flake was observed). Worth a dedicated stress-mode debugging session before trusting long
-heap-heavy runs.
+`deltablue 16777216 1` was dying with `native GC verification failed after collection 28`. Root
+cause: `SetPrototype` (operation 2 in the property runtime) stored a tagged undefined/null
+verbatim as the raw prototype pointer; heap verification then found a "pointer" outside both
+spaces. Tagged non-pointer words now clear the prototype, every silent `verify_heap` failure
+path prints a diagnostic, and the stress run completes with collections and passing
+verification.
+
+## Loop memory and nested-closure captures (NavierStokes fixes, all latent everywhere)
+
+- **Every loop now carries memory phis** (`fng-loop`; `fng-do-loop` already did). Without them
+  the exit arm's memory was the BODY's final store chain, which does not dominate the exit —
+  the first post-loop merge with no intervening call handed the backend a memory Phi input from
+  a non-dominating block. The phi set is the control alias list plus the runtime property heap
+  (force-recorded — the body's first dynamic store may be the function's first) plus capture
+  cells. A body that never touches an alias hands the phi ITSELF back as the backedge; such a
+  phi is subsumed by its init or it leaks. Phi content types are the alias's declared type,
+  exactly like `fng-memory` — a `(t-undef)` content let the fold pass prove loop-carried cell
+  loads undefined (integrated-heap-program regression caught it).
+- **Floating shaped stores place below their operands** (`ms-memory-block`): a Store's alias
+  chain can root at function entry while the stored allocation is pinned deeper (every
+  `x = new Array(n)` into a capture cell). Readers chained directly after such a store sink
+  with it. Property-table ops are excluded — their values can cross a merge in a register from
+  a sibling arm.
+- **Transitive captures**: creating a nested closure copies the closure's captures to the
+  creator (it must thread a grandparent's cell through its own environment before storing it
+  into the child's), and CALLING a capture-bearing sibling records the callee's IDENTITY as a
+  capture of the caller — the callee's value is the materialized closure in the parent-owned
+  cell, and without the identity capture the call site fell back to the bare Fun and handed
+  the callee a functionless environment.
+- A pre-existing index-reuse bug in `fng-loop` (carried-phi allocation loop continued from the
+  memory-phi loop's index) was latent while loops rarely had memory phis; it segfaulted the
+  frontend the moment every loop carried them.
 
 ## The uniform closure-call ABI (design A) — IMPLEMENTED, gate green
 

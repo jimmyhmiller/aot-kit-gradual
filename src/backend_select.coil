@@ -1352,10 +1352,26 @@
     ; Only shaped cell/field stores take the operand bound: their alias chains legitimately
     ; root at function entry while the stored allocation is pinned deeper. Property-table ops
     ; can carry values from a SIBLING branch arm (the value crosses the merge in a register),
-    ; and lowering them to that arm breaks the memory Phi they feed.
-    (if (or (>= pinned 0) (!= (n-op node) OP-STORE))
+    ; and lowering them to that arm breaks the memory Phi they feed. A reader chained directly
+    ; after a sunk store must then sink with it, so its chain PREDECESSOR bounds it too.
+    (if (>= pinned 0)
         (load answer)
-        (ms-memory-operand-bound owner node (load answer)))))
+        (let [bounded
+                (if (= (n-op node) OP-STORE)
+                    (ms-memory-operand-bound owner node (load answer))
+                    (load answer))
+              mem-in (if (> (n-nins node) 1) (n-in node 1) NO-NODE)
+              pred-block
+                (if (and (!= mem-in NO-NODE)
+                         (and (!= mem-in node) (= (n-op mem-in) OP-STORE)))
+                    (ms-memory-block owner mem-in)
+                    -1)]
+          (if (and (>= pred-block 0)
+                   (and (>= bounded 0)
+                        (and (!= pred-block bounded)
+                             (mu-dominates? bounded pred-block))))
+              pred-block
+              bounded)))))
 
 (defn ms-memory-chain-phi? [(node i64)] (-> bool)
   (if (< node 0)

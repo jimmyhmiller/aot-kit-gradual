@@ -5863,16 +5863,36 @@
       (n-add-def! loop-node NO-NODE)
       (n-add-def! loop-node (load (load (field context ctrl))))
       (n-add-def! loop-node NO-NODE)
-      (if (or (fng-node-has-kind frontend body-node TSK-BREAK)
-              (fng-node-has-kind frontend body-node TSK-CONTINUE))
-          (fng-active-memory! context (mut active))
+      ;; EVERY loop carries memory phis, not just those with break/continue. Without them the
+      ;; exit arm's memory is the BODY's final store chain, and a body store does not dominate
+      ;; the exit: the first post-loop merge with no intervening call hands the backend a memory
+      ;; Phi input from a non-dominating block (NavierStokes' dynamic element stores).
+      ;;
+      ;; The phi set is the CONTROL alias list — declared fields converted to aliases plus every
+      ;; dynamic alias — with the runtime property heap force-included: the body's first dynamic
+      ;; store may be the function's first, so entry-time recording alone misses it, and a body
+      ;; store with no phi is unreachable once the exit stops exposing body memory. Captured
+      ;; cells join for the same reason.
+      (fng-record-dynamic-alias! context JS-PROPERTY-ALIAS)
+      (fng-active-memory! context (mut active))
+      (fng-control-aliases! context (mut active))
+      (if (and (> (al-len [FeCapture] (load (field frontend captures))) 0)
+               (not (fng-list-has (mut active) (load (field context cell-alias)))))
+          (al-push! [i64] (mut active) (load (field context cell-alias)))
           0)
       (store! index 0)
       (loop (if (>= (load index) (al-len [i64] (load active)))
                 (break)
-                (let [field-index (al-get [i64] (load active) (load index))
-                      alias (al-get [i64] (load (load (field context aliases))) field-index)
-                      phi (n-new OP-PHI (t-mem-alias alias (t-undef)))]
+                (let [alias (al-get [i64] (load active) (load index))
+                      ;; The phi's CONTENT type must be the alias's declared type, exactly like
+                      ;; `fng-memory`: a `(t-undef)` content told inference the loop-carried
+                      ;; memory holds undefined and the fold pass replaced every load through
+                      ;; it with a constant.
+                      phi (n-new OP-PHI
+                                 (t-mem-alias alias
+                                              (if (shape-alias-defined? alias)
+                                                  (shape-alias-ty alias)
+                                                  (t-undef))))]
                   (n-add-def! phi loop-node)
                   (n-add-def! phi (fng-current-memory context alias))
                   (n-add-def! phi NO-NODE)
@@ -5882,6 +5902,7 @@
           (store! (load (field context memory)) (fng-merge memory-phis))
           0)
       ;; Phi nodes are allocated first, then initialized in source assignment order.
+      (store! index 0)
       (loop (if (>= (load index) (al-len [i64] (load carried)))
                 (break)
                 (do
@@ -5921,11 +5942,18 @@
           (store! index 0)
           (loop (if (>= (load index) (al-len [i64] (load active)))
                     (break)
-                    (let [field-index (al-get [i64] (load active) (load index))
-                          alias (al-get [i64] (load (load (field context aliases))) field-index)]
-                      (n-set-def! (al-get [i64] (load memory-phis) (load index))
-                                  2
-                                  (fng-current-memory context alias))
+                    (let [alias (al-get [i64] (load active) (load index))
+                          phi (al-get [i64] (load memory-phis) (load index))
+                          back (fng-current-memory context alias)]
+                      ;; A body that never touched this alias hands the phi ITSELF back as the
+                      ;; backedge. Such a phi is exactly its initial memory; keeping the
+                      ;; self-referential node alive leaks it once consumers fold to the init.
+                      (if (= back phi)
+                          (let [init (n-in phi 1)]
+                            (n-subsume! phi init)
+                            (al-set! [i64] (mut memory-phis) (load index) init)
+                            0)
+                          (do (n-set-def! phi 2 back) 0))
                       (store! index (+ (load index) 1)))))
           (n-set-def! loop-node 2 (if reaches-increment (load (load (field context ctrl))) NO-NODE))
           (if (not (load (fng-optimize-ptr)))
@@ -5946,6 +5974,12 @@
                                        (al-get [i64] (load phis) (load index)))
                       (store! index (+ (load index) 1)))))
           (store! (load (field context ctrl)) (arms-f arms))
+          ;; On exit the observable memory is the loop HEADER's state — the phis — not the
+          ;; body's final store chain (which does not dominate the exit arm). The phis also
+          ;; keep the body's stores reachable through their backedge inputs.
+          (if (> (al-len [i64] (load memory-phis)) 0)
+              (store! (load (field context memory)) (fng-merge memory-phis))
+              (store! (load (field context memory)) NO-NODE))
           (let [continues (fng-merge-target! context target-index FNG-JUMP-BREAK true)]
             (fng-pop-target! context target-index)
             (al-free! [i64] (mut carried))

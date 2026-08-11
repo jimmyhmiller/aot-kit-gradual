@@ -1648,6 +1648,31 @@
                              (< callee (al-len [FeFunction] (load (field frontend functions)))))
                         (do
                           (fe-copy-callee-captures! (mut frontend) caller callee)
+                          ;; A capture-bearing callee's VALUE is the materialized closure held in
+                          ;; the cell its declaring parent owns. Every OTHER caller reaches that
+                          ;; closure only through its own environment, so the callee's identity is
+                          ;; itself a capture; without it the call site falls back to the bare Fun
+                          ;; and hands the callee a functionless environment.
+                          (let [callee-fn
+                                  (al-get [FeFunction] (load (field frontend functions)) callee)
+                                callee-parent (load (field callee-fn parent))
+                                (mut callee-captures) false
+                                (mut scan) 0]
+                            (loop (if (or (>= (load scan)
+                                              (al-len [FeCapture] (load (field frontend captures))))
+                                          (load callee-captures))
+                                      (break)
+                                      (let [capture (al-get [FeCapture]
+                                                            (load (field frontend captures))
+                                                            (load scan))]
+                                        (if (= (load (field capture function)) callee)
+                                            (store! callee-captures true)
+                                            0)
+                                        (store! scan (+ (load scan) 1)))))
+                            (if (and (load callee-captures)
+                                     (and (>= callee-parent 0) (!= callee-parent caller)))
+                                (fe-record-capture! (mut frontend) caller callee)
+                                0))
                           (if (= kind TSK-NEW-EXPRESSION)
                               (fe-copy-prototype-captures! (mut frontend) caller callee)
                               0))
@@ -1677,7 +1702,16 @@
                 :else 0))
         0)
     (if (or (= kind TSK-FUNCTION-DECLARATION) (fe-function-expression-kind? kind))
-        0
+        ;; CREATING a nested closure is a capture site: before the creator can store a
+        ;; grandparent's cell into the child's environment it must thread that cell through
+        ;; its OWN environment. Copy the child's captures up (the copier already excludes
+        ;; symbols the creator itself owns). The child's body is not recursed into here —
+        ;; the driver visits every function under its own id.
+        (let [child (fe-function-for-node frontend node)]
+          (if (>= child 0)
+              (let [child-fn (al-get [FeFunction] (load (field frontend functions)) child)]
+                (fe-copy-callee-captures! (mut frontend) caller (load (field child-fn id))))
+              0))
         (let [(mut index) 0]
           (loop (if (>= (load index) (ts-child-count ast node))
                     (break)
