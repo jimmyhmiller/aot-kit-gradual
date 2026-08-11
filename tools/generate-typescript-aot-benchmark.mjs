@@ -201,6 +201,11 @@ ${resident ? residentHelper : ""}
           2)
         (let [entry (frontend-native-build! (mut frontend) ${frontendSeed} ${optimize ? "true" : "false"})]
           (fmt (stderr) "phase=frontend-build-end entry={d} nodes={d}\\n" entry (n-count))
+${resident ? `          (let [rep-count (g-rep-report (stderr))]
+            (if (> rep-count 0) (do (fmt (stderr) "rep-violations={d}\\n" rep-count) 0) 0))
+          (if (= (os/getenv c"AOT_DUMP_GRAPH") (cast (ptr i8) 0))
+              0
+              (do (g-print-flat (stderr)) 0))` : ""}
           (fe-native-free! (mut frontend))
           (if (!= (g-verify) 0)
                   (do

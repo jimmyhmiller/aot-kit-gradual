@@ -974,6 +974,176 @@
               (do (v-fail! VERR-LEAK NO-NODE) (store! i (+ (load i) 1)) 0))))
   0)
 
+; ============================================================================
+; Value representation (Phase 1 of the hardening plan)
+;
+; Every value edge carries one machine representation — a TAGGED NaN-boxed word, a RAW managed
+; pointer, or a RAW machine number — and nearly every hard bug in the NavierStokes campaign was
+; a producer and consumer disagreeing about which. The classification here is STRUCTURAL (which
+; op produced the value), never a read of the node's type seed: seeds lag construction and
+; lying seeds were themselves one of the bug classes. UNKNOWN is deliberately quiet — ops are
+; promoted into the classification as their contracts are pinned down, so this pass only ever
+; reports certain violations.
+; ============================================================================
+(const REP-UNKNOWN i64 0)
+(const REP-TAGGED i64 1)
+(const REP-RAW-PTR i64 2)
+(const REP-RAW-NUM i64 3)
+
+(defn v-rep-name [(rep i64)] (-> (slice u8))
+  (cond (= rep REP-TAGGED) "tagged"
+        (= rep REP-RAW-PTR) "raw-ptr"
+        (= rep REP-RAW-NUM) "raw-num"
+        :else "unknown"))
+
+;; What a load/store through this alias carries: the declared field content decides.
+(defn v-rep-of-alias [(alias i64)] (-> i64)
+  (if (not (shape-alias-defined? alias))
+      REP-TAGGED
+      (let [content (shape-alias-ty alias)]
+        (cond (= content (t-dyn)) REP-TAGGED
+              (= content (t-undef)) REP-TAGGED
+              (= (ty-kinds content) VK-OBJ) REP-RAW-PTR
+              (or (= (ty-kinds content) VK-INT)
+                  (or (= (ty-kinds content) VK-FLT) (= (ty-kinds content) VK-BOOL)))
+                REP-RAW-NUM
+              :else REP-UNKNOWN))))
+
+(defn v-rep-of [(n i64) (fuel i64)] (-> i64)
+  (if (or (< n 0) (or (<= fuel 0) (n-dead? n)))
+      REP-UNKNOWN
+      (let [op (n-op n)]
+        (cond (= op OP-BOX) REP-TAGGED
+              (= op OP-TONUMBER) REP-TAGGED
+              (= op OP-PROPLOAD) REP-TAGGED
+              (= op OP-PROPLOADKEY) REP-TAGGED
+              (= op OP-ARRAYLOAD) REP-TAGGED
+              (= op OP-JSBUILTIN) REP-TAGGED
+              (= op OP-JSTHROW) REP-TAGGED
+              (= op OP-ARRAYUNBOX) REP-RAW-PTR
+              (= op OP-ARRAYMARK) REP-RAW-PTR
+              (= op OP-UNBOX)
+                (let [t (n-aux n)]
+                  (cond (= (ty-kinds t) VK-OBJ) REP-RAW-PTR
+                        (or (= (ty-kinds t) VK-INT) (= (ty-kinds t) VK-FLT)) REP-RAW-NUM
+                        :else REP-UNKNOWN))
+              (= op OP-PROJ)
+                (if (= (n-op (n-in n 0)) OP-NEW) REP-RAW-PTR REP-UNKNOWN)
+              (= op OP-CAST) (v-rep-of (n-in n 1) (- fuel 1))
+              (= op OP-LOAD) (v-rep-of-alias (n-aux n))
+              (= op OP-PHI)
+                (let [(mut i) 1 (mut joined) REP-UNKNOWN (mut mixed) false]
+                  (loop (if (or (>= (load i) (n-nins n)) (load mixed))
+                            (break)
+                            (do
+                              (let [input (n-in n (load i))]
+                                (if (or (= input NO-NODE) (= input n))
+                                    0
+                                    (let [rep (v-rep-of input (- fuel 1))]
+                                      (cond (= rep REP-UNKNOWN) (store! mixed true)
+                                            (= (load joined) REP-UNKNOWN) (store! joined rep)
+                                            (!= (load joined) rep) (store! mixed true)
+                                            :else 0))))
+                              (store! i (+ (load i) 1))
+                              0)))
+                  (if (load mixed) REP-UNKNOWN (load joined)))
+              (or (= op OP-ADD)
+                  (or (= op OP-SUB)
+                      (or (= op OP-MUL)
+                          (or (= op OP-DIV)
+                              (or (= op OP-MOD) (= op OP-MINUS))))))
+                REP-RAW-NUM
+              (or (= op OP-BITAND)
+                  (or (= op OP-BITOR)
+                      (or (= op OP-BITXOR)
+                          (or (= op OP-SHL)
+                              (or (= op OP-SHR)
+                                  (or (= op OP-USHR) (= op OP-BITNOT)))))))
+                REP-RAW-NUM
+              (or (= op OP-EQ)
+                  (or (= op OP-LT)
+                      (or (= op OP-LE)
+                          (or (= op OP-NOT)
+                              (or (= op OP-TYPETEST)
+                                  (or (= op OP-ARRAYTEST) (= op OP-ISNAN)))))))
+                REP-RAW-NUM
+              ;; ToInteger is a RUNTIME call (JSSOP-TO-INTEGER) and returns a tagged value —
+              ;; its result can be +/-Infinity, which has no raw integer form.
+              (= op OP-TOINTEGER) REP-TAGGED
+              (or (= op OP-ARRAYLEN)
+                  (or (= op OP-STRINGLEN)
+                      (or (= op OP-STRINGCHARCODE)
+                          (or (= op OP-STRINGINDEXOF)
+                              (or (= op OP-STRINGCOMPARE) (= op OP-OWNKEYCOUNT))))))
+                REP-RAW-NUM
+              (or (= op OP-STRINGEQ)
+                  (or (= op OP-PROPHAS) (or (= op OP-PROPHASKEY) (= op OP-PROTOHAS))))
+                REP-RAW-NUM
+              :else REP-UNKNOWN))))
+
+(defn v-rep-violation! [(w (ptr Writer))
+                        (consumer i64)
+                        (slot i64)
+                        (required i64)
+                        (count (mut i64))] (-> i64)
+  (let [input (n-in consumer slot)
+        actual (if (= input NO-NODE) REP-UNKNOWN (v-rep-of input 8))]
+    (if (and (!= required REP-UNKNOWN)
+             (and (!= actual REP-UNKNOWN) (!= actual required)))
+        (do
+          (fmt w "REP n{d}:{s} slot {d} <- n{d}:{s} is {s}, needs {s}\n"
+               consumer (op-name (n-op consumer)) slot
+               input (op-name (n-op input))
+               (v-rep-name actual) (v-rep-name required))
+          (store! count (+ (load count) 1))
+          0)
+        0)))
+
+;; Warn-mode sweep: report every certain producer/consumer representation disagreement. This is
+;; NOT yet part of g-verify — it runs from the resident emitter so the whole conformance corpus
+;; can be triaged; it becomes a hard VERR once the corpus is clean.
+(defn g-rep-report [(w (ptr Writer))] (-> i64)
+  (let [lim (n-count)
+        (mut count) 0
+        (mut i) 0]
+    (loop (if (>= (load i) lim)
+              (break)
+              (do
+                (if (n-dead? (load i))
+                    0
+                    (let [n (load i)
+                          op (n-op n)]
+                      (cond (or (= op OP-UNBOX)
+                                (or (= op OP-TYPETEST)
+                                    (or (= op OP-ARRAYTEST) (= op OP-ARRAYUNBOX))))
+                              (do (v-rep-violation! w n 1 REP-TAGGED (mut count)) 0)
+                            (= op OP-STORE)
+                              (do (v-rep-violation! w n 2 REP-RAW-PTR (mut count))
+                                  (v-rep-violation! w n 3 (v-rep-of-alias (n-aux n)) (mut count))
+                                  0)
+                            (= op OP-LOAD)
+                              (do (v-rep-violation! w n 2 REP-RAW-PTR (mut count)) 0)
+                            (= op OP-ARRAYSTORE)
+                              (do (v-rep-violation! w n 3 REP-RAW-NUM (mut count))
+                                  (v-rep-violation! w n 4 REP-TAGGED (mut count))
+                                  0)
+                            (= op OP-ARRAYLOAD)
+                              (do (v-rep-violation! w n 3 REP-RAW-NUM (mut count)) 0)
+                            (= op OP-ARRAYRESIZE)
+                              (do (v-rep-violation! w n 3 REP-RAW-NUM (mut count)) 0)
+                            (= op OP-PROPSTORE)
+                              (do (v-rep-violation! w n 3 REP-TAGGED (mut count)) 0)
+                            (= op OP-PROPSTOREKEY)
+                              (do (v-rep-violation! w n 4 REP-TAGGED (mut count)) 0)
+                            (and (= op OP-CALL)
+                                 (or (= (n-aux n) CALL-ABI-RECEIVER)
+                                     (= (n-aux n) CALL-ABI-DYNAMIC-RECEIVER)))
+                              (do (v-rep-violation! w n 2 REP-TAGGED (mut count)) 0)
+                            :else 0)))
+                (store! i (+ (load i) 1))
+                0)))
+    (load count)))
+
 ;; Returns the number of violations; `g-verify-code` then names the first check that fired.
 ;;
 ;; THE PASSES ARE ORDERED CAUSE BEFORE CONSEQUENCE, and the type pass runs LAST and only on an

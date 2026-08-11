@@ -626,14 +626,21 @@
   ;; Source `number` values use the JavaScript numeric ABI at calls, but a static object field must
   ;; have one raw in-memory representation. Use f64 so integer and fractional assignments share
   ;; the same slot representation across constructors and methods.
-  (let [kind (if (<= type-node -1) -1 (ts-kind (field frontend ast) type-node))]
-    (if (= (fng-type-tag frontend type-node) FNG-NUMBER)
+  (let [kind (if (<= type-node -1) -1 (ts-kind (field frontend ast) type-node))
+        tag (fng-type-tag frontend type-node)]
+    (if (= tag FNG-NUMBER)
         (t-flt)
         ;; Nullable and other union fields need the tagged representation: a raw object slot
         ;; cannot distinguish null from an object pointer while preserving both values.
         (if (= kind TSK-UNION-TYPE)
             (t-dyn)
-            (fng-coil-type frontend shapes type-node)))))
+            ;; An UNRESOLVED field type must be TAGGED, never the int fallback: `inner: Point`
+            ;; reaching the fallback declared a slot the GC scan skips while the program stored
+            ;; raw object pointers into it — a dangling pointer on the first collection. The
+            ;; representation verifier (g-rep-report) is what caught it.
+            (if (and (= tag FNG-DYNAMIC) (!= kind TSK-TYPE-LITERAL))
+                (t-dyn)
+                (fng-coil-type frontend shapes type-node))))))
 
 (defn fng-field-index [(frontend (ptr NativeFrontend)) (owner i64) (name-node i64)] (-> i64)
   (let [name (ts-text (field frontend ast) name-node)
@@ -4130,9 +4137,14 @@
                (and (!= (n-op raw-object) OP-PARM)
                     (!= (n-op raw-object) OP-CAST)))
         object
+          ;; The dyn test is STRUCTURAL (fng-tagged-dynamic-value?), not a seed-type read: a
+          ;; fresh Load's type is not computed until inference runs, and `w.inner` — a field
+          ;; load through a TAGGED (dyn-content) slot — needed this unbox and never got it
+          ;; while the test compared the seed against the interned (t-dyn).
           (if (and (>= field-owner 0)
                    (or lexical-this
-                       (and (= (n-ty raw-object) (t-dyn))
+                       (and (or (= (n-ty raw-object) (t-dyn))
+                                (fng-tagged-dynamic-value? raw-object))
                             (and (!= (n-op raw-object) OP-CAST)
                                  (!= (ts-kind ast object-node) TSK-THIS)))))
               (n-unbox! raw-object
