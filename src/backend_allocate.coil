@@ -454,6 +454,117 @@
                           0)
                       (store! cell (+ (load cell) 1))))))
         0)
+    ; Positional cross-call diagnostic (liveness-independent): within each block walked
+    ; FORWARD, any instruction that reads a vreg whose register is caller-clobbered, after a
+    ; call has occurred since that vreg's in-block definition, is a corruption in waiting.
+    (if (= (mra-result) MRA-OK)
+        (let [blocks (mu-block-count) (mut bid) 0]
+          (loop (if (>= (load bid) blocks)
+                    (break)
+                    (do
+                      (let [first (mu-block-inst-first (load bid))
+                            count (mu-block-inst-count (load bid))
+                            (mut last-call) -1
+                            (mut i) 0]
+                        (loop (if (>= (load i) count)
+                                  (break)
+                                  (let [at (+ first (load i))
+                                        m (be-inst at)
+                                        mask (mi-desc-clobbers (mi-desc (load (field m op))))]
+                                    (let [(mut vr2) 0]
+                                      (loop (if (or (>= (load vr2) vregs) (< (load last-call) 0))
+                                                (break)
+                                                (do
+                                                  (if (and (ml-inst-uses? at (load vr2))
+                                                           (and (>= (mra-reg (load vr2)) 0)
+                                                                (and (!= (& -280379760046081
+                                                                           (<< 1 (mra-reg (load vr2))))
+                                                                        0)
+                                                                     (let [def (ms-owner-def-inst
+                                                                                 (load (field m owner))
+                                                                                 (load vr2))]
+                                                                       (or (< def first)
+                                                                           (< def (load last-call)))))))
+                                                      (do
+                                                        (fmt (stderr)
+                                                             "CROSS-CALL-CLOBBER vreg={d} reg={d} use-inst={d} use-op={d} last-call={d} block={d} live-out={d}\n"
+                                                             (load vr2) (mra-reg (load vr2)) at
+                                                             (load (field m op)) (load last-call) (load bid)
+                                                             (if (ml-live-out? (load bid) (load vr2)) 1 0))
+                                                        0)
+                                                      0)
+                                                  (store! vr2 (+ (load vr2) 1))
+                                                  0))))
+                                    (if (!= mask 0) (store! last-call at) 0)
+                                    (store! i (+ (load i) 1))
+                                    0))))
+                      (store! bid (+ (load bid) 1))
+                      0))))
+        0)
+    ; Independent clobber check: recompute liveness across every call-like instruction and
+    ; verify no vreg assigned a caller-clobbered register survives it. This duplicates what
+    ; alloc-forbidden SHOULD encode; a failure here names the exact hole.
+    (if (= (mra-result) MRA-OK)
+        (let [blocks (mu-block-count) (mut bid) 0]
+          (loop (if (or (>= (load bid) blocks) (!= (mra-result) MRA-OK))
+                    (break)
+                    (do
+                      (let [(mut vr2) 0]
+                        (loop (if (>= (load vr2) vregs)
+                                  (break)
+                                  (do
+                                    (al-set! [i64] (field u alloc-live) (load vr2)
+                                             (if (ml-live-out? (load bid) (load vr2)) 1 0))
+                                    (store! vr2 (+ (load vr2) 1))
+                                    0))))
+                      (let [first (mu-block-inst-first (load bid))
+                            count (mu-block-inst-count (load bid))
+                            (mut i) count]
+                        (loop (if (or (<= (load i) 0) (!= (mra-result) MRA-OK))
+                                  (break)
+                                  (do
+                                    (store! i (- (load i) 1))
+                                    (let [at (+ first (load i))
+                                          m (be-inst at)
+                                          dst (load (field m dst))
+                                          mask (mi-desc-clobbers (mi-desc (load (field m op))))]
+                                      (if (!= mask 0)
+                                          (let [(mut vr2) 0]
+                                            (loop (if (>= (load vr2) vregs)
+                                                      (break)
+                                                      (do
+                                                        (if (and (!= (load vr2) dst)
+                                                                 (and (!= (al-get (load (field u alloc-live)) (load vr2)) 0)
+                                                                      (and (>= (mra-reg (load vr2)) 0)
+                                                                           (!= (& mask (<< 1 (mra-reg (load vr2)))) 0))))
+                                                            (do
+                                                              (fmt (stderr)
+                                                                   "CLOBBER-LIVE vreg={d} reg={d} call-inst={d} op={d} block={d} forbidden={d}\n"
+                                                                   (load vr2) (mra-reg (load vr2)) at
+                                                                   (load (field m op)) (load bid)
+                                                                   (al-get (load (field u alloc-forbidden)) (load vr2)))
+                                                              (store! (field u allocation-result) MRA-INTERFERENCE)
+                                                              (store! (field u allocation-item) (load vr2)))
+                                                            0)
+                                                        (store! vr2 (+ (load vr2) 1))
+                                                        0))))
+                                          0)
+                                      (if (>= dst 0)
+                                          (al-set! [i64] (field u alloc-live) dst 0)
+                                          0)
+                                      (let [(mut vr2) 0]
+                                        (loop (if (>= (load vr2) vregs)
+                                                  (break)
+                                                  (do
+                                                    (if (ml-inst-uses? at (load vr2))
+                                                        (al-set! [i64] (field u alloc-live) (load vr2) 1)
+                                                        0)
+                                                    (store! vr2 (+ (load vr2) 1))
+                                                    0)))))
+                                    0)))
+                      (store! bid (+ (load bid) 1))
+                      0)))))
+        0)
     ; Every definition of a vreg, including Phi edge copies, publishes the same location.
     (if (= (mra-result) MRA-OK)
         (let [(mut at) 0]

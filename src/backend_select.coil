@@ -1124,6 +1124,18 @@
     (store! p (+ v 1))
     (al-push! [i64] (field u vreg-phi-block) -1)
     v))
+
+;; The dense-array runtime takes an INTEGER index in a GPR. An index computed in floating
+;; point (NavierStokes' j*rowSize chains) selects into an FPR vreg, and encoding that FPR's
+;; number in the instruction's GPR field silently truncated d8 (physical 40) to x8. Convert
+;; through the JavaScript ToInt32 residue instead.
+(defn ms-array-index! [(owner i64) (node i64) (bid i64)] (-> i64)
+  (let [raw (ms-select-value-at! owner node bid)]
+    (if (or (< raw 0) (not (be-node-fp-value? node)))
+        raw
+        (let [fresh (ms-new-vreg!)]
+          (ms-emit! owner bid (mi-new MI-I32FROMFP fresh raw -1 0 NO-NODE))
+          fresh))))
 (defn ms-seen? [(owner i64) (node i64)] (-> bool)
   (!= (al-get (load (field (machine-unit) selected-nodes)) (ms-map-index owner node)) 0))
 (defn ms-seen! [(owner i64) (node i64)] (-> i64)
@@ -1652,7 +1664,7 @@
               (if (not (ms-select-memory-at! owner (n-in node 1) bid))
                   (store! ok false)
                   (let [object (ms-select-value-at! owner (n-in node 2) bid)
-                        index (ms-select-value-at! owner (n-in node 3) bid)
+                        index (ms-array-index! owner (n-in node 3) bid)
                         value (ms-select-value-at! owner (n-in node 4) bid)]
                     (if (or (< object 0) (or (< index 0) (< value 0)))
                         (store! ok false)
@@ -1678,7 +1690,7 @@
               (if (not (ms-select-memory-at! owner (n-in node 1) bid))
                   (store! ok false)
                   (let [object (ms-select-value-at! owner (n-in node 2) bid)
-                        length (ms-select-value-at! owner (n-in node 3) bid)
+                        length (ms-array-index! owner (n-in node 3) bid)
                         ordered (ms-select-value-at! owner (n-in node 4) bid)]
                     (if (or (< object 0) (or (< length 0) (< ordered 0)))
                         (store! ok false)
@@ -1705,7 +1717,7 @@
                   (store! ok false)
                   (let [source (ms-select-value-at! owner (n-in node 2) bid)
                         result (ms-select-value-at! owner (n-in node 3) bid)
-                        start (ms-select-value-at! owner (n-in node 4) bid)]
+                        start (ms-array-index! owner (n-in node 4) bid)]
                     (if (or (< source 0) (or (< result 0) (< start 0)))
                         (store! ok false)
                         (let [fresh (ms-new-vreg!)
@@ -2637,7 +2649,7 @@
                         (not (ms-select-memory-at! owner (n-in node 1) pinned-bid)))
                     (ms-fail! MSEL-UNSUPPORTED node)
                     (let [object (ms-select-value-at! owner (n-in node 2) pinned-bid)
-                          index (ms-select-value-at! owner (n-in node 3) pinned-bid)]
+                          index (ms-array-index! owner (n-in node 3) pinned-bid)]
                       (if (or (< object 0) (< index 0))
                           (ms-fail! MSEL-UNSUPPORTED node)
                           (let [fresh (ms-new-vreg!)
