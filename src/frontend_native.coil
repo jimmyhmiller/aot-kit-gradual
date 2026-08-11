@@ -791,6 +791,48 @@
                       (store! index (+ (load index) 1)))))))
     0))
 
+;; A single-level `obj.name = f` (NavierStokes stores `this.reset = reset` inside FluidField)
+;; publishes a KNOWN function as a method. Its property-call sites use the receiver ABI, so the
+;; target must carry the receiver slot even when its body never reads `this` — the same rule the
+;; prototype indexer states. Unlike prototype indexing this walks into function bodies, because
+;; constructor-style publication happens inside the constructor.
+(defn fe-mark-property-published-functions! [(frontend (mut NativeFrontend)) (node i64)] (-> i64)
+  (let [ast (field frontend ast)
+        kind (ts-kind ast node)]
+    (if (= kind TSK-BINARY)
+        (let [operator-node (ts-role ast node TS-ROLE-OPERATOR 0)
+              left (ts-role ast node TS-ROLE-LEFT 0)
+              right (ts-role ast node TS-ROLE-RIGHT 0)]
+          (if (and (!= operator-node -1)
+                   (and (str-eq (ts-text ast operator-node) "=")
+                        (and (!= left -1)
+                             (and (= (ts-kind ast left) TSK-PROPERTY-ACCESS)
+                                  (and (!= right -1)
+                                       (and (= (ts-kind ast right) TSK-IDENTIFIER)
+                                            (!= (ts-kind ast (ts-child ast left 0))
+                                                TSK-PROPERTY-ACCESS)))))))
+              (let [target (fe-find-function-name frontend right)]
+                (if (and (>= target 0)
+                         (= (load (field (index (load (field (field frontend functions) data))
+                                                target)
+                                         receiver-type-node))
+                            -1))
+                    (store! (field (index (load (field (field frontend functions) data))
+                                          target)
+                                   receiver-type-node)
+                            FE-RECEIVER-DYNAMIC)
+                    0))
+              0))
+        0)
+    (let [(mut index) 0]
+      (loop (if (>= (load index) (ts-child-count ast node))
+                (break)
+                (do
+                  (fe-mark-property-published-functions! (mut frontend)
+                                                         (ts-child ast node (load index)))
+                  (store! index (+ (load index) 1))))))
+    0))
+
 (defn fe-index-prototype-parent! [(frontend (mut NativeFrontend)) (node i64)] (-> i64)
   (let [ast (field frontend ast)]
     (if (= (ts-kind ast node) TSK-CALL)
@@ -1218,7 +1260,14 @@
         kind (ts-kind ast node)]
     (cond (= (load (field frontend status)) FE-UNBOUND) 0
           (= kind TSK-IDENTIFIER) (do (fe-resolve-name! (mut frontend) bindings node owner) 0)
-          (fe-function-expression-kind? kind)
+          ;; A function declaration NESTED in another function resolves inline exactly like an
+          ;; expression: its parameters bind in its own scope, its body sees the enclosing lexical
+          ;; stack, and captures record against its own id. Only top-level declarations go through
+          ;; the driver's fe-resolve-function! pass — the default child walk used to descend into
+          ;; nested declaration bodies with the PARENT's bindings and report their parameters as
+          ;; unbound names. Sibling calls keep resolving through the fe-find-function-name
+          ;; fallback, which is how declaration hoisting is already approximated at top level.
+          (or (fe-function-expression-kind? kind) (= kind TSK-FUNCTION-DECLARATION))
             (let [function-index (fe-function-for-node frontend node)
                   fn (al-get [FeFunction] (load (field frontend functions)) function-index)
                   saved (al-len [FeBinding] (load bindings))
@@ -1346,6 +1395,24 @@
                                                0))
                     0)
                 (store! index (+ (load index) 1)))))
+    ;; `var` hoisting inside the function: every local this function owns is visible from the top
+    ;; of the body, including from nested functions declared before the `var` statement appears
+    ;; (NavierStokes declares FluidField's state vars BELOW the nested helpers that write them).
+    ;; Parameters are pushed afterwards, so a parameter of the same name shadows the local, which
+    ;; is JavaScript's `var x` merging with parameter `x`.
+    (store! index 0)
+    (loop (if (>= (load index) (al-len [FeSymbol] (load (field frontend symbols))))
+              (break)
+              (let [symbol (al-get [FeSymbol] (load (field frontend symbols)) (load index))]
+                (if (and (= (load (field symbol role)) FE-ROLE-LOCAL)
+                         (= (load (field symbol owner)) owner))
+                    (al-push! [FeBinding]
+                              (mut bindings)
+                              (fe-binding-make (load (field symbol name-node))
+                                               (load (field symbol id))
+                                               0))
+                    0)
+                (store! index (+ (load index) 1)))))
     (store! index 0)
     (loop (if (>= (load index) count)
               (break)
@@ -1408,6 +1475,27 @@
                                 (al-len [FeFunction] (load (field frontend functions))))
                              (= (fe-symbol-role frontend (load (field capture symbol)))
                                 FE-ROLE-GLOBAL)))
+                    (fe-record-capture! (mut frontend) caller (load (field capture symbol)))
+                    0)
+                (store! index (+ (load index) 1)))))
+    0))
+
+;; A direct call to a capture-carrying function threads the callee's environment through the
+;; CALLER: the call site passes each captured cell, so the caller must own or capture every one
+;; of them itself. Globals stopped being captures, but a nested function's parent-locals are real
+;; lexical state — NavierStokes' lin_solve calls set_bnd, and set_bnd's width/height/rowSize
+;; cells have to arrive through lin_solve. The fixpoint in fe-propagate-call-captures! makes this
+;; converge for recursion and call chains.
+(defn fe-copy-callee-captures! [(frontend (mut NativeFrontend)) (caller i64) (callee i64)] (-> i64)
+  (let [limit (al-len [FeCapture] (load (field frontend captures)))
+        (mut index) 0]
+    (loop (if (>= (load index) limit)
+              (break)
+              (let [capture (al-get [FeCapture] (load (field frontend captures)) (load index))]
+                ; A cell the caller itself OWNS is not a capture of the caller; the call site
+                ; reads it as the owner's local storage.
+                (if (and (= (load (field capture function)) callee)
+                         (!= (fe-symbol-owner frontend (load (field capture symbol))) caller))
                     (fe-record-capture! (mut frontend) caller (load (field capture symbol)))
                     0)
                 (store! index (+ (load index) 1)))))
@@ -1525,7 +1613,7 @@
                     (if (and (>= callee 0)
                              (< callee (al-len [FeFunction] (load (field frontend functions)))))
                         (do
-                          (fe-copy-global-captures! (mut frontend) caller callee)
+                          (fe-copy-callee-captures! (mut frontend) caller callee)
                           (if (= kind TSK-NEW-EXPRESSION)
                               (fe-copy-prototype-captures! (mut frontend) caller callee)
                               0))
@@ -1666,6 +1754,7 @@
                             (fe-index-prototype-method! (mut frontend) (ts-child ast root (load index)))
                             (fe-index-prototype-parent! (mut frontend) (ts-child ast root (load index)))
                             (store! index (+ (load index) 1)))))
+                (fe-mark-property-published-functions! (mut frontend) root)
                 ;; Keep semantic callable identities stable. Finite target masks are only an
                 ;; optimization summary; methods beyond their width retain exact runtime IDs and
                 ;; are dispatched generically instead of renumbering every declaration/capture

@@ -35,7 +35,7 @@ Node expects 2762). Every blocker below is reproduced and specific.
 |---|---|---|
 | Richards | Runs and passes | `result=0 collections=0 moves=0`; ~29 ms/run steady state. |
 | DeltaBlue | Runs and passes | `result=0 collections=0 moves=0`; ~65 ms/run steady state. |
-| NavierStokes | Frontend rejects: nested function-declaration parameters unbound | `FE-CODE-UNBOUND-NAME` on `x` = a parameter of `addFields`, a function declaration nested inside `FluidField`. Minimal repro (`function outer(n){ function addFields(x,s){return x+s;} return addFields(n,2);}`) fails identically, so the resolver never binds nested declarations' parameters. Likely the closest to passing. |
+| NavierStokes | Blocked on the runtime closure-call ABI (see below) | Five real fixes landed on the way (nested-declaration resolution/hoisting, capture threading through sibling calls, arity-guarded devirtualization, 32-slot calls). The remaining wall: `this.setDensity = function(x,y,d){...}` methods CAPTURE FluidField's locals, so the instance property holds a materialized closure object — and nothing can call a runtime closure value generically. The env object does not even record its target id, and polymorphic dispatch only decodes bare function tags. |
 | Splay | Frontend rejects namespaced constructors | `FE-CODE-UNBOUND-NAME` on `Node` from the `SplayTree.Node` pattern. A minimal namespaced-constructor repro gets further — frontend passes, then `MSEL-CALL` because `X.Y.prototype.method =` publications are not indexed as prototype methods, so instance method calls have no targets. Both halves needed. |
 | Crypto | Frontend rejects implicit globals | `FE-CODE-UNBOUND-NAME` on `setupEngine` (`setupEngine = function(...)` with no `var`), and `nValue`…`coeffValue` are likewise assigned-without-declaration; also uses bare `alert` (adapter shim needed, as DeltaBlue's). Needs sloppy-mode implicit-global creation in the resolver; unknown further blockers behind it (BigInteger is string/array heavy). |
 | RayTrace | Needs `arguments` + `Function.prototype.apply` | Built entirely on the Prototype.js idiom `this.initialize.apply(this, arguments)` — every class instantiation forwards variadic arguments. Real feature work, not a resolver gap. |
@@ -123,6 +123,37 @@ use array callbacks.
   `.prototype` load stored tagged bits that the operation-0 walk (which compares raw owners) could
   never match, ending every method lookup at depth 1. The prototype value now canonicalizes
   exactly like the owner argument (managed/function tag → payload).
+
+## Latent bug: GC verification fails under stress
+
+`deltablue 16777216 1` (16 MB heap, stress mode) dies with
+`native GC verification failed after collection 28` — reproduced identically on the committed
+tree before any of this session's changes, so it is pre-existing. Normal runs do zero
+collections and pass; a run that lands under enough memory pressure to collect can abort (one
+such flake was observed). Worth a dedicated stress-mode debugging session before trusting long
+heap-heavy runs.
+
+## The next required design: calling a runtime closure value
+
+NavierStokes (and RayTrace via `apply`, and likely EarleyBoyer) need to CALL a value that is a
+materialized closure loaded from the heap. Today that is unimplemented end to end: closure env
+objects carry only capture cells (no target id), and the polymorphic dispatch sequence decodes
+only bare `JSV-FUNCTION` payloads. Two candidate designs:
+
+- **A. Uniform hidden env slot** — every JS function's ABI becomes `[env, this?, params...]`;
+  capture-free functions ignore the slot; a closure's env object gains a `__target` fidx field;
+  generic dispatch extracts `(fidx, env)` from either tag; per-target capture prefixes disappear
+  entirely. This is the previous handoff's "fixed environment" design, now motivated by lexical
+  captures rather than globals (globals stay in the side table — that part is done and working).
+  Blast radius: call construction, parameter layout, JSL `%DynamicCallReceiver`, poly dispatch
+  emission, verify's receiver-slot math. Big, principled, and it deletes the capture-threading
+  machinery afterwards.
+- **B. Per-function closure entry stubs** — the backend emits an alternate entry that unpacks the
+  env into capture registers and shuffles receiver/args into place; dispatch branches to closure
+  entries for closure-tagged callees. No frontend ABI change, but the register/stack shuffling is
+  intricate and it leaves the per-target prefix machinery alive.
+
+A is recommended; it should be its own focused session.
 
 ## Performance: current numbers and remaining debt
 

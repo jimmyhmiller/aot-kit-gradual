@@ -1134,9 +1134,22 @@
         owner (load (field context owner))]
     ; An owner materializes cells for locals/globals captured by descendants. A different
     ; function only treats the symbol as a cell when that function actually has the capture.
-    (if (= (fe-symbol-owner frontend symbol) owner)
-        (fng-captured-symbol? frontend symbol)
-        (fng-function-captures-symbol? frontend owner symbol))))
+    ; A nested declaration's IDENTITY behaves like a local of its parent: siblings that
+    ; reference each other capture the identity cell, which is what lets mutual recursion
+    ; observe the closure that is materialized after the referencing sibling's own closure.
+    (if (< symbol (al-len [FeFunction] (load (field frontend functions))))
+        (let [function-index (fng-function-index frontend symbol)
+              parent (if (< function-index 0)
+                         -1
+                         (let [fn (al-get [FeFunction] (load (field frontend functions))
+                                          function-index)]
+                           (load (field fn parent))))]
+          (if (and (>= parent 0) (= parent owner))
+              (fng-captured-symbol? frontend symbol)
+              (fng-function-captures-symbol? frontend owner symbol)))
+        (if (= (fe-symbol-owner frontend symbol) owner)
+            (fng-captured-symbol? frontend symbol)
+            (fng-function-captures-symbol? frontend owner symbol)))))
 
 (defn fng-record-dynamic-alias! [(context FngContext) (alias i64)] (-> i64)
   (let [(mut index) 0
@@ -3767,9 +3780,31 @@
                                       callable-target
                                       receiver
                                       (al-slice [i64] (load args))))
-                (n-call! (load (load (field context ctrl)))
-                         callable-target
-                         (al-slice [i64] (load args))))
+                ; A receiverless capture-carrying target (a nested declaration called by name)
+                ; reads its capture cells as leading parameters; the memory token stays last
+                ; because it is already the final element of `args`.
+                (if (> (al-len [i64] (load call-captures)) 0)
+                    (let [(mut prefixed) (al-new [i64] (malloc-allocator))
+                          (mut copy) 0]
+                      (loop (if (>= (load copy) (al-len [i64] (load call-captures)))
+                                (break)
+                                (do (al-push! [i64] (mut prefixed)
+                                              (al-get [i64] (load call-captures) (load copy)))
+                                    (store! copy (+ (load copy) 1)))))
+                      (store! copy 0)
+                      (loop (if (>= (load copy) (al-len [i64] (load args)))
+                                (break)
+                                (do (al-push! [i64] (mut prefixed)
+                                              (al-get [i64] (load args) (load copy)))
+                                    (store! copy (+ (load copy) 1)))))
+                      (let [site (n-call! (load (load (field context ctrl)))
+                                          callable-target
+                                          (al-slice [i64] (load prefixed)))]
+                        (al-free! [i64] (mut prefixed))
+                        (load site)))
+                    (n-call! (load (load (field context ctrl)))
+                             callable-target
+                             (al-slice [i64] (load args)))))
           value (call-value call)]
       (store! (load (field context ctrl)) (call-end call))
       ;; The callee may have changed any active alias. Re-anchor subsequent alias reads at the
@@ -6191,6 +6226,10 @@
                                                 (fng-expression context
                                                                 (ts-child ast node 0)))))
               false)
+          ;; A nested function declaration contributes no statement effect here — its body is
+          ;; compiled as its own graph function. It MUST report fall-through: the default `false`
+          ;; means "control diverged" and silently dropped every statement after the declaration.
+          (= kind TSK-FUNCTION-DECLARATION) true
           :else false)))
 
 (defn fng-node-has-kind [(frontend (ptr NativeFrontend)) (node i64) (wanted i64)] (-> bool)
@@ -6341,6 +6380,75 @@
                 (store! ti (+ (load ti) 1)))))
     0))
 
+;; JavaScript hoists nested function declarations: their bindings hold callable closures from the
+;; top of the enclosing body. Materialize each nested declaration's closure after locals (and so
+;; capture cells) exist. Two phases make mutual references work: every cell-held identity first
+;; gets a defined slot, then each closure is built in source order — a sibling captured through
+;; its identity cell observes the closure stored a moment later. Every values[] slot touched is
+;; recorded for restoration; a closure is a value owned by THIS function's control and must never
+;; leak into another function's graph.
+(defn fng-materialize-nested-declarations! [(context FngContext)
+                                            (saved-symbols (mut (ArrayList i64)))
+                                            (saved-values (mut (ArrayList i64)))] (-> i64)
+  (let [frontend (load (field context frontend))
+        ast (field frontend ast)
+        owner (load (field context owner))
+        function-count (al-len [FeFunction] (load (field frontend functions)))
+        (mut any) false
+        (mut index) 0]
+    (loop (if (>= (load index) function-count)
+              (break)
+              (let [fn (al-get [FeFunction] (load (field frontend functions)) (load index))
+                    fn-id (load (field fn id))]
+                (if (and (= (load (field fn parent)) owner)
+                         (and (= (ts-kind ast (load (field fn node))) TSK-FUNCTION-DECLARATION)
+                              (or (> (fng-capture-count frontend fn-id) 0)
+                                  (fng-symbol-cell? context fn-id))))
+                    (do
+                      (store! any true)
+                      (al-push! [i64] (mut saved-symbols) fn-id)
+                      (al-push! [i64]
+                                (mut saved-values)
+                                (al-get [i64] (load (load (field context values))) fn-id))
+                      (if (fng-symbol-cell? context fn-id)
+                          (do (fng-set-symbol! context fn-id (fng-undefined)) 0)
+                          0))
+                    0)
+                (store! index (+ (load index) 1)))))
+    ; A hoisted closure may capture a local whose initializer has not run yet — `var` semantics
+    ; say that binding already exists as undefined. Give every cell-held local its cell now, so
+    ; the closure captures the cell and observes the later assignment, not a missing value.
+    (if (load any)
+        (do
+          (store! index 0)
+          (loop (if (>= (load index) (al-len [FeSymbol] (load (field frontend symbols))))
+                    (break)
+                    (let [symbol (al-get [FeSymbol] (load (field frontend symbols)) (load index))
+                          symbol-id (load (field symbol id))]
+                      (if (and (= (load (field symbol owner)) owner)
+                               (and (= (load (field symbol role)) FE-ROLE-LOCAL)
+                                    (and (fng-symbol-cell? context symbol-id)
+                                         (= (fng-symbol-storage context symbol-id) NO-NODE))))
+                          (do (fng-set-symbol! context symbol-id (fng-undefined)) 0)
+                          0)
+                      (store! index (+ (load index) 1))))))
+        0)
+    (store! index 0)
+    (loop (if (>= (load index) function-count)
+              (break)
+              (let [fn (al-get [FeFunction] (load (field frontend functions)) (load index))
+                    fn-id (load (field fn id))]
+                (if (and (= (load (field fn parent)) owner)
+                         (and (= (ts-kind ast (load (field fn node))) TSK-FUNCTION-DECLARATION)
+                              (or (> (fng-capture-count frontend fn-id) 0)
+                                  (fng-symbol-cell? context fn-id))))
+                    (let [closure (fng-closure-expression context (load (field fn node)))]
+                      (fng-set-symbol! context fn-id closure)
+                      0)
+                    0)
+                (store! index (+ (load index) 1)))))
+    0))
+
 (defn fng-compile-function! [(frontend (ptr NativeFrontend))
                              (values (mut (ArrayList i64)))
                              (value-types (mut (ArrayList i64)))
@@ -6462,6 +6570,9 @@
                         (fng-default-parameter! context fn (load index))
                         (store! index (+ (load index) 1)))))))
       (fng-initialize-locals! context)
+      (fng-materialize-nested-declarations! context
+                                            (mut saved-capture-symbols)
+                                            (mut saved-capture-values))
       (if top-level (fng-top-level-initialize! context) 0)
       (let [body-node (load (field fn body-node))
             expression-body (!= (ts-kind (field frontend ast) body-node) TSK-BLOCK)

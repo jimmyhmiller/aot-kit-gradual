@@ -3139,7 +3139,33 @@
                   (let [fun (n-find-fun-index fidx)]
                     (if (= fun NO-NODE)
                         NO-NODE
-                        (do (gvn-remove! n) (n-set-def! n 1 fun) (g-changed!) n))))))))))
+                        ;; Devirtualizing is only sound when this call site already supplies every
+                        ;; parameter the target reads. A capture-carrying target receives its
+                        ;; hidden environment through the closure value being discarded here;
+                        ;; rewriting such a call to the bare Fun leaves its capture parameters
+                        ;; reading the argument registers (VERR-CALL-ARITY at best).
+                        (let [raw (- (n-nins n) 2)
+                              mem (and (> raw 0)
+                                       (ty-mem? (n-ty (n-in n (- (n-nins n) 1)))))
+                              explicit (- raw (if mem 1 0))
+                              (mut parms) 0
+                              (mut out) 0]
+                          (loop (if (>= (load out) (n-nouts fun))
+                                    (break)
+                                    (let [u (n-out fun (load out))]
+                                      (if (and (not (n-dead? u))
+                                               (and (= (n-op u) OP-PARM) (= (n-in u 0) fun)))
+                                          (if (>= (n-aux u) (load parms))
+                                              (store! parms (+ (n-aux u) 1))
+                                              0)
+                                          0)
+                                      (store! out (+ (load out) 1)))))
+                          (if (> (load parms) explicit)
+                              NO-NODE
+                              (do (gvn-remove! n)
+                                  (n-set-def! n 1 fun)
+                                  (g-changed!)
+                                  n))))))))))))
 
 ;; M6's deliberately conservative first inliner. It admits only a single Return directly owned by
 ;; FunStart and a pure expression tree. Branches, memory, calls (including recursion), and closures
