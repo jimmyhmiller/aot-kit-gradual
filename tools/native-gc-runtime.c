@@ -332,6 +332,11 @@ static AotJsValue js_canonical_stored_value(AotJsValue value);
 static int js_array_reserve(JsArrayRec *array, size_t needed) {
   if (needed <= array->capacity) return 1;
   if (array_growth_disabled) return 0;
+  if (needed > (size_t)1 << 28) {
+    fprintf(stderr, "js_array_reserve: absurd growth to %zu elements (cap %zu len %zu)\n",
+            needed, array->capacity, array->length);
+    __builtin_trap();
+  }
   /* Literals and callback results overwhelmingly contain at least eight elements. Start there,
      and keep values plus presence bits in one allocation to avoid two allocator round trips and
      the otherwise guaranteed 4 -> 8 copy for that common case. */

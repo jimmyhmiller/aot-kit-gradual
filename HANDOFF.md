@@ -35,7 +35,7 @@ Node expects 2762). Every blocker below is reproduced and specific.
 |---|---|---|
 | Richards | Runs and passes | `result=0 collections=0 moves=0`; ~29 ms/run steady state. |
 | DeltaBlue | Runs and passes | `result=0 collections=0 moves=0`; ~65 ms/run steady state. |
-| NavierStokes | COMPILES AND EMITS; runtime trap remains | The whole compile pipeline now succeeds (graph verifies, machine select passes, 154KB object emits and links). Five deep bugs were fixed to get here (loop memory phis, floating-store placement, self-backedge phi leaks, phi content types, transitive/identity capture propagation — see "Loop memory and nested-closure captures" below). The remaining blocker is a RUNTIME trap early in FluidField: an unbox-to-object of a value that is tagged undefined, read from a stack slot (`aot_2 + ~944`, called from top level). Likely another cell/closure-identity value read before its store, or a capture cell seeded undefined and read through a path that skips the materialized closure. Repro: scratch harness `navier-stokes.coil` → build emitter (~3 min) → link with tools/native-gc-runtime.c + trampoline + v8-native-harness → run with DEFAULT heap (no args — `ns-bin 0 10` means a ZERO-BYTE heap and exits 86 via the OOM trap). Expected checksum 2762. |
+| NavierStokes | Compiles, emits, links, RUNS deep into the simulation; one arg-shifted array store remains | The compile pipeline succeeds and the program executes through construction, reset (arrays correctly sized to 16900 = 130x130), and into the update loop. The remaining bug: one `aot_arr_store` call site receives SHIFTED arguments — `owner` and `index` registers hold two pointers 8 bytes apart (owner=0x...80, index=owner-8) with a plausible tagged value in the value slot. Call chain at trap: `kernel → aot_8 → aot_9 → aot_d → aot_f → aot_10+2260` (update → vel_step-ish → ... → an inner solver loop; machine names, not fidx). The `js_array_reserve` absurd-growth tripwire (>2^28 elements → print + trap) added to tools/native-gc-runtime.c catches it immediately; keep it. Repro: scratch harness `navier-stokes.coil` → emitter (~3 min) → `clang ... ns.o -o ns-bin` → `ns-bin 268435456` (first arg is HEAP BYTES — `ns-bin 0 10` means a zero-byte heap and exits 86). Expected checksum 2762. |
 | Splay | Frontend rejects namespaced constructors | `FE-CODE-UNBOUND-NAME` on `Node` from the `SplayTree.Node` pattern. A minimal namespaced-constructor repro gets further — frontend passes, then `MSEL-CALL` because `X.Y.prototype.method =` publications are not indexed as prototype methods, so instance method calls have no targets. Both halves needed. |
 | Crypto | Frontend rejects implicit globals | `FE-CODE-UNBOUND-NAME` on `setupEngine` (`setupEngine = function(...)` with no `var`), and `nValue`…`coeffValue` are likewise assigned-without-declaration; also uses bare `alert` (adapter shim needed, as DeltaBlue's). Needs sloppy-mode implicit-global creation in the resolver; unknown further blockers behind it (BigInteger is string/array heavy). |
 | RayTrace | Needs `arguments` + `Function.prototype.apply` | Built entirely on the Prototype.js idiom `this.initialize.apply(this, arguments)` — every class instantiation forwards variadic arguments. Real feature work, not a resolver gap. |
@@ -158,6 +158,16 @@ verification.
 - A pre-existing index-reuse bug in `fng-loop` (carried-phi allocation loop continued from the
   memory-phi loop's index) was latent while loops rarely had memory phis; it segfaulted the
   frontend the moment every loop carried them.
+- **Captures are scope-checked**: a capture record is only RUNTIME-real when the capturing
+  function is lexically nested inside the symbol's owner (`fe-scope-inside?`, enforced in
+  `fng-runtime-capture?` and the copy passes). The closed-world analysis passes
+  (`fe-copy-global-captures!` for method calls, plus the new transitive copies) spread capture
+  records into TOP-LEVEL functions; treating those as runtime captures gave every top-level
+  function a demanded environment no call site could supply (`new FluidField(null)` passed
+  `Box(bare Fun)` as env and the prologue's env unbox trapped).
+- **`new Array(n)` coerces its length**: `ResizeArray` declares `(length int)`; the raw
+  expression was passed uncoerced, so an FP-computed size arrived as its IEEE bit pattern and
+  resized to ~4.6e18 elements. `fng-int-value` now wraps the length.
 
 ## The uniform closure-call ABI (design A) — IMPLEMENTED, gate green
 

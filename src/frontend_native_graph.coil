@@ -1027,18 +1027,26 @@
 ;; true lexical state still travels as a capture. This is what lets a generic call use one stable
 ;; descriptor for every capture-free target instead of a per-target hidden prefix.
 (defn fng-runtime-capture? [(frontend (ptr NativeFrontend)) (capture FeCapture)] (-> bool)
-  (let [symbol (load (field capture symbol))]
+  (let [symbol (load (field capture symbol))
+        capturer (load (field capture function))]
     (if (< symbol (al-len [FeFunction] (load (field frontend functions))))
         ; A nested declaration's value can be a capture-carrying closure, so its identity still
         ; travels with the parent. A top-level declaration is its bare Fun constant everywhere.
+        ; Either way, only a function NESTED INSIDE the declaring parent can thread the identity
+        ; cell — the analysis passes copy capture records into method callers as closed-world
+        ; data, and treating those as runtime captures demanded environments no call site has.
         (let [function-index (fng-function-index frontend symbol)]
           (if (< function-index 0)
               true
-              (let [fn (al-get [FeFunction] (load (field frontend functions)) function-index)]
-                (!= (load (field fn parent)) -1))))
+              (let [fn (al-get [FeFunction] (load (field frontend functions)) function-index)
+                    parent (load (field fn parent))]
+                (and (!= parent -1)
+                     (fe-scope-inside? frontend capturer parent)))))
         (if (= (fe-symbol-role frontend symbol) FE-ROLE-GLOBAL)
             false
-            (not (fng-static-global-symbol? frontend symbol))))))
+            (and (not (fng-static-global-symbol? frontend symbol))
+                 (let [owner (fe-symbol-owner frontend symbol)]
+                   (or (< owner 0) (fe-scope-inside? frontend capturer owner))))))))
 
 (defn fng-symbol-capture-count [(frontend (ptr NativeFrontend)) (function-id i64)] (-> i64)
   (let [(mut index) 0
@@ -3910,9 +3918,14 @@
                                         (n-obj-ptr allocation))]
               (fng-record-dynamic-alias! context JS-PROPERTY-ALIAS)
               (if (> argc 0)
-                  (let [resized
+                  ;; The length is a JavaScript NUMBER; ResizeArray declares an int. A float
+                  ;; length ((w+2)*(h+2) computed in FP) passed raw arrives as its IEEE bit
+                  ;; pattern and resizes to ~4.6e18 elements.
+                  (let [length-node (ts-child ast node 1)
+                        resized
                           (fng-jsl-call3 context "ResizeArray" array
-                                         (fng-expression context (ts-child ast node 1))
+                                         (fng-int-value context length-node
+                                                        (fng-expression context length-node))
                                          array)]
                     0)
                   0)

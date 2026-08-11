@@ -1520,6 +1520,19 @@
 ;; lexical state — NavierStokes' lin_solve calls set_bnd, and set_bnd's width/height/rowSize
 ;; cells have to arrive through lin_solve. The fixpoint in fe-propagate-call-captures! makes this
 ;; converge for recursion and call chains.
+;; True when `function` is lexically nested (at any depth) inside `owner`. Only such a function
+;; can legally capture a symbol `owner` declares — its environment chain reaches the cell.
+(defn fe-scope-inside? [(frontend (ptr NativeFrontend)) (function i64) (owner i64)] (-> bool)
+  (let [count (al-len [FeFunction] (load (field frontend functions)))
+        (mut cur) function
+        (mut found) false]
+    (loop (if (or (load found) (or (< (load cur) 0) (>= (load cur) count)))
+              (break)
+              (let [fn (al-get [FeFunction] (load (field frontend functions)) (load cur))]
+                (store! cur (load (field fn parent)))
+                (if (= (load cur) owner) (store! found true) 0))))
+    (load found)))
+
 (defn fe-copy-callee-captures! [(frontend (mut NativeFrontend)) (caller i64) (callee i64)] (-> i64)
   (let [limit (al-len [FeCapture] (load (field frontend captures)))
         (mut index) 0]
@@ -1527,11 +1540,18 @@
               (break)
               (let [capture (al-get [FeCapture] (load (field frontend captures)) (load index))]
                 ; A cell the caller itself OWNS is not a capture of the caller; the call site
-                ; reads it as the owner's local storage.
-                (if (and (= (load (field capture function)) callee)
-                         (!= (fe-symbol-owner frontend (load (field capture symbol))) caller))
-                    (fe-record-capture! (mut frontend) caller (load (field capture symbol)))
-                    0)
+                ; reads it as the owner's local storage. And a caller that is NOT nested inside
+                ; the symbol's owner cannot capture it at all — its environment chain never
+                ; reaches the cell, so recording it would demand an unsatisfiable environment
+                ; (a top-level function "capturing" a constructor's locals).
+                (let [symbol (load (field capture symbol))
+                      owner (fe-symbol-owner frontend (load (field capture symbol)))]
+                  (if (and (= (load (field capture function)) callee)
+                           (and (!= owner caller)
+                                (or (< owner 0)
+                                    (fe-scope-inside? frontend caller owner))))
+                      (fe-record-capture! (mut frontend) caller symbol)
+                      0))
                 (store! index (+ (load index) 1)))))
     0))
 
@@ -1670,7 +1690,9 @@
                                             0)
                                         (store! scan (+ (load scan) 1)))))
                             (if (and (load callee-captures)
-                                     (and (>= callee-parent 0) (!= callee-parent caller)))
+                                     (and (>= callee-parent 0)
+                                          (and (!= callee-parent caller)
+                                               (fe-scope-inside? frontend caller callee-parent))))
                                 (fe-record-capture! (mut frontend) caller callee)
                                 0))
                           (if (= kind TSK-NEW-EXPRESSION)
