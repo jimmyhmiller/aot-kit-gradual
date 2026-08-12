@@ -62,6 +62,10 @@ collect(path.join(root, "src"));
 collect(path.join(root, "lib"));
 stampInputs.push(path.join(root, "Coil.toml"));
 stampInputs.push(path.join(root, "tools", "generate-typescript-aot-benchmark.mjs"));
+// The coil binary itself is a stamp input: a compiler upgrade must invalidate the cached
+// emitters even when no repo source changed.
+const coilBinary = spawnSync("which", ["coil"], { encoding: "utf8" }).stdout.trim();
+if (coilBinary) stampInputs.push(coilBinary);
 stampInputs.sort();
 const hash = crypto.createHash("sha256");
 for (const file of stampInputs) {
@@ -99,22 +103,32 @@ const work = keep
 const object = path.join(work, "program.o");
 const binary = path.join(work, "program");
 
+// Phase timings: every run prints where the milliseconds went, so slow loops get diagnosed
+// from the numbers instead of vibes.
+const phaseMs = {};
+const timed = (name, fn) => {
+  const start = performance.now();
+  const value = fn();
+  phaseMs[name] = Math.round(performance.now() - start);
+  return value;
+};
+
 const kind = tsNative && input.endsWith(".ts") ? "ts" : "js";
-const emitted = spawnSync(emitter, [sourcePath, "0", "10", kind],
-                          { maxBuffer: 256 * 1024 * 1024 });
+const emitted = timed("emit", () => spawnSync(emitter, [sourcePath, "0", "10", kind],
+                          { maxBuffer: 256 * 1024 * 1024 }));
 if (emitted.status !== 0) {
   process.stderr.write(emitted.stderr ?? "");
   console.error(`emitter failed with status ${emitted.status}`);
   process.exit(1);
 }
 fs.writeFileSync(object, emitted.stdout);
-execFileSync("xcrun", ["clang", "-arch", "arm64", "-O1",
+timed("clang", () => execFileSync("xcrun", ["clang", "-arch", "arm64", "-O1",
   path.join(root, "tools", "native-gc-runtime.c"),
   path.join(root, "tools", "native-gc-trampoline.S"),
   path.join(root, "tools", "v8-native-harness.c"),
-  object, "-o", binary], { stdio: "inherit" });
+  object, "-o", binary], { stdio: "inherit" }));
 
-const native = spawnSync(binary, [String(heapBytes)], { encoding: "utf8" });
+const native = timed("native", () => spawnSync(binary, [String(heapBytes)], { encoding: "utf8" }));
 process.stdout.write(native.stdout);
 process.stderr.write(native.stderr);
 const nativeMatch = /result=(-?\d+)/.exec(native.stdout);
@@ -141,8 +155,8 @@ if (nativeValue !== null) {
 let evalValue = null;
 let evalStatus = null;
 if (runEval) {
-  const evaluated = spawnSync(emitter, [sourcePath, "0", "10", kind, "eval"],
-                              { encoding: "utf8", maxBuffer: 256 * 1024 * 1024 });
+  const evaluated = timed("eval", () => spawnSync(emitter, [sourcePath, "0", "10", kind, "eval"],
+                              { encoding: "utf8", maxBuffer: 256 * 1024 * 1024 }));
   const statusMatch = /evstatus=(-?\d+)/.exec(evaluated.stdout ?? "");
   const resultMatch = /result=(-?\d+)/.exec(evaluated.stdout ?? "");
   evalStatus = statusMatch ? Number(statusMatch[1]) : null;
@@ -169,7 +183,7 @@ try {
     }).outputText.replace(/^export /gm, "");
   }
   const script = `${nodeSource}\nconsole.log(String(main()));`;
-  const nodeRun = spawnSync("node", ["--input-type=module", "-e", script], { encoding: "utf8" });
+  const nodeRun = timed("node", () => spawnSync("node", ["--input-type=module", "-e", script], { encoding: "utf8" }));
   const lines = nodeRun.stdout.trim().split("\n");
   nodeValue = BigInt(lines[lines.length - 1]);
   console.log(`node result=${nodeValue}`);
@@ -179,6 +193,9 @@ try {
 
 if (!keep) fs.rmSync(work, { recursive: true, force: true });
 else console.log(`artifacts kept in ${work}`);
+
+console.log(`phase-ms: ${Object.entries(phaseMs).map(([name, ms]) => `${name}=${ms}`).join(" ")}` +
+            ` total=${Object.values(phaseMs).reduce((sum, ms) => sum + ms, 0)}`);
 
 if (native.status !== 0) {
   console.log(`VERDICT: native exited ${native.status} (signal ${native.signal ?? "none"})`);

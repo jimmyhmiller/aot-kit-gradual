@@ -34,6 +34,7 @@
 (import "coil.slice" :use *)
 (import "coil.os" :as os)
 (import "coil.primitive" :as primitive)
+(import "coil.hashmap" :use *)
 (import "ty" :use *)
 (import "shape" :use *)
 (import "node" :use *)
@@ -691,6 +692,10 @@
    ; the first property touch allocates one identity per function and every later touch reuses it.
    (fun-objs (ArrayList i64))
    (array-elements (ArrayList EvArrayElement))  ; imperative indexed payload, keyed by object id
+   ;; (object << 32 | index) -> slot in array-elements. Slots are append-only (delete and
+   ;; resize flip `present` in place), so a mapping is never stale. Without this, every array
+   ;; access rescanned the whole element list: NavierStokes-sized grids made eval mode hours.
+   (array-slot (HashMap i64 i64))
    (latest-fixed (ArrayList i64))  ; (object * 63 + alias) -> latest executed fixed-field write
    (latest-array (ArrayList i64))  ; object id -> latest executed array write/resize
    (cfun (ArrayList i64))  ; closure id -> exact ideal Fun node
@@ -735,6 +740,8 @@
           (store! (field p fun-objs) (al-new [i64] (malloc-allocator)))
           (store! (field p int-owner-objs) (al-new [i64] (malloc-allocator)))
           (store! (field p array-elements) (al-new [EvArrayElement] (malloc-allocator)))
+          (store! (field p array-slot)
+                  (hm-new [i64 i64] (malloc-allocator) (ev-array-slot-keyops)))
           (store! (field p latest-fixed) (al-new [i64] (malloc-allocator)))
           (store! (field p latest-array) (al-new [i64] (malloc-allocator)))
           (store! (field p cfun) (al-new [i64] (malloc-allocator)))
@@ -775,6 +782,7 @@
     (al-clear! [i64] (field p fun-objs))
     (al-clear! [i64] (field p int-owner-objs))
     (al-clear! [EvArrayElement] (field p array-elements))
+    (hm-clear! [i64 i64] (field p array-slot))
     (al-clear! [i64] (field p latest-fixed))
     (al-clear! [i64] (field p latest-array))
     (jso-reset!)
@@ -1850,7 +1858,32 @@
                                           (jso-set-prototype! object prototype)
                                           (RMem (hv-proto-write! ver object pv)))))))))))))))))
 
+(defn ev-array-slot-keyhash [(slot (ptr i8)) (n i64)] (-> i64)
+  (& (* (load (cast (ptr i64) slot)) 2654435761) 2147483647))
+(defn ev-array-slot-keyeq [(ka (ptr i8)) (kb (ptr i8)) (n i64)] (-> bool)
+  (= (load (cast (ptr i64) ka)) (load (cast (ptr i64) kb))))
+(defn ev-array-slot-keyops [] (-> (ptr KeyOps))
+  (let [o (static KeyOps)]
+    (store! (field o hash) (fnptr-of ev-array-slot-keyhash))
+    (store! (field o eq) (fnptr-of ev-array-slot-keyeq))
+    (store! (field o size) (sizeof i64))
+    o))
+
+;; An index outside [0, 2^32) cannot pack into the map key without colliding; such an access
+;; keeps the original list scan, which is also the behavior every access had before the map.
+(defn ev-array-slot-key-packs? [(index i64)] (-> bool)
+  (and (>= index 0) (< index 4294967296)))
+(defn ev-array-slot-key [(object i64) (index i64)] (-> i64)
+  (+ (* object 4294967296) index))
+
 (defn ev-array-element-index [(object i64) (index i64)] (-> i64)
+  (if (ev-array-slot-key-packs? index)
+      (match (hm-get (load (field (ev) array-slot)) (ev-array-slot-key object index))
+        (Some [at] at)
+        (None [] -1))
+      (ev-array-element-index-scan object index)))
+
+(defn ev-array-element-index-scan [(object i64) (index i64)] (-> i64)
   (let [elements (load (field (ev) array-elements))
         (mut at) (- (al-len [EvArrayElement] elements) 1)
         (mut found) -1]
@@ -1890,7 +1923,16 @@
     (store! (field element value) value)
     (store! (field element present) true)
     (if (< at 0)
-        (al-push! [EvArrayElement] (field p array-elements) (load element))
+        (do
+          (al-push! [EvArrayElement] (field p array-elements) (load element))
+          (if (ev-array-slot-key-packs? index)
+              (do
+                (hm-put! [i64 i64] (field p array-slot)
+                         (ev-array-slot-key object index)
+                         (- (al-len [EvArrayElement] (load (field p array-elements))) 1))
+                0)
+              0)
+          0)
         (al-set! [EvArrayElement] (field p array-elements) at (load element)))
     (if (>= index (ev-array-current-length object))
         (al-set! [i64] (field p array-lengths) object (+ index 1))
@@ -3633,8 +3675,15 @@
                           (if (= (n-ty c) (t-xctrl))
                               (do (ev-fail! EV-DEAD c) 0)
                               (do
-                                ; CallEnd executes its call before operations pinned to the continuation.
-                                (ev-enter-ctrl! c)
+                                ;; Merge Phis establish the block environment before any allocation or
+                                ;; effect controlled by that block can read them, so Region/Loop/CallEnd
+                                ;; defer to their case arms below (enter-merge first, then enter-ctrl) —
+                                ;; the same order the ev-call loop uses. Entering here first ran a
+                                ;; region-pinned ArrayStore before its merge's Phis had values.
+                                (if (or (= (n-op c) OP-CALLEND)
+                                        (or (= (n-op c) OP-REGION) (= (n-op c) OP-LOOP)))
+                                    0
+                                    (ev-enter-ctrl! c))
                                 (case (n-op c) OP-RETURN
                                       (do
                                         (store! (field p result) (ev-data (n-in c 1)))

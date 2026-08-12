@@ -161,6 +161,73 @@
         (al-set! [i64] (field u alloc-interference) (+ (* b n) a) 1)
         0)))
 
+(defstruct MraUseScratch [(list (ArrayList i64)) (inited bool)])
+(defn mra-use-scratch [] (-> (ptr MraUseScratch))
+  (let [c (static MraUseScratch)]
+    (if (load (field c inited))
+        0
+        (do
+          (store! (field c list) (al-new [i64] (malloc-allocator)))
+          (store! (field c inited) true)
+          0))
+    c))
+
+(defn mra-note-use! [(vreg i64)] (-> i64)
+  (let [c (mra-use-scratch)
+        n (al-len [i64] (load (field c list)))
+        (mut k) 0
+        (mut seen) false]
+    (if (and (>= vreg 0) (< vreg (ml-vreg-count)))
+        (do
+          (loop (if (or (>= (load k) n) (load seen))
+                    (break)
+                    (do
+                      (if (= (al-get [i64] (load (field c list)) (load k)) vreg)
+                          (store! seen true)
+                          0)
+                      (store! k (+ (load k) 1))
+                      0)))
+          (if (load seen) 0 (do (al-push! [i64] (field c list) vreg) 0)))
+        0)))
+
+;; The instruction's used vregs, deduplicated, into the scratch list. Replaces the verifier
+;; and interference walks that asked ml-inst-uses? for EVERY vreg at every instruction, which
+;; was quadratic in program size.
+(defn mra-collect-inst-uses! [(at i64)] (-> i64)
+  (let [c (mra-use-scratch)
+        m (be-inst at)
+        op (load (field m op))
+        inputs (mi-inputs op)]
+    (al-clear! [i64] (field c list))
+    (if (> inputs 0) (mra-note-use! (load (field m a))) 0)
+    (if (> inputs 1) (mra-note-use! (load (field m b))) 0)
+    (if (= op MI-CSEL) (mra-note-use! (load (field m imm))) 0)
+    (let [args (load (field m arg-count))
+          base (load (field m arg-first))
+          (mut k) 0]
+      (loop (if (>= (load k) args)
+                (break)
+                (do
+                  (mra-note-use! (al-get (load (field (machine-unit) call-args))
+                                         (+ base (load k))))
+                  (store! k (+ (load k) 1))
+                  0))))
+    (al-len [i64] (load (field c list)))))
+
+(defn mra-mark-uses-live! [(at i64)] (-> i64)
+  (let [u (machine-unit)
+        uses (mra-collect-inst-uses! at)
+        (mut k) 0]
+    (loop (if (>= (load k) uses)
+              (break)
+              (do
+                (al-set! [i64] (field u alloc-live)
+                         (al-get [i64] (load (field (mra-use-scratch) list)) (load k))
+                         1)
+                (store! k (+ (load k) 1))
+                0)))
+    0))
+
 (defn mra-build-interference! [] (-> i64)
   (let [u (machine-unit)
         blocks (mu-block-count)
@@ -220,15 +287,7 @@
                                                   0)))
                                       (al-set! [i64] (field u alloc-live) dst 0))
                                     0)
-                                (store! vr 0)
-                                (loop (if (>= (load vr) vregs)
-                                          (break)
-                                          (do
-                                            (if (ml-inst-uses? at (load vr))
-                                                (al-set! [i64] (field u alloc-live) (load vr) 1)
-                                                0)
-                                            (store! vr (+ (load vr) 1))
-                                            0))))))))
+                                (mra-mark-uses-live! at))))))
                 (store! bid (+ (load bid) 1))
                 0)))
     0))
@@ -471,30 +530,38 @@
                                   (let [at (+ first (load i))
                                         m (be-inst at)
                                         mask (mi-desc-clobbers (mi-desc (load (field m op))))]
-                                    (let [(mut vr2) 0]
-                                      (loop (if (or (>= (load vr2) vregs) (< (load last-call) 0))
-                                                (break)
-                                                (do
-                                                  (if (and (ml-inst-uses? at (load vr2))
-                                                           (and (>= (mra-reg (load vr2)) 0)
-                                                                (and (!= (& -280379760046081
-                                                                           (<< 1 (mra-reg (load vr2))))
-                                                                        0)
-                                                                     (let [def (ms-owner-def-inst
-                                                                                 (load (field m owner))
-                                                                                 (load vr2))]
-                                                                       (or (< def first)
-                                                                           (< def (load last-call)))))))
-                                                      (do
-                                                        (fmt (stderr)
-                                                             "CROSS-CALL-CLOBBER vreg={d} reg={d} use-inst={d} use-op={d} last-call={d} block={d} live-out={d}\n"
-                                                             (load vr2) (mra-reg (load vr2)) at
-                                                             (load (field m op)) (load last-call) (load bid)
-                                                             (if (ml-live-out? (load bid) (load vr2)) 1 0))
-                                                        0)
-                                                      0)
-                                                  (store! vr2 (+ (load vr2) 1))
-                                                  0))))
+                                    ; Diagnostic only: on a clean allocation nothing prints, so
+                                    ; walking the instruction's operands (instead of every vreg
+                                    ; ascending) is observable only when a clobber bug exists.
+                                    (if (>= (load last-call) 0)
+                                        (let [uses (mra-collect-inst-uses! at)
+                                              (mut k) 0]
+                                          (loop (if (>= (load k) uses)
+                                                    (break)
+                                                    (do
+                                                      (let [vr2 (al-get [i64]
+                                                                        (load (field (mra-use-scratch) list))
+                                                                        (load k))]
+                                                        (if (and (>= (mra-reg vr2) 0)
+                                                                 (and (!= (& -280379760046081
+                                                                            (<< 1 (mra-reg vr2)))
+                                                                         0)
+                                                                      (let [def (ms-owner-def-inst
+                                                                                  (load (field m owner))
+                                                                                  vr2)]
+                                                                        (or (< def first)
+                                                                            (< def (load last-call))))))
+                                                            (do
+                                                              (fmt (stderr)
+                                                                   "CROSS-CALL-CLOBBER vreg={d} reg={d} use-inst={d} use-op={d} last-call={d} block={d} live-out={d}\n"
+                                                                   vr2 (mra-reg vr2) at
+                                                                   (load (field m op)) (load last-call) (load bid)
+                                                                   (if (ml-live-out? (load bid) vr2) 1 0))
+                                                              0)
+                                                            0))
+                                                      (store! k (+ (load k) 1))
+                                                      0))))
+                                        0)
                                     (if (!= mask 0) (store! last-call at) 0)
                                     (store! i (+ (load i) 1))
                                     0))))
@@ -552,15 +619,7 @@
                                       (if (>= dst 0)
                                           (al-set! [i64] (field u alloc-live) dst 0)
                                           0)
-                                      (let [(mut vr2) 0]
-                                        (loop (if (>= (load vr2) vregs)
-                                                  (break)
-                                                  (do
-                                                    (if (ml-inst-uses? at (load vr2))
-                                                        (al-set! [i64] (field u alloc-live) (load vr2) 1)
-                                                        0)
-                                                    (store! vr2 (+ (load vr2) 1))
-                                                    0)))))
+                                      (mra-mark-uses-live! at))
                                     0)))
                       (store! bid (+ (load bid) 1))
                       0)))))

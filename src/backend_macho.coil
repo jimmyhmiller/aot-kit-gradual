@@ -236,26 +236,177 @@
            (ml-live-before? at vr))
        (!= (ml-value-kind vr) MLK-SCALAR)))
 
-(defn mobj-root-count [] (-> i64)
-  (let [(mut at) 0
-        (mut roots) 0]
-    (loop (if (>= (load at) (be-inst-count))
+;; All stackmap roots, computed by ONE backward liveness walk per block and read by everything
+;; downstream. The per-query path above (mobj-root? -> ml-live-before?) rescans the block tail
+;; for every (safepoint, vreg) pair, and the layout, the two stackmap sweeps, and the byte
+;; verifier each repeated that product — it made the Mach-O step dominate large emits. The
+;; per-query form stays as the reference implementation (the object tests exercise it).
+(defstruct MobjRootCache
+  [(site (ArrayList i64))     ; root entry -> safepoint instruction, grouped ascending
+   (vreg (ArrayList i64))     ; root entry -> vreg, ascending within a site
+   (tmp-site (ArrayList i64))
+   (tmp-first (ArrayList i64))
+   (tmp-count (ArrayList i64))
+   (tmp-vreg (ArrayList i64))
+   (flags (ArrayList bool))   ; per-vreg live flag during the block walk
+   (inited bool)])
+
+(defn mobj-roots [] (-> (ptr MobjRootCache))
+  (let [c (static MobjRootCache)]
+    (if (load (field c inited))
+        0
+        (do
+          (store! (field c site) (al-new [i64] (malloc-allocator)))
+          (store! (field c vreg) (al-new [i64] (malloc-allocator)))
+          (store! (field c tmp-site) (al-new [i64] (malloc-allocator)))
+          (store! (field c tmp-first) (al-new [i64] (malloc-allocator)))
+          (store! (field c tmp-count) (al-new [i64] (malloc-allocator)))
+          (store! (field c tmp-vreg) (al-new [i64] (malloc-allocator)))
+          (store! (field c flags) (al-new [bool] (malloc-allocator)))
+          (store! (field c inited) true)
+          0))
+    c))
+
+(defn mobj-mark-use! [(vreg i64)] (-> i64)
+  (let [c (mobj-roots)]
+    (if (and (>= vreg 0) (< vreg (al-len [bool] (load (field c flags)))))
+        (do (al-set! [bool] (field c flags) vreg true) 0)
+        0)))
+
+(defn mobj-mark-inst-uses! [(at i64)] (-> i64)
+  (let [m (be-inst at)
+        op (load (field m op))
+        inputs (mi-inputs op)]
+    (if (> inputs 0) (mobj-mark-use! (load (field m a))) 0)
+    (if (> inputs 1) (mobj-mark-use! (load (field m b))) 0)
+    (if (= op MI-CSEL) (mobj-mark-use! (load (field m imm))) 0)
+    (let [args (load (field m arg-count))
+          base (load (field m arg-first))
+          (mut k) 0]
+      (loop (if (>= (load k) args)
+                (break)
+                (do
+                  (mobj-mark-use! (al-get (load (field (machine-unit) call-args))
+                                          (+ base (load k))))
+                  (store! k (+ (load k) 1))
+                  0))))
+    0))
+
+(defn mobj-note-root-snapshot! [(at i64) (exclude i64) (vregs i64)] (-> i64)
+  (let [c (mobj-roots)
+        first (al-len [i64] (load (field c tmp-vreg)))
+        (mut vr) 0
+        (mut count) 0]
+    (loop (if (>= (load vr) vregs)
               (break)
               (do
-                (if (ml-safepoint? (load at))
-                    (let [(mut vr) 0]
-                      (loop (if (>= (load vr) (ml-vreg-count))
-                                (break)
-                                (do
-                                  (if (mobj-root? (load at) (load vr))
-                                      (store! roots (+ (load roots) 1))
-                                      0)
-                                  (store! vr (+ (load vr) 1))
-                                  0))))
+                (if (and (al-get [bool] (load (field c flags)) (load vr))
+                         (and (!= (load vr) exclude)
+                              (!= (ml-value-kind (load vr)) MLK-SCALAR)))
+                    (do
+                      (al-push! [i64] (field c tmp-vreg) (load vr))
+                      (store! count (+ (load count) 1))
+                      0)
                     0)
-                (store! at (+ (load at) 1))
+                (store! vr (+ (load vr) 1))
                 0)))
-    (load roots)))
+    (al-push! [i64] (field c tmp-site) at)
+    (al-push! [i64] (field c tmp-first) first)
+    (al-push! [i64] (field c tmp-count) (load count))
+    0))
+
+(defn mobj-build-block-roots! [(bid i64) (vregs i64)] (-> i64)
+  (let [c (mobj-roots)
+        first (mu-block-inst-first bid)
+        count (mu-block-inst-count bid)
+        (mut vr) 0
+        (mut i) count]
+    (al-clear! [i64] (field c tmp-site))
+    (al-clear! [i64] (field c tmp-first))
+    (al-clear! [i64] (field c tmp-count))
+    (al-clear! [i64] (field c tmp-vreg))
+    (al-clear! [bool] (field c flags))
+    (loop (if (>= (load vr) vregs)
+              (break)
+              (do
+                (al-push! [bool] (field c flags) (ml-live-out? bid (load vr)))
+                (store! vr (+ (load vr) 1))
+                0)))
+    (loop (if (<= (load i) 0)
+              (break)
+              (do
+                (store! i (- (load i) 1))
+                (let [at (+ first (load i))
+                      m (be-inst at)
+                      op (load (field m op))
+                      dst (load (field m dst))]
+                  ; Arriving here the flags hold live-AFTER `at`; a call reads its roots now,
+                  ; excluding its own destination, exactly as mobj-root? does.
+                  (if (= op MI-CALL)
+                      (mobj-note-root-snapshot! at dst vregs)
+                      0)
+                  (if (>= dst 0) (al-set! [bool] (field c flags) dst false) 0)
+                  (mobj-mark-inst-uses! at)
+                  ; After the kill and the uses the flags hold live-BEFORE `at`.
+                  (if (= op MI-NEW)
+                      (mobj-note-root-snapshot! at -1 vregs)
+                      0))
+                0)))
+    ;; The walk visited safepoints in descending order; publish ascending.
+    (let [sites (al-len [i64] (load (field c tmp-site)))
+          (mut s) sites]
+      (loop (if (<= (load s) 0)
+                (break)
+                (do
+                  (store! s (- (load s) 1))
+                  (let [site (al-get [i64] (load (field c tmp-site)) (load s))
+                        rf (al-get [i64] (load (field c tmp-first)) (load s))
+                        rc (al-get [i64] (load (field c tmp-count)) (load s))
+                        (mut k) 0]
+                    (loop (if (>= (load k) rc)
+                              (break)
+                              (do
+                                (al-push! [i64] (field c site) site)
+                                (al-push! [i64] (field c vreg)
+                                          (al-get [i64] (load (field c tmp-vreg))
+                                                  (+ rf (load k))))
+                                (store! k (+ (load k) 1))
+                                0))))
+                  0))))
+    0))
+
+(defn mobj-build-roots! [] (-> i64)
+  (let [c (mobj-roots)
+        vregs (ml-vreg-count)
+        blocks (mu-block-count)
+        (mut bid) 0]
+    (al-clear! [i64] (field c site))
+    (al-clear! [i64] (field c vreg))
+    (loop (if (>= (load bid) blocks)
+              (break)
+              (do
+                (mobj-build-block-roots! (load bid) vregs)
+                (store! bid (+ (load bid) 1))
+                0)))
+    0))
+
+(defn mobj-root-count [] (-> i64)
+  (al-len [i64] (load (field (mobj-roots) vreg))))
+
+;; First cache position whose site is >= at. Cache sites ascend, so [result..) begins at's
+;; root range (possibly empty).
+(defn mobj-roots-lower-bound [(at i64)] (-> i64)
+  (let [c (mobj-roots)
+        (mut lo) 0
+        (mut hi) (al-len [i64] (load (field c site)))]
+    (loop (if (>= (load lo) (load hi))
+              (break)
+              (let [mid (/ (+ (load lo) (load hi)) 2)]
+                (if (< (al-get [i64] (load (field c site)) mid) at)
+                    (store! lo (+ mid 1))
+                    (store! hi mid))
+                0)))
+    (load lo)))
 
 (defn mobj-stackmap-size [] (-> i64)
   (+ 24
@@ -288,53 +439,45 @@
                   (obj-u32! 0)
                   (store! owner (+ (load owner) 1))
                   0))))
-    (loop (if (>= (load at) (be-inst-count))
-              (break)
-              (do
-                (if (ml-safepoint? (load at))
-                    (let [m (be-inst (load at))
-                          (mut vr) 0
-                          (mut count) 0]
-                      (loop (if (>= (load vr) (ml-vreg-count))
-                                (break)
-                                (do
-                                  (if (mobj-root? (load at) (load vr))
-                                      (store! count (+ (load count) 1))
-                                      0)
-                                  (store! vr (+ (load vr) 1))
-                                  0)))
-                      (obj-u32! (mobj-safepoint-pc (load at)))
-                      (obj-u32! (load (field m owner)))
-                      (obj-u32! (load at))
-                      (obj-u32! (load root-first))
-                      (obj-u32! (load count))
-                      (obj-u32! (load (field m op)))
-                      (store! root-first (+ (load root-first) (load count))))
-                    0)
-                (store! at (+ (load at) 1))
-                0)))
-    (store! at 0)
-    (loop (if (>= (load at) (be-inst-count))
-              (break)
-              (do
-                (if (ml-safepoint? (load at))
-                    (let [(mut vr) 0]
-                      (loop (if (>= (load vr) (ml-vreg-count))
-                                (break)
-                                (do
-                                  (if (mobj-root? (load at) (load vr))
-                                      (let [reg (mra-reg (load vr))
-                                            spill (mra-spill (load vr))]
-                                        (obj-u32! (load vr))
-                                        (obj-u32! (ml-value-kind (load vr)))
-                                        (obj-u32! (if (>= reg 0) 0 1))
-                                        (obj-u32! (if (>= reg 0) reg (be-spill-off-vreg (load vr)))))
-                                      0)
-                                  (store! vr (+ (load vr) 1))
-                                  0))))
-                    0)
-                (store! at (+ (load at) 1))
-                0)))
+    (let [c (mobj-roots)
+          total (al-len [i64] (load (field c site)))
+          (mut cursor) 0]
+      (loop (if (>= (load at) (be-inst-count))
+                (break)
+                (do
+                  (if (ml-safepoint? (load at))
+                      (let [m (be-inst (load at))
+                            (mut count) 0]
+                        (loop (if (or (>= (load cursor) total)
+                                      (!= (al-get [i64] (load (field c site)) (load cursor))
+                                          (load at)))
+                                  (break)
+                                  (do
+                                    (store! count (+ (load count) 1))
+                                    (store! cursor (+ (load cursor) 1))
+                                    0)))
+                        (obj-u32! (mobj-safepoint-pc (load at)))
+                        (obj-u32! (load (field m owner)))
+                        (obj-u32! (load at))
+                        (obj-u32! (load root-first))
+                        (obj-u32! (load count))
+                        (obj-u32! (load (field m op)))
+                        (store! root-first (+ (load root-first) (load count))))
+                      0)
+                  (store! at (+ (load at) 1))
+                  0)))
+      (let [(mut r) 0]
+        (loop (if (>= (load r) total)
+                  (break)
+                  (do
+                    (let [vr (al-get [i64] (load (field c vreg)) (load r))
+                          reg (mra-reg vr)]
+                      (obj-u32! vr)
+                      (obj-u32! (ml-value-kind vr))
+                      (obj-u32! (if (>= reg 0) 0 1))
+                      (obj-u32! (if (>= reg 0) reg (be-spill-off-vreg vr))))
+                    (store! r (+ (load r) 1))
+                    0)))))
     0))
 
 (defn mobj-shape-bitmap [(shape i64)] (-> i64)
@@ -559,17 +702,25 @@
                                   root-first (mobj-u32 (+ rec 12))
                                   root-count (mobj-u32 (+ rec 16))
                                   op (mobj-u32 (+ rec 20))
-                                  (mut vr) 0
+                                  ; The root cache is this verifier's model of the roots; a
+                                  ; site absent from it has zero.
+                                  clo (if (< at (be-inst-count)) (mobj-roots-lower-bound at) 0)
+                                  (mut chi) clo
                                   (mut expected-count) 0]
                               (if (< at (be-inst-count))
-                                  (loop (if (>= (load vr) (ml-vreg-count))
-                                            (break)
-                                            (do
-                                              (if (mobj-root? at (load vr))
-                                                  (store! expected-count (+ (load expected-count) 1))
-                                                  0)
-                                              (store! vr (+ (load vr) 1))
-                                              0)))
+                                  (let [c (mobj-roots)
+                                        total (al-len [i64] (load (field c site)))]
+                                    (loop (if (or (>= (load chi) total)
+                                                  (!= (al-get [i64] (load (field c site))
+                                                              (load chi))
+                                                      at))
+                                              (break)
+                                              (do
+                                                (store! chi (+ (load chi) 1))
+                                                (store! expected-count
+                                                        (+ (load expected-count) 1))
+                                                0)))
+                                    0)
                                   0)
                               (if (or (>= at (be-inst-count))
                                       (or (not (ml-safepoint? at))
@@ -583,36 +734,35 @@
                                     (mobj-fail! MOBJ-STACKMAP (load site)))
                                   false)
                               (if (load ok)
-                                  (do
-                                    (store! vr 0)
-                                    (let [(mut ordinal) 0]
-                                      (loop (if (or (>= (load vr) (ml-vreg-count))
-                                                    (not (load ok)))
-                                                (break)
-                                                (do
-                                                  (if (mobj-root? at (load vr))
-                                                      (let [rootrec
-                                                              (+ sitebase
-                                                                 (+ (* sites 24)
-                                                                    (* (+ root-first (load ordinal)) 16)))
-                                                            reg (mra-reg (load vr))]
-                                                        (if (or (!= (mobj-u32 rootrec) (load vr))
-                                                                (or (!= (mobj-u32 (+ rootrec 4))
-                                                                        (ml-value-kind (load vr)))
-                                                                    (or (!= (mobj-u32 (+ rootrec 8))
-                                                                            (if (>= reg 0) 0 1))
-                                                                        (!= (mobj-u32 (+ rootrec 12))
-                                                                            (if (>= reg 0)
-                                                                                reg
-                                                                                (be-spill-off-vreg (load vr)))))))
-                                                            (do
-                                                              (store! ok false)
-                                                              (mobj-fail! MOBJ-STACKMAP (load site)))
-                                                            false)
-                                                        (store! ordinal (+ (load ordinal) 1)))
-                                                      0)
-                                                  (store! vr (+ (load vr) 1))
-                                                  0))))
+                                  (let [c (mobj-roots)
+                                        (mut ordinal) 0]
+                                    (loop (if (or (>= (load ordinal) (load expected-count))
+                                                  (not (load ok)))
+                                              (break)
+                                              (do
+                                                (let [vr (al-get [i64]
+                                                                 (load (field c vreg))
+                                                                 (+ clo (load ordinal)))
+                                                      rootrec
+                                                        (+ sitebase
+                                                           (+ (* sites 24)
+                                                              (* (+ root-first (load ordinal)) 16)))
+                                                      reg (mra-reg vr)]
+                                                  (if (or (!= (mobj-u32 rootrec) vr)
+                                                          (or (!= (mobj-u32 (+ rootrec 4))
+                                                                  (ml-value-kind vr))
+                                                              (or (!= (mobj-u32 (+ rootrec 8))
+                                                                      (if (>= reg 0) 0 1))
+                                                                  (!= (mobj-u32 (+ rootrec 12))
+                                                                      (if (>= reg 0)
+                                                                          reg
+                                                                          (be-spill-off-vreg vr))))))
+                                                      (do
+                                                        (store! ok false)
+                                                        (mobj-fail! MOBJ-STACKMAP (load site)))
+                                                      false))
+                                                (store! ordinal (+ (load ordinal) 1))
+                                                0)))
                                     0)
                                   0))
                             (store! site (+ (load site) 1))
@@ -696,6 +846,7 @@
   0)
 
 (defn be-macho! [] (-> i64)
+  (mobj-build-roots!)
   (let [p (backend)
         textlen (be-code-len)
         funcs (mu-function-count)

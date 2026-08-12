@@ -1116,6 +1116,13 @@
   (al-get (load (field (machine-unit) selected-values)) (ms-map-index owner node)))
 (defn ms-vset! [(owner i64) (node i64) (vreg i64)] (-> i64)
   (al-set! [i64] (field (machine-unit) selected-values) (ms-map-index owner node) vreg)
+  (let [u (machine-unit)]
+    (if (and (>= vreg 0) (< vreg (al-len [i64] (load (field u vreg-node)))))
+        (do
+          (al-set! [i64] (field u vreg-node) vreg node)
+          (al-set! [i64] (field u vreg-node-owner) vreg owner)
+          0)
+        0))
   0)
 (defn ms-new-vreg! [] (-> i64)
   (let [u (machine-unit)
@@ -1123,6 +1130,8 @@
         v (load p)]
     (store! p (+ v 1))
     (al-push! [i64] (field u vreg-phi-block) -1)
+    (al-push! [i64] (field u vreg-node) -1)
+    (al-push! [i64] (field u vreg-node-owner) -1)
     v))
 
 ;; The dense-array runtime takes an INTEGER index in a GPR. An index computed in floating
@@ -3606,31 +3615,129 @@
         0)
     (load ok)))
 
+;; Sits in the scheduler's instruction-pair loops: one be-inst, direct field reads, and the raw
+;; input-count table, instead of a descriptor copy and an accessor chain per argument.
 (defn ms-inst-uses-vreg? [(at i64) (vreg i64)] (-> bool)
   (let [m (be-inst at)
-        desc (mi-desc (load (field m op)))
-        inputs (mi-desc-inputs desc)
-        (mut used) false]
-    (if (and (> inputs 0) (= (load (field m a)) vreg)) (store! used true) 0)
-    (if (and (> inputs 1) (= (load (field m b)) vreg)) (store! used true) 0)
-    (if (and (= (load (field m op)) MI-CSEL) (= (load (field m imm)) vreg))
-        (store! used true)
-        0)
-    (if (> (ms-inst-arg-count at) 0)
-        (let [(mut arg) 0]
-          (loop (if (or (>= (load arg) (ms-inst-arg-count at)) (load used))
-                    (break)
-                    (do
-                      (if (= (ms-inst-arg at (load arg)) vreg) (store! used true) 0)
-                      (store! arg (+ (load arg) 1))
-                      0))))
-        0)
-    (load used)))
+        op (load (field m op))
+        inputs (mi-inputs op)]
+    (if (and (> inputs 0) (= (load (field m a)) vreg))
+        true
+        (if (and (> inputs 1) (= (load (field m b)) vreg))
+            true
+            (if (and (= op MI-CSEL) (= (load (field m imm)) vreg))
+                true
+                (let [args (load (field m arg-count))]
+                  (if (<= args 0)
+                      false
+                      (let [call-args (load (field (machine-unit) call-args))
+                            base (load (field m arg-first))
+                            (mut k) 0
+                            (mut used) false]
+                        (loop (if (or (>= (load k) args) (load used))
+                                  (break)
+                                  (do
+                                    (if (= (al-get call-args (+ base (load k))) vreg)
+                                        (store! used true)
+                                        0)
+                                    (store! k (+ (load k) 1))
+                                    0)))
+                        (load used)))))))))
 
 (defn ms-gcm-lca [(left i64) (right i64)] (-> i64)
   (if (< left 0) right (if (< right 0) left (mu-idom-intersect left right))))
 
+(defn ms-gcm-note-use! [(vreg i64) (entry i64)] (-> i64)
+  (let [u (machine-unit)]
+    (if (and (>= vreg 0) (< vreg (al-len [i64] (load (field u vreg-use-head)))))
+        (do
+          (al-push! [i64] (field u vreg-use-entry) entry)
+          (al-push! [i64] (field u vreg-use-next)
+                    (al-get [i64] (load (field u vreg-use-head)) vreg))
+          (al-set! [i64] (field u vreg-use-head) vreg
+                   (- (al-len [i64] (load (field u vreg-use-entry))) 1))
+          0)
+        0)))
+
+;; Rebuild the per-vreg use lists. Called at the start of each pass that queries
+;; ms-gcm-latest-use-block (placement and verification), so the lists always describe the
+;; instructions and edge copies as that pass sees them; block assignments read at query time.
+(defn ms-gcm-build-use-lists! [] (-> i64)
+  (let [u (machine-unit)
+        vregs (load (field u next-vreg))
+        (mut i) 0]
+    (al-clear! [i64] (field u vreg-use-head))
+    (al-clear! [i64] (field u vreg-use-entry))
+    (al-clear! [i64] (field u vreg-use-next))
+    (loop (if (>= (load i) vregs)
+              (break)
+              (do
+                (al-push! [i64] (field u vreg-use-head) -1)
+                (store! i (+ (load i) 1))
+                0)))
+    (store! i 0)
+    (loop (if (>= (load i) (be-inst-count))
+              (break)
+              (do
+                (let [m (be-inst (load i))
+                      inputs (mi-desc-inputs (mi-desc (load (field m op))))]
+                  (if (> inputs 0) (ms-gcm-note-use! (load (field m a)) (load i)) 0)
+                  (if (> inputs 1) (ms-gcm-note-use! (load (field m b)) (load i)) 0)
+                  (if (= (load (field m op)) MI-CSEL)
+                      (ms-gcm-note-use! (load (field m imm)) (load i))
+                      0)
+                  (let [args (ms-inst-arg-count (load i))
+                        (mut k) 0]
+                    (loop (if (>= (load k) args)
+                              (break)
+                              (do
+                                (ms-gcm-note-use! (ms-inst-arg (load i) (load k)) (load i))
+                                (store! k (+ (load k) 1))
+                                0)))))
+                (store! i (+ (load i) 1))
+                0)))
+    (let [(mut e) 0]
+      (loop (if (>= (load e) (mu-edge-count))
+                (break)
+                (do
+                  (let [(mut k) 0]
+                    (loop (if (>= (load k) (mu-edge-copy-count (load e)))
+                              (break)
+                              (do
+                                (if (= (mu-copy-kind (load e) (load k)) MCOPY-VALUE)
+                                    (ms-gcm-note-use! (mu-copy-src (load e) (load k))
+                                                      (- 0 (+ (mu-edge-source (load e)) 2)))
+                                    0)
+                                (store! k (+ (load k) 1))
+                                0))))
+                  (store! e (+ (load e) 1))
+                  0))))
+    0))
+
 (defn ms-gcm-latest-use-block [(owner i64) (vreg i64)] (-> i64)
+  (let [u (machine-unit)
+        (mut latest) -1
+        (mut e) (if (and (>= vreg 0) (< vreg (al-len [i64] (load (field u vreg-use-head)))))
+                    (al-get [i64] (load (field u vreg-use-head)) vreg)
+                    -1)]
+    (loop (if (< (load e) 0)
+              (break)
+              (do
+                (let [entry (al-get [i64] (load (field u vreg-use-entry)) (load e))]
+                  (if (>= entry 0)
+                      (if (= (ms-inst-owner entry) owner)
+                          (store! latest (ms-gcm-lca (load latest) (ms-inst-block entry)))
+                          0)
+                      ; A Phi source is used on its incoming edge, hence in the predecessor block.
+                      (let [block (- (- 0 entry) 2)]
+                        (if (= (mu-block-owner block) owner)
+                            (store! latest (ms-gcm-lca (load latest) block))
+                            0))))
+                (store! e (al-get [i64] (load (field u vreg-use-next)) (load e)))
+                0)))
+    (load latest)))
+
+(defn ms-gcm-latest-use-block-scan [(owner i64) (vreg i64)] (-> i64)
   (let [(mut latest) -1
         (mut rpo) 0
         (mut edge) 0]
@@ -3675,6 +3782,7 @@
     (load latest)))
 
 (defn ms-gcm-place! [] (-> bool)
+  (ms-gcm-build-use-lists!)
   (if (not (ms-gcm-compute-earliest!))
       false
       (let [(mut at) (be-inst-count)
@@ -3884,6 +3992,8 @@
     (store! (field u selection-item) -1)
     (store! (field u next-vreg) 0)
     (al-clear! [i64] (field u vreg-phi-block))
+    (al-clear! [i64] (field u vreg-node))
+    (al-clear! [i64] (field u vreg-node-owner))
     (al-clear! [MCopy] (field u edge-copies))
     (al-clear! [MMove] (field u edge-moves))
     (al-clear! [i64] (field u call-args))
@@ -4801,6 +4911,7 @@
           (load ok)))))
 
 (defn ms-verify! [] (-> bool)
+  (ms-gcm-build-use-lists!)
   (let [u (machine-unit)
         blocks (mu-block-count)
         edges (mu-edge-count)
@@ -5234,7 +5345,23 @@
       (ml-kind-for-parm-representation node)
       (ml-kind-for-source-representation node)))
 
+;; The reverse map answers most queries directly; a vreg whose recorded node has since died or
+;; been reassigned falls back to the scan, so the answer is always the one the scan would give
+;; (the verifier already requires every definition of a vreg to agree on its kind).
 (defn ml-kind-for-vreg [(vreg i64)] (-> i64)
+  (let [u (machine-unit)
+        candidate (if (and (>= vreg 0) (< vreg (al-len [i64] (load (field u vreg-node)))))
+                      (al-get [i64] (load (field u vreg-node)) vreg)
+                      -1)
+        candidate-owner (if (< candidate 0)
+                            -1
+                            (al-get [i64] (load (field u vreg-node-owner)) vreg))]
+    (if (and (and (>= candidate 0) (not (n-dead? candidate)))
+             (= (ms-vget candidate-owner candidate) vreg))
+        (ml-kind-for-node candidate)
+        (ml-kind-for-vreg-scan vreg))))
+
+(defn ml-kind-for-vreg-scan [(vreg i64)] (-> i64)
   (let [funcs (mu-function-count)
         (mut owner) 0
         (mut found) MLK-SCALAR
@@ -5525,7 +5652,19 @@
                   0))))
     ;; Dependency kinds are invariant during this block schedule. Publish each candidate's
     ;; indegree once; the former ready check rebuilt the same answer for every candidate after
-    ;; every emission, making a large straight-line block cubic.
+    ;; every emission, making a large straight-line block cubic. The same pair loop records the
+    ;; edges themselves, so each emission below decrements along the producer's edge list
+    ;; instead of re-asking the kind for every consumer.
+    (al-clear! [i64] (field u sched-edge-head))
+    (al-clear! [i64] (field u sched-edge-consumer))
+    (al-clear! [i64] (field u sched-edge-next))
+    (let [(mut i) 0]
+      (loop (if (>= (load i) count)
+                (break)
+                (do
+                  (al-push! [i64] (field u sched-edge-head) -1)
+                  (store! i (+ (load i) 1))
+                  0))))
     (let [(mut consumer) 0]
       (loop (if (>= (load consumer) count)
                 (break)
@@ -5537,7 +5676,19 @@
                                        (+ first (load producer))
                                        (+ first (load consumer)))
                                      0)
-                                  (store! degree (+ (load degree) 1))
+                                  (do
+                                    (store! degree (+ (load degree) 1))
+                                    (al-push! [i64] (field u sched-edge-consumer)
+                                              (load consumer))
+                                    (al-push! [i64] (field u sched-edge-next)
+                                              (al-get [i64]
+                                                      (load (field u sched-edge-head))
+                                                      (load producer)))
+                                    (al-set! [i64] (field u sched-edge-head) (load producer)
+                                             (- (al-len [i64]
+                                                        (load (field u sched-edge-consumer)))
+                                                1))
+                                    0)
                                   0)
                               (store! producer (+ (load producer) 1)))))
                   (al-set! [i64] (field u schedule-done) (load consumer) (load degree))
@@ -5575,24 +5726,29 @@
                       (al-push! [MInst]
                                 (field u schedule-work)
                                 (load (be-inst (+ first (load choice)))))
-                      (let [(mut consumer) 0]
-                        (loop (if (>= (load consumer) count)
+                      (let [(mut e) (al-get [i64]
+                                            (load (field u sched-edge-head))
+                                            (load choice))]
+                        (loop (if (< (load e) 0)
                                   (break)
                                   (do
-                                    (let [degree
-                                            (al-get (load (field u schedule-done))
-                                                    (load consumer))]
-                                      (if (and (> degree 0)
-                                               (> (ms-schedule-dependency-kind
-                                                    (+ first (load choice))
-                                                    (+ first (load consumer)))
-                                                  0))
-                                          (al-set! [i64]
-                                                   (field u schedule-done)
-                                                   (load consumer)
-                                                   (- degree 1))
+                                    (let [consumer (al-get [i64]
+                                                           (load (field u sched-edge-consumer))
+                                                           (load e))
+                                          degree (al-get (load (field u schedule-done))
+                                                         consumer)]
+                                      (if (> degree 0)
+                                          (do
+                                            (al-set! [i64]
+                                                     (field u schedule-done)
+                                                     consumer
+                                                     (- degree 1))
+                                            0)
                                           0))
-                                    (store! consumer (+ (load consumer) 1))))))
+                                    (store! e (al-get [i64]
+                                                      (load (field u sched-edge-next))
+                                                      (load e)))
+                                    0))))
                       (store! emitted (+ (load emitted) 1)))))))
     (= (load emitted) count)))
 

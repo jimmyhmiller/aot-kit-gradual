@@ -60,6 +60,28 @@ const generated = `(module generatedtypescriptbenchmark)
 
 (extern write :cc c [i32 (ptr u8) i64] (-> i64))
 (extern atoi :cc c [(ptr i8)] (-> i32))
+(extern mach_absolute_time :cc c [] (-> u64))
+(defstruct MachTimebase [(numer u32) (denom u32)])
+(extern mach_timebase_info :cc c [(ptr MachTimebase)] (-> i32))
+
+;; Per-pass wall time on stderr. bt-phase! prints the milliseconds since its previous call, so
+;; dropping a call between two pipeline stages names exactly what that stage cost. The first
+;; call only arms the clock.
+(defn bt-ticks-to-ms [(dt i64)] (-> i64)
+  (let [tb (stack MachTimebase)]
+    (mach_timebase_info tb)
+    (/ (* dt (cast i64 (load (field tb numer))))
+       (* (cast i64 (load (field tb denom))) 1000000))))
+(defn bt-phase-mark [] (-> (ptr i64))
+  (static i64))
+(defn bt-phase! [(name (slice u8))] (-> i64)
+  (let [cell (bt-phase-mark)
+        now (cast i64 (mach_absolute_time))
+        prev (load cell)]
+    (store! cell now)
+    (if (= prev 0)
+        0
+        (do (fmt (stderr) "phase-ms {s}={d}\\n" name (bt-ticks-to-ms (- now prev))) 0))))
 
 (defn print-parm-sources [(parm i64)] (-> i64)
   (let [fun (n-in parm 0) fidx (n-aux fun) idx (n-aux parm) (mut call) 0]
@@ -227,6 +249,7 @@ ${resident ? residentHelper : ""}
         filename ${JSON.stringify(input)}`}
         (mut frontend) (fe-native-new-file source filename ${resident ? "script-kind" : scriptKind})]
     (fmt (stderr) "phase=frontend-index-begin\\n")
+    (bt-phase! "arm")
     (if (!= (fe-native-index! (mut frontend)) FE-OK)
         (do
           (fmt (stderr) "frontend-status={d} code={d} node={d} role={d}\\n"
@@ -235,6 +258,7 @@ ${resident ? residentHelper : ""}
           (fe-native-free! (mut frontend))
           2)
         (let [entry (frontend-native-build! (mut frontend) ${frontendSeed} ${optimize ? "true" : "false"})]
+          (bt-phase! "frontend")
           (fmt (stderr) "phase=frontend-build-end entry={d} nodes={d}\\n" entry (n-count))
 ${resident ? `          (let [rep-count (g-rep-report (stderr))]
             (if (> rep-count 0) (do (fmt (stderr) "rep-violations={d}\\n" rep-count) 0) 0))
@@ -417,9 +441,12 @@ ${resident ? `          (let [rep-count (g-rep-report (stderr))]
                                 (g-print-flat (stderr)) (mu-dump (stderr)) (ms-dump-verbose (stderr)) 0)
                             0)
                         (be-use-runtime-allocation! true)
-                        (if (< (if (= schedule-seed -777)
-                                   (be-schedule!)
-                                   (be-schedule-seeded! schedule-seed)) 0)
+                        (bt-phase! "select")
+                        (let [sched-rc (if (= schedule-seed -777)
+                                           (be-schedule!)
+                                           (be-schedule-seeded! schedule-seed))]
+                          (bt-phase! "schedule")
+                          (if (< sched-rc 0)
                             (do
                               (fmt (stderr)
                                    "schedule={d} item={d} machine={d} machine-item={d} live={d} live-item={d}\\n"
@@ -430,18 +457,24 @@ ${resident ? `          (let [rep-count (g-rep-report (stderr))]
                                   (ml-dump-register-classes (stderr))
                                   0)
                               6)
-                            (if (< (if (= schedule-seed -777)
-                                       (be-color! register-count)
-                                       (be-color-seeded! register-count schedule-seed)) 0)
+                            (let [color-rc (if (= schedule-seed -777)
+                                               (be-color! register-count)
+                                               (be-color-seeded! register-count schedule-seed))]
+                              (bt-phase! "color")
+                              (if (< color-rc 0)
                                 7
-                                (if (not (be-encode-checked!))
+                                (let [encode-ok (be-encode-checked!)]
+                                  (bt-phase! "encode")
+                                  (if (not encode-ok)
                                     8
-                                    (if (not (be-macho-checked!))
+                                    (let [macho-ok (be-macho-checked!)]
+                                      (bt-phase! "macho")
+                                      (if (not macho-ok)
                                         9
                                         (if (= (write 1 (be-object-data) (be-object-len))
                                                (be-object-len))
                                             0
-                                            10))))))))))))))
+                                            10))))))))))))))))))
 `;
 
 fs.writeFileSync(output, generated);

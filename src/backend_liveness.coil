@@ -23,20 +23,39 @@
 
 (defn ml-vreg-count [] (-> i64)
   (load (field (machine-unit) next-vreg)))
+;; ml-index/ml-edge-index survive as the DIAGNOSTIC item encoding (liveness-item) only. The
+;; sets themselves are bitsets — 64 vregs per word — so the fixed-point solver and the whole-set
+;; verifiers move word-wise instead of one (block, vreg) cell at a time.
 (defn ml-index [(bid i64) (vreg i64)] (-> i64)
   (+ (* bid (ml-vreg-count)) vreg))
 (defn ml-edge-index [(edge i64) (vreg i64)] (-> i64)
   (+ (* edge (ml-vreg-count)) vreg))
+(defn ml-live-words [] (-> i64)
+  (/ (+ (ml-vreg-count) 63) 64))
+(defn ml-word-index [(bid i64) (vreg i64)] (-> i64)
+  (+ (* bid (ml-live-words)) (/ vreg 64)))
+(defn ml-bit [(vreg i64)] (-> i64)
+  (<< 1 (& vreg 63)))
 (defn ml-use? [(bid i64) (vreg i64)] (-> bool)
-  (!= (al-get (load (field (machine-unit) live-use)) (ml-index bid vreg)) 0))
+  (!= (& (al-get (load (field (machine-unit) live-use)) (ml-word-index bid vreg))
+         (ml-bit vreg))
+      0))
 (defn ml-def? [(bid i64) (vreg i64)] (-> bool)
-  (!= (al-get (load (field (machine-unit) live-def)) (ml-index bid vreg)) 0))
+  (!= (& (al-get (load (field (machine-unit) live-def)) (ml-word-index bid vreg))
+         (ml-bit vreg))
+      0))
 (defn ml-live-in? [(bid i64) (vreg i64)] (-> bool)
-  (!= (al-get (load (field (machine-unit) live-in)) (ml-index bid vreg)) 0))
+  (!= (& (al-get (load (field (machine-unit) live-in)) (ml-word-index bid vreg))
+         (ml-bit vreg))
+      0))
 (defn ml-live-out? [(bid i64) (vreg i64)] (-> bool)
-  (!= (al-get (load (field (machine-unit) live-out)) (ml-index bid vreg)) 0))
+  (!= (& (al-get (load (field (machine-unit) live-out)) (ml-word-index bid vreg))
+         (ml-bit vreg))
+      0))
 (defn ml-edge-live? [(edge i64) (vreg i64)] (-> bool)
-  (!= (al-get (load (field (machine-unit) edge-live)) (ml-edge-index edge vreg)) 0))
+  (!= (& (al-get (load (field (machine-unit) edge-live)) (ml-word-index edge vreg))
+         (ml-bit vreg))
+      0))
 (defn ml-value-kind [(vreg i64)] (-> i64)
   (al-get (load (field (machine-unit) value-kind)) vreg))
 (defn ml-register-class [(vreg i64)] (-> i64)
@@ -157,6 +176,67 @@
 (defn ml-inst-uses? [(at i64) (vreg i64)] (-> bool)
   (ms-inst-uses-vreg? at vreg))
 
+(defstruct MlVerifyScratch
+  [(expected-use (ArrayList bool))
+   (expected-def (ArrayList bool))
+   (inited bool)])
+(defn ml-verify-scratch [] (-> (ptr MlVerifyScratch))
+  (let [s (static MlVerifyScratch)]
+    (if (load (field s inited))
+        0
+        (do
+          (store! (field s expected-use) (al-new [bool] (malloc-allocator)))
+          (store! (field s expected-def) (al-new [bool] (malloc-allocator)))
+          (store! (field s inited) true)
+          0))
+    s))
+
+(defn ml-verify-note-use! [(vreg i64)] (-> i64)
+  (let [s (ml-verify-scratch)]
+    (if (and (>= vreg 0) (< vreg (al-len [bool] (load (field s expected-use)))))
+        (if (al-get [bool] (load (field s expected-def)) vreg)
+            0
+            (do (al-set! [bool] (field s expected-use) vreg true) 0))
+        0)))
+
+;; One instruction's contribution to the block's expected use/def sets: a use counts only when
+;; the block has not yet defined that vreg, exactly as the per-vreg forward walk counted it.
+(defn ml-verify-note-inst! [(at i64)] (-> i64)
+  (let [s (ml-verify-scratch)
+        m (be-inst at)
+        op (load (field m op))
+        inputs (mi-inputs op)
+        dst (load (field m dst))]
+    (if (> inputs 0) (ml-verify-note-use! (load (field m a))) 0)
+    (if (> inputs 1) (ml-verify-note-use! (load (field m b))) 0)
+    (if (= op MI-CSEL) (ml-verify-note-use! (load (field m imm))) 0)
+    (let [args (load (field m arg-count))
+          base (load (field m arg-first))
+          (mut k) 0]
+      (loop (if (>= (load k) args)
+                (break)
+                (do
+                  (ml-verify-note-use! (al-get (load (field (machine-unit) call-args))
+                                               (+ base (load k))))
+                  (store! k (+ (load k) 1))
+                  0))))
+    (if (and (>= dst 0) (< dst (al-len [bool] (load (field s expected-def)))))
+        (do (al-set! [bool] (field s expected-def) dst true) 0)
+        0)))
+
+;; Mark one operand of one instruction upward-exposed in its block, unless the block already
+;; defined it. Enumerating an instruction's few operands replaces the old per-instruction sweep
+;; over EVERY vreg asking ms-inst-uses-vreg?, which was quadratic in program size.
+(defn ml-note-use! [(bid i64) (vreg i64)] (-> i64)
+  (if (and (>= vreg 0) (< vreg (ml-vreg-count)))
+      (if (ml-def? bid vreg)
+          0
+          (let [u (machine-unit)
+                idx (ml-word-index bid vreg)]
+            (al-set! [i64] (field u live-use) idx
+                     (| (al-get (load (field u live-use)) idx) (ml-bit vreg)))))
+      0))
+
 (defn ml-init-tables! [] (-> i64)
   (let [u (machine-unit)
         blocks (mu-block-count)
@@ -170,7 +250,7 @@
     (al-clear! [i64] (field u edge-live))
     (al-clear! [i64] (field u value-kind))
     (al-clear! [i64] (field u register-class))
-    (loop (if (>= (load i) (* blocks vregs))
+    (loop (if (>= (load i) (* blocks (ml-live-words)))
               (break)
               (do
                 (al-push! [i64] (field u live-use) 0)
@@ -180,7 +260,7 @@
                 (store! i (+ (load i) 1))
                 0)))
     (store! i 0)
-    (loop (if (>= (load i) (* edges vregs))
+    (loop (if (>= (load i) (* edges (ml-live-words)))
               (break)
               (do
                 (al-push! [i64] (field u edge-live) 0)
@@ -213,22 +293,28 @@
                               (let [at (+ first (load i))
                                     m (be-inst (+ first (load i)))
                                     dst (load (field m dst))
-                                    (mut vr) 0]
-                                (loop (if (>= (load vr) vregs)
-                                          (break)
-                                          (do
-                                            (if (and (ml-inst-uses? at (load vr))
-                                                     (not (ml-def? (load bid) (load vr))))
-                                                (al-set! [i64]
-                                                         (field u live-use)
-                                                         (ml-index (load bid) (load vr))
-                                                         1)
-                                                0)
-                                            (store! vr (+ (load vr) 1))
-                                            0)))
+                                    desc (mi-desc (load (field m op)))
+                                    inputs (mi-desc-inputs desc)]
+                                ; The same operand positions ms-inst-uses-vreg? tests, walked
+                                ; directly: a, b, a CSEL's imm, and the argument list.
+                                (if (> inputs 0) (ml-note-use! (load bid) (load (field m a))) 0)
+                                (if (> inputs 1) (ml-note-use! (load bid) (load (field m b))) 0)
+                                (if (= (load (field m op)) MI-CSEL)
+                                    (ml-note-use! (load bid) (load (field m imm)))
+                                    0)
+                                (let [args (ms-inst-arg-count at)
+                                      (mut arg) 0]
+                                  (loop (if (>= (load arg) args)
+                                            (break)
+                                            (do
+                                              (ml-note-use! (load bid) (ms-inst-arg at (load arg)))
+                                              (store! arg (+ (load arg) 1))
+                                              0))))
                                 (if (>= dst 0)
-                                    (do
-                                      (al-set! [i64] (field u live-def) (ml-index (load bid) dst) 1)
+                                    (let [idx (ml-word-index (load bid) dst)]
+                                      (al-set! [i64] (field u live-def) idx
+                                               (| (al-get (load (field u live-def)) idx)
+                                                  (ml-bit dst)))
                                       (al-set! [i64] (field u value-kind) dst (ml-kind-for-inst at))
                                       (al-set! [i64] (field u register-class) dst (ml-class-for-inst at)))
                                     0))
@@ -273,13 +359,20 @@
                 0)))
     (load rounds)))
 
+;; Word-wise Gauss-Seidel over the bitsets: the 64 vregs of one word update together, and each
+;; is an independent equation, so the per-round states match the old one-cell-at-a-time solver
+;; exactly — including the round count.
 (defn ml-solve! [(seed i64)] (-> bool)
   (let [u (machine-unit)
         blocks (mu-block-count)
-        vregs (ml-vreg-count)
+        words (ml-live-words)
+        live-in (load (field u live-in))
+        live-use (load (field u live-use))
+        live-def (load (field u live-def))
+        live-out (load (field u live-out))
         (mut changed) true
         (mut rounds) 0]
-    (loop (if (or (not (load changed)) (> (load rounds) (+ (* blocks vregs) 1)))
+    (loop (if (or (not (load changed)) (> (load rounds) (+ (* blocks (ml-vreg-count)) 1)))
               (break)
               (do
                 (store! changed false)
@@ -291,40 +384,40 @@
                                       (if (= (& seed 1) 0)
                                           (- blocks (+ (load pos) 1))
                                           (load pos))
-                                    (mut vr) 0]
-                                (loop (if (>= (load vr) vregs)
+                                    succs (mu-block-succ-count bid)
+                                    base (* bid words)
+                                    (mut w) 0]
+                                (loop (if (>= (load w) words)
                                           (break)
                                           (do
                                             (let [(mut s) 0
-                                                  (mut out) false]
-                                              (loop (if (>= (load s) (mu-block-succ-count bid))
+                                                  (mut out) 0]
+                                              (loop (if (>= (load s) succs)
                                                         (break)
                                                         (do
-                                                          (if (ml-live-in? (mu-block-succ-target bid (load s))
-                                                                           (load vr))
-                                                              (store! out true)
-                                                              0)
+                                                          (store! out
+                                                                  (| (load out)
+                                                                     (al-get live-in
+                                                                             (+ (* (mu-block-succ-target bid (load s))
+                                                                                   words)
+                                                                                (load w)))))
                                                           (store! s (+ (load s) 1))
                                                           0)))
-                                              (let [in
-                                                      (or (ml-use? bid (load vr))
-                                                          (and (load out) (not (ml-def? bid (load vr)))))
-                                                    idx (ml-index bid (load vr))]
-                                                (if (!= (al-get (load (field u live-out)) idx)
-                                                        (if (load out) 1 0))
+                                              (let [idx (+ base (load w))
+                                                    in (| (al-get live-use idx)
+                                                          (& (load out)
+                                                             (^ (al-get live-def idx) -1)))]
+                                                (if (!= (al-get live-out idx) (load out))
                                                     (do
-                                                      (al-set! [i64]
-                                                               (field u live-out)
-                                                               idx
-                                                               (if (load out) 1 0))
+                                                      (al-set! [i64] (field u live-out) idx (load out))
                                                       (store! changed true))
                                                     0)
-                                                (if (!= (al-get (load (field u live-in)) idx) (if in 1 0))
+                                                (if (!= (al-get live-in idx) in)
                                                     (do
-                                                      (al-set! [i64] (field u live-in) idx (if in 1 0))
+                                                      (al-set! [i64] (field u live-in) idx in)
                                                       (store! changed true))
                                                     0)))
-                                            (store! vr (+ (load vr) 1))
+                                            (store! w (+ (load w) 1))
                                             0))))
                               (store! pos (+ (load pos) 1))
                               0))))
@@ -337,40 +430,57 @@
   (let [u (machine-unit)
         edges (mu-edge-count)
         vregs (ml-vreg-count)
+        words (ml-live-words)
+        live-in (load (field u live-in))
         (mut edge) 0]
     (loop (if (>= (load edge) edges)
               (break)
               (do
                 (let [target (mu-edge-target (load edge))
-                      (mut vr) 0]
-                  (loop (if (>= (load vr) vregs)
+                      base (* (load edge) words)
+                      copies (mu-edge-copy-count (load edge))
+                      (mut w) 0
+                      (mut i) 0]
+                  (loop (if (>= (load w) words)
                             (break)
                             (do
-                              (let [(mut live) (ml-live-in? target (load vr))
-                                    (mut is-dst) false
-                                    (mut is-src) false
-                                    (mut i) 0]
-                                (loop (if (>= (load i) (mu-edge-copy-count (load edge)))
-                                          (break)
-                                          (do
-                                            (if (= (mu-copy-kind (load edge) (load i)) MCOPY-VALUE)
-                                                (do
-                                                  (if (= (mu-copy-dst (load edge) (load i)) (load vr))
-                                                      (store! is-dst true)
-                                                      0)
-                                                  (if (= (mu-copy-src (load edge) (load i)) (load vr))
-                                                      (store! is-src true)
-                                                      0))
-                                                0)
-                                            (store! i (+ (load i) 1))
-                                            0)))
-                                (if (load is-dst) (store! live false) 0)
-                                (if (load is-src) (store! live true) 0)
-                                (al-set! [i64]
-                                         (field u edge-live)
-                                         (ml-edge-index (load edge) (load vr))
-                                         (if (load live) 1 0)))
-                              (store! vr (+ (load vr) 1))
+                              (al-set! [i64] (field u edge-live) (+ base (load w))
+                                       (al-get live-in (+ (* target words) (load w))))
+                              (store! w (+ (load w) 1))
+                              0)))
+                  ; A copy's destination is born on the edge (cleared), its source is consumed
+                  ; there (set); a vreg that is both stays live, so every clear happens before
+                  ; any set — the same precedence the per-vreg version had.
+                  (loop (if (>= (load i) copies)
+                            (break)
+                            (do
+                              (if (= (mu-copy-kind (load edge) (load i)) MCOPY-VALUE)
+                                  (let [dst (mu-copy-dst (load edge) (load i))]
+                                    (if (and (>= dst 0) (< dst vregs))
+                                        (let [idx (+ base (/ dst 64))]
+                                          (al-set! [i64] (field u edge-live) idx
+                                                   (& (al-get (load (field u edge-live)) idx)
+                                                      (^ (ml-bit dst) -1)))
+                                          0)
+                                        0))
+                                  0)
+                              (store! i (+ (load i) 1))
+                              0)))
+                  (store! i 0)
+                  (loop (if (>= (load i) copies)
+                            (break)
+                            (do
+                              (if (= (mu-copy-kind (load edge) (load i)) MCOPY-VALUE)
+                                  (let [src (mu-copy-src (load edge) (load i))]
+                                    (if (and (>= src 0) (< src vregs))
+                                        (let [idx (+ base (/ src 64))]
+                                          (al-set! [i64] (field u edge-live) idx
+                                                   (| (al-get (load (field u edge-live)) idx)
+                                                      (ml-bit src)))
+                                          0)
+                                        0))
+                                  0)
+                              (store! i (+ (load i) 1))
                               0))))
                 (store! edge (+ (load edge) 1))
                 0)))
@@ -417,47 +527,56 @@
         blocks (mu-block-count)
         edges (mu-edge-count)
         vregs (ml-vreg-count)
+        s (ml-verify-scratch)
         (mut bid) 0]
     (store! (field u liveness-result) MLIVE-OK)
     (store! (field u liveness-item) -1)
     ; Re-derive use/def and the fixed-point equations without mutating the published sets.
+    ; One forward operand walk per block fills the per-vreg expectations; asking every vreg
+    ; about every instruction made this verifier cubic on large programs.
     (loop (if (or (>= (load bid) blocks) (!= (ml-result) MLIVE-OK))
               (break)
               (do
                 (let [first (mu-block-inst-first (load bid))
                       count (mu-block-inst-count (load bid))
-                      (mut vr) 0]
+                      (mut vr) 0
+                      (mut i) 0]
+                  (al-clear! [bool] (field s expected-use))
+                  (al-clear! [bool] (field s expected-def))
+                  (loop (if (>= (load vr) vregs)
+                            (break)
+                            (do
+                              (al-push! [bool] (field s expected-use) false)
+                              (al-push! [bool] (field s expected-def) false)
+                              (store! vr (+ (load vr) 1))
+                              0)))
+                  (loop (if (>= (load i) count)
+                            (break)
+                            (do
+                              (ml-verify-note-inst! (+ first (load i)))
+                              (store! i (+ (load i) 1))
+                              0)))
+                  (store! vr 0)
                   (loop (if (or (>= (load vr) vregs) (!= (ml-result) MLIVE-OK))
                             (break)
                             (do
-                              (let [(mut i) 0
-                                    (mut expected-use) false
-                                    (mut expected-def) false
-                                    (mut expected-out) false]
-                                (loop (if (>= (load i) count)
+                              (let [expected-use (al-get [bool] (load (field s expected-use)) (load vr))
+                                    expected-def (al-get [bool] (load (field s expected-def)) (load vr))
+                                    (mut expected-out) false
+                                    (mut k) 0]
+                                (loop (if (>= (load k) (mu-block-succ-count (load bid)))
                                           (break)
                                           (do
-                                            (let [at (+ first (load i))]
-                                              (if (and (ml-inst-uses? at (load vr)) (not (load expected-def)))
-                                                  (store! expected-use true)
-                                                  0)
-                                              (if (= (ms-inst-dst at) (load vr)) (store! expected-def true) 0))
-                                            (store! i (+ (load i) 1))
-                                            0)))
-                                (store! i 0)
-                                (loop (if (>= (load i) (mu-block-succ-count (load bid)))
-                                          (break)
-                                          (do
-                                            (if (ml-live-in? (mu-block-succ-target (load bid) (load i)) (load vr))
+                                            (if (ml-live-in? (mu-block-succ-target (load bid) (load k)) (load vr))
                                                 (store! expected-out true)
                                                 0)
-                                            (store! i (+ (load i) 1))
+                                            (store! k (+ (load k) 1))
                                             0)))
                                 (let [expected-in
-                                        (or (load expected-use)
-                                            (and (load expected-out) (not (load expected-def))))]
-                                  (if (or (!= (ml-use? (load bid) (load vr)) (load expected-use))
-                                          (or (!= (ml-def? (load bid) (load vr)) (load expected-def))
+                                        (or expected-use
+                                            (and (load expected-out) (not expected-def)))]
+                                  (if (or (!= (ml-use? (load bid) (load vr)) expected-use)
+                                          (or (!= (ml-def? (load bid) (load vr)) expected-def)
                                               (or (!= (ml-live-out? (load bid) (load vr)) (load expected-out))
                                                   (!= (ml-live-in? (load bid) (load vr)) expected-in))))
                                       (do
@@ -551,10 +670,18 @@
         (do (ml-compute-edge-live!) (ml-verify!)))))
 
 (defn ml-corrupt-live-out! [(bid i64) (vreg i64) (live bool)] (-> i64)
-  (al-set! [i64] (field (machine-unit) live-out) (ml-index bid vreg) (if live 1 0))
+  (let [u (machine-unit)
+        idx (ml-word-index bid vreg)
+        word (al-get (load (field u live-out)) idx)]
+    (al-set! [i64] (field u live-out) idx
+             (if live (| word (ml-bit vreg)) (& word (^ (ml-bit vreg) -1)))))
   0)
 (defn ml-corrupt-edge-live! [(edge i64) (vreg i64) (live bool)] (-> i64)
-  (al-set! [i64] (field (machine-unit) edge-live) (ml-edge-index edge vreg) (if live 1 0))
+  (let [u (machine-unit)
+        idx (ml-word-index edge vreg)
+        word (al-get (load (field u edge-live)) idx)]
+    (al-set! [i64] (field u edge-live) idx
+             (if live (| word (ml-bit vreg)) (& word (^ (ml-bit vreg) -1)))))
   0)
 (defn ml-corrupt-kind! [(vreg i64) (kind i64)] (-> i64)
   (al-set! [i64] (field (machine-unit) value-kind) vreg kind)
