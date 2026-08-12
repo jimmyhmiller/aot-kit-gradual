@@ -32,6 +32,11 @@ export function ensureResidentEmitter(root, {debug = false} = {}) {
   stampInputs.push(path.join(root, "tools", "generate-typescript-aot-benchmark.mjs"));
   const coilBinary = spawnSync("which", ["coil"], {encoding: "utf8"}).stdout.trim();
   if (coilBinary) stampInputs.push(coilBinary);
+  // The standard library ships beside the compiler, not inside it, so a stdlib-only update
+  // must invalidate cached emitters too. `coil --version` names the library it resolved.
+  const version = spawnSync("coil", ["--version"], {encoding: "utf8"}).stdout ?? "";
+  const stdlib = /(?:installed|checkout): (.+)/.exec(version)?.[1]?.trim();
+  if (stdlib && fs.existsSync(stdlib)) collect(stdlib);
   stampInputs.sort();
   const hash = crypto.createHash("sha256");
   for (const file of stampInputs) {

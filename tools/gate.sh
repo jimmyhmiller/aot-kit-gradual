@@ -101,44 +101,23 @@ for f in src/*.coil; do
 done
 
 section "suites"
-# A suite that reports SIGNAL 9 has reported nothing, and this re-runs it before believing it.
-# That is the documented policy in HANDOFF.md, applied here instead of left to whoever reads the
-# output: `coil test`'s fork-and-exec of a freshly written child dies at random, a different suite
-# each time, each passing in isolation. Running the suites in parallel makes the machine busier and
-# turned "about one per full sweep" into five, so the retry stops being advice and becomes part of
-# the gate.
-#
-# THE DETECTION IS ON THE OUTPUT, NOT THE EXIT CODE. `coil test` survives its own child: it prints
-# `FAILED (signal 9)` and exits 1, exactly like a real assertion failure, so a `[ "$rc" = 137 ]`
-# check never fires. Three attempts, and a suite that reports it three times in a row is reported as
-# a failure like any other — at that point it is evidence rather than noise.
-mkdir -p "$WORK/suite"
-printf '%s\n' tests/*-test.coil | xargs -P "$JOBS" -I{} sh -c '
-  attempt=0
-  while : ; do
-    out=$(coil test "$1" 2>&1); rc=$?
-    attempt=$((attempt + 1))
-    case "$out" in
-      *"(signal 9)"*) [ "$attempt" -lt 3 ] && continue ;;
-    esac
-    break
-  done
-  b=$(basename "$1"); printf "%s" "$out" > "$2/$b.out"; echo "$rc" > "$2/$b.rc"' \
-  _ {} "$WORK/suite"
+# One invocation. `coil test` discovers every (deftest …) under Coil.toml's [test] roots,
+# compiles the shared source tree ONCE, and forks each test; --jobs is the runner's own
+# parallelism. This replaced a per-file xargs loop that rebuilt the whole compiler 44 times
+# and carried a 3-attempt "(signal 9)" retry: the macOS atfork race that caused those
+# random child deaths is now absorbed by the runner itself (a stillborn child — one that
+# died before writing its first-act pipe byte — is re-forked, up to 5 attempts, with a
+# stderr note). "FAILED (child killed before the test started, 5 attempts)" is therefore a
+# real signal, not the old flake.
 total=0
-for f in tests/*-test.coil; do
-  b=$(basename "$f")
-  if [ "$(cat "$WORK/suite/$b.rc" 2>/dev/null || echo 1)" = "0" ]; then
-    line=$(grep -E '^test result' "$WORK/suite/$b.out" | tail -1)
-    n=$(echo "$line" | sed -n 's/.*ok\. \([0-9]*\) passed.*/\1/p')
-    total=$((total + ${n:-0}))
-    note "$f" "${line:-ok}"
-  else
-    note "$f" "FAILED"
-    grep -E 'FAILED|assertion|MISMATCH|VIOLATED|corruption|error:' "$WORK/suite/$b.out" 2>/dev/null | head -20
-    fails=$((fails+1))
-  fi
-done
+if out=$(coil test --jobs "$JOBS" 2>&1); then
+  total=$(echo "$out" | sed -n 's/.*ok\. \([0-9]*\) passed.*/\1/p' | awk '{s+=$1} END {print s+0}')
+  note "coil test --jobs $JOBS" "$(echo "$out" | grep -c '^test result: ok') suites ok, $total tests passed"
+else
+  note "coil test --jobs $JOBS" "FAILED"
+  echo "$out" | grep -E 'FAILED|assertion|MISMATCH|VIOLATED|corruption|error:' | head -40
+  fails=$((fails+1))
+fi
 
 section "roadmap workflow"
 if out=$(node tools/workflow-gate.mjs 2>&1); then
