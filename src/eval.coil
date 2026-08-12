@@ -809,9 +809,14 @@
                 (store! i (- (load i) 1))
                 (if (not (n-dead? (load i)))
                     (let [op (n-op (load i))]
+                      ;; PropLoadKey caches its answer per node exactly like PropLoad/ArrayLoad;
+                      ;; leaving it OFF this chain meant the cache was never invalidated on a new
+                      ;; control arrival, so a getter's element read returned its FIRST call's
+                      ;; value on every later call (fm2: every getDensity read repeated read #1).
                       (if (or (= op OP-CALL)
                               (or (= op OP-PROPLOAD)
-                                  (or (= op OP-ARRAYLOAD) (ev-effect-op? op))))
+                                  (or (= op OP-PROPLOADKEY)
+                                      (or (= op OP-ARRAYLOAD) (ev-effect-op? op)))))
                           (let [control (ev-effect-control (load i))]
                             (if (>= control 0)
                                 (do
@@ -826,7 +831,8 @@
                       (if (or (= op OP-CALL)
                               (or (= op OP-NEW)
                                   (or (= op OP-PROPLOAD)
-                                      (or (= op OP-ARRAYLOAD) (ev-effect-op? op)))))
+                                      (or (= op OP-PROPLOADKEY)
+                                          (or (= op OP-ARRAYLOAD) (ev-effect-op? op))))))
                           (al-push! [i64] (field p frame-nodes) (load i))
                           0))
                     0))))
@@ -1646,6 +1652,15 @@
                             (do (ev-fail! EV-TYPE n) 0))
                         (do (ev-fail! EV-TYPE n) 0))
                     (let [array-index (if (ev-array-object? object) (ev-property-key-index key) -1)]
+                      (if (ev-debug?)
+                          (do (fmt (stderr) "EVDBG propstorekey n{d} obj {d} arraylike={d} index={d} key='"
+                                   n object (if (ev-array-object? object) 1 0) array-index)
+                              (rt-print (stderr) (RStr key))
+                              (fmt (stderr) "' = ")
+                              (rt-print (stderr) vv)
+                              (fmt (stderr) "\n")
+                              0)
+                          0)
                       (if (>= array-index 0)
                           (ev-array-current-store! object array-index vv)
                           (jso-store! object (jss-utf8! key (mut bytes)) (dyn-encode vv)))))
@@ -2233,6 +2248,11 @@
               (jss-from-utf8! "NaN")
               (if (= (& bits 9223372036854775807) 0)
                   (jss-from-utf8! "0")
+                  ;; JavaScript ToString(2.0) is "2", and array-index keys round-trip through this
+                  ;; string: {f}'s fixed "2.000000" made every float-indexed element store land as
+                  ;; a NON-INDEX property that indexed reads never see (fm2/NavierStokes density).
+                  (if (= (f64-bits (cast f64 (cast i64 (bits-f64 bits)))) bits)
+                      (jss-from-int-radix! (cast i64 (bits-f64 bits)) 10)
                   (let [cap 64
                         buf (cast (ptr i8) (malloc cap))
                         fb (stack FixBuf)
@@ -2248,7 +2268,7 @@
                                 (do (ev-fail! EV-TYPE n) JSS-NONE)
                                 (jss-from-utf8! (slice-new [u8] (cast (ptr u8) buf) length)))]
                       (free buf)
-                      result)))))
+                      result))))))
     (RStr [string] string)
     (RObj [id] (do (ev-fail! EV-TYPE n) JSS-NONE))
     (RSym [id] (do (ev-fail! EV-TYPE n) JSS-NONE))
@@ -2833,7 +2853,8 @@
                       op (n-op u)]
                   (al-set! [bool] (field p hasenv) u false)
                   (if (and (not (n-dead? u)) (= (ev-effect-control u) c))
-                      (if (or (= op OP-PROPLOAD) (= op OP-ARRAYLOAD))
+                      (if (or (= op OP-PROPLOAD)
+                              (or (= op OP-PROPLOADKEY) (= op OP-ARRAYLOAD)))
                           ;; The per-control chain is in graph/source order. Sample a load when its
                           ;; block is entered so a following imperative property effect cannot
                           ;; retroactively change it. Richards relies on `v=this.v1; this.v1=null`.
@@ -3098,6 +3119,13 @@
                     cid (ev-fun-closure-id token)
                     capc (if (< cid 0) 0 (al-get (load (field p clen)) cid))
                     fun (ev-fun-node token)]
+                (if (ev-debug?)
+                    (do (fmt (stderr) "EVDBG call n{d} callee-node n{d}:{s} -> fun n{d}, value "
+                             n (n-in n 1) (op-name (n-op (n-in n 1))) fun)
+                        (rt-print (stderr) cv)
+                        (fmt (stderr) "\n")
+                        0)
+                    0)
                 (if (or (< fun 0) (or (>= fun (n-count)) (!= (n-op fun) OP-FUN)))
                     (ev-fail! EV-CALL n)
                     (let [(mut parms) (al-new [i64] (malloc-allocator))
