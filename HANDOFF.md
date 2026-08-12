@@ -23,7 +23,15 @@ it killed the old bottleneck outright:
 - Small-repro three-way loop: **~0.7s total**.
 - Full gate under the new compiler: GREEN.
 
-## Emitter performance: ~8x landed 2026-08-12 (91.7s → ~11.6s on ns.js, under load)
+## Emitter performance: 91.7s → 3.85s on ns.js (24x, 2026-08-12)
+
+FINAL STATE: Jimmy's 16:01 compiler rebuild restored small-function inlining (see the
+inlining section below), taking ns.js emit from 11.6s to **3.85s** on top of the ~8x from
+the algorithmic fixes in this repo. Phase split now: frontend 0.19s, select 1.1s,
+schedule 0.9s, color 0.5s, encode 0.7s, macho 0.15s. Object output byte-identical
+throughout. The history of the 8x:
+
+### The ~8x from this repo (91.7s → ~11.6s, measured under load)
 
 ns.js (396 lines, 8542 nodes) baseline was **emit=91.7s** — 97% of the check. Cost tracks
 code SIZE, not run length. `sample`(1) works out of the box (full symbol names), and the
@@ -96,10 +104,18 @@ bad codegen. Diagnosis, fully verified by old-vs-new binary diff:
   the bug for its whole life; the new compiler faithfully executes the eager call. FIXED
   in this repo (lookup moved inside the guard) — conformance is GREEN again with the new
   compiler.
-- The same lost inlining is the emitter's remaining "diffuse" cost: every integer `=`,
-  `<`, `+` and every tiny accessor is a real `bl` to a 2-3 instruction function
-  (disassembly-verified). Restoring the inliner is Jimmy's fix and the next big
-  multiplier on emit speed.
+- The same lost inlining was the emitter's remaining "diffuse" cost: every integer `=`,
+  `<`, `+` and every tiny accessor was a real `bl` to a 2-3 instruction function
+  (disassembly-verified). **RESOLVED: Jimmy's 16:01 rebuild restored inlining** (tiny-fn
+  symbol count back to 0); ns.js emit dropped 11.6s → 3.85s and the crash repro runs
+  clean even without this repo's guard fix.
+- Certifying the 16:01 compiler surfaced a SECOND latent bug of the same species, this
+  time a stack buffer overflow in OUR tool: `emit-jsl-object.coil` sized its argument
+  array `(array i64 4)` while arity comes from the command line (JsonStringifyPlainArray
+  is arity 6); the two stray writes used to land on dead frame padding, and the new frame
+  layout put the args slice pointer there instead. Fixed (10 slots + a loud arity guard).
+  Running lesson, twice-proven today: when a compiler change makes green code crash,
+  suspect formerly-benign UB in this repo before suspecting codegen.
 
 ## Remaining plan, in order
 
