@@ -76,7 +76,12 @@ const expectedDigests = Object.freeze({
   // diff is exactly one input on one node — `If <- Loop` became `If <- Region` — with node count
   // and every other structure unchanged.
   // Repinned for the uniform closure-call ABI (see `call`).
-  full: "a85616a2aa6533219083dc09027af67705aa129ac52d7375efc4def7f953eb8c",
+  // Repinned when fng-merge-snapshots! started typing its memory phis by the alias's declared
+  // content, the same rule fng-loop always used: n48's mem#1 phi content went `~dyn` -> `flt`
+  // (and the types that flow from it). A bare t-undef content let inference fold loads through
+  // a branch merge to undefined — repros/cell-store-in-branch.js. Three type strings changed;
+  // node count and every edge are identical.
+  full: "7d8600e05f201c284f2685388b8f2d092083fb91bbe9b506b1c0bf5af6a819dc",
   bitwise: "a9e893ac4a4e394075e850fef7c876ce8db3f5b3a61fc5993b217ab06b8c5ab7",
 });
 

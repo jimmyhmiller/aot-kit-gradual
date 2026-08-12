@@ -6070,8 +6070,17 @@
             (store! index 0)
             (loop (if (>= (load index) (al-len [i64] (load active)))
                       (break)
+                      ;; The phi's CONTENT type must be the alias's declared type, exactly like
+                      ;; fng-loop's memory phis: a (t-undef) content tells inference the merged
+                      ;; memory holds undefined, and the fold pass replaces loads through it
+                      ;; with constants (an ArrayLoad through the captured-cell alias read
+                      ;; undefined instead of the array the branch stored).
                       (let [alias (al-get [i64] (load active) (load index))
-                            phi (n-new OP-PHI (t-mem-alias alias (t-undef)))]
+                            phi (n-new OP-PHI
+                                       (t-mem-alias alias
+                                                    (if (shape-alias-defined? alias)
+                                                        (shape-alias-ty alias)
+                                                        (t-undef))))]
                         (n-add-def! phi region)
                         (n-add-def! phi
                                     (al-get [i64]
@@ -6091,7 +6100,8 @@
             true)))
 
 (defn fng-control-aliases! [(context FngContext) (active (mut (ArrayList i64)))] (-> i64)
-  (let [(mut index) 0]
+  (let [frontend (load (field context frontend))
+        (mut index) 0]
     ;; fng-active-memory! publishes declared-field indices for layout consumers. Control snapshots
     ;; instead carry aliases, including the runtime JavaScript property heap.
     (loop (if (>= (load index) (al-len [i64] (load active)))
@@ -6111,6 +6121,17 @@
                 (let [alias (al-get [i64] (load (field context dynamic-aliases)) (load index))]
                   (if (fng-list-has active alias) 0 (al-push! [i64] (mut active) alias)))
                 (store! index (+ (load index) 1)))))
+    ;; Captured cells ALWAYS join a control snapshot, exactly as fng-loop force-includes them
+    ;; for loop memory phis: the branch being lowered may contain the function's FIRST cell
+    ;; touch, which records the alias only after the snapshot list was fixed. Without the phi,
+    ;; a cell store that happens only inside one branch is silently dropped at the merge —
+    ;; `setIterations = function(v) { if (v > 0) iterations = v; }` left the shared cell at its
+    ;; initial value forever (repros/cell-store-in-branch.js; NavierStokes ran lin_solve with
+    ;; iterations=10 instead of 2).
+    (if (and (> (al-len [FeCapture] (load (field frontend captures))) 0)
+             (not (fng-list-has active (load (field context cell-alias)))))
+        (al-push! [i64] (mut active) (load (field context cell-alias)))
+        0)
     0))
 
 (defn fng-if [(context FngContext) (node i64)] (-> bool)
