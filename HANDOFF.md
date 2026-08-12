@@ -60,6 +60,20 @@ a single `for (x=0; x<16; x+=2) checksum=(checksum+f(x))|0` loop at top level of
 VERR-STALE-TYPE (n-ty != n-compute on the counter Phi) while the nested two-loop form compiles —
 frontend type-fixpoint bug with its own tiny repro (ns-row0.js pre-nested-form).
 
+## NavierStokes native divergence ISOLATED to project()'s section composition (2026-08-12 06:45)
+
+`proj.js` in the scratchpad is a ~50-line standalone project() repro: native=-2016 vs node=-469
+in ~2s iterations. Bisect (projA/projB use a runtime `stop` flag): the div/p loop alone is EXACT
+(500=500), through set_bnd+lin_solve is EXACT (704=704), and the gradient-subtract loop ALONE
+(grad.js) is EXACT (11000=11000) — but the full composition diverges. So the gradient loop's
+reads of `p` are being satisfied by a STALE memory state (pre-lin_solve) — a memory-edge or
+scheduling defect across the three sections within one function, the same class as the frontend
+nested-merge issues. Chase it by diffing the memory edges into the grad loop's p ArrayLoads in
+proj.js's graph vs where lin_solve's ArrayStores publish. Fixed along the way (uncommitted at
+the time of writing): bare `return;` lowered a Return with an EMPTY value slot (VERR-DATA-SLOT);
+now returns undefined. Velocity probes: ns-u.js/ns-v.js show native u/v sums are garbage-scale
+(1.8e9 vs Node's -1) after 5 frames — all downstream of this project() defect.
+
 ## RESOLVED (5387293): the fm2 evaluator gap was NOT dispatch — two evaluator defects
 
 fm2/fma/ns-ui now three-way MATCH. The real causes: {f}-formatted float keys ("2.000000" vs
