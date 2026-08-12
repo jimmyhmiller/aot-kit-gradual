@@ -3150,26 +3150,55 @@
                                                       (mi-new MI-SCVTF converted raw -1 0 NO-NODE))
                                             converted)
                                           raw)
+                                    ;; The KERNEL returns to the C harness through x0. An integer
+                                    ;; result is already a raw x0 word, but a FLOAT result sits in
+                                    ;; d0 and the harness reads whatever scratch is left in x0
+                                    ;; (repro: `readX(p) * 4` returned the literal 4). So for
+                                    ;; JS-frontend graphs (g-rep-strict) the kernel materializes
+                                    ;; FP results into x0 as raw IEEE bits (JSBOX tag 0) — and
+                                    ;; nothing else changes, so raw-integer harness contracts and
+                                    ;; raw Coil test graphs keep their exact results.
+                                    kernel-fp-return
+                                      (and (= owner 0)
+                                           (and (> (g-rep-strict?) 0)
+                                                (if (= (n-op node) OP-CALL)
+                                                    (let [direct (infer-direct-callee-fun node)
+                                                          towner (if (= direct NO-NODE)
+                                                                     -1
+                                                                     (mu-find-function direct))]
+                                                      (and (>= towner 0)
+                                                           (and (= (be-function-return-kind towner)
+                                                                   MLK-SCALAR)
+                                                                (be-function-fp-return? towner))))
+                                                    (be-node-fp-value? node))))
+                                    boxed-return
+                                      (and (be-function-return-mixed? owner)
+                                           (= return-kind MLK-BOXED))
                                     value
-                                      (if (and (>= normalized 0)
-                                               (and (be-function-return-mixed? owner)
-                                                    (and (= return-kind MLK-BOXED)
-                                                         (not (be-box-input-already-tagged? node)))))
-                                          (let [tag (if (be-node-fp-value? node)
-                                                        0
-                                                        (be-js-tag-for-value node))]
-                                            (if (= tag -1)
-                                                -1
-                                                (let [boxed (ms-new-vreg!)]
-                                                  (ms-emit! owner
-                                                            bid
-                                                            (mi-new MI-JSBOX boxed normalized -1 tag term))
-                                                  boxed)))
-                                          normalized)]
+                                      (if (< normalized 0)
+                                          normalized
+                                          (if kernel-fp-return
+                                              (let [boxed (ms-new-vreg!)]
+                                                (ms-emit! owner
+                                                          bid
+                                                          (mi-new MI-JSBOX boxed normalized -1 0 term))
+                                                boxed)
+                                              (if (and boxed-return
+                                                       (not (be-box-input-already-tagged? node)))
+                                                  (let [tag (if (be-node-fp-value? node)
+                                                                0
+                                                                (be-js-tag-for-value node))]
+                                                    (if (= tag -1)
+                                                        -1
+                                                        (let [boxed (ms-new-vreg!)]
+                                                          (ms-emit! owner
+                                                                    bid
+                                                                    (mi-new MI-JSBOX boxed normalized -1 tag term))
+                                                          boxed)))
+                                                  normalized)))]
                                 (if (< value 0)
                                     (ms-fail! MSEL-UNSUPPORTED term)
-                                    (if (and (= return-kind MLK-BOXED)
-                                             (be-function-return-mixed? owner))
+                                    (if (or kernel-fp-return boxed-return)
                                         (do (ms-vset! owner term value) value)
                                         value))))
                               (ms-fail! MSEL-TERMINATOR term))))
@@ -4966,6 +4995,48 @@
                                             (store! i (+ (load i) 1))
                                             0)))
                                 (ps w "\n"))
+                              (store! rpo (+ (load rpo) 1))
+                              0))))
+                (store! owner (+ (load owner) 1))
+                0)))
+    0))
+
+;; One instruction per line with vregs, so a machine-level bug can be read against the
+;; disassembly instead of guessed at. ms-dump's terse one-line-per-block format is a GOLDEN
+;; contract (ms-render feeds test fixtures) and must not change.
+(defn ms-dump-verbose [(w (ptr Writer))] (-> i64)
+  (let [funcs (mu-function-count)
+        (mut owner) 0]
+    (loop (if (>= (load owner) funcs)
+              (break)
+              (do
+                (fmt w "function {d}\n" (load owner))
+                (let [nblocks (mu-function-block-count (load owner))
+                      (mut rpo) 0]
+                  (loop (if (>= (load rpo) nblocks)
+                            (break)
+                            (do
+                              (let [bid (mu-function-block (load owner) (load rpo))
+                                    first (mu-block-inst-first bid)
+                                    n (mu-block-inst-count bid)
+                                    (mut i) 0]
+                                (fmt w "  b{d}:\n" (load rpo))
+                                (loop (if (>= (load i) n)
+                                          (break)
+                                          (do
+                                            (let [at (+ first (load i))
+                                                  m (be-inst at)]
+                                              (fmt w "    {d}: {s} d={d} a={d} b={d} imm={d} n={d}\n"
+                                                   at
+                                                   (mi-op-name (ms-inst-op at))
+                                                   (load (field m dst))
+                                                   (load (field m a))
+                                                   (load (field m b))
+                                                   (load (field m imm))
+                                                   (load (field m node))))
+                                            (store! i (+ (load i) 1))
+                                            0)))
+                                0)
                               (store! rpo (+ (load rpo) 1))
                               0))))
                 (store! owner (+ (load owner) 1))

@@ -119,10 +119,23 @@ process.stdout.write(native.stdout);
 process.stderr.write(native.stderr);
 const nativeMatch = /result=(-?\d+)/.exec(native.stdout);
 let nativeValue = nativeMatch ? BigInt(nativeMatch[1]) : null;
-// Decode an integer-tagged result (JSV-INTEGER = 0x7ffc << 48) to its payload.
-if (nativeValue !== null && (BigInt.asUintN(64, nativeValue) >> 48n) === 0x7ffcn) {
-  nativeValue = BigInt.asIntN(48, BigInt.asUintN(64, nativeValue));
-  console.log(`native result was integer-tagged; payload = ${nativeValue}`);
+// Decode an integer-tagged result (JSV-INTEGER = 0x7ffc << 48) to its payload. A word whose top
+// sixteen bits are OUTSIDE the NaN-box tag range is a float stored as its raw IEEE bits; decode
+// it numerically so `return 2.5 * 4` compares as 10 and not as 4621819117588971520.
+const boxTags = new Set([0x7ff9n, 0x7ffan, 0x7ffbn, 0x7ffcn, 0x7ffdn, 0x7ffen, 0x7fffn,
+                         0xfff8n, 0xfff9n, 0xfffan, 0xfffbn, 0xfffcn, 0xfffdn, 0xfffen, 0xffffn]);
+let nativeFloat = null;
+if (nativeValue !== null) {
+  const bits = BigInt.asUintN(64, nativeValue);
+  if ((bits >> 48n) === 0x7ffcn) {
+    nativeValue = BigInt.asIntN(48, bits);
+    console.log(`native result was integer-tagged; payload = ${nativeValue}`);
+  } else if (!boxTags.has(bits >> 48n) && bits > 0xffffffffn) {
+    const view = new DataView(new ArrayBuffer(8));
+    view.setBigUint64(0, bits);
+    nativeFloat = view.getFloat64(0);
+    console.log(`native result was float bits; value = ${nativeFloat}`);
+  }
 }
 
 let evalValue = null;
@@ -169,6 +182,10 @@ else console.log(`artifacts kept in ${work}`);
 if (native.status !== 0) {
   console.log(`VERDICT: native exited ${native.status} (signal ${native.signal ?? "none"})`);
   process.exit(1);
+}
+if (nativeFloat !== null && nodeValue !== null && Number.isFinite(nativeFloat) &&
+    nativeFloat === Number(nodeValue)) {
+  nativeValue = nodeValue;
 }
 if (runEval && nativeValue !== null && nodeValue !== null) {
   const parts = `native=${nativeValue} eval=${evalValue ?? "?"} node=${nodeValue}`;

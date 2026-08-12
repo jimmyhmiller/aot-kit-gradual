@@ -50,6 +50,7 @@ const generated = `(module generatedtypescriptbenchmark)
 (import "backend_aarch64" :use *)
 (import "backend_macho" :use *)
 (import "eval" :use *)
+(import "ty" :use *)
 (import "coil.io" :use *)
 (import "coil.fmt" :use *)
 (import "coil.fs" :use *)
@@ -193,7 +194,15 @@ const generated = `(module generatedtypescriptbenchmark)
     (fmt (stdout) "evstatus={d} steps={d} at={d}:{s}\n"
          status (ev-steps) (ev-at)
          (if (= (ev-at) NO-NODE) "none" (op-name (n-op (ev-at)))))
-    (fmt (stdout) "result={d}\n" (rt-payload (ev-result)))
+    ;; A float result prints as its numeric value, not its bit pattern: the driver compares
+    ;; against Node's decimal output. Integral floats print as integers so 10.0 matches 10.
+    (let [result (ev-result)]
+      (if (= (rt-tag result) RT-FLT)
+          (let [value (bits-f64 (rt-payload result))]
+            (if (= (f64-bits (cast f64 (cast i64 value))) (rt-payload result))
+                (fmt (stdout) "result={d}\n" (cast i64 value))
+                (fmt (stdout) "result-float={f}\n" value)))
+          (fmt (stdout) "result={d}\n" (rt-payload result))))
     (if (= status EV-OK) 0 3)))
 
 ${resident ? residentHelper : ""}
@@ -399,7 +408,7 @@ ${resident ? `          (let [rep-count (g-rep-report (stderr))]
                                             (do (fmt (stderr) "shape-name {d}={s}\\n"
                                                      (load name) (shape-name-bytes (load name)))
                                                 (store! name (+ (load name) 1))))))
-                                (g-print-flat (stderr)) (mu-dump (stderr)) (ms-dump (stderr)) 0)
+                                (g-print-flat (stderr)) (mu-dump (stderr)) (ms-dump-verbose (stderr)) 0)
                             0)
                         (be-use-runtime-allocation! true)
                         (if (< (if (= schedule-seed -777)

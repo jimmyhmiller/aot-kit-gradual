@@ -492,8 +492,83 @@
 ;; Extracted from the two callers below only so that the rule is stated once. `captured-cell` is a
 ;; variable that lives in a heap cell because a closure writes it, which is a tagged word whatever
 ;; the syntax says its type is.
+;; Does this value certainly carry a RAW machine number? Seed types lag construction, so an
+;; open Phi reads as dyn even when every incoming value is raw numeric — follow the structure
+;; with fuel, the same way the backend's return-kind analysis does, or the caller injects a
+;; tagged-word conversion the backend then feeds a raw float (MLIVE-CLASS on arrow-lexical-this).
+(defn fng-machine-number-value? [(v i64) (fuel i64)] (-> bool)
+  (if (or (= v NO-NODE) (<= fuel 0))
+      false
+      (if (fng-tagged-dynamic-value? v)
+          false
+          (if (ty-isa (n-ty v) (t-num))
+              true
+              (if (= (n-op v) OP-PHI)
+                  (let [(mut i) 1
+                        (mut ok) (> (n-nins v) 1)]
+                    (loop (if (or (>= (load i) (n-nins v)) (not (load ok)))
+                              (break)
+                              (do
+                                (let [input (n-in v (load i))]
+                                  (if (and (!= input v)
+                                           (not (fng-machine-number-value? input (- fuel 1))))
+                                      (store! ok false)
+                                      0))
+                                (store! i (+ (load i) 1))
+                                0)))
+                    (load ok))
+                  ;; A delegated result: `() => f()` returns f's raw representation, so follow the
+                  ;; direct callee the same way the backend's return-kind analysis does.
+                  (if (and (= (n-op v) OP-CALL)
+                           (or (= (n-op (n-in v 1)) OP-FUN)
+                               (= (n-op (n-in v 1)) OP-CLOSURE)))
+                      (fng-call-returns-machine-number-fuel? v (- fuel 1))
+                      false))))))
+
+;; Is this a DIRECT call whose callee returns a MACHINE NUMBER on every return arm? The
+;; number-conversion exemption for direct calls assumed "direct => raw numeric return", but a
+;; callee that returns a dyn-content field load returns a TAGGED word (drop4: readX over
+;; dyn-shaped {x,y} returned 0x7ffc-tagged 4; the caller's scvtf then converted the tag bits as
+;; an integer, contaminating the total by ~9.2e18). A Fun's inputs after its FunStart are its
+;; Returns, so the callee's actual return types are inspectable at the call site.
+(defn fng-call-returns-machine-number-fuel? [(value i64) (fuel i64)] (-> bool)
+  (let [callee (n-in value 1)
+        fun (if (= (n-op callee) OP-CLOSURE) (n-in callee 0) callee)]
+    (if (or (<= fuel 0) (!= (n-op fun) OP-FUN))
+        false
+    ;; A Fun with no Return inputs is NOT BUILT YET: nested function bodies lower after the
+    ;; enclosing body that calls them, so their returns are uninspectable here. Keep the old
+    ;; structural exemption for those (converting blindly injected tagged-word conversions into
+    ;; raw-float paths — MLIVE-CLASS on arrow-lexical-this); a BUILT callee whose return is
+    ;; tagged still gets the conversion, which is the drop4/object-parameters fix.
+    (if (< (n-nins fun) 2)
+        true
+        (let [(mut i) 1
+              (mut ok) true]
+          (loop (if (or (>= (load i) (n-nins fun)) (not (load ok)))
+                    (break)
+                    (do
+                      (let [ret (n-in fun (load i))]
+                        (if (and (!= ret NO-NODE) (= (n-op ret) OP-RETURN))
+                            (if (fng-machine-number-value? (n-in ret 1) fuel)
+                                0
+                                (store! ok false))
+                            0))
+                      (store! i (+ (load i) 1))
+                      0)))
+          (load ok))))))
+
+(defn fng-call-returns-machine-number? [(value i64)] (-> bool)
+  (fng-call-returns-machine-number-fuel? value 8))
+
 (defn fng-needs-to-number? [(value i64) (captured-cell bool)] (-> bool)
-  (or captured-cell (= (n-ty value) (t-dyn))))
+  ;; STRUCTURAL, not just the seed type: a fresh Load's type is not computed until inference
+  ;; runs, so `n-ty == dyn` misses a tagged field load written moments earlier — Mul then took
+  ;; NaN-boxed bits as a double (nested inner.x through a dyn-content field was the witness:
+  ;; tagged 3 read as NaN, NaN*5|0 == 0).
+  (or captured-cell
+      (or (= (n-ty value) (t-dyn))
+          (fng-tagged-dynamic-value? value))))
 
 (defn fng-int-value [(context FngContext) (source i64) (value i64)] (-> i64)
   (let [frontend (load (field context frontend))
@@ -509,8 +584,9 @@
       ;; pattern to the integer op — the low 32 bits of any small double are zero, which
       ;; silently zeroed `f() | 0` for every dispatched callee.
       (if (or (and (= (n-op value) OP-CALL)
-                   (or (= (n-op (n-in value 1)) OP-FUN)
-                       (= (n-op (n-in value 1)) OP-CLOSURE)))
+                   (and (or (= (n-op (n-in value 1)) OP-FUN)
+                            (= (n-op (n-in value 1)) OP-CLOSURE))
+                        (fng-call-returns-machine-number? value)))
               (or (= (n-op value) OP-ADD)
                   (or (= (n-op value) OP-SUB)
                       (or (= (n-op value) OP-MUL)
@@ -539,8 +615,9 @@
       ;; but a DYNAMICALLY dispatched call returns a BOXED dyn value and needs the guarded
       ;; conversion — passing it raw fed double bit patterns into numeric ops.
       (if (or (and (= (n-op value) OP-CALL)
-                   (or (= (n-op (n-in value 1)) OP-FUN)
-                       (= (n-op (n-in value 1)) OP-CLOSURE)))
+                   (and (or (= (n-op (n-in value 1)) OP-FUN)
+                            (= (n-op (n-in value 1)) OP-CLOSURE))
+                        (fng-call-returns-machine-number? value)))
               (or (= (n-op value) OP-ADD)
                   (or (= (n-op value) OP-SUB)
                       (or (= (n-op value) OP-MUL)
@@ -602,15 +679,6 @@
               (= kind TSK-STRING-LITERAL) FNG-STRING
               (= kind TSK-ARRAY-LITERAL) FNG-ARRAY
               (= kind TSK-VOID) FNG-VOID
-              ;; A literal-inferred parameter records the OBJECT LITERAL as its type-node, and
-              ;; literal types live in the decl-node registry, not the type-node registry the
-              ;; `named` probe above consults. Without this arm the callee body (fng-infer, which
-              ;; DOES consult the decl registry) reads the parameter through the inferred static
-              ;; shape while every call site lowers its literal argument dynamically — fixed-slot
-              ;; loads over dynamic property storage.
-              (= kind TSK-OBJECT-LITERAL)
-                (let [declared (fe-type-index-for-decl-node frontend type-node)]
-                  (if (>= declared 0) declared FNG-DYNAMIC))
               :else FNG-DYNAMIC))))
 
 (defn fng-coil-type [(frontend (ptr NativeFrontend))

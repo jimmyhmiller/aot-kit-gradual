@@ -1,6 +1,6 @@
 # Handoff: V8 benchmark support, DSL coverage, and runtime performance
 
-Last updated: 2026-08-11
+Last updated: 2026-08-12
 
 ## Goal
 
@@ -44,6 +44,47 @@ Node expects 2762). Every blocker below is reproduced and specific.
 There is still no valid benchmark/Node comparison table. Do not report performance numbers for a
 benchmark until its native result passes the benchmark's correctness checks and the perf debt
 below is at least triaged.
+
+## Three-way differential tooling (built 2026-08-11/12) — USE THIS FIRST
+
+`node tools/js-native-run.mjs FILE.js [--debug] [--ts-native] [--eval] [--keep]` is now the
+primary iteration loop (~2s with the cached -O0 emitter after `--debug`'s first build):
+
+- `--eval` runs Node vs the IR EVALUATOR (ev-run on the frontend's graph) vs native, and blames a
+  mismatch at the frontend (evaluator already disagrees with Node) or the backend (evaluator
+  agrees, native does not). The evaluator understands the materialized-closure ABI (env object
+  marked callable), function property shadow objects, and entry-Arg-rooted memory chains; its
+  EV-MEM/EV-UNBOX/EV-CAST failures print the node, value, and requirement.
+- Float results print numerically (native side decodes NaN-boxed float bits).
+- `--keep` keeps program.o for objdump; `AOT_DUMP_GRAPH=1` dumps the graph from the resident
+  emitter; schedule-seed -999 dumps mu/ms.
+
+## OPEN: numeric-join boxing picks a WRONG STATIC TAG (the isolated backend bug, 2026-08-12)
+
+Exact repro (scratchpad acc6.js / drop4.js; object-parameters JS-mode reduces to it): an untyped
+accumulator `total = total + call() * k` over enough terms computes the right float in d-regs and
+then boxes it with the INT tag. Disassembly (drop4): `fadd d0...; fmov x15, d0; ... movk x17,
+#0x7ffc, lsl 48; orr x0, x0, x17` — 0x7ffc OR'd onto raw IEEE bits. ToInt32 of the resulting
+word rounds the true total to a multiple of 256 (7052134 -> 7052288).
+
+Root cause: `be-js-tag-for-value`'s numeric-join case answers `(if (be-node-fp-value? node) 0
+JSV-INTEGER)` — a SECOND representation walk that can disagree with the walk selection used when
+it chose FADD. The file's own comment admits the class ("the answer decides the representation,
+so the two sides ... could disagree"). The representation authority must be single: either (a)
+tag from the SELECTED register class of the operand vreg at JSBOX emission (FPR -> tag 0), or
+(b) box `num`-typed values with a runtime integrality test (int -> 0x7ffc, else raw float bits),
+which is the semantically faithful choice. Note `total < 1e18` comparisons on such dyn totals
+also evaluate false natively (same family; OP-LT has no dyn boundary routing while OP-EQ does —
+see ms select OP-EQ vs OP-LT).
+
+Related fixed already (2026-08-12): kernel (owner 0) Return now always boxes to tagged x0 (the C
+harness contract); fng-needs-to-number? is structural (fng-tagged-dynamic-value?), fixing Mul on
+tagged field loads; fe-type-index-for-decl-node resolves structurally-deduped literals to their
+declaration (object-parameters frontend defect — evaluator now matches Node at 1507052134).
+A fng-type-tag TSK-OBJECT-LITERAL arm crashes fe indexing (segfault in al-get during index) —
+reverted twice now; the structural decl fallback makes it unnecessary. Verifier note: the rep
+lattice treats int-raw and float-raw both as RAW-NUM, so it cannot see this bug — splitting
+RAW-NUM into RAW-INT/RAW-FLT would catch it at Store/operand edges.
 
 ## The systematic hardening plan (agreed 2026-08-11; work in phases, gate-green at every step)
 
