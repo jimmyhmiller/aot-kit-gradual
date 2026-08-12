@@ -1323,6 +1323,13 @@
                 (let [op (n-op (load m))]
                   (cond (= op OP-ARG) (do (store! ans true) (store! done true) 0)
                         (= op OP-STORE) (do (store! m (n-in (load m) 1)) 0)
+                        ;; A loop memory Phi: follow the PREHEADER edge (input 1). The backedge
+                        ;; is a cycle, and the entry edge is where an entry-state root would be.
+                        (= op OP-PHI)
+                          (let [entry (n-in (load m) 1)]
+                            (if (or (= entry NO-NODE) (= entry (load m)))
+                                (do (store! done true) 0)
+                                (do (store! m entry) 0)))
                         (= op OP-MEMMERGE)
                           (let [(mut i) 1
                                 (mut nxt) NO-NODE]
@@ -1922,6 +1929,19 @@
   (let [latest (al-get [i64] (load (field (ev) latest-array)) object)]
     (if (and (= (n-op (n-in n 1)) OP-ARG) (>= latest 0)) latest version)))
 
+;; An array index computed through float arithmetic arrives as an INTEGRAL FLOAT (natively
+;; I32FROMFP converts it); accept exactly those and stay loud for everything else.
+(defn ev-array-index [(iv RtVal) (n i64)] (-> i64)
+  (if (= (rt-tag iv) RT-INT)
+      (rt-payload iv)
+      (if (= (rt-tag iv) RT-FLT)
+          (let [value (bits-f64 (rt-payload iv))
+                as-int (cast i64 value)]
+            (if (= (f64-bits (cast f64 as-int)) (rt-payload iv))
+                as-int
+                (do (ev-fail! EV-TYPE n) -1)))
+          (do (ev-fail! EV-TYPE n) -1))))
+
 (defn ev-array-load-uncached [(n i64)] (-> RtVal)
   (let [mv (ev-data (n-in n 1))]
     (if (ev-failed?)
@@ -1932,16 +1952,17 @@
               (let [iv (ev-data (n-in n 3))]
                 (if (ev-failed?)
                     iv
-                    (if (!= (rt-tag iv) RT-INT)
-                        (ev-fail! EV-TYPE n)
+                    (let [raw-index (ev-array-index iv n)]
+                    (if (ev-failed?)
+                        (RUndef)
                         (let [ver (rt-need-mem mv n)
                               object (rt-need-obj av n)
-                              index (rt-payload iv)]
+                              index raw-index]
                           (if (ev-failed?)
                               (RUndef)
                               (if (= (& (hv-mask ver) (<< 1 JS-PROPERTY-ALIAS)) 0)
                                   (ev-fail! EV-MEM n)
-                                  (ev-array-current-load object index))))))))))))
+                                  (ev-array-current-load object index)))))))))))))
 
 (defn ev-array-load [(n i64)] (-> RtVal)
   ;; An ArrayLoad ordered before a resize (notably Array.prototype.pop) denotes the old element.
@@ -1970,7 +1991,8 @@
                     (let [value (ev-data (n-in n 4))]
                       (if (ev-failed?)
                           value
-                          (if (or (!= (rt-tag iv) RT-INT) (< (rt-payload iv) 0))
+                          (let [raw-index (ev-array-index iv n)]
+                          (if (or (ev-failed?) (< raw-index 0))
                               (ev-fail! EV-TYPE n)
                               (let [ver (rt-need-mem mv n)
                                     object (rt-need-obj av n)]
@@ -1982,8 +2004,8 @@
                                         (ev-fail! EV-MEM n)
                                         (RMem (ev-array-publish-write! ver
                                                                        object
-                                                                       (rt-payload iv)
-                                                                       value))))))))))))))))
+                                                                       raw-index
+                                                                       value)))))))))))))))))
 
 (defn ev-array-length [(n i64)] (-> RtVal)
   (let [mv (ev-data (n-in n 1))]
