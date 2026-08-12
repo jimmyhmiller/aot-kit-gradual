@@ -39,7 +39,20 @@ trap 'rm -rf "$WORK"' EXIT
 fails=0
 note() { printf '%-34s %s\n' "$1" "$2"; }
 
-echo "=== native TypeScript bridge ==="
+# Every section reports its wall time: a slow gate gets fixed by knowing WHERE it is slow.
+LAST_SECTION=""
+SECTION_T0=$SECONDS
+section() {
+  if [ -n "$LAST_SECTION" ]; then
+    printf '    [%ss] %s\n' "$((SECONDS - SECTION_T0))" "$LAST_SECTION"
+  fi
+  LAST_SECTION="$1"
+  SECTION_T0=$SECONDS
+  echo
+  echo "=== $1 ==="
+}
+
+section "native TypeScript bridge"
 if out=$(./tools/build-typescript-go-bridge.sh 2>&1); then
   note "typescript-go bridge" "ready"
 else
@@ -48,8 +61,7 @@ else
   exit 1
 fi
 
-echo
-echo "=== status checklist ==="
+section "status checklist"
 # docs/STATUS.md is generated, and this is what stops it going stale the way docs/CONVERSION.md did
 # — that file claimed "all of String.prototype except split" for months while twelve methods sat in
 # lib/ that no program could name. The check re-derives the recognised operations from the
@@ -61,16 +73,14 @@ else
   note "status.mjs" "FAILED"; echo "$out" | head -20; fails=$((fails+1))
 fi
 
-echo
-echo "=== backend module boundaries ==="
+section "backend module boundaries"
 if out=$(node tools/backend-module-gate.mjs 2>&1); then
   note "backend-module-gate.mjs" "$out"
 else
   note "backend-module-gate.mjs" "FAILED"; echo "$out" | tail -20; fails=$((fails+1))
 fi
 
-echo
-echo "=== typecheck ==="
+section "typecheck"
 mkdir -p "$WORK/check"
 for f in src/*.coil; do
   [ "$f" = "src/frontend_native_graph.coil" ] && continue
@@ -90,8 +100,7 @@ for f in src/*.coil; do
   fi
 done
 
-echo
-echo "=== suites ==="
+section "suites"
 # A suite that reports SIGNAL 9 has reported nothing, and this re-runs it before believing it.
 # That is the documented policy in HANDOFF.md, applied here instead of left to whoever reads the
 # output: `coil test`'s fork-and-exec of a freshly written child dies at random, a different suite
@@ -131,48 +140,42 @@ for f in tests/*-test.coil; do
   fi
 done
 
-echo
-echo "=== roadmap workflow ==="
+section "roadmap workflow"
 if out=$(node tools/workflow-gate.mjs 2>&1); then
   note "workflow-gate.mjs" "$out"
 else
   note "workflow-gate.mjs" "FAILED"; echo "$out" | tail -20; fails=$((fails+1))
 fi
 
-echo
-echo "=== native backend ==="
+section "native backend"
 if out=$(./tools/native-gate.sh 2>&1); then
   note "native-gate.sh" "$out"
 else
   note "native-gate.sh" "FAILED"; echo "$out" | tail -20; fails=$((fails+1))
 fi
 
-echo
-echo "=== TypeScript frontend ==="
+section "TypeScript frontend"
 if out=$(./tools/ts-gate.sh 2>&1); then
   note "ts-gate.sh" "$out"
 else
   note "ts-gate.sh" "FAILED"; echo "$out" | tail -20; fails=$((fails+1))
 fi
 
-echo
-echo "=== JSL runtime library ==="
+section "JSL runtime library"
 if out=$(./tools/jsl-gate.sh 2>&1); then
   note "jsl-gate.sh" "$(echo "$out" | tail -1)"
 else
   note "jsl-gate.sh" "FAILED"; echo "$out" | tail -20; fails=$((fails+1))
 fi
 
-echo
-echo "=== JSL native machine code ==="
+section "JSL native machine code"
 if out=$(./tools/jsl-native-gate.sh 2>&1); then
   note "jsl-native-gate.sh" "$(echo "$out" | tail -1)"
 else
   note "jsl-native-gate.sh" "FAILED"; echo "$out" | tail -20; fails=$((fails+1))
 fi
 
-echo
-echo "=== native source conformance ==="
+section "native source conformance"
 if out=$(./tools/native-source-conformance.sh 2>&1); then
   note "native-source-conformance.sh" "$(echo "$out" | tail -1)"
 else
@@ -205,7 +208,7 @@ if [ "$QUICK" = 0 ]; then
   fi
 fi
 
-echo
+section "done"
 if [ "$fails" -eq 0 ]; then
   echo "GATE GREEN — $total tests passed"
   exit 0
