@@ -60,6 +60,22 @@ a single `for (x=0; x<16; x+=2) checksum=(checksum+f(x))|0` loop at top level of
 VERR-STALE-TYPE (n-ty != n-compute on the counter Phi) while the nested two-loop form compiles —
 frontend type-fixpoint bug with its own tiny repro (ns-row0.js pre-nested-form).
 
+## NavierStokes ROOT CAUSE FOUND (2026-08-12 09:10): shape-dependent index miscompile in set_bnd
+
+The evaluator now runs project() correctly (proj.js: eval=-469=node, native=-2016 — BACKEND).
+Per-cell diff on the 2x2 repro (proj2.js): only set_bnd(2, v)'s EDGE writes are wrong — the loop
+RUNS (sentinel fires) but `x[i] = -x[i + rowSize]` reads OUT OF BOUNDS natively (undefined ->
+NaN -> 0 under |0). Adding ANY extra statement to the loop body (x[5]=12345 sentinel) makes the
+whole loop compute CORRECTLY — the miscompile is SHAPE-DEPENDENT. Diagnosis: the index
+`i + rowSize` (int-ish loop var + captured-cell rowSize through ToNumber) gets INCONSISTENT
+int-vs-fp representation decisions between be-node-fp-value?-style walks at selection — the
+exact hazard the walk's own doc comment describes and the latent dual-walk issue recorded below.
+Deterministic across seeds/register counts (not the allocator). REPRO: proj2.js (native -288 vs
+-260, 2s loop); per-cell probes show v[1],v[2],v[13],v[14] zero natively where Node has values,
+corners computed from the stale zeros. FIX DIRECTION: single-source representation decisions
+(the Phase 1b "unconditional ABI table" work in task #15) — selection must consult ONE
+authority for a node's machine representation, not re-derive it per consumer.
+
 ## proj.js graph analysis state (2026-08-12 07:30, continue here)
 
 In proj-dump.txt (scratchpad): project = fun n8 (u=n2421, v=n2422, p=n2423 Parms); lin_solve call
