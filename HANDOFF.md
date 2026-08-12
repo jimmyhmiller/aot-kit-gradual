@@ -45,6 +45,16 @@ There is still no valid benchmark/Node comparison table. Do not report performan
 benchmark until its native result passes the benchmark's correctness checks and the perf debt
 below is at least triaged.
 
+## Evaluator gap: script-global CLOSURE dispatch takes the initial value (repro fm2.js)
+
+`var uiCallback = function(){}; setCb(cb); ... uiCallback(f)` — NATIVE dispatches to the
+reassigned callback correctly (after 9b6b26c), but the EVALUATOR still invokes the INITIAL empty
+closure: fm2.js in the scratchpad shows eval=0 vs native=node=15, with AOT_EV_DEBUG showing the
+zeroing stores but none of addP's writes. This is why ns-small/ns-ui still read eval=0. Fix the
+evaluator's dispatch through a closure value loaded from the script-global shadow object (the
+loaded RObj is closure-marked; suspect the call goes through a path that consults values pinned
+at build time — start at ev-call's callee resolution for Cast-wrapped loads).
+
 ## Three-way differential tooling (built 2026-08-11/12) — USE THIS FIRST
 
 `node tools/js-native-run.mjs FILE.js [--debug] [--ts-native] [--eval] [--keep]` is now the

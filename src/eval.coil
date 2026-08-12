@@ -1919,6 +1919,12 @@
 ;; both representations together. Keeping that lockstep here prevents builtins such as StringSplit
 ;; from publishing a version that ArrayLoad cannot observe through the imperative array payload.
 (defn ev-array-publish-write! [(prev i64) (object i64) (index i64) (value RtVal)] (-> i64)
+  (if (ev-debug?)
+      (do (fmt (stderr) "EVDBG arrstore obj {d} [{d}] = " object index)
+          (rt-print (stderr) value)
+          (fmt (stderr) "\n")
+          0)
+      0)
   (ev-array-current-store! object index value)
   (hv-array-write! prev object index value))
 
@@ -1927,7 +1933,10 @@
   ;; call boundary. Array mutations performed by a callee can be absent from that Arg's narrowed
   ;; persistent view, so use the most recently executed version for this object in that case.
   (let [latest (al-get [i64] (load (field (ev) latest-array)) object)]
-    (if (and (= (n-op (n-in n 1)) OP-ARG) (>= latest 0)) latest version)))
+    (if (and (>= latest 0)
+             (ev-mem-chain-root-arg? (n-in n 1) JS-PROPERTY-ALIAS))
+        latest
+        version)))
 
 ;; An array index computed through float arithmetic arrives as an INTEGRAL FLOAT (natively
 ;; I32FROMFP converts it); accept exactly those and stay loud for everything else.
@@ -1962,7 +1971,14 @@
                               (RUndef)
                               (if (= (& (hv-mask ver) (<< 1 JS-PROPERTY-ALIAS)) 0)
                                   (ev-fail! EV-MEM n)
-                                  (ev-array-current-load object index)))))))))))))
+                                  (let [answer (ev-array-current-load object index)]
+                                    (if (ev-debug?)
+                                        (do (fmt (stderr) "EVDBG arrload n{d} obj {d} [{d}] -> " n object index)
+                                            (rt-print (stderr) answer)
+                                            (fmt (stderr) "\n")
+                                            0)
+                                        0)
+                                    answer)))))))))))))
 
 (defn ev-array-load [(n i64)] (-> RtVal)
   ;; An ArrayLoad ordered before a resize (notably Array.prototype.pop) denotes the old element.
@@ -2795,13 +2811,21 @@
                                     (store! slot (+ (load slot) 1))))))
                       0))
                 (store! i (+ (load i) 1)))))
-    ;; Dynamic object effects are control-pinned but may not contribute to the fixed-field Return
-    ;; memory tuple. Execute them on block entry so prototype construction and property publication
-    ;; remain observable through later synthetic memory Args.
-    (store! i
+    (ev-enter-effects! c)))
+
+;; Dynamic object effects are control-pinned but may not contribute to the fixed-field Return
+;; memory tuple. Execute them on block entry so prototype construction and property publication
+;; remain observable through later synthetic memory Args. This ALSO invalidates the per-node
+;; result caches of the block's effect chain — and that must happen for EVERY block kind:
+;; Region/Loop/CallEnd blocks skip ev-enter-ctrl! (their Phis are established elsewhere), and a
+;; load pinned under a merge — e.g. dens[x+1] behind x's ToNumber diamond — kept returning its
+;; FIRST invocation's value on every later call of the same function.
+(defn ev-enter-effects! [(c i64)] (-> i64)
+  (let [p (ev)
+        (mut i)
             (if (and (>= c 0) (< c (al-len [i64] (load (field p effect-head)))))
                 (al-get [i64] (load (field p effect-head)) c)
-                NO-NODE))
+                NO-NODE)]
     (loop (if (or (= (load i) NO-NODE) (ev-failed?))
               (break)
               (do
@@ -3579,7 +3603,7 @@
                                 ; CallEnd executes its call before operations pinned to the continuation.
                                 (if (or (= (n-op c) OP-CALLEND)
                                         (or (= (n-op c) OP-REGION) (= (n-op c) OP-LOOP)))
-                                    0
+                                    (ev-enter-effects! c)
                                     (ev-enter-ctrl! c))
                                 (case (n-op c) OP-RETURN
                                       (do
