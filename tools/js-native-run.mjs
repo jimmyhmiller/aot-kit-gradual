@@ -153,6 +153,7 @@ if (runEval) {
   if (evalStatus !== 0) {
     process.stderr.write(evaluated.stderr ?? "");
     console.log(`evaluator failed: evstatus=${evalStatus ?? "missing"} (exit ${evaluated.status})`);
+    evalValue = null;
   } else {
     console.log(`eval result=${evalValue}`);
   }

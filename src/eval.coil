@@ -32,6 +32,7 @@
 (import "coil.io" :use *)
 (import "coil.fmt" :use *)
 (import "coil.slice" :use *)
+(import "coil.os" :as os)
 (import "coil.primitive" :as primitive)
 (import "ty" :use *)
 (import "shape" :use *)
@@ -680,6 +681,11 @@
    ; native model, where a JS function VALUE is its env pointer under a function tag: the same
    ; word casts to fun#N at a call site and unboxes to obj@shape inside the callee.
    (closure-funs (ArrayList i64))
+   ; pairs [owner int, object id]: the shadow object backing property access on an INTEGER owner.
+   ; The native runtime's property side table is keyed by the raw owner WORD, and the frontend
+   ; deliberately uses a small-int script-owner id as the receiver for SCRIPT GLOBALS — natively
+   ; that is just a key, so here each distinct integer owner gets one shadow object.
+   (int-owner-objs (ArrayList i64))
    ; pairs [fun-token, object id]: the shadow object backing property access ON a function value
    ; (f.prototype and friends). Natively a function IS an object; the evaluator's RFun is not, so
    ; the first property touch allocates one identity per function and every later touch reuses it.
@@ -727,6 +733,7 @@
           (store! (field p array-kinds) (al-new [bool] (malloc-allocator)))
           (store! (field p closure-funs) (al-new [i64] (malloc-allocator)))
           (store! (field p fun-objs) (al-new [i64] (malloc-allocator)))
+          (store! (field p int-owner-objs) (al-new [i64] (malloc-allocator)))
           (store! (field p array-elements) (al-new [EvArrayElement] (malloc-allocator)))
           (store! (field p latest-fixed) (al-new [i64] (malloc-allocator)))
           (store! (field p latest-array) (al-new [i64] (malloc-allocator)))
@@ -766,6 +773,7 @@
     (al-clear! [bool] (field p array-kinds))
     (al-clear! [i64] (field p closure-funs))
     (al-clear! [i64] (field p fun-objs))
+    (al-clear! [i64] (field p int-owner-objs))
     (al-clear! [EvArrayElement] (field p array-elements))
     (al-clear! [i64] (field p latest-fixed))
     (al-clear! [i64] (field p latest-array))
@@ -1218,12 +1226,35 @@
           (al-push! [i64] (field p fun-objs) id)
           id))))
 
-;; A property receiver in JavaScript may be a function; RFun carries no fields, so route it to
-;; the function's shadow object. Everything else keeps rt-need-obj's loud failure.
+(defn ev-int-owner-object! [(key i64)] (-> i64)
+  (let [p (ev)
+        pairs (load (field p int-owner-objs))
+        (mut i) 0
+        (mut found) -1]
+    (loop (if (or (>= (load i) (al-len [i64] pairs)) (>= (load found) 0))
+              (break)
+              (do
+                (if (= (al-get [i64] pairs (load i)) key)
+                    (store! found (al-get [i64] pairs (+ (load i) 1)))
+                    0)
+                (store! i (+ (load i) 2)))))
+    (if (>= (load found) 0)
+        (load found)
+        (let [id (ev-obj-new! SHAPE-ROOT)]
+          (al-push! [i64] (field p int-owner-objs) key)
+          (al-push! [i64] (field p int-owner-objs) id)
+          id))))
+
+;; A property receiver in JavaScript may be a function (RFun carries no fields — route to the
+;; function's shadow object) or the frontend's integer script-owner key (route to that key's
+;; shadow object, mirroring the native side table). Everything else keeps rt-need-obj's loud
+;; failure.
 (defn rt-need-property-receiver [(v RtVal) (n i64)] (-> i64)
   (if (= (rt-tag v) RT-FUN)
       (ev-fun-object! (rt-payload v))
-      (rt-need-obj v n)))
+      (if (= (rt-tag v) RT-INT)
+          (ev-int-owner-object! (rt-payload v))
+          (rt-need-obj v n))))
 
 (defn ev-check-access [(n i64) (ver i64) (obj i64) (alias i64)] (-> bool)
   (if (= (& (hv-mask ver) (<< 1 alias)) 0)
@@ -1338,7 +1369,18 @@
                                        n (n-aux n) obj
                                        (n-in n 1) (op-name (n-op (n-in n 1))))
                                   (ev-fail! EV-MEM n))
-                              (let [ent (hv-ent e)] (hve-val ent))))))))))))
+                              (let [ent (hv-ent e)]
+                                (if (ev-debug?)
+                                    (do (fmt (stderr) "EVDBG load n{d} obj {d} alias {d} (mem n{d}:{s}, direct {d}) -> "
+                                             n obj (n-aux n) (n-in n 1) (op-name (n-op (n-in n 1))) direct)
+                                        (rt-print (stderr) (hve-val ent))
+                                        (fmt (stderr) "\n")
+                                        0)
+                                    0)
+                                (hve-val ent))))))))))))
+
+(defn ev-debug? [] (-> bool)
+  (!= (os/getenv c"AOT_EV_DEBUG") (cast (ptr i8) 0)))
 
 (defn ev-store [(n i64)] (-> RtVal)
   (let [mv (ev-data (n-in n 1))]
@@ -1356,7 +1398,14 @@
                           (RUndef)
                           (if (not (ev-check-access n ver obj (n-aux n)))
                               (RUndef)
-                              (RMem (hv-write! ver obj (n-aux n) xv))))))))))))
+                              (do
+                                (if (ev-debug?)
+                                    (do (fmt (stderr) "EVDBG store n{d} obj {d} alias {d} = " n obj (n-aux n))
+                                        (rt-print (stderr) xv)
+                                        (fmt (stderr) "\n")
+                                        0)
+                                    0)
+                                (RMem (hv-write! ver obj (n-aux n) xv)))))))))))))
 
 (defn ev-prop-load [(n i64)] (-> RtVal)
   (let [p (ev)]
@@ -1378,6 +1427,13 @@
                               ;; proves ordering and carries the alias mask; it is not a historical value
                               ;; snapshot. Effect caching below makes demanding that token idempotent.
                               (let [answer (dyn-decode (jso-load object (shape-name-bytes (n-aux n))))]
+                                (if (ev-debug?)
+                                    (do (fmt (stderr) "EVDBG propload n{d} obj {d} name {s} -> "
+                                             n object (shape-name-bytes (n-aux n)))
+                                        (rt-print (stderr) answer)
+                                        (fmt (stderr) "\n")
+                                        0)
+                                    0)
                                 (ev-trace-event! EVT-PROPLOAD
                                                  n
                                                  (ev-effect-control n)
@@ -1413,6 +1469,13 @@
                                                  object
                                                  (n-aux n)
                                                  xv)
+                                (if (ev-debug?)
+                                    (do (fmt (stderr) "EVDBG propstore n{d} obj {d} name {s} = "
+                                             n object (shape-name-bytes (n-aux n)))
+                                        (rt-print (stderr) xv)
+                                        (fmt (stderr) "\n")
+                                        0)
+                                    0)
                                 (jso-store! object (shape-name-bytes (n-aux n)) (dyn-encode xv))
                                 (al-set! [i64] (field (ev) objs) object (jso-shape object))
                                 ;; Named properties are deliberately imperative in the whole-program

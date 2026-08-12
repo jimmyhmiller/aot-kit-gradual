@@ -189,6 +189,9 @@ const generated = `(module generatedtypescriptbenchmark)
 ;; native (is the BACKEND right?). A budget exhaustion or trap is a loud nonzero evstatus.
 (defn run-eval! [] (-> i64)
   (ev-reset!)
+  (if (= (os/getenv c"AOT_EV_TRACE") (cast (ptr i8) 0))
+      0
+      (do (ev-trace-enable! 100000) 0))
   (ev-bind-args! 0)
   (let [status (ev-run-nobind 2000000000)]
     (fmt (stdout) "evstatus={d} steps={d} at={d}:{s}\n"
@@ -203,6 +206,9 @@ const generated = `(module generatedtypescriptbenchmark)
                 (fmt (stdout) "result={d}\n" (cast i64 value))
                 (fmt (stdout) "result-float={f}\n" value)))
           (fmt (stdout) "result={d}\n" (rt-payload result))))
+    (if (= (os/getenv c"AOT_EV_TRACE") (cast (ptr i8) 0))
+        0
+        (do (ev-trace-print-jsonl (stderr)) 0))
     (if (= status EV-OK) 0 3)))
 
 ${resident ? residentHelper : ""}

@@ -59,7 +59,17 @@ primary iteration loop (~2s with the cached -O0 emitter after `--debug`'s first 
 - `--keep` keeps program.o for objdump; `AOT_DUMP_GRAPH=1` dumps the graph from the resident
   emitter; schedule-seed -999 dumps mu/ms.
 
-## OPEN: numeric-join boxing picks a WRONG STATIC TAG (the isolated backend bug, 2026-08-12)
+## FIXED 2026-08-12 (f8da6b2): the untyped-JS accumulator corruption — object-parameters exact
+
+The corruption chain described below was closed: the direct-call ToNumber exemption now checks
+what the callee RETURNS (fng-machine-number-value? / fng-call-returns-machine-number?, with
+unbuilt-callee fallback to the structural exemption), and the kernel materializes FP results
+into x0 (raw IEEE bits) for JS-frontend graphs. JS-mode object-parameters computes 1507052134
+natively. STILL LATENT (no current repro): be-js-tag-for-value's numeric-join arm and selection
+run SEPARATE representation walks and can in principle disagree; `total < 1e18` on a tagged dyn
+compares false natively (OP-LT has no dyn-boundary routing while OP-EQ does).
+
+## Historical diagnosis (kept for the latent parts)
 
 Exact repro (scratchpad acc6.js / drop4.js; object-parameters JS-mode reduces to it): an untyped
 accumulator `total = total + call() * k` over enough terms computes the right float in d-regs and
