@@ -653,6 +653,11 @@
             (fng-bin OP-EQ
                      (if left-dynamic left (n-box! left))
                      (if right-dynamic right (n-box! right)))
+          ;; The dynamic side is a TAGGED word of unknown numeric representation — an INT-tagged
+          ;; global compared against a numeric peer was the NavierStokes checksum bug: a raw flt
+          ;; unbox of 0x7ffc-tagged 0 never equals 0. fng-to-number-operand already RETURNS a raw
+          ;; flt (its own unbox of the guarded ToNumberValue), so no second unbox here — the
+          ;; earlier attempt double-unboxed and died in MLIVE-CLASS.
           (and left-dynamic (fng-numeric-equality-peer? right))
             (fng-bin OP-EQ (n-unbox! left (t-flt)) right)
           (and right-dynamic (fng-numeric-equality-peer? left))
@@ -3467,12 +3472,31 @@
   (let [ast (field frontend ast)
         symbol-id (fe-resolution-symbol frontend node)
         (mut index) 0
-        (mut answer) -1]
+        (mut answer) -1
+        (mut closure-mutated) false]
+    ;; A local whose declaration initializer is a function expression is NOT a stable call
+    ;; target when a closure REASSIGNS it: NavierStokes seeds `var uiCallback = function(){}`
+    ;; and setUICallback overwrites it, so pinning the call to the initial closure silently
+    ;; ran the empty function forever (prepareFrame never fired, density stayed zero).
+    ;; Same-function reassignment is already handled by the values[] tracking.
+    (loop (if (or (>= (load index) (al-len [FeCapture] (load (field frontend captures))))
+                  (load closure-mutated))
+              (break)
+              (let [capture (al-get [FeCapture] (load (field frontend captures)) (load index))]
+                (if (and (= (load (field capture symbol)) symbol-id)
+                         (load (field capture mutable)))
+                    (store! closure-mutated true)
+                    0)
+                (store! index (+ (load index) 1)))))
+    (if (load closure-mutated)
+        (do (store! answer -2) 0)
+        0)
+    (store! index 0)
     (loop (if (or (>= (load index) (al-len [FeSymbol] (load (field frontend symbols))))
                   (>= (load answer) 0))
               (break)
               (let [symbol (al-get [FeSymbol] (load (field frontend symbols)) (load index))]
-                (if (= (load (field symbol id)) symbol-id)
+                (if (and (not (load closure-mutated)) (= (load (field symbol id)) symbol-id))
                     (let [declaration (load (field symbol node))
                           count (ts-child-count ast declaration)
                           initializer (if (> count 1) (ts-child ast declaration (- count 1)) -1)]
@@ -3488,7 +3512,7 @@
                           0))
                     0)
                 (store! index (+ (load index) 1)))))
-    (load answer)))
+    (if (load closure-mutated) -1 (load answer))))
 
 ;; Graph-level polymorphic dispatch for a method-call target set the finite 63-bit summary
 ;; cannot represent. The loaded callee is compared against each candidate's exact callable
