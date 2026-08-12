@@ -100,6 +100,12 @@
 (const VERR-CALL-RECEIVER i64 26)
 (const VERR-CALL-RECEIVER-TAG i64 27)
 
+;; A value edge whose producer and consumer disagree about machine REPRESENTATION — a tagged
+;; NaN-boxed word where a raw pointer belongs, a raw pointer in a tagged slot, float bits fed
+;; to an integer op. Nearly every hard bug in the NavierStokes campaign was an instance; the
+;; classification is structural and only certain disagreements fail (see v-rep-of).
+(const VERR-REPRESENTATION i64 28)
+
 (defn verr-name [(c i64)] (-> (slice u8))
   (case c VERR-NONE
         "VERR-NONE" VERR-IN-PROGRESS
@@ -129,7 +135,8 @@
         "VERR-CLOSURE-LAYOUT" VERR-CALL-TARGETS
         "VERR-CALL-TARGETS" VERR-CALL-RECEIVER
         "VERR-CALL-RECEIVER" VERR-CALL-RECEIVER-TAG
-        "VERR-CALL-RECEIVER-TAG" "VERR-?"))
+        "VERR-CALL-RECEIVER-TAG" VERR-REPRESENTATION
+        "VERR-REPRESENTATION" "VERR-?"))
 
 ; ============================================================================
 ; The last run's result
@@ -1081,23 +1088,49 @@
                 REP-RAW-NUM
               :else REP-UNKNOWN))))
 
-(defn v-rep-violation! [(w (ptr Writer))
-                        (consumer i64)
-                        (slot i64)
-                        (required i64)
-                        (count (mut i64))] (-> i64)
-  (let [input (n-in consumer slot)
-        actual (if (= input NO-NODE) REP-UNKNOWN (v-rep-of input 8))]
-    (if (and (!= required REP-UNKNOWN)
-             (and (!= actual REP-UNKNOWN) (!= actual required)))
-        (do
-          (fmt w "REP n{d}:{s} slot {d} <- n{d}:{s} is {s}, needs {s}\n"
-               consumer (op-name (n-op consumer)) slot
-               input (op-name (n-op input))
-               (v-rep-name actual) (v-rep-name required))
-          (store! count (+ (load count) 1))
-          0)
-        0)))
+;; What representation this consumer requires at this input slot, REP-UNKNOWN for slots the
+;; contract has not been pinned down for. One table serves the verbose report and the hard
+;; verify pass so they can never disagree.
+(defn v-rep-slot-required [(n i64) (slot i64)] (-> i64)
+  (let [op (n-op n)]
+    (cond (and (= slot 1)
+               (or (= op OP-UNBOX)
+                   (or (= op OP-TYPETEST)
+                       (or (= op OP-ARRAYTEST) (= op OP-ARRAYUNBOX)))))
+            REP-TAGGED
+          (and (= op OP-STORE) (= slot 2)) REP-RAW-PTR
+          (and (= op OP-STORE) (= slot 3)) (v-rep-of-alias (n-aux n))
+          (and (= op OP-LOAD) (= slot 2)) REP-RAW-PTR
+          (and (= op OP-ARRAYSTORE) (= slot 3)) REP-RAW-NUM
+          (and (= op OP-ARRAYSTORE) (= slot 4)) REP-TAGGED
+          (and (= op OP-ARRAYLOAD) (= slot 3)) REP-RAW-NUM
+          (and (= op OP-ARRAYRESIZE) (= slot 3)) REP-RAW-NUM
+          (and (= op OP-PROPSTORE) (= slot 3)) REP-TAGGED
+          (and (= op OP-PROPSTOREKEY) (= slot 4)) REP-TAGGED
+          (and (= op OP-CALL)
+               (and (= slot 2)
+                    (or (= (n-aux n) CALL-ABI-RECEIVER)
+                        (= (n-aux n) CALL-ABI-DYNAMIC-RECEIVER))))
+            REP-TAGGED
+          :else REP-UNKNOWN)))
+
+;; The first slot of `n` whose input's representation certainly disagrees with the slot's
+;; requirement, or -1.
+(defn v-rep-first-violation [(n i64)] (-> i64)
+  (let [(mut slot) 1 (mut found) -1]
+    (loop (if (or (>= (load slot) (n-nins n)) (>= (load found) 0))
+              (break)
+              (do
+                (let [required (v-rep-slot-required n (load slot))
+                      input (n-in n (load slot))
+                      actual (if (= input NO-NODE) REP-UNKNOWN (v-rep-of input 8))]
+                  (if (and (!= required REP-UNKNOWN)
+                           (and (!= actual REP-UNKNOWN) (!= actual required)))
+                      (store! found (load slot))
+                      0))
+                (store! slot (+ (load slot) 1))
+                0)))
+    (load found)))
 
 ;; Warn-mode sweep: report every certain producer/consumer representation disagreement. This is
 ;; NOT yet part of g-verify — it runs from the resident emitter so the whole conformance corpus
@@ -1111,38 +1144,44 @@
               (do
                 (if (n-dead? (load i))
                     0
-                    (let [n (load i)
-                          op (n-op n)]
-                      (cond (or (= op OP-UNBOX)
-                                (or (= op OP-TYPETEST)
-                                    (or (= op OP-ARRAYTEST) (= op OP-ARRAYUNBOX))))
-                              (do (v-rep-violation! w n 1 REP-TAGGED (mut count)) 0)
-                            (= op OP-STORE)
-                              (do (v-rep-violation! w n 2 REP-RAW-PTR (mut count))
-                                  (v-rep-violation! w n 3 (v-rep-of-alias (n-aux n)) (mut count))
-                                  0)
-                            (= op OP-LOAD)
-                              (do (v-rep-violation! w n 2 REP-RAW-PTR (mut count)) 0)
-                            (= op OP-ARRAYSTORE)
-                              (do (v-rep-violation! w n 3 REP-RAW-NUM (mut count))
-                                  (v-rep-violation! w n 4 REP-TAGGED (mut count))
-                                  0)
-                            (= op OP-ARRAYLOAD)
-                              (do (v-rep-violation! w n 3 REP-RAW-NUM (mut count)) 0)
-                            (= op OP-ARRAYRESIZE)
-                              (do (v-rep-violation! w n 3 REP-RAW-NUM (mut count)) 0)
-                            (= op OP-PROPSTORE)
-                              (do (v-rep-violation! w n 3 REP-TAGGED (mut count)) 0)
-                            (= op OP-PROPSTOREKEY)
-                              (do (v-rep-violation! w n 4 REP-TAGGED (mut count)) 0)
-                            (and (= op OP-CALL)
-                                 (or (= (n-aux n) CALL-ABI-RECEIVER)
-                                     (= (n-aux n) CALL-ABI-DYNAMIC-RECEIVER)))
-                              (do (v-rep-violation! w n 2 REP-TAGGED (mut count)) 0)
-                            :else 0)))
+                    (let [slot (v-rep-first-violation (load i))]
+                      (if (>= slot 0)
+                          (let [input (n-in (load i) slot)]
+                            (fmt w "REP n{d}:{s} slot {d} <- n{d}:{s} is {s}, needs {s}\n"
+                                 (load i) (op-name (n-op (load i))) slot
+                                 input (op-name (n-op input))
+                                 (v-rep-name (v-rep-of input 8))
+                                 (v-rep-name (v-rep-slot-required (load i) slot)))
+                            (store! count (+ (load count) 1))
+                            0)
+                          0)))
                 (store! i (+ (load i) 1))
                 0)))
     (load count)))
+
+(defn v-pass-representation [] (-> i64)
+  (let [lim (n-count)
+        (mut i) 0]
+    (loop (if (>= (load i) lim)
+              (break)
+              (do
+                (if (n-dead? (load i))
+                    0
+                    (let [slot (v-rep-first-violation (load i))]
+                      (if (>= slot 0)
+                          (let [input (n-in (load i) slot)
+                            w (stderr)]
+                            (fmt w "REP n{d}:{s} slot {d} <- n{d}:{s} is {s}, needs {s}\n"
+                                 (load i) (op-name (n-op (load i))) slot
+                                 input (op-name (n-op input))
+                                 (v-rep-name (v-rep-of input 8))
+                                 (v-rep-name (v-rep-slot-required (load i) slot)))
+                            (v-fail! VERR-REPRESENTATION (load i))
+                            0)
+                          0)))
+                (store! i (+ (load i) 1))
+                0)))
+    0))
 
 ;; Returns the number of violations; `g-verify-code` then names the first check that fired.
 ;;
@@ -1167,6 +1206,11 @@
             (do
               (v-pass-closure-contracts)
               (if (> (g-verify-count) 0) 0 (v-pass-types))
+              ; after types so a precise code (VERR-PTR-SLOT etc.) wins the report when both
+              ; catch the same edge; JS-frontend graphs only (see g-rep-strict-cell)
+              (if (or (> (g-verify-count) 0) (= (g-rep-strict?) 0))
+                  0
+                  (v-pass-representation))
               (if (> (g-verify-count) 0) 0 (v-pass-gc))
               0))
         0))

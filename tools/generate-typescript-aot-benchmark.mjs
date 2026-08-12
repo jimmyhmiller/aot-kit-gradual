@@ -186,11 +186,14 @@ ${resident ? residentHelper : ""}
   (let [${resident ? `schedule-seed (if (> argc 2) (cast i64 (atoi (load (index argv 2)))) 0)
         register-count (if (> argc 3) (cast i64 (atoi (load (index argv 3)))) 10)
         source (resident-source argc argv)
-        filename (if (< argc 2) "" (cstr->str (load (index argv 1))))` : `schedule-seed (if (> argc 1) (cast i64 (atoi (load (index argv 1)))) ${seed})
+        filename (if (< argc 2) "" (cstr->str (load (index argv 1))))
+        script-kind (if (and (> argc 4) (str-eq (cstr->str (load (index argv 4))) "ts"))
+                        TS-SCRIPT-TS
+                        TS-SCRIPT-JS)` : `schedule-seed (if (> argc 1) (cast i64 (atoi (load (index argv 1)))) ${seed})
         register-count (if (> argc 2) (cast i64 (atoi (load (index argv 2)))) ${registers})
         source ${JSON.stringify(source)}
         filename ${JSON.stringify(input)}`}
-        (mut frontend) (fe-native-new-file source filename ${scriptKind})]
+        (mut frontend) (fe-native-new-file source filename ${resident ? "script-kind" : scriptKind})]
     (fmt (stderr) "phase=frontend-index-begin\\n")
     (if (!= (fe-native-index! (mut frontend)) FE-OK)
         (do

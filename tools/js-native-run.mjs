@@ -20,11 +20,20 @@ import process from "node:process";
 import { execFileSync, spawnSync } from "node:child_process";
 
 const root = path.resolve(path.dirname(new URL(import.meta.url).pathname), "..");
-const args = process.argv.slice(2).filter(argument => argument !== "--keep");
-const keep = process.argv.includes("--keep");
+const flags = new Set(process.argv.slice(2).filter(argument => argument.startsWith("--")));
+const args = process.argv.slice(2).filter(argument => !argument.startsWith("--"));
+const keep = flags.has("--keep");
+// --debug: use a separately cached -O0 emitter. The compiler self-build drops from minutes to
+// tens of seconds, which is the whole loop when the change under test is in the COMPILER; the
+// emitter runs slower, which costs nothing at conformance-program scale.
+const debug = flags.has("--debug");
+// --ts-native: hand the TypeScript file to the native TS parser instead of transpiling first.
+// The two modes compile DIFFERENT programs (annotations drive shapes), and divergences between
+// them are themselves bugs worth surfacing.
+const tsNative = flags.has("--ts-native");
 const [inputArgument, heapText] = args;
 if (!inputArgument) {
-  console.error("usage: js-native-run.mjs FILE.js|FILE.ts [HEAP_BYTES] [--keep]");
+  console.error("usage: js-native-run.mjs FILE.js|FILE.ts [HEAP_BYTES] [--keep] [--debug] [--ts-native]");
   process.exit(2);
 }
 const input = path.resolve(inputArgument);
@@ -32,8 +41,8 @@ const heapBytes = heapText ? Number.parseInt(heapText, 10) : 268435456;
 
 const cacheDirectory = path.join(root, ".coil", "build", "js-resident");
 fs.mkdirSync(cacheDirectory, { recursive: true });
-const emitter = path.join(cacheDirectory, "emitter");
-const stampPath = path.join(cacheDirectory, "emitter.stamp");
+const emitter = path.join(cacheDirectory, debug ? "emitter-O0" : "emitter");
+const stampPath = path.join(cacheDirectory, debug ? "emitter-O0.stamp" : "emitter.stamp");
 
 // The emitter embeds the whole compiler, so it is stale whenever any compiler input is.
 const stampInputs = [];
@@ -62,13 +71,14 @@ if (!fs.existsSync(emitter) || !fs.existsSync(stampPath) ||
   const harness = path.join(cacheDirectory, "resident.coil");
   execFileSync("node", [path.join(root, "tools", "generate-typescript-aot-benchmark.mjs"),
                         "--resident", harness], { cwd: root, stdio: "inherit" });
-  execFileSync("coil", ["build", harness, "-o", emitter], { cwd: root, stdio: "inherit" });
+  execFileSync("coil", ["build", ...(debug ? ["-O0"] : []), harness, "-o", emitter],
+               { cwd: root, stdio: "inherit" });
   fs.writeFileSync(stampPath, stamp);
 }
 
 // TypeScript arrives as plain JavaScript at the emitter; transpile like the conformance runner.
 let sourcePath = input;
-if (input.endsWith(".ts")) {
+if (input.endsWith(".ts") && !tsNative) {
   const ts = (await import("typescript")).default;
   const transpiled = ts.transpileModule(fs.readFileSync(input, "utf8"), {
     compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 },
@@ -84,7 +94,9 @@ const work = keep
 const object = path.join(work, "program.o");
 const binary = path.join(work, "program");
 
-const emitted = spawnSync(emitter, [sourcePath, "0", "10"], { maxBuffer: 256 * 1024 * 1024 });
+const kindArguments = tsNative && input.endsWith(".ts") ? ["ts"] : [];
+const emitted = spawnSync(emitter, [sourcePath, "0", "10", ...kindArguments],
+                          { maxBuffer: 256 * 1024 * 1024 });
 if (emitted.status !== 0) {
   process.stderr.write(emitted.stderr ?? "");
   console.error(`emitter failed with status ${emitted.status}`);
@@ -110,7 +122,14 @@ if (nativeValue !== null && (BigInt.asUintN(64, nativeValue) >> 48n) === 0x7ffcn
 
 let nodeValue = null;
 try {
-  const script = `${fs.readFileSync(sourcePath, "utf8")}\nconsole.log(String(main()));`;
+  let nodeSource = fs.readFileSync(sourcePath, "utf8");
+  if (sourcePath.endsWith(".ts")) {
+    const ts = (await import("typescript")).default;
+    nodeSource = ts.transpileModule(nodeSource, {
+      compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 },
+    }).outputText.replace(/^export /gm, "");
+  }
+  const script = `${nodeSource}\nconsole.log(String(main()));`;
   const nodeRun = spawnSync("node", ["--input-type=module", "-e", script], { encoding: "utf8" });
   const lines = nodeRun.stdout.trim().split("\n");
   nodeValue = BigInt(lines[lines.length - 1]);
