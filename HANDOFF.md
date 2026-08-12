@@ -60,7 +60,17 @@ a single `for (x=0; x<16; x+=2) checksum=(checksum+f(x))|0` loop at top level of
 VERR-STALE-TYPE (n-ty != n-compute on the counter Phi) while the nested two-loop form compiles —
 frontend type-fixpoint bug with its own tiny repro (ns-row0.js pre-nested-form).
 
-## Evaluator gap: script-global CLOSURE dispatch takes the initial value (repro fm2.js)
+## RESOLVED (5387293): the fm2 evaluator gap was NOT dispatch — two evaluator defects
+
+fm2/fma/ns-ui now three-way MATCH. The real causes: {f}-formatted float keys ("2.000000" vs
+JavaScript's "2") sent float-indexed element stores to non-index properties, and OP-PROPLOADKEY
+was missing from the per-control effect chain so a getter's element-read cache was never
+invalidated across calls (every getDensity call returned call #1's answer). Remaining on
+ns-small: DIFFUSION phase diverges everywhere — node 68, native 100, evaluator 35 (eval matches
+node pre-diffusion at 35, so eval's dens_step/advect does nothing or fails silently; native's
+does the wrong thing). Old text follows for context.
+
+## STALE — Evaluator gap: script-global CLOSURE dispatch takes the initial value (repro fm2.js)
 
 `var uiCallback = function(){}; setCb(cb); ... uiCallback(f)` — NATIVE dispatches to the
 reassigned callback correctly (after 9b6b26c), but the EVALUATOR still invokes the INITIAL empty
