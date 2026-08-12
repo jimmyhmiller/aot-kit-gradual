@@ -2962,24 +2962,29 @@
 
 (defn ev-closure [(n i64)] (-> RtVal)
   (let [p (ev)]
+    (if (> (n-nins n) (+ 1 (n-aux n)))
+        ; materialized form [fun, env object, capture cells...]: the closure VALUE is the env
+        ; object itself, marked callable. Captures live in env fields the frontend stored, so
+        ; the generic call path binds parm 0 = env, parm 1 = receiver with no capture magic.
+        ;
+        ; NEVER cached per node: the env object's identity is re-established at every arrival of
+        ; its allocation's control block (ev-enter-ctrl!), and OP-CLOSURE is not on the per-control
+        ; effect chain, so a cached value survives across calls. The SECOND `new Field(...)` then
+        ; handed out the FIRST call's getDensity env — its captured `dens` was the other instance's
+        ; array (ns-small read dens_prev through lastField: 350 vs Node's 35). ev-proj is uncached
+        ; for exactly the same reason; deriving from the current New each demand is cheap.
+        (let [fv (ev-data (n-in n 0))]
+          (if (or (ev-failed?) (!= (rt-tag fv) RT-FUN))
+              (ev-fail! EV-CALL n)
+              (let [ov (ev-data (n-in n 1))]
+                (if (or (ev-failed?) (!= (rt-tag ov) RT-OBJ))
+                    (ev-fail! EV-CALL n)
+                    (do
+                      (al-set! [i64] (field p closure-funs) (rt-payload ov)
+                               (ev-fun-node (rt-payload fv)))
+                      ov)))))
     (if (al-get (load (field p hasenv)) n)
         (al-get (load (field p env)) n)
-        (if (> (n-nins n) (+ 1 (n-aux n)))
-            ; materialized form [fun, env object, capture cells...]: the closure VALUE is the env
-            ; object itself, marked callable. Captures live in env fields the frontend stored, so
-            ; the generic call path binds parm 0 = env, parm 1 = receiver with no capture magic.
-            (let [fv (ev-data (n-in n 0))]
-              (if (or (ev-failed?) (!= (rt-tag fv) RT-FUN))
-                  (ev-fail! EV-CALL n)
-                  (let [ov (ev-data (n-in n 1))]
-                    (if (or (ev-failed?) (!= (rt-tag ov) RT-OBJ))
-                        (ev-fail! EV-CALL n)
-                        (do
-                          (al-set! [i64] (field p closure-funs) (rt-payload ov)
-                                   (ev-fun-node (rt-payload fv)))
-                          (al-set! [bool] (field p hasenv) n true)
-                          (al-set! [RtVal] (field p env) n ov)
-                          ov)))))
         (let [fv (ev-data (n-in n 0))]
           (if (or (ev-failed?) (!= (rt-tag fv) RT-FUN))
               (ev-fail! EV-CALL n)

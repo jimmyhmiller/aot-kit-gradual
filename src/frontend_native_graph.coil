@@ -303,6 +303,87 @@
             (or (= op OP-ARRAYLOAD)
                 (and (= op OP-LOAD) (= (shape-alias-ty (n-aux value)) (t-dyn))))))))
 
+;; Mark array, walk stack, and generation stamp for `fng-boxed-dynamic-value?`, following the
+;; backend's fp-walk discipline exactly (backend_core's fp-mark/fp-stack): one shared buffer,
+;; generation-stamped marks, and a busy flag so an accidental reentrant walk aborts instead of
+;; answering from a truncated stack.
+(defstruct FngBoxedWalk
+  [(mark (ArrayList i64))
+   (stack (ArrayList i64))
+   (gen i64)
+   (busy bool)
+   (inited bool)])
+
+(defn fng-boxed-walk-unit [] (-> (ptr FngBoxedWalk))
+  (let [p (static FngBoxedWalk)]
+    (if (load (field p inited))
+        0
+        (do
+          (store! (field p inited) true)
+          (store! (field p mark) (al-new [i64] (malloc-allocator)))
+          (store! (field p stack) (al-new [i64] (malloc-allocator)))
+          (store! (field p gen) 0)
+          (store! (field p busy) false)
+          0))
+    p))
+
+;; Is this value CERTAINLY a tagged word by construction — a tagged-ABI producer
+;; (`fng-tagged-dynamic-value?`), a Box, a runtime ToNumber, or a Phi reached through Casts and
+;; other Phis from such a producer on any arm? Seed types lag construction, so `n-ty == dyn` is
+;; not enough: a JSL macro like StringCodePointAt inlines to nested diamonds whose arms are all
+;; `%Box`, and the join's seed type is still unanalysed while the consuming expression is being
+;; lowered — `codePointAt(0) * 2` selected a raw multiply over the tagged word (correct only by
+;; the low-32-bit accident, wrong the moment the payload is float-represented; repros/negload.js
+;; is the observed form of that failure). The walk is marked, not fuel-bounded: a wrong answer in
+;; EITHER direction miscompiles (a missed guard feeds tag bits to arithmetic; a spurious guard
+;; feeds raw bits to the tag test), so depth may not decide it. A Phi is boxed if ANY arm is —
+;; the frontend never deliberately builds a mixed-representation Phi (see lib/string/char.jsl's
+;; StringAt note), and the representation verifier now rejects graphs where one leaks through.
+(defn fng-boxed-dynamic-value? [(value i64)] (-> bool)
+  (let [u (fng-boxed-walk-unit)]
+    (if (load (field u busy))
+        (do (panic-corrupt "fng-boxed-dynamic-value?: reentrant walk; the mark and stack are shared") 0)
+        0)
+    (store! (field u busy) true)
+    (loop (if (>= (al-len [i64] (load (field u mark))) (n-count))
+              (break)
+              (do (al-push! [i64] (field u mark) 0) 0)))
+    (store! (field u gen) (+ (load (field u gen)) 1))
+    (let [gen (load (field u gen))
+          (mut found) false]
+      (al-clear! [i64] (field u stack))
+      (al-push! [i64] (field u stack) value)
+      (loop (let [depth (al-len [i64] (load (field u stack)))]
+              (if (or (load found) (= depth 0))
+                  (break)
+                  (let [m (al-get (load (field u stack)) (- depth 1))]
+                    (al-pop! [i64] (field u stack))
+                    (if (or (< m 0) (= (al-get (load (field u mark)) m) gen))
+                        0
+                        (do
+                          (al-set! [i64] (field u mark) m gen)
+                          (if (fng-tagged-dynamic-value? m)
+                              (store! found true)
+                              (let [op (n-op m)]
+                                (cond (= op OP-BOX) (store! found true)
+                                      (= op OP-TONUMBER) (store! found true)
+                                      (= op OP-CAST)
+                                        (do (al-push! [i64] (field u stack) (n-in m 1)) 0)
+                                      (= op OP-PHI)
+                                        (let [(mut input) 1]
+                                          (loop (if (>= (load input) (n-nins m))
+                                                    (break)
+                                                    (do
+                                                      (al-push! [i64] (field u stack)
+                                                                (n-in m (load input)))
+                                                      (store! input (+ (load input) 1))
+                                                      0)))
+                                          0)
+                                      :else 0)))
+                          0))))))
+      (store! (field u busy) false)
+      (load found))))
+
 ;; A dynamic argument can be consumed while a loop Phi is still open. At that point its backedge
 ;; is unknown, so `fng-box-dynamic-argument!` must leave a Box(Phi) placeholder. Once all function
 ;; bodies have closed their loops, distribute those placeholders across the incoming CFG edges.
@@ -499,7 +580,9 @@
 (defn fng-machine-number-value? [(v i64) (fuel i64)] (-> bool)
   (if (or (= v NO-NODE) (<= fuel 0))
       false
-      (if (fng-tagged-dynamic-value? v)
+      ;; The boxed walk, not just the shallow producer test: `ty-isa ANY num` below is true for
+      ;; an unanalysed Phi, so a Phi joining Box arms would otherwise read as a machine number.
+      (if (fng-boxed-dynamic-value? v)
           false
           (if (ty-isa (n-ty v) (t-num))
               true
@@ -561,14 +644,57 @@
 (defn fng-call-returns-machine-number? [(value i64)] (-> bool)
   (fng-call-returns-machine-number-fuel? value 8))
 
+;; A loop-carried local may be assigned values of BOTH machine representations: NavierStokes'
+;; `lastX` in lin_solve enters the loop as a tagged ArrayLoad and comes back around as a raw
+;; Mul result. A Phi whose arms disagree has no single register class — selection classified it
+;; from whichever arm its walk reached first and every consumer re-derived its own answer
+;; (MLIVE-CLASS on repros/proj2.js once the guarded ToNumber consumed the tagged arm honestly).
+;; Tagged is the representation that can hold every arm, so when any arm is certainly tagged,
+;; box the arms that are certainly raw machine numbers; consumers already route tagged values
+;; through the guarded ToNumber. Arms that are OTHER PHIS are never boxed, even when their own
+;; arms are all machine numbers: a phi arm can later be SUBSUMED into the phi being reconciled
+;; (nested-loop phi chains with no outside consumer collapse that way), which rewrites the Box's
+;; input to the consumer itself and strands a Box(self) cycle nothing reaches (VERR-LEAK on
+;; proj2). Arms that are neither certainly tagged nor certainly raw are also left alone —
+;; boxing a value that MIGHT already be tagged would double-box it.
+(defn fng-reconcile-phi-arms! [(phi i64)] (-> i64)
+  (let [(mut any-tagged) false
+        (mut input) 1]
+    (loop (if (or (>= (load input) (n-nins phi)) (load any-tagged))
+              (break)
+              (do
+                (let [arm (n-in phi (load input))]
+                  (if (and (and (!= arm NO-NODE) (!= arm phi))
+                           (fng-boxed-dynamic-value? arm))
+                      (store! any-tagged true)
+                      0))
+                (store! input (+ (load input) 1)))))
+    (if (load any-tagged)
+        (let [(mut at) 1]
+          (loop (if (>= (load at) (n-nins phi))
+                    (break)
+                    (do
+                      (let [arm (n-in phi (load at))]
+                        (if (and (and (!= arm NO-NODE) (!= arm phi))
+                                 (and (!= (n-op arm) OP-PHI)
+                                      (and (not (fng-boxed-dynamic-value? arm))
+                                           (fng-machine-number-value? arm 8))))
+                            (do (n-set-def! phi (load at) (n-box! arm)) 0)
+                            0))
+                      (store! at (+ (load at) 1)))))
+          0)
+        0)
+    0))
+
 (defn fng-needs-to-number? [(value i64) (captured-cell bool)] (-> bool)
   ;; STRUCTURAL, not just the seed type: a fresh Load's type is not computed until inference
   ;; runs, so `n-ty == dyn` misses a tagged field load written moments earlier — Mul then took
   ;; NaN-boxed bits as a double (nested inner.x through a dyn-content field was the witness:
-  ;; tagged 3 read as NaN, NaN*5|0 == 0).
+  ;; tagged 3 read as NaN, NaN*5|0 == 0). The boxed walk extends the same structural test
+  ;; through Phi joins of Box arms (inlined JSL macros like StringCodePointAt).
   (or captured-cell
       (or (= (n-ty value) (t-dyn))
-          (fng-tagged-dynamic-value? value))))
+          (fng-boxed-dynamic-value? value))))
 
 (defn fng-int-value [(context FngContext) (source i64) (value i64)] (-> i64)
   (let [frontend (load (field context frontend))
@@ -4722,8 +4848,17 @@
                                          (fng-jsl-call1 context "StringLength" value)
                                          value)
                                      (fng-const 0))
-                          (str-eq operator "-") (fng-bin OP-SUB (fng-const 0) value)
-                          (str-eq operator "~") (n-new2 OP-BITNOT 0 NO-NODE value)
+                          ;; The operand must go through the same guarded ToNumber as binary
+                          ;; arithmetic: a raw OP-SUB on a tagged dynamic value negates the NaN-box
+                          ;; BITS (x[1] = -x[5] zeroed the cell when the element was float-boxed —
+                          ;; low32 of a negated double is 0). fng-number-value exempts values that
+                          ;; are already machine numbers, so `-(a*b)` stays direct.
+                          (str-eq operator "-")
+                            (fng-bin OP-SUB (fng-const 0)
+                                     (fng-number-value context source value))
+                          (str-eq operator "~")
+                            (n-new2 OP-BITNOT 0 NO-NODE
+                                    (fng-int-value context source value))
                           :else NO-NODE))))
           (= kind TSK-POSTFIX-UNARY) (fng-update-local context node false)
           (= kind TSK-VOID-EXPRESSION)
@@ -6113,6 +6248,7 @@
                     (let [symbol (al-get [i64] (load carried) (load index))
                           phi (al-get [i64] (load phis) (load index))]
                       (n-set-def! phi 2 (fng-symbol-node context symbol))
+                      (fng-reconcile-phi-arms! phi)
                       (store! index (+ (load index) 1)))))
           (store! index 0)
           (loop (if (>= (load index) (al-len [i64] (load active)))
@@ -6216,6 +6352,7 @@
                     (let [symbol (al-get [i64] (load carried) (load index))
                           phi (al-get [i64] (load phis) (load index))]
                       (n-set-def! phi 2 (fng-symbol-node context symbol))
+                      (fng-reconcile-phi-arms! phi)
                       (store! index (+ (load index) 1)))))
           (store! index 0)
           (loop (if (>= (load index) (al-len [i64] (load active)))
