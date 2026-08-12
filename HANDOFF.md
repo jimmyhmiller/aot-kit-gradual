@@ -60,6 +60,20 @@ a single `for (x=0; x<16; x+=2) checksum=(checksum+f(x))|0` loop at top level of
 VERR-STALE-TYPE (n-ty != n-compute on the counter Phi) while the nested two-loop form compiles —
 frontend type-fixpoint bug with its own tiny repro (ns-row0.js pre-nested-form).
 
+## proj.js graph analysis state (2026-08-12 07:30, continue here)
+
+In proj-dump.txt (scratchpad): project = fun n8 (u=n2421, v=n2422, p=n2423 Parms); lin_solve call
+= n2764/CallEnd n2765. The gradient j-loop: Loop n2817, whole-memory loop phi n2818 with ENTRY
+Arg n2819 minted at Region n2808 (post-call control — the hScale ToNumber diamond merge). Inner
+i-loop phi n2969; p reads n3001/n3004/n3007 (via n2969), u compound store n3057, v store n3116.
+Everything is control-ordered after the call and the entry Arg is fresh (no forwarding source),
+so simple hoisting is NOT the mechanism — the divergence is finer. Next: diff this region against
+the PASSING standalone grad.js graph (same shapes minus lin_solve+diamonds), then single-step the
+few first grad iterations in the EVALUATOR (AOT_EV_DEBUG=1 on proj.js, evaluator now runs it) and
+compare each load/store against Node-computed expected values to find the first wrong cell.
+Note: proj's arrays index via n2421/n2423 Parm DIRECTLY (tagged dyn) — check whether ArrayLoad's
+array operand being a TAGGED parm vs grad.js's (maybe unboxed) changes native indexing.
+
 ## NavierStokes native divergence ISOLATED to project()'s section composition (2026-08-12 06:45)
 
 `proj.js` in the scratchpad is a ~50-line standalone project() repro: native=-2016 vs node=-469
