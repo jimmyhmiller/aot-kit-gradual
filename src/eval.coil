@@ -2426,6 +2426,7 @@
         len (n-nins n)
         (mut kids) (al-new [i64] (malloc-allocator))
         (mut mask) 0
+        (mut arg-mask) 0
         (mut i) 1]
     (loop (if (or (>= (load i) len) (ev-failed?))
               (break)
@@ -2461,9 +2462,28 @@
                                     (if (load duplicate)
                                         0
                                         (if (!= (& (load mask) (hv-mask ver)) 0)
-                                            (do (ev-fail! EV-MEM n) 0)
+                                            ; Two states claiming the same alias is a miswired
+                                            ; graph — EXCEPT when every claimant is a function-
+                                            ; entry Arg. Arg has no memory input, so two Args
+                                            ; over one alias are the SAME entry state minted
+                                            ; twice (the JS frontend does this for dynamic-op
+                                            ; aliases; Arg is GVN-exempt so nothing dedupes
+                                            ; them). Skipping the duplicate keeps the check
+                                            ; loud for every real state.
+                                            (if (and (= (n-op input) OP-ARG)
+                                                     (and (= (& (hv-mask ver) (load mask))
+                                                             (hv-mask ver))
+                                                          (= (& (hv-mask ver) (load arg-mask))
+                                                             (hv-mask ver))))
+                                                0
+                                                (do (ev-fail! EV-MEM n) 0))
                                             (do
                                               (store! mask (| (load mask) (hv-mask ver)))
+                                              (if (= (n-op input) OP-ARG)
+                                                  (do (store! arg-mask
+                                                              (| (load arg-mask) (hv-mask ver)))
+                                                      0)
+                                                  0)
                                               (al-push! [i64] (mut kids) ver)
                                               0))))))))))
                 (store! i (+ (load i) 1))

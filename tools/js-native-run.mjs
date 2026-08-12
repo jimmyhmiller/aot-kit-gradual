@@ -31,9 +31,14 @@ const debug = flags.has("--debug");
 // The two modes compile DIFFERENT programs (annotations drive shapes), and divergences between
 // them are themselves bugs worth surfacing.
 const tsNative = flags.has("--ts-native");
+// --eval: also run the program through the IR evaluator (resident harness mode "eval") for a
+// THREE-WAY verdict. Node is the semantic oracle; the evaluator executes the graph the frontend
+// built; native executes what the backend emitted. eval wrong => frontend bug, eval right but
+// native wrong => backend bug. Splits any mismatch in half before a single graph dump is read.
+const runEval = flags.has("--eval");
 const [inputArgument, heapText] = args;
 if (!inputArgument) {
-  console.error("usage: js-native-run.mjs FILE.js|FILE.ts [HEAP_BYTES] [--keep] [--debug] [--ts-native]");
+  console.error("usage: js-native-run.mjs FILE.js|FILE.ts [HEAP_BYTES] [--keep] [--debug] [--ts-native] [--eval]");
   process.exit(2);
 }
 const input = path.resolve(inputArgument);
@@ -94,8 +99,8 @@ const work = keep
 const object = path.join(work, "program.o");
 const binary = path.join(work, "program");
 
-const kindArguments = tsNative && input.endsWith(".ts") ? ["ts"] : [];
-const emitted = spawnSync(emitter, [sourcePath, "0", "10", ...kindArguments],
+const kind = tsNative && input.endsWith(".ts") ? "ts" : "js";
+const emitted = spawnSync(emitter, [sourcePath, "0", "10", kind],
                           { maxBuffer: 256 * 1024 * 1024 });
 if (emitted.status !== 0) {
   process.stderr.write(emitted.stderr ?? "");
@@ -118,6 +123,26 @@ let nativeValue = nativeMatch ? BigInt(nativeMatch[1]) : null;
 if (nativeValue !== null && (BigInt.asUintN(64, nativeValue) >> 48n) === 0x7ffcn) {
   nativeValue = BigInt.asIntN(48, BigInt.asUintN(64, nativeValue));
   console.log(`native result was integer-tagged; payload = ${nativeValue}`);
+}
+
+let evalValue = null;
+let evalStatus = null;
+if (runEval) {
+  const evaluated = spawnSync(emitter, [sourcePath, "0", "10", kind, "eval"],
+                              { encoding: "utf8", maxBuffer: 256 * 1024 * 1024 });
+  const statusMatch = /evstatus=(-?\d+)/.exec(evaluated.stdout ?? "");
+  const resultMatch = /result=(-?\d+)/.exec(evaluated.stdout ?? "");
+  evalStatus = statusMatch ? Number(statusMatch[1]) : null;
+  if (resultMatch) evalValue = BigInt(resultMatch[1]);
+  if (evalValue !== null && (BigInt.asUintN(64, evalValue) >> 48n) === 0x7ffcn) {
+    evalValue = BigInt.asIntN(48, BigInt.asUintN(64, evalValue));
+  }
+  if (evalStatus !== 0) {
+    process.stderr.write(evaluated.stderr ?? "");
+    console.log(`evaluator failed: evstatus=${evalStatus ?? "missing"} (exit ${evaluated.status})`);
+  } else {
+    console.log(`eval result=${evalValue}`);
+  }
 }
 
 let nodeValue = null;
@@ -143,6 +168,18 @@ else console.log(`artifacts kept in ${work}`);
 
 if (native.status !== 0) {
   console.log(`VERDICT: native exited ${native.status} (signal ${native.signal ?? "none"})`);
+  process.exit(1);
+}
+if (runEval && nativeValue !== null && nodeValue !== null) {
+  const parts = `native=${nativeValue} eval=${evalValue ?? "?"} node=${nodeValue}`;
+  if (nativeValue === nodeValue && evalValue === nodeValue) {
+    console.log(`VERDICT: MATCH (${parts})`);
+    process.exit(0);
+  }
+  const blame = evalValue === null ? "evaluator did not finish"
+    : evalValue !== nodeValue ? "frontend: the evaluator already disagrees with Node"
+    : "backend: the evaluator agrees with Node but native does not";
+  console.log(`VERDICT: MISMATCH (${parts}) — ${blame}`);
   process.exit(1);
 }
 if (nativeValue !== null && nodeValue !== null) {

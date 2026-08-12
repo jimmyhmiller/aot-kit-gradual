@@ -49,6 +49,7 @@ const generated = `(module generatedtypescriptbenchmark)
 (import "backend_allocate" :use *)
 (import "backend_aarch64" :use *)
 (import "backend_macho" :use *)
+(import "eval" :use *)
 (import "coil.io" :use *)
 (import "coil.fmt" :use *)
 (import "coil.fs" :use *)
@@ -181,6 +182,20 @@ const generated = `(module generatedtypescriptbenchmark)
                   0))))
     0))
 
+;; MODE argv "eval": run the built graph through the IR evaluator instead of emitting machine
+;; code. The result prints in the same result= form the native harness uses, so a driver can
+;; three-way a program: Node (semantic oracle) vs evaluator (is the FRONTEND lowering right?) vs
+;; native (is the BACKEND right?). A budget exhaustion or trap is a loud nonzero evstatus.
+(defn run-eval! [] (-> i64)
+  (ev-reset!)
+  (ev-bind-args! 0)
+  (let [status (ev-run-nobind 2000000000)]
+    (fmt (stdout) "evstatus={d} steps={d} at={d}:{s}\n"
+         status (ev-steps) (ev-at)
+         (if (= (ev-at) NO-NODE) "none" (op-name (n-op (ev-at)))))
+    (fmt (stdout) "result={d}\n" (rt-payload (ev-result)))
+    (if (= status EV-OK) 0 3)))
+
 ${resident ? residentHelper : ""}
 (defn main [(argc i32) (argv (ptr (ptr i8)))] (-> i64)
   (let [${resident ? `schedule-seed (if (> argc 2) (cast i64 (atoi (load (index argv 2)))) 0)
@@ -189,7 +204,9 @@ ${resident ? residentHelper : ""}
         filename (if (< argc 2) "" (cstr->str (load (index argv 1))))
         script-kind (if (and (> argc 4) (str-eq (cstr->str (load (index argv 4))) "ts"))
                         TS-SCRIPT-TS
-                        TS-SCRIPT-JS)` : `schedule-seed (if (> argc 1) (cast i64 (atoi (load (index argv 1)))) ${seed})
+                        TS-SCRIPT-JS)
+        run-mode (if (> argc 5) (cstr->str (load (index argv 5))) "")` : `run-mode ""
+        schedule-seed (if (> argc 1) (cast i64 (atoi (load (index argv 1)))) ${seed})
         register-count (if (> argc 2) (cast i64 (atoi (load (index argv 2)))) ${registers})
         source ${JSON.stringify(source)}
         filename ${JSON.stringify(input)}`}
@@ -215,6 +232,8 @@ ${resident ? `          (let [rep-count (g-rep-report (stderr))]
                     (fmt (stderr) "verify={d} node={d}\\n" (g-verify-code) (g-verify-node))
                     (g-print-flat (stderr))
                     4)
+                  (if (str-eq run-mode "eval")
+                  (run-eval!)
                   (do
                   (fmt (stderr) "phase=machine-select-begin\\n")
                   (if (not (be-select-machine-program!))
@@ -407,7 +426,7 @@ ${resident ? `          (let [rep-count (g-rep-report (stderr))]
                                         (if (= (write 1 (be-object-data) (be-object-len))
                                                (be-object-len))
                                             0
-                                            10)))))))))))))
+                                            10))))))))))))))
 `;
 
 fs.writeFileSync(output, generated);
