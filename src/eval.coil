@@ -638,6 +638,7 @@
     (al-push! [i64] (field p objs) shape)
     (al-push! [i64] (field p array-lengths) 0)
     (al-push! [bool] (field p array-kinds) false)
+    (al-push! [i64] (field p closure-funs) NO-NODE)
     (al-push! [i64] (field p latest-array) -1)
     (let [(mut alias) 0]
       (loop (if (>= (load alias) JS-PROPERTY-ALIAS)
@@ -675,6 +676,14 @@
    (objs (ArrayList i64))  ; object id -> its shape
    (array-lengths (ArrayList i64))  ; object id -> current observable array length
    (array-kinds (ArrayList bool))  ; object id -> was its identity passed through ArrayMark
+   ; object id -> Fun node when the object is a materialized closure environment. Mirrors the
+   ; native model, where a JS function VALUE is its env pointer under a function tag: the same
+   ; word casts to fun#N at a call site and unboxes to obj@shape inside the callee.
+   (closure-funs (ArrayList i64))
+   ; pairs [fun-token, object id]: the shadow object backing property access ON a function value
+   ; (f.prototype and friends). Natively a function IS an object; the evaluator's RFun is not, so
+   ; the first property touch allocates one identity per function and every later touch reuses it.
+   (fun-objs (ArrayList i64))
    (array-elements (ArrayList EvArrayElement))  ; imperative indexed payload, keyed by object id
    (latest-fixed (ArrayList i64))  ; (object * 63 + alias) -> latest executed fixed-field write
    (latest-array (ArrayList i64))  ; object id -> latest executed array write/resize
@@ -716,6 +725,8 @@
           (store! (field p objs) (al-new [i64] (malloc-allocator)))
           (store! (field p array-lengths) (al-new [i64] (malloc-allocator)))
           (store! (field p array-kinds) (al-new [bool] (malloc-allocator)))
+          (store! (field p closure-funs) (al-new [i64] (malloc-allocator)))
+          (store! (field p fun-objs) (al-new [i64] (malloc-allocator)))
           (store! (field p array-elements) (al-new [EvArrayElement] (malloc-allocator)))
           (store! (field p latest-fixed) (al-new [i64] (malloc-allocator)))
           (store! (field p latest-array) (al-new [i64] (malloc-allocator)))
@@ -753,6 +764,8 @@
     (al-clear! [i64] (field p objs))
     (al-clear! [i64] (field p array-lengths))
     (al-clear! [bool] (field p array-kinds))
+    (al-clear! [i64] (field p closure-funs))
+    (al-clear! [i64] (field p fun-objs))
     (al-clear! [EvArrayElement] (field p array-elements))
     (al-clear! [i64] (field p latest-fixed))
     (al-clear! [i64] (field p latest-array))
@@ -913,6 +926,15 @@
   (n-aux (ev-fun-node token)))
 (defn ev-fun-closure-id [(token i64)] (-> i64)
   (if (>= token 0) -1 (- (- 0 token) 1)))
+
+;; The Fun node a materialized-closure environment object dispatches to, NO-NODE otherwise.
+(defn ev-closure-fun [(v RtVal)] (-> i64)
+  (if (!= (rt-tag v) RT-OBJ)
+      NO-NODE
+      (let [id (rt-payload v)]
+        (if (or (< id 0) (>= id (al-len [i64] (load (field (ev) closure-funs)))))
+            NO-NODE
+            (al-get [i64] (load (field (ev) closure-funs)) id)))))
 
 (defn rt-ty [(v RtVal)] (-> i64)
   (match v
@@ -1176,11 +1198,42 @@
 ;; Does this memory state describe that class, and does that object carry that word. Both are
 ;; asked by Load and by Store, and both are the checks that make running a memory graph mean
 ;; something; see EV-MEM and EV-SHAPE.
+(defn ev-fun-object! [(token i64)] (-> i64)
+  (let [p (ev)
+        pairs (load (field p fun-objs))
+        (mut i) 0
+        (mut found) -1]
+    (loop (if (or (>= (load i) (al-len [i64] pairs)) (>= (load found) 0))
+              (break)
+              (do
+                (if (= (al-get [i64] pairs (load i)) token)
+                    (store! found (al-get [i64] pairs (+ (load i) 1)))
+                    0)
+                (store! i (+ (load i) 2)))))
+    (if (>= (load found) 0)
+        (load found)
+        (let [id (ev-obj-new! SHAPE-ROOT)]
+          (al-set! [i64] (field p closure-funs) id (ev-fun-node token))
+          (al-push! [i64] (field p fun-objs) token)
+          (al-push! [i64] (field p fun-objs) id)
+          id))))
+
+;; A property receiver in JavaScript may be a function; RFun carries no fields, so route it to
+;; the function's shadow object. Everything else keeps rt-need-obj's loud failure.
+(defn rt-need-property-receiver [(v RtVal) (n i64)] (-> i64)
+  (if (= (rt-tag v) RT-FUN)
+      (ev-fun-object! (rt-payload v))
+      (rt-need-obj v n)))
+
 (defn ev-check-access [(n i64) (ver i64) (obj i64) (alias i64)] (-> bool)
   (if (= (& (hv-mask ver) (<< 1 alias)) 0)
-      (do (ev-fail! EV-MEM n) false)
+      (do (fmt (stderr) "EV-MEM n{d}:{s} state does not claim alias {d} (mask {d}) obj {d}\n"
+               n (op-name (n-op n)) alias (hv-mask ver) obj)
+          (ev-fail! EV-MEM n) false)
       (if (= (shape-field-by-alias (ev-obj-shape obj) alias) SHAPE-NO-FIELD)
-          (do (ev-fail! EV-SHAPE n) false)
+          (do (fmt (stderr) "EV-SHAPE n{d}:{s} shape {d} has no field for alias {d} obj {d}\n"
+                   n (op-name (n-op n)) (ev-obj-shape obj) alias obj)
+              (ev-fail! EV-SHAPE n) false)
           true)))
 
 ;; A New's projections. Slot 0 is the object, which control established when it arrived at the
@@ -1222,6 +1275,41 @@
                                           (RUndef)
                                           (RMem (hv-write! ver (rt-payload ov) alias (RUndef))))))))))))))))
 
+;; Does this memory chain bottom out at a function-entry Arg for the given alias? The direct
+;; lookup already searched every in-chain write, so a miss over an Arg-rooted chain means the
+;; word predates this function: the same situation the find-latest escape hatch below exists
+;; for when the Arg is the load's IMMEDIATE input. Entry states get built lazily, so a Store or
+;; a merge on top of the Arg must not hide it.
+(defn ev-mem-chain-root-arg? [(m0 i64) (alias i64)] (-> bool)
+  (let [(mut m) m0
+        (mut fuel) 64
+        (mut ans) false
+        (mut done) false]
+    (loop (if (or (load done) (<= (load fuel) 0))
+              (break)
+              (do
+                (store! fuel (- (load fuel) 1))
+                (let [op (n-op (load m))]
+                  (cond (= op OP-ARG) (do (store! ans true) (store! done true) 0)
+                        (= op OP-STORE) (do (store! m (n-in (load m) 1)) 0)
+                        (= op OP-MEMMERGE)
+                          (let [(mut i) 1
+                                (mut nxt) NO-NODE]
+                            (loop (if (or (>= (load i) (n-nins (load m)))
+                                          (!= (load nxt) NO-NODE))
+                                      (break)
+                                      (do (if (!= (& (ty-mem-aliases (n-ty (n-in (load m) (load i))))
+                                                    (<< 1 alias))
+                                              0)
+                                              (store! nxt (n-in (load m) (load i)))
+                                              0)
+                                          (store! i (+ (load i) 1)))))
+                            (if (= (load nxt) NO-NODE)
+                                (do (store! done true) 0)
+                                (do (store! m (load nxt)) 0)))
+                        :else (do (store! done true) 0))))))
+    (load ans)))
+
 (defn ev-load [(n i64)] (-> RtVal)
   (let [mv (ev-data (n-in n 1))]
     (if (ev-failed?)
@@ -1237,7 +1325,7 @@
                         (RUndef)
                         (let [direct (hv-find ver obj (n-aux n))
                               e
-                                (if (and (< direct 0) (= (n-op (n-in n 1)) OP-ARG))
+                                (if (and (< direct 0) (ev-mem-chain-root-arg? (n-in n 1) (n-aux n)))
                                     (hv-find-latest obj (n-aux n))
                                     direct)]
                           ; NOTHING IN THIS CHAIN EVER INITIALISED THAT WORD. Every object is created by
@@ -1246,7 +1334,10 @@
                           ; descend from that allocation: the chain was miswired, and `undefined` would
                           ; be a plausible answer that hides it.
                           (if (< e 0)
-                              (ev-fail! EV-MEM n)
+                              (do (fmt (stderr) "EV-MEM n{d}:Load alias {d} obj {d}: no write in this chain initialised that word (mem in n{d}:{s})\n"
+                                       n (n-aux n) obj
+                                       (n-in n 1) (op-name (n-op (n-in n 1))))
+                                  (ev-fail! EV-MEM n))
                               (let [ent (hv-ent e)] (hve-val ent))))))))))))
 
 (defn ev-store [(n i64)] (-> RtVal)
@@ -1278,7 +1369,7 @@
                 (if (ev-failed?)
                     pv
                     (let [ver (rt-need-mem mv n)
-                          object (rt-need-obj pv n)]
+                          object (rt-need-property-receiver pv n)]
                       (if (ev-failed?)
                           (RUndef)
                           (if (= (& (hv-mask ver) (<< 1 JS-PROPERTY-ALIAS)) 0)
@@ -1308,7 +1399,7 @@
                 (if (ev-failed?)
                     xv
                     (let [ver (rt-need-mem mv n)
-                          object (rt-need-obj pv n)]
+                          object (rt-need-property-receiver pv n)]
                       (if (ev-failed?)
                           (RUndef)
                           (if (= (& (hv-mask ver) (<< 1 JS-PROPERTY-ALIAS)) 0)
@@ -1337,7 +1428,7 @@
           (if (ev-failed?)
               pv
               (let [ver (rt-need-mem mv n)
-                    object (rt-need-obj pv n)]
+                    object (rt-need-property-receiver pv n)]
                 (if (ev-failed?)
                     (RUndef)
                     (if (= (& (hv-mask ver) (<< 1 JS-PROPERTY-ALIAS)) 0)
@@ -1352,7 +1443,7 @@
           (if (ev-failed?)
               pv
               (let [ver (rt-need-mem mv n)
-                    object (rt-need-obj pv n)]
+                    object (rt-need-property-receiver pv n)]
                 (if (ev-failed?)
                     (RUndef)
                     (if (= (& (hv-mask ver) (<< 1 JS-PROPERTY-ALIAS)) 0)
@@ -1374,7 +1465,7 @@
                 (if (ev-failed?)
                     pv
                     (let [ver (rt-need-mem mv n)
-                          object (rt-need-obj ov n)
+                          object (rt-need-property-receiver ov n)
                           prototype (rt-need-obj pv n)]
                       (if (ev-failed?)
                           (RUndef)
@@ -1447,7 +1538,7 @@
                                       (if (and (>= index 0) (< index (jss-length string)))
                                           (RStr (jss-char-at! string index))
                                           (RUndef))))
-                                (let [object (rt-need-obj ov n)
+                                (let [object (rt-need-property-receiver ov n)
                                       array-index
                                         (if (ev-array-object? object)
                                             (ev-property-key-index key) -1)]
@@ -1470,7 +1561,7 @@
     (if (ev-failed?)
         (RUndef)
         (let [ver (rt-need-mem mv n)
-              object (rt-need-obj ov n)
+              object (rt-need-property-receiver ov n)
               key (ev-need-string kv n)
               (mut bytes) (al-new [u8] (malloc-allocator))]
           (if (or (ev-failed?) (= (& (hv-mask ver) (<< 1 JS-PROPERTY-ALIAS)) 0))
@@ -1499,7 +1590,7 @@
     (if (ev-failed?)
         (RUndef)
         (let [ver (rt-need-mem mv n)
-              object (rt-need-obj ov n)
+              object (rt-need-property-receiver ov n)
               key (ev-need-string kv n)
               (mut bytes) (al-new [u8] (malloc-allocator))]
           (if (or (ev-failed?) (= (& (hv-mask ver) (<< 1 JS-PROPERTY-ALIAS)) 0))
@@ -1521,7 +1612,7 @@
     (if (ev-failed?)
         (RUndef)
         (let [ver (rt-need-mem mv n)
-              object (rt-need-obj ov n)
+              object (rt-need-property-receiver ov n)
               key (ev-need-string kv n)
               (mut bytes) (al-new [u8] (malloc-allocator))]
           (if (or (ev-failed?) (= (& (hv-mask ver) (<< 1 JS-PROPERTY-ALIAS)) 0))
@@ -1603,7 +1694,7 @@
 (defn ev-object-freeze [(n i64)] (-> RtVal)
   (let [mv (ev-data (n-in n 1)) ov (ev-data (n-in n 2))]
     (if (ev-failed?) (RUndef)
-        (let [ver (rt-need-mem mv n) object (rt-need-obj ov n)]
+        (let [ver (rt-need-mem mv n) object (rt-need-property-receiver ov n)]
           (if (or (ev-failed?) (= (& (hv-mask ver) (<< 1 JS-PROPERTY-ALIAS)) 0))
               (ev-fail! EV-MEM n)
               (do (jso-freeze! object) (RMem ver)))))))
@@ -1611,7 +1702,7 @@
 (defn ev-internal-load [(n i64)] (-> RtVal)
   (let [mv (ev-data (n-in n 1)) ov (ev-data (n-in n 2))]
     (if (ev-failed?) (RUndef)
-        (let [ver (rt-need-mem mv n) object (rt-need-obj ov n)]
+        (let [ver (rt-need-mem mv n) object (rt-need-property-receiver ov n)]
           (if (or (ev-failed?) (= (& (hv-mask ver) (<< 1 JS-PROPERTY-ALIAS)) 0))
               (ev-fail! EV-MEM n)
               (if (= (jso-internal-kind object) JSO-NONE)
@@ -1624,7 +1715,7 @@
 (defn ev-internal-store [(n i64)] (-> RtVal)
   (let [mv (ev-data (n-in n 1)) ov (ev-data (n-in n 2)) vv (ev-data (n-in n 3))]
     (if (ev-failed?) (RUndef)
-        (let [ver (rt-need-mem mv n) object (rt-need-obj ov n)]
+        (let [ver (rt-need-mem mv n) object (rt-need-property-receiver ov n)]
           (if (or (ev-failed?) (= (& (hv-mask ver) (<< 1 JS-PROPERTY-ALIAS)) 0))
               (ev-fail! EV-MEM n)
               (if (= (n-aux n) INTERNAL-INIT)
@@ -1647,7 +1738,7 @@
                 (if (ev-failed?)
                     pv
                     (let [ver (rt-need-mem mv n)
-                          object (rt-need-obj ov n)]
+                          object (rt-need-property-receiver ov n)]
                       (if (ev-failed?)
                           (RUndef)
                           (if (jso-frozen? object)
@@ -2667,7 +2758,16 @@
   (let [v (ev-data (n-in n 1))]
     (if (ev-failed?)
         v
-        (if (ty-isa (rt-ty v) (n-aux n)) v (ev-fail! EV-CAST n)))))
+        (if (ty-isa (rt-ty v) (n-aux n))
+            v
+            (let [cf (ev-closure-fun v)]
+              (if (and (!= cf NO-NODE) (ty-isa (n-ty cf) (n-aux n)))
+                  v
+                  (do (fmt (stderr) "EV-CAST n{d}: value " n)
+                      (rt-print (stderr) v)
+                      (fmt (stderr) " (ty {d}) does not satisfy target ty {d}\n"
+                           (rt-ty v) (n-aux n))
+                      (ev-fail! EV-CAST n))))))))
 
 (defn ev-box [(n i64)] (-> RtVal)
   (ev-data (n-in n 1)))
@@ -2678,11 +2778,24 @@
         v
         (if (and (= (n-aux n) (t-flt)) (= (rt-tag v) RT-INT))
             (RFlt (f64-bits (cast f64 (rt-payload v))))
-            (if (ty-isa (rt-ty v) (n-aux n)) v (ev-fail! EV-UNBOX n))))))
+            (if (ty-isa (rt-ty v) (n-aux n))
+                v
+                (let [cf (ev-closure-fun v)]
+                  (if (and (!= cf NO-NODE) (ty-isa (n-ty cf) (n-aux n)))
+                      v
+                      (do (fmt (stderr) "EV-UNBOX n{d}: value " n)
+                          (rt-print (stderr) v)
+                          (fmt (stderr) " (ty {d}) does not satisfy target ty {d}\n"
+                               (rt-ty v) (n-aux n))
+                          (ev-fail! EV-UNBOX n)))))))))
 
 (defn ev-typetest [(n i64)] (-> RtVal)
   (let [v (ev-data (n-in n 1))]
-    (if (ev-failed?) v (RBool (ty-isa (rt-ty v) (n-aux n))))))
+    (if (ev-failed?)
+        v
+        (RBool (or (ty-isa (rt-ty v) (n-aux n))
+                   (let [cf (ev-closure-fun v)]
+                     (and (!= cf NO-NODE) (ty-isa (n-ty cf) (n-aux n)))))))))
 
 (defn ev-array-mark [(n i64)] (-> RtVal)
   (let [v (ev-data (n-in n 1))]
@@ -2721,6 +2834,22 @@
   (let [p (ev)]
     (if (al-get (load (field p hasenv)) n)
         (al-get (load (field p env)) n)
+        (if (> (n-nins n) (+ 1 (n-aux n)))
+            ; materialized form [fun, env object, capture cells...]: the closure VALUE is the env
+            ; object itself, marked callable. Captures live in env fields the frontend stored, so
+            ; the generic call path binds parm 0 = env, parm 1 = receiver with no capture magic.
+            (let [fv (ev-data (n-in n 0))]
+              (if (or (ev-failed?) (!= (rt-tag fv) RT-FUN))
+                  (ev-fail! EV-CALL n)
+                  (let [ov (ev-data (n-in n 1))]
+                    (if (or (ev-failed?) (!= (rt-tag ov) RT-OBJ))
+                        (ev-fail! EV-CALL n)
+                        (do
+                          (al-set! [i64] (field p closure-funs) (rt-payload ov)
+                                   (ev-fun-node (rt-payload fv)))
+                          (al-set! [bool] (field p hasenv) n true)
+                          (al-set! [RtVal] (field p env) n ov)
+                          ov)))))
         (let [fv (ev-data (n-in n 0))]
           (if (or (ev-failed?) (!= (rt-tag fv) RT-FUN))
               (ev-fail! EV-CALL n)
@@ -2739,7 +2868,7 @@
                 (let [v (RFun (- 0 (+ id 1)))]
                   (al-set! [bool] (field p hasenv) n true)
                   (al-set! [RtVal] (field p env) n v)
-                  v)))))))
+                  v))))))))
 
 (const EV-CALL-DEPTH-MAX i64 512)
 
@@ -2852,10 +2981,11 @@
   (let [p (ev)]
     (if (al-get (load (field p hasenv)) n)
         (al-get (load (field p env)) n)
-        (let [cv (ev-data (n-in n 1))]
-          (if (or (ev-failed?) (!= (rt-tag cv) RT-FUN))
+        (let [cv (ev-data (n-in n 1))
+              cfun (ev-closure-fun cv)]
+          (if (or (ev-failed?) (and (!= (rt-tag cv) RT-FUN) (= cfun NO-NODE)))
               (ev-fail! EV-CALL n)
-              (let [token (rt-payload cv)
+              (let [token (if (!= cfun NO-NODE) cfun (rt-payload cv))
                     cid (ev-fun-closure-id token)
                     capc (if (< cid 0) 0 (al-get (load (field p clen)) cid))
                     fun (ev-fun-node token)]

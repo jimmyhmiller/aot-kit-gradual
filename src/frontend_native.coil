@@ -471,7 +471,60 @@
               (let [type (al-get [FeTypeDecl] (load (field frontend types)) (load index))]
                 (if (= (load (field type node)) node) (store! answer (load index)) 0)
                 (store! index (+ (load index) 1)))))
-    (load answer)))
+    ;; `fe-index-object-layouts!` DEDUPES structurally identical literals: only the first
+    ;; occurrence of a layout gets a declaration, and later literals were resolved to -1 here —
+    ;; so the CALLEE read a parameter through the first literal's static shape while the call
+    ;; site built its identical literal DYNAMICALLY (fixed-slot loads over dynamic property
+    ;; storage; object-parameters returned 7000064 for 1507052134 in JS mode). Resolve them by
+    ;; the same structural criterion the dedup used.
+    (if (>= (load answer) 0)
+        (load answer)
+        (let [ast (field frontend ast)]
+          (if (!= (ts-kind ast node) TSK-OBJECT-LITERAL)
+              -1
+              (let [(mut eligible) true
+                    (mut property-at) 0]
+                (loop (if (or (not (load eligible))
+                              (>= (load property-at) (ts-child-count ast node)))
+                          (break)
+                          (let [property (ts-child ast node (load property-at))]
+                            (if (or (!= (ts-kind ast property) TSK-PROPERTY-ASSIGNMENT)
+                                    (= (ts-kind ast (ts-child ast property 0))
+                                       TSK-COMPUTED-PROPERTY-NAME))
+                                (store! eligible false)
+                                0)
+                            (store! property-at (+ (load property-at) 1)))))
+                (if (or (not (load eligible)) (= (ts-child-count ast node) 0))
+                    -1
+                    (let [(mut type-at) 0
+                          (mut found) -1]
+                      (loop (if (or (>= (load type-at)
+                                        (al-len [FeTypeDecl] (load (field frontend types))))
+                                    (>= (load found) 0))
+                                (break)
+                                (let [decl (al-get [FeTypeDecl] (load (field frontend types))
+                                                   (load type-at))
+                                      (mut same) (= (load (field decl field-count))
+                                                    (ts-child-count ast node))
+                                      (mut field-at) 0]
+                                  (loop (if (or (not (load same))
+                                                (>= (load field-at) (ts-child-count ast node)))
+                                            (break)
+                                            (let [property (ts-child ast node (load field-at))
+                                                  field (al-get [FeField]
+                                                                (load (field frontend fields))
+                                                                (+ (load (field decl field-start))
+                                                                   (load field-at)))]
+                                              (if (not (str-eq
+                                                         (ts-text ast (ts-child ast property 0))
+                                                         (ts-text ast
+                                                                  (load (field field name-node)))))
+                                                  (store! same false)
+                                                  0)
+                                              (store! field-at (+ (load field-at) 1)))))
+                                  (if (load same) (store! found (load type-at)) 0)
+                                  (store! type-at (+ (load type-at) 1)))))
+                      (load found)))))))))
 
 (defn fe-index-type! [(frontend (mut NativeFrontend)) (node i64)] (-> i64)
   (let [ast (field frontend ast)

@@ -18,6 +18,8 @@
 (import "coil.arraylist" :use *)
 (import "coil.slice" :use *)
 (import "coil.str" :use *)
+(import "coil.io" :use *)
+(import "coil.fmt" :use *)
 
 (const FNG-DYNAMIC i64 -1)
 (const FNG-NUMBER i64 -2)
@@ -600,6 +602,15 @@
               (= kind TSK-STRING-LITERAL) FNG-STRING
               (= kind TSK-ARRAY-LITERAL) FNG-ARRAY
               (= kind TSK-VOID) FNG-VOID
+              ;; A literal-inferred parameter records the OBJECT LITERAL as its type-node, and
+              ;; literal types live in the decl-node registry, not the type-node registry the
+              ;; `named` probe above consults. Without this arm the callee body (fng-infer, which
+              ;; DOES consult the decl registry) reads the parameter through the inferred static
+              ;; shape while every call site lowers its literal argument dynamically — fixed-slot
+              ;; loads over dynamic property storage.
+              (= kind TSK-OBJECT-LITERAL)
+                (let [declared (fe-type-index-for-decl-node frontend type-node)]
+                  (if (>= declared 0) declared FNG-DYNAMIC))
               :else FNG-DYNAMIC))))
 
 (defn fng-coil-type [(frontend (ptr NativeFrontend))
@@ -778,6 +789,25 @@
                                                         (n-ty memory))]
                                               (ty-mem? t))))))))))))))
 
+;; The single non-merge state that carries `alias` inside a (possibly nested) MemMerge. Answering
+;; a per-alias query with a whole merge is how merges ended up NESTED in bigger merges: the outer
+;; merge then held one child selected for alias A whose static mask also claims B, C, ... next to
+;; the newer states it was merged with — two states claiming one alias, which is ambiguous (the
+;; IR evaluator rejects it as EV-MEM; the backend just happens to schedule the newer one).
+(defn fng-alias-leaf [(memory i64) (alias i64) (fuel i64)] (-> i64)
+  (if (or (<= fuel 0) (!= (n-op memory) OP-MEMMERGE))
+      memory
+      (let [(mut index) 1
+            (mut answer) NO-NODE]
+        (loop (if (or (>= (load index) (n-nins memory)) (!= (load answer) NO-NODE))
+                  (break)
+                  (let [candidate (n-in memory (load index))]
+                    (if (fng-memory-has-alias? candidate alias) (store! answer candidate) 0)
+                    (store! index (+ (load index) 1)))))
+        (if (= (load answer) NO-NODE)
+            memory
+            (fng-alias-leaf (load answer) alias (- fuel 1))))))
+
 (defn fng-current-memory [(context FngContext) (alias i64)] (-> i64)
   (let [memory (load (load (field context memory)))]
     (if (= memory NO-NODE)
@@ -792,9 +822,9 @@
                           (store! index (+ (load index) 1)))))
               (if (= (load answer) NO-NODE)
                   (fng-memory (load (load (field context ctrl))) alias)
-                  (load answer)))
+                  (fng-alias-leaf (load answer) alias 16)))
             (if (fng-memory-has-alias? memory alias)
-                memory
+                (fng-alias-leaf memory alias 16)
                 (fng-memory (load (load (field context ctrl))) alias))))))
 
 (defn fng-control [(context FngContext)] (-> i64)
@@ -3722,6 +3752,22 @@
                   (fng-box-dynamic-argument! (fng-expression context callee-node))
                   (fng-undefined))
               (if direct-value-callee (n-box! target) target))
+        ;; The 3833-recovery below fills omitted arguments from a graph-resolved Fun AFTER the
+        ;; argument loop — too late for the loop itself, which lowers call-site object literals
+        ;; against the callee's EXPECTED parameter shapes. Without this hoisted resolution a
+        ;; direct-value callee (top-level JS function, IIFE, local closure) lowered its literal
+        ;; arguments DYNAMICALLY while the callee body read the literal-inferred STATIC shape:
+        ;; fixed-slot loads against dynamic property storage, i.e. garbage (object-parameters
+        ;; computed 7000064 instead of 1507052134 in JS mode).
+        argument-function-index
+          (if (or (>= argument-function-index 0) (not direct-value-callee))
+              argument-function-index
+              (let [target-fun (if (= (n-op target) OP-CLOSURE) (n-in target 0) target)]
+                (fng-function-index frontend (- (n-aux target-fun) 1))))
+        argument-fn
+          (if (>= argument-function-index 0)
+              (al-get [FeFunction] (load (field frontend functions)) argument-function-index)
+              (zeroed FeFunction))
         (mut args) (al-new [i64] (malloc-allocator))
         (mut call-captures) (al-new [i64] (malloc-allocator))
         optional-call
