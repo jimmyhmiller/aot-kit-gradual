@@ -7,6 +7,7 @@ import os from "node:os";
 import path from "node:path";
 import process from "node:process";
 import ts from "typescript";
+import {ensureResidentEmitter} from "./resident-emitter.mjs";
 
 const root = path.resolve(import.meta.dirname, "..");
 const argumentsSet = new Set(process.argv.slice(2));
@@ -61,14 +62,19 @@ const linkFlags = [];
 
 const report = {schemaVersion: 1, extended, modes, cases: []};
 
-// EACH CASE IS AN INDEPENDENT PROGRAM, so they run concurrently. Every one of them spends most of
-// its time in `coil build`, compiling its own emitter, and running thirty of those one after
-// another took 233 seconds on a twelve-core machine that was idle for most of it. Nothing is
-// shared between cases but the temp directory and each case names its files after itself.
-//
-// The results are collected by INDEX and the report is assembled in manifest order afterwards, so
-// out/native-conformance.json is byte-identical to what the serial loop produced no matter which
-// case finishes first. The per-case console line prints on completion, so that order does vary.
+// ONE EMITTER FOR THE WHOLE SUITE. Each case used to generate a bespoke harness with its source
+// embedded as a string constant and `coil build` it — 75 full compiler builds (~4s each) whose
+// binaries differed only in that string. The resident emitter takes the source path, seeds,
+// register count, script kind, and optimize flag from argv, and it shares js-native-run's cache,
+// so an unchanged compiler means ZERO builds here. The FIRST case still runs the embedded path
+// as a canary so the non-resident template stays proven to compile.
+const residentEmitter = ensureResidentEmitter(root);
+const canary = cases.length ? cases[0].name : null;
+
+// CASES RUN CONCURRENTLY; results are collected by INDEX and the report assembled in manifest
+// order afterwards, so out/native-conformance.json is byte-identical to the serial loop's no
+// matter which case finishes first. The per-case console line prints on completion, so that
+// order does vary.
 const concurrency = Math.max(1, Math.min(cases.length, os.availableParallelism?.() ?? os.cpus().length));
 const collected = new Array(cases.length);
 const runOne = async (test, slot) => {
@@ -95,17 +101,28 @@ const runOne = async (test, slot) => {
       if (nodeThrow) throw nodeThrow;
       assert.ok(Number.isSafeInteger(expected), `${sourcePath} returns a safe integer observable`);
     }
-    const coilPath = path.join(directory, `${test.name}.coil`);
-    const emitterPath = path.join(directory, `${test.name}-emitter`);
-    await runAsync(process.execPath, [path.join(root, "tools", "generate-typescript-aot-benchmark.mjs"), sourcePath, coilPath,
-      String(test.buildSeed ?? 0), "10", test.optimize === false ? "0" : "1"]);
-    await runAsync("coil", ["build", coilPath, "-o", emitterPath, ...linkFlags]);
+    // The generator maps a build seed of 0 to its default; the resident emitter takes the
+    // resolved value directly, so resolve it the same way here.
+    const frontendSeed = (test.buildSeed ?? 0) === 0 ? 7301 : test.buildSeed;
+    const scriptKind = test.file.endsWith(".ts") ? "ts" : "js";
+    let embeddedEmitter = null;
+    if (test.name === canary) {
+      const coilPath = path.join(directory, `${test.name}.coil`);
+      embeddedEmitter = path.join(directory, `${test.name}-emitter`);
+      await runAsync(process.execPath, [path.join(root, "tools", "generate-typescript-aot-benchmark.mjs"), sourcePath, coilPath,
+        String(test.buildSeed ?? 0), "10", test.optimize === false ? "0" : "1"]);
+      await runAsync("coil", ["build", coilPath, "-o", embeddedEmitter, ...linkFlags]);
+    }
     const observations = [];
     for (const mode of modes) {
       const objectPath = path.join(directory, `${test.name}-${mode.name}.o`);
       const binaryPath = path.join(directory, `${test.name}-${mode.name}`);
       const scheduleSeed = mode.name === "normal" && test.scheduleSeed !== undefined ? test.scheduleSeed : mode.seed;
-      fs.writeFileSync(objectPath, await runAsync(emitterPath, [String(scheduleSeed), String(test.registers ?? mode.registers)], {binary: true}));
+      fs.writeFileSync(objectPath, embeddedEmitter
+        ? await runAsync(embeddedEmitter, [String(scheduleSeed), String(test.registers ?? mode.registers)], {binary: true})
+        : await runAsync(residentEmitter, [sourcePath, String(scheduleSeed),
+            String(test.registers ?? mode.registers), scriptKind, "emit",
+            String(frontendSeed), test.optimize === false ? "0" : "1"], {binary: true}));
       await runAsync("xcrun", ["clang", "-arch", "arm64", "-O1", "-fno-omit-frame-pointer",
         path.join(root, "tools", "native-gc-runtime.c"),
         path.join(root, "native", "unicode_runtime.c"), "-framework", "CoreFoundation",
@@ -139,22 +156,41 @@ const runOne = async (test, slot) => {
       observations.map(item => item.throws ? "throws" : item.result).join(",")}`);
 };
 
-try {
+// FAILURES STOP THE SUITE AND NAME THEMSELVES. Workers check the shared failure slot before
+// taking new cases, every failure is recorded against its case with the child's actual stderr,
+// and cleanup happens only after every worker has settled — the old `finally` rmSync raced the
+// still-running workers, threw ENOTEMPTY, and REPLACED the real assertion error with a crash
+// about the temp directory.
+const failures = [];
+{
   let next = 0;
   const worker = async () => {
     for (;;) {
+      if (failures.length) return;
       const slot = next++;
       if (slot >= cases.length) return;
-      await runOne(cases[slot], slot);
+      try {
+        await runOne(cases[slot], slot);
+      } catch (error) {
+        failures.push({name: cases[slot].name, error});
+      }
     }
   };
-  await Promise.all(Array.from({length: concurrency}, worker));
-  report.cases = collected;
-  fs.mkdirSync(path.join(root, "out"), {recursive: true});
-  fs.writeFileSync(path.join(root, "out", "native-conformance.json"), `${JSON.stringify(report, null, 2)}\n`);
-  const featureCount = new Set(report.cases.flatMap(test => test.features)).size;
-  console.log(`NATIVE CONFORMANCE GREEN — ${report.cases.length} programs, ${featureCount} feature labels, ${modes.length} mode(s)`);
-} finally {
-  if (keep) console.error(`kept conformance artifacts: ${directory}`);
-  else fs.rmSync(directory, {recursive: true, force: true});
+  await Promise.allSettled(Array.from({length: concurrency}, worker));
 }
+if (keep) console.error(`kept conformance artifacts: ${directory}`);
+else fs.rmSync(directory, {recursive: true, force: true});
+if (failures.length) {
+  for (const {name, error} of failures) {
+    console.error(`\nCONFORMANCE FAILED: ${name}`);
+    console.error(`  ${error.message ?? error}`);
+    const stderrText = String(error.stderr ?? "").trim();
+    if (stderrText) console.error(stderrText.split("\n").map(line => `  stderr: ${line}`).join("\n"));
+  }
+  process.exit(1);
+}
+report.cases = collected;
+fs.mkdirSync(path.join(root, "out"), {recursive: true});
+fs.writeFileSync(path.join(root, "out", "native-conformance.json"), `${JSON.stringify(report, null, 2)}\n`);
+const featureCount = new Set(report.cases.flatMap(test => test.features)).size;
+console.log(`NATIVE CONFORMANCE GREEN — ${report.cases.length} programs, ${featureCount} feature labels, ${modes.length} mode(s)`);

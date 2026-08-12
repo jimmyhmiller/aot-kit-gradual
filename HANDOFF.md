@@ -117,17 +117,31 @@ bad codegen. Diagnosis, fully verified by old-vs-new binary diff:
   Running lesson, twice-proven today: when a compiler change makes green code crash,
   suspect formerly-benign UB in this repo before suspecting codegen.
 
+## Conformance now runs on THE resident emitter (done 2026-08-12)
+
+`tools/resident-emitter.mjs` provisions the one cached emitter binary (shared with
+js-native-run, stamped on compiler sources + the coil binary); the conformance runner
+invokes it per case with (source, schedule-seed, registers, kind, "emit", frontend-seed,
+optimize) instead of generating and `coil build`-ing a bespoke embedded-source emitter per
+case. The FIRST case still runs the embedded path as a canary for the non-resident
+template. **Conformance: 75 programs in ~17s** (was 75 full compiler builds). Failure
+handling fixed with it: workers stop on first failure, every failure prints its case name
+and the child's actual stderr, and cleanup waits for all workers (the old `finally` rmSync
+raced them and replaced real errors with ENOTEMPTY). Gate is GREEN at ~9.2 min wall; the
+remaining time is the test suites and the native/TS gates, which still build bespoke
+fixture emitters — same disease, same cure if it matters later.
+
 ## Remaining plan, in order
 
-1. **Fix the error masking in `tools/native-source-conformance.mjs`.** A failing case's
-   `finally` `rmSync` races still-running workers, throws ENOTEMPTY, and REPLACES the real
-   assertion error.
-2. The gate does NOT run the repro `--eval` sweep — that is how the evaluator regression
+1. The gate does NOT run the repro `--eval` sweep — that is how the evaluator regression
    hid. Add a fast repro sweep to the gate (it is ~30s of parallel work now).
-3. **`tools/sweep.mjs`: parallel batch runner with a verdict cache** keyed on
+2. **`tools/sweep.mjs`: parallel batch runner with a verdict cache** keyed on
    (emitter hash, file hash); also the bisection/fuzzer harness.
+3. Gate wall time is now suites-bound: `tests/*-test.coil` and the native/TS gate fixtures
+   each pay their own `coil build`. Port them to shared/resident binaries if the ~9 min
+   gate starts to hurt.
 4. More emitter speed if needed: counter-based scheduler pair pass, allocator verify passes
-   (see profile notes above). Ask Jimmy about a coil inliner before micro-optimizing more.
+   (see profile notes above).
 
 ## Ground rules that still apply
 

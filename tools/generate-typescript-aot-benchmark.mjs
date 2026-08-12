@@ -24,7 +24,7 @@ const frontendSeed = seed === 0 ? 7301 : seed;
 const residentHelper = String.raw`
 (defn resident-source [(argc i32) (argv (ptr (ptr i8)))] (-> (slice u8))
   (if (< argc 2)
-      (do (fmt (stderr) "usage: emitter SOURCE.js [SEED] [REGISTERS]\n") (os/_exit 2) "")
+      (do (fmt (stderr) "usage: emitter SOURCE.js|ts [SCHED-SEED] [REGISTERS] [js|ts] [emit|eval] [FRONTEND-SEED] [OPTIMIZE]\n") (os/_exit 2) "")
       (match (read-file (malloc-allocator) (cstr->str (load (index argv 1))))
         (Ok [src] src)
         (Err [e]
@@ -242,7 +242,11 @@ ${resident ? residentHelper : ""}
         script-kind (if (and (> argc 4) (str-eq (cstr->str (load (index argv 4))) "ts"))
                         TS-SCRIPT-TS
                         TS-SCRIPT-JS)
-        run-mode (if (> argc 5) (cstr->str (load (index argv 5))) "")` : `run-mode ""
+        run-mode (if (> argc 5) (cstr->str (load (index argv 5))) "")
+        frontend-seed (if (> argc 6) (cast i64 (atoi (load (index argv 6)))) ${frontendSeed})
+        optimize-build (if (> argc 7)
+                           (!= (cast i64 (atoi (load (index argv 7)))) 0)
+                           ${optimize ? "true" : "false"})` : `run-mode ""
         schedule-seed (if (> argc 1) (cast i64 (atoi (load (index argv 1)))) ${seed})
         register-count (if (> argc 2) (cast i64 (atoi (load (index argv 2)))) ${registers})
         source ${JSON.stringify(source)}
@@ -257,7 +261,7 @@ ${resident ? residentHelper : ""}
                (load (field frontend error-node)) (load (field frontend error-role)))
           (fe-native-free! (mut frontend))
           2)
-        (let [entry (frontend-native-build! (mut frontend) ${frontendSeed} ${optimize ? "true" : "false"})]
+        (let [entry (frontend-native-build! (mut frontend) ${resident ? "frontend-seed" : frontendSeed} ${resident ? "optimize-build" : (optimize ? "true" : "false")})]
           (bt-phase! "frontend")
           (fmt (stderr) "phase=frontend-build-end entry={d} nodes={d}\\n" entry (n-count))
 ${resident ? `          (let [rep-count (g-rep-report (stderr))]

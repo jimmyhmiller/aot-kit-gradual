@@ -12,12 +12,12 @@
 // The program must define `main()`; the native harness prints `result=<n>`; this tool runs the
 // same file under Node and reports MATCH/MISMATCH. Integer-tagged native results (0x7ffc<<48)
 // are decoded before comparison so a tagged return still compares by value.
-import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import process from "node:process";
 import { execFileSync, spawnSync } from "node:child_process";
+import { ensureResidentEmitter } from "./resident-emitter.mjs";
 
 const root = path.resolve(path.dirname(new URL(import.meta.url).pathname), "..");
 const flags = new Set(process.argv.slice(2).filter(argument => argument.startsWith("--")));
@@ -46,44 +46,7 @@ const heapBytes = heapText ? Number.parseInt(heapText, 10) : 268435456;
 
 const cacheDirectory = path.join(root, ".coil", "build", "js-resident");
 fs.mkdirSync(cacheDirectory, { recursive: true });
-const emitter = path.join(cacheDirectory, debug ? "emitter-O0" : "emitter");
-const stampPath = path.join(cacheDirectory, debug ? "emitter-O0.stamp" : "emitter.stamp");
-
-// The emitter embeds the whole compiler, so it is stale whenever any compiler input is.
-const stampInputs = [];
-const collect = directory => {
-  for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
-    const target = path.join(directory, entry.name);
-    if (entry.isDirectory()) collect(target);
-    else if (/\.(coil|jsl)$/.test(entry.name)) stampInputs.push(target);
-  }
-};
-collect(path.join(root, "src"));
-collect(path.join(root, "lib"));
-stampInputs.push(path.join(root, "Coil.toml"));
-stampInputs.push(path.join(root, "tools", "generate-typescript-aot-benchmark.mjs"));
-// The coil binary itself is a stamp input: a compiler upgrade must invalidate the cached
-// emitters even when no repo source changed.
-const coilBinary = spawnSync("which", ["coil"], { encoding: "utf8" }).stdout.trim();
-if (coilBinary) stampInputs.push(coilBinary);
-stampInputs.sort();
-const hash = crypto.createHash("sha256");
-for (const file of stampInputs) {
-  hash.update(file);
-  hash.update(fs.readFileSync(file));
-}
-const stamp = hash.digest("hex");
-
-if (!fs.existsSync(emitter) || !fs.existsSync(stampPath) ||
-    fs.readFileSync(stampPath, "utf8") !== stamp) {
-  console.error("compiler changed; rebuilding resident emitter (~minutes, then cached)...");
-  const harness = path.join(cacheDirectory, "resident.coil");
-  execFileSync("node", [path.join(root, "tools", "generate-typescript-aot-benchmark.mjs"),
-                        "--resident", harness], { cwd: root, stdio: "inherit" });
-  execFileSync("coil", ["build", ...(debug ? ["-O0"] : []), harness, "-o", emitter],
-               { cwd: root, stdio: "inherit" });
-  fs.writeFileSync(stampPath, stamp);
-}
+const emitter = ensureResidentEmitter(root, { debug });
 
 // TypeScript arrives as plain JavaScript at the emitter; transpile like the conformance runner.
 let sourcePath = input;
