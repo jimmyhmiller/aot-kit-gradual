@@ -45,6 +45,21 @@ There is still no valid benchmark/Node comparison table. Do not report performan
 benchmark until its native result passes the benchmark's correctness checks and the perf debt
 below is at least triaged.
 
+## NavierStokes density divergence: drift direction is TRANSPOSED (2026-08-12 03:30)
+
+On ns-small.js (16x16), per-region probes show Node's density drifting toward COLUMN 0 (row-0
+sum 2, col-0 sum 139) while native drifts toward ROW 0 (row-0 sum 400, col-0 sum 0) — a u/v- or
+x/y-role swap somewhere in the velocity path, NOT a magnitude error. Pattern probes that all
+PASS natively (scratchpad): evaluation order `x[cur] = (... x[++cur] ...)` (evo.js), compound
+`x[i] += dt*s[i]` (cadd.js), `u[++p] -= k` (cinc.js), captured-cell `<=` loop bound (lecap.js),
+set_bnd b===1/2/else dispatch (sbnd.js), multi-capture u/v ordering (caporder.js). So the swap
+is in composition, not any single pattern. NEXT: get grid visibility — either fix the evaluator
+script-global closure dispatch (fm2.js) and trace with AOT_EV_DEBUG, or add a console.log/print
+builtin to the native runtime (frontend rejects console.log today, FE-CODE 1003). Also found:
+a single `for (x=0; x<16; x+=2) checksum=(checksum+f(x))|0` loop at top level of main FAILS
+VERR-STALE-TYPE (n-ty != n-compute on the counter Phi) while the nested two-loop form compiles —
+frontend type-fixpoint bug with its own tiny repro (ns-row0.js pre-nested-form).
+
 ## Evaluator gap: script-global CLOSURE dispatch takes the initial value (repro fm2.js)
 
 `var uiCallback = function(){}; setCb(cb); ... uiCallback(f)` — NATIVE dispatches to the
