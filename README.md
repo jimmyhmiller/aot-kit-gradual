@@ -14,12 +14,18 @@ deoptimisation machinery anywhere in the design.
 ## Getting oriented
 
 ```sh
-tools/gate.sh          # THE gate: typecheck everything, run every suite, re-render the diagrams
-tools/gate.sh --quick  # skip the diagram pipeline
+coil test              # THE gate. 45 suites, 550 tests, one compile of the shared tree
 ```
 
-Green means every milestone's gate still holds. **Nothing is marked done and nothing is committed
-while it is red**, which is the contract the whole project runs on.
+Green means every suite still holds. **Nothing is marked done and nothing is committed while it is
+red**, which is the contract the whole project runs on.
+
+The gate used to be `tools/gate.sh`: shell gates, 19 Node oracles, a second frontend in JavaScript,
+35 emit drivers and 40 C harnesses. All of it is gone. That deletion dropped real coverage —
+differential testing against a JavaScript engine, proof that emitted machine code executes, and the
+falsification discipline that made each gate able to fail. **[docs/DEFTESTS-OWED.md](docs/DEFTESTS-OWED.md)
+records exactly what was lost and the deftest owed for each.** Read it before assuming green means
+what it used to.
 
 The product frontend entry point is:
 
@@ -77,9 +83,9 @@ Read in this order:
 | `src/frontend_native_graph.coil` | Native frontend lowering into the ideal graph |
 | `src/backend_*.coil` | Explicit, one-way [backend phase modules](docs/BACKEND-ARCHITECTURE.md) from machine IR through Mach-O emission |
 | `lib/**/*.jsl`, `lib/index` | The JavaScript runtime library, written in [JSL](docs/JSL.md) |
-| `tools/jsl-gate.sh` | Node/JSL conformance for the library, with its ToInt32 falsification |
-| `tests/*-test.coil` | One suite per area; `tools/gate.sh` runs them all |
-| `tools/dot-dump.coil`, `render-dot.sh`, `build-page.py` | The diagram pipeline and the gallery page |
+| `tests/*-test.coil` | One suite per area; `coil test` runs them all. This is the entire gate |
+| `tools/build-typescript-go-bridge.sh` | Builds the Go c-archive `Coil.toml` force-loads. Not a check — without it, linking fails |
+| `tools/dot-dump.coil` | The graph printer (`Coil.toml`'s entry point) |
 
 The verified TypeScript subset and native backend are under active expansion. The roadmap grows the
 native `typescript-go`/Coil frontend into a usable JavaScript and TypeScript runtime: complete

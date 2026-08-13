@@ -146,6 +146,7 @@ fixture emitters — same disease, same cure if it matters later.
 
 ## Ground rules that still apply
 
-- `bash tools/gate.sh` green before every commit; commit directly to main.
+- `coil test` green before every commit; commit directly to main. It is the whole gate now —
+  see docs/DEFTESTS-OWED.md for the coverage that deletion dropped and still owes deftests.
 - Repros in `repros/` stay passing (`node tools/js-native-run.mjs FILE --debug --eval`).
 - Tell Jimmy, with numbers, anything that is still slow — do not endure it.
