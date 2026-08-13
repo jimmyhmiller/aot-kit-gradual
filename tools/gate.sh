@@ -33,8 +33,6 @@ for arg in "$@"; do
 done
 
 JOBS=$(sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo 4)
-WORK=$(mktemp -d)
-trap 'rm -rf "$WORK"' EXIT
 
 fails=0
 note() { printf '%-34s %s\n' "$1" "$2"; }
@@ -80,25 +78,20 @@ else
   note "backend-module-gate.mjs" "FAILED"; echo "$out" | tail -20; fails=$((fails+1))
 fi
 
-section "typecheck"
-mkdir -p "$WORK/check"
-for f in src/*.coil; do
-  [ "$f" = "src/frontend_native_graph.coil" ] && continue
-  [ "$f" = "src/typescript_native.coil" ] && continue
-  printf '%s\n' "$f"
-done | xargs -P "$JOBS" -I{} sh -c \
-  'out=$(coil check "$1" 2>&1); rc=$?; b=$(basename "$1"); printf "%s" "$out" > "$2/$b.out"; echo "$rc" > "$2/$b.rc"' \
-  _ {} "$WORK/check"
-for f in src/*.coil; do
-  b=$(basename "$f")
-  if [ "$f" = "src/frontend_native_graph.coil" ] || [ "$f" = "src/typescript_native.coil" ]; then
-    note "$f" "native bridge gate"
-  elif [ "$(cat "$WORK/check/$b.rc" 2>/dev/null || echo 1)" = "0" ]; then
-    note "$f" "ok"
-  else
-    note "$f" "FAILED"; head -20 "$WORK/check/$b.out" 2>/dev/null; fails=$((fails+1))
-  fi
-done
+# THERE IS NO TYPECHECK SECTION, deliberately. It ran `coil check` over all 30 src modules --
+# 30 processes, 37.5s of CPU, a third of every coil invocation in this gate -- and proved nothing
+# the rest of the run does not prove again, harder, a minute later. `coil check` is compilation
+# without an object, and every one of those 30 modules is transitively imported by something this
+# gate BUILDS: 29 by the test suites, and frontendnative by the typescript-native-*-smoke tools.
+#
+# The one thing that could have justified it is DCE hiding a fault in code nothing references,
+# which this repo has been bitten by before. That was tested rather than assumed: an ill-typed
+# function nothing calls, appended to src/text.coil, is rejected by `coil check` AND by
+# text-test AND by an unrelated `coil build`. Typechecking precedes dead-code elimination, so a
+# build cannot mask what the check would have caught.
+#
+# What was lost is failing ~90s sooner on a broken tree, with a per-file label. The suites name
+# the file that failed too. If that trade ever stops being worth it, this is why it was made.
 
 section "suites"
 # One invocation. `coil test` discovers every (deftest …) under Coil.toml's [test] roots,

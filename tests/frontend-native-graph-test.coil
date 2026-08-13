@@ -1,0 +1,48 @@
+;; The native frontend's graph, pinned as ORDINARY TESTS.
+;;
+;; WHY THIS EXISTS. Each of these fixtures used to be its own 21-line program under `tools/`
+;; (`typescript-native-*-graph-smoke.coil`), differing from its siblings by exactly two things: the
+;; module name and a TypeScript source string. Every one of them imported `frontendnativegraph` --
+;; 7,290 lines, the largest module in the repo -- so the gate spent ~2.6 seconds per fixture
+;; recompiling the whole frontend to vary a string literal, then ran the binary, dumped its stdout
+;; to a file, and had a Node script sha256 it.
+;;
+;; A deftest costs no build at all: `coil test` compiles the test tree once and forks each test.
+;;
+;; THE EXPECTED GRAPH IS TEXT, NOT A DIGEST, and that is the other half of the point. The digests
+;; lived in tests/frontend-native-graph-regression.mjs under ~60 lines of changelog explaining what
+;; each repin meant, because a hash can say THAT the graph changed and never WHAT. Here the graph
+;; you expected is in the source next to the failure. (`assert-eq` prints the expected side and the
+;; line, not the actual -- it is not a diff, it is a readable expectation.)
+(module frontendnativegraphtest)
+
+(import "frontendnative" :use *)
+(import "frontendnativegraph" :use *)
+(import "gtext" :use *)
+(import "ty" :use *)
+(import "coil.io" :use *)
+(import "coil.alloc" :use *)
+(import "coil.fmt" :use *)
+
+;; The rendered graph for one TypeScript program. 6201 is the seed the smoke programs used; it
+;; picks the graph's node-id base, so it is part of what the expected text pins.
+(defn render-ts [(source (slice u8))] (-> (slice u8))
+  (let [(mut frontend) (fe-native-new source)
+        buffer (stack (array i8 32768))]
+    (if (!= (fe-native-index! (mut frontend)) FE-OK)
+        (do (fe-native-free! (mut frontend)) "FRONTEND INDEX FAILED")
+        (do (frontend-native-build! (mut frontend) 6201 true)
+            (let [out (g-render (cast (ptr i8) buffer) 32768)]
+              (fe-native-free! (mut frontend))
+              out)))))
+
+(deftest native-graph-basic
+  (assert-eq
+    (render-ts "function main(n: number): number { return n + 1; }")
+    "n0: Start <- : ctrl
+n1: Stop <- n5 : ALL
+n2: Arg int <- n0 : int
+n3: Const int=1 <- n0 : int=1
+n4: Add <- _ n2 n3 : num
+n5: Return <- n0 n4 : [ctrl,num]
+"))
