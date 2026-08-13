@@ -267,23 +267,36 @@ Only `+` and `-` are generated. JavaScript's `&`, `|` and `^` are int32 operator
 operands, signed 32-bit result) and the IR's bitwise nodes are not, so generating them would report
 the language's own semantics as a compiler bug. Covering them needs the lifter to model ToInt32.
 
-### OPEN: the property hangs, the deftest does not
+### CONFIRMED: the frontend cannot run inside a forked property case
 
-The differential is **table-driven**, not a `defprop`. As a property it fails with
+The differential is **table-driven**, not a `defprop`, and now for a measured reason rather than a
+suspected one. Same property, same fresh property database, only the flag differing:
 
-    the property NEVER FINISHED on this input (watchdog fired after 60s)
+    COIL_PBT_DB=$(mktemp -d) coil test <file> --cases 40 --no-fork   ->  40 passed, 4.8s
+    COIL_PBT_DB=$(mktemp -d) coil test <file> --cases 40             ->  watchdog at 60s, case 0
 
-on case 0, for any seed, after ~64 shrink calls. The same inputs -- including the exact reported
-counterexample and its exact argument -- run in well under a second from a `deftest`, returning
-matching values from both backends.
+The native TypeScript frontend reaches the TypeScript-Go bridge, whose c-archive has already started
+Go runtime threads. Running that in a forked child is the same trap as this project's signal-9 saga,
+which was fixed in the coil test runner by spawning one process per test instead of forking. The
+property runner still forks per generated case.
 
-Ruled out: the input (reproduced by hand, passes), program length (8-statement programs pass),
-`--no-fork` (hangs the same), and interning-table growth (`shape-reset!`/`jss-reset!` per case,
-still hangs).
+Two things had to be understood before that pair of runs meant anything, both from reading
+`prop_runner.coil`:
 
-Not ruled out: the frontend reaches the TypeScript-Go bridge, whose c-archive starts Go runtime
-threads, and a property forks per case. Fork plus a multithreaded runtime is the shape of this
-project's signal-9 saga. A hypothesis, not a diagnosis. Raised with the coil session.
+- **`--no-fork` gates one of four fork sites.** It reaches the property runner (`prop_runner.coil`
+  :942) but governs only the generation loop; `fork-replay`, the bisection in `find-crashing-case`,
+  and the per-shrink-candidate fork all fork unconditionally. So `--no-fork` on a FAILING property
+  proves nothing -- the failure path forks regardless. A clean measurement needs a property that
+  passes.
+- **The reuse phase runs first and is seed-independent by design** (replay a known failure in the
+  first millisecond rather than after 200 fresh cases). Its store is `.coil/pbt/<property>/failing`,
+  overridable with `--db` or `COIL_PBT_DB`. An earlier attempt to measure this was worthless because
+  every run replayed a stored counterexample through `fork-replay` and never reached generation at
+  all -- which also explains why passing a different `--seed` changed nothing.
+
+So this property is one `--no-fork` away from working. It stays table-driven because the gate is a
+bare `coil test`, and a `defprop` here would hang it. If the property runner ever spawns rather than
+forks -- the same fix the test runner already took -- convert this back and delete this section.
 
 Worth resolving -- a source-level property is the only thing that would exercise the frontend at
 scale, and the lifter it needs already works.
