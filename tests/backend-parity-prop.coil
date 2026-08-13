@@ -690,3 +690,109 @@
   (build-loop-program! 3 0 "ab")
   (assert (graph-has-op? OP-LOOP))
   (assert (graph-has-op? OP-PHI)))
+
+; ============================================================================
+; Calls
+; ============================================================================
+;; A call is the one boundary where the allocator has to give a value back UNCHANGED across code it
+;; does not control. Straight-line chains, diamonds and loops all keep every value inside one
+;; function, so none of them can reach caller-saved preservation: the register a value sits in is
+;; only ever clobbered by instructions the allocator itself placed.
+;;
+;; So the shape here is deliberate. Several values are computed BEFORE the call, the call happens,
+;; and every one of them is used AFTER it. They are live across the boundary by construction, which
+;; is what forces the allocator to preserve or spill each one.
+(defn build-call-program! [(ops (slice u8))] (-> i64)
+  ;; callee: f(x) = x * 3 + 1, small enough that the interesting part stays the caller.
+  (let [callee (n-fun-open! 0)
+        px (n-parm! callee 0)
+        body (n-new3 OP-ADD 0 NO-NODE
+                     (n-new3 OP-MUL 0 NO-NODE px (n-new1 OP-CONST (t-int-con 3) (g-start)))
+                     (n-new1 OP-CONST (t-int-con 1) (g-start)))
+        cret (n-new2 OP-RETURN 0 (n-fun-entry callee) body)]
+    (n-fun-close! callee cret)
+    (let [pool (stack (array i64 32))
+          p (cast (ptr i64) pool)
+          a0 (n-new1 OP-ARG (t-int) (g-start))
+          v0 (n-new3 OP-ADD 0 NO-NODE a0 (n-new1 OP-CONST (t-int-con 3) (g-start)))]
+      (store! (index p 0) v0)
+      ;; Build a handful of values first; each becomes live across the call below.
+      (let [(mut n) 1
+            (mut cur) v0
+            (mut k) 0
+            limit (if (> (slice-len ops) 6) 6 (slice-len ops))]
+        (loop (if (>= (load k) limit) (break)
+                (let [b (cast i64 (slice-get ops (load k)))]
+                  (store! cur (n-new3 (prop-op (% b PROP-OPS)) 0 NO-NODE (load cur)
+                                      (n-new1 OP-CONST (t-int-con (+ 1 (% (/ b 8) 7))) (g-start))))
+                  (store! (index p (load n)) (load cur))
+                  (store! n (+ (load n) 1))
+                  (store! k (+ (load k) 1))
+                  0)))
+        (let [site (n-call1! (g-start) callee (load cur))
+              (mut acc) (call-value site)
+              (mut j) 0]
+          ;; EVERY pre-call value folded in AFTER the call. This is the whole point: each one had
+          ;; to survive a boundary the allocator does not own.
+          (loop (if (>= (load j) (load n)) (break)
+                  (do (store! acc (n-new3 OP-ADD 0 NO-NODE (load acc) (load (index p (load j)))))
+                      (store! j (+ (load j) 1))
+                      0)))
+          (let [ret (n-new2 OP-RETURN 0 (call-end site) (load acc))]
+            (n-add-def! (g-stop) ret)
+            (g-analyze!)
+            ret))))))
+
+(defn call-colors-at? [(ops (slice u8)) (regs i64)] (-> bool)
+  (graph-reset! 909)
+  (build-call-program! ops)
+  (if (!= (g-verify) 0) false
+    (if (not (be-select-machine-program!)) false
+      (do (be-schedule!) (= (be-color! regs) 0)))))
+
+;; A CALL NEEDS MORE REGISTERS THAN WIDE-REGS. Measured: the smallest count that colours this
+;; shape is 11, because a call pins argument and return registers by ABI on top of everything the
+;; caller keeps live across it. Searching to 8 made the precondition unsatisfiable and the property
+;; vacuous -- 200 of 200 cases rejected, which the runner reported as a warning rather than letting
+;; it pass silently.
+(const CALL-WIDE-REGS i64 16)
+(defn call-min-regs [(ops (slice u8))] (-> i64)
+  (let [(mut r) 1
+        (mut found) 0]
+    (loop (if (or (> (load r) CALL-WIDE-REGS) (!= (load found) 0)) (break)
+            (if (call-colors-at? ops (load r))
+                (do (store! found 1) 0)
+                (do (store! r (+ (load r) 1)) 0))))
+    (if (= (load found) 0) 0 (load r))))
+
+(defn call-eval [(ops (slice u8)) (arg i64)] (-> i64)
+  (graph-reset! 909)
+  (build-call-program! ops)
+  (assert (= (g-verify) 0))
+  (ev-reset!)
+  (let [a (find-arg)]
+    (if (!= a NO-NODE) (do (ev-bind! a (RInt arg)) 0) 0))
+  (assert (= (ev-run-nobind PROP-BUDGET) EV-OK))
+  (assert (= (rt-tag (ev-result)) RT-INT))
+  (rt-payload (ev-result)))
+
+(defn call-native-at [(ops (slice u8)) (arg i64) (regs i64)] (-> i64)
+  (graph-reset! 909)
+  (build-call-program! ops)
+  (assert (= (g-verify) 0))
+  (assert (be-select-machine-program!))
+  (be-schedule!)
+  (assert (= (be-color! regs) 0))
+  (be-encode!)
+  (native1 arg))
+
+(defprop call-native-agrees-with-interpreter-at-the-allocator-floor
+  [(ops (slice u8)) (arg i64)]
+  (assume (> (slice-len ops) 0))
+  (let [arg (% arg 1048576)
+        tight (call-min-regs ops)]
+    (assume (> tight 0))
+    (let [want (call-eval ops arg)
+          wide (call-native-at ops arg CALL-WIDE-REGS)
+          got (call-native-at ops arg tight)]
+      (and (= want wide) (= want got)))))

@@ -184,9 +184,17 @@ fails after 2 cases and shrinks to a 1-byte input.
   two or more) but neither `coil test` nor `--verbose` prints the distribution — only pass and
   reject counts. Evidence that an arm fires currently comes from the coverage delta, which is the
   weaker instrument. Worth asking upstream whether the distribution can be printed on success.
-- **Branches yes; loops, calls and memory no.** `emit-branch!` generates a diamond
+- **Calls need a bigger register budget than everything else.** The smallest count that colours the
+  call shape is 11 -- a call pins argument and return registers by ABI on top of every caller value
+  live across it -- so that property searches to 16 where the others search to 8. Searching to 8
+  made its precondition unsatisfiable and the property vacuous; the runner caught it with
+  "rejected 200 of 200 generated cases (100%). The precondition is too sparse", which is the guard
+  `classify` would have given if its buckets printed.
+- **Branches yes; memory no.** `emit-branch!` generates a diamond
   (`if (a < b) a+b else a-b`) merged by a Phi, which is what reaches the scheduler, the CFG and Phi
-  handling. *Owed:* loops (the deleted B08 gates), calls (B09/B10), and the heap (the GC gates).
+  handling; `build-loop-program!` covers the back edge (B08) and `build-call-program!` covers values
+  live across a call boundary (B09/B10). *Owed:* the heap -- objects, arrays and GC barriers, where
+  the deleted GC gates lived, and the largest uncovered region left.
 - The argument is reduced into ±2^40 to keep ADD/SUB exact.
 
 ### Measured: coverage, and a generator arm that was dead for 31,000 cases
@@ -214,6 +222,7 @@ Keyed off the low bits instead:
     float native      corpus 18, 1678 of 10602 edges   (1258 before float diamonds)
     float optimizer   corpus 19,  641 of 10602 edges   ( 487 before float diamonds)
     integer optimizer corpus 35,  765 of 10602 edges
+    call native       corpus  9, 1642 of 10721 edges
 
 60,000 guided iterations at the branch stage ran 52,842 cases with no disagreement.
 
