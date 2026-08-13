@@ -59,9 +59,16 @@ It is a deftest over six fixed programs rather than a property, because a link p
 sustain 200 cases (a property attempt ran past ten minutes). Breadth at that layer belongs to the
 mmap properties, which run thousands of cases against the same encoder.
 
-STILL OUT OF REACH: allocating programs, for the reason below -- the collector binds to the
-object's stackmap and layout SECTIONS, so linking is necessary but not sufficient; that harness
-needs the recovered `native-gc-runtime.c` compiled in alongside.
+ALLOCATING PROGRAMS: one step further, still not running. The recovered collector
+(`git show c8b0a65^:tools/native-gc-runtime.c`, 2166 lines, plus `js-value.h`) COMPILES AND LINKS
+against an emitted allocating object -- no undefined symbols, so the stackmap and layout sections
+resolve. Running it exits 139 (SIGSEGV) even after `aot_gc_configure(1<<20, 0)`.
+
+So the remaining gap is runtime INITIALISATION, not linking. `aot_gc_alloc` takes a `context`
+argument and the collector keeps an `aot_gc_thread_state`; establishing what the emitted code
+expects in those is the next step, and it is now a bounded question against a recovered 2166-line
+file rather than an unknown. The deleted `tools/native-gc-harness.c` from the same commit is
+probably the answer sitting in git.
 
 
 
