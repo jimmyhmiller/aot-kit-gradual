@@ -59,7 +59,28 @@ It is a deftest over six fixed programs rather than a property, because a link p
 sustain 200 cases (a property attempt ran past ten minutes). Breadth at that layer belongs to the
 mmap properties, which run thousands of cases against the same encoder.
 
-ALLOCATING PROGRAMS: one step further, still not running. The recovered collector
+ALLOCATING PROGRAMS RUN. SOLVED -- see the recipe below.
+
+    stdout=[41] exit=0
+
+An emitted allocating object (store 41 into a field, load it back) links against the recovered
+collector and executes correctly. The two pieces missing from my earlier attempts:
+
+  1. `native-gc-trampoline.S` must be linked in as well -- 54 lines of assembly.
+  2. The kernel is called THROUGH the trampoline, `aot_gc_enter(fn)`, never directly. Calling
+     `kernel(arg)` straight from `main` segfaults, which is what "the heap argument is wrong" looked
+     like for several attempts. There is no heap argument; there is an entry protocol.
+
+  int aot_gc_configure(size_t bytes, int stress);   // returns nonzero on success
+  int64_t aot_gc_enter(int64_t (*)(void));          // run the kernel under the collector
+
+The three sources are restored to `native/gc/` (runtime.c, trampoline.S, js-value.h) so this no
+longer depends on archaeology. A deftest can drive the link -- `tests/linked-object-test.coil`
+already does exactly that with `popen` -- so native heap, array and GC-barrier coverage is now
+mechanical work rather than a blocked question. Counters the collector exposes for assertions:
+aot_gc_collections, verifications, moves, slow_paths, promotions, barriers, allocations.
+
+SUPERSEDED NOTE, kept because the reasoning was wrong in an instructive way: one step further, still not running. The recovered collector
 (`git show c8b0a65^:tools/native-gc-runtime.c`, 2166 lines, plus `js-value.h`) COMPILES AND LINKS
 against an emitted allocating object -- no undefined symbols, so the stackmap and layout sections
 resolve. Running it exits 139 (SIGSEGV) even after `aot_gc_configure(1<<20, 0)`.
