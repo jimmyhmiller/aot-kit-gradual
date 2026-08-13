@@ -338,6 +338,25 @@
 (defn flt-same? [(a i64) (b i64)] (-> bool)
   (if (and (nan-bits? a) (nan-bits? b)) true (= a b)))
 
+;; A float diamond: `if (a < b) a+b else a-b`, merged by a float Phi.
+;;
+;; The integer diamonds never reach this. FP values allocate from a different register bank, so a
+;; Phi merging two float arms is where a spill slot and a merge have to agree about a location in a
+;; class the integer path never touches -- which is the rule the deleted B05 gate policed as a
+;; negative test ("cross-register-class: named liveness rejection").
+(defn emit-flt-branch! [(ctrl i64) (a i64) (b i64)] (-> i64)
+  (let [cond (n-new3 OP-LT 0 NO-NODE a b)
+        arms (n-if-arms! (n-peephole (n-new2 OP-IF 0 ctrl cond)))
+        region (n-new OP-REGION 0)]
+    (n-add-def! region NO-NODE)
+    (n-add-def! region (arms-t arms))
+    (n-add-def! region (arms-f arms))
+    (let [phi (n-new OP-PHI (t-flt))]
+      (n-add-def! phi region)
+      (n-add-def! phi (n-new3 OP-ADD 0 NO-NODE a b))
+      (n-add-def! phi (n-new3 OP-SUB 0 NO-NODE a b))
+      phi)))
+
 (defn build-flt-program! [(ops (slice u8))] (-> i64)
   (let [pool (stack (array i64 32))
         p (cast (ptr i64) pool)
@@ -349,6 +368,7 @@
     (store! (index p 2) seed)
     (let [(mut n) 3
           (mut cur) seed
+          (mut ctrl) (g-start)
           (mut i) 0
           limit (if (> (slice-len ops) MAX-OPS) MAX-OPS (slice-len ops))]
       (loop (if (>= (load i) limit) (break)
@@ -359,12 +379,19 @@
                     other (if (= (% (/ b 4) 2) 0)
                               (n-new1 OP-CONST (flt-const (% (/ b 8) FLT-CONSTS)) (g-start))
                             (load (index p (% (/ b 8) (load n)))))]
-                (store! cur (n-new3 (flt-op (% b FLT-OPS)) 0 NO-NODE (load cur) other))
+                ;; One step in four is a diamond. Low bits, not high: the (slice u8) generator
+                ;; produces printable bytes, and a step chosen from the top bits never fires.
+                (if (= (% b 4) 3)
+                    (let [phi (emit-flt-branch! (load ctrl) (load cur) other)]
+                      (store! ctrl (n-in phi 0))
+                      (store! cur phi)
+                      0)
+                  (store! cur (n-new3 (flt-op (% (/ b 4) FLT-OPS)) 0 NO-NODE (load cur) other)))
                 (store! (index p (load n)) (load cur))
                 (store! n (+ (load n) 1))
                 (store! i (+ (load i) 1))
                 0)))
-      (let [ret (n-new2 OP-RETURN 0 (g-start) (load cur))]
+      (let [ret (n-new2 OP-RETURN 0 (load ctrl) (load cur))]
         (n-add-def! (g-stop) ret)
         (g-analyze!)
         ret))))
@@ -619,3 +646,47 @@
           wide (loop-native-at trips opk body arg WIDE-REGS)
           got (loop-native-at trips opk body arg tight)]
       (and (= want wide) (= want got)))))
+
+;; EVERY GENERATOR ARM MUST ACTUALLY FIRE.
+;;
+;; This exists because one did not. The branch step was originally chosen from a byte's TOP two
+;; bits, and the `(slice u8)` generator produces printable bytes, so the diamond code was dead
+;; through 31,000 cases while the coverage number sat still and read as a ceiling. `classify` would
+;; be the natural guard, but its buckets are not printed by `coil test` or `--verbose`, so the
+;; distribution is not observable from a run. A structural assertion is.
+(defn graph-has-op? [(op i64)] (-> bool)
+  (let [n (n-count)
+        (mut i) 0
+        (mut found) false]
+    (loop (if (or (>= (load i) n) (load found)) (break)
+            (do (if (and (not (n-dead? (load i))) (= (n-op (load i)) op))
+                    (do (store! found true) 0)
+                    0)
+                (store! i (+ (load i) 1))
+                0)))
+    (load found)))
+
+(deftest every-generator-arm-fires
+  ;; byte 3: (% 3 4) = 3 -> the branch arm in both generators.
+  (graph-reset! 909)
+  (build-program! "\x03")
+  (assert (graph-has-op? OP-PHI))
+  (assert (graph-has-op? OP-REGION))
+  (assert (graph-has-op? OP-IF))
+  (graph-reset! 909)
+  (build-flt-program! "\x03")
+  (assert (graph-has-op? OP-PHI))
+  (assert (graph-has-op? OP-REGION))
+  (assert (graph-has-op? OP-IF))
+  ;; byte 0: (% 0 4) = 0 -> the arithmetic arm, and NO control flow.
+  (graph-reset! 909)
+  (build-program! "\x00")
+  (assert (not (graph-has-op? OP-IF)))
+  (graph-reset! 909)
+  (build-flt-program! "\x00")
+  (assert (not (graph-has-op? OP-IF)))
+  ;; the loop generator always builds its loop
+  (graph-reset! 909)
+  (build-loop-program! 3 0 "ab")
+  (assert (graph-has-op? OP-LOOP))
+  (assert (graph-has-op? OP-PHI)))

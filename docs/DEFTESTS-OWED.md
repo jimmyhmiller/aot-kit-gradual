@@ -205,9 +205,15 @@ ceiling.
 
 Keyed off the low bits instead:
 
-    ADD/SUB only      corpus 12, 561 of 8650 edges,  23.5% rejected
-    + branches        corpus 19, 739 of 8655 edges,  13.8% rejected
-    + bitwise ops     corpus 20, 775 of 8659 edges,  12.5% rejected
+    ADD/SUB only      corpus 12,  561 of  8650 edges,  23.5% rejected
+    + branches        corpus 19,  739 of  8655 edges,  13.8% rejected
+    + bitwise ops     corpus 20,  775 of  8659 edges,  12.5% rejected
+    on the machine selector, after the legacy one was deleted:
+    integer native    corpus 16, 1678 of 10602 edges
+    loop native       corpus 24, 1886 of 10602 edges
+    float native      corpus 18, 1678 of 10602 edges   (1258 before float diamonds)
+    float optimizer   corpus 19,  641 of 10602 edges   ( 487 before float diamonds)
+    integer optimizer corpus 35,  765 of 10602 edges
 
 60,000 guided iterations at the branch stage ran 52,842 cases with no disagreement.
 
