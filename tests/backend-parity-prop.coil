@@ -190,6 +190,27 @@
                 0)))
     (load found)))
 
+;; Evaluate the program, optionally running the optimizer first.
+;;
+;; `iterate!` self-seeds with `wl-push-live!` and runs peephole, GVN, type narrowing and dead-node
+;; elimination to a fixpoint, so this needs no worklist priming -- but it does need `g-analyze!`
+;; again afterwards, since the graph it analysed is not the graph that comes out.
+;;
+;; THE ARGUMENT CAN BE OPTIMIZED AWAY. `BITXOR(x, x)` folds to zero, and the generator can pick the
+;; running value as its own second operand, so a program that read `arg` before folding may not
+;; afterwards. That is the optimizer working, not a failure: bind only if the node survived.
+(defn eval-program [(ops (slice u8)) (arg i64) (optimize bool)] (-> i64)
+  (graph-reset! 909)
+  (build-program! ops)
+  (if optimize (do (iterate!) (g-analyze!) 0) 0)
+  (assert (= (g-verify) 0))
+  (ev-reset!)
+  (let [a (find-arg)]
+    (if (!= a NO-NODE) (do (ev-bind! a (RInt arg)) 0) 0))
+  (assert (= (ev-run-nobind PROP-BUDGET) EV-OK))
+  (assert (= (rt-tag (ev-result)) RT-INT))
+  (rt-payload (ev-result)))
+
 ;; NOT `ev-run-bound`. That takes a SEED and binds each argument to a value derived from it
 ;; (`seed*31 + k*7919`), which is the right thing for a fixture asserting a pinned number and the
 ;; wrong thing here: the native side is called with `arg` itself, so seeding would compare two
@@ -264,3 +285,17 @@
           wide (native-at ops arg WIDE-REGS)
           got (native-at ops arg tight)]
       (and (= want wide) (= want got)))))
+
+;; The optimizer must not change what a program means.
+;;
+;; A DIFFERENT SUBSYSTEM from the property above, and a cheaper one: no backend, no register
+;; allocation, no execution. `iterate!` folds constants, merges equal nodes with GVN, narrows types
+;; and deletes what it proves dead -- every one of which is a rewrite that can be wrong in a way the
+;; graph verifier still accepts. Interpreting before and after is what makes a wrong rewrite visible.
+(defprop optimization-preserves-meaning
+  [(ops (slice u8)) (arg i64)]
+  (assume (> (slice-len ops) 0))
+  (let [arg (% arg 1099511627776)
+        raw (eval-program ops arg false)
+        opt (eval-program ops arg true)]
+    (= raw opt)))
