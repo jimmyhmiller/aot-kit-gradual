@@ -1,0 +1,188 @@
+;; JAVASCRIPT AS AN OUTPUT FORMAT, NOT AS THE THING BEING MUTATED.
+;;
+;; This is the architecture every serious JavaScript fuzzer converged on, and the reason is that
+;; mutating source TEXT is close to useless: flip bytes in a program and almost none of the results
+;; parse, and almost none of the ones that parse survive their first line. So the thing generated
+;; and mutated is a linear program description in which every step consumes values that provably
+;; exist, and source is emitted from it only at the end. Fuzzilli calls that description FuzzIL;
+;; here it is the same byte string the other properties drive their IR from.
+;;
+;; ONE DESCRIPTION, TWO BACKENDS. `lift-js!` writes it as TypeScript; `build-ir!` builds the same
+;; program straight as IR. Both walk the identical byte loop and make identical decisions, so the
+;; two are the same program by construction.
+;;
+;; THAT IS WHAT GIVES THE FRONTEND AN ORACLE. The graph the frontend produces from the lifted source
+;; must compute what the directly-built graph computes. A disagreement is the frontend mistranslating
+;; its input -- which is the check that was lost when the second, JavaScript frontend was deleted,
+;; recovered here without any external engine. `src/frontend_native_graph.coil` is 7,290 lines, the
+;; largest module in the repo, and until now one pinned six-line graph was the whole of its coverage.
+(module jssourceprop)
+
+(import "ty" :use *)
+(import "node" :use *)
+(import "verify" :use *)
+(import "eval" :use *)
+(import "shape" :use *)
+(import "jsstring" :use *)
+(import "frontendnative" :use *)
+(import "frontendnativegraph" :use *)
+(import "coil.assert" :use *)
+(import "coil.prop" :use *)
+(import "coil.io" :use *)
+(import "coil.fmt" :use *)
+(import "coil.slice" :use *)
+(import "coil.alloc" :use *)
+(import "coil.control" :use *)
+(import "coil.str" :use *)
+
+(const JS-BUDGET i64 100000)
+;; Eight statements keeps the emitted source well inside the buffer and the case fast.
+(const JS-MAX-OPS i64 8)
+
+;; ONLY `+` AND `-`, and the omission is the whole reason this property can compare anything.
+;; JavaScript's `&`, `|` and `^` are int32 operators: they run ToInt32 on both operands and yield a
+;; signed 32-bit result. The IR's bitwise nodes do not. Generating them would produce a disagreement
+;; on every wide value and report the language's own semantics as a compiler bug.
+(defn js-op-add? [(b i64)] (-> bool) (= (% b 2) 0))
+
+;; Does this step use a fresh constant, or an earlier variable?
+(defn js-uses-const? [(b i64)] (-> bool) (= (% (/ b 4) 2) 0))
+(defn js-const-of [(b i64)] (-> i64) (+ 1 (% (/ b 8) 7)))
+(defn js-var-of [(b i64) (n i64)] (-> i64) (% (/ b 8) n))
+
+(defn js-limit [(ops (slice u8))] (-> i64)
+  (if (> (slice-len ops) JS-MAX-OPS) JS-MAX-OPS (slice-len ops)))
+
+;; ---------------------------------------------------------------------------
+;; Backend 1: TypeScript source
+;; ---------------------------------------------------------------------------
+(defn lift-js! [(ops (slice u8)) (buf (ptr i8)) (cap i64)] (-> (slice u8))
+  (let [fb (stack FixBuf)
+        w (stack Writer)]
+    (store! (field fb data) buf)
+    (store! (field fb cap) cap)
+    (store! (field fb len) 0)
+    (fixed-buffer-writer w fb)
+    (ps w "function main(n: number): number {\n")
+    ;; v0 seeds from the parameter so the argument is always live.
+    (ps w "  let v0 = n + 3;\n")
+    (let [(mut k) 0
+          limit (js-limit ops)]
+      (loop (if (>= (load k) limit) (break)
+              (let [b (cast i64 (slice-get ops (load k)))
+                    cur (+ (load k) 1)]
+                (fmt w "  let v{d} = v{d} " cur (load k))
+                (ps w (if (js-op-add? b) "+ " "- "))
+                (if (js-uses-const? b)
+                    (fmt w "{d};\n" (js-const-of b))
+                  (fmt w "v{d};\n" (js-var-of b cur)))
+                (store! k (+ (load k) 1))
+                0)))
+      (fmt w "  return v{d};\n" (js-limit ops))
+      (ps w "}\n"))
+    (let [n (load (field fb len))]
+      (if (>= n cap)
+          (do (fmt (stderr) "lift-js!: source did not fit the buffer\n") (abort) 0)
+          0)
+      (slice-new [u8] (cast (ptr u8) buf) n))))
+
+;; ---------------------------------------------------------------------------
+;; Backend 2: the same program, straight to IR
+;; ---------------------------------------------------------------------------
+(defn build-ir! [(ops (slice u8))] (-> i64)
+  (let [pool (stack (array i64 32))
+        p (cast (ptr i64) pool)
+        a0 (n-new1 OP-ARG (t-int) (g-start))
+        v0 (n-new3 OP-ADD 0 NO-NODE a0 (n-new1 OP-CONST (t-int-con 3) (g-start)))]
+    (store! (index p 0) v0)
+    (let [(mut n) 1
+          (mut cur) v0
+          (mut k) 0
+          limit (js-limit ops)]
+      (loop (if (>= (load k) limit) (break)
+              (let [b (cast i64 (slice-get ops (load k)))
+                    other (if (js-uses-const? b)
+                              (n-new1 OP-CONST (t-int-con (js-const-of b)) (g-start))
+                            (load (index p (js-var-of b (load n)))))]
+                (store! cur (n-new3 (if (js-op-add? b) OP-ADD OP-SUB) 0 NO-NODE (load cur) other))
+                (store! (index p (load n)) (load cur))
+                (store! n (+ (load n) 1))
+                (store! k (+ (load k) 1))
+                0)))
+      (let [ret (n-new2 OP-RETURN 0 (g-start) (load cur))]
+        (n-add-def! (g-stop) ret)
+        (g-analyze!)
+        ret))))
+
+;; EVERY table, not just the graph. A property runs its body hundreds of times in one process, and
+;; the frontend interns shapes and strings as it lowers: resetting only the graph leaves those
+;; growing case after case until a single case exceeds the 60-second watchdog. A deftest calling
+;; this two or three times never notices; a property does immediately.
+(defn js-reset-world! [] (-> i64)
+  (graph-reset! 4242)
+  (shape-reset!)
+  (jss-reset!)
+  0)
+
+;; The graph's single OP-ARG node, whichever backend produced the graph.
+(defn js-find-arg [] (-> i64)
+  (let [n (n-count)
+        (mut i) 0
+        (mut found) NO-NODE]
+    (loop (if (>= (load i) n) (break)
+            (do (if (and (not (n-dead? (load i))) (= (n-op (load i)) OP-ARG))
+                    (do (store! found (load i)) 0)
+                    0)
+                (store! i (+ (load i) 1))
+                0)))
+    (load found)))
+
+(defn js-eval-current [(arg i64)] (-> i64)
+  (assert (= (g-verify) 0))
+  (ev-reset!)
+  (let [a (js-find-arg)]
+    (if (!= a NO-NODE) (do (ev-bind! a (RInt arg)) 0) 0))
+  (assert (= (ev-run-nobind JS-BUDGET) EV-OK))
+  (assert (= (rt-tag (ev-result)) RT-INT))
+  (rt-payload (ev-result)))
+
+(defn eval-via-ir [(ops (slice u8)) (arg i64)] (-> i64)
+  (js-reset-world!)
+  (build-ir! ops)
+  (js-eval-current arg))
+
+(defn eval-via-source [(ops (slice u8)) (arg i64)] (-> i64)
+  (let [buf (stack (array i8 8192))
+        source (lift-js! ops (cast (ptr i8) buf) 8192)]
+    (js-reset-world!)
+    (let [(mut fe) (fe-native-new source)]
+      (assert (= (fe-native-index! (mut fe)) FE-OK))
+      (frontend-native-build! (mut fe) 6201 true)
+      (let [r (js-eval-current arg)]
+        (fe-native-free! (mut fe))
+        r))))
+
+;; The frontend must translate the source into a graph that means what the program means.
+;;
+;; A `defprop` here HANGS -- see docs/DEFTESTS-OWED.md. The same calls run fine in a deftest, so
+;; this is table-driven until that is understood, rather than left red or deleted.
+(deftest frontend_translates_generated_javascript_faithfully
+  (let [progs (stack (array i64 6))]
+    ;; Each row is a program description; the same bytes drive both backends.
+    (assert (= (eval-via-ir "a" 10) (eval-via-source "a" 10)))
+    (assert (= (eval-via-ir "ab" 10) (eval-via-source "ab" 10)))
+    (assert (= (eval-via-ir "abcd" -7) (eval-via-source "abcd" -7)))
+    (assert (= (eval-via-ir "abcdefgh" 0) (eval-via-source "abcdefgh" 0)))
+    (assert (= (eval-via-ir "zqx" 1099511627775) (eval-via-source "zqx" 1099511627775)))
+    (assert (= (eval-via-ir "\x01\x02\x03" -1099511627775)
+               (eval-via-source "\x01\x02\x03" -1099511627775)))
+    ;; and the lifted text is the program it claims to be
+    (let [buf (stack (array i8 8192))]
+      (assert (str-eq (lift-js! "a" (cast (ptr i8) buf) 8192)
+                      "function main(n: number): number {
+  let v0 = n + 3;
+  let v1 = v0 - 6;
+  return v1;
+}
+")))
+    0))

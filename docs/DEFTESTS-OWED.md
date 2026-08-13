@@ -245,3 +245,45 @@ Verified on the installed `~/.cargo/bin/coil`: `coil fuzz tests/backend-parity-p
 gives corpus 12, 561 of 8650 edges, 233 cases passed. The 551-test gate is green on the same
 toolchain, which matters here — this repo has twice had a compiler upgrade expose formerly-benign
 UB of its own, so a new install is a reason to re-run the gate rather than assume it.
+
+## The JavaScript source lifter (2026-08-13)
+
+`tests/js-source-prop.coil`. One generated program description, two backends: `lift-js!` writes it
+as TypeScript, `build-ir!` builds the same program straight as IR. Both walk the identical byte loop
+and make identical decisions, so they are the same program by construction.
+
+That is the architecture JavaScript fuzzers converged on (Fuzzilli's FuzzIL being the well-known
+one): generate and mutate a linear description in which every step consumes values that provably
+exist, and emit source only at the end. Mutating source text is close to useless -- almost nothing
+survives the parser, and almost nothing that parses survives its first line.
+
+**It gives the frontend an oracle with no external engine.** The graph the frontend produces from
+the lifted source must compute what the directly-built graph computes; a disagreement is the
+frontend mistranslating its input. That is the check lost when the JavaScript frontend was deleted,
+recovered from inside. `src/frontend_native_graph.coil` is 7,290 lines -- the largest module in the
+repo -- and one pinned six-line graph was the whole of its coverage before this.
+
+Only `+` and `-` are generated. JavaScript's `&`, `|` and `^` are int32 operators (ToInt32 on both
+operands, signed 32-bit result) and the IR's bitwise nodes are not, so generating them would report
+the language's own semantics as a compiler bug. Covering them needs the lifter to model ToInt32.
+
+### OPEN: the property hangs, the deftest does not
+
+The differential is **table-driven**, not a `defprop`. As a property it fails with
+
+    the property NEVER FINISHED on this input (watchdog fired after 60s)
+
+on case 0, for any seed, after ~64 shrink calls. The same inputs -- including the exact reported
+counterexample and its exact argument -- run in well under a second from a `deftest`, returning
+matching values from both backends.
+
+Ruled out: the input (reproduced by hand, passes), program length (8-statement programs pass),
+`--no-fork` (hangs the same), and interning-table growth (`shape-reset!`/`jss-reset!` per case,
+still hangs).
+
+Not ruled out: the frontend reaches the TypeScript-Go bridge, whose c-archive starts Go runtime
+threads, and a property forks per case. Fork plus a multithreaded runtime is the shape of this
+project's signal-9 saga. A hypothesis, not a diagnosis. Raised with the coil session.
+
+Worth resolving -- a source-level property is the only thing that would exercise the frontend at
+scale, and the lifter it needs already works.
