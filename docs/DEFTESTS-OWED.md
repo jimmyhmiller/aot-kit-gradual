@@ -75,10 +75,10 @@ deftest that replaces it.
 
 | Proved | Deftest owed |
 |---|---|
-| arm64 Mach-O links and executes; kernel returns 84 | Build the graph, run the backend, assert on `be-object-len` and the encoded instruction sequence. Execution is not recoverable in-process. |
+| arm64 Mach-O links and executes; kernel returns 84 | Split it: "the instructions compute 84" is a deftest that mmaps and calls them (see above). "The object links" is not recoverable in-process. |
 | Six call layouts + external allocation relocation linked and executed | Per-layout deftest asserting the selected machine program and relocation entries. |
 | Fast allocation, promotion, recursive raw/boxed roots, old-to-young barriers; OOM and omitted barriers trap | Per-scenario deftest over the GC graph; assert barrier nodes are present where required. The *trap* cases were the strongest part of this gate — they need explicit negative deftests. |
-| FP semantics, constants, calls, Phis, safepoints, forced spills execute natively | Deftests at 8 and 1 registers asserting the allocated/encoded form; evaluator for values. |
+| FP semantics, constants, calls, Phis, safepoints, forced spills execute natively | A `defprop` in the shape of `backend-parity-prop.coil`, generating FP graphs. Note one register is infeasible for a generated tree — search for the allocator floor rather than pinning a count. |
 | All 54 JSL builtins reach machine code; 180 results agree with Node | Deftest per builtin asserting it lowers and encodes. The 180 value comparisons become recorded expectations (see above). |
 
 ### Differential vs Node — 19 oracles, 15 golden tables
