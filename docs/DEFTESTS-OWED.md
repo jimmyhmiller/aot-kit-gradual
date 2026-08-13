@@ -373,10 +373,24 @@ as an argument, so an allocating program needs a heap in the right slot. Passing
 region as either the first or the second argument SEGFAULTS, so allocation expects an initialised
 structure -- a bump pointer and a limit, most likely -- and not a raw region.
 
-The contract for that structure lived in `tools/native-gc-runtime.c`, deleted with everything else.
-Recover it with `git show <deletion>:tools/native-gc-runtime.c`. Note this corrects an earlier
-reading in this file: "zero external relocations" means allocation is INLINED, not that it needs no
-runtime -- the inlined sequence still bump-allocates against state that something must initialise.
+RECOVERED AND ANSWERED. `git show c8b0a65^:tools/native-gc-runtime.c` is a semispace copying
+collector, and the first thing it does is bind to the emitted object's SECTIONS:
+
+    extern const uint8_t aot_stackmaps[] __asm("section$start$__DATA$__aot_stackmap");
+    extern const uint8_t aot_layouts[]   __asm("section$start$__DATA$__aot_layout");
+    extern const uint8_t aot_kernel[]    __asm("_kernel");
+
+So allocating code cannot be executed from an mmapped page at all, whatever is passed as the heap.
+The collector needs the stackmap and layout sections and the `_kernel` symbol, which exist only in
+a LINKED Mach-O object. This is not an argument-convention problem and no amount of probing solves
+it: it is the linked-object capability recorded as lost at the top of this file, met from the other
+direction.
+
+Two consequences worth stating plainly. Native heap and GC coverage requires a deftest that drives
+`clang` -- which puts it behind the same fork-versus-Go-runtime question as everything else here.
+And this corrects an earlier reading in this file: "zero external relocations" means allocation is
+INLINED, not that it needs no runtime; the inlined sequence bump-allocates against state the
+collector initialises through those sections.
 
 Until that is reconstructed, the heap and array properties compare the interpreter against the
 optimiser only, and every GC barrier the deleted native-gc gate covered stays uncovered.
