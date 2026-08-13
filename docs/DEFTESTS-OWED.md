@@ -202,7 +202,7 @@ Also measured: 22.9% of cases are discarded by `assume` (programs whose allocato
 `WIDE-REGS`). That is the generator's balance between `MAX-OPS` and `WIDE-REGS`, not a fuzz problem,
 and it is wasted work worth tuning.
 
-### `coil fuzz` does not work in this project
+### `coil fuzz` (was broken here; fixed upstream)
 
 `coil fuzz tests/backend-parity-prop.coil` fails in the instrumented build:
 
@@ -214,7 +214,7 @@ It passes this project's `[link] flags` from `Coil.toml` to clang as coil's own 
 `coil build` and `coil test` handle the same manifest correctly, so this is a `coil fuzz` bug, not
 a manifest problem.
 
-**FIXED upstream 2026-08-13, not yet installed.** Root cause was `m-emit-link` in the compiler's
+**FIXED and installed 2026-08-13** (coil `565f416`). Root cause was `m-emit-link` in the compiler's
 driver: it exists to build a `<self> build …` child command line, so it spells every manifest link
 input as `--link-flag <tok>` — including `-framework` and its name as two separate pairs — and the
 fuzz path was the one caller handing that to clang directly. The fix also repaired three further
@@ -223,5 +223,7 @@ build (this project has one, so the next failure would have been `Undefined symb
 `[metaprograms]` were not applied to `emit-ir` (fuzz silently tested a different program than
 `coil test` does), and `m-prepare-native-deps` was skipped.
 
-Until `~/.cargo/bin/coil` is rebuilt, `coil fuzz` still fails here. Check `coil --version` against
-the install rather than assuming.
+Verified on the installed `~/.cargo/bin/coil`: `coil fuzz tests/backend-parity-prop.coil -n 100`
+gives corpus 12, 561 of 8650 edges, 233 cases passed. The 551-test gate is green on the same
+toolchain, which matters here — this repo has twice had a compiler upgrade expose formerly-benign
+UB of its own, so a new install is a reason to re-run the gate rather than assume it.
