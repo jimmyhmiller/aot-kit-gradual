@@ -918,6 +918,58 @@
 
 ;; Kinds 0 and 4 are interpreter-only comparisons (the optimiser and the heap), so this asserts what
 ;; each shape can actually support rather than forcing every shape through the backend.
+; ============================================================================
+; Arrays
+; ============================================================================
+;; An array is an allocation the runtime treats specially -- marked, indexed, length-carrying -- so
+;; it reaches OP-ARRAYMARK, OP-ARRAYSTORE, OP-ARRAYLOAD, OP-ARRAYLEN and the boxing that indexed
+;; storage requires, none of which the object property touches. Storing at GENERATED indices is the
+;; part that matters: the length is a function of the largest index written, so an optimiser that
+;; reorders or drops a store changes the answer.
+(defn build-array-program! [(ops (slice u8))] (-> i64)
+  (shape-reset!)
+  (let [shape (shape-transition SHAPE-ROOT "keep" (t-int))
+        alias (shape-field-alias shape 0)
+        allocation (n-new-obj1! (g-start) shape (mk-mem-in alias))
+        array (n-array-mark! (g-start) (n-obj-ptr allocation))
+        a0 (n-new1 OP-ARG (t-int) (g-start))]
+    (let [(mut mem) (mk-mem-in JS-PROPERTY-ALIAS)
+          (mut k) 0
+          limit (if (> (slice-len ops) 8) 8 (slice-len ops))]
+      (loop (if (>= (load k) limit) (break)
+              (let [b (cast i64 (slice-get ops (load k)))
+                    idx (n-new1 OP-CONST (t-int-con (% b 6)) (g-start))]
+                (store! mem (n-array-store! (load mem) array idx
+                                            (n-box! (n-new1 OP-CONST (t-int-con (% (/ b 8) 9))
+                                                            (g-start)))))
+                (store! k (+ (load k) 1))
+                0)))
+      ;; The argument is folded into the result. Creating an OP-ARG and never referencing it is a
+      ;; LEAK to the verifier -- correctly, since an unread parameter is a graph that lies about
+      ;; what it consumes.
+      (let [value (n-new3 OP-ADD 0 NO-NODE (n-array-length! (load mem) array) a0)
+            memory (n-memmerge2! (n-obj-mem allocation 0) (load mem))
+            ret (n-new3 OP-RETURN 0 (g-start) value memory)]
+        (n-add-def! (g-stop) ret)
+        (g-analyze!)
+        ret))))
+
+(defn array-eval [(ops (slice u8)) (arg i64) (optimize bool)] (-> i64)
+  (graph-reset! 909)
+  (build-array-program! ops)
+  (if optimize (do (iterate!) (g-analyze!) 0) 0)
+  (assert (= (g-verify) 0))
+  (ev-reset!)
+  (let [a (find-int-arg)]
+    (if (!= a NO-NODE) (do (ev-bind! a (RInt arg)) 0) 0))
+  (assert (= (ev-run-nobind PROP-BUDGET) EV-OK))
+  (rt-payload (ev-result)))
+
+(defprop array-optimization-preserves-meaning
+  [(ops (slice u8)) (arg i64)]
+  (assume (> (slice-len ops) 0))
+  (= (array-eval ops arg false) (array-eval ops arg true)))
+
 (defprop every-shape-agrees-under-one-corpus
   [(ops (slice u8)) (arg i64)]
   (assume (> (slice-len ops) 1))
