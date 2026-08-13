@@ -283,11 +283,17 @@ property runner still forks per generated case.
 Two things had to be understood before that pair of runs meant anything, both from reading
 `prop_runner.coil`:
 
-- **`--no-fork` gates one of four fork sites.** It reaches the property runner (`prop_runner.coil`
-  :942) but governs only the generation loop; `fork-replay`, the bisection in `find-crashing-case`,
-  and the per-shrink-candidate fork all fork unconditionally. So `--no-fork` on a FAILING property
-  proves nothing -- the failure path forks regardless. A clean measurement needs a property that
-  passes.
+- **`--no-fork` had exactly one gap, since fixed upstream.** It reaches the property runner
+  (`prop_runner.coil`:942) and gated the generation loop; the reuse phase reached it through
+  `fork-replay` before the flag was read, so a run that replayed a stored failure forked no matter
+  what the flag said. The bisection and per-candidate forks look ungated but are unreachable under
+  the flag by construction -- a crashing case takes the process with it rather than returning a
+  signal from a child, so the `> 128` branch they sit behind never runs. (An earlier version of this
+  note claimed four ungated sites. That was wrong and is corrected here.)
+  Verified on this machine, `--no-fork` with a saved crashing input: the pre-fix stdlib prints
+  "(replaying the saved counterexample)" and reports the crash, because a child died in the parent's
+  place; the post-fix stdlib lets the abort take the process. A clean measurement of anything else
+  still wants a property that PASSES.
 - **The reuse phase runs first and is seed-independent by design** (replay a known failure in the
   first millisecond rather than after 200 fresh cases). Its store is `.coil/pbt/<property>/failing`,
   overridable with `--db` or `COIL_PBT_DB`. An earlier attempt to measure this was worthless because
