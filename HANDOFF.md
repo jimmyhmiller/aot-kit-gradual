@@ -110,7 +110,8 @@ bad codegen. Diagnosis, fully verified by old-vs-new binary diff:
   symbol count back to 0); ns.js emit dropped 11.6s → 3.85s and the crash repro runs
   clean even without this repo's guard fix.
 - Certifying the 16:01 compiler surfaced a SECOND latent bug of the same species, this
-  time a stack buffer overflow in OUR tool: `emit-jsl-object.coil` sized its argument
+  time a stack buffer overflow in OUR tool: the JSL emitter (now `emit-object.coil`)
+  sized its argument
   array `(array i64 4)` while arity comes from the command line (JsonStringifyPlainArray
   is arity 6); the two stray writes used to land on dead frame padding, and the new frame
   layout put the args slice pointer there instead. Fixed (10 slots + a loud arity guard).
