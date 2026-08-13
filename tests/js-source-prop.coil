@@ -56,14 +56,15 @@
 ;; ---------------------------------------------------------------------------
 ;; Backend 1: TypeScript source
 ;; ---------------------------------------------------------------------------
-(defn lift-js! [(ops (slice u8)) (buf (ptr i8)) (cap i64)] (-> (slice u8))
+(defn lift-js-as! [(ops (slice u8)) (buf (ptr i8)) (cap i64) (typed bool)] (-> (slice u8))
   (let [fb (stack FixBuf)
         w (stack Writer)]
     (store! (field fb data) buf)
     (store! (field fb cap) cap)
     (store! (field fb len) 0)
     (fixed-buffer-writer w fb)
-    (ps w "function main(n: number): number {\n")
+    (if typed (ps w "function main(n: number): number {\n")
+              (ps w "function main(n) {\n"))
     ;; v0 seeds from the parameter so the argument is always live.
     (ps w "  let v0 = n + 3;\n")
     (let [(mut k) 0
@@ -89,6 +90,10 @@
 ;; ---------------------------------------------------------------------------
 ;; Backend 2: the same program, straight to IR
 ;; ---------------------------------------------------------------------------
+;; TypeScript for the frontend, plain JavaScript for node -- node cannot parse the annotations.
+(defn lift-js! [(ops (slice u8)) (buf (ptr i8)) (cap i64)] (-> (slice u8))
+  (lift-js-as! ops buf cap true))
+
 (defn build-ir! [(ops (slice u8))] (-> i64)
   (let [pool (stack (array i64 32))
         p (cast (ptr i64) pool)
@@ -186,3 +191,50 @@
 }
 ")))
     0))
+
+; ============================================================================
+; A real external oracle
+; ============================================================================
+;; NODE, NOT OURSELVES. Every other property in this repo compares two implementations that live
+;; here -- the evaluator against the backend, or a graph against itself before and after
+;; optimisation -- so all of them prove SELF-CONSISTENCY and none can prove correctness. If the
+;; evaluator and the backend share a misunderstanding of JavaScript, no amount of that fuzzing sees
+;; it. That is the ceiling docs/DEFTESTS-OWED.md opens with, and this is the property that lifts it.
+;;
+;; The generated description is lifted twice: to plain JavaScript for node, and to IR for us. A
+;; disagreement is a disagreement with the language, not with our other opinion of it.
+(extern popen :cc c [(ptr i8) (ptr i8)] (-> (ptr u8)))
+(extern pclose :cc c [(ptr u8)] (-> i32))
+(extern fgets :cc c [(ptr i8) i32 (ptr u8)] (-> (ptr i8)))
+(extern atoll :cc c [(ptr i8)] (-> i64))
+
+(defn node-run [(ops (slice u8)) (arg i64)] (-> i64)
+  (let [srcbuf (stack (array i8 4096))
+        cmdbuf (stack (array i8 8192))
+        modebuf (stack (array i8 2))
+        source (lift-js-as! ops (cast (ptr i8) srcbuf) 4096 false)
+        fb (stack FixBuf) w (stack Writer)]
+    (store! (index (cast (ptr i8) modebuf) 0) (cast i8 114))
+    (store! (index (cast (ptr i8) modebuf) 1) (cast i8 0))
+    (store! (field fb data) (cast (ptr i8) cmdbuf))
+    (store! (field fb cap) 8192)
+    (store! (field fb len) 0)
+    (fixed-buffer-writer w fb)
+    ;; Single-quoted shell argument: the lifted source contains no quote, and its only punctuation
+    ;; is arithmetic, so nothing here can close the quoting.
+    (fmt w "node -e '{s}; console.log(String(main({d})))'" source arg)
+    (store! (index (cast (ptr i8) cmdbuf) (load (field fb len))) (cast i8 0))
+    (let [f (popen (cast (ptr i8) cmdbuf) (cast (ptr i8) modebuf))
+          out (stack (array i8 256))]
+      (assert (!= (cast i64 f) 0))
+      (fgets (cast (ptr i8) out) 256 f)
+      (pclose f)
+      (atoll (cast (ptr i8) out)))))
+
+(defprop node_agrees_with_the_compiler
+  [(ops (slice u8)) (arg i64)]
+  (assume (> (slice-len ops) 0))
+  ;; Bounded so `+`/`-` stay exact on both sides: a JavaScript number stops being an exact integer
+  ;; at 2^53, and a disagreement there would be about the language rather than about us.
+  (let [arg (% arg 1048576)]
+    (= (node-run ops arg) (eval-via-ir ops arg))))

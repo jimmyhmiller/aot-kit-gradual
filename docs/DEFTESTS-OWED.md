@@ -20,7 +20,18 @@ a golden table, invoked a tool, or shelled out, which is why the deletion could 
 
 Both were accepted deliberately. They are the actual cost of this change.
 
-### 1. An independent authority on what the answer *is*
+### 1. An independent authority on what the answer *is* — PARTLY RECOVERED
+
+**`node_agrees_with_the_compiler` in `tests/js-source-prop.coil` restores this for arithmetic.** The
+generated description is lifted twice -- to plain JavaScript for `node -e` via `popen`, and to IR
+for us -- and the two answers must match. A disagreement is a disagreement with the language, not
+with our other opinion of it. 200 generated cases against a real JavaScript engine, ~12s.
+
+That covers `+` and `-` over one integer parameter and nothing else yet. Everything below still
+stands for every other surface: String, Math, Number, Array, the int32 operators, and the whole B07
+to B15 range.
+
+
 
 19 Node/V8 oracle scripts produced 15 committed golden tables. `jsl-gate.sh` stated the design in
 its own header:
