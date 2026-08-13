@@ -47,7 +47,11 @@
 (const MAX-OPS i64 24)
 ;; The generous register count, and the ceiling of the floor search.
 (const WIDE-REGS i64 8)
-;; ADD and SUB only, and the omissions are deliberate.
+;; ADD, SUB and the three bitwise ops. The omissions are deliberate.
+;;
+;; The bitwise operators are here because they are TOTAL AND EXACT on integers: no trap, and no
+;; path where the evaluator has to leave the integer domain. That makes them free coverage of
+;; instruction selection, which is why they came before loops or calls.
 ;;
 ;; No DIV or MOD: they trap on zero, and a disagreement about a fault is not a disagreement about
 ;; arithmetic. No MUL: the graph's `int` is a JAVASCRIPT integer, so the evaluator promotes an
@@ -57,7 +61,11 @@
 ;; calling the difference a bug. Covering MUL needs the comparison to model that promotion; it is
 ;; listed in docs/DEFTESTS-OWED.md rather than faked here.
 (defn prop-op [(k i64)] (-> i64)
-  (if (= k 0) OP-ADD OP-SUB))
+  (if (= k 0) OP-ADD
+    (if (= k 1) OP-SUB
+      (if (= k 2) OP-BITAND
+        (if (= k 3) OP-BITOR OP-BITXOR)))))
+(const PROP-OPS i64 5)
 
 ;; Build a straight-line integer expression over `arg` and return its Return node.
 ;;
@@ -125,7 +133,7 @@
                 ;; saturation. Three of four steps are arithmetic and one is a branch, so programs
                 ;; keep a straight-line spine with diamonds through it.
                 (if (< (% b 4) 3)
-                    (store! cur (n-new3 (prop-op (% (/ b 4) 2)) 0 NO-NODE (load cur) other))
+                    (store! cur (n-new3 (prop-op (% (/ b 4) PROP-OPS)) 0 NO-NODE (load cur) other))
                     (let [phi (emit-branch! (load ctrl) (load cur) other)]
                       (store! ctrl (n-in phi 0))
                       (store! cur phi)
@@ -221,6 +229,21 @@
                 (do (store! r (+ (load r) 1)) 0))))
     (if (= (load found) 0) 0 (load r))))
 
+;; How many branch steps this byte string will actually produce. Reported by `classify` below,
+;; because inferring which arms fire from a coverage number is exactly the mistake that let the
+;; branch arm sit dead through 31,000 cases: a flat number looks the same either way.
+(defn branch-count [(ops (slice u8))] (-> i64)
+  (let [limit (if (> (slice-len ops) MAX-OPS) MAX-OPS (slice-len ops))
+        (mut i) 0
+        (mut c) 0]
+    (loop (if (>= (load i) limit) (break)
+            (do (if (= (% (cast i64 (slice-get ops (load i))) 4) 3)
+                    (do (store! c (+ (load c) 1)) 0)
+                    0)
+                (store! i (+ (load i) 1))
+                0)))
+    (load c)))
+
 (defprop native-agrees-with-interpreter-at-the-allocator-floor
   [(ops (slice u8)) (arg i64)]
   (assume (> (slice-len ops) 0))
@@ -234,6 +257,9 @@
     (classify "needs more than WIDE-REGS" (= tight 0))
     (assume (> tight 0))
     (classify "floor is WIDE-REGS" (= tight WIDE-REGS))
+    (classify "straight-line (no branch)" (= (branch-count ops) 0))
+    (classify "one branch" (= (branch-count ops) 1))
+    (classify "two or more branches" (> (branch-count ops) 1))
     (let [want (interpreted ops arg)
           wide (native-at ops arg WIDE-REGS)
           got (native-at ops arg tight)]

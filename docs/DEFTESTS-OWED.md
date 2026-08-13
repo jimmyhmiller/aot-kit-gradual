@@ -180,6 +180,10 @@ fails after 2 cases and shrinks to a 1-byte input.
   wraps at 64 bits. Chained multiplication leaves the exact range in a few operations, so a naive
   MUL property spends its cases calling that difference a bug. *Owed:* a comparison that models the
   promotion, which then covers DIV/MOD traps too.
+- **`classify` output does not surface.** The buckets are declared (straight-line / one branch /
+  two or more) but neither `coil test` nor `--verbose` prints the distribution — only pass and
+  reject counts. Evidence that an arm fires currently comes from the coverage delta, which is the
+  weaker instrument. Worth asking upstream whether the distribution can be printed on success.
 - **Branches yes; loops, calls and memory no.** `emit-branch!` generates a diamond
   (`if (a < b) a+b else a-b`) merged by a Phi, which is what reaches the scheduler, the CFG and Phi
   handling. *Owed:* loops (the deleted B08 gates), calls (B09/B10), and the heap (the GC gates).
@@ -201,8 +205,11 @@ ceiling.
 
 Keyed off the low bits instead:
 
-    arithmetic only   corpus 12, 561 of 8650 edges,  23.5% rejected
-    with branches     corpus 19, 739 of 8655 edges,  13.8% rejected
+    ADD/SUB only      corpus 12, 561 of 8650 edges,  23.5% rejected
+    + branches        corpus 19, 739 of 8655 edges,  13.8% rejected
+    + bitwise ops     corpus 20, 775 of 8659 edges,  12.5% rejected
+
+60,000 guided iterations at the branch stage ran 52,842 cases with no disagreement.
 
 **+32% edges and a third fewer discards.** The lesson worth keeping: a flat coverage number means
 "nothing new is being reached", which is at least as likely to be a dead generator arm as a real
