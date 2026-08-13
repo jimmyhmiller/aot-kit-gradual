@@ -48,7 +48,22 @@ If a spec question ever becomes contentious, re-derive the answer from a real Ja
 hand and paste it in with a comment saying where it came from. That is the replacement, and it is
 manual.
 
-### 2. Proof that a LINKED OBJECT runs
+### 2. Proof that a LINKED OBJECT runs — RECOVERED
+
+**`tests/linked-object-test.coil` does this.** A deftest CAN drive `clang`: the same `popen` the
+node oracle uses writes the emitted object to disk, links it against a generated C harness, and
+runs it. That covers what the mmap properties stop short of -- `be-macho-checked!`, the symbol
+table, and the relocations resolving against a C caller at a real ABI boundary.
+
+It is a deftest over six fixed programs rather than a property, because a link per case cannot
+sustain 200 cases (a property attempt ran past ten minutes). Breadth at that layer belongs to the
+mmap properties, which run thousands of cases against the same encoder.
+
+STILL OUT OF REACH: allocating programs, for the reason below -- the collector binds to the
+object's stackmap and layout SECTIONS, so linking is necessary but not sufficient; that harness
+needs the recovered `native-gc-runtime.c` compiled in alongside.
+
+
 
 Narrower than it first looks, and the correction matters.
 
