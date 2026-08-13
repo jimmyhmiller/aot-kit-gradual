@@ -70,6 +70,36 @@
 ;; The right operand is any earlier value. That is where the register pressure comes from -- a value
 ;; picked by a much later node stays live across everything in between, which is exactly the shape
 ;; that makes the allocator spill.
+;; One diamond: `if (a < b) a+b else a-b`, merged by a Phi. Returns the Phi, whose first input is
+;; the merge Region -- the caller reads it back with `n-in` and makes it the new control.
+;;
+;; This is what reaches the scheduler, the CFG and Phi handling. A straight-line ADD/SUB chain
+;; touches none of them, which is why the first version of this property saturated at 6.5% of the
+;; backend's edges no matter how long it fuzzed.
+(defn emit-branch! [(ctrl i64) (a i64) (b i64)] (-> i64)
+  (let [cond (n-new3 OP-LT 0 NO-NODE a b)
+        arms (n-if-arms! (n-peephole (n-new2 OP-IF 0 ctrl cond)))
+        region (n-new OP-REGION 0)]
+    (n-add-def! region NO-NODE)
+    (n-add-def! region (arms-t arms))
+    (n-add-def! region (arms-f arms))
+    (let [phi (n-new OP-PHI (t-int))]
+      (n-add-def! phi region)
+      (n-add-def! phi (n-new3 OP-ADD 0 NO-NODE a b))
+      (n-add-def! phi (n-new3 OP-SUB 0 NO-NODE a b))
+      phi)))
+
+;; Build an integer program over `arg` and return its Return node.
+;;
+;; EVERY NODE MUST BE REACHABLE FROM THE RETURN. The graph verifier reports an unreferenced node as
+;; a LEAK and rejects the graph, so a generator that builds a pool and returns only its last entry
+;; produces nothing but verifier failures. The chain below is what makes reachability structural:
+;; each step consumes the RUNNING VALUE, so walking back from the final node visits everything.
+;;
+;; The second operand is any earlier value. That is where the register pressure comes from -- a
+;; value picked by a much later step stays live across everything in between, which is the shape
+;; that makes the allocator spill. Branches add the other axis: values live ACROSS a merge, which
+;; is where a spill and a Phi have to agree about the same location.
 (defn build-program! [(ops (slice u8))] (-> i64)
   (let [pool (stack (array i64 32))
         p (cast (ptr i64) pool)
@@ -82,18 +112,29 @@
     (store! (index p 2) seed)
     (let [(mut n) 3
           (mut cur) seed
+          (mut ctrl) (g-start)
           (mut i) 0
           limit (if (> (slice-len ops) MAX-OPS) MAX-OPS (slice-len ops))]
       (loop (if (>= (load i) limit) (break)
               (let [b (cast i64 (slice-get ops (load i)))
-                    other (load (index p (% b (load n))))
-                    node (n-new3 (prop-op (% (/ b 64) 2)) 0 NO-NODE (load cur) other)]
-                (store! (index p (load n)) node)
+                    other (load (index p (% (/ b 8) (load n))))]
+                ;; LOW BITS, NOT HIGH BITS. The `(slice u8)` generator produces printable bytes --
+                ;; every counterexample this property has ever reported was ASCII -- so a step
+                ;; chosen from the top two bits is a step that never happens: the branch arm sat
+                ;; dead through 31,000 cases while the coverage number stayed flat and looked like
+                ;; saturation. Three of four steps are arithmetic and one is a branch, so programs
+                ;; keep a straight-line spine with diamonds through it.
+                (if (< (% b 4) 3)
+                    (store! cur (n-new3 (prop-op (% (/ b 4) 2)) 0 NO-NODE (load cur) other))
+                    (let [phi (emit-branch! (load ctrl) (load cur) other)]
+                      (store! ctrl (n-in phi 0))
+                      (store! cur phi)
+                      0))
+                (store! (index p (load n)) (load cur))
                 (store! n (+ (load n) 1))
-                (store! cur node)
                 (store! i (+ (load i) 1))
                 0)))
-      (let [ret (n-new2 OP-RETURN 0 (g-start) (load cur))]
+      (let [ret (n-new2 OP-RETURN 0 (load ctrl) (load cur))]
         (n-add-def! (g-stop) ret)
         (g-analyze!)
         ret))))

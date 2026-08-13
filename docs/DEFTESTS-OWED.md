@@ -180,27 +180,38 @@ fails after 2 cases and shrinks to a 1-byte input.
   wraps at 64 bits. Chained multiplication leaves the exact range in a few operations, so a naive
   MUL property spends its cases calling that difference a bug. *Owed:* a comparison that models the
   promotion, which then covers DIV/MOD traps too.
-- **Straight-line only.** No branches, loops, calls or memory. *Owed:* generators for control flow
-  and for the heap — the latter is where the deleted GC gates lived.
+- **Branches yes; loops, calls and memory no.** `emit-branch!` generates a diamond
+  (`if (a < b) a+b else a-b`) merged by a Phi, which is what reaches the scheduler, the CFG and Phi
+  handling. *Owed:* loops (the deleted B08 gates), calls (B09/B10), and the heap (the GC gates).
 - The argument is reduced into ±2^40 to keep ADD/SUB exact.
 
-### Measured: the generator saturates at 6.5% of the backend
+### Measured: coverage, and a generator arm that was dead for 31,000 cases
 
-With the fixed fuzzer (see below), 40,000 guided iterations ran 31,052 cases with no disagreement
-between the interpreter and natively-executed code. Real assurance, but narrow — and the coverage
-number says how narrow:
+The first version of this property was straight-line ADD/SUB only. 40,000 guided iterations ran
+31,052 cases with no disagreement, at `corpus 12, 561 of 8650 edges` — a number that did not move
+between `-n 10`, `-n 2000` and `-n 40000`, nor after deleting the persisted corpus at
+`.coil/build/fuzz`. That flatness was read here as "straight-line programs cannot reach more of the
+backend." **Half right, and the wrong half was load-bearing.**
 
-    corpus 12, 561 of 8650 edges, 64 comparison pairs
+Adding a branch step changed nothing: `562 of 8655`. The branch arm was never executing. The step
+was chosen from the byte's TOP two bits, and the `(slice u8)` generator produces printable bytes —
+every counterexample this property ever reported was ASCII (`"a"`, `"Q"`). `b >= 192` never
+happened, so the diamond code was dead while the coverage number sat still and looked like a
+ceiling.
 
-**That number is identical at `-n 10`, `-n 2000` and `-n 40000`, and identical again after deleting
-the persisted corpus at `.coil/build/fuzz` and starting fresh.** Coverage saturates almost
-immediately: straight-line ADD/SUB over one integer argument cannot reach the other 93.5% of the
-backend, so more iterations buy nothing. **Broadening the generator is the only lever that matters
-here** — control flow, memory, calls, and the remaining opcodes, in roughly that order.
+Keyed off the low bits instead:
 
-Also measured: 22.9% of cases are discarded by `assume` (programs whose allocator floor exceeds
-`WIDE-REGS`). That is the generator's balance between `MAX-OPS` and `WIDE-REGS`, not a fuzz problem,
-and it is wasted work worth tuning.
+    arithmetic only   corpus 12, 561 of 8650 edges,  23.5% rejected
+    with branches     corpus 19, 739 of 8655 edges,  13.8% rejected
+
+**+32% edges and a third fewer discards.** The lesson worth keeping: a flat coverage number means
+"nothing new is being reached", which is at least as likely to be a dead generator arm as a real
+ceiling. Check that each arm fires before concluding anything about the code under test — and note
+that a shrunk counterexample doubles as evidence about the input distribution.
+
+Rejections are `assume` discarding programs whose allocator floor exceeds `WIDE-REGS`, not a fuzz
+problem. Branch programs have different floors (a one-diamond program floors at 5 registers against
+3 for its arithmetic equivalent), which is why widening the generator lowered the discard rate.
 
 ### `coil fuzz` (was broken here; fixed upstream)
 
