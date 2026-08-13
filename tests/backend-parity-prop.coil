@@ -1,0 +1,199 @@
+;; THE ALLOCATOR, UNDER GENERATED PRESSURE.
+;;
+;; One law: a straight-line integer program means the same thing however many registers the
+;; allocator was given. The interpreter says what it means; the CPU is asked twice, once with eight
+;; registers and once with one, and all three must agree.
+;;
+;; WHY A PROPERTY AND NOT MORE FIXTURES. The deleted gates carried hand-written "register pressure"
+;; matrices -- B05, B09, B10, B11 each had one, a few fixed programs colored at 8 and at 1. A fixed
+;; matrix only ever finds the spill bug someone already thought of. The generator here builds trees
+;; whose values are simultaneously live by construction, which is the shape that makes the spiller
+;; work, and `coil test` shrinks any failure to the smallest program that still breaks.
+;;
+;; THE ORACLE IS INTERNAL AND THAT IS THE POINT. `eval.coil` and the AArch64 backend are two
+;; independent implementations of the same semantics living in this repo, so this law survives the
+;; deletion of every Node oracle. It is the strongest differential still available here.
+;;
+;; Execution is real: `native1` mmaps the encoded bytes, marks them executable, and calls them --
+;; the same trick tests/backend-parity-test.coil uses. See docs/DEFTESTS-OWED.md for what that does
+;; and does not cover (it runs instructions, not a linked Mach-O object).
+(module backendparityprop)
+
+(import "ty" :use *)
+(import "node" :use *)
+(import "verify" :use *)
+(import "backend_core" :use *)
+(import "backend_select" :use *)
+(import "backend_schedule" :use *)
+(import "backend_allocate" :use *)
+(import "backend_aarch64" :use *)
+(import "eval" :use *)
+(import "coil.assert" :use *)
+(import "coil.prop" :use *)
+(import "coil.alloc" :use *)
+(import "coil.control" :use *)
+(import "coil.io" :use *)
+(import "coil.fmt" :use *)
+(import "coil.slice" :use *)
+(import "coil.primitive" :as primitive)
+
+(extern mmap :cc c [(ptr u8) i64 i32 i32 i32 i64] (-> (ptr u8)))
+(extern mprotect :cc c [(ptr u8) i64 i32] (-> i32))
+(extern munmap :cc c [(ptr u8) i64] (-> i32))
+(extern sys_icache_invalidate :cc c [(ptr u8) i64] (-> void))
+
+(const PROP-BUDGET i64 100000)
+;; Enough nodes to force spilling at one register, few enough that 200 cases stay quick.
+(const MAX-OPS i64 24)
+;; The generous register count, and the ceiling of the floor search.
+(const WIDE-REGS i64 8)
+;; ADD and SUB only, and the omissions are deliberate.
+;;
+;; No DIV or MOD: they trap on zero, and a disagreement about a fault is not a disagreement about
+;; arithmetic. No MUL: the graph's `int` is a JAVASCRIPT integer, so the evaluator promotes an
+;; overflowing result to a double exactly as the language specifies, while the emitted AArch64 code
+;; wraps at 64 bits. Chained multiplication leaves the exact range within a handful of operations,
+;; so a MUL property would spend its cases comparing an `RT-FLT` against a wrapped integer and
+;; calling the difference a bug. Covering MUL needs the comparison to model that promotion; it is
+;; listed in docs/DEFTESTS-OWED.md rather than faked here.
+(defn prop-op [(k i64)] (-> i64)
+  (if (= k 0) OP-ADD OP-SUB))
+
+;; Build a straight-line integer expression over `arg` and return its Return node.
+;;
+;; EVERY NODE MUST BE REACHABLE FROM THE RETURN. The graph verifier reports an unreferenced node as
+;; a LEAK and rejects the graph, so a generator that builds a pool and returns only its last entry
+;; produces nothing but verifier failures. The chain below is what makes reachability structural:
+;; each new node takes the RUNNING VALUE as its left operand, so walking left edges back from the
+;; final node visits everything the generator ever made.
+;;
+;; The right operand is any earlier value. That is where the register pressure comes from -- a value
+;; picked by a much later node stays live across everything in between, which is exactly the shape
+;; that makes the allocator spill.
+(defn build-program! [(ops (slice u8))] (-> i64)
+  (let [pool (stack (array i64 32))
+        p (cast (ptr i64) pool)
+        a0 (n-new1 OP-ARG (t-int) (g-start))
+        k0 (n-new1 OP-CONST (t-int-con 3) (g-start))
+        seed (n-new3 OP-ADD 0 NO-NODE a0 k0)]
+    ;; `seed` uses both roots, so the argument and the constant are reachable too.
+    (store! (index p 0) a0)
+    (store! (index p 1) k0)
+    (store! (index p 2) seed)
+    (let [(mut n) 3
+          (mut cur) seed
+          (mut i) 0
+          limit (if (> (slice-len ops) MAX-OPS) MAX-OPS (slice-len ops))]
+      (loop (if (>= (load i) limit) (break)
+              (let [b (cast i64 (slice-get ops (load i)))
+                    other (load (index p (% b (load n))))
+                    node (n-new3 (prop-op (% (/ b 64) 2)) 0 NO-NODE (load cur) other)]
+                (store! (index p (load n)) node)
+                (store! n (+ (load n) 1))
+                (store! cur node)
+                (store! i (+ (load i) 1))
+                0)))
+      (let [ret (n-new2 OP-RETURN 0 (g-start) (load cur))]
+        (n-add-def! (g-stop) ret)
+        (g-analyze!)
+        ret))))
+
+;; Copy the encoded bytes onto an executable page and call them with one argument.
+(defn native1 [(arg i64)] (-> i64)
+  (let [mem (mmap (cast (ptr u8) 0) 4096 3 4098 -1 0)]
+    (assert (!= (cast i64 mem) -1))
+    (let [n (be-code-len)
+          (mut i) 0]
+      (loop (if (>= (load i) n) (break)
+              (do (store! (index mem (load i)) (cast u8 (be-code-byte (load i))))
+                  (store! i (+ (load i) 1))
+                  0)))
+      (assert (= (mprotect mem 4096 5) 0))
+      (sys_icache_invalidate mem n)
+      (let [fp (cast (fnptr c [i64] i64) mem)
+            result (primitive/call-ptr fp arg)]
+        (assert (= (munmap mem 4096) 0))
+        result))))
+
+;; Compile the same program at a given register count and run it on the CPU.
+;; The graph is rebuilt from scratch per register count rather than re-coloured, so nothing carries
+;; over from the previous compilation.
+(defn native-at [(ops (slice u8)) (arg i64) (regs i64)] (-> i64)
+  (graph-reset! 909)
+  (build-program! ops)
+  (assert (= (g-verify) 0))
+  (assert (be-select-program!))
+  (be-schedule!)
+  (assert (= (be-color! regs) 0))
+  (be-encode!)
+  (native1 arg))
+
+;; The graph's single OP-ARG node.
+(defn find-arg [] (-> i64)
+  (let [n (n-count)
+        (mut i) 0
+        (mut found) NO-NODE]
+    (loop (if (>= (load i) n) (break)
+            (do (if (and (not (n-dead? (load i))) (= (n-op (load i)) OP-ARG))
+                    (do (store! found (load i)) 0)
+                    0)
+                (store! i (+ (load i) 1))
+                0)))
+    (load found)))
+
+;; NOT `ev-run-bound`. That takes a SEED and binds each argument to a value derived from it
+;; (`seed*31 + k*7919`), which is the right thing for a fixture asserting a pinned number and the
+;; wrong thing here: the native side is called with `arg` itself, so seeding would compare two
+;; different inputs and report a disagreement on every case.
+(defn interpreted [(ops (slice u8)) (arg i64)] (-> i64)
+  (graph-reset! 909)
+  (build-program! ops)
+  (assert (= (g-verify) 0))
+  (ev-reset!)
+  (ev-bind! (find-arg) (RInt arg))
+  (assert (= (ev-run-nobind PROP-BUDGET) EV-OK))
+  (assert (= (rt-tag (ev-result)) RT-INT))
+  (rt-payload (ev-result)))
+
+
+;; Does the allocator claim to have solved this program at `regs` registers?
+;; `be-color!` returns 0 on success and a nonzero failure code otherwise (7 at one register for a
+;; typical generated tree, 1 at three -- a binary op needs somewhere to put both operands).
+(defn colors-at? [(ops (slice u8)) (regs i64)] (-> bool)
+  (graph-reset! 909)
+  (build-program! ops)
+  (if (!= (g-verify) 0) false
+    (if (not (be-select-program!)) false
+      (do (be-schedule!) (= (be-color! regs) 0)))))
+
+;; The TIGHTEST allocation this program admits, or 0 if it needs more than WIDE-REGS.
+;;
+;; The floor is a property of the program, not a constant -- which is why the deleted fixed
+;; matrices ("colour it at 8 and at 1") could not have covered generated input. Compiling at the
+;; floor puts the allocator exactly at its limit, which is where a spill bug lives.
+(defn min-regs [(ops (slice u8))] (-> i64)
+  (let [(mut r) 1
+        (mut found) 0]
+    (loop (if (or (> (load r) WIDE-REGS) (!= (load found) 0)) (break)
+            (if (colors-at? ops (load r))
+                (do (store! found 1) 0)
+                (do (store! r (+ (load r) 1)) 0))))
+    (if (= (load found) 0) 0 (load r))))
+
+(defprop native-agrees-with-interpreter-at-the-allocator-floor
+  [(ops (slice u8)) (arg i64)]
+  (assume (> (slice-len ops) 0))
+  ;; Bounded so ADD/SUB stay exact: 24 operations against constants of 3 and 7 cannot carry a
+  ;; magnitude of 2^40 anywhere near the 2^53 where the evaluator would start returning a double.
+  ;; Reducing beats `assume` here -- a precondition this narrow would discard almost every case.
+  (let [arg (% arg 1099511627776)
+        tight (min-regs ops)]
+    ;; A program needing more than WIDE-REGS is discarded rather than silently passed. `classify`
+    ;; reports the split, so this property cannot quietly become vacuous.
+    (classify "needs more than WIDE-REGS" (= tight 0))
+    (assume (> tight 0))
+    (classify "floor is WIDE-REGS" (= tight WIDE-REGS))
+    (let [want (interpreted ops arg)
+          wide (native-at ops arg WIDE-REGS)
+          got (native-at ops arg tight)]
+      (and (= want wide) (= want got)))))

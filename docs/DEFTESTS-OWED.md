@@ -37,19 +37,32 @@ If a spec question ever becomes contentious, re-derive the answer from a real Ja
 hand and paste it in with a comment saying where it came from. That is the replacement, and it is
 manual.
 
-### 2. Proof that emitted machine code runs
+### 2. Proof that a LINKED OBJECT runs
 
-The deleted native gates emitted a Mach-O object, linked it against a C harness with `clang`, ran
-the binary, and checked the answer — `arm64 Mach-O linked and executed; kernel returned 84`. A
-deftest runs in-process and cannot link.
+Narrower than it first looks, and the correction matters.
 
-A deftest **can** assert on the encoded bytes and on the evaluator's result, which covers "the
-graph computes the right value" and "selection/allocation/encoding produced the expected
-instructions." It does not cover "the CPU agrees."
+**Executing emitted machine code is NOT lost.** `tests/backend-parity-test.coil`'s
+`parity-native1` already does it inside an ordinary deftest: `mmap` a page, copy `be-code-byte`
+output into it, `mprotect` it executable, `sys_icache_invalidate`, cast to a `fnptr` and call it.
+The CPU really does run the emitted instructions. Anything covered by
+select → schedule → colour → encode is recoverable as a deftest today, including register-pressure
+matrices, and `defprop` is a better tool for it than the fixed matrices that were deleted.
 
-`coil.os` exposes `fork`, `execvp`, `waitpid`, `pipe`, `dup2`, so a deftest could drive `clang`.
-Note before trying: `coil test` already forks each test, and forking again inside a test child to
-exec a toolchain is the multithreaded-fork pattern behind this project's signal-9 saga.
+What IS lost is everything downstream of `be-encode!`:
+
+- **Mach-O emission** (`be-macho-checked!`) — container, symbol table, relocations. The mmap path
+  executes raw code bytes and never builds an object file.
+- **Linking** — `clang` resolving symbols against a C harness, the C ABI at a real call boundary,
+  external allocation relocations.
+- **`llvm-objdump` assertions** on the disassembled object.
+
+So `arm64 Mach-O linked and executed; kernel returned 84` splits in two: "the instructions compute
+84" is a deftest, "the object file links" is not.
+
+`coil.os` exposes `fork`, `execvp`, `waitpid`, `pipe`, `dup2`, so a deftest could drive `clang` for
+the remainder. Note before trying: `coil test` already forks each test, and forking again inside a
+test child to exec a toolchain is the multithreaded-fork pattern behind this project's signal-9
+saga.
 
 ---
 
@@ -135,3 +148,51 @@ constraint deliberately or record why the ordering matters on its own terms.
 3. JSL's 322 cases — recover the golden from git before touching anything.
 4. Native encoding deftests, each with its falsification pair.
 5. Decide, explicitly, whether execution coverage returns via a forking deftest or stays gone.
+
+---
+
+## Property tests (started 2026-08-13)
+
+`tests/backend-parity-prop.coil` is the first. `Coil.toml` now discovers `-prop.coil` alongside
+`-test.coil`, so `coil test` runs properties and examples together.
+
+**The law:** a straight-line integer program means the same thing however many registers the
+allocator was given. The interpreter says what it means; the CPU is asked twice — once at eight
+registers, once at the *tightest count the allocator claims to have solved* — and all three agree.
+
+Two things make this the right replacement for the deleted register-pressure matrices:
+
+- **The floor is per-program, not a constant.** The deleted matrices coloured fixed programs at 8
+  and at 1. One register is not even feasible for a generated tree (`be-color!` returns failure
+  code 7; a binary op needs somewhere to put both operands), and a fixture's floor tells you
+  nothing about another program's. `min-regs` searches for it per case, so every run exercises the
+  allocator exactly at its limit.
+- **The oracle is internal.** `eval.coil` and the AArch64 backend are two independent
+  implementations in this repo, so this law survived the deletion of every Node oracle.
+
+Falsified before being trusted: compiling the native side from a program with one constant changed
+fails after 2 cases and shrinks to a 1-byte input.
+
+### Known limits of this property
+
+- **MUL is excluded, deliberately.** The graph's `int` is a JavaScript integer, so the evaluator
+  promotes an overflowing product to a double exactly as specified, while the emitted AArch64 code
+  wraps at 64 bits. Chained multiplication leaves the exact range in a few operations, so a naive
+  MUL property spends its cases calling that difference a bug. *Owed:* a comparison that models the
+  promotion, which then covers DIV/MOD traps too.
+- **Straight-line only.** No branches, loops, calls or memory. *Owed:* generators for control flow
+  and for the heap — the latter is where the deleted GC gates lived.
+- The argument is reduced into ±2^40 to keep ADD/SUB exact.
+
+### `coil fuzz` does not work in this project
+
+`coil fuzz tests/backend-parity-prop.coil` fails in the instrumented build:
+
+    clang: error: unknown argument: '--link-flag'
+    clang: error: no such file or directory: 'CoreFoundation'
+
+It passes this project's `[link] flags` from `Coil.toml` to clang as coil's own CLI spelling
+(`--link-flag X`) rather than as clang arguments, and splits the `-framework CoreFoundation` pairs.
+`coil build` and `coil test` handle the same manifest correctly, so this is a `coil fuzz` bug, not
+a manifest problem. Until it is fixed, properties run only under `coil test`'s uniform sampling
+(200 cases by default, `--cases N` to raise it) and the coverage-guided corpus is unavailable.
