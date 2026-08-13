@@ -407,3 +407,65 @@
   (assert (not (flt-same? (f64-bits 0.0) -9223372036854775808)))
   ;; Infinity is not NaN: exponent all ones, mantissa zero.
   (assert (not (nan-bits? 9218868437227405312))))
+
+;; The same page trick as `native1`, but through the FLOAT calling convention: the argument
+;; arrives in d0 and the result comes back in d0, not x0. Casting to the integer signature would
+;; read the wrong register and quietly compare garbage.
+(defn native1-flt [(bits i64)] (-> i64)
+  (let [mem (mmap (cast (ptr u8) 0) 4096 3 4098 -1 0)]
+    (assert (!= (cast i64 mem) -1))
+    (let [n (be-code-len)
+          (mut i) 0]
+      (loop (if (>= (load i) n) (break)
+              (do (store! (index mem (load i)) (cast u8 (be-code-byte (load i))))
+                  (store! i (+ (load i) 1))
+                  0)))
+      (assert (= (mprotect mem 4096 5) 0))
+      (sys_icache_invalidate mem n)
+      (let [fp (cast (fnptr c [f64] f64) mem)
+            result (primitive/call-ptr fp (bits-f64 bits))]
+        (assert (= (munmap mem 4096) 0))
+        (f64-bits result)))))
+
+;; `be-select-machine-program!`, NOT `be-select-program!`. The older selector does not handle
+;; floats -- it returns true and encodes 0xFFFFFFE0/E1/E2 placeholder words, which execute as
+;; SIGILL. See the `legacy-selector-*` tests below: that silence is its own finding, and this path
+;; uses the selector that actually emits `fmov`/`fadd`.
+(defn flt-colors-at? [(ops (slice u8)) (regs i64)] (-> bool)
+  (graph-reset! 909)
+  (build-flt-program! ops)
+  (if (!= (g-verify) 0) false
+    (if (not (be-select-machine-program!)) false
+      (do (be-schedule!) (= (be-color! regs) 0)))))
+
+(defn flt-min-regs [(ops (slice u8))] (-> i64)
+  (let [(mut r) 1
+        (mut found) 0]
+    (loop (if (or (> (load r) WIDE-REGS) (!= (load found) 0)) (break)
+            (if (flt-colors-at? ops (load r))
+                (do (store! found 1) 0)
+                (do (store! r (+ (load r) 1)) 0))))
+    (if (= (load found) 0) 0 (load r))))
+
+(defn flt-native-at [(ops (slice u8)) (bits i64) (regs i64)] (-> i64)
+  (graph-reset! 909)
+  (build-flt-program! ops)
+  (assert (= (g-verify) 0))
+  (assert (be-select-machine-program!))
+  (be-schedule!)
+  (assert (= (be-color! regs) 0))
+  (be-encode!)
+  (native1-flt bits))
+
+;; A SECOND REGISTER CLASS. Integer pressure and float pressure are allocated from different banks,
+;; and the rule the deleted B05 gate policed as a negative test -- a value must not be coloured into
+;; the wrong class -- is exactly what a generated float program at its allocation floor exercises.
+(defprop float-native-agrees-with-interpreter-at-the-allocator-floor
+  [(ops (slice u8)) (bits i64)]
+  (assume (> (slice-len ops) 0))
+  (let [tight (flt-min-regs ops)]
+    (assume (> tight 0))
+    (let [want (eval-flt ops bits false)
+          wide (flt-native-at ops bits WIDE-REGS)
+          got (flt-native-at ops bits tight)]
+      (and (flt-same? want wide) (flt-same? want got)))))
