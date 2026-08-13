@@ -768,63 +768,6 @@
     (al-clear! [u8] (field p obj))
     false))
 
-(defn be-preflight! [] (-> bool)
-  (if (= (g-verify) 0)
-      ; Calls are rejected before control-shape walking so CallEnd cannot be misreported as a CFG
-      ; accident and no callee/body instructions can leak into the current compilation.
-      (let [n (n-count)
-            (mut i) 0
-            (mut call) NO-NODE]
-        (loop (if (or (>= (load i) n) (!= (load call) NO-NODE))
-                  (break)
-                  (do
-                    (if (and (not (n-dead? (load i))) (= (n-op (load i)) OP-CALL))
-                        (store! call (load i))
-                        0)
-                    (store! i (+ (load i) 1))
-                    0)))
-        (if (!= (load call) NO-NODE)
-            (be-fail! BER-UNSUPPORTED-CALL (load call))
-            ; The prototype loop selector searches for one loop Phi. More than one is not a
-            ; conservative subset: accepting it silently chooses whichever use happens to be last.
-            (let [(mut loop-node) NO-NODE
-                  (mut cfg-node) NO-NODE]
-              (store! i 0)
-              (loop (if (or (>= (load i) n) (!= (load loop-node) NO-NODE))
-                        (break)
-                        (do
-                          (if (and (not (n-dead? (load i))) (= (n-op (load i)) OP-LOOP))
-                              (let [outs (n-nouts (load i))
-                                    (mut j) 0
-                                    (mut phis) 0]
-                                (loop (if (>= (load j) outs)
-                                          (break)
-                                          (do
-                                            (let [u (n-out (load i) (load j))]
-                                              (if (and (not (n-dead? u))
-                                                       (and (= (n-op u) OP-PHI) (not (ty-mem? (n-ty u)))))
-                                                  (store! phis (+ (load phis) 1))
-                                                  0))
-                                            (store! j (+ (load j) 1))
-                                            0)))
-                                (if (> (load phis) 1) (store! loop-node (load i)) 0)
-                                ; A Region back edge means control branched inside the loop body. The
-                                ; shape walker accepted this and emitted an infinite native loop.
-                                (if (and (= (load cfg-node) NO-NODE)
-                                         (!= (n-op (n-in (load i) 2)) OP-CPROJ))
-                                    (store! cfg-node (load i))
-                                    0))
-                              0)
-                          (store! i (+ (load i) 1))
-                          0)))
-              (if (!= (load loop-node) NO-NODE)
-                  (be-fail! BER-UNSUPPORTED-PHI (load loop-node))
-                  (if (!= (load cfg-node) NO-NODE)
-                      (be-fail! BER-UNSUPPORTED-CFG (load cfg-node))
-                      true)))))
-      (do
-        (store! (field (backend) verify-code) (g-verify-code))
-        (be-fail! BER-MALFORMED-GRAPH (g-verify-node)))))
 
 (defn mi-new [(op i64) (dst i64) (a i64) (b i64) (imm i64) (node i64)] (-> MInst)
   (let [p (stack MInst)]
