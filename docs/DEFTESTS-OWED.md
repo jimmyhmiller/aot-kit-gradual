@@ -193,8 +193,13 @@ fails after 2 cases and shrinks to a 1-byte input.
 - **Branches yes; memory no.** `emit-branch!` generates a diamond
   (`if (a < b) a+b else a-b`) merged by a Phi, which is what reaches the scheduler, the CFG and Phi
   handling; `build-loop-program!` covers the back edge (B08) and `build-call-program!` covers values
-  live across a call boundary (B09/B10). *Owed:* the heap -- objects, arrays and GC barriers, where
-  the deleted GC gates lived, and the largest uncovered region left.
+  live across a call boundary (B09/B10), and `build-heap-program!` covers aliasing between two
+  objects of the same shape. *Owed:* the heap NATIVELY -- `build-heap-program!` compares the
+  interpreter against the optimiser only, because memory arrives as an argument (`mk-mem-in`), so
+  running an allocating program from a raw page means supplying a heap pointer in the right slot.
+  Worth doing: the emitted code needs no runtime allocator (measured: zero external relocations),
+  so the obstacle is the argument convention and nothing more. Also still owed: arrays, and the GC
+  barriers the deleted native-gc gate covered.
 - The argument is reduced into ±2^40 to keep ADD/SUB exact.
 
 ### Measured: coverage, and a generator arm that was dead for 31,000 cases
@@ -223,6 +228,7 @@ Keyed off the low bits instead:
     float optimizer   corpus 19,  641 of 10602 edges   ( 487 before float diamonds)
     integer optimizer corpus 35,  765 of 10602 edges
     call native       corpus  9, 1642 of 10721 edges
+    heap optimizer    corpus 30,  830 of 10839 edges
 
 60,000 guided iterations at the branch stage ran 52,842 cases with no disagreement.
 

@@ -27,6 +27,8 @@
 (import "backend_schedule" :use *)
 (import "backend_allocate" :use *)
 (import "backend_aarch64" :use *)
+(import "shape" :use *)
+(import "corpus" :use *)
 (import "eval" :use *)
 (import "coil.assert" :use *)
 (import "coil.prop" :use *)
@@ -796,3 +798,91 @@
           wide (call-native-at ops arg CALL-WIDE-REGS)
           got (call-native-at ops arg tight)]
       (and (= want wide) (= want got)))))
+
+; ============================================================================
+; The heap
+; ============================================================================
+;; TWO OBJECTS OF THE SAME SHAPE, which is the case alias analysis has to get right and the only one
+;; that can be got wrong. Their field accesses share an alias class, so nothing distinguishes them
+;; but the allocations themselves: an optimiser that folds a load through a store must prove the two
+;; pointers are distinct, and one that reorders a store past a load must prove they are not. Both
+;; directions are wrong on the same program if the reasoning is wrong.
+;;
+;; NO NATIVE SIDE HERE. Memory arrives as an argument (`mk-mem-in`), so executing an allocating
+;; program from a raw page means supplying a heap pointer in the right slot, which is a different
+;; ABI question from the one this property is about. The optimiser is the target: `iterate!` folds,
+;; commons and eliminates memory operations, and every one of those is a rewrite the graph verifier
+;; will happily accept while being wrong. Interpreting before and after is what catches it.
+(defn heap-store [(alias i64) (mem i64) (ptr i64) (v i64)] (-> i64)
+  (n-new4 OP-STORE alias NO-NODE mem ptr v))
+(defn heap-load [(alias i64) (mem i64) (ptr i64)] (-> i64)
+  (n-new3 OP-LOAD alias NO-NODE mem ptr))
+
+(defn build-heap-program! [(ops (slice u8))] (-> i64)
+  (shape-reset!)
+  (let [sx (shape-transition SHAPE-ROOT "x" (t-int))
+        ax (shape-field-alias sx 0)
+        a0 (n-new1 OP-ARG (t-int) (g-start))
+        o1 (n-new-obj1! (g-start) sx (mk-mem-in ax))
+        p1 (n-obj-ptr o1)
+        o2 (n-new-obj1! (g-start) sx (n-obj-mem o1 0))
+        p2 (n-obj-ptr o2)]
+    ;; Both fields initialised before the generated sequence: a load from an untouched field is a
+    ;; question about uninitialised memory, not about aliasing.
+    (let [(mut mem) (heap-store ax (n-obj-mem o2 0) p1 a0)
+          (mut cur) a0
+          (mut k) 0
+          limit (if (> (slice-len ops) 10) 10 (slice-len ops))]
+      (store! mem (heap-store ax (load mem) p2
+                              (n-new3 OP-ADD 0 NO-NODE a0 (n-new1 OP-CONST (t-int-con 1) (g-start)))))
+      (loop (if (>= (load k) limit) (break)
+              (let [b (cast i64 (slice-get ops (load k)))
+                    ptr (if (= (% b 2) 0) p1 p2)]
+                (if (= (% (/ b 2) 2) 0)
+                    ;; store the running value
+                    (do (store! mem (heap-store ax (load mem) ptr (load cur))) 0)
+                  ;; or read a field back and fold it in
+                  (do (store! cur (n-new3 (prop-op (% (/ b 4) PROP-OPS)) 0 NO-NODE
+                                          (load cur) (heap-load ax (load mem) ptr)))
+                      0))
+                (store! k (+ (load k) 1))
+                0)))
+      (let [ret (n-new3 OP-RETURN 0 (g-start) (load cur) (load mem))]
+        (n-add-def! (g-stop) ret)
+        (g-analyze!)
+        ret))))
+
+;; NOT `find-arg`. A heap program has TWO arguments -- the integer and the memory that
+;; `mk-mem-in` threads in -- and `find-arg` returns whichever OP-ARG it meets first. Binding an
+;; integer into the memory argument leaves the evaluator with no heap and it stops, which is what
+;; the first version of this property reported as a crash on every input.
+(defn find-int-arg [] (-> i64)
+  (let [n (n-count)
+        (mut i) 0
+        (mut found) NO-NODE]
+    (loop (if (or (>= (load i) n) (!= (load found) NO-NODE)) (break)
+            (do (if (and (and (not (n-dead? (load i))) (= (n-op (load i)) OP-ARG))
+                         (= (n-ty (load i)) (t-int)))
+                    (do (store! found (load i)) 0)
+                    0)
+                (store! i (+ (load i) 1))
+                0)))
+    (load found)))
+
+(defn heap-eval [(ops (slice u8)) (arg i64) (optimize bool)] (-> i64)
+  (graph-reset! 909)
+  (build-heap-program! ops)
+  (if optimize (do (iterate!) (g-analyze!) 0) 0)
+  (assert (= (g-verify) 0))
+  (ev-reset!)
+  (let [a (find-int-arg)]
+    (if (!= a NO-NODE) (do (ev-bind! a (RInt arg)) 0) 0))
+  (assert (= (ev-run-nobind PROP-BUDGET) EV-OK))
+  (assert (= (rt-tag (ev-result)) RT-INT))
+  (rt-payload (ev-result)))
+
+(defprop heap-optimization-preserves-meaning
+  [(ops (slice u8)) (arg i64)]
+  (assume (> (slice-len ops) 0))
+  (let [arg (% arg 1048576)]
+    (= (heap-eval ops arg false) (heap-eval ops arg true))))
