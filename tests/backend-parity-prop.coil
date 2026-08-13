@@ -886,3 +886,50 @@
   (assume (> (slice-len ops) 0))
   (let [arg (% arg 1048576)]
     (= (heap-eval ops arg false) (heap-eval ops arg true))))
+
+; ============================================================================
+; One corpus over every shape
+; ============================================================================
+;; SIX GENERATORS, ONE CORPUS. Each property above explores its own island: the coverage-guided
+;; search builds a corpus for arithmetic, a separate one for loops, a separate one for calls, and
+;; nothing ever combines them. A mutation that would be interesting in a loop is never tried in a
+;; call, because the two searches share nothing.
+;;
+;; Here the FIRST BYTE picks the shape and the rest drives it, so one corpus spans all of them and
+;; the search can splice a productive tail from one shape onto another. That is the whole reason
+;; Fuzzilli-style corpora hold choices rather than bytes -- a spliced program is still a program.
+(defn any-eval [(kind i64) (ops (slice u8)) (arg i64)] (-> i64)
+  (if (= kind 0) (interpreted ops arg)
+    (if (= kind 1) (eval-program ops arg true)
+      (if (= kind 2) (loop-eval (+ 1 (% arg 7)) (% arg PROP-OPS) ops arg)
+        (if (= kind 3) (call-eval ops arg)
+          (heap-eval ops arg false))))))
+
+(defn any-native [(kind i64) (ops (slice u8)) (arg i64) (regs i64)] (-> i64)
+  (if (= kind 2) (loop-native-at (+ 1 (% arg 7)) (% arg PROP-OPS) ops arg regs)
+    (if (= kind 3) (call-native-at ops arg regs)
+      (native-at ops arg regs))))
+
+(defn any-min-regs [(kind i64) (ops (slice u8)) (arg i64)] (-> i64)
+  (if (= kind 2) (loop-min-regs (+ 1 (% arg 7)) (% arg PROP-OPS) ops)
+    (if (= kind 3) (call-min-regs ops)
+      (min-regs ops))))
+
+;; Kinds 0 and 4 are interpreter-only comparisons (the optimiser and the heap), so this asserts what
+;; each shape can actually support rather than forcing every shape through the backend.
+(defprop every-shape-agrees-under-one-corpus
+  [(ops (slice u8)) (arg i64)]
+  (assume (> (slice-len ops) 1))
+  (let [kind (% (cast i64 (slice-get ops 0)) 5)
+        body (subslice ops 1 (slice-len ops))
+        arg (% arg 1048576)]
+    (if (or (= kind 1) (= kind 4))
+        ;; interpreter versus optimiser
+        (= (if (= kind 1) (eval-program body arg false) (heap-eval body arg false))
+           (if (= kind 1) (eval-program body arg true) (heap-eval body arg true)))
+      ;; interpreter versus the CPU, at the tightest allocation the allocator claims to solve
+      (let [tight (any-min-regs kind body arg)]
+        (if (= tight 0) true
+          (let [want (any-eval kind body arg)]
+            (and (= want (any-native kind body arg CALL-WIDE-REGS))
+                 (= want (any-native kind body arg tight)))))))))
