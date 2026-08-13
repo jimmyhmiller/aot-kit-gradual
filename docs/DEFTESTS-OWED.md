@@ -338,3 +338,45 @@ forks -- the same fix the test runner already took -- convert this back and dele
 
 Worth resolving -- a source-level property is the only thing that would exercise the frontend at
 scale, and the lifter it needs already works.
+
+## Coverage: measured ceiling, and why the native heap is blocked (2026-08-13)
+
+Property coverage went 1888 -> 3080 of ~11.5k instrumented edges (17.4% -> 26.6%) across four
+levers, each smaller than the last:
+
+    unified corpus (6 shapes, one search)   1888 -> 2703   +815
+    Mach-O publication                      2703 -> 2947   +244  (and +656 denominator)
+    arrays folded into the shared corpus    2949 -> 3048    +99
+    three shift operators                   3048 -> 3080    +32
+
+**The operator set is saturated.** An added opcode is one more case in a selection switch whose
+surrounding paths are already covered; +32 is what that looks like. Further operators are not a
+coverage lever.
+
+**The denominator moves with the numerator.** Pulling a subsystem into a property instruments it
+too -- Mach-O added 244 covered and 656 total -- so a percentage-of-all-edges target gets harder
+the more of the compiler a property honestly touches, and rewards narrow properties over broad
+ones.
+
+What the remaining ~73% consists of, and why none of it is more of the same:
+
+- **Strings, prototypes, closures, JSL** -- whole op families, each needing its own generator.
+- **The frontend**, 7,290 lines, the largest module: cannot run inside a forked property at all
+  (the confirmed Go-runtime hang above). Structural, not a generator gap.
+- **Verifier rejection paths, diagnostics, unsupported-opcode branches** -- reachable only by
+  generating INVALID programs, which every property here is constructed never to do.
+
+### BLOCKED: native execution of allocating programs
+
+The largest single remaining lever, and it needs a decision rather than more effort. Memory arrives
+as an argument, so an allocating program needs a heap in the right slot. Passing a freshly mmapped
+region as either the first or the second argument SEGFAULTS, so allocation expects an initialised
+structure -- a bump pointer and a limit, most likely -- and not a raw region.
+
+The contract for that structure lived in `tools/native-gc-runtime.c`, deleted with everything else.
+Recover it with `git show <deletion>:tools/native-gc-runtime.c`. Note this corrects an earlier
+reading in this file: "zero external relocations" means allocation is INLINED, not that it needs no
+runtime -- the inlined sequence still bump-allocates against state that something must initialise.
+
+Until that is reconstructed, the heap and array properties compare the interpreter against the
+optimiser only, and every GC barrier the deleted native-gc gate covered stays uncovered.
