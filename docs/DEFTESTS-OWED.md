@@ -184,6 +184,24 @@ fails after 2 cases and shrinks to a 1-byte input.
   and for the heap — the latter is where the deleted GC gates lived.
 - The argument is reduced into ±2^40 to keep ADD/SUB exact.
 
+### Measured: the generator saturates at 6.5% of the backend
+
+With the fixed fuzzer (see below), 40,000 guided iterations ran 31,052 cases with no disagreement
+between the interpreter and natively-executed code. Real assurance, but narrow — and the coverage
+number says how narrow:
+
+    corpus 12, 561 of 8650 edges, 64 comparison pairs
+
+**That number is identical at `-n 10`, `-n 2000` and `-n 40000`, and identical again after deleting
+the persisted corpus at `.coil/build/fuzz` and starting fresh.** Coverage saturates almost
+immediately: straight-line ADD/SUB over one integer argument cannot reach the other 93.5% of the
+backend, so more iterations buy nothing. **Broadening the generator is the only lever that matters
+here** — control flow, memory, calls, and the remaining opcodes, in roughly that order.
+
+Also measured: 22.9% of cases are discarded by `assume` (programs whose allocator floor exceeds
+`WIDE-REGS`). That is the generator's balance between `MAX-OPS` and `WIDE-REGS`, not a fuzz problem,
+and it is wasted work worth tuning.
+
 ### `coil fuzz` does not work in this project
 
 `coil fuzz tests/backend-parity-prop.coil` fails in the instrumented build:
@@ -194,5 +212,16 @@ fails after 2 cases and shrinks to a 1-byte input.
 It passes this project's `[link] flags` from `Coil.toml` to clang as coil's own CLI spelling
 (`--link-flag X`) rather than as clang arguments, and splits the `-framework CoreFoundation` pairs.
 `coil build` and `coil test` handle the same manifest correctly, so this is a `coil fuzz` bug, not
-a manifest problem. Until it is fixed, properties run only under `coil test`'s uniform sampling
-(200 cases by default, `--cases N` to raise it) and the coverage-guided corpus is unavailable.
+a manifest problem.
+
+**FIXED upstream 2026-08-13, not yet installed.** Root cause was `m-emit-link` in the compiler's
+driver: it exists to build a `<self> build …` child command line, so it spells every manifest link
+input as `--link-flag <tok>` — including `-framework` and its name as two separate pairs — and the
+fuzz path was the one caller handing that to clang directly. The fix also repaired three further
+fuzz-only divergences from `coil test`: `[cc]` sources were never compiled into the instrumented
+build (this project has one, so the next failure would have been `Undefined symbols`),
+`[metaprograms]` were not applied to `emit-ir` (fuzz silently tested a different program than
+`coil test` does), and `m-prepare-native-deps` was skipped.
+
+Until `~/.cargo/bin/coil` is rebuilt, `coil fuzz` still fails here. Check `coil --version` against
+the install rather than assuming.
