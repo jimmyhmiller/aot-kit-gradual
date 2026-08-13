@@ -17,10 +17,10 @@ golden=tests/jsl-string-oracle.txt
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 
-# ONE emitter, built once, reading its fixture at runtime. The probes are `--source` input
-# rather than something the emitter is compiled from, so adding a probe costs no rebuild.
-coil build tools/emit-object.coil -o "$tmp/emit-object" >/dev/null
-emit=("$tmp/emit-object" --source tools/jsl-native-probes.jsl)
+# ONE emitter, built at most once per gate run and shared by every script that needs it.
+. tools/emit-object-path.sh
+emit_bin=$(emit_object_path)
+
 
 # entry:arity:label:table — label and table must match the Node script's naming exactly.
 COVERED=(
@@ -50,7 +50,7 @@ COVERED=(
 # is written and this cannot silently check fewer than exist.
 compiled=0
 while read -r name arity; do
-  if ! "${emit[@]}" "$name" "$arity" > "$tmp/all.o" 2>"$tmp/all.err"; then
+  if ! "$emit_bin" --source tools/jsl-native-probes.jsl "$name" "$arity" > "$tmp/all.o" 2>"$tmp/all.err"; then
     echo "JSL native: $name/$arity did not emit (the library is loaded per entry, so a load-time failure is reported against the first name tried): $(tr '\n' ' ' < "$tmp/all.err")" >&2
     exit 1
   fi
@@ -68,7 +68,7 @@ if [ "$compiled" -eq 0 ]; then echo "JSL native: found no builtins to compile" >
 covered=0
 for spec in "${COVERED[@]}"; do
   IFS=: read -r entry arity label table count <<<"$spec"
-  "${emit[@]}" "$entry" "$arity" > "$tmp/$entry.o"
+  "$emit_bin" --source tools/jsl-native-probes.jsl "$entry" "$arity" > "$tmp/$entry.o"
   xcrun clang -O2 -arch arm64 -I tools -o "$tmp/$entry" \
     tools/jsl-native-harness.c "$tmp/$entry.o" tools/native-gc-runtime.c
   "$tmp/$entry" "$label" "$table" ${count:-} >> "$tmp/native.txt"

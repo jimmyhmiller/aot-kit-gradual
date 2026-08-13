@@ -28,13 +28,13 @@ if cmp -s "$tmp/node.txt" "$tmp/signed-ushr.txt"; then
   exit 1
 fi
 
-# ONE emitter, built once, reading its fixtures at runtime. These were two more
-# emit-*-object.coil programs that each linked the whole compiler to vary an opcode.
-coil build tools/emit-object.coil -o "$tmp/emit" >/dev/null
+# ONE emitter, built at most once per gate run and shared by every script that needs it.
+. tools/emit-object-path.sh
+emit_bin=$(emit_object_path)
 INT_ENTRY=(B06BitAnd B06BitOr B06BitXor B06Shl B06Shr B06Ushr B06BitNot)
 for registers in 8 1; do
   for mode in 0 1 2 3 4 5 6; do
-    "$tmp/emit" --source tools/fixtures/b06-int.jsl --regs "$registers" \
+    "$emit_bin" --source tools/fixtures/b06-int.jsl --regs "$registers" \
       "${INT_ENTRY[$mode]}" > "$tmp/int-$registers-$mode.o"
     xcrun clang -arch arm64 -DMODE="$mode" tools/b06-int-harness.c \
       "$tmp/int-$registers-$mode.o" -o "$tmp/int-$registers-$mode"
@@ -45,24 +45,24 @@ done
 CO_ENTRY=(B06CoerceBitNot B06CoerceShl B06CoerceShr B06CoerceUshr)
 for registers in 8 1; do
   for mode in 0 1 2 3; do
-    "$tmp/emit" --source tools/fixtures/b06-coercion.jsl --regs "$registers" \
+    "$emit_bin" --source tools/fixtures/b06-coercion.jsl --regs "$registers" \
       "${CO_ENTRY[$mode]}" > "$tmp/coercion-$registers-$mode.o"
     xcrun clang -arch arm64 -DMODE="$mode" tools/b06-coercion-harness.c \
       "$tmp/coercion-$registers-$mode.o" -o "$tmp/coercion-$registers-$mode"
     "$tmp/coercion-$registers-$mode"
   done
-  "$tmp/emit" --source tools/fixtures/b06-coercion.jsl --regs "$registers" \
+  "$emit_bin" --source tools/fixtures/b06-coercion.jsl --regs "$registers" \
     B06CoerceMod > "$tmp/mod-$registers.o"
   xcrun clang -arch arm64 tools/b06-mod-harness.c \
     "$tmp/mod-$registers.o" -o "$tmp/mod-$registers"
   "$tmp/mod-$registers"
 done
 
-"$tmp/emit" --source tools/fixtures/b06-coercion.jsl --falsify shift-mask \
+"$emit_bin" --source tools/fixtures/b06-coercion.jsl --falsify shift-mask \
   B06CoerceShl > "$tmp/falsified-mask.o"
 xcrun clang -arch arm64 -DMODE=1 tools/b06-coercion-harness.c \
   "$tmp/falsified-mask.o" -o "$tmp/falsified-mask"
-"$tmp/emit" --source tools/fixtures/b06-coercion.jsl --falsify unsigned-shift \
+"$emit_bin" --source tools/fixtures/b06-coercion.jsl --falsify unsigned-shift \
   B06CoerceUshr > "$tmp/falsified-ushr.o"
 xcrun clang -arch arm64 -DMODE=3 tools/b06-coercion-harness.c \
   "$tmp/falsified-ushr.o" -o "$tmp/falsified-ushr"
