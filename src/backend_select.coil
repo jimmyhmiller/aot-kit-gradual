@@ -1064,11 +1064,35 @@
                     (be-fail! BER-UNSUPPORTED-CALL c)
                     (be-fail! BER-UNSUPPORTED-CFG c))))))
 
+;; The prototype selector has no float support: it materialises a double into a general register
+;; and then has no instruction to apply. Reject the program by NAME instead, the same way
+;; `be-preflight!` rejects a call or a multi-Phi loop -- and for the reason stated there, that
+;; accepting what cannot be compiled silently picks whatever happens to come out.
+;;
+;; `be-select-machine-program!` is the path that does handle floats.
+(defn be-preflight-scalar-only! [] (-> bool)
+  (let [n (n-count)
+        (mut i) 0
+        (mut bad) NO-NODE]
+    (loop (if (or (>= (load i) n) (!= (load bad) NO-NODE))
+              (break)
+              (do
+                (if (and (not (n-dead? (load i))) (be-float-only? (n-ty (load i))))
+                    (store! bad (load i))
+                    0)
+                (store! i (+ (load i) 1))
+                0)))
+    (if (!= (load bad) NO-NODE)
+        (be-fail! BER-UNSUPPORTED-OPCODE (load bad))
+        true)))
+
 (defn be-select-program! [] (-> bool)
   (be-reset!)
   (if (not (be-preflight!))
       false
-      (let [(mut label) 0] (be-select-control! (g-start) (mut label)))))
+      (if (not (be-preflight-scalar-only!))
+          false
+          (let [(mut label) 0] (be-select-control! (g-start) (mut label))))))
 
 (defn be-inst-count [] (-> i64)
   (al-len [MInst] (load (field (backend) ins))))
