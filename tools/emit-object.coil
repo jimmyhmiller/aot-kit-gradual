@@ -7,15 +7,16 @@
 ;; file. The fixture is INPUT, so it belongs in a file the emitter reads, not in source the emitter
 ;; is compiled from.
 ;;
-;;   emit-object [--source PATH]... ENTRY [ARITY] [REGISTERS]
+;;   emit-object [--source PATH]... [--regs N] [--falsify KIND] ENTRY [ARITY]
 ;;
 ;; `--source` is repeatable and is read AFTER `lib/index`, so a fixture may call the shipped
-;; library. ENTRY is the JSL definition to compile; the emitted symbol is that name. The Mach-O
-;; object goes to stdout.
+;; library. ENTRY is the JSL definition to compile. The Mach-O object goes to stdout.
 ;;
-;; EVERY PARAMETER IS `dyn`. A JSL builtin takes NaN-boxed JavaScript values; declaring them as raw
-;; integers compiles, links, runs and answers nonsense — `MathAbs` on a boxed -5 returned -5,
-;; because a boxed integer is a large positive word and `x < 0` was false.
+;; PARAMETER TYPES COME FROM THE DECLARATION. `(a dyn)` gets a NaN-boxed argument and `(a int)` a
+;; raw one, so both the library's boxed builtins and a raw-ABI backend fixture are expressible as
+;; source. Getting this wrong is not a compile error: `MathAbs` on a boxed -5 once returned -5,
+;; because a boxed integer is a large positive word and `x < 0` was false. The optional trailing
+;; ARITY is an assertion against the declaration, never the source of truth.
 (module emitobject)
 
 (import "ty" :use *)
@@ -53,7 +54,7 @@
 
 (defn main [(argc i32) (argv (ptr (ptr i8)))] (-> i64)
   (if (< argc 2)
-      (do (fmt (stderr) "usage: emit-object [--source PATH]... ENTRY [ARITY] [REGISTERS]\n") 1)
+      (do (fmt (stderr) "usage: emit-object [--source PATH]... [--regs N] [--falsify KIND] ENTRY [ARITY]\n") 1)
     (do
       (graph-reset! 9600)
       (shape-reset!)
@@ -70,10 +71,31 @@
               (mut entry) (slice-new [u8] (cast (ptr u8) 0) 0)
               (mut arity) 1
               (mut regs) 8
+              (mut falsify) 0
               (mut rc) 0]
           (loop
             (if (or (>= (load ai) (cast i64 argc)) (!= (load rc) 0)) (break)
               (let [a (cstr (load (index argv (load ai))))]
+                ;; A BACKEND corruption, deliberately injected between colouring and encoding, so a
+                ;; gate can prove its own harness would notice one. It is a property of the run,
+                ;; not of the fixture, which is why it is a flag and not something in the source.
+                (if (str-eq a "--falsify")
+                    (if (>= (+ (load ai) 1) (cast i64 argc))
+                        (do (fmt (stderr) "emit-object: --falsify needs shift-mask|unsigned-shift\n")
+                            (store! rc 1) 0)
+                      (let [k (cstr (load (index argv (+ (load ai) 1))))]
+                        (if (str-eq k "shift-mask") (do (store! falsify 1) 0)
+                          (if (str-eq k "unsigned-shift") (do (store! falsify 2) 0)
+                            (do (fmt (stderr) "emit-object: unknown falsification {s}\n" k)
+                                (store! rc 1) 0)))
+                        (store! ai (+ (load ai) 2)) 0))
+                (if (str-eq a "--regs")
+                    (if (>= (+ (load ai) 1) (cast i64 argc))
+                        (do (fmt (stderr) "emit-object: --regs needs a COUNT\n")
+                            (store! rc 1) 0)
+                      (do (store! regs
+                                  (cast i64 (atoi (load (index argv (+ (load ai) 1))))))
+                          (store! ai (+ (load ai) 2)) 0))
                 (if (str-eq a "--source")
                     (if (>= (+ (load ai) 1) (cast i64 argc))
                         (do (fmt (stderr) "emit-object: --source needs a PATH\n")
@@ -92,15 +114,10 @@
                           0)))
                     (store! np (+ (load np) 1))
                     (store! ai (+ (load ai) 1))
-                    0)))))
+                    0)))))))
           (if (!= (load rc) 0) (load rc)
           (if (= (load np) 0)
               (do (fmt (stderr) "emit-object: no ENTRY given\n") 1)
-          ;; 9 arguments plus jsl-call!'s implicit memory arg fills its 10-slot buffer; a larger
-          ;; CLI arity must fail loudly here rather than overflow two stack arrays.
-          (if (or (< (load arity) 0) (> (load arity) 9))
-              (do (fmt (stderr) "emit-object: arity {d} out of range [0, 9]\n" (load arity))
-                  (os/_exit 11) 0)
             (if (!= (jsl-check) JSL-OK)
                 (die "check failed" (jsl-err-name (jsl-err)) 10)
               ;; ON DEMAND, not the whole library. This is the same path the frontend links
@@ -109,18 +126,37 @@
               ;; callees and nothing else.
               (if (do (jl-reset!) (!= (jsl-require! (load entry)) JSL-OK))
                   (die "jsl lower failed" (jsl-err-name (jsl-err)) 8)
-                ;; Ten slots to match jsl-call!'s own argument buffer: arity is read from the
-                ;; command line, and a 6-parameter builtin overflowed the old 4-slot array into
-                ;; whatever the frame layout placed after it.
+                ;; ARITY AND ARGUMENT TYPES COME FROM THE DECLARATION, not the command line. The
+                ;; old emitter took arity as an argument and typed every parameter `dyn`, which
+                ;; cost this repo two real bugs: a 6-parameter builtin overflowed a 4-slot stack
+                ;; array (HANDOFF.md), and `MathAbs` on a boxed -5 returned -5 because a boxed
+                ;; integer is a large positive word and `x < 0` was false. A declaration that says
+                ;; `(a int)` now gets an int-typed OP-ARG, which is what lets a raw-ABI fixture
+                ;; like B06's bitwise kernels be a source file at all.
+                (let [d (jsl-find (load entry))
+                      n (jsl-decl-nparams d)]
+                  ;; A CLI arity is an ASSERTION about the declaration, never the source of truth.
+                  (if (and (> (load np) 1) (!= (load arity) n))
+                      (do (fmt (stderr) "emit-object: {s} declares {d} parameter(s), not {d}\n"
+                               (load entry) n (load arity))
+                          (os/_exit 11) 0)
+                    0)
+                  (if (or (< n 0) (> n 9))
+                      (do (fmt (stderr) "emit-object: {s} arity {d} out of range [0, 9]\n"
+                               (load entry) n)
+                          (os/_exit 11) 0)
+                    0)
+                ;; Ten slots to match jsl-call!'s own argument buffer.
                 (let [buf (stack (array i64 10))
                       p (cast (ptr i64) buf)
                       (mut i) 0]
-                  (loop (if (>= (load i) (load arity)) (break)
-                          (do (store! (index p (load i)) (n-new1 OP-ARG (t-dyn) (g-start)))
+                  (loop (if (>= (load i) n) (break)
+                          (do (store! (index p (load i))
+                                      (n-new1 OP-ARG (jsl-param-ty d (load i)) (g-start)))
                               (store! i (+ (load i) 1))
                               0)))
                   (let [cs (jsl-call! (g-start) (load entry)
-                                      (slice-new [i64] p (load arity)))]
+                                      (slice-new [i64] p n))]
                     (n-add-def! (g-stop) (n-new2 OP-RETURN 0 (call-end cs) (call-value cs)))
                     (iterate!)
                     (g-analyze!)
@@ -132,7 +168,10 @@
                             2)
                       (do (be-schedule!)
                           (if (< (be-color! (load regs)) 0) 3
+                            (do
+                            (if (= (load falsify) 1) (be-falsify-shift-mask!)
+                              (if (= (load falsify) 2) (be-falsify-unsigned-shift!) 0))
                             (if (not (be-encode-checked!)) 4
                               (if (not (be-macho-checked!)) 5
                                 (if (= (write 1 (be-object-data) (be-object-len)) (be-object-len))
-                                    0 6))))))))))))))))))
+                                    0 6)))))))))))))))))))
