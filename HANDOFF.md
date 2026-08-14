@@ -1,152 +1,152 @@
-# THE MISSION: MAKE THE ITERATION LOOP FAST
+# Handoff: testing
 
-That is the whole mission. Not correctness. Not benchmarks. Not features. The ONLY goal is
-shrinking the time between "I changed something" and "I know what happened." A multi-minute
-wait is a bug; fix the wait, don't endure it.
+The gate is `coil test`. 538 tests, ~25s, project mode. Nothing else runs.
 
-(The old correctness-hardening handoff and its archive are deleted on purpose — they are in
-git history before commit 2f716ab if ever needed. NavierStokes is DONE: `repros/ns.js`
-three-way MATCHES at 26, gate green, all repros pass. Do not reopen that work now.)
+The previous handoff (the iteration-loop mission) is in git history before this commit. That mission
+landed: the gate went 257s to 25s. This one is about what the tests actually prove.
 
-## State after Jimmy's compiler update (measured 2026-08-12)
+---
 
-Jimmy's new `coil` landed (installed 12:46, `~/Documents/Code/projects/coil` @ ~24a4f4c) and
-it killed the old bottleneck outright:
+## Start here: make the opcode set a type
 
-- **Resident emitter self-build: -O0 3.1s, -O3 4.3s** (was multi-minute). A compiler-source
-  edit now costs seconds. The whole "-O0 tier so rebuilds are bearable" motivation is gone;
-  -O3 is cheap enough to be the only tier (`--debug` still works but buys nothing: the -O0
-  emitter also RUNS ~1.6x slower on big inputs — 143.5s vs 91.7s emit on ns.js).
-- `js-native-run.mjs` now prints `phase-ms: emit=… clang=… native=… eval=… node=… total=…`
-  on every run (plan step 1, done), and the emitter cache stamp now hashes the `coil` binary
-  itself — before that fix a compiler upgrade silently kept running stale emitters.
-- Small-repro three-way loop: **~0.7s total**.
-- Full gate under the new compiler: GREEN.
+92 opcodes are declared as bare integers in `src/node.coil`:
 
-## Emitter performance: 91.7s → 3.85s on ns.js (24x, 2026-08-12)
+    (const OP-ADD i64 14)
+    (const OP-MUL i64 15)
+    ...
+    (const OP-COUNT i64 90)     ; already wrong -- there are 92
 
-FINAL STATE: Jimmy's 16:01 compiler rebuild restored small-function inlining (see the
-inlining section below), taking ns.js emit from 11.6s to **3.85s** on top of the ~8x from
-the algorithmic fixes in this repo. Phase split now: frontend 0.19s, select 1.1s,
-schedule 0.9s, color 0.5s, encode 0.7s, macho 0.15s. Object output byte-identical
-throughout. The history of the 8x:
+They should be a `defsum`. This is first in the handoff because it is the structural fix for the
+coverage problem described further down, not because it is tidy.
 
-### The ~8x from this repo (91.7s → ~11.6s, measured under load)
+**Why it matters for testing.** `coil.prop` derives generators from types: `(derive Arbitrary Op)`
+would generate all 92 opcodes. Today every property generator hand-picks about 15, which means a
+person is choosing which parts of the compiler get exercised, and that person forgets. The coverage
+ceiling measured this session traces directly to that.
 
-ns.js (396 lines, 8542 nodes) baseline was **emit=91.7s** — 97% of the check. Cost tracks
-code SIZE, not run length. `sample`(1) works out of the box (full symbol names), and the
-resident harness now prints per-pass wall times on stderr
-(`phase-ms frontend/select/schedule/color/encode/macho`) — that breakdown, not the flat
-profile, is what found the big one. Every change below verified BYTE-IDENTICAL objects on
-all 30 repros + ns.js. Final ns.js breakdown (concurrent-load numbers):
-frontend 0.75s, select 3.5s, schedule 2.5s, color 2.0s, encode 2.3s, macho 0.6s.
+**Why it matters beyond testing.** `match` over a sum is exhaustive. A missing case becomes a
+compile error. The backend defect found and fixed this session (`be-select-program!` accepting a
+float program, emitting `0xFFFFFFE0/E1/E2` as instructions, and passing every downstream check) was
+*exactly* a missing case that reported success. Exhaustiveness would have made it unwritable.
 
-1. **Mach-O stackmaps were 33.5s of the 92** — invisible in flat profiles because the cost
-   is `ml-live-before?` re-walking a block tail per (safepoint, vreg) query, and the layout,
-   both stackmap sweeps, and the byte verifier each repeated the product. Now ONE backward
-   liveness walk per block builds a root cache (`mobj-build-roots!`); everything reads it.
-   33.5s → 0.6s.
-2. **Liveness sets are bitsets now** (64 vregs/word; accessor API unchanged). The dataflow
-   solver (`ml-solve!`) runs word-wise Gauss-Seidel — same per-round states, same round
-   count. Schedule phase 5.3s → 2.5s.
-3. Scheduler: the indegree pair pass records dependency EDGES; each emission decrements
-   along the producer's edge list instead of re-asking `ms-schedule-dependency-kind` per
-   consumer. `ms-inst-uses-vreg?` is a lean path (one be-inst, raw `mi-inputs` table,
-   direct arg fields).
-4. Allocator: `mra-build-interference!` / `mra-verify!` / the cross-call diagnostic walk
-   each instruction's OPERANDS (`mra-collect-inst-uses!`) instead of asking every vreg;
-   `ml-verify!` re-derives use/def with one operand pass per block. Color 4.9s → 2.0s.
-5. `mi-desc` memoized into a table; `ml-kind-for-vreg` via a validated vreg→(node, owner)
-   reverse map; `ms-gcm-latest-use-block` via per-vreg use lists.
+**The objections I raised and then measured away:**
 
-What remains (the profile is now DIFFUSE — no quadratic left visible):
+| worry | reality |
+|---|---|
+| a tagged union is wider than `i64` | **identical.** Measured: an all-nullary `defsum` is 8 bytes, same as `i64`. Only sums with payloads pay (that test sum was 16). |
+| opcodes are used as array indices | **one site.** `gtext.coil:716` loops `0..OP-COUNT` searching by name. Everything else is `=` or `case`. |
+| enormous churn | ordinary. 92 constants; `case` forms become `match`. |
 
-- **For Jimmy: the top of every phase's profile is non-inlined tiny calls** —
-  `coil.core.Eq$i64$=`, `Ord$i64$*`, `Add$i64$+`, `al-get`, zero-arg accessors
-  (`machine-unit`, `backend`, `node.graph`) are real out-of-line calls even at -O3.
-  An inliner is the next big multiplier (est. 1.5-2x across the board).
-- The scheduler's initial pair pass is still O(block²) for kinds 2/3 (memory order and the
-  class-based effect rules); a counter-based rewrite could kill it but is subtle.
-- select (3.5s) is the biggest remaining phase and is call-overhead-diffuse.
+Fix `OP-COUNT` first regardless — it says 90 against 92 constants, so anything iterating that range
+silently skips two opcodes.
 
-## Evaluator: ns.js eval went from non-terminating to ~4.5 min
+### Manual or lint+fix?
 
-`ev-array-element-index` scanned ONE global flat (object,index,value) list per array access
-— NavierStokes grids made eval mode effectively hang (30+ CPU-min, killed). Now a
-`(object<<32|index) -> slot` HashMap (`array-slot` in EvalState; slots are append-only so
-mappings never go stale; indexes outside [0,2^32) keep the scan). ns.js eval: **190.6M
-steps, result=26, MATCH, ~4.5 min under load**. Eval cost is now step-count-bound; if that
-is still too slow, the next lever is per-step dispatch, not memory.
+**Split it by whether the change needs a decision.**
 
-## Evaluator bug found & fixed 2026-08-12 (pre-existing, NOT compiler-related)
+*Mechanical, automate freely:* renaming the constants, rewriting `(= (n-op x) OP-ADD)` comparison
+sites, the single `gtext` integer loop. A `coil lint --fix` rule or plain `sed` handles these, and
+`coil test` is a sound gate for them.
 
-`--eval` failed on cinc/cadd/evo (EV-STUCK at a merge Phi): the top-level `ev-run-nobind`
-interpreter loop called `ev-enter-ctrl!` unconditionally, so effects PINNED ON A REGION
-(compound array assignment through a ToNumber diamond) executed before `ev-enter-merge!`
-gave that region's Phis values. The `ev-call` loop already had the guard; the fix mirrors it
-(src/eval.coil). The old-coil A/B settled the blame: an emitter built from 837bb8e with
-YESTERDAY'S compiler fails identically, so this was a genuine latent source bug — the
-"all repros pass --eval" claim was stale (the gate never ran the eval sweep; see plan).
+*Semantic, do by hand:* every `case` over opcodes with a default arm. Exhaustiveness will reject
+these, and **that rejection is the entire point.** Each one is a question only a person can answer:
+is this default a genuine fallback, or a missing case that has been quietly succeeding?
 
-## The new coil compiler STOPPED INLINING — root cause of the crash AND the call tax
+**The trap to avoid:** an auto-fix that satisfies the compiler by inserting a catch-all arm produces
+a green build that has learned nothing, and destroys the one benefit worth having. If you write a
+lint rule, make it *report* incomplete dispatches, never repair them.
 
-The conformance segfault (zero-parameter mains: math-minmax and any tiny program) was NOT
-bad codegen. Diagnosis, fully verified by old-vs-new binary diff:
+**`hivemind` fits the mechanical half well** — it is file-partitionable, the gate is the real test
+suite, and a failed unit reverts. Point it at the comparison sites and the constant renames, keep
+the `case`-to-`match` work in your own hands.
 
-- The old compiler (46ee64d) inlined every small monomorph: its binaries contain ZERO
-  `al-get__*` / `Eq$i64$=` / `Ord$i64$*` / `Add$i64$+` symbols. The new compiler (12:58
-  install, 24a4f4c-era; suspect commit "Preserve exports through compiler transforms")
-  emits them all out-of-line — 36 such symbols in the same program.
-- `frontend_native_graph.coil:7269` bound `first` with an UNCONDITIONAL
-  `al-get [FeSymbol]` whose result is only used under a `(> parameter-count 0)` guard.
-  Zero-parameter mains leave the symbol list empty -> al-get(empty, 0) -> null deref.
-  The old compiler's inlining + dead-load elimination deleted the unguarded load, masking
-  the bug for its whole life; the new compiler faithfully executes the eager call. FIXED
-  in this repo (lookup moved inside the guard) — conformance is GREEN again with the new
-  compiler.
-- The same lost inlining was the emitter's remaining "diffuse" cost: every integer `=`,
-  `<`, `+` and every tiny accessor was a real `bl` to a 2-3 instruction function
-  (disassembly-verified). **RESOLVED: Jimmy's 16:01 rebuild restored inlining** (tiny-fn
-  symbol count back to 0); ns.js emit dropped 11.6s → 3.85s and the crash repro runs
-  clean even without this repo's guard fix.
-- Certifying the 16:01 compiler surfaced a SECOND latent bug of the same species, this
-  time a stack buffer overflow in OUR tool: the JSL emitter (now `emit-object.coil`)
-  sized its argument
-  array `(array i64 4)` while arity comes from the command line (JsonStringifyPlainArray
-  is arity 6); the two stray writes used to land on dead frame padding, and the new frame
-  layout put the args slice pointer there instead. Fixed (10 slots + a loud arity guard).
-  Running lesson, twice-proven today: when a compiler change makes green code crash,
-  suspect formerly-benign UB in this repo before suspecting codegen.
+**Sequence that keeps the tree green:** fix `OP-COUNT`; add the `defsum` alongside the constants;
+convert `n-op`'s return type and let the compiler list the sites; do the mechanical ones in bulk;
+then work the exhaustiveness failures one at a time, treating each as a possible bug rather than a
+compile error. Expect that pile to be large and to contain at least one real finding.
 
-## Conformance now runs on THE resident emitter (done 2026-08-12)
+---
 
-`tools/resident-emitter.mjs` provisions the one cached emitter binary (shared with
-js-native-run, stamped on compiler sources + the coil binary); the conformance runner
-invokes it per case with (source, schedule-seed, registers, kind, "emit", frontend-seed,
-optimize) instead of generating and `coil build`-ing a bespoke embedded-source emitter per
-case. The FIRST case still runs the embedded path as a canary for the non-resident
-template. **Conformance: 75 programs in ~17s** (was 75 full compiler builds). Failure
-handling fixed with it: workers stop on first failure, every failure prints its case name
-and the child's actual stderr, and cleanup waits for all workers (the old `finally` rmSync
-raced them and replaced real errors with ENOTEMPTY). Gate is GREEN at ~9.2 min wall; the
-remaining time is the test suites and the native/TS gates, which still build bespoke
-fixture emitters — same disease, same cure if it matters later.
+## What testing looks like now
 
-## Remaining plan, in order
+Eight properties plus supporting tests, all in `tests/backend-parity-prop.coil` unless noted. Every
+one was **falsified before being trusted** — broken deliberately, confirmed to fail, restored. Keep
+that discipline; it caught three of my own mistakes this session.
 
-1. The gate does NOT run the repro `--eval` sweep — that is how the evaluator regression
-   hid. Add a fast repro sweep to the gate (it is ~30s of parallel work now).
-2. **`tools/sweep.mjs`: parallel batch runner with a verdict cache** keyed on
-   (emitter hash, file hash); also the bisection/fuzzer harness.
-3. Gate wall time is now suites-bound: `tests/*-test.coil` and the native/TS gate fixtures
-   each pay their own `coil build`. Port them to shared/resident binaries if the ~9 min
-   gate starts to hurt.
-4. More emitter speed if needed: counter-based scheduler pair pass, allocator verify passes
-   (see profile notes above).
+| property | law |
+|---|---|
+| `native-agrees-with-interpreter-at-the-allocator-floor` | compiled code means the same at 8 registers and at the tightest count the allocator claims to solve |
+| `loop-native-...` | same, for values live across a back edge |
+| `float-native-...` | same, through the FP register bank |
+| `call-native-...` | same, for values live across a call boundary |
+| `optimization-preserves-meaning` | `iterate!` must not change what a program computes |
+| `float-optimization-...` | same, where `x*0`, `x+0`, `x/x` are the tempting wrong rewrites |
+| `heap-optimization-...` | same, over two objects of one shape — the case alias analysis can get wrong |
+| `array-optimization-...` | same, over marked allocations and indexed storage |
+| `every-shape-agrees-under-one-corpus` | all of the above behind ONE corpus, so the search can splice shapes together |
+| `an_uncompilable_program_is_refused_by_name...` | what the backend cannot compile is refused by name and publishes nothing |
+| `the_verifier_reaches_a_verdict...` | a malformed graph gets a verdict, not a crash, and a rejection names itself |
+| `string_optimization_preserves_meaning` | concat/length folding preserves meaning |
+| `node_agrees_with_the_compiler` (`js-source-prop.coil`) | **the only external oracle.** Same TypeScript to `node -e` and to us |
+| `a_linked_object_agrees_...` (`linked-object-test.coil`) | a real Mach-O object, linked with clang and executed |
+| `an_allocating_program_runs_under_the_collector` | allocation through the real GC |
 
-## Ground rules that still apply
+`docs/DEFTESTS-OWED.md` is the ledger: what the deletion of the shell gates cost, what has been
+recovered, and what is still owed. Read it before assuming green means what it used to.
 
-- `coil test` green before every commit; commit directly to main. It is the whole gate now —
-  see docs/DEFTESTS-OWED.md for the coverage that deletion dropped and still owes deftests.
-- Repros in `repros/` stay passing (`node tools/js-native-run.mjs FILE --debug --eval`).
-- Tell Jimmy, with numbers, anything that is still slow — do not endure it.
+---
+
+## The coverage picture, and what would actually move it
+
+27.3% of instrumented edges (3173 of 11618). It went 17.4% to 27.3% this session across four levers,
+each smaller than the last: unified corpus (+815), Mach-O publication (+244), arrays (+99), shift
+operators (+32).
+
+**Do not chase this percentage directly.** Two measurements explain why:
+
+- **The denominator grows with the numerator.** Pulling a subsystem into a property instruments it
+  too. Mach-O added 244 covered and 656 total.
+- **New program shapes mostly re-tread old paths.** Going from seven shapes to nine in the unified
+  corpus added *nine edges*. Distinct properties are not distinct coverage.
+
+**What would move it, in order:**
+
+1. **The opcode sum type**, above. Generators stop being limited by what someone typed out.
+2. **Real JavaScript through the real frontend.** `frontend_native_graph.coil` is 7,290 lines, the
+   largest uncovered block. The lifter already exists (`js-source-prop.coil` emits TypeScript from
+   the same description that drives the IR) and both paths agree. It is blocked on one thing: the
+   property runner forks per case and the frontend reaches the TypeScript-Go bridge, whose Go
+   runtime cannot survive a fork. Measured: 40 cases pass in 4.8s under `--no-fork`, watchdog at 60s
+   with forking. If that loop moves to `posix_spawn` — the fix the *test* runner already took for
+   the signal-9 problem — convert `frontend_translates_generated_javascript_faithfully` from a
+   table-driven deftest back to a `defprop` and delete the caveat in `DEFTESTS-OWED.md`.
+3. **More string operators.** Concat and length are two of twenty-odd. An attempt to add
+   `STRINGUPPER`/`STRINGLOWER`/`STRINGSUBSTRING` crashed the property with an ambiguous LEAK
+   naming nodes the string program does not contain — unresolved, worth a fresh look.
+4. **Prototypes and closures.** Untouched subsystems. Expect ~400 edges each, on the strings
+   precedent.
+
+---
+
+## Method notes
+
+These are here because each cost real time, and all three have the same shape: **a green signal I
+did not try to break.**
+
+- **A generator arm that never fired.** The branch step was chosen from a byte's *high* bits while
+  the `(slice u8)` generator produces printable ASCII, so the diamond code was dead through 31,000
+  cases while coverage sat flat and looked like a ceiling. Every counterexample the property had
+  ever printed was ASCII — the evidence was in plain sight. `every-generator-arm-fires` now asserts
+  structurally that each arm produces the nodes it should.
+- **A property that passed while testing nothing.** The call property searched for an allocator
+  floor up to 8 registers; that shape needs 11, so the precondition never held and 200 of 200 cases
+  were rejected. The runner reported it; watch for that warning.
+- **A "solved" claim from one lucky run.** A linked allocating program printed the right answer once
+  and I wrote it up. The same binary, re-run minutes later, exited 139. It was faulting on
+  uninitialised state that happened once to be benign. **Re-run anything that manages its own
+  memory before believing it.**
+
+And the pattern worth carrying: every *capability* limit I claimed this session and then tested was
+wrong — linked-object execution, driving clang from a deftest, GC allocation, rejection paths,
+strings were all reachable. Every *arithmetic* limit held. Be suspicious of "can't", trust "the
+numbers don't get there" only after measuring.
