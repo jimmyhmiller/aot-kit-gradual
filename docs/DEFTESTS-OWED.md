@@ -59,28 +59,32 @@ It is a deftest over six fixed programs rather than a property, because a link p
 sustain 200 cases (a property attempt ran past ten minutes). Breadth at that layer belongs to the
 mmap properties, which run thousands of cases against the same encoder.
 
-ALLOCATING PROGRAMS RUN. SOLVED -- see the recipe below.
+ALLOCATING PROGRAMS: NOT SOLVED. I claimed otherwise and was wrong; the retraction is the useful
+part of this entry.
 
-    stdout=[41] exit=0
+One run of a linked allocating program printed the right answer (41) and exited 0, and I reported
+it as solved. It does not reproduce: the SAME BINARY, re-run minutes later with nothing rebuilt,
+exits 139 (SIGSEGV), as does every rebuild. So the one success was luck -- benign uninitialised
+memory or address-space layout -- not a working configuration.
 
-An emitted allocating object (store 41 into a field, load it back) links against the recovered
-collector and executes correctly. The two pieces missing from my earlier attempts:
+What IS established and does reproduce:
 
-  1. `native-gc-trampoline.S` must be linked in as well -- 54 lines of assembly.
-  2. The kernel is called THROUGH the trampoline, `aot_gc_enter(fn)`, never directly. Calling
-     `kernel(arg)` straight from `main` segfaults, which is what "the heap argument is wrong" looked
-     like for several attempts. There is no heap argument; there is an entry protocol.
+  - `native-gc-trampoline.S` must be linked alongside the collector.
+  - The kernel is entered via `aot_gc_enter(fn)`, never called directly; `kernel(arg)` straight
+    from `main` segfaults deterministically.
+  - `int aot_gc_configure(size_t bytes, int stress)` returns nonzero on success.
+  - The link succeeds with no undefined symbols, so the stackmap and layout sections resolve.
 
-  int aot_gc_configure(size_t bytes, int stress);   // returns nonzero on success
-  int64_t aot_gc_enter(int64_t (*)(void));          // run the kernel under the collector
+The remaining fault is runtime state the harness does not establish: the collector keeps an
+`aot_gc_thread_state` and `aot_gc_alloc` takes a `context`. Read the deleted gate in full before
+trying again -- `git show c8b0a65^:tools/native-gc-gate.sh` -- since it linked these same three
+files and must set up whatever is missing.
 
-The three sources are restored to `native/gc/` (runtime.c, trampoline.S, js-value.h) so this no
-longer depends on archaeology. A deftest can drive the link -- `tests/linked-object-test.coil`
-already does exactly that with `popen` -- so native heap, array and GC-barrier coverage is now
-mechanical work rather than a blocked question. Counters the collector exposes for assertions:
-aot_gc_collections, verifications, moves, slow_paths, promotions, barriers, allocations.
+`native/gc/` keeps runtime.c, trampoline.S and js-value.h restored, which is worth having anyway.
 
-SUPERSEDED NOTE, kept because the reasoning was wrong in an instructive way: one step further, still not running. The recovered collector
+METHOD NOTE, the third time this session a single observation misled me: one green run of a program
+that manages its own memory is not evidence. Re-run it.
+
 (`git show c8b0a65^:tools/native-gc-runtime.c`, 2166 lines, plus `js-value.h`) COMPILES AND LINKS
 against an emitted allocating object -- no undefined symbols, so the stackmap and layout sections
 resolve. Running it exits 139 (SIGSEGV) even after `aot_gc_configure(1<<20, 0)`.
