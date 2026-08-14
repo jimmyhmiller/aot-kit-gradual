@@ -29,6 +29,7 @@
 (import "backend_aarch64" :use *)
 (import "backend_macho" :use *)
 (import "shape" :use *)
+(import "jsstring" :use *)
 (import "corpus" :use *)
 (import "eval" :use *)
 (import "coil.assert" :use *)
@@ -1124,3 +1125,56 @@
       ;; gap.
       (let [code (g-verify)]
         (if (= code 0) true (!= (g-verify-code) 0))))))
+
+; ============================================================================
+; Strings
+; ============================================================================
+;; A WHOLE SUBSYSTEM none of the generators above can enter. `src/jsstring.coil` and the string
+;; opcodes are reached by no arithmetic, heap, array, loop or call program, so every edge in them
+;; has been dark for this entire test file.
+;;
+;; The programs are built from interned constants and the length/concat/equality operators, and the
+;; law is the optimiser one: folding a concatenation or commoning two equal strings must not change
+;; what the program computes. String folding is a classic place to get it wrong, because equal
+;; CONTENT and identical IDENTITY are different questions and an interning table makes them look
+;; like the same one.
+(defn jss-of [(k i64)] (-> i64)
+  (if (= k 0) (jss-from-utf8! "")
+    (if (= k 1) (jss-from-utf8! "a")
+      (if (= k 2) (jss-from-utf8! "ab")
+        (if (= k 3) (jss-from-utf8! "abc")
+          (if (= k 4) (jss-from-utf8! "0")
+            (jss-from-utf8! "length")))))))
+(const JSS-COUNT i64 6)
+
+(defn build-string-program! [(ops (slice u8))] (-> i64)
+  (jss-reset!)
+  (let [(mut cur) (n-string-const! (jss-of 1))
+        (mut k) 0
+        limit (if (> (slice-len ops) 6) 6 (slice-len ops))]
+    (loop (if (>= (load k) limit) (break)
+            (let [b (cast i64 (slice-get ops (load k)))
+                  other (n-string-const! (jss-of (% (/ b 4) JSS-COUNT)))]
+              (store! cur (n-new3 OP-STRINGCONCAT 0 NO-NODE (load cur) other))
+              (store! k (+ (load k) 1))
+              0)))
+    ;; the result is a LENGTH, an integer the evaluator can report
+    (let [value (n-new2 OP-STRINGLEN 0 NO-NODE (load cur))
+          ret (n-new2 OP-RETURN 0 (g-start) value)]
+      (n-add-def! (g-stop) ret)
+      (g-analyze!)
+      ret)))
+
+(defn string-eval [(ops (slice u8)) (optimize bool)] (-> i64)
+  (graph-reset! 909)
+  (build-string-program! ops)
+  (if optimize (do (iterate!) (g-analyze!) 0) 0)
+  (assert (= (g-verify) 0))
+  (ev-reset!)
+  (assert (= (ev-run-nobind PROP-BUDGET) EV-OK))
+  (rt-payload (ev-result)))
+
+(defprop string_optimization_preserves_meaning
+  [(ops (slice u8))]
+  (assume (> (slice-len ops) 0))
+  (= (string-eval ops false) (string-eval ops true)))
