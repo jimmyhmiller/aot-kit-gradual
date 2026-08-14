@@ -980,9 +980,23 @@
 (defprop every-shape-agrees-under-one-corpus
   [(ops (slice u8)) (arg i64)]
   (assume (> (slice-len ops) 1))
-  (let [kind (% (cast i64 (slice-get ops 0)) 6)
+  (let [kind (% (cast i64 (slice-get ops 0)) 7)
         body (subslice ops 1 (slice-len ops))
         arg (% arg 1048576)]
+    (if (= kind 6)
+        ;; a program the backend cannot compile: refused by name, nothing published
+        (do (graph-reset! 909)
+            (let [a0 (n-new1 OP-ARG (t-int) (g-start))
+                  v (n-new3 OP-ADD 0 NO-NODE a0 (n-new1 OP-CONST (t-int-con 3) (g-start)))
+                  bad (n-new3 (unsupported-op (% (cast i64 (slice-get ops 0)) UNSUPPORTED-OPS))
+                              0 NO-NODE v v)
+                  ret (n-new2 OP-RETURN 0 (g-start) bad)]
+              (n-add-def! (g-stop) ret)
+              (g-analyze!)
+              (if (be-select-machine-program!)
+                  (do (be-schedule!)
+                      (if (< (be-color! CALL-WIDE-REGS) 0) true (be-encode-checked!)))
+                (and (!= (be-result) BER-OK) (= (be-code-len) 0)))))
     (if (or (= kind 1) (or (= kind 4) (= kind 5)))
         ;; interpreter versus optimiser: the arithmetic, heap and array shapes
         (= (if (= kind 1) (eval-program body arg false)
@@ -1001,4 +1015,45 @@
             ;; that encodes must also publish, and `mobj-verify-model!` is the backend's own check
             ;; that what it published describes what it emitted.
             (and (and (= want wide) (= want got))
-                 (and (be-macho-checked!) (mobj-verify-model!)))))))))
+                 (and (be-macho-checked!) (mobj-verify-model!))))))))))
+
+; ============================================================================
+; Rejection is behaviour too
+; ============================================================================
+;; EVERY PROPERTY ABOVE GENERATES PROGRAMS THE BACKEND ACCEPTS, so none of them reach the code that
+;; refuses one -- the verifier's rejection paths, the failure naming, and the atomicity that clears
+;; published bytes. That is a large region, and the deleted gates covered it deliberately:
+;; "malformed graph is distinct from unsupported and clears old bytes",
+;; "unsupported opcode is named before code publication".
+;;
+;; The law: a program the backend cannot compile is refused BY NAME, and nothing is published. A
+;; backend that quietly emits something for input it does not understand is the defect this catches
+;; -- which is not hypothetical here, since exactly that was found and fixed in the legacy selector.
+(defn unsupported-op [(k i64)] (-> i64)
+  (if (= k 0) OP-STRINGCONCAT
+    (if (= k 1) OP-PROPLOAD
+      (if (= k 2) OP-NUMBERTOSTRING
+        (if (= k 3) OP-PARSEINT
+          (if (= k 4) OP-TOSTRING
+            (if (= k 5) OP-OBJECTFREEZE
+              (if (= k 6) OP-STRINGUPPER OP-PROTOHAS))))))))
+(const UNSUPPORTED-OPS i64 8)
+
+(defprop an_uncompilable_program_is_refused_by_name_and_publishes_nothing
+  [(ops (slice u8)) (arg i64)]
+  (assume (> (slice-len ops) 0))
+  (let [b (cast i64 (slice-get ops 0))]
+    (graph-reset! 909)
+    ;; a valid prefix, then one node the backend has no rule for
+    (let [a0 (n-new1 OP-ARG (t-int) (g-start))
+          v (n-new3 OP-ADD 0 NO-NODE a0 (n-new1 OP-CONST (t-int-con 3) (g-start)))
+          bad (n-new3 (unsupported-op (% b UNSUPPORTED-OPS)) 0 NO-NODE v v)
+          ret (n-new2 OP-RETURN 0 (g-start) bad)]
+      (n-add-def! (g-stop) ret)
+      (g-analyze!)
+      (if (be-select-machine-program!)
+          ;; if it DID compile, it must be genuinely encodable -- not silently wrong
+          (do (be-schedule!)
+              (if (< (be-color! CALL-WIDE-REGS) 0) true (be-encode-checked!)))
+        ;; refused: the failure carries a name, and no bytes survive
+        (and (!= (be-result) BER-OK) (= (be-code-len) 0))))))

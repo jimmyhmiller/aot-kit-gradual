@@ -287,6 +287,8 @@ Keyed off the low bits instead:
     float optimizer   corpus 19,  641 of 10602 edges   ( 487 before float diamonds)
     integer optimizer corpus 35,  765 of 10602 edges
     call native       corpus  9, 1642 of 10721 edges
+    rejection paths   corpus 10, 1263 of 11594 edges
+    unified + rejection corpus 57, 3164 of 11594 edges
     heap optimizer    corpus 30,  830 of 10839 edges
 
 60,000 guided iterations at the branch stage ran 52,842 cases with no disagreement.
