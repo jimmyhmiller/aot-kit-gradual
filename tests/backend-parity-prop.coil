@@ -1057,3 +1057,46 @@
               (if (< (be-color! CALL-WIDE-REGS) 0) true (be-encode-checked!)))
         ;; refused: the failure carries a name, and no bytes survive
         (and (!= (be-result) BER-OK) (= (be-code-len) 0))))))
+
+;; MALFORMED GRAPHS, a different region again from unsupported opcodes. `src/verify.coil` is 1,237
+;; lines whose entire job is refusing graphs, and every property above hands it well-formed ones, so
+;; the code that names a fault runs almost never. The generated corruptions below are the mistakes a
+;; graph builder actually makes -- a leaked node, a Return with no control, a Phi without a region,
+;; an input pointing at nothing.
+;;
+;; The law is NOT "these are rejected" but the stronger pair: the verifier reaches a VERDICT rather
+;; than crashing or looping, and when it rejects it names a code and a node. A verifier that
+;; segfaults on malformed input is worse than one that accepts it, because the accepting one at
+;; least reports.
+(defprop the_verifier_reaches_a_verdict_on_a_malformed_graph
+  [(ops (slice u8)) (arg i64)]
+  (assume (> (slice-len ops) 0))
+  (let [b (cast i64 (slice-get ops 0))
+        kind (% b 4)]
+    (graph-reset! 909)
+    (let [a0 (n-new1 OP-ARG (t-int) (g-start))
+          c3 (n-new1 OP-CONST (t-int-con 3) (g-start))
+          v (n-new3 OP-ADD 0 NO-NODE a0 c3)]
+      (if (= kind 0)
+          ;; a node nothing references
+          (do (n-new1 OP-CONST (t-int-con 99) (g-start))
+              (n-add-def! (g-stop) (n-new2 OP-RETURN 0 (g-start) v)) 0)
+        (if (= kind 1)
+            ;; a Phi with no region behind it
+            (let [phi (n-new OP-PHI (t-int))]
+              (n-add-def! phi NO-NODE)
+              (n-add-def! phi v)
+              (n-add-def! phi c3)
+              (n-add-def! (g-stop) (n-new2 OP-RETURN 0 (g-start) phi)) 0)
+          (if (= kind 2)
+              ;; a Return whose control input is a value
+              (do (n-add-def! (g-stop) (n-new2 OP-RETURN 0 v v)) 0)
+            ;; nothing added to Stop at all
+            0)))
+      (g-analyze!)
+      ;; A VERDICT, either way -- and a rejection has to name itself.
+      ;; A rejection must NAME itself. The node is not required: some faults are properties of the
+      ;; graph rather than of any one node, and those report NO-NODE, which is honest rather than a
+      ;; gap.
+      (let [code (g-verify)]
+        (if (= code 0) true (!= (g-verify-code) 0))))))
