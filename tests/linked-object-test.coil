@@ -9,6 +9,7 @@
 ;; relocations resolving against a C caller at a real ABI boundary.
 (import "ty" :use *) (import "node" :use *) (import "verify" :use *)
 (import "shape" :use *)
+(import "shape" :use *)
 (import "corpus" :use *)
 (import "eval" :use *)
 (import "backend_core" :use *) (import "backend_select" :use *)
@@ -110,3 +111,55 @@
   (assert (= (linked-eval "zq" 0) (linked-native "zq" 0)))
   (assert (= (linked-eval "\x01\x02" 99) (linked-native "\x01\x02" 99)))
   (assert (= (linked-eval "abcdef" 1234) (linked-native "abcdef" 1234))))
+
+;; AN ALLOCATING PROGRAM, LINKED AGAINST THE COLLECTOR AND RUN.
+;;
+;; The piece that made this work is `be-use-runtime-allocation!`. Without it the backend compiles an
+;; allocation to a pure inline bump against thread state nothing has initialised: the object carries
+;; ZERO relocations, links cleanly, and segfaults. With it the object calls `_aot_alloc_slow` and the
+;; collector is actually in the loop. A `_aot_alloc_slow` relocation is therefore the cheap signal
+;; that a generated allocation is the real thing -- asserted below, before anything is run.
+;;
+;; The kernel is entered through `aot_gc_enter`, never called directly. There is no heap argument;
+;; there is an entry protocol. `native/gc/` holds the collector, trampoline and header, restored
+;; from the deletion commit.
+(defn gc-mem [(alias i64)] (-> i64) (n-new1 OP-ARG (t-mem-alias alias (t-top)) (g-start)))
+
+(defn gc-run [] (-> i64)
+  (let [b1 (stack (array i8 64)) b2 (stack (array i8 8)) b3 (stack (array i8 8))
+        b4 (stack (array i8 2048)) out (stack (array i8 128))]
+    (let [f (fopen (cstr! (cast (ptr i8) b1) 64 "/tmp/aotk-gc.o")
+                   (cstr! (cast (ptr i8) b2) 8 "w"))]
+      (assert (!= (cast i64 f) 0))
+      (fwrite (be-object-data) 1 (be-object-len) f)
+      (fclose f))
+    (let [p (popen (cstr! (cast (ptr i8) b4) 2048
+                          "printf '#include <stdint.h>\\n#include <stddef.h>\\n#include <stdio.h>\\nint aot_gc_configure(size_t,int);\\nextern int64_t kernel(void);\\nint64_t aot_gc_enter(int64_t(*)(void));\\nint main(void){if(!aot_gc_configure(4096,0))return 2;printf(\"%%lld\\\\n\",(long long)aot_gc_enter(kernel));}\\n' > /tmp/aotk-gc.c && xcrun clang -arch arm64 -O1 -fno-omit-frame-pointer -Inative/gc /tmp/aotk-gc.c native/gc/runtime.c native/gc/trampoline.S /tmp/aotk-gc.o -o /tmp/aotk-gc 2>/dev/null && /tmp/aotk-gc")
+                   (cstr! (cast (ptr i8) b3) 8 "r"))]
+      (assert (!= (cast i64 p) 0))
+      (fgets (cast (ptr i8) out) 128 p)
+      (pclose p)
+      (atoll (cast (ptr i8) out)))))
+
+(deftest an_allocating_program_runs_under_the_collector
+  (graph-reset! 1201) (shape-reset!)
+  (let [sx (shape-transition SHAPE-ROOT "x" (t-int)) ax (shape-field-alias sx 0)
+        first (n-new-obj1! (g-start) sx (gc-mem ax)) root (n-obj-ptr first)
+        mem1 (n-new4 OP-STORE ax NO-NODE (n-obj-mem first 0) root
+                     (n-new1 OP-CONST (t-int-con 41) (g-start)))
+        second (n-new-obj1! (g-start) sx mem1) other (n-obj-ptr second)
+        mem2 (n-new4 OP-STORE ax NO-NODE (n-obj-mem second 0) other
+                     (n-new1 OP-CONST (t-int-con 2) (g-start)))
+        value (n-new3 OP-LOAD ax NO-NODE mem2 root)
+        ret (n-new3 OP-RETURN 0 (g-start) value mem2)]
+    (n-add-def! (g-stop) ret) (g-analyze!)
+    (assert (= (g-verify) 0))
+    (assert (be-select-machine-program!))
+    (be-use-runtime-allocation! true)
+    (be-schedule!)
+    (assert (>= (be-color! 1) 0))
+    (assert (be-encode-checked!))
+    (assert (be-macho-checked!))
+    ;; two allocations, so two calls into the collector -- and the field written to the FIRST
+    ;; object is the one read back, across a second allocation that could have moved it.
+    (assert (= (gc-run) 41))))

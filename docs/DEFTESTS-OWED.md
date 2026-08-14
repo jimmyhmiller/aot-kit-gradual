@@ -59,38 +59,29 @@ It is a deftest over six fixed programs rather than a property, because a link p
 sustain 200 cases (a property attempt ran past ten minutes). Breadth at that layer belongs to the
 mmap properties, which run thousands of cases against the same encoder.
 
-ALLOCATING PROGRAMS: NOT SOLVED. I claimed otherwise and was wrong; the retraction is the useful
-part of this entry.
+ALLOCATING PROGRAMS RUN UNDER THE COLLECTOR -- `tests/linked-object-test.coil`.
 
-One run of a linked allocating program printed the right answer (41) and exited 0, and I reported
-it as solved. It does not reproduce: the SAME BINARY, re-run minutes later with nothing rebuilt,
-exits 139 (SIGSEGV), as does every rebuild. So the one success was luck -- benign uninitialised
-memory or address-space layout -- not a working configuration.
+The piece that made it work is **`be-use-runtime-allocation!`**, called after selection. Without it
+the backend compiles an allocation to a pure inline bump against thread state nothing has
+initialised: the object carries ZERO relocations, links cleanly, and segfaults. With it the object
+calls `_aot_alloc_slow` twice and the collector is genuinely in the loop.
 
-What IS established and does reproduce:
+So a `_aot_alloc_slow` relocation is the cheap signal that a generated allocation is the real thing.
+The deleted `native-gc-gate.sh` asserted exactly that before running anything, which is how this was
+found; the test asserts it too.
 
-  - `native-gc-trampoline.S` must be linked alongside the collector.
-  - The kernel is entered via `aot_gc_enter(fn)`, never called directly; `kernel(arg)` straight
-    from `main` segfaults deterministically.
-  - `int aot_gc_configure(size_t bytes, int stress)` returns nonzero on success.
-  - The link succeeds with no undefined symbols, so the stackmap and layout sections resolve.
+Also required, and not guessable: the kernel is entered through `aot_gc_enter(fn)`, never called
+directly, and `native-gc-trampoline.S` must be linked alongside the collector. There is no heap
+argument -- there is an entry protocol.
 
-THE ACTUAL DISCREPANCY, found by reading the deleted gate. Its first assertion after emitting is
+`native/gc/` holds runtime.c, trampoline.S and js-value.h, restored from the deletion commit.
 
-    xcrun llvm-objdump -r program.o | grep -q '_aot_alloc_slow'
-
-so the gate's objects CALL the collector's slow-allocation path. Mine do not: `llvm-objdump -r` on
-my object lists no relocations at all, while `__aot_stackmap` and `__aot_layout` are both present.
-The allocation compiled to a pure inline bump against thread state that nothing initialised, which
-is exactly the segfault.
-
-So the gap is not the harness and not the link -- it is the GRAPH. The gate's
-`emit-native-gc-object.coil` builds an allocation that emits a slow-path call; `n-new-obj1!` alone,
-as used here, does not. Recover it with `git show c8b0a65^:tools/emit-native-gc-object.coil` and
-compare against `build-heap-program!`. A relocation to `_aot_alloc_slow` is the cheap signal that a
-generated allocation is the real thing: assert it before trying to run anything.
-
-`native/gc/` keeps runtime.c, trampoline.S and js-value.h restored, which is worth having anyway.
+RETRACTED ON THE WAY HERE, kept because the correction is the useful part: an earlier version of
+this entry claimed the same thing on the strength of ONE run that printed the right answer. It did
+not reproduce -- the same binary re-run minutes later exited 139 -- because that build lacked
+`be-use-runtime-allocation!` and was faulting on uninitialised thread state that happened once to
+be benign. The current result was checked over three consecutive runs and two full suite runs
+before being written down.
 
 METHOD NOTE, the third time this session a single observation misled me: one green run of a program
 that manages its own memory is not evidence. Re-run it.
