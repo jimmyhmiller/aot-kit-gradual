@@ -75,10 +75,20 @@ What IS established and does reproduce:
   - `int aot_gc_configure(size_t bytes, int stress)` returns nonzero on success.
   - The link succeeds with no undefined symbols, so the stackmap and layout sections resolve.
 
-The remaining fault is runtime state the harness does not establish: the collector keeps an
-`aot_gc_thread_state` and `aot_gc_alloc` takes a `context`. Read the deleted gate in full before
-trying again -- `git show c8b0a65^:tools/native-gc-gate.sh` -- since it linked these same three
-files and must set up whatever is missing.
+THE ACTUAL DISCREPANCY, found by reading the deleted gate. Its first assertion after emitting is
+
+    xcrun llvm-objdump -r program.o | grep -q '_aot_alloc_slow'
+
+so the gate's objects CALL the collector's slow-allocation path. Mine do not: `llvm-objdump -r` on
+my object lists no relocations at all, while `__aot_stackmap` and `__aot_layout` are both present.
+The allocation compiled to a pure inline bump against thread state that nothing initialised, which
+is exactly the segfault.
+
+So the gap is not the harness and not the link -- it is the GRAPH. The gate's
+`emit-native-gc-object.coil` builds an allocation that emits a slow-path call; `n-new-obj1!` alone,
+as used here, does not. Recover it with `git show c8b0a65^:tools/emit-native-gc-object.coil` and
+compare against `build-heap-program!`. A relocation to `_aot_alloc_slow` is the cheap signal that a
+generated allocation is the real thing: assert it before trying to run anything.
 
 `native/gc/` keeps runtime.c, trampoline.S and js-value.h restored, which is worth having anyway.
 
