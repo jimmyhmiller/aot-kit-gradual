@@ -571,36 +571,6 @@
         (fng-jsl-call1 context "StringLength" value)
         value)))
 
-(defn fng-nullish-literal? [(context FngContext) (node i64)] (-> bool)
-  (let [frontend (load (field context frontend))
-        ast (field frontend ast)
-        kind (ts-kind ast node)]
-    (or (= kind TSK-NULL)
-        (and (= kind TSK-IDENTIFIER)
-             (= (fe-resolution-symbol frontend node) FE-INTRINSIC-UNDEFINED)))))
-
-(defn fng-nullish-equal [(context FngContext) (source i64) (value i64)] (-> i64)
-  ;; Property inference may know the declared class field while the actual load still crosses the
-  ;; tagged PropertyKey ABI. Choose the comparison from the value representation, not only the
-  ;; source-level declaration, so `undefined == null` remains true after a generic field load.
-  (if (fng-value-tagged? value)
-      (fng-bin (BitOr)
-               (fng-bin (Eq) value (n-box! (fng-null)))
-               (fng-bin (Eq) value (n-box! (fng-undefined))))
-      ;; A value that is not provably in the tagged ABI may still ARRIVE tagged: a callee with
-      ;; mixed return representations (satisfy returns both `null` and an object) has every
-      ;; return boxed by the backend, while raw null/undefined constants materialize as zero.
-      ;; When no numeric kind is possible, testing both representations is exact — a raw object
-      ;; pointer can never equal the tagged nullish constants, and a tagged object can never
-      ;; equal zero. Numeric kinds keep the raw-only compare: raw zero must not look nullish.
-      (if (= (& (ty-kinds (n-ty value)) (| VK-INT VK-FLT)) 0)
-          (fng-bin (BitOr)
-                   (fng-bin (Eq) value (fng-null))
-                   (fng-bin (BitOr)
-                            (fng-bin (Eq) value (n-box! (fng-null)))
-                            (fng-bin (Eq) value (n-box! (fng-undefined)))))
-          (fng-bin (Eq) value (fng-null)))))
-
 ;; The dynamic-to-number seam, and the difference between an UNBOX and a COERCION.
 ;;
 ;; `Unbox : flt` asserts a representation: it strips a tag it has already been promised is there,
@@ -819,68 +789,19 @@
           (fng-to-number-operand context value))
       value))))
 
-(defn fng-numeric-equality-peer? [(value i64)] (-> bool)
-  (let [ty (n-ty value)]
-    (and (and (!= (ty-kinds ty) VK-NULL) (!= (ty-kinds ty) VK-UNDEF))
-         (and (ty-isa ty (t-num))
-         (if (not (op-is? value Phi [_]))
-             true
-             ;; An open Phi initially has bottom type, which is below every concrete type.  Its
-             ;; first real value is the only available evidence until the backedge is installed.
-             (if (> (n-nins value) 1)
-                 (let [initial-ty (n-ty (n-in value 1))]
-                   (and (!= initial-ty (t-bot))
-                        (and (!= initial-ty (t-dyn)) (ty-isa initial-ty (t-num)))))
-                 false))))))
-
-(defn fng-equal-value [(context FngContext)
-                       (left-source i64) (left i64)
-                       (right-source i64) (right i64)] (-> i64)
-  (let [left-dynamic (fng-value-tagged? left)
-        right-dynamic (fng-value-tagged? right)]
-    ;; `dyn` includes numeric values, so `ty-isa dyn num` is true.  It is not proof that a
-    ;; particular dynamic value is numeric.  In particular, an open loop Phi has bottom type before
-    ;; its backedge arrives; bottom satisfies every `ty-isa` query and is not numeric evidence.
-    (cond (or (fng-nullish-literal? context left-source)
-              (fng-nullish-literal? context right-source))
-            (fng-bin (Eq)
-                     (if left-dynamic left (n-box! left))
-                     (if right-dynamic right (n-box! right)))
-          ;; The dynamic side is a TAGGED word of unknown numeric representation — an INT-tagged
-          ;; global compared against a numeric peer was the NavierStokes checksum bug: a raw flt
-          ;; unbox of 0x7ffc-tagged 0 never equals 0. fng-to-number-operand already RETURNS a raw
-          ;; flt (its own unbox of the guarded ToNumberValue), so no second unbox here — the
-          ;; earlier attempt double-unboxed and died in MLIVE-CLASS.
-          (and left-dynamic (fng-numeric-equality-peer? right))
-            (fng-bin (Eq) (n-unbox! left (t-flt)) right)
-          (and right-dynamic (fng-numeric-equality-peer? left))
-            (fng-bin (Eq) left (n-unbox! right (t-flt)))
-          (or left-dynamic right-dynamic)
-            (fng-bin (Eq)
-                     (if left-dynamic left (n-box! left))
-                     (if right-dynamic right (n-box! right)))
-          :else (fng-bin (Eq) left right))))
-
-;; `==` AND `!=`, WHICH ARE NOT `===` WITH BOXING.
+;; EQUALITY IS THE DSL'S, WHOLE -- all four operators and `switch` matching. `StrictEqual`,
+;; `StrictNotEqual`, `LooseEqual` and `LooseNotEqual` in `lib/abstract/conversions.jsl` are the
+;; entire meaning; nothing here decides anything about operands.
 ;;
-;; `fng-equal-value` above is STRICT equality's lowering, and `switch` shares it because `switch`
-;; matches with `===`. Loose equality coerces, and routing it through the strict lowering is what
-;; made `7 == "7"` false: that lowering unboxes a tagged operand as a float on the evidence that
-;; the OTHER side is numeric, which is no evidence about the tagged one at all, and a string's
-;; tagged word read as a double equals nothing.
+;; What was deleted to get here, because each piece was a live defect or one waiting:
+;; `fng-equal-value` unboxed a tagged operand as a float on the evidence that the OTHER side was
+;; numeric -- no evidence about the tagged one -- and `7 == "7"` was false until loose equality
+;; stopped routing through it. `fng-nullish-equal` was loose-equality-with-null spelled by hand
+;; over raw Eq/BitOr. The number/number and string/string fast paths on `===` were the compiler's
+;; opinion of strict equality; the specialisation lives in `StrictEqual`, which leads with the
+;; Number/Number case so proven operands still fold to one compare -- and `x == null` folds
+;; through `LooseEqual`'s leading IsNullish guards because the null constant's kinds prove them.
 ;;
-;; ONE FAST PATH, AND IT NEEDS A PROOF. Both operands PROVABLY raw machine numbers is the only
-;; case where a machine compare is exact, because it is the only case where no coercion can apply.
-;; The proof has to be `fng-machine-number-value?` and not "is the type `dyn`": a string is not
-;; `dyn`-typed either, so an is-it-tagged test lets `acc == String(acc)` through to the raw compare
-;; and reproduces the original bug exactly. It was written that way first, and the repro did not
-;; move.
-;;
-;; Everything else goes to the library, because the answer depends on runtime tags. That costs a
-;; call on comparisons that used to be inline; `docs/DECISIONS.md` and this project's policy put
-;; correctness ahead of that, and the alternative is a wrong answer with no diagnostic.
-;;
-;; repros/open/loose-equality-number-to-string.js.
 ;; THE RELATIONAL OPERATORS ARE THE DSL'S, WHOLE. `IsLessThan` and `IsLessEqual` in
 ;; `lib/abstract/conversions.jsl` are the entire meaning of `<`, `<=`, `>` and `>=`; nothing here
 ;; decides anything about operands.
@@ -933,13 +854,6 @@
 
 (defn fng-bitwise1 [(context FngContext) (name (slice u8)) (a i64)] (-> i64)
   (fng-jsl-call1 context name (n-box! a)))
-
-(defn fng-loose-equal [(context FngContext) (left i64) (right i64)] (-> i64)
-  (if (and (fng-machine-number-value? left 8) (fng-machine-number-value? right 8))
-      (fng-bin (Eq) left right)
-      (fng-jsl-call2 context "LooseEqual"
-                     (fng-box-dynamic-argument! left)
-                     (fng-box-dynamic-argument! right))))
 
 (defn fng-type-tag [(frontend (ptr NativeFrontend)) (type-node i64)] (-> i64)
   (if (<= type-node -1)
@@ -5185,12 +5099,12 @@
                                 (n-unbox! (fng-jsl-call1 context "ToNumberValue" (n-box! value))
                                           (t-flt))
                                 value)
+                          ;; `!` IS THE DSL'S `LogicalNot`. The hand-written form was
+                          ;; `value == 0` with a StringLength detour when inference said string --
+                          ;; wrong for every operand inference could not classify, exactly like
+                          ;; the relational operators before their migration.
                           (str-eq operator "!")
-                            (fng-bin (Eq)
-                                     (if (= (fng-infer context source FNG-DYNAMIC) FNG-STRING)
-                                         (fng-jsl-call1 context "StringLength" value)
-                                         value)
-                                     (fng-const 0))
+                            (fng-jsl-call1 context "LogicalNot" (n-box! value))
                           ;; UNARY `-` IS THE DSL'S `JsNegate`, the last arithmetic operator that
                           ;; was still hand-written here as `Sub(0, ToNumber(x))`. Same argument
                           ;; as the binary operators at `fng-arith2`: the coercion is ECMAScript's,
@@ -5348,54 +5262,34 @@
                                 (fng-relational context "IsLessThan" right left)
                               (str-eq operator ">=")
                                 (fng-relational context "IsLessEqual" right left)
+                              ;; `===` AND `!==` ARE THE DSL'S, WHOLE. The number/number and
+                              ;; string/string fast paths that lived here were the compiler
+                              ;; holding an opinion about what strict equality means; the
+                              ;; specialisation is in `StrictEqual` itself, which leads with the
+                              ;; Number/Number case so proven operands fold to one compare. The
+                              ;; negation is `StrictNotEqual` -- spelling it here as `== 0` was
+                              ;; itself a hand-written semantic.
                               (str-eq operator "===")
-                                (cond (and (= (fng-infer context left-node FNG-DYNAMIC) FNG-NUMBER)
-                                           (and (= (fng-infer context right-node FNG-DYNAMIC) FNG-NUMBER)
-                                                (and (!= (n-ty left) (t-dyn))
-                                                     (!= (n-ty right) (t-dyn)))))
-                                        (fng-bin (Eq) left right)
-                                      (and (= (fng-infer context left-node FNG-DYNAMIC) FNG-STRING)
-                                           (= (fng-infer context right-node FNG-DYNAMIC) FNG-STRING))
-                                        (fng-jsl-call2 context "StringEquals" left right)
-                                      :else
-                                        (fng-jsl-call2 context "StrictEqual"
-                                                       (fng-box-dynamic-argument! left)
-                                                       (fng-box-dynamic-argument! right)))
+                                (fng-jsl-call2 context "StrictEqual"
+                                               (fng-box-dynamic-argument! left)
+                                               (fng-box-dynamic-argument! right))
                               (str-eq operator "!==")
-                                (let [equal
-                                        (cond (and (= (fng-infer context left-node FNG-DYNAMIC) FNG-NUMBER)
-                                                   (and (= (fng-infer context right-node FNG-DYNAMIC) FNG-NUMBER)
-                                                        (and (!= (n-ty left) (t-dyn))
-                                                             (!= (n-ty right) (t-dyn)))))
-                                                (fng-bin (Eq) left right)
-                                              (and (= (fng-infer context left-node FNG-DYNAMIC) FNG-STRING)
-                                                   (= (fng-infer context right-node FNG-DYNAMIC) FNG-STRING))
-                                                (fng-jsl-call2 context "StringEquals" left right)
-                                              :else
-                                                (fng-jsl-call2 context "StrictEqual"
-                                                               (fng-box-dynamic-argument! left)
-                                                               (fng-box-dynamic-argument! right)))]
-                                  (fng-bin (Eq) equal (fng-const 0)))
+                                (fng-jsl-call2 context "StrictNotEqual"
+                                               (fng-box-dynamic-argument! left)
+                                               (fng-box-dynamic-argument! right))
+                              ;; `==` AND `!=` ARE THE DSL'S, WHOLE. The nullish-literal and
+                              ;; string/string dispatches that lived here were pre-specialisations
+                              ;; of `LooseEqual`'s own leading cases: `x == null` folds through
+                              ;; the IsNullish guards because the null constant's kinds prove
+                              ;; them, and two proven strings fold to the StringEquals arm.
                               (str-eq operator "!=")
-                                (let [equal
-                                        (if (fng-nullish-literal? context left-node)
-                                            (fng-nullish-equal context right-node right)
-                                            (if (fng-nullish-literal? context right-node)
-                                                (fng-nullish-equal context left-node left)
-                                                (if (and (= (fng-infer context left-node FNG-DYNAMIC) FNG-STRING)
-                                                         (= (fng-infer context right-node FNG-DYNAMIC) FNG-STRING))
-                                                    (fng-jsl-call2 context "StringEquals" left right)
-                                                    (fng-loose-equal context left right))))]
-                                  (fng-bin (Eq) equal (fng-const 0)))
+                                (fng-jsl-call2 context "LooseNotEqual"
+                                               (fng-box-dynamic-argument! left)
+                                               (fng-box-dynamic-argument! right))
                               (str-eq operator "==")
-                                (if (fng-nullish-literal? context left-node)
-                                    (fng-nullish-equal context right-node right)
-                                    (if (fng-nullish-literal? context right-node)
-                                        (fng-nullish-equal context left-node left)
-                                        (if (and (= (fng-infer context left-node FNG-DYNAMIC) FNG-STRING)
-                                                 (= (fng-infer context right-node FNG-DYNAMIC) FNG-STRING))
-                                            (fng-jsl-call2 context "StringEquals" left right)
-                                            (fng-loose-equal context left right))))
+                                (fng-jsl-call2 context "LooseEqual"
+                                               (fng-box-dynamic-argument! left)
+                                               (fng-box-dynamic-argument! right))
                               (str-eq operator "in")
                                 (if (or (= (ts-kind ast left-node) TSK-STRING-LITERAL)
                                         (= (ts-kind ast left-node) TSK-NUMERIC-LITERAL))
@@ -6242,16 +6136,20 @@
                   (do
                     (if (= (ts-kind ast clause) TSK-DEFAULT-CLAUSE)
                         (store! default-index (load index))
+                        ;; `switch` matches with `===`, so the test is the DSL's StrictEqual. The
+                        ;; call is lowered BEFORE the If reads the current control: inlining it
+                        ;; builds guard diamonds that ADVANCE the control, and an If anchored at
+                        ;; the pre-call control gave one Region two non-projection control
+                        ;; successors -- the evaluator reports that as stuck control.
                         (let [test (fng-expression context (ts-role ast clause TS-ROLE-EXPRESSION 0))
+                              matches
+                                (fng-jsl-call2 context "StrictEqual"
+                                               (fng-box-dynamic-argument! discriminant)
+                                               (fng-box-dynamic-argument! test))
                               arms
                                 (n-if-arms! (fng-peep (n-new2 (If)
                                                               (load (load (field context ctrl)))
-                                                              (fng-equal-value
-                                                                context
-                                                                (ts-role ast node TS-ROLE-EXPRESSION 0)
-                                                                discriminant
-                                                                (ts-role ast clause TS-ROLE-EXPRESSION 0)
-                                                                test))))]
+                                                              matches)))]
                           (al-push! [i64] (mut entry-clauses) (load index))
                           (al-push! [i64] (mut entry-ctrls) (arms-t arms))
                           (al-push! [i64]
@@ -6839,16 +6737,17 @@
                       kind (ts-kind ast clause)]
                   (if (= kind TSK-DEFAULT-CLAUSE)
                       (store! default-index (load index))
+                      ;; `switch` matches with `===`; the call is lowered before the If reads the
+                      ;; control, for the reason given at the other switch lowering above.
                       (let [case-value (fng-expression context (ts-role ast clause TS-ROLE-EXPRESSION 0))
+                            matches
+                              (fng-jsl-call2 context "StrictEqual"
+                                             (fng-box-dynamic-argument! discriminant)
+                                             (fng-box-dynamic-argument! case-value))
                             arms
                               (n-if-arms! (fng-peep (n-new2 (If)
                                                             (load (load (field context ctrl)))
-                                                            (fng-equal-value
-                                                              context
-                                                              (ts-role ast node TS-ROLE-EXPRESSION 0)
-                                                              discriminant
-                                                              (ts-role ast clause TS-ROLE-EXPRESSION 0)
-                                                              case-value))))]
+                                                            matches)))]
                         (al-set! [i64] (mut entry-ctrls) (load index) (arms-t arms))
                         (al-set! [i64]
                                  (mut entry-starts)
