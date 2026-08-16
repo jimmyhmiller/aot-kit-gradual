@@ -27,10 +27,10 @@
                 0)))
     (load yes)))
 
-(defn be-cfg-control? [(op i64)] (-> bool)
-  (or (or (= op OP-IF) (= op OP-RETURN))
-      (or (or (= op OP-LOOP) (= op OP-REGION))
-          (or (= op OP-CPROJ) (= op OP-CALLEND)))))
+(defn be-cfg-control? [(op Op)] (-> bool)
+  (match op
+    (If [] true) (Return [] true) (Loop [] true) (Region [] true)
+    (CProj [_] true) (CallEnd [] true) (_ false)))
 
 (defn be-ctrl-succ [(ctrl i64)] (-> i64)
   (let [len (n-nouts ctrl)
@@ -60,7 +60,7 @@
               (do
                 (let [u (n-out iff (load i))]
                   (if (and (not (n-dead? u))
-                           (and (= (n-op u) OP-CPROJ) (= (n-aux u) slot)))
+                           (match (n-op u) (CProj [label] (= label slot)) (_ false)))
                       (store! found u)
                       0))
                 (store! i (+ (load i) 1))
@@ -73,7 +73,7 @@
 ; ---------------------------------------------------------------------------
 
 (defn mu-target-slot [(target i64) (incoming i64)] (-> i64)
-  (if (or (= (n-op target) OP-REGION) (= (n-op target) OP-LOOP))
+  (if (or (op-is? target Region []) (op-is? target Loop []))
       (let [len (n-nins target)
             (mut i) 1
             (mut found) -1]
@@ -136,9 +136,9 @@
                             (store! done true))
                           (do
                             (al-set! [i64] (field u ctrl-block) (load ctrl) bid)
-                            (case (n-op (load ctrl)) OP-RETURN
-                                  (do (mu-note-return! owner (load ctrl)) (store! done true)) OP-IF
-                                  (let [a (be-if-arm (load ctrl) 0)
+                            (match (n-op (load ctrl))
+                              (Return [] (do (mu-note-return! owner (load ctrl)) (store! done true)))
+                              (If [] (let [a (be-if-arm (load ctrl) 0)
                                         b (be-if-arm (load ctrl) 1)]
                                     (if (!= a NO-NODE)
                                         (do
@@ -158,12 +158,12 @@
                                                         0)
                                           0)
                                         0)
-                                    (store! done true))
-                                    (let [next (be-ctrl-succ (load ctrl))]
+                                    (store! done true)))
+                              (_ (let [next (be-ctrl-succ (load ctrl))]
                                       (if (= next NO-NODE)
                                           (store! done true)
-                                          (if (or (= (n-op next) OP-REGION)
-                                                  (or (= (n-op next) OP-LOOP) (= (n-op next) OP-CPROJ)))
+                                          (if (or (op-is? next Region [])
+                                                  (or (op-is? next Loop []) (op-is? next CProj [_])))
                                               (do
                                                 (mu-walk-block! owner next)
                                                 (mu-add-edge! owner
@@ -171,7 +171,7 @@
                                                               (al-get (load (field u ctrl-block)) next)
                                                               (mu-target-slot next (load ctrl)))
                                                 (store! done true))
-                                              (store! ctrl next)))))))))
+                                              (store! ctrl next))))))))))
             bid)))))
 
 (defn mu-build-function! [(ideal i64) (entry i64)] (-> i64)
@@ -179,7 +179,12 @@
         id (mu-function-count)
         first (mu-block-count)]
     (al-push! [MFunction] (field u functions) (mf-new id ideal entry))
-    (al-push! [i64] (field u symbols) (if (= ideal NO-NODE) -1 (n-aux ideal)))
+    (al-push! [i64]
+              (field u symbols)
+              (if (= ideal NO-NODE)
+                  -1
+                  (match (n-op ideal) (Fun [index] index) (Start [] 0)
+                    (_ (do (panic-corrupt "machine function root must be Start or Fun") 0)))))
     (mu-walk-block! id entry)
     (let [f (mu-function id)]
       (store! (field f block-first) first)
@@ -212,11 +217,11 @@
 
 (defn mu-direct-callee [(call i64)] (-> i64)
   (let [callee (n-in call 1)]
-    (case (n-op callee) OP-FUN
-          callee OP-CLOSURE
-          (n-in callee 0)
-            (let [fidx (ty-fun-singleton (n-ty callee))]
-              (if (< fidx 0) NO-NODE (n-find-fun-index fidx))))))
+    (match (n-op callee)
+      (Fun [index] callee)
+      (Closure [captures] (n-in callee 0))
+      (_ (let [fidx (ty-fun-singleton (n-ty callee))]
+           (if (< fidx 0) NO-NODE (n-find-fun-index fidx)))))))
 
 (defn mu-build-call-targets! [(call i64)] (-> i64)
   (let [direct (mu-direct-callee call)
@@ -245,7 +250,7 @@
           (loop (if (>= (load i) lim)
                     (break)
                     (do
-                      (if (and (not (n-dead? (load i))) (= (n-op (load i)) OP-CALL))
+                      (if (and (not (n-dead? (load i))) (op-is? (load i) Call [_]))
                           (let [ctrl (n-in (load i) 0)
                                 bid
                                   (if (= ctrl NO-NODE)
@@ -476,7 +481,7 @@
                       header (load (field back target))
                       source (load (field back source))
                       slot (load (field back target-slot))]
-                  (if (and (= slot 2) (= (n-op (mu-block-control header)) OP-LOOP))
+                  (if (and (= slot 2) (op-is? (mu-block-control header) Loop []))
                       (do
                         (al-clear! [i64] (field u rpo-seen))
                         (al-clear! [i64] (field u rpo-post))
@@ -597,7 +602,7 @@
         t (load (field e target))
         slot (load (field e target-slot))
         target (mu-block-control t)]
-    (if (or (= (n-op target) OP-REGION) (= (n-op target) OP-LOOP))
+    (if (or (op-is? target Region []) (op-is? target Loop []))
         (if (or (<= slot 0) (or (>= slot (n-nins target)) (= (n-in target slot) NO-NODE)))
             false
             (let [incoming (n-in target slot)
@@ -621,13 +626,13 @@
 (defn mu-block-terminator-op [(bid i64)] (-> i64)
   (let [lim (n-count)
         (mut i) 0
-        (mut op) -1]
+        (mut op) NO-NODE]
     (loop (if (>= (load i) lim)
               (break)
               (do
                 (if (= (al-get (load (field (machine-unit) ctrl-block)) (load i)) bid)
-                    (let [candidate (n-op (load i))]
-                      (if (or (= candidate OP-IF) (= candidate OP-RETURN))
+                    (let [candidate (load i)]
+                      (if (or (op-is? candidate If []) (op-is? candidate Return []))
                           (store! op candidate)
                           0))
                     0)
@@ -643,8 +648,8 @@
               (break)
               (do
                 (if (= (al-get (load (field (machine-unit) ctrl-block)) (load i)) bid)
-                    (let [candidate (n-op (load i))]
-                      (if (or (= candidate OP-IF) (= candidate OP-RETURN))
+                    (let [candidate (load i)]
+                      (if (or (op-is? candidate If []) (op-is? candidate Return []))
                           (store! found (load i))
                           0))
                     0)
@@ -658,10 +663,10 @@
     (loop (if (>= (load i) blocks)
               (break)
               (do
-                (let [op (mu-block-terminator-op (load i))
+                (let [term (mu-block-terminator-op (load i))
                       succ (load (field (mu-block (load i)) succ-count))]
-                  (if (or (and (= op OP-IF) (!= succ 2))
-                          (and (= op OP-RETURN) (!= succ 0)))
+                  (if (or (and (!= term NO-NODE) (and (op-is? term If []) (!= succ 2)))
+                          (and (!= term NO-NODE) (and (op-is? term Return []) (!= succ 0))))
                       (do (mu-fail-verify! MCFG-TERMINATOR-ARITY (load i)) (break))
                       0))
                 (store! i (+ (load i) 1))
@@ -910,9 +915,9 @@
 
 (defn mu-build-entry! [(entry-fun i64)] (-> bool)
   (mu-reset!)
-  (if (or (!= (g-verify) 0) (= (n-op entry-fun) OP-FUNSTART))
+  (if (or (!= (g-verify) 0) (op-is? entry-fun FunStart []))
       false
-      (if (!= (n-op entry-fun) OP-FUN)
+      (if (not (op-is? entry-fun Fun [_]))
           false
           (do
             (mu-build-reachable-function! entry-fun)
@@ -928,7 +933,7 @@
         (loop (if (>= (load i) lim)
                   (break)
                   (do
-                    (if (and (not (n-dead? (load i))) (= (n-op (load i)) OP-CALL))
+                    (if (and (not (n-dead? (load i))) (op-is? (load i) Call [_]))
                         (let [ctrl (n-in (load i) 0)
                               bid
                                 (if (= ctrl NO-NODE)
@@ -947,7 +952,7 @@
         (loop (if (>= (load i) lim)
                   (break)
                   (do
-                    (if (and (not (n-dead? (load i))) (= (n-op (load i)) OP-FUN))
+                    (if (and (not (n-dead? (load i))) (op-is? (load i) Fun [_]))
                         (do (mu-build-reachable-function! (load i)) 0)
                         0)
                     (store! i (+ (load i) 1))
@@ -964,7 +969,7 @@
         (loop (if (>= (load i) lim)
                   (break)
                   (do
-                    (if (and (not (n-dead? (load i))) (= (n-op (load i)) OP-FUN))
+                    (if (and (not (n-dead? (load i))) (op-is? (load i) Fun [_]))
                         (do
                           (mu-build-function! (load i) (n-fun-entry (load i)))
                           (store! found true))

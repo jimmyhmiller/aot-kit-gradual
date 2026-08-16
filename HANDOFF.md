@@ -1,152 +1,140 @@
-# Handoff: testing
+# Handoff: move JavaScript semantics into the DSL
 
-The gate is `coil test`. 538 tests, ~25s, project mode. Nothing else runs.
+**THE TREE IS GREEN. 564 passed, 0 failed.** The arithmetic migration is landed: the five failures
+the previous handoff recorded are fixed, and what fixed them is written down below because each was
+a general lesson, not a local patch.
 
-The previous handoff (the iteration-loop mission) is in git history before this commit. That mission
-landed: the gate went 257s to 25s. This one is about what the tests actually prove.
-
----
-
-## Start here: make the opcode set a type
-
-92 opcodes are declared as bare integers in `src/node.coil`:
-
-    (const OP-ADD i64 14)
-    (const OP-MUL i64 15)
-    ...
-    (const OP-COUNT i64 90)     ; already wrong -- there are 92
-
-They should be a `defsum`. This is first in the handoff because it is the structural fix for the
-coverage problem described further down, not because it is tidy.
-
-**Why it matters for testing.** `coil.prop` derives generators from types: `(derive Arbitrary Op)`
-would generate all 92 opcodes. Today every property generator hand-picks about 15, which means a
-person is choosing which parts of the compiler get exercised, and that person forgets. The coverage
-ceiling measured this session traces directly to that.
-
-**Why it matters beyond testing.** `match` over a sum is exhaustive. A missing case becomes a
-compile error. The backend defect found and fixed this session (`be-select-program!` accepting a
-float program, emitting `0xFFFFFFE0/E1/E2` as instructions, and passing every downstream check) was
-*exactly* a missing case that reported success. Exhaustiveness would have made it unwritable.
-
-**The objections I raised and then measured away:**
-
-| worry | reality |
-|---|---|
-| a tagged union is wider than `i64` | **identical.** Measured: an all-nullary `defsum` is 8 bytes, same as `i64`. Only sums with payloads pay (that test sum was 16). |
-| opcodes are used as array indices | **one site.** `gtext.coil:716` loops `0..OP-COUNT` searching by name. Everything else is `=` or `case`. |
-| enormous churn | ordinary. 92 constants; `case` forms become `match`. |
-
-Fix `OP-COUNT` first regardless — it says 90 against 92 constants, so anything iterating that range
-silently skips two opcodes.
-
-### Manual or lint+fix?
-
-**Split it by whether the change needs a decision.**
-
-*Mechanical, automate freely:* renaming the constants, rewriting `(= (n-op x) OP-ADD)` comparison
-sites, the single `gtext` integer loop. A `coil lint --fix` rule or plain `sed` handles these, and
-`coil test` is a sound gate for them.
-
-*Semantic, do by hand:* every `case` over opcodes with a default arm. Exhaustiveness will reject
-these, and **that rejection is the entire point.** Each one is a question only a person can answer:
-is this default a genuine fallback, or a missing case that has been quietly succeeding?
-
-**The trap to avoid:** an auto-fix that satisfies the compiler by inserting a catch-all arm produces
-a green build that has learned nothing, and destroys the one benefit worth having. If you write a
-lint rule, make it *report* incomplete dispatches, never repair them.
-
-**`hivemind` fits the mechanical half well** — it is file-partitionable, the gate is the real test
-suite, and a failed unit reverts. Point it at the comparison sites and the constant renames, keep
-the `case`-to-`match` work in your own hands.
-
-**Sequence that keeps the tree green:** fix `OP-COUNT`; add the `defsum` alongside the constants;
-convert `n-op`'s return type and let the compiler list the sites; do the mechanical ones in bulk;
-then work the exhaustiveness failures one at a time, treating each as a possible bug rather than a
-compile error. Expect that pile to be large and to contain at least one real finding.
+Read `docs/DSL-OWNERSHIP.md` for the measurement, the phases and the enforcement. This file is what
+is in flight.
 
 ---
 
-## What testing looks like now
+## The mandate, stated here so it is not a pointer
 
-Eight properties plus supporting tests, all in `tests/backend-parity-prop.coil` unless noted. Every
-one was **falsified before being trusted** — broken deliberately, confirmed to fail, restored. Keep
-that discipline; it caught three of my own mistakes this session.
+**Every JavaScript semantic moves into `lib/`. Not most of it, not the convenient parts — all of
+it.** The frontend's job is to lower *syntax* into structure: control flow, scoping, memory and
+alias plumbing, the call ABI, closure environments, shapes. The meaning of every operator, every
+coercion and every builtin belongs to the DSL.
 
-| property | law |
-|---|---|
-| `native-agrees-with-interpreter-at-the-allocator-floor` | compiled code means the same at 8 registers and at the tightest count the allocator claims to solve |
-| `loop-native-...` | same, for values live across a back edge |
-| `float-native-...` | same, through the FP register bank |
-| `call-native-...` | same, for values live across a call boundary |
-| `optimization-preserves-meaning` | `iterate!` must not change what a program computes |
-| `float-optimization-...` | same, where `x*0`, `x+0`, `x/x` are the tempting wrong rewrites |
-| `heap-optimization-...` | same, over two objects of one shape — the case alias analysis can get wrong |
-| `array-optimization-...` | same, over marked allocations and indexed storage |
-| `every-shape-agrees-under-one-corpus` | all of the above behind ONE corpus, so the search can splice shapes together |
-| `an_uncompilable_program_is_refused_by_name...` | what the backend cannot compile is refused by name and publishes nothing |
-| `the_verifier_reaches_a_verdict...` | a malformed graph gets a verdict, not a crash, and a rejection names itself |
-| `string_optimization_preserves_meaning` | concat/length folding preserves meaning |
-| `node_agrees_with_the_compiler` (`js-source-prop.coil`) | **the only external oracle.** Same TypeScript to `node -e` and to us |
-| `a_linked_object_agrees_...` (`linked-object-test.coil`) | a real Mach-O object, linked with clang and executed |
-| `an_allocating_program_runs_under_the_collector` | allocation through the real GC |
+**The DSL's current expressiveness is never the limit.** If something cannot be written in `lib/`
+today, the DSL is what is wrong and gets extended. A `%` primitive is the correct way for the DSL
+to reach a runtime capability it cannot express — number formatting and a regexp engine are the two
+still owed.
 
-`docs/DEFTESTS-OWED.md` is the ledger: what the deletion of the shell gates cost, what has been
-recovered, and what is still owed. Read it before assuming green means what it used to.
+**The goal is not "the frontend delegates". It is that the frontend CANNOT hold a semantic.**
+Phase 1 in `docs/DSL-OWNERSHIP.md` is deleting the six helpers that exist so it can
+(`fng-bin`, `fng-number-value`, `fng-int-value`, `fng-to-number-operand`,
+`fng-condition-expression`, `fng-equal-value`) and splitting `Op` so the arithmetic and comparison
+variants are unnameable outside `jsl_lower` — a compile error rather than a lint. Phase 5 is
+deleting the surface entirely, so a future change that wants a hand-written semantic has to add the
+door back in a commit that says so.
+
+**Do not accept a partial conversion as done.** Every time a remainder looked inherent it was not:
+"the guards cannot fold" was a missing primitive, "the round trip is genuine work" was a missing
+fold rule, "arithmetic is unaffordable" was both. When something looks like it must stay in the
+compiler, the burden is to prove it is structure and not meaning.
 
 ---
 
-## The coverage picture, and what would actually move it
+## What is done and green
 
-27.3% of instrumented edges (3173 of 11618). It went 17.4% to 27.3% this session across four levers,
-each smaller than the last: unified corpus (+815), Mach-O publication (+244), arrays (+99), shift
-operators (+32).
+- **Phase 0 — a DSL call is free when the types are known.** `box-compute` carries the input's kind
+  (widened over the numeric union — a soundness requirement, not an optimisation);
+  `fng-analyze-fresh!` iterates analyse → fold → `iterate!` to a fixpoint; `jl-if` lowers the arm
+  before collecting a proven predicate; JSL bindings are pinned for their scope.
+- **The relational operators** are `IsLessThan`/`IsLessEqual` in `lib/`.
+- **The bitwise operators** are the DSL's, which also wired `ToInt32`/`ToUint32`.
+- **The arithmetic operators** are the DSL's: `JsAdd`, `JsSub`, `JsMul`, `JsDiv`, `JsMod` and
+  `JsNegate` (unary `-` included — it was still a hand-written `Sub(0, ToNumber(x))` until the
+  dead-definition ratchet flagged `JsNegate` as defined-but-uncalled). Two primitives were added to
+  make this affordable, `%IsNumber` and `%UnboxNumber` — see the recorded reasons below.
+- **The ownership ratchets are re-recorded**: `DSL-WIRED` includes the six arithmetic operations;
+  the opcode budgets are `Add` 4, `Sub` 2, `Mul`/`Div`/`Mod` 1 each (the survivors are the
+  relative-index clamp, the `++`/`--` raw fast path, and `fng-static-global-value`); the golden
+  graph text for `return n + 1` is re-pinned with the six-node value path plus the memory
+  scaffolding.
 
-**Do not chase this percentage directly.** Two measurements explain why:
+## What fixed the five failures, because each is a rule
 
-- **The denominator grows with the numerator.** Pulling a subsystem into a property instruments it
-  too. Mach-O added 244 covered and 656 total.
-- **New program shapes mostly re-tread old paths.** Going from seven shapes to nine in the unified
-  corpus added *nine edges*. Distinct properties are not distinct coverage.
+**1. A representation boundary is decided from the DECLARED type, at the site that knows it —
+never from the value's shape.** `main : number` returned a NaN-boxed word to a native caller
+because the unboxing hack (`fng-return-representation`) tested for the folded shape `Box(Add)` at
+build time, when the DSL's result is still an unfolded `Phi dyn` over the concat/numeric arms. The
+shape it looked for does not exist until analysis folds the guards, so it matched nothing, ever.
+The fix: `fng-expression-expected` now applies the `FNG-NUMBER` coercion (`fng-number-value`) to
+EVERY expression kind, not just identifiers, and the shape hack is deleted. The coercion is built
+eagerly and folds against the DSL's own boxing when analysis proves the types.
 
-**What would move it, in order:**
+**2. A type proof is not a representation proof, in the folds as much as anywhere.**
+The opcode fuzzer's `((If) (New))` counterexample: an if/else merges two boxed arms into
+`Phi(Box, Box) : num`; an object field forwards it; `unbox-idealize` deleted `Unbox(Box(v))` on
+the evidence that `v` proves `num` — and handed the tagged Phi to a raw `Add`, which consumed the
+NaN-box bits. Three changes in node.coil:
+- The verifier's representation classifier moved to **`n-rep-of` in node.coil** — one table, read
+  by the verifier's REP pass and by the idealizations, so they can never disagree. One deliberate
+  difference: a Phi with an ABSENT arm classifies UNKNOWN, because the idealizations run during
+  construction where an open loop Phi's backedge is still unknown (this is what keeps the deferred
+  `Box(Phi)` placeholders alive for `fng-distribute-deferred-phi-boxes!`).
+- `unbox-idealize` vetoes both fold arms when the boxed value is certainly tagged.
+- `box-idealize` peels `Box(x)` whenever `x` is certainly tagged: **boxing a tagged word is the
+  identity**, and `Box(Box(x)) → Box(x)` was only the easiest case of that rule. The frontend
+  boxes DSL operands blindly (`fng-arith2`), so tagged-without-being-a-Box values (a Phi of Box
+  arms, a PropLoad) arrive under a second tag the backend would corrupt.
 
-1. **The opcode sum type**, above. Generators stop being limited by what someone typed out.
-2. **Real JavaScript through the real frontend.** `frontend_native_graph.coil` is 7,290 lines, the
-   largest uncovered block. The lifter already exists (`js-source-prop.coil` emits TypeScript from
-   the same description that drives the IR) and both paths agree. It is blocked on one thing: the
-   property runner forks per case and the frontend reaches the TypeScript-Go bridge, whose Go
-   runtime cannot survive a fork. Measured: 40 cases pass in 4.8s under `--no-fork`, watchdog at 60s
-   with forking. If that loop moves to `posix_spawn` — the fix the *test* runner already took for
-   the signal-9 problem — convert `frontend_translates_generated_javascript_faithfully` from a
-   table-driven deftest back to a `defprop` and delete the caveat in `DEFTESTS-OWED.md`.
-3. **More string operators.** Concat and length are two of twenty-odd. An attempt to add
-   `STRINGUPPER`/`STRINGLOWER`/`STRINGSUBSTRING` crashed the property with an ambiguous LEAK
-   naming nodes the string program does not contain — unresolved, worth a fresh look.
-4. **Prototypes and closures.** Untouched subsystems. Expect ~400 edges each, on the strings
-   precedent.
+**3. The ratchet counter is textual.** `occurrences` counts `(Add)` anywhere in
+`frontend_native_graph.coil`, comments included — a comment saying `Box(Add)` inflates the debt.
+Word comments accordingly.
 
----
+## The two primitives, and why they exist
 
-## Method notes
+**`%IsNumber`** (`JSP-ISNUMBER`, lowers to `TypeTest (t-num)`). A boxed operand must carry the kind
+`int|flt` — a field declared `flt` holds an int-tagged 0 after `{a: 0}`, so the static type cannot
+determine the runtime tag — and against that union `ty-isa num num` decides while `ty-isa num int`
+does not. Selection emits two `MI-JSTEST`s and an OR; no new encoding.
 
-These are here because each cost real time, and all three have the same shape: **a green signal I
-did not try to break.**
+**`%UnboxNumber`** (`JSP-UNBOXNUMBER`, a bare `Unbox (t-flt)`). `%UnboxFlt` lowers through
+`jl-unbox`, which wraps its operand in a `Cast` the evaluator checks — an int-tagged number fails
+`Cast flt` even though the unbox beneath converts correctly (`ev-unbox` turns RT-INT into RFlt;
+aarch64 emits `sxt48`/`scvtf`).
 
-- **A generator arm that never fired.** The branch step was chosen from a byte's *high* bits while
-  the `(slice u8)` generator produces printable ASCII, so the diamond code was dead through 31,000
-  cases while coverage sat flat and looked like a ceiling. Every counterexample the property had
-  ever printed was ASCII — the evidence was in plain sight. `every-generator-arm-fires` now asserts
-  structurally that each arm produces the nodes it should.
-- **A property that passed while testing nothing.** The call property searched for an allocator
-  floor up to 8 registers; that shape needs 11, so the precondition never held and 200 of 200 cases
-  were rejected. The runner reported it; watch for that warning.
-- **A "solved" claim from one lucky run.** A linked allocating program printed the right answer once
-  and I wrote it up. The same binary, re-run minutes later, exited 139. It was faulting on
-  uninitialised state that happened once to be benign. **Re-run anything that manages its own
-  memory before believing it.**
+## Traps that cost real time
 
-And the pattern worth carrying: every *capability* limit I claimed this session and then tested was
-wrong — linked-object execution, driving clang from a deftest, GC allocation, rejection paths,
-strings were all reachable. Every *arithmetic* limit held. Be suspicious of "can't", trust "the
-numbers don't get there" only after measuring.
+- **A type is not a representation.** `ty-isa int flt` is false, and that says nothing about the
+  machine. `n-rep-of` is now the one answer to representation questions; do not re-derive from the
+  lattice.
+- **`ty-isa ANY num` is true.** An unanalysed node reads as a machine number, so
+  `fng-machine-number-value?` over-reports and cannot be used as "is this a primitive".
+- **Build-time type tests do not fire.** `n-ty-proven?` is false for everything while the graph is
+  being constructed. A coercion decided at build time keys on the DECLARED type (see rule 1) or on
+  shape — and shapes that only exist post-fold do not count.
+- **Do not put a fast path in the frontend.** Specialisation belongs in the DSL definition, which
+  leads with the common case.
+
+## Tools
+
+- `coil build tools/js-repro.coil -o out/js-repro` then `out/js-repro FILE.js ARG [--dump] [--tag]`
+  — node's answer beside ours in milliseconds, naming which of frontend/verifier/evaluator refused
+  it and at which node.
+- `tools/js-sweep.sh` — 29,068 cases, catalogued, crash-resumable. `docs/SWEEP-CATALOGUE.md`.
+- `repros/*.js` all pass; `repros/open/*.js` all fail. Sweep with
+  `for f in repros/*.js; do ./out/js-repro "$f" 10 >/dev/null || echo "FAIL $f"; done`.
+  **`ns.js` needs the raised budget in `tools/js-repro.coil` and takes ~2 minutes.**
+- The fuzz property: `coil test tests/js-source-prop.coil --cases N` (append `--seed S` to replay).
+
+## Next, in order
+
+Continue the plan in `docs/DSL-OWNERSHIP.md`, and finish it:
+
+1. `Eq` (18 sites) → `IsStrictlyEqual`, `Not` → `ToBoolean`, and the four remaining owed abstract
+   operations (`ToLength`, `SameValueZero`, `RelativeIndex`, `ToPropertyKey`). None need a new
+   primitive — they are wiring. The two `(Add)` relative-index clamps in `fng-relative-index`
+   territory are `RelativeIndex`'s to absorb.
+2. `fng-static-global-value`, the build-time constant evaluator, is the one site with a real
+   argument for staying: no `FngContext` and literals only. It is also demonstrably wrong today
+   (`true + 1` there builds a raw `Add` on a boolean). Either thread a context to it or fix it —
+   do not leave it as an unexamined exception.
+3. The intrinsics currently REFUSED at the frontend rather than implemented: `Number.prototype.
+   toFixed`, `String.prototype.replace`, `instanceof` against a global, object spread. Two need a
+   new `%` primitive — correctly-rounded number formatting, and a regexp engine. Build them.
+4. Then Phase 1 and Phase 5: delete the six helpers, split `Op`, and leave nowhere to put a
+   hand-written semantic.

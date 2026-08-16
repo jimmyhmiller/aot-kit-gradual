@@ -25,9 +25,9 @@
 (extern sys_icache_invalidate :cc c [(ptr u8) i64] (-> void))
 
 (defn cc [(v i64)] (-> i64)
-  (n-new1 OP-CONST (t-int-con v) (g-start)))
-(defn cb [(op i64) (a i64) (b i64)] (-> i64)
-  (n-new3 op 0 NO-NODE a b))
+  (n-new1 (Const (t-int-con v)) (g-start)))
+(defn cb [(op Op) (a i64) (b i64)] (-> i64)
+  (n-new3 op NO-NODE a b))
 
 (defn native0 [] (-> i64)
   (let [mem (mmap (cast (ptr u8) 0) 4096 3 4098 -1 0)]
@@ -94,11 +94,11 @@
 (deftest boxing_a_call_result_ignores_the_top_level_pseudo_function
   (graph-reset! 419)
   (let [callee (n-fun-open! 0)
-        callee-ret (n-new2 OP-RETURN 0 (n-fun-entry callee) (cc 7))]
+        callee-ret (n-new2 (Return) (n-fun-entry callee) (cc 7))]
     (n-fun-close! callee callee-ret)
     (let [site (n-call! (g-start) callee (slice-new [i64] (cast (ptr i64) 0) 0))
-          boxed (n-new2 OP-BOX 0 NO-NODE (call-value site))
-          ret (n-new2 OP-RETURN 0 (call-end site) boxed)]
+          boxed (n-new2 (Box 0) NO-NODE (call-value site))
+          ret (n-new2 (Return) (call-end site) boxed)]
       (n-add-def! (g-stop) ret)
       (g-analyze!)
       ;; A top-level graph is represented by a machine function whose ideal node is NO-NODE.
@@ -110,16 +110,16 @@
 (deftest call_return_discovery_does_not_alias_function_indices_above_the_target_mask
   (graph-reset! 421)
   (let [callee (n-fun-open! 0)
-        callee-ret (n-new2 OP-RETURN 0 (n-fun-entry callee) (cc 7))
+        callee-ret (n-new2 (Return) (n-fun-entry callee) (cc 7))
         decoy (n-fun-open! 64)
-        decoy-value (n-new2 OP-BOX 0 NO-NODE (cc 9))
-        decoy-ret (n-new2 OP-RETURN 0 (n-fun-entry decoy) decoy-value)]
+        decoy-value (n-new2 (Box 0) NO-NODE (cc 9))
+        decoy-ret (n-new2 (Return) (n-fun-entry decoy) decoy-value)]
     (n-fun-close! callee callee-ret)
     (n-fun-close! decoy decoy-ret)
     (let [decoy-site (n-call! (g-start) decoy (slice-new [i64] (cast (ptr i64) 0) 0))
           site (n-call! (call-end decoy-site) callee (slice-new [i64] (cast (ptr i64) 0) 0))
-          boxed (n-new2 OP-BOX 0 NO-NODE (call-value site))]
-      (n-add-def! (g-stop) (n-new2 OP-RETURN 0 (call-end site) boxed))
+          boxed (n-new2 (Box 0) NO-NODE (call-value site))]
+      (n-add-def! (g-stop) (n-new2 (Return) (call-end site) boxed))
       (g-analyze!)
       ;; Shifting by 64 must not make fidx 64 look like fidx 0 in the i64 target mask.
       (assert (be-select-machine-program!))
@@ -131,7 +131,7 @@
   (graph-reset! 422)
   (let [callee (n-fun-open! 0)
         third (n-parm! callee 2)
-        callee-ret (n-new2 OP-RETURN 0 (n-fun-entry callee) third)]
+        callee-ret (n-new2 (Return) (n-fun-entry callee) third)]
     (n-fun-close! callee callee-ret)
     (let [raw (stack (array i64 3))
           args (cast (ptr i64) raw)]
@@ -139,7 +139,7 @@
       (store! (index args 1) (cc 22))
       (store! (index args 2) (cc 33))
       (let [site (n-call! (g-start) callee (slice-new [i64] args 3))]
-        (n-add-def! (g-stop) (n-new2 OP-RETURN 0 (call-end site) (call-value site)))
+        (n-add-def! (g-stop) (n-new2 (Return) (call-end site) (call-value site)))
         (g-analyze!)
         (assert (= (g-verify) 0))
         (compile-machine!)
@@ -152,21 +152,21 @@
         tree (shape-transition tree-left "right" (t-obj))
         left-alias (shape-field-alias tree 0) right-alias (shape-field-alias tree 1)
         callee (n-fun-open! 0) parm (n-parm! callee 0)
-        callee-ret (n-new2 OP-RETURN 0 (n-fun-entry callee) parm)]
+        callee-ret (n-new2 (Return) (n-fun-entry callee) parm)]
     (n-fun-close! callee callee-ret)
     (let [left (n-call1! (g-start) callee (cc 11))
           right (n-call1! (call-end left) callee (cc 22))
           incoming (stack (array i64 2))]
-      (store! (index incoming 0) (n-new1 OP-ARG (t-mem-alias left-alias (t-undef)) (call-end right)))
-      (store! (index incoming 1) (n-new1 OP-ARG (t-mem-alias right-alias (t-undef)) (call-end right)))
+      (store! (index incoming 0) (n-new1 (Arg (t-mem-alias left-alias (t-undef))) (call-end right)))
+      (store! (index incoming 1) (n-new1 (Arg (t-mem-alias right-alias (t-undef))) (call-end right)))
       (let [parent (n-new-obj! (call-end right) tree
                      (slice-new [i64] (cast (ptr i64) incoming) 2))
             object (n-obj-ptr parent)
             left-store (n-store! (n-obj-mem parent 0) object (call-value left) left-alias)
             right-store (n-store! (n-obj-mem parent 1) object (call-value right) right-alias)
-            merge (n-new OP-MEMMERGE 0)]
+            merge (n-new (MemMerge))]
         (n-add-def! merge NO-NODE) (n-add-def! merge left-store) (n-add-def! merge right-store)
-        (n-add-def! (g-stop) (n-new3 OP-RETURN 0 (call-end right) object merge))
+        (n-add-def! (g-stop) (n-new3 (Return) (call-end right) object merge))
         (g-analyze!)
         (assert (be-select-machine-program!))
         (assert (>= (be-schedule!) 0))
@@ -188,16 +188,15 @@
   (graph-reset! 413)
   (shape-reset!)
   (let [callee (n-fun-open! 0)
-        callee-ret (n-new2 OP-RETURN 0 (n-fun-entry callee) (cc 0))]
+        callee-ret (n-new2 (Return) (n-fun-entry callee) (cc 0))]
     (n-fun-close! callee callee-ret)
-    (let [object (n-new1 OP-ARG (t-obj) (g-start))
+    (let [object (n-new1 (Arg (t-obj)) (g-start))
           site (n-call! (g-start) callee (slice-new [i64] (cast (ptr i64) 0) 0))
           memory
-            (n-new1 OP-ARG
-                    (t-mem-alias JS-PROPERTY-ALIAS (t-undef))
+            (n-new1 (Arg (t-mem-alias JS-PROPERTY-ALIAS (t-undef)))
                     (call-end site))
           loaded (n-prop-load-at! (call-end site) memory object "value")
-          ret (n-new3 OP-RETURN 0 (call-end site) loaded memory)]
+          ret (n-new3 (Return) (call-end site) loaded memory)]
       (n-add-def! (g-stop) ret)
       (g-analyze!)
       (assert (= (g-verify) 0))
@@ -271,10 +270,10 @@
   (graph-reset! 401)
   (let [inc (n-fun-open! 0)
         x (n-parm! inc 0)
-        body (n-new2 OP-RETURN 0 (n-fun-entry inc) (cb OP-ADD x (cc 1)))]
+        body (n-new2 (Return) (n-fun-entry inc) (cb (Add) x (cc 1)))]
     (n-fun-close! inc body)
     (let [site (n-call1! (g-start) inc (cc 41))
-          ret (n-new2 OP-RETURN 0 (call-end site) (call-value site))]
+          ret (n-new2 (Return) (call-end site) (call-value site))]
       (n-add-def! (g-stop) ret)
       (g-analyze!)
       (call-value site))))
@@ -283,15 +282,15 @@
   (graph-reset! 402)
   (let [inc (n-fun-open! 0)
         ix (n-parm! inc 0)
-        inc-ret (n-new2 OP-RETURN 0 (n-fun-entry inc) (cb OP-ADD ix (cc 1)))
+        inc-ret (n-new2 (Return) (n-fun-entry inc) (cb (Add) ix (cc 1)))
         twice (n-fun-open! 1)
         tx (n-parm! twice 0)
-        twice-ret (n-new2 OP-RETURN 0 (n-fun-entry twice) (cb OP-MUL tx (cc 2)))]
+        twice-ret (n-new2 (Return) (n-fun-entry twice) (cb (Mul) tx (cc 2)))]
     (n-fun-close! inc inc-ret)
     (n-fun-close! twice twice-ret)
     (let [first (n-call1! (g-start) inc (cc 20))
           second (n-call1! (call-end first) twice (call-value first))
-          ret (n-new2 OP-RETURN 0 (call-end second) (call-value second))]
+          ret (n-new2 (Return) (call-end second) (call-value second))]
       (n-add-def! (g-stop) ret)
       (g-analyze!)
       (call-value first))))
@@ -300,13 +299,13 @@
   (graph-reset! 403)
   (let [inc (n-fun-open! 0)
         x (n-parm! inc 0)
-        body (n-new2 OP-RETURN 0 (n-fun-entry inc) (cb OP-ADD x (cc 1)))]
+        body (n-new2 (Return) (n-fun-entry inc) (cb (Add) x (cc 1)))]
     (n-fun-close! inc body)
-    (let [pred (n-new1 OP-ARG (t-bool) (g-start))
-          arms (n-if-arms! (n-peephole (n-new2 OP-IF 0 (g-start) pred)))
+    (let [pred (n-new1 (Arg (t-bool)) (g-start))
+          arms (n-if-arms! (n-peephole (n-new2 (If) (g-start) pred)))
           site (n-call1! (arms-t arms) inc (cc 40))
-          yes (n-new2 OP-RETURN 0 (call-end site) (call-value site))
-          no (n-new2 OP-RETURN 0 (arms-f arms) (cc 9))]
+          yes (n-new2 (Return) (call-end site) (call-value site))
+          no (n-new2 (Return) (arms-f arms) (cc 9))]
       (n-add-def! (g-stop) yes)
       (n-add-def! (g-stop) no)
       (g-analyze!)
@@ -314,7 +313,7 @@
 
 (deftest one_direct_callee_has_disjoint_machine_ownership_and_executes_real_bl
          (let [call (build-one-call!)]
-           (assert (= (n-op call) OP-CALL))
+           (assert (op-is? call Call [_]))
            (assert (= (g-verify) 0))
            (assert (= (ev-run-bound 1 10000) EV-OK))
            (assert (= (rt-payload (ev-result)) 42))
@@ -343,11 +342,11 @@
          (graph-reset! 404)
          (let [identity (n-fun-open! 0)
                x (n-parm! identity 0)
-               body (n-new2 OP-RETURN 0 (n-fun-entry identity) x)]
+               body (n-new2 (Return) (n-fun-entry identity) x)]
            (n-fun-close! identity body)
            (let [held (cc 10)
                  site (n-call1! (g-start) identity (cc 32))
-                 ret (n-new2 OP-RETURN 0 (call-end site) (cb OP-ADD held (call-value site)))]
+                 ret (n-new2 (Return) (call-end site) (cb (Add) held (call-value site)))]
              (n-add-def! (g-stop) ret)
              (g-analyze!)
              (compile-machine!)
@@ -358,10 +357,10 @@
          (let [add (n-fun-open! 0)
                x (n-parm! add 0)
                y (n-parm! add 1)
-               body (n-new2 OP-RETURN 0 (n-fun-entry add) (cb OP-ADD x y))]
+               body (n-new2 (Return) (n-fun-entry add) (cb (Add) x y))]
            (n-fun-close! add body)
            (let [site (n-call2! (g-start) add (cc 20) (cc 22))
-                 ret (n-new2 OP-RETURN 0 (call-end site) (call-value site))]
+                 ret (n-new2 (Return) (call-end site) (call-value site))]
              (n-add-def! (g-stop) ret)
              (g-analyze!)
              (compile-machine!)
@@ -375,10 +374,10 @@
                c2 (n-parm! method 2)
                c3 (n-parm! method 3)
                receiver (n-parm! method 4)
-               sum0 (cb OP-ADD receiver c0)
-               sum1 (cb OP-ADD sum0 c1)
-               sum2 (cb OP-ADD sum1 c2)
-               body (n-new2 OP-RETURN 0 (n-fun-entry method) (cb OP-ADD sum2 c3))
+               sum0 (cb (Add) receiver c0)
+               sum1 (cb (Add) sum0 c1)
+               sum2 (cb (Add) sum1 c2)
+               body (n-new2 (Return) (n-fun-entry method) (cb (Add) sum2 c3))
                captures-buf (stack (array i64 4))
                captures (cast (ptr i64) captures-buf)]
            (n-fun-close! method body)
@@ -388,14 +387,14 @@
            (store! (index captures 3) (cc 0))
            (let [capture-slice (slice-new [i64] captures 4)
                  closure (n-closure! method capture-slice)
-                 receiver-object (n-new1 OP-ARG (t-obj) (g-start))
+                 receiver-object (n-new1 (Arg (t-obj)) (g-start))
                  site (n-call-captured-receiver!
                         (g-start)
                         closure
                         capture-slice
                         receiver-object
                         (slice-new [i64] (cast (ptr i64) 0) 0))
-                 ret (n-new2 OP-RETURN 0 (call-end site) (call-value site))]
+                 ret (n-new2 (Return) (call-end site) (call-value site))]
              (n-add-def! (g-stop) ret)
              (g-analyze!)
              (if (!= (g-verify) 0) (g-verify-print (stderr)) 0)
@@ -437,16 +436,16 @@
          (let [fun (n-fun-open! 0)
                n (n-parm! fun 0)
                arms (n-if-arms!
-                      (n-peephole (n-new2 OP-IF 0 (n-fun-entry fun) (cb OP-LT n (cc 1)))))
-               recur (n-call1! (arms-f arms) fun (cb OP-SUB n (cc 1)))
-               base (n-new2 OP-RETURN 0 (arms-t arms) (cc 0))
-               step (n-new2 OP-RETURN 0 (call-end recur)
-                            (cb OP-ADD (cc 1) (call-value recur)))]
+                      (n-peephole (n-new2 (If) (n-fun-entry fun) (cb (Lt) n (cc 1)))))
+               recur (n-call1! (arms-f arms) fun (cb (Sub) n (cc 1)))
+               base (n-new2 (Return) (arms-t arms) (cc 0))
+               step (n-new2 (Return) (call-end recur)
+                            (cb (Add) (cc 1) (call-value recur)))]
            (n-fun-close! fun base)
            (n-fun-add-return! fun step)
            (let [site (n-call1! (g-start) fun (cc 10))]
              (n-add-def! (g-stop)
-                         (n-new2 OP-RETURN 0 (call-end site) (call-value site)))
+                         (n-new2 (Return) (call-end site) (call-value site)))
              (g-analyze!)
              (assert (be-select-machine-program!))
              (assert (= (be-call-return-kind (call-value site)) MLK-SCALAR))
@@ -459,14 +458,14 @@
          (graph-reset! 406)
          (let [fun (n-fun-open! 0)
                n (n-parm! fun 0)
-               arms (n-if-arms! (n-peephole (n-new2 OP-IF 0 (n-fun-entry fun) (cb OP-LT n (cc 1)))))
-               recur (n-call1! (arms-f arms) fun (cb OP-SUB n (cc 1)))
-               base (n-new2 OP-RETURN 0 (arms-t arms) (cc 1))
-               step (n-new2 OP-RETURN 0 (call-end recur) (call-value recur))]
+               arms (n-if-arms! (n-peephole (n-new2 (If) (n-fun-entry fun) (cb (Lt) n (cc 1)))))
+               recur (n-call1! (arms-f arms) fun (cb (Sub) n (cc 1)))
+               base (n-new2 (Return) (arms-t arms) (cc 1))
+               step (n-new2 (Return) (call-end recur) (call-value recur))]
            (n-fun-close! fun base)
            (n-fun-add-return! fun step)
            (let [site (n-call1! (g-start) fun (cc 100))
-                 ret (n-new2 OP-RETURN 0 (call-end site) (call-value site))]
+                 ret (n-new2 (Return) (call-end site) (call-value site))]
              (n-add-def! (g-stop) ret)
              (g-analyze!)
              (assert (= (g-verify) 0))
@@ -480,21 +479,21 @@
                en (n-parm! even 0)
                on (n-parm! odd 0)
                ea
-                 (n-if-arms! (n-peephole (n-new2 OP-IF 0 (n-fun-entry even) (cb OP-EQ en (cc 0)))))
-               er (n-call1! (arms-f ea) odd (cb OP-SUB en (cc 1)))
-               eb (n-new2 OP-RETURN 0 (arms-t ea) (cc 1))
-               es (n-new2 OP-RETURN 0 (call-end er) (call-value er))
+                 (n-if-arms! (n-peephole (n-new2 (If) (n-fun-entry even) (cb (Eq) en (cc 0)))))
+               er (n-call1! (arms-f ea) odd (cb (Sub) en (cc 1)))
+               eb (n-new2 (Return) (arms-t ea) (cc 1))
+               es (n-new2 (Return) (call-end er) (call-value er))
                oa
-                 (n-if-arms! (n-peephole (n-new2 OP-IF 0 (n-fun-entry odd) (cb OP-EQ on (cc 0)))))
-               orc (n-call1! (arms-f oa) even (cb OP-SUB on (cc 1)))
-               ob (n-new2 OP-RETURN 0 (arms-t oa) (cc 0))
-               os (n-new2 OP-RETURN 0 (call-end orc) (call-value orc))]
+                 (n-if-arms! (n-peephole (n-new2 (If) (n-fun-entry odd) (cb (Eq) on (cc 0)))))
+               orc (n-call1! (arms-f oa) even (cb (Sub) on (cc 1)))
+               ob (n-new2 (Return) (arms-t oa) (cc 0))
+               os (n-new2 (Return) (call-end orc) (call-value orc))]
            (n-fun-close! even eb)
            (n-fun-add-return! even es)
            (n-fun-close! odd ob)
            (n-fun-add-return! odd os)
            (let [site (n-call1! (g-start) even (cc 20))
-                 ret (n-new2 OP-RETURN 0 (call-end site) (call-value site))]
+                 ret (n-new2 (Return) (call-end site) (call-value site))]
              (n-add-def! (g-stop) ret)
              (g-analyze!)
              (assert (= (g-verify) 0))
@@ -508,11 +507,11 @@
          (graph-reset! 407)
          (let [fun (n-fun-open! 0)
                x (n-parm! fun 0)
-               body (n-new2 OP-RETURN 0 (n-fun-entry fun) x)]
+               body (n-new2 (Return) (n-fun-entry fun) x)]
            (n-fun-close! fun body)
-           (let [indirect (n-new1 OP-ARG (t-fun-con 0) (g-start))
+           (let [indirect (n-new1 (Arg (t-fun-con 0)) (g-start))
                  site (n-call1! (g-start) indirect (cc 42))
-                 ret (n-new2 OP-RETURN 0 (call-end site) (call-value site))]
+                 ret (n-new2 (Return) (call-end site) (call-value site))]
              (n-add-def! (g-stop) ret)
              (g-analyze!)
              (assert (= (g-verify) 0))

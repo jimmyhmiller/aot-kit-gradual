@@ -123,19 +123,35 @@
 
 ;; https://tc39.es/ecma262/#sec-array.prototype.unshift, one syntax argument at a time. The
 ;; frontend visits arguments right-to-left, so repeated calls preserve their source order.
+;;
+;; NEVER BOUND A LOOP BY THE LENGTH OF AN ARRAY THE LOOP GROWS. This read the receiver's length
+;; into a `let` first -- `(len (%ArrayLen a))` -- and used `len` as the write-back loop's bound.
+;; That binding does not stay fixed: the loop stores at `i + 1`, which reaches the end and EXTENDS
+;; `a`, and the bound followed it. Every `unshift` then failed to terminate, at any length
+;; including zero -- 200,000,000 evaluator steps on a two-element array.
+;;
+;; The bound now comes from `copy`, which is written once and never grown afterwards, so it cannot
+;; move however much the receiver does.
+;;
+;; `ArrayShift` and `ArrayReverse` have the same loop-over-an-array shape and are NOT affected,
+;; which is worth knowing before copying either as a template: both only ever store WITHIN the
+;; existing bounds, so their receiver's length never changes while they iterate. `shift`'s resize
+;; is its last binding, outside the loop, deliberately.
+;; repros/array-unshift-does-not-terminate.js.
 (macro ArrayUnshift1 :params [(a dyn) (v dyn)] :ret int
-  (let [(len (%ArrayLen a))
-        (copy (%NewArray))
+  (let [(copy (%NewArray))
         (copied
           (loop [(i 0)]
-            (if (%Le len i) i
+            (if (%Le (%ArrayLen a) i) i
               (let [(stored (%ArrayStore copy i (%ArrayLoad a i)))]
                 (recur (%Add i 1))))))
-        (head (%ArrayStore a 0 v))]
-    (loop [(i 0)]
-      (if (%Le len i) (%Add len 1)
-        (let [(moved (%ArrayStore a (%Add i 1) (%ArrayLoad copy i)))]
-          (recur (%Add i 1)))))))
+        (head (%ArrayStore a 0 v))
+        (moved
+          (loop [(i 0)]
+            (if (%Le (%ArrayLen copy) i) i
+              (let [(stored2 (%ArrayStore a (%Add i 1) (%ArrayLoad copy i)))]
+                (recur (%Add i 1))))))]
+    (%Add (%ArrayLen copy) 1)))
 
 ;; https://tc39.es/ecma262/#sec-array.prototype.reverse. Swapping only the lower half makes odd
 ;; lengths leave their centre element untouched.

@@ -12,7 +12,7 @@
   (let [lim (n-count) (mut i) 0 (mut count) 0]
     (loop
       (if (>= (load i) lim) (break)
-        (do (if (and (not (n-dead? (load i))) (= (n-op (load i)) op))
+        (do (if (and (not (n-dead? (load i))) (= (op-encode-tag (n-op (load i))) op))
                 (store! count (+ (load count) 1)) 0)
             (store! i (+ (load i) 1)) 0)))
     (load count)))
@@ -22,19 +22,19 @@
 
 (deftest relocated_projection_is_the_only_legal_post_safepoint_reference
   (graph-reset! 1)
-  (let [s (gc-shape) obj (n-new1 OP-ARG (t-obj-shape s) (g-start))
+  (let [s (gc-shape) obj (n-new1 (Arg (t-obj-shape s)) (g-start))
         sp (n-safepoint1! (g-start) obj)
         ctrl (n-safepoint-ctrl! sp) moved (n-safepoint-ref! sp 0)
-        ret (n-new2 OP-RETURN 0 ctrl moved)]
+        ret (n-new2 (Return) ctrl moved)]
     (n-add-def! (g-stop) ret) (iterate!)
-    (assert (= (gc-live-op OP-SAFEPOINT) 1))
+    (assert (= (gc-live-op OPTAG-SAFEPOINT) 1))
     (assert (= (g-verify) 0))))
 
 (deftest verifier_rejects_an_interior_nonreference_live_at_a_safepoint
   (graph-reset! 2)
   (let [word (n-const (t-int-con 8)) sp (n-safepoint1! (g-start) word)
         ctrl (n-safepoint-ctrl! sp) moved (n-safepoint-ref! sp 0)
-        ret (n-new2 OP-RETURN 0 ctrl moved)]
+        ret (n-new2 (Return) ctrl moved)]
     (n-add-def! (g-stop) ret) (g-analyze!)
     (assert (> (g-verify) 0))
     (assert (= (g-verify-code) VERR-SAFEPOINT-INTERIOR))))
@@ -42,14 +42,14 @@
 (deftest verifier_rejects_a_pre_safepoint_reference_used_after_relocation
   (graph-reset! 3)
   (let [s (gc-shape) alias (shape-field-alias s 0)
-        mem (n-new1 OP-ARG (t-mem-alias alias (t-top)) (g-start))
-        obj (n-new1 OP-ARG (t-obj-shape s) (g-start))
+        mem (n-new1 (Arg (t-mem-alias alias (t-top))) (g-start))
+        obj (n-new1 (Arg (t-obj-shape s)) (g-start))
         sp (n-safepoint1! (g-start) obj)
         ctrl (n-safepoint-ctrl! sp) moved (n-safepoint-ref! sp 0)
         ; `moved` keeps the required relocation projection live, but the Return deliberately uses
         ; the old identity. A moving collector is allowed to invalidate it.
         barrier (n-barrier! ctrl mem obj moved)
-        ret (n-new3 OP-RETURN 0 ctrl obj barrier)]
+        ret (n-new3 (Return) ctrl obj barrier)]
     (n-add-def! (g-stop) ret) (g-analyze!)
     (assert (> (g-verify) 0))
     (assert (= (g-verify-code) VERR-PRE-SAFEPOINT-REF))))
@@ -57,43 +57,43 @@
 (deftest duplicate_abstract_barriers_are_eliminated
   (graph-reset! 4)
   (let [s (gc-shape) alias (shape-field-alias s 0)
-        mem (n-new1 OP-ARG (t-mem-alias alias (t-top)) (g-start))
-        obj (n-new1 OP-ARG (t-obj-shape s) (g-start))
+        mem (n-new1 (Arg (t-mem-alias alias (t-top))) (g-start))
+        obj (n-new1 (Arg (t-obj-shape s)) (g-start))
         b1 (n-barrier! (g-start) mem obj obj)
         b2 (n-barrier! (g-start) b1 obj obj)
-        ret (n-new3 OP-RETURN 0 (g-start) obj b2)]
+        ret (n-new3 (Return) (g-start) obj b2)]
     (n-add-def! (g-stop) ret) (iterate!)
-    (assert (= (gc-live-op OP-BARRIER) 1))
+    (assert (= (gc-live-op OPTAG-BARRIER) 1))
     (assert (= (g-verify) 0))))
 
 (deftest placement_covers_allocations_calls_and_loop_back_edges
   ; Allocation boundary.
   (graph-reset! 5)
   (let [s (gc-shape) alias (shape-field-alias s 0)
-        mem (n-new1 OP-ARG (t-mem-alias alias (t-top)) (g-start))
+        mem (n-new1 (Arg (t-mem-alias alias (t-top))) (g-start))
         nw (n-new-obj1! (g-start) s mem)
-        ret (n-new3 OP-RETURN 0 (g-start) (n-obj-ptr nw) (n-obj-mem nw 0))]
+        ret (n-new3 (Return) (g-start) (n-obj-ptr nw) (n-obj-mem nw 0))]
     (n-add-def! (g-stop) ret) (iterate!)
     (assert (= (g-place-safepoints!) 1)) (iterate!)
-    (assert (= (gc-live-op OP-SAFEPOINT) 1))
+    (assert (= (gc-live-op OPTAG-SAFEPOINT) 1))
     (assert (= (g-verify) 0)))
   ; Call boundary.
   (graph-reset! 6)
   (let [fun (n-fun-open! 0) x (n-parm! fun 0)
-        body (n-new2 OP-RETURN 0 (n-fun-entry fun) x)]
+        body (n-new2 (Return) (n-fun-entry fun) x)]
     (n-fun-close! fun body)
     (let [site (n-call1! (g-start) fun (n-const (t-int-con 1)))
-          ret (n-new2 OP-RETURN 0 (call-end site) (call-value site))]
+          ret (n-new2 (Return) (call-end site) (call-value site))]
       (n-add-def! (g-stop) ret) (iterate!)
       (assert (= (g-place-safepoints!) 1)) (iterate!)
-      (assert (= (gc-live-op OP-SAFEPOINT) 1))
+      (assert (= (gc-live-op OPTAG-SAFEPOINT) 1))
       (assert (= (g-verify) 0))))
   ; Loop back edge.
   (graph-reset! 7)
-  (let [lp (n-new3 OP-LOOP 0 NO-NODE (g-start) NO-NODE)]
+  (let [lp (n-new3 (Loop) NO-NODE (g-start) NO-NODE)]
     (n-set-def! lp 2 lp)
-    (let [ret (n-new2 OP-RETURN 0 lp (n-const (t-int-con 0)))]
+    (let [ret (n-new2 (Return) lp (n-const (t-int-con 0)))]
       (n-add-def! (g-stop) ret) (g-analyze!)
       (assert (= (g-place-safepoints!) 1)) (g-analyze!)
-      (assert (= (gc-live-op OP-SAFEPOINT) 1))
+      (assert (= (gc-live-op OPTAG-SAFEPOINT) 1))
       (assert (= (g-verify) 0)))))

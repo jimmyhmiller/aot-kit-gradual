@@ -27,8 +27,8 @@
 (extern munmap :cc c [(ptr u8) i64] (-> i32))
 (extern sys_icache_invalidate :cc c [(ptr u8) i64] (-> void))
 
-(defn raw-const [(v i64)] (-> i64) (n-new1 OP-CONST (t-int-con v) (g-start)))
-(defn raw-bin [(op i64) (a i64) (b i64)] (-> i64) (n-new3 op 0 NO-NODE a b))
+(defn raw-const [(v i64)] (-> i64) (n-new1 (Const (t-int-con v)) (g-start)))
+(defn raw-bin [(op Op) (a i64) (b i64)] (-> i64) (n-new3 op NO-NODE a b))
 
 
 
@@ -92,12 +92,12 @@
 (deftest tagged_words_survive_direct_calls_and_returns
   (graph-reset! 103)
   (let [fun (n-fun-open! 0) value (n-parm! fun 0)
-        body (n-new2 OP-RETURN 0 (n-fun-entry fun) value)]
+        body (n-new2 (Return) (n-fun-entry fun) value)]
     (n-fun-close! fun body)
-    (let [boxed (n-new2 OP-BOX 0 NO-NODE (raw-const -23))
+    (let [boxed (n-new2 (Box 0) NO-NODE (raw-const -23))
           site (n-call1! (g-start) fun boxed)
-          unboxed (n-new2 OP-UNBOX (t-int) NO-NODE (call-value site))
-          ret (n-new2 OP-RETURN 0 (call-end site) unboxed)]
+          unboxed (n-new2 (Unbox (t-int)) NO-NODE (call-value site))
+          ret (n-new2 (Return) (call-end site) unboxed)]
       (n-add-def! (g-stop) ret) (g-analyze!)
       (assert (select-program-or-report))
       (be-schedule!) (assert (= (be-color! 8) 0)) (be-encode!)
@@ -106,10 +106,10 @@
 (deftest every_tag_survives_the_dynamic_direct_call_abi
   (graph-reset! 109)
   (let [fun (n-fun-open! 0) value (n-parm! fun 0)
-        body (n-new2 OP-RETURN 0 (n-fun-entry fun) value)]
+        body (n-new2 (Return) (n-fun-entry fun) value)]
     (n-fun-close! fun body)
-    (let [arg (n-new1 OP-ARG (t-dyn) (g-start)) site (n-call1! (g-start) fun arg)
-          ret (n-new2 OP-RETURN 0 (call-end site) (call-value site))]
+    (let [arg (n-new1 (Arg (t-dyn)) (g-start)) site (n-call1! (g-start) fun arg)
+          ret (n-new2 (Return) (call-end site) (call-value site))]
       (n-add-def! (g-stop) ret) (g-analyze!)
       (assert (select-program-or-report))
       (be-schedule!) (assert (= (be-color! 8) 0)) (be-encode!)
@@ -122,17 +122,17 @@
 
 (deftest tagged_words_survive_phi_edges
   (graph-reset! 104)
-  (let [arg (n-new1 OP-ARG (t-bool) (g-start))
-        iff (n-new2 OP-IF 0 (g-start) arg) arms (n-if-arms! iff)
-        region (n-new OP-REGION 0)]
+  (let [arg (n-new1 (Arg (t-bool)) (g-start))
+        iff (n-new2 (If) (g-start) arg) arms (n-if-arms! iff)
+        region (n-new (Region))]
     (n-add-def! region NO-NODE) (n-add-def! region (arms-t arms))
     (n-add-def! region (arms-f arms))
-    (let [phi (n-new OP-PHI (t-dyn))]
+    (let [phi (n-new (Phi (t-dyn)))]
       (n-add-def! phi region)
-      (n-add-def! phi (n-new2 OP-BOX 0 NO-NODE (raw-const 11)))
-      (n-add-def! phi (n-new2 OP-BOX 0 NO-NODE (raw-const 22)))
-      (let [value (n-new2 OP-UNBOX (t-int) NO-NODE phi)
-            ret (n-new2 OP-RETURN 0 region value)]
+      (n-add-def! phi (n-new2 (Box 0) NO-NODE (raw-const 11)))
+      (n-add-def! phi (n-new2 (Box 0) NO-NODE (raw-const 22)))
+      (let [value (n-new2 (Unbox (t-int)) NO-NODE phi)
+            ret (n-new2 (Return) region value)]
         (n-add-def! (g-stop) ret) (g-analyze!)
         (assert (select-program-or-report))
         (be-schedule!) (assert (= (be-color! 8) 0)) (be-encode!)
@@ -141,15 +141,15 @@
 
 (deftest every_tag_survives_dynamic_phi_edges
   (graph-reset! 110)
-  (let [pred (n-new1 OP-ARG (t-bool) (g-start))
-        left (n-new1 OP-ARG (t-dyn) (g-start)) right (n-new1 OP-ARG (t-dyn) (g-start))
-        iff (n-new2 OP-IF 0 (g-start) pred) arms (n-if-arms! iff)
-        region (n-new OP-REGION 0)]
+  (let [pred (n-new1 (Arg (t-bool)) (g-start))
+        left (n-new1 (Arg (t-dyn)) (g-start)) right (n-new1 (Arg (t-dyn)) (g-start))
+        iff (n-new2 (If) (g-start) pred) arms (n-if-arms! iff)
+        region (n-new (Region))]
     (n-add-def! region NO-NODE) (n-add-def! region (arms-t arms))
     (n-add-def! region (arms-f arms))
-    (let [phi (n-new OP-PHI (t-dyn))]
+    (let [phi (n-new (Phi (t-dyn)))]
       (n-add-def! phi region) (n-add-def! phi left) (n-add-def! phi right)
-      (let [ret (n-new2 OP-RETURN 0 region phi)]
+      (let [ret (n-new2 (Return) region phi)]
         (n-add-def! (g-stop) ret) (g-analyze!)
         (assert (select-program-or-report))
         (be-schedule!) (assert (= (be-color! 8) 0)) (be-encode!)
@@ -164,19 +164,19 @@
 (deftest tagged_words_survive_forced_spills
   (graph-reset! 105)
   (let [fun (n-fun-open! 0) pa (n-parm! fun 0) pb (n-parm! fun 1) pc (n-parm! fun 2)
-        ua (n-new2 OP-UNBOX (t-int) NO-NODE pa)
-        ub (n-new2 OP-UNBOX (t-int) NO-NODE pb)
-        uc (n-new2 OP-UNBOX (t-int) NO-NODE pc)
-        body (n-new2 OP-RETURN 0 (n-fun-entry fun)
-                     (raw-bin OP-ADD (raw-bin OP-ADD ua ub) uc))]
+        ua (n-new2 (Unbox (t-int)) NO-NODE pa)
+        ub (n-new2 (Unbox (t-int)) NO-NODE pb)
+        uc (n-new2 (Unbox (t-int)) NO-NODE pc)
+        body (n-new2 (Return) (n-fun-entry fun)
+                     (raw-bin (Add) (raw-bin (Add) ua ub) uc))]
     (n-fun-close! fun body)
-    (let [a (n-new2 OP-BOX 0 NO-NODE (raw-const 10))
-          b (n-new2 OP-BOX 0 NO-NODE (raw-const 20))
-          c (n-new2 OP-BOX 0 NO-NODE (raw-const 30))
+    (let [a (n-new2 (Box 0) NO-NODE (raw-const 10))
+          b (n-new2 (Box 0) NO-NODE (raw-const 20))
+          c (n-new2 (Box 0) NO-NODE (raw-const 30))
           buf (stack (array i64 3)) args (cast (ptr i64) buf)]
       (store! (index args 0) a) (store! (index args 1) b) (store! (index args 2) c)
       (let [site (n-call! (g-start) fun (slice-new [i64] args 3))
-            ret (n-new2 OP-RETURN 0 (call-end site) (call-value site))]
+            ret (n-new2 (Return) (call-end site) (call-value site))]
         (n-add-def! (g-stop) ret)))
     (g-analyze!)
     (assert (select-program-or-report)) (be-schedule!)
@@ -195,13 +195,13 @@
   (graph-reset! 106) (shape-reset!)
   (let [shape (shape-transition SHAPE-ROOT "value" (t-dyn))
         alias (shape-field-alias shape 0)
-        mem0 (n-new1 OP-ARG (t-mem-alias alias (t-undef)) (g-start))
+        mem0 (n-new1 (Arg (t-mem-alias alias (t-undef))) (g-start))
         nw (n-new-obj1! (g-start) shape mem0) object (n-obj-ptr nw)
-        boxed (n-new2 OP-BOX 0 NO-NODE (raw-const -91))
-        mem1 (n-new4 OP-STORE alias NO-NODE (n-obj-mem nw 0) object boxed)
-        loaded (n-new3 OP-LOAD alias NO-NODE mem1 object)
-        value (n-new2 OP-UNBOX (t-int) NO-NODE loaded)
-        ret (n-new3 OP-RETURN 0 (g-start) value mem1)]
+        boxed (n-new2 (Box 0) NO-NODE (raw-const -91))
+        mem1 (n-new4 (Store alias) NO-NODE (n-obj-mem nw 0) object boxed)
+        loaded (n-new3 (Load alias) NO-NODE mem1 object)
+        value (n-new2 (Unbox (t-int)) NO-NODE loaded)
+        ret (n-new3 (Return) (g-start) value mem1)]
     (n-add-def! (g-stop) ret) (g-analyze!)
     (assert (select-program-or-report))
     (be-schedule!) (assert (= (be-color! 8) 0)) (be-encode!)
@@ -211,12 +211,12 @@
   (graph-reset! 111) (shape-reset!)
   (let [shape (shape-transition SHAPE-ROOT "value" (t-dyn))
         alias (shape-field-alias shape 0)
-        value (n-new1 OP-ARG (t-dyn) (g-start))
-        mem0 (n-new1 OP-ARG (t-mem-alias alias (t-undef)) (g-start))
+        value (n-new1 (Arg (t-dyn)) (g-start))
+        mem0 (n-new1 (Arg (t-mem-alias alias (t-undef))) (g-start))
         nw (n-new-obj1! (g-start) shape mem0) object (n-obj-ptr nw)
-        mem1 (n-new4 OP-STORE alias NO-NODE (n-obj-mem nw 0) object value)
-        loaded (n-new3 OP-LOAD alias NO-NODE mem1 object)
-        ret (n-new3 OP-RETURN 0 (g-start) loaded mem1)]
+        mem1 (n-new4 (Store alias) NO-NODE (n-obj-mem nw 0) object value)
+        loaded (n-new3 (Load alias) NO-NODE mem1 object)
+        ret (n-new3 (Return) (g-start) loaded mem1)]
     (n-add-def! (g-stop) ret) (g-analyze!)
     (assert (select-program-or-report))
     (be-schedule!) (assert (>= (be-color! 8) 0)) (be-encode!)
@@ -229,9 +229,9 @@
 
 (deftest native_type_tests_distinguish_integer_tags_from_other_values
   (graph-reset! 107)
-  (let [arg (n-new1 OP-ARG (t-dyn) (g-start))
-        tested (n-new2 OP-TYPETEST (t-int) NO-NODE arg)
-        ret (n-new2 OP-RETURN 0 (g-start) tested)]
+  (let [arg (n-new1 (Arg (t-dyn)) (g-start))
+        tested (n-new2 (TypeTest (t-int)) NO-NODE arg)
+        ret (n-new2 (Return) (g-start) tested)]
     (n-add-def! (g-stop) ret) (g-analyze!)
     (assert (select-program-or-report))
     (be-schedule!) (assert (= (be-color! 8) 0)) (be-encode!)
@@ -241,9 +241,9 @@
 
 (deftest native_double_type_tests_include_nan_and_signed_zero_but_exclude_tags
   (graph-reset! 108)
-  (let [arg (n-new1 OP-ARG (t-dyn) (g-start))
-        tested (n-new2 OP-TYPETEST (t-flt) NO-NODE arg)
-        ret (n-new2 OP-RETURN 0 (g-start) tested)]
+  (let [arg (n-new1 (Arg (t-dyn)) (g-start))
+        tested (n-new2 (TypeTest (t-flt)) NO-NODE arg)
+        ret (n-new2 (Return) (g-start) tested)]
     (n-add-def! (g-stop) ret) (g-analyze!)
     (assert (select-program-or-report))
     (be-schedule!) (assert (= (be-color! 8) 0)) (be-encode!)
@@ -257,9 +257,9 @@
 
 (deftest checked_native_double_unbox_preserves_bits
   (graph-reset! 112)
-  (let [arg (n-new1 OP-ARG (t-dyn) (g-start))
-        value (n-new2 OP-UNBOX (t-flt) NO-NODE arg)
-        ret (n-new2 OP-RETURN 0 (g-start) value)]
+  (let [arg (n-new1 (Arg (t-dyn)) (g-start))
+        value (n-new2 (Unbox (t-flt)) NO-NODE arg)
+        ret (n-new2 (Return) (g-start) value)]
     (n-add-def! (g-stop) ret) (g-analyze!)
     (assert (select-program-or-report))
     (be-schedule!) (assert (= (be-color! 8) 0)) (be-encode!)

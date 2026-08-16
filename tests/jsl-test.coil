@@ -41,12 +41,12 @@
   0)
 
 (defn sconst [(s (slice u8))] (-> i64) (n-string-const! (jss-from-utf8! s)))
-(defn kconst [(t i64)] (-> i64) (n-peephole (n-new1 OP-CONST t (g-start))))
+(defn kconst [(t i64)] (-> i64) (n-peephole (n-new1 (Const t) (g-start))))
 (defn fconst [(x f64)] (-> i64) (kconst (t-flt-con x)))
 (defn bconst [(b bool)] (-> i64) (kconst (t-bool-con b)))
 (const INF-BITS i64 9218868437227405312)
 (const NEG-INF-BITS i64 -4503599627370496)
-(defn iconst [(v i64)] (-> i64) (n-peephole (n-new1 OP-CONST (t-int-con v) (g-start))))
+(defn iconst [(v i64)] (-> i64) (n-peephole (n-new1 (Const (t-int-con v)) (g-start))))
 
 ;; Load, check and lower a unit, asserting each stage. Returns nothing useful; the assertions are
 ;; the content.
@@ -60,7 +60,7 @@
 ;; gives the evaluator somewhere to start.
 (defn runN [(name (slice u8)) (args (slice i64))] (-> RtVal)
   (let [cs (jsl-call! (g-start) name args)
-        ret (n-new2 OP-RETURN 0 (call-end cs) (call-value cs))]
+        ret (n-new2 (Return) (call-end cs) (call-value cs))]
     (n-add-def! (g-stop) ret)
     (n-peephole (g-stop))
     ; `iterate!` IS THE OPTIMISER; `g-analyze!` only computes types and rewrites nothing. Running
@@ -93,7 +93,7 @@
         p (cast (ptr i64) buf)]
     (store! (index p 0) a) (store! (index p 1) b) (store! (index p 2) c)
     (let [cs (jsl-call! (g-start) name (slice-new [i64] p 3))
-          ret (n-new2 OP-RETURN 0 (call-end cs) (call-value cs))]
+          ret (n-new2 (Return) (call-end cs) (call-value cs))]
       (n-add-def! (g-stop) ret)
       (n-peephole (g-stop))
       (iterate!)
@@ -185,8 +185,8 @@
            (loop (if (>= (load i) (n-count)) (break)
                    (do
                      (if (and (not (n-dead? (load i)))
-                              (and (= (n-op (load i)) OP-BOX)
-                                   (= (n-aux (load i)) BOX-AUX-ARRAY)))
+                              (and (op-is? (load i) Box [_])
+                                   (= (n-box-kind (load i)) BOX-AUX-ARRAY)))
                          (store! found true)
                          0)
                      (store! i (+ (load i) 1)))))
@@ -227,9 +227,9 @@
 (deftest an_explicit_receiver_is_part_of_the_javascript_call_abi
          (fresh! 90109)
          (build! SRC-CALL-WITH-RECEIVER)
-         (let [call (first-op OP-CALL)]
+         (let [call (first-op OPTAG-CALL)]
            (assert (!= call NO-NODE))
-           (assert (= (n-aux call) CALL-ABI-RECEIVER))
+           (assert (= (n-call-abi call) CALL-ABI-RECEIVER))
            ; ctrl, callee, the hidden closure environment (the callee value itself), receiver,
            ; one positional value, and the implicit heap effect.
            (assert (= (n-nins call) 6)))
@@ -269,7 +269,9 @@
 ;; and the index format are all only exercised here.
 (deftest the_library_on_disk_loads_and_every_declaration_lowers
          (lib! 90300)
-         (assert (= (jsl-decl-count) 212))
+         ; 229: `LooseEqual`, the relational pair, the seven bitwise operations, the arithmetic
+         ; group and `NumberRaw` joined lib/abstract/conversions.jsl.
+         (assert (= (jsl-decl-count) 229))
          ; A builtin has a Fun and a macro does not, and every declaration is one or the other.
          (let [(mut i) 0 (mut funs) 0 (mut macros) 0]
            (loop (if (>= (load i) (jsl-decl-count)) (break)
@@ -280,11 +282,11 @@
                                (store! funs (+ (load funs) 1)) 0))
                        (store! i (+ (load i) 1))
                        0)))
-           (assert (= (+ (load funs) (load macros)) 212))
+           (assert (= (+ (load funs) (load macros)) 229))
            ; Most existing heap definitions remain macros for graph visibility and historical
            ; stability; called builtins can now carry an implicit heap effect when recursion or
            ; code sharing requires one.
-           (assert (= (load macros) 158)))
+           (assert (= (load macros) 175)))
          (assert (>= (jsl-find "Clamp") 0))
          (assert (>= (jsl-find "StringIndexOfFrom") 0))
          (assert (>= (jsl-find "StringStartsWith") 0))
@@ -300,7 +302,7 @@
          (assert (jsl-macro? (jsl-find "RequireObjectCoercible"))))
 
 ;; INLINING A HELPER REMOVES ITS CALLER'S ANNOTATION. `Clamp` used to be a builtin, which put an
-;; OP-CALL on `StringIndexOfFrom`'s only path and forced `:transitioning true` on it. As a macro it
+;; OPTAG-CALL on `StringIndexOfFrom`'s only path and forced `:transitioning true` on it. As a macro it
 ;; contributes nodes instead of a call, so the annotation came off — and the transition check,
 ;; which reads the lowered graph rather than the source, is what makes that safe to rely on: if the
 ;; inlining had not happened, this declaration would no longer lower.
@@ -404,9 +406,9 @@
                mp (cast (ptr i64) mem)]
            (store! (index cp 0) (g-start))
            (store! (index mp 0)
-                   (n-new1 OP-ARG (t-mem-alias JS-PROPERTY-ALIAS (t-undef)) (g-start)))
+                   (n-new1 (Arg (t-mem-alias JS-PROPERTY-ALIAS (t-undef))) (g-start)))
            (let [value (jsl-inline! cp mp (g-start) "makeAndRead" (slice-new [i64] cp 0))
-                 ret (n-new3 OP-RETURN 0 (load (index cp 0)) value (load (index mp 0)))]
+                 ret (n-new3 (Return) (load (index cp 0)) value (load (index mp 0)))]
              (n-add-def! (g-stop) ret)
              (iterate!)
              (g-analyze!)
@@ -433,9 +435,9 @@
                cp (cast (ptr i64) ctrl) mp (cast (ptr i64) mem)]
            (store! (index cp 0) (g-start))
            (store! (index mp 0)
-                   (n-new1 OP-ARG (t-mem-alias JS-PROPERTY-ALIAS (t-undef)) (g-start)))
+                   (n-new1 (Arg (t-mem-alias JS-PROPERTY-ALIAS (t-undef))) (g-start)))
            (let [value (jsl-inline! cp mp (g-start) "makeAndSum" (slice-new [i64] cp 0))
-                 ret (n-new3 OP-RETURN 0 (load (index cp 0)) value (load (index mp 0)))]
+                 ret (n-new3 (Return) (load (index cp 0)) value (load (index mp 0)))]
              (n-add-def! (g-stop) ret)
              (iterate!)
              (g-analyze!)
@@ -481,15 +483,15 @@
                ap (cast (ptr i64) argv)]
            (store! (index cp 0) (g-start))
            (store! (index mp 0)
-                   (n-new1 OP-ARG (t-mem-alias JS-PROPERTY-ALIAS (t-undef)) (g-start)))
-           (store! (index ap 0) (n-new1 OP-ARG (t-dyn) (g-start)))
+                   (n-new1 (Arg (t-mem-alias JS-PROPERTY-ALIAS (t-undef))) (g-start)))
+           (store! (index ap 0) (n-new1 (Arg (t-dyn)) (g-start)))
            (let [value (jsl-inline! cp mp (g-start) "chooseStore" (slice-new [i64] ap 1))
-                 ret (n-new3 OP-RETURN 0 (load (index cp 0)) value (load (index mp 0)))]
+                 ret (n-new3 (Return) (load (index cp 0)) value (load (index mp 0)))]
              (n-add-def! (g-stop) ret)
              (iterate!)
              (g-analyze!)
              (assert (= (g-verify) 0))
-             (assert (= (n-op (load (index mp 0))) OP-PHI))
+             (assert (op-is? (load (index mp 0)) Phi [_]))
              (assert (ty-mem? (n-ty (load (index mp 0))))))))
 
 (deftest an_ordinary_object_can_be_allocated_and_populated_entirely_in_jsl
@@ -507,10 +509,10 @@
                argv (stack (array i64 1))]
            (store! (index cp 0) (g-start))
            (store! (index mp 0)
-                   (n-new1 OP-ARG (t-mem-alias JS-PROPERTY-ALIAS (t-undef)) (g-start)))
+                   (n-new1 (Arg (t-mem-alias JS-PROPERTY-ALIAS (t-undef))) (g-start)))
            (let [value (jsl-inline! cp mp (g-start) "makeObject"
                                     (slice-new [i64] (cast (ptr i64) argv) 0))
-                 ret (n-new3 OP-RETURN 0 (load (index cp 0)) value (load (index mp 0)))]
+                 ret (n-new3 (Return) (load (index cp 0)) value (load (index mp 0)))]
              (n-add-def! (g-stop) ret)
              (iterate!)
              (g-analyze!)
@@ -540,10 +542,10 @@
                mp (cast (ptr i64) mem)]
            (store! (index cp 0) (g-start))
            (store! (index mp 0)
-                   (n-new1 OP-ARG (t-mem-alias JS-PROPERTY-ALIAS (t-undef)) (g-start)))
+                   (n-new1 (Arg (t-mem-alias JS-PROPERTY-ALIAS (t-undef))) (g-start)))
            (let [value (jsl-inline! cp mp (g-start) "firstOwnKey"
                                     (slice-new [i64] (cast (ptr i64) argv) 0))
-                 ret (n-new3 OP-RETURN 0 (load (index cp 0)) value (load (index mp 0)))]
+                 ret (n-new3 (Return) (load (index cp 0)) value (load (index mp 0)))]
              (n-add-def! (g-stop) ret)
              (iterate!)
              (g-analyze!)
@@ -589,7 +591,7 @@
 
 ;; THE ONE THAT IS CHECKED AGAINST THE GRAPH. The source differs from SRC-CALL only by the missing
 ;; annotation, so nothing syntactic distinguishes them: the refusal can only come from walking the
-;; nodes the declaration built and finding an OP-CALL in them. That is what makes this check
+;; nodes the declaration built and finding an OPTAG-CALL in them. That is what makes this check
 ;; stronger than the annotation discipline it is modelled on.
 (deftest a_call_inside_a_non_transitioning_definition_is_refused_by_the_lowered_graph
          (fresh! 90218)
@@ -772,7 +774,7 @@
          (build! "(builtin typedLoop :params [] :ret int
                     (loop [(i 0 int)]
                       (if (%Lt i 3) (recur (%Add i 1)) i)))")
-         (assert (= (n-aux (first-op OP-PHI)) (t-int)))
+         (assert (= (n-phi-declared-type (first-op OPTAG-PHI)) (t-int)))
          (assert (= (rt-payload (runN "typedLoop" (slice-new [i64] (cast (ptr i64) 0) 0))) 3))
          (refuses 91112
                   "(builtin f :params [] (loop [(i 0 not-a-type)] (recur i)))"
@@ -823,7 +825,7 @@
 (defn count-op [(op i64)] (-> i64)
   (let [n (n-count) (mut i) 0 (mut c) 0]
     (loop (if (>= (load i) n) (break)
-            (do (if (and (not (n-dead? (load i))) (= (n-op (load i)) op))
+            (do (if (and (not (n-dead? (load i))) (= (op-encode-tag (n-op (load i))) op))
                     (store! c (+ (load c) 1)) 0)
                 (store! i (+ (load i) 1))
                 0)))
@@ -833,14 +835,14 @@
   (block :found
     (let [n (n-count) (mut i) 0]
       (loop (if (>= (load i) n) (break)
-              (do (if (and (not (n-dead? (load i))) (= (n-op (load i)) op))
+              (do (if (and (not (n-dead? (load i))) (= (op-encode-tag (n-op (load i))) op))
                       (return-from :found (load i)) 0)
                   (store! i (+ (load i) 1)) 0)))
       NO-NODE)))
 
 ;; `useTwice` is NOT declared `:transitioning`, and that is the assertion. A macro is expanded into
 ;; the caller's graph, so if `Twice` had lowered to a call instead the transition check would see an
-;; OP-CALL among the nodes `useTwice` built and refuse the whole unit.
+;; OPTAG-CALL among the nodes `useTwice` built and refuse the whole unit.
 (const SRC-MACRO
   "(macro Twice :params [(x dyn)] (%Mul x 2))
    (builtin useTwice :params [(y dyn)] :ret dyn (%Add (Twice y) 1))")
@@ -928,21 +930,21 @@
          (fresh! 90406)
          (build! SRC-SPECIALISE)
          ; These are pre-iteration assertions: the dead source arm was never lowered.
-         (assert (= (count-op OP-IF) 0))
-         (assert (= (count-op OP-ADD) 0))
+         (assert (= (count-op OPTAG-IF) 0))
+         (assert (= (count-op OPTAG-ADD) 0))
          (assert (= (rt-payload (run1 "fast" 1)) 70))
-         (assert (= (count-op OP-CALL) 1))   ; only the top-level call the harness makes
-         (assert (= (count-op OP-IF) 0))
-         (assert (= (count-op OP-ADD) 0))
-         (assert (= (count-op OP-MUL) 0))
-         (assert (= (count-op OP-LT) 0)))
+         (assert (= (count-op OPTAG-CALL) 1))   ; only the top-level call the harness makes
+         (assert (= (count-op OPTAG-IF) 0))
+         (assert (= (count-op OPTAG-ADD) 0))
+         (assert (= (count-op OPTAG-MUL) 0))
+         (assert (= (count-op OPTAG-LT) 0)))
 
 (deftest an_opaque_guard_keeps_the_branch_and_the_slow_path
          (fresh! 90407)
          (build! SRC-NOT-SPECIALISED)
          (assert (= (rt-payload (run1 "slowpath" 4)) 40))
-         (assert (>= (count-op OP-IF) 1))
-         (assert (>= (count-op OP-ADD) 1))
+         (assert (>= (count-op OPTAG-IF) 1))
+         (assert (>= (count-op OPTAG-ADD) 1))
          (fresh! 90408)
          (build! SRC-NOT-SPECIALISED)
          (assert (= (rt-payload (run1 "slowpath" -4)) 995)))
@@ -985,7 +987,7 @@
          (let [(mut id) 0 (mut checked) 0]
            (loop (if (>= (load id) JSP-COUNT) (break)
                    (do
-                     (assert (!= (jsp-op (load id)) -1))
+                     (assert (>= (op-encode-tag (jsp-op (load id))) 0))
                      ; `%NewArray` takes no operands: it needs the current control, not a value.
                      (assert (>= (jsp-arity (load id)) 0))
                      (assert (<= (jsp-arity (load id)) 3))

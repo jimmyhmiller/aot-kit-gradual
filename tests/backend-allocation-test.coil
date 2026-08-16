@@ -20,9 +20,9 @@
 (extern munmap :cc c [(ptr u8) i64] (-> i32))
 (extern sys_icache_invalidate :cc c [(ptr u8) i64] (-> void))
 
-(defn ra-const [(v i64)] (-> i64) (n-new1 OP-CONST (t-int-con v) (g-start)))
-(defn ra-bin [(op i64) (a i64) (b i64)] (-> i64)
-  (n-peephole (n-new3 op (t-int) NO-NODE a b)))
+(defn ra-const [(v i64)] (-> i64) (n-new1 (Const (t-int-con v)) (g-start)))
+(defn ra-bin [(op Op) (a i64) (b i64)] (-> i64)
+  (n-peephole (n-new3 op NO-NODE a b)))
 
 (defn ra-native1 [(arg i64)] (-> i64)
   (let [mem (mmap (cast (ptr u8) 0) 4096 3 4098 -1 0)]
@@ -39,10 +39,10 @@
 
 (defn build-ra-pressure! [] (-> i64)
   (graph-reset! 1101)
-  (let [x (n-new1 OP-ARG (t-int-range -100 100) (g-start))
-        left (ra-bin OP-ADD x (ra-const 1)) right (ra-bin OP-ADD x (ra-const 2))
-        result (ra-bin OP-MUL left right)]
-    (n-add-def! (g-stop) (n-new2 OP-RETURN 0 (g-start) result))
+  (let [x (n-new1 (Arg (t-int-range -100 100)) (g-start))
+        left (ra-bin (Add) x (ra-const 1)) right (ra-bin (Add) x (ra-const 2))
+        result (ra-bin (Mul) left right)]
+    (n-add-def! (g-stop) (n-new2 (Return) (g-start) result))
     (g-analyze!) result))
 
 (defn ra-compile! [(nregs i64) (seed i64)] (-> i64)
@@ -83,10 +83,10 @@
 (deftest caller_live_value_uses_callee_saved_register_or_spill
   (graph-reset! 1102)
   (let [identity (n-fun-open! 0) x (n-parm! identity 0)]
-    (n-fun-close! identity (n-new2 OP-RETURN 0 (n-fun-entry identity) x))
+    (n-fun-close! identity (n-new2 (Return) (n-fun-entry identity) x))
     (let [held (ra-const 32) site (n-call1! (g-start) identity held)
-          result (ra-bin OP-ADD held (call-value site))]
-      (n-add-def! (g-stop) (n-new2 OP-RETURN 0 (call-end site) result))
+          result (ra-bin (Add) held (call-value site))]
+      (n-add-def! (g-stop) (n-new2 (Return) (call-end site) result))
       (g-analyze!)
       (ra-compile! 10 0)
       (let [vreg (ms-vget 0 held) reg (mra-reg vreg)]
@@ -140,13 +140,13 @@
 
 (deftest safe_phi_edge_copy_coalesces_to_one_location
   (graph-reset! 1103)
-  (let [pred (n-new1 OP-ARG (t-bool) (g-start))
-        arms (n-if-arms! (n-peephole (n-new2 OP-IF 0 (g-start) pred)))
-        join (n-new OP-REGION 0) yes (ra-const 11) no (ra-const 22)]
+  (let [pred (n-new1 (Arg (t-bool)) (g-start))
+        arms (n-if-arms! (n-peephole (n-new2 (If) (g-start) pred)))
+        join (n-new (Region)) yes (ra-const 11) no (ra-const 22)]
     (n-add-def! join NO-NODE) (n-add-def! join (arms-t arms)) (n-add-def! join (arms-f arms))
-    (let [phi (n-new OP-PHI (t-int))]
+    (let [phi (n-new (Phi (t-int)))]
       (n-add-def! phi join) (n-add-def! phi yes) (n-add-def! phi no)
-      (n-add-def! (g-stop) (n-new2 OP-RETURN 0 join phi))
+      (n-add-def! (g-stop) (n-new2 (Return) join phi))
       (g-analyze!)
       (ra-compile! 4 0)
       (let [dst (ms-vget 0 phi) (mut edge) 0 (mut copies) 0 (mut coalesced) 0]
@@ -182,11 +182,11 @@
   (shape-reset!)
   (let [sx (shape-transition SHAPE-ROOT "x" (t-dyn)) ax (shape-field-alias sx 0)
         first (n-new-obj1! (g-start) sx (mk-mem-in ax)) root (n-obj-ptr first)
-        mem1 (n-new4 OP-STORE ax NO-NODE (n-obj-mem first 0) root (ra-const 1))
+        mem1 (n-new4 (Store ax) NO-NODE (n-obj-mem first 0) root (ra-const 1))
         second (n-new-obj1! (g-start) sx mem1) other (n-obj-ptr second)
-        mem2 (n-new4 OP-STORE ax NO-NODE (n-obj-mem second 0) other (ra-const 2))
-        value (n-new3 OP-LOAD ax NO-NODE mem2 root)
-        ret (n-new3 OP-RETURN 0 (g-start) value mem2)]
+        mem2 (n-new4 (Store ax) NO-NODE (n-obj-mem second 0) other (ra-const 2))
+        value (n-new3 (Load ax) NO-NODE mem2 root)
+        ret (n-new3 (Return) (g-start) value mem2)]
     (n-add-def! (g-stop) ret) (g-analyze!)
     (ra-compile! 1 0)
     (let [root-v (ms-vget 0 root) (mut at) 0 (mut second-at) -1 (mut seen) 0]

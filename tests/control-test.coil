@@ -25,31 +25,31 @@
 ; ---------------------------------------------------------------------------
 ; Builders
 ; ---------------------------------------------------------------------------
-(defn mk-arg [(t i64)] (-> i64) (n-peephole (n-new1 OP-ARG t (g-start))))
+(defn mk-arg [(t i64)] (-> i64) (n-peephole (n-new1 (Arg t) (g-start))))
 (defn mk-int [(v i64)] (-> i64) (n-const (t-int-con v)))
 (defn mk-con [(t i64)] (-> i64) (n-const t))
-(defn mk-bin [(op i64) (a i64) (b i64)] (-> i64) (n-peephole (n-new3 op 0 NO-NODE a b)))
-(defn mk-if [(ctrl i64) (pred i64)] (-> i64) (n-peephole (n-new2 OP-IF 0 ctrl pred)))
-(defn mk-cast [(ctrl i64) (t i64) (v i64)] (-> i64) (n-peephole (n-new2 OP-CAST t ctrl v)))
+(defn mk-bin [(op Op) (a i64) (b i64)] (-> i64) (n-peephole (n-new3 op NO-NODE a b)))
+(defn mk-if [(ctrl i64) (pred i64)] (-> i64) (n-peephole (n-new2 (If) ctrl pred)))
+(defn mk-cast [(ctrl i64) (t i64) (v i64)] (-> i64) (n-peephole (n-new2 (Cast t) ctrl v)))
 
 ;; Regions are created UNPEEPHOLED, because a two-armed region with no Phi yet collapses
 ;; immediately as a degenerate diamond. A real parser has the same problem and solves it the
 ;; same way: build the merge, attach the values, then let the peepholes look at it.
 (defn new-region2 [(a i64) (b i64)] (-> i64)
-  (let [r (n-new OP-REGION 0)]
+  (let [r (n-new (Region))]
     (n-add-def! r NO-NODE) (n-add-def! r a) (n-add-def! r b) r))
 (defn new-region3 [(a i64) (b i64) (c i64)] (-> i64)
-  (let [r (n-new OP-REGION 0)]
+  (let [r (n-new (Region))]
     (n-add-def! r NO-NODE) (n-add-def! r a) (n-add-def! r b) (n-add-def! r c) r))
 (defn new-phi2 [(r i64) (declared i64) (a i64) (b i64)] (-> i64)
-  (let [p (n-new OP-PHI declared)]
+  (let [p (n-new (Phi declared))]
     (n-add-def! p r) (n-add-def! p a) (n-add-def! p b) p))
 (defn new-phi3 [(r i64) (declared i64) (a i64) (b i64) (c i64)] (-> i64)
-  (let [p (n-new OP-PHI declared)]
+  (let [p (n-new (Phi declared))]
     (n-add-def! p r) (n-add-def! p a) (n-add-def! p b) (n-add-def! p c) p))
 
 (defn add-ret [(ctrl i64) (v i64)] (-> i64)
-  (let [r (n-peephole (n-new2 OP-RETURN 0 ctrl v))]
+  (let [r (n-peephole (n-new2 (Return) ctrl v))]
     (n-add-def! (g-stop) r)
     (n-peephole (g-stop))
     r))
@@ -89,7 +89,7 @@
   (let [n (n-count) (mut i) 0 (mut c) 0]
     (loop
       (if (>= (load i) n) (break)
-        (do (if (and (not (n-dead? (load i))) (= (n-op (load i)) op))
+        (do (if (and (not (n-dead? (load i))) (= (op-encode-tag (n-op (load i))) op))
                 (store! c (+ (load c) 1))
               0)
             (store! i (+ (load i) 1))
@@ -155,16 +155,16 @@
 
 (deftest not_agrees_with_the_branch_decision
   (graph-reset! 1)
-  (assert (= (n-ty (n-peephole (n-new2 OP-NOT 0 NO-NODE (mk-arg (t-undef))))) (t-bool-con true)))
+  (assert (= (n-ty (n-peephole (n-new2 (Not) NO-NODE (mk-arg (t-undef))))) (t-bool-con true)))
   (graph-reset! 1)
-  (assert (= (n-ty (n-peephole (n-new2 OP-NOT 0 NO-NODE (mk-arg (t-obj))))) (t-bool-con false)))
+  (assert (= (n-ty (n-peephole (n-new2 (Not) NO-NODE (mk-arg (t-obj))))) (t-bool-con false)))
   (graph-reset! 1)
-  (assert (= (n-ty (n-peephole (n-new2 OP-NOT 0 NO-NODE (mk-int 0)))) (t-bool-con true)))
+  (assert (= (n-ty (n-peephole (n-new2 (Not) NO-NODE (mk-int 0)))) (t-bool-con true)))
   (graph-reset! 1)
-  (assert (= (n-ty (n-peephole (n-new2 OP-NOT 0 NO-NODE (mk-int 7)))) (t-bool-con false)))
+  (assert (= (n-ty (n-peephole (n-new2 (Not) NO-NODE (mk-int 7)))) (t-bool-con false)))
   ; a string is undecided, exactly as the branch is
   (graph-reset! 1)
-  (assert (= (n-ty (n-peephole (n-new2 OP-NOT 0 NO-NODE (mk-arg (t-str))))) (t-bool))))
+  (assert (= (n-ty (n-peephole (n-new2 (Not) NO-NODE (mk-arg (t-str))))) (t-bool))))
 
 ; ---------------------------------------------------------------------------
 ; Dead control flow really goes away
@@ -180,10 +180,10 @@
     (finish)
     ; the false Return is unreachable and gone from Stop; only one Return remains
     (check-ir "if(1) two returns" "return int=1;")
-    (assert (= (count-op OP-RETURN) 1))
+    (assert (= (count-op OPTAG-RETURN) 1))
     ; and with only one branch reachable, the If and its projections have no reason to exist
-    (assert (= (count-op OP-IF) 0))
-    (assert (= (count-op OP-CPROJ) 0))
+    (assert (= (count-op OPTAG-IF) 0))
+    (assert (= (count-op OPTAG-CPROJ) 0))
     (check-no-leaks "if(1)")))
 
 (deftest the_other_side_folds_too
@@ -195,7 +195,7 @@
     (add-ret f (mk-int 2))
     (finish)
     (check-ir "if(0) two returns" "return int=2;")
-    (assert (= (count-op OP-IF) 0))
+    (assert (= (count-op OPTAG-IF) 0))
     (check-no-leaks "if(0)")))
 
 (deftest an_undecided_branch_keeps_both_returns
@@ -206,9 +206,9 @@
     (add-ret t (mk-int 1))
     (add-ret f (mk-int 2))
     (finish)
-    (assert (= (count-op OP-RETURN) 2))
-    (assert (= (count-op OP-IF) 1))
-    (assert (= (count-op OP-CPROJ) 2))
+    (assert (= (count-op OPTAG-RETURN) 2))
+    (assert (= (count-op OPTAG-IF) 1))
+    (assert (= (count-op OPTAG-CPROJ) 2))
     (check-no-leaks "if(dyn)")))
 
 (deftest an_empty_diamond_collapses
@@ -222,8 +222,8 @@
     (finish)
     (check-ir "empty diamond" "return int=7;")
     ; nothing merged, so the branch itself was pointless
-    (assert (= (count-op OP-REGION) 0))
-    (assert (= (count-op OP-IF) 0))
+    (assert (= (count-op OPTAG-REGION) 0))
+    (assert (= (count-op OPTAG-IF) 0))
     (check-no-leaks "empty diamond")))
 
 ; ---------------------------------------------------------------------------
@@ -241,8 +241,8 @@
     (wl-push! r) (wl-push! ph)
     (finish)
     ; the phi survives, and its type is the meet of the two arms, not `dyn`
-    (assert (= (count-op OP-PHI) 1))
-    (assert (= (count-op OP-REGION) 1))
+    (assert (= (count-op OPTAG-PHI) 1))
+    (assert (= (count-op OPTAG-REGION) 1))
     (assert (= (n-ty ph) (t-int-range 1 2)))
     (check-no-leaks "phi merge")))
 
@@ -258,8 +258,8 @@
     (wl-push! r) (wl-push! ph)
     (finish)
     (check-ir "phi with a dead arm" "return int=1;")
-    (assert (= (count-op OP-PHI) 0))
-    (assert (= (count-op OP-REGION) 0))
+    (assert (= (count-op OPTAG-PHI) 0))
+    (assert (= (count-op OPTAG-REGION) 0))
     (check-no-leaks "phi dead arm")))
 
 (deftest a_phi_with_equal_arms_collapses
@@ -274,7 +274,7 @@
     (wl-push! r) (wl-push! ph)
     (finish)
     (check-ir "phi with equal arms" "return int=5;")
-    (assert (= (count-op OP-PHI) 0))
+    (assert (= (count-op OPTAG-PHI) 0))
     ; the branch stays: it is still an undecided test, only the merged VALUE was redundant
     (check-no-leaks "phi equal arms")))
 
@@ -296,7 +296,7 @@
     (finish)
     ; path b came off the true side of if(0) and cannot be reached, so it goes, and the phi
     ; must lose exactly the matching value (20) and keep 10 and 30
-    (if (= (count-op OP-PHI) 1)
+    (if (= (count-op OPTAG-PHI) 1)
         (let [live-phi ph]
           (if (!= (n-nins live-phi) (n-nins r))
               (fail "lockstep" "phi and region disagree on arity") 0)
@@ -318,7 +318,7 @@
   (let [a (mk-arg (t-int))
         c (mk-cast (g-start) (t-num) a)]
     (assert (= c a))
-    (assert (= (count-op OP-CAST) 0)))
+    (assert (= (count-op OPTAG-CAST) 0)))
 
   ; an exactly-matching cast also folds
   (graph-reset! 1)
@@ -332,18 +332,18 @@
   (let [a (mk-arg (t-dyn))
         c (mk-cast (g-start) (t-int) a)]
     (assert (!= c a))
-    (assert (= (count-op OP-CAST) 1))
+    (assert (= (count-op OPTAG-CAST) 1))
     ; downstream of the cast the value IS an int, which is the entire point. Addition can still
     ; leave the tagged integer fast path, so its JavaScript result type is Number.
     (assert (= (n-ty c) (t-int)))
-    (let [e (mk-bin OP-ADD c (mk-int 1))]
+    (let [e (mk-bin (Add) c (mk-int 1))]
       (assert (= (n-ty e) (t-num)))))
 
   ; and the narrowing composes: casting dyn to num then adding gives num, not dyn
   (graph-reset! 1)
   (let [a (mk-arg (t-dyn))
         c (mk-cast (g-start) (t-num) a)
-        e (mk-bin OP-ADD c (mk-int 1))]
+        e (mk-bin (Add) c (mk-int 1))]
     (assert (= (n-ty e) (t-num)))))
 
 (deftest a_contradictory_cast_does_not_claim_the_impossible
@@ -366,17 +366,17 @@
 ;; otherwise, which is that the whole loop is deleted with no error reported.
 (defn build-counted-loop [(seed i64)] (-> i64)
   (graph-reset! seed)
-  (let [lp (n-new OP-LOOP 0)]
+  (let [lp (n-new (Loop))]
     (n-add-def! lp NO-NODE)
     (n-add-def! lp (g-start))
     (n-add-def! lp NO-NODE)             ; the back edge: this is what marks it in progress
     (n-peephole lp)
-    (let [ph (n-new OP-PHI (t-int))]
+    (let [ph (n-new (Phi (t-int)))]
       (n-add-def! ph lp)
       (n-add-def! ph (mk-int 0))
       (n-add-def! ph NO-NODE)
       (n-peephole ph)                   ; reports its declared type while the merge is open
-      (let [nx (mk-bin OP-ADD ph (mk-int 1))]   ; the body, peepholed inside the window
+      (let [nx (mk-bin (Add) ph (mk-int 1))]   ; the body, peepholed inside the window
         (n-set-def! ph 2 nx)            ; phis close first
         (n-set-def! lp 2 lp)            ; then control
         (wl-push! lp) (wl-push! ph) (wl-push! nx)
@@ -389,8 +389,8 @@
     ; reached the int axis bottom rather than an ever-growing range
     (assert (not (ty-const? (n-ty ph))))
     (assert (= (n-ty ph) (t-int)))
-    (assert (= (count-op OP-LOOP) 1))
-    (assert (= (count-op OP-PHI) 1))))
+    (assert (= (count-op OPTAG-LOOP) 1))
+    (assert (= (count-op OPTAG-PHI) 1))))
 
 (deftest a_loop_phi_settles_under_every_seed
   ;; Worklist order changes which intermediate ranges the phi passes through on the way down.
@@ -418,9 +418,9 @@
   ; ONE projection, deliberately, so the open/close window is written out longhand: an If has to
   ; survive while its projections are built (see n-multi-open!), and there is no sibling here.
   (let [iff (n-multi-open! (mk-if (g-start) (mk-int 0)))
-        t   (n-peephole (n-new1 OP-CPROJ 0 iff))]   ; the true arm of if(0): unreachable
+        t   (n-peephole (n-new1 (CProj 0) iff))]   ; the true arm of if(0): unreachable
     (n-multi-close! iff)
-    (let [lp (n-new OP-LOOP 0)]
+    (let [lp (n-new (Loop))]
       (n-add-def! lp NO-NODE)
       (n-add-def! lp t)
       (n-add-def! lp lp)
@@ -437,22 +437,22 @@
 ;; accident of construction order is not terminating.
 (defn build-raw-counted-loop [(seed i64)] (-> i64)
   (graph-reset! seed)
-  (let [lp (n-new OP-LOOP 0)]
+  (let [lp (n-new (Loop))]
     (n-add-def! lp NO-NODE)
     (n-add-def! lp (g-start))
     (n-add-def! lp NO-NODE)
-    (let [c0 (n-new1 OP-CONST (t-int-con 0) (g-start))
-          ph (n-new OP-PHI (t-int))]
+    (let [c0 (n-new1 (Const (t-int-con 0)) (g-start))
+          ph (n-new (Phi (t-int)))]
       (n-add-def! ph lp)
       (n-add-def! ph c0)
       (n-add-def! ph NO-NODE)
-      (let [c1 (n-new1 OP-CONST (t-int-con 1) (g-start))
-            nx (n-new3 OP-ADD 0 NO-NODE ph c1)]
+      (let [c1 (n-new1 (Const (t-int-con 1)) (g-start))
+            nx (n-new3 (Add) NO-NODE ph c1)]
         ; nothing above was peepholed, so every type starts at ANY and the analysis does all
         ; the work, widening included
         (n-set-def! ph 2 nx)
         (n-set-def! lp 2 lp)
-        (let [r (n-new2 OP-RETURN 0 lp ph)]
+        (let [r (n-new2 (Return) lp ph)]
           (n-add-def! (g-stop) r))
         ph))))
 
@@ -499,7 +499,7 @@
         t (arms-t arms-iff)
         f (arms-f arms-iff)
         r   (new-region2 t f)
-        ph  (new-phi2 r (t-dyn) (mk-int 1) (mk-bin OP-ADD (mk-arg (t-int)) (mk-int 2)))]
+        ph  (new-phi2 r (t-dyn) (mk-int 1) (mk-bin (Add) (mk-arg (t-int)) (mk-int 2)))]
     (add-ret r ph)
     (wl-push! r) (wl-push! ph)
     (finish)

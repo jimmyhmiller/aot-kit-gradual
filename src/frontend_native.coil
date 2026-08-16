@@ -219,6 +219,40 @@
     (store! (field frontend error-role) 0)
     (load frontend)))
 
+;; A REFUSAL'S REASON, BY NAME. `error-code` is one of the `FE-CODE-*` constants, and a bare 1007
+;; in a report is a number the reader has to come here to decode -- which is the same failure of
+;; diagnostics as not reporting it at all, one step further along.
+(defn fe-code-name [(code i64)] (-> (slice u8))
+  (cond (= code FE-CODE-UNSUPPORTED-SYNTAX) "unsupported-syntax"
+        (= code FE-CODE-UNSUPPORTED-OPERATOR) "unsupported-operator"
+        (= code FE-CODE-UNBOUND-NAME) "unbound-name"
+        (= code FE-CODE-INVALID-TARGET) "invalid-target"
+        (= code FE-CODE-CONSTRUCTOR-LAYOUT) "constructor-layout"
+        (= code FE-CODE-MISSING-RECEIVER) "missing-receiver"
+        (= code FE-CODE-UNKNOWN-BUILTIN) "unknown-builtin"
+        (= code 0) "none"
+        :else "unnamed-code"))
+
+(defn fe-status-name [(status i64)] (-> (slice u8))
+  (cond (= status FE-OK) "ok"
+        (= status FE-PARSE) "parse"
+        (= status FE-UNBOUND) "unbound"
+        (= status FE-UNSUPPORTED) "unsupported"
+        (= status FE-TARGET) "target"
+        :else "unnamed-status"))
+
+;; THE SOURCE A REFUSAL IS ABOUT. `status` and `error-code` say what kind of thing was refused;
+;; `error-node` says which one, but only as an AST index, so every consumer that wanted to report
+;; a refusal usefully had to reach into the struct and know about `ast` to resolve it. None did:
+;; `tools/js-sweep.coil` reported 5508 refusals as the bare word INDEX, and `tools/js-repro.coil`
+;; said "the source did not index" and stopped. A refusal that cannot name its cause tells you to
+;; look and nothing about where.
+;;
+;; Empty when the refusal named no node -- a parse failure has no offending construct to point at.
+(defn fe-error-text [(frontend (mut NativeFrontend))] (-> (slice u8))
+  (let [n (load (field frontend error-node))]
+    (if (< n 0) "" (ts-text (field frontend ast) n))))
+
 (defn fe-fail! [(frontend (mut NativeFrontend)) (code i64) (node i64) (role i64)] (-> i64)
   (if (= (load (field frontend status)) FE-OK)
       (do
@@ -1090,6 +1124,25 @@
   (let [symbol (al-get [FeSymbol] (load (field frontend symbols)) index)]
     (ts-text (field frontend ast) (load (field symbol name-node)))))
 
+;; A REST PARAMETER, DETECTED FROM ITS OWN SOURCE TEXT. Nothing in this frontend implements one,
+;; and until this check existed nothing noticed: `...xs` was indexed as an ordinary parameter named
+;; `xs`, the call site passed it nothing, and every read came back undefined. `xs.length` was
+;; therefore `undefined`, and `undefined | 0` is 0 -- so `(...xs) => xs.length` returned zero for
+;; every call, with a well-formed graph and no diagnostic anywhere.
+;;
+;; That is the worst outcome available: a wrong answer nothing signals. Refusing by name is not the
+;; feature, but it is the difference between "this is not supported" and a number that is quietly
+;; false. repros/open/rest-parameters-report-length-zero.js.
+;;
+;; The text, not a token kind: the bridge maps every syntax it does not enumerate to kind 0, so a
+;; `DotDotDotToken` is not reliably distinguishable from anything else it has not been taught. The
+;; parameter's extent always begins with the ellipsis when one is present.
+(defn fe-rest-parameter? [(ast TsAst) (parameter i64)] (-> bool)
+  (let [t (ts-text ast parameter)]
+    (and (>= (slice-len t) 3)
+         (and (= (slice-get t 0) 46)
+              (and (= (slice-get t 1) 46) (= (slice-get t 2) 46))))))
+
 (defn fe-find-function-parts! [(frontend (mut NativeFrontend)) (node i64) (id i64) (parent i64)] (-> i64)
   (let [ast (field frontend ast)
         ;; Function metadata comes from semantic roles, never child position. Arrow functions add
@@ -1109,6 +1162,9 @@
                 (if (= kind TSK-PARAMETER)
                     (let [parameter-name (ts-role ast child TS-ROLE-NAME 0)
                           type-node (ts-role ast child TS-ROLE-TYPE 0)]
+                      (if (fe-rest-parameter? ast child)
+                          (fe-fail! (mut frontend) FE-CODE-UNSUPPORTED-SYNTAX child FE-ROLE-PARAMETER)
+                          0)
                       (if (and (!= parameter-name -1)
                                (or (= (ts-kind ast parameter-name) TSK-THIS)
                                    (str-eq (ts-text ast parameter-name) "this")))

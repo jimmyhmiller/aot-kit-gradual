@@ -24,16 +24,16 @@
 ; ---------------------------------------------------------------------------
 ;; Binary and unary ops take (ctrl, args...), so the operand indices line up with what
 ;; `n-compute` reads. Control is absent for pure arithmetic.
-(defn mk-arg [(t i64)] (-> i64) (n-peephole (n-new1 OP-ARG t (g-start))))
+(defn mk-arg [(t i64)] (-> i64) (n-peephole (n-new1 (Arg t) (g-start))))
 (defn mk-con [(t i64)] (-> i64) (n-const t))
-(defn mk-bin [(op i64) (a i64) (b i64)] (-> i64) (n-peephole (n-new3 op 0 NO-NODE a b)))
-(defn mk-un  [(op i64) (a i64)] (-> i64) (n-peephole (n-new2 op 0 NO-NODE a)))
+(defn mk-bin [(op Op) (a i64) (b i64)] (-> i64) (n-peephole (n-new3 op NO-NODE a b)))
+(defn mk-un  [(op Op) (a i64)] (-> i64) (n-peephole (n-new2 op NO-NODE a)))
 (defn mk-int [(v i64)] (-> i64) (mk-con (t-int-con v)))
 (defn mk-flt-bits [(v i64)] (-> i64) (mk-con (t-flt-bits v)))
 
 ;; Finish a program: return the value, hook it to Stop, then run peepholes to a fixpoint.
 (defn mk-ret [(v i64)] (-> i64)
-  (let [r (n-peephole (n-new2 OP-RETURN 0 (g-start) v))]
+  (let [r (n-peephole (n-new2 (Return) (g-start) v))]
     (n-add-def! (g-stop) r)
     (n-peephole (g-stop))
     (iterate!)
@@ -83,64 +83,64 @@
 
 (deftest folds-arithmetic
   (graph-reset! 1)
-  (mk-ret (mk-bin OP-ADD (mk-int 1) (mk-int 2)))
+  (mk-ret (mk-bin (Add) (mk-int 1) (mk-int 2)))
   (check-prog "1+2" "return int=3;")
 
   (graph-reset! 1)
   ; 1 + 2*3, folded all the way down
-  (mk-ret (mk-bin OP-ADD (mk-int 1) (mk-bin OP-MUL (mk-int 2) (mk-int 3))))
+  (mk-ret (mk-bin (Add) (mk-int 1) (mk-bin (Mul) (mk-int 2) (mk-int 3))))
   (check-prog "1+2*3" "return int=7;")
 
   (graph-reset! 1)
-  (mk-ret (mk-bin OP-SUB (mk-int 10) (mk-int 4)))
+  (mk-ret (mk-bin (Sub) (mk-int 10) (mk-int 4)))
   (check-prog "10-4" "return int=6;")
 
   (graph-reset! 1)
   ; exact division stays an integer
-  (mk-ret (mk-bin OP-DIV (mk-int 12) (mk-int 4)))
+  (mk-ret (mk-bin (Div) (mk-int 12) (mk-int 4)))
   (check-prog "12/4" "return int=3;")
 
   (graph-reset! 1)
   ; inexact constant division folds to its exact IEEE-754 result
-  (mk-ret (mk-bin OP-DIV (mk-int 1) (mk-int 2)))
+  (mk-ret (mk-bin (Div) (mk-int 1) (mk-int 2)))
   (check-prog "1/2" "return flt=0.5;")
 
   (graph-reset! 1)
   ; division by zero folds to the IEEE-754 infinity constant
-  (mk-ret (mk-bin OP-DIV (mk-int 1) (mk-int 0)))
+  (mk-ret (mk-bin (Div) (mk-int 1) (mk-int 0)))
   (check-prog "1/0" "return flt=inf;"))
 
 (deftest folds-comparisons
   (graph-reset! 1)
-  (mk-ret (mk-bin OP-LT (mk-int 1) (mk-int 2)))
+  (mk-ret (mk-bin (Lt) (mk-int 1) (mk-int 2)))
   (check-prog "1<2" "return bool=1;")
 
   (graph-reset! 1)
-  (mk-ret (mk-bin OP-EQ (mk-int 1) (mk-int 2)))
+  (mk-ret (mk-bin (Eq) (mk-int 1) (mk-int 2)))
   (check-prog "1==2" "return bool=0;")
 
   (graph-reset! 1)
-  (mk-ret (mk-un OP-NOT (mk-int 0)))
+  (mk-ret (mk-un (Not) (mk-int 0)))
   (check-prog "!0" "return bool=1;")
 
   (graph-reset! 1)
-  (mk-ret (mk-un OP-NOT (mk-int 7)))
+  (mk-ret (mk-un (Not) (mk-int 7)))
   (check-prog "!7" "return bool=0;")
 
   (graph-reset! 1)
-  (mk-ret (mk-un OP-MINUS (mk-int 5)))
+  (mk-ret (mk-un (Minus) (mk-int 5)))
   (check-prog "-5" "return int=-5;"))
 
 (deftest folds_ieee_comparisons_without_assuming_nan_reflexivity
   (graph-reset! 1)
   (let [nan (mk-flt-bits 9221120237041090560)]
-    (assert (= (n-ty (mk-bin OP-EQ nan nan)) (t-bool-con false)))
-    (assert (= (n-ty (mk-bin OP-LT nan (mk-int 1))) (t-bool-con false))))
+    (assert (= (n-ty (mk-bin (Eq) nan nan)) (t-bool-con false)))
+    (assert (= (n-ty (mk-bin (Lt) nan (mk-int 1))) (t-bool-con false))))
   (graph-reset! 1)
-  (assert (= (n-ty (mk-bin OP-EQ (mk-flt-bits 0)
+  (assert (= (n-ty (mk-bin (Eq) (mk-flt-bits 0)
                                   (mk-flt-bits -9223372036854775808)))
              (t-bool-con true)))
-  (assert (= (n-ty (mk-bin OP-LT (mk-flt-bits 9218868437227405312)
+  (assert (= (n-ty (mk-bin (Lt) (mk-flt-bits 9218868437227405312)
                                   (mk-flt-bits -4503599627370496)))
              (t-bool-con false))))
 
@@ -149,35 +149,35 @@
 ; ---------------------------------------------------------------------------
 (deftest simplifies-with-an-opaque-operand
   (graph-reset! 1)
-  (mk-ret (mk-bin OP-ADD (mk-arg (t-int)) (mk-int 0)))
+  (mk-ret (mk-bin (Add) (mk-arg (t-int)) (mk-int 0)))
   (check-prog "arg+0" "return arg;")
 
   (graph-reset! 1)
-  (mk-ret (mk-bin OP-MUL (mk-arg (t-int)) (mk-int 1)))
+  (mk-ret (mk-bin (Mul) (mk-arg (t-int)) (mk-int 1)))
   (check-prog "arg*1" "return arg;")
 
   (graph-reset! 1)
   ; An unbounded integer refinement can be negative, and negative * +0 is -0.
-  (mk-ret (mk-bin OP-MUL (mk-arg (t-int)) (mk-int 0)))
+  (mk-ret (mk-bin (Mul) (mk-arg (t-int)) (mk-int 0)))
   (check-prog "arg*0" "return (arg*int=0);")
 
   (graph-reset! 1)
   (let [a (mk-arg (t-int))]
-    (mk-ret (mk-bin OP-SUB a a)))
+    (mk-ret (mk-bin (Sub) a a)))
   (check-prog "arg-arg" "return int=0;")
 
   (graph-reset! 1)
-  (mk-ret (mk-un OP-MINUS (mk-un OP-MINUS (mk-arg (t-int)))))
+  (mk-ret (mk-un (Minus) (mk-un (Minus) (mk-arg (t-int)))))
   (check-prog "-(-arg)" "return arg;")
 
   (graph-reset! 1)
   (let [a (mk-arg (t-int))]
-    (mk-ret (mk-bin OP-EQ a a)))
+    (mk-ret (mk-bin (Eq) a a)))
   (check-prog "arg==arg" "return bool=1;")
 
   (graph-reset! 1)
   (let [a (mk-arg (t-int))]
-    (mk-ret (mk-bin OP-LT a a)))
+    (mk-ret (mk-bin (Lt) a a)))
   (check-prog "arg<arg" "return bool=0;"))
 
 ;; Floats are excluded from the identities that integers get, and that exclusion is the point:
@@ -185,17 +185,17 @@
 (deftest float-identities-are-not-taken
   (graph-reset! 1)
   (let [a (mk-arg (t-num))]
-    (mk-ret (mk-bin OP-EQ a a)))
+    (mk-ret (mk-bin (Eq) a a)))
   (check-prog "num==num survives" "return (arg==arg);")
 
   (graph-reset! 1)
   (let [a (mk-arg (t-num))]
-    (mk-ret (mk-bin OP-SUB a a)))
+    (mk-ret (mk-bin (Sub) a a)))
   (check-prog "num-num survives" "return (arg-arg);")
 
   (graph-reset! 1)
   (let [a (mk-arg (t-num))]
-    (mk-ret (mk-bin OP-MUL a (mk-int 0))))
+    (mk-ret (mk-bin (Mul) a (mk-int 0))))
   (check-prog "num*0 survives" "return (arg*int=0);"))
 
 ;; AN IDENTITY PEEPHOLE MUST NOT CHANGE THE TYPE OF THE VALUE IT REPLACES.
@@ -231,34 +231,34 @@
   ; a string is the clearest witness: every one of these identities is FALSE for it
   (graph-reset! 1)
   (let [a (mk-arg (t-str))]
-    (identity-keeps-its-type "str + 0" (n-new3 OP-ADD 0 NO-NODE a (mk-int 0)))
-    (identity-keeps-its-type "str - 0" (n-new3 OP-SUB 0 NO-NODE a (mk-int 0)))
-    (identity-keeps-its-type "str * 1" (n-new3 OP-MUL 0 NO-NODE a (mk-int 1)))
-    (identity-keeps-its-type "str * 0" (n-new3 OP-MUL 0 NO-NODE a (mk-int 0)))
-    (identity-keeps-its-type "-(-str)" (n-new2 OP-MINUS 0 NO-NODE (mk-un OP-MINUS a)))
-    (identity-keeps-its-type "str == str" (n-new3 OP-EQ 0 NO-NODE a a)))
+    (identity-keeps-its-type "str + 0" (n-new3 (Add) NO-NODE a (mk-int 0)))
+    (identity-keeps-its-type "str - 0" (n-new3 (Sub) NO-NODE a (mk-int 0)))
+    (identity-keeps-its-type "str * 1" (n-new3 (Mul) NO-NODE a (mk-int 1)))
+    (identity-keeps-its-type "str * 0" (n-new3 (Mul) NO-NODE a (mk-int 0)))
+    (identity-keeps-its-type "-(-str)" (n-new2 (Minus) NO-NODE (mk-un (Minus) a)))
+    (identity-keeps-its-type "str == str" (n-new3 (Eq) NO-NODE a a)))
 
   ; a bool is non-numeric too, and unlike a string it exists in the interpreter's value domain,
   ; which is what makes the differential half of this gate (eval-test) possible
   (graph-reset! 1)
   (let [b (mk-arg (t-bool))]
-    (identity-keeps-its-type "bool + 0" (n-new3 OP-ADD 0 NO-NODE b (mk-int 0)))
-    (identity-keeps-its-type "bool - 0" (n-new3 OP-SUB 0 NO-NODE b (mk-int 0)))
-    (identity-keeps-its-type "bool * 1" (n-new3 OP-MUL 0 NO-NODE b (mk-int 1)))
-    (identity-keeps-its-type "-(-bool)" (n-new2 OP-MINUS 0 NO-NODE (mk-un OP-MINUS b))))
+    (identity-keeps-its-type "bool + 0" (n-new3 (Add) NO-NODE b (mk-int 0)))
+    (identity-keeps-its-type "bool - 0" (n-new3 (Sub) NO-NODE b (mk-int 0)))
+    (identity-keeps-its-type "bool * 1" (n-new3 (Mul) NO-NODE b (mk-int 1)))
+    (identity-keeps-its-type "-(-bool)" (n-new2 (Minus) NO-NODE (mk-un (Minus) b))))
 
   ; AND THEY STILL FIRE where they are true. Without this half, deleting the four peepholes
   ; outright would pass the test above.
   (graph-reset! 1)
   (let [a (mk-arg (t-int))]
-    (assert (= (n-peephole (n-new3 OP-ADD 0 NO-NODE a (mk-int 0))) a))
-    (assert (= (n-peephole (n-new3 OP-SUB 0 NO-NODE a (mk-int 0))) a))
-    (assert (= (n-peephole (n-new3 OP-MUL 0 NO-NODE a (mk-int 1))) a))
-    (assert (= (n-peephole (n-new2 OP-MINUS 0 NO-NODE (mk-un OP-MINUS a))) a))
-    (assert (= (n-ty (n-peephole (n-new3 OP-EQ 0 NO-NODE a a))) (t-bool-con true))))
+    (assert (= (n-peephole (n-new3 (Add) NO-NODE a (mk-int 0))) a))
+    (assert (= (n-peephole (n-new3 (Sub) NO-NODE a (mk-int 0))) a))
+    (assert (= (n-peephole (n-new3 (Mul) NO-NODE a (mk-int 1))) a))
+    (assert (= (n-peephole (n-new2 (Minus) NO-NODE (mk-un (Minus) a))) a))
+    (assert (= (n-ty (n-peephole (n-new3 (Eq) NO-NODE a a))) (t-bool-con true))))
   (let [nonnegative (mk-arg (t-int-range 0 TY-IMAX))]
     (assert (n-int-con?
-      (n-peephole (n-new3 OP-MUL 0 NO-NODE nonnegative (mk-int 0))) 0))))
+      (n-peephole (n-new3 (Mul) NO-NODE nonnegative (mk-int 0))) 0))))
 
 ; ---------------------------------------------------------------------------
 ; Cast: the one rewrite that deletes a type check
@@ -274,9 +274,9 @@
 ;; documents (order comes from the seed, the result must not).
 (defn build-raw-cast [(seed i64)] (-> i64)
   (graph-reset! seed)
-  (let [x (n-new1 OP-ARG (t-dyn) (g-start))
-        c (n-new2 OP-CAST (t-int) (g-start) x)
-        r (n-new2 OP-RETURN 0 (g-start) c)]
+  (let [x (n-new1 (Arg (t-dyn)) (g-start))
+        c (n-new2 (Cast (t-int)) (g-start) x)
+        r (n-new2 (Return) (g-start) c)]
     (n-add-def! (g-stop) r)
     (wl-push! x) (wl-push! c) (wl-push! r) (wl-push! (g-stop)) (wl-push! (g-start))
     (iterate!)
@@ -286,7 +286,7 @@
   (let [n (n-count) (mut i) 0 (mut k) 0]
     (loop
       (if (>= (load i) n) (break)
-        (do (if (and (not (n-dead? (load i))) (= (n-op (load i)) op))
+        (do (if (and (not (n-dead? (load i))) (= (op-encode-tag (n-op (load i))) op))
                 (store! k (+ (load k) 1))
               0)
             (store! i (+ (load i) 1))
@@ -299,7 +299,7 @@
       (if (>= (load s) 200) (break)
         (do (build-raw-cast (+ 1 (load s)))
             ; `dyn` is not `int`, so this Cast can never be discharged, whatever the order was
-            (if (= (count-live-op OP-CAST) 0) (store! lost (+ (load lost) 1)) 0)
+            (if (= (count-live-op OPTAG-CAST) 0) (store! lost (+ (load lost) 1)) 0)
             (store! s (+ (load s) 1))
             0)))
     (if (= (load lost) 0) 0
@@ -309,7 +309,7 @@
           (abort) 0))
     ; the fixture is not vacuous: the Cast really is in the graph to begin with
     (build-raw-cast 1)
-    (assert (= (count-live-op OP-CAST) 1))))
+    (assert (= (count-live-op OPTAG-CAST) 1))))
 
 ;; And the CONTRADICTION half, on the ordinary eager path. A phi whose declared type is `int` and
 ;; whose every arm is `null` reports `~dyn`: high, but NOT `t-top`, so a guard written as
@@ -318,21 +318,21 @@
 ;; half of the same rule.
 (deftest a_cast_survives_a_contradictory_phi
   (graph-reset! 1)
-  (let [iff  (n-peephole (n-new2 OP-IF 0 (g-start) (mk-arg (t-dyn))))
+  (let [iff  (n-peephole (n-new2 (If) (g-start) (mk-arg (t-dyn))))
         arms (n-if-arms! iff)
-        r    (let [q (n-new OP-REGION 0)]
+        r    (let [q (n-new (Region))]
                (n-add-def! q NO-NODE) (n-add-def! q (arms-t arms)) (n-add-def! q (arms-f arms)) q)
-        ph   (let [q (n-new OP-PHI (t-int))]
+        ph   (let [q (n-new (Phi (t-int)))]
                (n-add-def! q r) (n-add-def! q (mk-con (t-null))) (n-add-def! q (mk-con (t-null))) q)
-        c    (n-peephole (n-new2 OP-CAST (t-int) r ph))]
-    (let [ret (n-peephole (n-new2 OP-RETURN 0 r c))]
+        c    (n-peephole (n-new2 (Cast (t-int)) r ph))]
+    (let [ret (n-peephole (n-new2 (Return) r c))]
       (n-add-def! (g-stop) ret) (n-peephole (g-stop)))
     (wl-push! r) (wl-push! ph)
     (iterate!)
     ; the phi's type is high and contradicts `int`, so the check has NOT been discharged: the
     ; compiler never proved anything and the Cast is the only record of that
     (assert (ty-high? (n-ty ph)))
-    (assert (= (count-live-op OP-CAST) 1))))
+    (assert (= (count-live-op OPTAG-CAST) 1))))
 
 ; ---------------------------------------------------------------------------
 ; Commutativity and value numbering, together
@@ -343,19 +343,19 @@
   ; numbering collapses them to one node. The subtraction stays because this broad numeric result
   ; may have promoted, and Infinity-Infinity is NaN rather than zero.
   (let [a (mk-arg (t-int))
-        l (mk-bin OP-ADD a (mk-int 2))
-        r (mk-bin OP-ADD (mk-int 2) a)]
-    (mk-ret (mk-bin OP-SUB l r)))
+        l (mk-bin (Add) a (mk-int 2))
+        r (mk-bin (Add) (mk-int 2) a)]
+    (mk-ret (mk-bin (Sub) l r)))
   (check-prog "(arg+2)-(2+arg)" "return ((arg+int=2)-(arg+int=2));"))
 
 (deftest gvn-dedups-identical-expressions
   (graph-reset! 1)
   (let [a (mk-arg (t-int))
-        l (mk-bin OP-MUL a a)
-        r (mk-bin OP-MUL a a)]
+        l (mk-bin (Mul) a a)
+        r (mk-bin (Mul) a a)]
     ; both multiplies are the same node; promoted numeric results still exclude the x-x identity
     (assert (= l r))
-    (mk-ret (mk-bin OP-SUB l r)))
+    (mk-ret (mk-bin (Sub) l r)))
   (check-prog "(arg*arg)-(arg*arg)" "return ((arg*arg)-(arg*arg));"))
 
 (deftest gvn-dedups-constants
@@ -369,44 +369,44 @@
 (deftest ranges-propagate-through-arithmetic
   (graph-reset! 1)
   (let [a (mk-arg (t-int-range 0 10))
-        e (mk-bin OP-ADD a (mk-int 5))]
+        e (mk-bin (Add) a (mk-int 5))]
     (assert (= (n-ty e) (t-int-range 5 15))))
 
   (graph-reset! 1)
   (let [a (mk-arg (t-int-range 2 3))
         b (mk-arg (t-int-range 10 20))
-        e (mk-bin OP-MUL a b)]
+        e (mk-bin (Mul) a b)]
     (assert (= (n-ty e) (t-int-range 20 60))))
 
   (graph-reset! 1)
   (let [a (mk-arg (t-int-range 0 10))
         b (mk-arg (t-int-range 1 2))
-        e (mk-bin OP-SUB a b)]
+        e (mk-bin (Sub) a b)]
     (assert (= (n-ty e) (t-int-range -2 9))))
 
   (graph-reset! 1)
   ; an unbounded range can leave the tagged integer fast path and therefore becomes numeric
   (let [a (mk-arg (t-int))
-        e (mk-bin OP-ADD a (mk-int 1))]
+        e (mk-bin (Add) a (mk-int 1))]
     (assert (= (n-ty e) (t-num)))))
 
 (deftest dynamic-operands_stay_sound
   (graph-reset! 1)
   ; `+` on an unknown value can concatenate strings, so the result is dyn
   (let [a (mk-arg (t-dyn))
-        e (mk-bin OP-ADD a (mk-int 1))]
+        e (mk-bin (Add) a (mk-int 1))]
     (assert (= (n-ty e) (t-dyn))))
 
   (graph-reset! 1)
   ; `-` coerces to number, so it is num even on a dyn operand
   (let [a (mk-arg (t-dyn))
-        e (mk-bin OP-SUB a (mk-int 1))]
+        e (mk-bin (Sub) a (mk-int 1))]
     (assert (= (n-ty e) (t-num))))
 
   (graph-reset! 1)
   ; a string operand cannot be an integer add
   (let [a (mk-arg (t-str))
-        e (mk-bin OP-ADD a (mk-int 1))]
+        e (mk-bin (Add) a (mk-int 1))]
     (assert (= (n-ty e) (t-dyn)))))
 
 ; ---------------------------------------------------------------------------
@@ -420,14 +420,14 @@
   (graph-reset! seed)
   (let [a  (mk-arg (t-int-range 0 100))
         b  (mk-arg (t-int-range 1 4))
-        e1 (mk-bin OP-ADD a (mk-int 0))          ; folds to a
-        e2 (mk-bin OP-MUL e1 (mk-int 1))         ; folds to a
-        e3 (mk-bin OP-ADD (mk-int 3) e2)         ; canonicalises to a+3
-        e4 (mk-bin OP-ADD e2 (mk-int 3))         ; the same node as e3, after GVN
-        e5 (mk-bin OP-SUB e3 e4)                 ; therefore 0
-        e6 (mk-bin OP-MUL b (mk-int 2))
-        e7 (mk-bin OP-ADD e5 e6)                 ; 0 + b*2
-        e8 (mk-un OP-MINUS (mk-un OP-MINUS e7))] ; double negation
+        e1 (mk-bin (Add) a (mk-int 0))          ; folds to a
+        e2 (mk-bin (Mul) e1 (mk-int 1))         ; folds to a
+        e3 (mk-bin (Add) (mk-int 3) e2)         ; canonicalises to a+3
+        e4 (mk-bin (Add) e2 (mk-int 3))         ; the same node as e3, after GVN
+        e5 (mk-bin (Sub) e3 e4)                 ; therefore 0
+        e6 (mk-bin (Mul) b (mk-int 2))
+        e7 (mk-bin (Add) e5 e6)                 ; 0 + b*2
+        e8 (mk-un (Minus) (mk-un (Minus) e7))] ; double negation
     (mk-ret e8))
   0)
 
@@ -436,27 +436,27 @@
 ;; every node onto the worklist and letting `iterate!` do the whole job. Two things fall out:
 ;; the order space is much larger, and eager and deferred peepholing are shown to reach the
 ;; same graph, which is what the optimistic pass in M7 will depend on.
-(defn raw-arg [(t i64)] (-> i64) (let [n (n-new1 OP-ARG t (g-start))] (wl-push! n) n))
-(defn raw-con [(t i64)] (-> i64) (let [n (n-new1 OP-CONST t (g-start))] (wl-push! n) n))
+(defn raw-arg [(t i64)] (-> i64) (let [n (n-new1 (Arg t) (g-start))] (wl-push! n) n))
+(defn raw-con [(t i64)] (-> i64) (let [n (n-new1 (Const t) (g-start))] (wl-push! n) n))
 (defn raw-int [(v i64)] (-> i64) (raw-con (t-int-con v)))
-(defn raw-bin [(op i64) (a i64) (b i64)] (-> i64)
-  (let [n (n-new3 op 0 NO-NODE a b)] (wl-push! n) n))
-(defn raw-un [(op i64) (a i64)] (-> i64)
-  (let [n (n-new2 op 0 NO-NODE a)] (wl-push! n) n))
+(defn raw-bin [(op Op) (a i64) (b i64)] (-> i64)
+  (let [n (n-new3 op NO-NODE a b)] (wl-push! n) n))
+(defn raw-un [(op Op) (a i64)] (-> i64)
+  (let [n (n-new2 op NO-NODE a)] (wl-push! n) n))
 
 (defn build-fixture-raw [(seed i64)] (-> i64)
   (graph-reset! seed)
   (let [a  (raw-arg (t-int-range 0 100))
         b  (raw-arg (t-int-range 1 4))
-        e1 (raw-bin OP-ADD a (raw-int 0))
-        e2 (raw-bin OP-MUL e1 (raw-int 1))
-        e3 (raw-bin OP-ADD (raw-int 3) e2)
-        e4 (raw-bin OP-ADD e2 (raw-int 3))
-        e5 (raw-bin OP-SUB e3 e4)
-        e6 (raw-bin OP-MUL b (raw-int 2))
-        e7 (raw-bin OP-ADD e5 e6)
-        e8 (raw-un OP-MINUS (raw-un OP-MINUS e7))
-        r  (n-new2 OP-RETURN 0 (g-start) e8)]
+        e1 (raw-bin (Add) a (raw-int 0))
+        e2 (raw-bin (Mul) e1 (raw-int 1))
+        e3 (raw-bin (Add) (raw-int 3) e2)
+        e4 (raw-bin (Add) e2 (raw-int 3))
+        e5 (raw-bin (Sub) e3 e4)
+        e6 (raw-bin (Mul) b (raw-int 2))
+        e7 (raw-bin (Add) e5 e6)
+        e8 (raw-un (Minus) (raw-un (Minus) e7))
+        r  (n-new2 (Return) (g-start) e8)]
     (wl-push! r)
     (n-add-def! (g-stop) r)
     (wl-push! (g-stop))
@@ -542,7 +542,7 @@
   (graph-reset! 1)
   (let [a (mk-arg (t-int))
         b (mk-int 7)
-        e (mk-bin OP-ADD a b)]
+        e (mk-bin (Add) a b)]
     ; the add is a use of both operands
     (assert (= (n-in e 1) a))
     (assert (= (n-in e 2) b))
@@ -557,8 +557,8 @@
 (deftest killing_cascades
   (graph-reset! 1)
   (let [a (mk-arg (t-int))
-        inner (mk-bin OP-MUL a a)
-        outer (mk-bin OP-ADD inner (mk-int 1))]
+        inner (mk-bin (Mul) a a)
+        outer (mk-bin (Add) inner (mk-int 1))]
     (assert (not (n-dead? inner)))
     ; killing the only user of `inner` must take `inner` with it, and then `a`
     (n-kill! outer)
@@ -569,7 +569,7 @@
 (deftest dead_nodes_are_never_resurrected
   (graph-reset! 1)
   (let [a (mk-arg (t-int))
-        e (mk-bin OP-ADD a (mk-int 0))]     ; folds to a, so the Add dies
+        e (mk-bin (Add) a (mk-int 0))]     ; folds to a, so the Add dies
     (assert (= e a))
     (mk-ret a)
     (check-no-leaks "folded add")))
@@ -616,26 +616,27 @@
         lowb (t-bool-con true)]
     (assert (ty-high? inv))
     (assert (ty-high? invb))
-    (falls-or-fail "arith ADD" (arith-compute OP-ADD inv (t-int-con 1))
-                               (arith-compute OP-ADD low (t-int-con 1)))
-    (falls-or-fail "arith SUB" (arith-compute OP-SUB inv (t-int-con 1))
-                               (arith-compute OP-SUB low (t-int-con 1)))
-    (falls-or-fail "arith MUL" (arith-compute OP-MUL inv (t-int-con 2))
-                               (arith-compute OP-MUL low (t-int-con 2)))
+    (falls-or-fail "arith ADD" (arith-compute (Add) inv (t-int-con 1))
+                               (arith-compute (Add) low (t-int-con 1)))
+    (falls-or-fail "arith SUB" (arith-compute (Sub) inv (t-int-con 1))
+                               (arith-compute (Sub) low (t-int-con 1)))
+    (falls-or-fail "arith MUL" (arith-compute (Mul) inv (t-int-con 2))
+                               (arith-compute (Mul) low (t-int-con 2)))
     (falls-or-fail "minus" (minus-compute inv) (minus-compute low))
     (falls-or-fail "not"   (not-compute invb)  (not-compute lowb))
     ; and the axis rule at the level below, so a future caller of int-arith cannot reintroduce it
-    (falls-or-fail "int-arith directly" (int-arith OP-ADD 8 5 1 1) (int-arith OP-ADD 0 5 1 1)))
+    (falls-or-fail "int-arith directly" (int-arith (Add) 8 5 1 1)
+                                             (int-arith (Add) 0 5 1 1)))
 
   ;; if-compute, which needs a node. An If whose PREDICATE holds no value takes neither arm; the old
   ;; code fell through to [ctrl ctrl], the bottom of that axis, and then rose to [ctrl ~ctrl].
   (let [(mut before) 0 (mut after) 0]
     (graph-reset! 1)
-    (let [x (n-peephole (n-new1 OP-ARG (ty-join (t-bool-con true) (t-bool-con false)) (g-start)))]
-      (store! before (n-compute (n-new2 OP-IF 0 (g-start) x))))
+    (let [x (n-peephole (n-new1 (Arg (ty-join (t-bool-con true) (t-bool-con false))) (g-start)))]
+      (store! before (n-compute (n-new2 (If) (g-start) x))))
     (graph-reset! 1)
-    (let [x (n-peephole (n-new1 OP-ARG (t-bool-con true) (g-start)))]
-      (store! after (n-compute (n-new2 OP-IF 0 (g-start) x))))
+    (let [x (n-peephole (n-new1 (Arg (t-bool-con true)) (g-start)))]
+      (store! after (n-compute (n-new2 (If) (g-start) x))))
     (falls-or-fail "if-compute" (load before) (load after))))
 
 ;; The end-to-end half: `if (p) x = 8; else x = 0; return ((int[0..5]) x) + 1;` built raw and handed
@@ -648,19 +649,19 @@
     (loop
       (if (>= (load s) 300) (break)
         (do (graph-reset! (+ 1 (load s)))
-            (let [p   (n-new1 OP-ARG (t-dyn) (g-start))
-                  iff (n-new2 OP-IF 0 (g-start) p)]
-              (let [tt (n-new1 OP-CPROJ 0 iff)
-                    ff (n-new1 OP-CPROJ 1 iff)
-                    r  (n-new OP-REGION 0)]
+            (let [p   (n-new1 (Arg (t-dyn)) (g-start))
+                  iff (n-new2 (If) (g-start) p)]
+              (let [tt (n-new1 (CProj 0) iff)
+                    ff (n-new1 (CProj 1) iff)
+                    r  (n-new (Region))]
                 (n-add-def! r NO-NODE) (n-add-def! r tt) (n-add-def! r ff)
-                (let [ph (n-new OP-PHI (t-int))]
+                (let [ph (n-new (Phi (t-int)))]
                   (n-add-def! ph r)
-                  (n-add-def! ph (n-new1 OP-CONST (t-int-con 8) (g-start)))
-                  (n-add-def! ph (n-new1 OP-CONST (t-int-con 0) (g-start)))
-                  (let [c   (n-new2 OP-CAST (t-int-range 0 5) r ph)
-                        add (n-new3 OP-ADD 0 NO-NODE c (n-new1 OP-CONST (t-int-con 1) (g-start)))]
-                    (n-add-def! (g-stop) (n-new2 OP-RETURN 0 r add))
+                  (n-add-def! ph (n-new1 (Const (t-int-con 8)) (g-start)))
+                  (n-add-def! ph (n-new1 (Const (t-int-con 0)) (g-start)))
+                  (let [c   (n-new2 (Cast (t-int-range 0 5)) r ph)
+                        add (n-new3 (Add) NO-NODE c (n-new1 (Const (t-int-con 1)) (g-start)))]
+                    (n-add-def! (g-stop) (n-new2 (Return) r add))
                     (g-analyze!)
                     ; the monotonicity check really ran: without this the test would pass just as
                     ; well with the assertion inside g-analyze! deleted
@@ -684,10 +685,10 @@
 ;; run over the whole program, a Phi collapsed onto one arm, a live projection replaced by XCtrl.
 (deftest an_unanalysed_merge_does_not_claim_to_be_unreachable
   (graph-reset! 1)
-  (let [iff (n-new2 OP-IF 0 (g-start) (n-peephole (n-new1 OP-ARG (t-dyn) (g-start))))
-        r   (n-new OP-REGION 0)]
-    (let [tt (n-new1 OP-CPROJ 0 iff)
-          ff (n-new1 OP-CPROJ 1 iff)]
+  (let [iff (n-new2 (If) (g-start) (n-peephole (n-new1 (Arg (t-dyn)) (g-start))))
+        r   (n-new (Region))]
+    (let [tt (n-new1 (CProj 0) iff)
+          ff (n-new1 (CProj 1) iff)]
       (n-add-def! r NO-NODE) (n-add-def! r tt) (n-add-def! r ff)
       ; nothing has been peepholed, so both paths are still ANY
       (assert (= (n-ty tt) (t-top)))
@@ -707,7 +708,7 @@
   ;; And a merge every one of whose paths is PROVEN dead really is unreachable, so the guard above
   ;; did not simply switch the answer off.
   (graph-reset! 1)
-  (let [r (n-new OP-REGION 0)]
+  (let [r (n-new (Region))]
     (n-add-def! r NO-NODE) (n-add-def! r (n-xctrl)) (n-add-def! r (n-xctrl))
     (assert (= (n-compute r) (t-xctrl)))))
 
@@ -716,10 +717,10 @@
 ;; BOTH arms provably not taken. `cproj-idealize` then replaced both live projections with XCtrl.
 (deftest an_if_whose_control_is_unanalysed_does_not_claim_neither_arm
   (graph-reset! 1)
-  (let [outer (n-new2 OP-IF 0 (g-start) (n-peephole (n-new1 OP-ARG (t-dyn) (g-start))))]
-    (let [tt (n-new1 OP-CPROJ 0 outer)
-          q  (n-peephole (n-new1 OP-ARG (t-dyn) (g-start)))]
-      (let [inner (n-new2 OP-IF 0 tt q)]
+  (let [outer (n-new2 (If) (g-start) (n-peephole (n-new1 (Arg (t-dyn)) (g-start))))]
+    (let [tt (n-new1 (CProj 0) outer)
+          q  (n-peephole (n-new1 (Arg (t-dyn)) (g-start)))]
+      (let [inner (n-new2 (If) tt q)]
         ; the inner If's control is an unanalysed projection, its predicate is a known `dyn`
         (assert (= (n-ty tt) (t-top)))
         (assert (= (n-ty q) (t-dyn)))
@@ -733,7 +734,7 @@
 ;; distinguish "unknown" from "dead" rather than disabling dead-code elimination.
 (deftest an_if_in_proven_dead_control_still_takes_neither_arm
   (graph-reset! 1)
-  (let [iff (n-new2 OP-IF 0 (n-xctrl) (n-peephole (n-new1 OP-ARG (t-dyn) (g-start))))]
+  (let [iff (n-new2 (If) (n-xctrl) (n-peephole (n-new1 (Arg (t-dyn)) (g-start))))]
     (assert (= (n-compute iff) (t-if-neither)))))
 
 ;; A PHI'S REVISIT DEPENDENCY GOES ON THE PATH, NOT ON THE REGION.
@@ -753,12 +754,12 @@
 
 (deftest a_phi_records_its_revisit_dependency_on_the_skipped_path
   (graph-reset! 1)
-  (let [iff (n-new2 OP-IF 0 (g-start) (n-peephole (n-new1 OP-ARG (t-dyn) (g-start))))
-        r   (n-new OP-REGION 0)]
-    (let [tt (n-new1 OP-CPROJ 0 iff)
-          ff (n-new1 OP-CPROJ 1 iff)]
+  (let [iff (n-new2 (If) (g-start) (n-peephole (n-new1 (Arg (t-dyn)) (g-start))))
+        r   (n-new (Region))]
+    (let [tt (n-new1 (CProj 0) iff)
+          ff (n-new1 (CProj 1) iff)]
       (n-add-def! r NO-NODE) (n-add-def! r tt) (n-add-def! r ff)
-      (let [ph (n-new OP-PHI (t-int))]
+      (let [ph (n-new (Phi (t-int)))]
         (n-add-def! ph r) (n-add-def! ph (n-const (t-int-con 8))) (n-add-def! ph (n-const (t-int-con 0)))
         ; compute the phi while both paths are unanalysed: that is when the dependency is recorded
         (n-compute ph)
@@ -780,16 +781,16 @@
     (loop
       (if (>= (load s) 100) (break)
         (do (graph-reset! (+ 1 (load s)))
-            (let [iff (n-new2 OP-IF 0 (g-start) (n-new1 OP-CONST (t-int-con 0) (g-start)))]
-              (let [tt (n-new1 OP-CPROJ 0 iff)
-                    ff (n-new1 OP-CPROJ 1 iff)
-                    r  (n-new OP-REGION 0)]
+            (let [iff (n-new2 (If) (g-start) (n-new1 (Const (t-int-con 0)) (g-start)))]
+              (let [tt (n-new1 (CProj 0) iff)
+                    ff (n-new1 (CProj 1) iff)
+                    r  (n-new (Region))]
                 (n-add-def! r NO-NODE) (n-add-def! r tt) (n-add-def! r ff)
-                (let [ph (n-new OP-PHI (t-int))]
+                (let [ph (n-new (Phi (t-int)))]
                   (n-add-def! ph r)
-                  (n-add-def! ph (n-new1 OP-CONST (t-int-con 8) (g-start)))
-                  (n-add-def! ph (n-new1 OP-CONST (t-int-con 0) (g-start)))
-                  (n-add-def! (g-stop) (n-new2 OP-RETURN 0 r ph))
+                  (n-add-def! ph (n-new1 (Const (t-int-con 8)) (g-start)))
+                  (n-add-def! ph (n-new1 (Const (t-int-con 0)) (g-start)))
+                  (n-add-def! (g-stop) (n-new2 (Return) r ph))
                   (g-analyze!)
                   (assert (> (g-analyze-checks) 0))
                   (if (= (n-ty ph) (t-int-con 0)) 0
@@ -820,26 +821,26 @@
 
 (deftest a_provisional_xctrl_is_not_a_licence_to_drop_a_control_path
   (graph-reset! 1)
-  (let [iff (n-peephole (n-new2 OP-IF 0 (g-start) (n-const (t-int-con 0))))]
-    (let [tt (analyse-only! (n-new1 OP-CPROJ 0 iff))
-          ff (analyse-only! (n-new1 OP-CPROJ 1 iff))]
+  (let [iff (n-peephole (n-new2 (If) (g-start) (n-const (t-int-con 0))))]
+    (let [tt (analyse-only! (n-new1 (CProj 0) iff))
+          ff (analyse-only! (n-new1 (CProj 1) iff))]
       ; while the predicate is the constant 0, the true arm really is proven dead
       (assert (= (n-ty tt) (t-xctrl)))
       (assert (n-ty-proven? tt))
       ; now the predicate becomes an unanalysed opaque value. Nothing recomputed `tt` yet, so its
       ; stored type still says XCtrl and it is now a LIE.
-      (n-set-def! iff 1 (n-new1 OP-ARG (t-dyn) (g-start)))
+      (n-set-def! iff 1 (n-new1 (Arg (t-dyn)) (g-start)))
       (assert (= (n-ty tt) (t-xctrl)))
       (assert (not (n-ty-proven? tt)))
-      (let [r  (n-new OP-REGION 0)
-            ph (n-new OP-PHI (t-int))]
+      (let [r  (n-new (Region))
+            ph (n-new (Phi (t-int)))]
         (n-add-def! r NO-NODE) (n-add-def! r tt) (n-add-def! r ff)
         (n-add-def! ph r)
         (n-add-def! ph (n-const (t-int-con 1)))
         (n-add-def! ph (n-const (t-int-con 2)))
         ; the whole graph exists before anything is peepholed, so no rewrite below can be handed the
         ; id of a node an earlier rewrite killed
-        (n-add-def! (g-stop) (n-new2 OP-RETURN 0 tt (n-const (t-int-con 3))))
+        (n-add-def! (g-stop) (n-new2 (Return) tt (n-const (t-int-con 3))))
         ; the merge keeps the path: that arity is what `region-remove-path!` would drop, together
         ; with the matching arm of every Phi on the region (LAW 5)
         (n-peephole r)
@@ -856,18 +857,18 @@
   ;; And when the predicate really is the constant 0 and really is analysed, every one of those
   ;; rewrites fires. Without this half, refusing them unconditionally would pass the part above.
   (graph-reset! 1)
-  (let [iff (n-peephole (n-new2 OP-IF 0 (g-start) (n-const (t-int-con 0))))]
-    (let [tt (analyse-only! (n-new1 OP-CPROJ 0 iff))
-          ff (analyse-only! (n-new1 OP-CPROJ 1 iff))]
+  (let [iff (n-peephole (n-new2 (If) (g-start) (n-const (t-int-con 0))))]
+    (let [tt (analyse-only! (n-new1 (CProj 0) iff))
+          ff (analyse-only! (n-new1 (CProj 1) iff))]
       (assert (= (n-ty tt) (t-xctrl)))
       (assert (n-ty-proven? tt))
-      (let [r  (n-new OP-REGION 0)
-            ph (n-new OP-PHI (t-int))]
+      (let [r  (n-new (Region))
+            ph (n-new (Phi (t-int)))]
         (n-add-def! r NO-NODE) (n-add-def! r tt) (n-add-def! r ff)
         (n-add-def! ph r)
         (n-add-def! ph (n-const (t-int-con 1)))
         (n-add-def! ph (n-const (t-int-con 2)))
-        (n-add-def! (g-stop) (n-new2 OP-RETURN 0 tt (n-const (t-int-con 3))))
+        (n-add-def! (g-stop) (n-new2 (Return) tt (n-const (t-int-con 3))))
         ; the Return goes first: dropping the path kills `tt`, and a Return whose control has been
         ; killed is the corruption a dead input causes rather than the rewrite under test
         (n-peephole (g-stop))
@@ -887,8 +888,8 @@
         u (n-unbox! b (t-int))]
     (assert (= u v))
     (assert (n-dead? b))
-    (assert (= (count-live-op OP-BOX) 0))
-    (assert (= (count-live-op OP-UNBOX) 0))
+    (assert (= (count-live-op OPTAG-BOX) 0))
+    (assert (= (count-live-op OPTAG-UNBOX) 0))
     (mk-ret u)
     (check-prog "box/unbox cancellation" "return int=42;"))
 
@@ -899,8 +900,8 @@
         b (n-box! a)
         u (n-unbox! b (t-int))]
     (mk-ret u)
-    (assert (= (count-live-op OP-BOX) 1))
-    (assert (= (count-live-op OP-UNBOX) 1))
+    (assert (= (count-live-op OPTAG-BOX) 1))
+    (assert (= (count-live-op OPTAG-UNBOX) 1))
     (assert (= (n-ty b) (t-dyn)))
     (assert (= (n-ty u) (t-int)))
     (assert (= (g-leaked-count) 0))))
@@ -909,16 +910,15 @@
   (graph-reset! 1)
   (let [a (mk-arg (t-int))
         q (n-typetest! a (t-int))]
-    (assert (= (n-op q) OP-CONST))
+    (assert (op-is? q Const [_]))
     (assert (= (n-ty q) (t-bool-con true)))
     (mk-ret q)
-    (assert (= (count-live-op OP-TYPETEST) 0)))
+    (assert (= (count-live-op OPTAG-TYPETEST) 0)))
 
   (graph-reset! 1)
   (let [a (mk-arg (t-dyn))
         q (n-typetest! a (t-int))]
     (mk-ret q)
-    (assert (= (n-op q) OP-TYPETEST))
+    (assert (op-is? q TypeTest [_]))
     (assert (= (n-ty q) (t-bool)))
     (assert (= (g-leaked-count) 0))))
-

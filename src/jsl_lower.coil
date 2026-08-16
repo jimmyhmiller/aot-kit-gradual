@@ -16,7 +16,7 @@
 ;; at length: a node held only in a local can be collected by a cascade, and the caller then wires
 ;; a live Return to a dead node.
 ;;
-;; A DECLARED PARAMETER TYPE IS NOT INJECTED ONTO ITS `OP-PARM`. Under D1 an annotation is a
+;; A DECLARED PARAMETER TYPE IS NOT INJECTED ONTO ITS `OPTAG-PARM`. Under D1 an annotation is a
 ;; contract to discharge and under D8 a rewrite may only act on a PROVEN type, so handing the
 ;; optimiser an unproven claim it is entitled to act on is precisely the failure D8 exists to
 ;; prevent. Parameter types stay on the declaration; closed-world inference computes the real ones.
@@ -65,7 +65,7 @@
    (anchor i64)               ; Start/FunStart of the CFG owner receiving newly rooted constants
    (frame  i64)               ; lookup floor: a macro body cannot see its caller's bindings
    (decl   i64)               ; which declaration is being lowered, for diagnostics
-   (fun    i64)               ; its OP-FUN
+   (fun    i64)               ; its OPTAG-FUN
    (inited bool)])
 
 (defn jl [] (-> (ptr JslLower))
@@ -88,8 +88,36 @@
           0))
     p))
 
+;; EVERY BINDING IS PINNED, SO EVERY WAY OF DROPPING ONE MUST UNPIN. `jl-drop!` is the ordinary
+;; path; these two clear the whole table at once -- `jl-reset!` between units and
+;; `jl-lower-decl!` between declarations -- and a pin left behind there survives into the next
+;; unit, where the node it protects can never be collected and `g-verify` reports a leak. That
+;; failure does not reproduce on the program that caused it, only on whatever runs after it, which
+;; is the worst way to find out.
+;;
+;; Guarded on `n-keeps` because a reset may follow a graph reset, and unpinning something that was
+;; never pinned is itself an abort.
+(defn jl-unpin-binds! [] (-> i64)
+  (let [(mut i) 0]
+    (loop (if (>= (load i) (jl-depth))
+              (break)
+              (do (let [n (load (field (jl-bind-p (load i)) node))]
+                    (if (and (!= n NO-NODE)
+                             (and (>= n 0) (and (< n (n-count)) (> (n-keeps n) 0))))
+                        (n-unkeep! n)
+                        0))
+                  (store! i (+ (load i) 1))
+                  0)))
+    0))
+
 (defn jl-reset! [] (-> i64)
   (let [p (jl)]
+    ;; NO UNPIN HERE, and that is the whole difference between the two clear sites. `jl-reset!` runs
+    ;; immediately after `graph-reset!`, so every node id in this table belongs to a graph that no
+    ;; longer exists; "releasing" them would decrement `keeps` on whatever unrelated node now
+    ;; occupies those ids in the fresh graph. The pins die with the arena.
+    ;;
+    ;; `jl-lower-decl!` is the opposite case -- same graph, still live -- and unpins for real.
     (al-clear! [JslBind] (field p binds))
     (al-clear! [i64] (field p exits))
     (al-clear! [JslLoop] (field p loops))
@@ -110,8 +138,8 @@
 (defn jl-diverged? [] (-> bool) (= (jl-ctrl) JL-DIVERGED))
 
 ;; THE HEAP THIS DEFINITION WAS GIVEN. A heap-using builtin's call has an implicit trailing memory
-;; argument. The callee sees that effect as its function-entry `OP-ARG`, and its caller takes the
-;; returned effect from a CallEnd-rooted `OP-ARG`. Memory therefore crosses the call without being
+;; argument. The callee sees that effect as its function-entry `OPTAG-ARG`, and its caller takes the
+;; returned effect from a CallEnd-rooted `OPTAG-ARG`. Memory therefore crosses the call without being
 ;; exposed as a source parameter. The IR already reserves this convention: `v-need-call-args`
 ;; permits the LAST argument of a call to be a memory producer.
 ;;
@@ -125,7 +153,7 @@
   (let [p (jl)]
     (if (!= (load (field p mem)) NO-NODE) 0
         (store! (field p mem)
-                (n-new1 OP-ARG (t-mem-alias JS-PROPERTY-ALIAS (t-undef))
+                (n-new1 (Arg (t-mem-alias JS-PROPERTY-ALIAS (t-undef)))
                         (n-fun-entry (load (field p fun))))))
     (load (field p mem))))
 
@@ -152,10 +180,24 @@
 
 (defn jl-depth [] (-> i64) (al-len [JslBind] (load (field (jl) binds))))
 
+;; A BINDING IS PINNED FOR ITS WHOLE SCOPE, and that is not defensive.
+;;
+;; A `let` value can lose every user it currently has while its LATER uses have not been built yet
+;; -- `(let ((a …)) (if (IsNumber a) … (NumLt a b)))` is exactly that: folding `IsNumber a` to a
+;; constant collects the TypeTest, the cascade takes `a` with it, and `NumLt` is then built on a
+;; corpse. `n-add-def!: input is dead`, surfacing later as a spray of `VERR-DEAD-INPUT`.
+;;
+;; Having users is not evidence a value is still needed; being IN SCOPE is. `jl-drop!` unpins at
+;; scope exit and collects there, which is the point where "nothing used it" is finally true.
+;;
+;; Dormant until DSL guards began folding against typed operands: before that a `%IsInt` on a boxed
+;; argument never proved, so a binding never lost its last user mid-scope. See
+;; docs/DSL-OWNERSHIP.md.
 (defn jl-bind! [(name (slice u8)) (node i64)] (-> i64)
   (let [(mut b) (zeroed JslBind)]
     (store! (field b name) name)
     (store! (field b node) node)
+    (jl-keep! node)
     (al-push! [JslBind] (field (jl) binds) (load b))))
 
 ;; NO-NODE IS -1 AND EVERY NODE ACCESSOR INDEXES AN ARENA, so pinning "the value of a path that
@@ -187,6 +229,9 @@
           ; The wrong order passes every test today and breaks on an unrelated change later.
           (let [n (load (field (jl-bind-p (- (jl-depth) 1)) node))]
             (al-pop! [JslBind] (field (jl) binds))
+            ;; Unpin before collecting: the pin is what kept it alive through the scope, and
+            ;; `jl-collect!` only kills a value with no users AND no pins.
+            (jl-unkeep! n)
             (jl-collect! n)
             0)))
   0)
@@ -213,10 +258,10 @@
 ; Leaves
 ; ============================================================================
 (defn jl-const [(t i64)] (-> i64)
-  (n-peephole (n-new1 OP-CONST t (load (field (jl) anchor)))))
+  (n-peephole (n-new1 (Const t) (load (field (jl) anchor)))))
 
 ;; A bare symbol: a literal, or a binding. Parameters are bindings too — `jl-lower-decl!` creates
-;; one `OP-PARM` per parameter at entry and binds it by name.
+;; one `OPTAG-PARM` per parameter at entry and binds it by name.
 ;;
 ;; ONE PARM NODE PER PARAMETER, NOT ONE PER REFERENCE. `op-gvn?` excludes Parm, so `n-parm!` called
 ;; twice for the same index yields two live `Parm.0` nodes. Nothing about that graph looks wrong
@@ -240,18 +285,18 @@
 ;; null: a value op is ordered by its data edges and by nothing else, which is what lets the
 ;; optimiser float it. Arity came from `jsp-arity` and was checked, so an unhandled width here is
 ;; a table that grew a row without growing this dispatch.
-;; An unbox is CHECKED: `MI-JSUNBOX` traps on a tag mismatch. `OP-UNBOX` has a null control anchor,
+;; An unbox is CHECKED: `MI-JSUNBOX` traps on a tag mismatch. `OPTAG-UNBOX` has a null control anchor,
 ;; so it floats and the scheduler may place it where the guard that establishes the tag has not run
 ;; — measured as a `brk` in `MathMin2` while the structurally identical `MathMax2` happened to be
 ;; scheduled safely.
 ;;
 ;; D4's pattern is the fix: a guard is `If(TypeTest(v, T))` followed by a `Cast(T)` ON THE TAKEN
-;; EDGE, and `OP-CAST` takes a real control input. Narrowing through the Cast pins the claim to the
+;; EDGE, and `OPTAG-CAST` takes a real control input. Narrowing through the Cast pins the claim to the
 ;; guarded edge, after which the Unbox is floating over a value whose type is already proven and
 ;; cannot trap.
 (defn jl-unbox [(target i64) (v i64)] (-> i64)
-  (n-peephole (n-new2 OP-UNBOX target NO-NODE
-                      (n-peephole (n-new2 OP-CAST target (jl-ctrl) v)))))
+  (n-peephole (n-new2 (Unbox target) NO-NODE
+                      (n-peephole (n-new2 (Cast target) (jl-ctrl) v)))))
 
 ;; Named-property IR stores the interned property-name id in AUX, not as a data input. The JSL
 ;; surface therefore accepts a key operand so frontend call sites remain ordinary macro calls, but
@@ -259,12 +304,12 @@
 ;; from the eventual dynamic `PropertyKey` operation: silently accepting a runtime key here would
 ;; bake whatever happened to be in a non-Const node's aux word into the graph.
 (defn jl-static-property-key [(key i64)] (-> i64)
-  (if (and (= (n-op key) OP-CONST)
-           (and (ty-int-only? (n-aux key)) (ty-const? (n-aux key))))
-      (ty-int-lo (n-aux key))
-      (if (= (n-op key) OP-STRINGCONST)
+  (if (and (op-is? key Const [_])
+           (and (ty-int-only? (n-const-type key)) (ty-const? (n-const-type key))))
+      (ty-int-lo (n-const-type key))
+      (if (op-is? key StringConst [_])
           (let [(mut bytes) (al-new [u8] (malloc-allocator))
-                text (jss-utf8! (n-aux key) (mut bytes))
+                text (jss-utf8! (n-stringconst-id key) (mut bytes))
                 name (shape-name-intern! text)]
             ;; The spelling moves into the property's aux field; the temporary StringConst is not
             ;; a runtime operand and would otherwise be an unreachable graph leaf.
@@ -280,29 +325,34 @@
   ;; exception ABI can propagate it, but the operation itself must remain in the branch that chose
   ;; it; otherwise scheduling can hoist an untaken error path and throw unconditionally.
   (if (= id JSP-THROW)
-      (n-peephole (n-new2 OP-JSTHROW 0 (jl-ctrl) a))
+      (n-peephole (n-new2 (JsThrow) (jl-ctrl) a))
+  ;; NO `Cast` IN FRONT. `jl-unbox` asserts the target type, and an int-tagged number does not
+  ;; satisfy `Cast flt` even though the unbox beneath converts it correctly. For the numeric case
+  ;; the unbox IS the conversion, which is why the frontend's own `fng-to-number-operand` is a bare
+  ;; `n-unbox!`. See docs/DSL-OWNERSHIP.md.
+  (if (= id JSP-UNBOXNUMBER)
+      (n-peephole (n-new2 (Unbox (jsp-aux id)) NO-NODE a))
   (if (or (= id JSP-UNBOXINT)
           (or (= id JSP-UNBOXFLT)
               (or (= id JSP-UNBOXBOOL) (or (= id JSP-UNBOXOBJ) (= id JSP-UNBOXSTRING)))))
       (jl-unbox (jsp-aux id) a)
-   ;; `OP-JSBUILTIN` always carries two operands. Unary descriptors ignore the duplicate second
+   ;; `OPTAG-JSBUILTIN` always carries two operands. Unary descriptors ignore the duplicate second
    ;; operand; the zero-argument random descriptor ignores both explicit zero placeholders.
-   (if (= (jsp-op id) OP-JSBUILTIN)
+   (if (op-value-is? (jsp-op id) JsBuiltin [_])
        (let [arity (jsp-arity id)
              zero (if (= arity 0) (jl-const (t-int-con 0)) NO-NODE)
              first (if (= arity 0) zero a)
              second (if (= arity 2) b first)]
-         (n-peephole (n-new3 OP-JSBUILTIN (jsp-aux id) NO-NODE first second)))
+         (n-peephole (n-new3 (JsBuiltin (jsp-aux id)) NO-NODE first second)))
    (if (jsp-touches-memory? id) (jl-prim-mem id a b c)
     (let [op (jsp-op id)
-          n (jsp-arity id)
-          aux (jsp-aux id)]
+          n (jsp-arity id)]
       (if (= id JSP-BOXARRAY) (n-box-array! a)
-      (if (= n 1) (n-peephole (n-new2 op aux NO-NODE a))
-        (if (= n 2) (n-peephole (n-new3 op aux NO-NODE a b))
-          (if (= n 3) (n-peephole (n-new4 op aux NO-NODE a b c))
+      (if (= n 1) (n-peephole (n-new2 op NO-NODE a))
+        (if (= n 2) (n-peephole (n-new3 op NO-NODE a b))
+          (if (= n 3) (n-peephole (n-new4 op NO-NODE a b c))
             (do (panic-corrupt "jsl lowering: a primitive arity this dispatch does not build")
-                NO-NODE)))))))))))
+                NO-NODE))))))))))))
 
 ;; A heap-reading primitive. The memory operand is supplied here rather than written in the `.jsl`
 ;; source, so `%ArrayLoad a i` in the library becomes `ArrayLoad(mem, a, i)` in the graph and the
@@ -314,15 +364,15 @@
     ;; body and wrong the moment the memory it reads is LOOP-CARRIED. `(%ArrayLen a)` after a loop
     ;; that never ran answered 1 instead of 0, because a floating read of a header Phi has no block
     ;; to say which trip it belongs to. Anchoring pins it to the block it was written in.
-    (if (= op OP-ARRAYLEN) (n-array-length-at! (jl-ctrl) (jl-mem) a)
-      (if (= op OP-OWNKEYCOUNT) (n-own-key-count-at! (jl-ctrl) (jl-mem) a)
-      (if (= op OP-OWNKEYAT) (n-own-key-at-at! (jl-ctrl) (jl-mem) a b)
-      (if (= op OP-ARRAYLOAD) (n-array-load-at! (jl-ctrl) (jl-mem) a b)
-        (if (= op OP-PROTOHAS) (n-prototype-has-at! (jl-ctrl) (jl-mem) a b)
-        (if (= op OP-SETPROTO)
+    (if (op-value-is? op ArrayLen []) (n-array-length-at! (jl-ctrl) (jl-mem) a)
+      (if (op-value-is? op OwnKeyCount []) (n-own-key-count-at! (jl-ctrl) (jl-mem) a)
+      (if (op-value-is? op OwnKeyAt []) (n-own-key-at-at! (jl-ctrl) (jl-mem) a b)
+      (if (op-value-is? op ArrayLoad [_]) (n-array-load-at! (jl-ctrl) (jl-mem) a b)
+        (if (op-value-is? op ProtoHas []) (n-prototype-has-at! (jl-ctrl) (jl-mem) a b)
+        (if (op-value-is? op SetProto [])
             (do (jl-set-mem! (n-set-prototype-at! (jl-ctrl) (jl-mem) a b))
                 (jl-const (t-undef)))
-        (if (= op OP-OBJECTFREEZE)
+        (if (op-value-is? op ObjectFreeze [])
             (do (jl-set-mem! (n-object-freeze-at! (jl-ctrl) (jl-mem) a))
                 (jl-const (t-undef)))
         (if (= id JSP-INTERNALINIT)
@@ -334,38 +384,37 @@
         (if (or (= id JSP-INTERNALTARGET)
                 (or (= id JSP-INTERNALINDEX) (= id JSP-INTERNALKIND)))
             (n-internal-load-at! (jl-ctrl) (jl-mem) a (jsp-aux id))
-        (if (= op OP-PROPLOADKEY)
+        (if (op-value-is? op PropLoadKey [])
             (n-prop-load-key-at! (jl-ctrl) (jl-mem) a b)
-        (if (= op OP-PROPHASKEY)
+        (if (op-value-is? op PropHasKey [])
             (n-prop-has-key-at! (jl-ctrl) (jl-mem) a b)
-        (if (= op OP-PROPDELETEKEY)
+        (if (op-value-is? op PropDeleteKey [])
             (do (jl-set-mem! (n-prop-delete-key-at! (jl-ctrl) (jl-mem) a b))
                 (jl-const (t-undef)))
-        (if (= op OP-PROPSTOREKEY)
+        (if (op-value-is? op PropStoreKey [])
             (do (jl-set-mem! (n-prop-store-key-at! (jl-ctrl) (jl-mem) a b c))
                 (jl-const (t-undef)))
-        (if (= op OP-PROPLOAD)
-            (n-peephole (n-new3 OP-PROPLOAD (jl-static-property-key b)
+        (if (op-value-is? op PropLoad [_])
+            (n-peephole (n-new3 (PropLoad (jl-static-property-key b))
                                 (jl-ctrl) (jl-mem) a))
-        (if (= op OP-PROPHAS)
-            (n-peephole (n-new3 OP-PROPHAS (jl-static-property-key b)
+        (if (op-value-is? op PropHas [_])
+            (n-peephole (n-new3 (PropHas (jl-static-property-key b))
                                 (jl-ctrl) (jl-mem) a))
-        (if (= op OP-PROPDELETE)
-            (do (jl-set-mem! (n-peephole (n-new3 OP-PROPDELETE
-                                                   (jl-static-property-key b)
+        (if (op-value-is? op PropDelete [_])
+            (do (jl-set-mem! (n-peephole (n-new3 (PropDelete (jl-static-property-key b))
                                                    (jl-ctrl) (jl-mem) a)))
                 (jl-const (t-undef)))
-        (if (= op OP-PROPSTORE)
-            (do (jl-set-mem! (n-peephole (n-new4 OP-PROPSTORE (jl-static-property-key b)
+        (if (op-value-is? op PropStore [_])
+            (do (jl-set-mem! (n-peephole (n-new4 (PropStore (jl-static-property-key b))
                                                    (jl-ctrl) (jl-mem) a c)))
                 (jl-const (t-undef)))
-        (if (= op OP-NEW)
+        (if (op-value-is? op New [_])
             ; SHAPE-ROOT, then the Array tag. The allocation's control input is real — an allocation
             ; happening twice is two objects — so it hangs off the current control rather than
             ; floating like a value op.
             (let [object (n-obj-ptr (n-new-obj0! (jl-ctrl) SHAPE-ROOT))]
               (if (= id JSP-NEWARRAY) (n-array-mark! (jl-ctrl) object) object))
-          (if (= op OP-ARRAYSTORE)
+          (if (op-value-is? op ArrayStore [])
               ; The store PRODUCES the new memory, which becomes current. Its JSL value is
               ; `undefined`: a store is an effect, and giving it the stored value back would invite
               ; a definition to read a heap write as an expression.
@@ -375,7 +424,7 @@
             ;; built with `n-array-resize-after-at!` so `v`'s read is forced ahead of the write that
             ;; destroys it. Without it `pop`'s load of the last element floats past the shortening
             ;; and selection rejects the block with `MSEL-MEMORY-ORDER`.
-            (if (= op OP-ARRAYRESIZE)
+            (if (op-value-is? op ArrayResize [])
                 (do (jl-set-mem! (n-array-resize-after-at! (jl-ctrl) (jl-mem) a b c))
                     (jl-const (t-undef)))
               (do (panic-corrupt "jsl lowering: a memory primitive this dispatch does not build")
@@ -436,16 +485,16 @@
       ;; untagged callable. Exact sites pass the BOXED closure as the hidden environment (the
       ;; callee prologue unboxes parameter 0); only a runtime-value callee needs tag dispatch,
       ;; and there the tagged callee value doubles as the environment.
-      (let [direct (or (= (n-op callee) OP-FUN) (= (n-op callee) OP-CLOSURE))
+      (let [direct (or (op-is? callee Fun [_]) (op-is? callee Closure [_]))
             cs (n-call-receiver! (jl-ctrl) callee
                                  (if direct (n-box! callee) callee)
                                  (n-box! (jl-const (t-undef)))
                                  (slice-new [i64] p (+ n 1)))
             end (call-end cs)]
-        (if direct 0 (do (n-set-aux! (call-value cs) CALL-ABI-DYNAMIC-RECEIVER) 0))
+      (if direct 0 (do (n-set-op! (call-value cs) (Call CALL-ABI-DYNAMIC-RECEIVER)) 0))
         (al-push! [i64] (field (jl) callback-calls) (call-value cs))
         (jl-set-ctrl! end)
-        (jl-set-mem! (n-new1 OP-ARG (t-mem-alias JS-PROPERTY-ALIAS (t-undef)) end))
+        (jl-set-mem! (n-new1 (Arg (t-mem-alias JS-PROPERTY-ALIAS (t-undef))) end))
         ;; A JavaScript call expression always yields a tagged language value even when the
         ;; closed-world callee uses an unboxed native return register. `Box(Call)` is the existing
         ;; representation boundary; selection removes it when the target already returns `dyn`.
@@ -466,9 +515,9 @@
   (let [(mut node) 0 (mut targets) 0]
     (loop (if (>= (load node) (n-count)) (break)
             (do
-              (if (and (= (n-op (load node)) OP-FUN)
+              (if (and (op-is? (load node) Fun [_])
                        (not (jl-jsl-function? (load node))))
-                  (let [fidx (n-aux (load node))]
+                  (let [fidx (n-fun-index (load node))]
                     (if (and (>= fidx 0) (< fidx 63))
                         (store! targets (| (load targets) (<< 1 fidx)))
                         0))
@@ -481,9 +530,9 @@
     (loop (if (>= (load node) (n-count)) (break)
             (do
               (if (and (not (n-dead? (load node)))
-                       (and (= (n-op (load node)) OP-PARM)
+                       (and (op-is? (load node) Parm [_])
                             (= (n-in (load node) 0) fun)))
-                  (let [next (+ (n-aux (load node)) 1)]
+                  (let [next (+ (n-parm-index (load node)) 1)]
                     (if (> next (load count)) (store! count next) 0))
                   0)
               (store! node (+ (load node) 1)))))
@@ -493,11 +542,11 @@
   (let [(mut node) 0 (mut count) 0]
     (loop (if (>= (load node) (n-count)) (break)
             (do
-              (if (and (= (n-op (load node)) OP-FUN)
+              (if (and (op-is? (load node) Fun [_])
                        (and (not (jl-jsl-function? (load node)))
-                            (and (>= (n-aux (load node)) 0)
-                                 (and (< (n-aux (load node)) 63)
-                                      (!= (& targets (<< 1 (n-aux (load node)))) 0)))))
+                            (and (>= (n-fun-index (load node)) 0)
+                                 (and (< (n-fun-index (load node)) 63)
+                                      (!= (& targets (<< 1 (n-fun-index (load node)))) 0)))))
                   (let [arity (jl-function-param-count (load node))]
                     (if (> arity (load count)) (store! count arity) 0))
                   0)
@@ -511,7 +560,7 @@
           callee
             (if (and dynamic (!= targets 0))
                 (n-peephole
-                  (n-new2 OP-CAST (t-fun-set targets)
+                  (n-new2 (Cast (t-fun-set targets))
                           (jl-ctrl) raw-callee))
                 raw-callee)
           receiver (if (and dynamic (= targets 0))
@@ -557,9 +606,9 @@
             (let [cs (n-call-receiver! (jl-ctrl) callee callee receiver
                                      (slice-new [i64] p (+ call-n 1)))
                 end (call-end cs)]
-              (if dynamic (n-set-aux! (call-value cs) CALL-ABI-DYNAMIC-RECEIVER) 0)
+              (if dynamic (n-set-op! (call-value cs) (Call CALL-ABI-DYNAMIC-RECEIVER)) 0)
               (jl-set-ctrl! end)
-              (jl-set-mem! (n-new1 OP-ARG (t-mem-alias JS-PROPERTY-ALIAS (t-undef)) end))
+              (jl-set-mem! (n-new1 (Arg (t-mem-alias JS-PROPERTY-ALIAS (t-undef))) end))
               (n-box! (call-value cs))))))))
 
 (defn jl-js-call-with-receiver [(x (ptr rd/Sexp))] (-> i64)
@@ -612,10 +661,10 @@
 ;; problem: a diamond in which either side may have bailed out instead of arriving.
 ;; A memory Phi over a merge, when the two paths left the heap in different states. Its aux is the
 ;; declared memory type, which is what makes it a memory PRODUCER: `v-mem-producer?` decides that
-;; structurally from `(op-phi? op)` and `ty-mem? (n-aux d)`, not from the computed type.
+;; structurally from the Phi variant and its declared-type payload, not from the computed type.
 (defn jl-mem-phi [(region i64) (ma i64) (mb i64)] (-> i64)
   (if (= ma mb) ma
-    (let [phi (n-new OP-PHI (t-mem-alias JS-PROPERTY-ALIAS (t-undef)))]
+    (let [phi (n-new (Phi (t-mem-alias JS-PROPERTY-ALIAS (t-undef))))]
       (n-add-def! phi region)
       (n-add-def! phi ma)
       (n-add-def! phi mb)
@@ -631,11 +680,11 @@
           (if (= xb JL-DIVERGED) NO-NODE (do (jl-set-mem! mb) vb)))
     (if (= xb JL-DIVERGED)
         (do (jl-set-ctrl! xa) (jl-set-mem! ma) va)
-      (let [region (n-new OP-REGION 0)]
+      (let [region (n-new (Region))]
         (n-add-def! region NO-NODE)
         (n-add-def! region xa)
         (n-add-def! region xb)
-        (let [phi (n-new OP-PHI (t-dyn))]
+        (let [phi (n-new (Phi (t-dyn)))]
           (n-add-def! phi region)
           (n-add-def! phi va)
           (n-add-def! phi vb)
@@ -649,7 +698,7 @@
           phi)))))
 
 (defn jl-if-dynamic [(x (ptr rd/Sexp)) (pred i64)] (-> i64)
-  (let [iff (n-peephole (n-new2 OP-IF 0 (jl-ctrl) pred))
+  (let [iff (n-peephole (n-new2 (If) (jl-ctrl) pred))
         arms (n-if-arms! iff)
         at (arms-t arms)
         af (arms-f arms)]
@@ -681,12 +730,33 @@
     ;; The checker has already validated both arms. If construction proves the predicate, lower
     ;; only the reachable arm: building an unreachable arm and then peepholing its If used to kill
     ;; the control projection while leaving its values wired into the later Region/Phi.
+    ;; LOWER THE ARM, THEN COLLECT THE PREDICATE -- in that order, and the order is the whole fix.
+    ;;
+    ;; `n-kill!` CASCADES into its inputs, so killing a proven predicate first releases whatever
+    ;; only it was holding. `(if (%IsInt a) (%UnboxInt a) …)` is precisely that shape: the
+    ;; TypeTest is the Box's only user at this moment, killing the TypeTest takes the Box with it,
+    ;; and the arm is then lowered against a corpse -- `n-add-def!: input is dead`, surfacing much
+    ;; later as `VERR-DEAD-INPUT` on a `Cast` whose value was a dead `Box` with four live uses.
+    ;;
+    ;; Doing it the other way round means every value the arm needs has a live user before anything
+    ;; is collected. The result is pinned across the collect for the reason `jl-drop!` states about
+    ;; its own caller: a freshly built value has no users yet and is indistinguishable from garbage.
+    ;;
+    ;; This was dormant until DSL guards began folding against typed operands -- before that a
+    ;; `%IsInt` on a boxed argument never proved, so this branch was rarely taken. See
+    ;; docs/DSL-OWNERSHIP.md.
     (if (= (n-ty pred) (t-bool-con true))
-        (do (if (= (n-nouts pred) 0) (n-kill! pred) 0)
-            (jl-expr (rd/sexp-nth x 2)))
+        (let [v (jl-expr (rd/sexp-nth x 2))]
+          (jl-keep! v)
+          (jl-collect! pred)
+          (jl-unkeep! v)
+          v)
         (if (= (n-ty pred) (t-bool-con false))
-            (do (if (= (n-nouts pred) 0) (n-kill! pred) 0)
-                (jl-expr (rd/sexp-nth x 3)))
+            (let [v (jl-expr (rd/sexp-nth x 3))]
+              (jl-keep! v)
+              (jl-collect! pred)
+              (jl-unkeep! v)
+              v)
             (jl-if-dynamic x pred)))))
 
 ;; `(loop [(name init [type]) ...] BODY...)`. Built in the order D9's in-progress contract requires,
@@ -722,7 +792,7 @@
     ; as `n-in: input index out of range`. Two sibling loops with the same entry collide the same
     ; way. The worklist pushes at close time are what get their types computed instead;
     ; `fng-if-expression` in the frontend builds every phi this way for the same reason.
-    (let [lp (n-new OP-LOOP 0)]
+    (let [lp (n-new (Loop))]
       (n-add-def! lp NO-NODE)
       (n-add-def! lp entry)
       (n-add-def! lp NO-NODE)          ; the back edge, filled in below
@@ -732,7 +802,7 @@
                     declared (if (= (rd/sexp-count binding) 3)
                                  (jsl-type-of (rd/sexp-nth binding 2))
                                  (t-dyn))
-                    ph (n-new OP-PHI declared)]
+                    ph (n-new (Phi declared))]
                 (n-add-def! ph lp)
                 (n-add-def! ph (load (index inits (load k))))
                 (n-add-def! ph NO-NODE)  ; the recur value, filled in below
@@ -749,7 +819,7 @@
             vbase (jl-rvals-count)
             m0 (jl-mem-raw)
             memphi (if (= m0 NO-NODE) NO-NODE
-                     (let [ph (n-new OP-PHI (t-mem-alias JS-PROPERTY-ALIAS (t-undef)))]
+                     (let [ph (n-new (Phi (t-mem-alias JS-PROPERTY-ALIAS (t-undef))))]
                        (n-add-def! ph lp) (n-add-def! ph m0) (n-add-def! ph NO-NODE)
                        ph))
             (mut frame) (zeroed JslLoop)]
@@ -818,7 +888,7 @@
 ;; The memory reaching the back edge, from the memory each `recur` recorded.
 (defn jl-recur-mem! [(rbase i64) (nrec i64) (back i64)] (-> i64)
   (if (= nrec 1) (al-get (load (field (jl) rmem)) rbase)
-    (let [phi (n-new OP-PHI (t-mem-alias JS-PROPERTY-ALIAS (t-undef)))
+    (let [phi (n-new (Phi (t-mem-alias JS-PROPERTY-ALIAS (t-undef))))
           (mut i) 0]
       (n-add-def! phi back)
       (loop (if (>= (load i) nrec) (break)
@@ -831,7 +901,7 @@
 ;; More than one `recur`: the IR gives a Loop exactly one back edge (`n-back-edge?` is input 2), so
 ;; the recur controls merge into a Region first and THAT is the back edge.
 (defn jl-recur-region! [(rbase i64) (nrec i64)] (-> i64)
-  (let [region (n-new OP-REGION 0)
+  (let [region (n-new (Region))
         (mut i) 0]
     (n-add-def! region NO-NODE)
     (loop (if (>= (load i) nrec) (break)
@@ -846,7 +916,7 @@
 ;; separately from the control base.
 (defn jl-recur-value! [(vbase i64) (nrec i64) (nb i64) (k i64) (back i64)] (-> i64)
   (if (= nrec 1) (al-get (load (field (jl) rvals)) (+ vbase k))
-    (let [phi (n-new OP-PHI (t-dyn))
+    (let [phi (n-new (Phi (t-dyn)))
           (mut i) 0]
       (n-add-def! phi back)
       (loop (if (>= (load i) nrec) (break)
@@ -917,7 +987,7 @@
         c (if (>= n 3) (jl-expr (rd/sexp-nth x 3)) NO-NODE)]
     (if (jl-diverged?) NO-NODE (jl-prim id a b c))))
 
-;; The macro machinery. A `macro` has no `OP-FUN` and is never called: its body is lowered AGAIN,
+;; The macro machinery. A `macro` has no `OPTAG-FUN` and is never called: its body is lowered AGAIN,
 ;; here, in the caller's graph, with its parameters bound to the caller's already-lowered argument
 ;; nodes. That is real inlining with no cloning machinery — re-lowering from the source is both
 ;; simpler than copying a graph and automatically correct, because the source is the only
@@ -985,7 +1055,7 @@
 ;; More than one `goto` to the same label. Unpeepholed and worklisted, following the same rule the
 ;; diamond does.
 (defn jl-exit-region [(base i64) (n i64)] (-> i64)
-  (let [region (n-new OP-REGION 0)
+  (let [region (n-new (Region))
         (mut i) 0]
     (n-add-def! region NO-NODE)
     (loop (if (>= (load i) n) (break)
@@ -995,8 +1065,8 @@
     (wl-push! region)
     region))
 
-;; A call to another JSL builtin. The callee is the `OP-FUN` NODE itself rather than a Closure:
-;; `call-idealize` accepts a Fun directly, `OP-FUN` computes to `t-fun-con fidx` so
+;; A call to another JSL builtin. The callee is the `OPTAG-FUN` NODE itself rather than a Closure:
+;; `call-idealize` accepts a Fun directly, `OPTAG-FUN` computes to `t-fun-con fidx` so
 ;; `infer-call-targets` sees an exact singleton, and with no captures `infer-parm-source` maps
 ;; argument `k` to input `2 + k` either way. A Closure would be a wrapper carrying nothing.
 (defn jl-call [(x (ptr rd/Sexp)) (name (slice u8))] (-> i64)
@@ -1027,7 +1097,7 @@
           end (call-end cs)]
       (jl-set-ctrl! end)
       (if uses-mem
-          (jl-set-mem! (n-new1 OP-ARG (t-mem-alias JS-PROPERTY-ALIAS (t-undef)) end))
+          (jl-set-mem! (n-new1 (Arg (t-mem-alias JS-PROPERTY-ALIAS (t-undef))) end))
           0)
         (call-value cs)))))
 
@@ -1065,8 +1135,8 @@
                 (break)
                 (do
                   (if (n-dead? (load n)) 0
-                    (let [op (n-op (load n))]
-                      (if (or (= op OP-CALL) (= op OP-SAFEPOINT))
+                    (let [node (load n)]
+                      (if (or (op-is? node Call [_]) (op-is? node Safepoint []))
                           (store! err (jsl-fail! JSL-ERR-UNDECLARED-TRANSITION (jsl-decl-name d)))
                           0)))
                   (store! n (+ (load n) 1))
@@ -1091,6 +1161,7 @@
   (let [fun (jsl-decl-fun d)
         before (n-count)
         p (jl)]
+    (jl-unpin-binds!)
     (al-clear! [JslBind] (field p binds))
     (store! (field p decl) d)
     (store! (field p fun) fun)
@@ -1120,8 +1191,8 @@
           ; `g-verify` reports VERR-LEAK. corpus.coil's memory fixtures all end this way for the
           ; same reason.
           ret (if (= (jl-mem-raw) NO-NODE)
-                  (n-new2 OP-RETURN 0 (jl-ctrl) v)
-                  (n-new3 OP-RETURN 0 (jl-ctrl) v (jl-mem-raw)))]
+                  (n-new2 (Return) (jl-ctrl) v)
+                  (n-new3 (Return) (jl-ctrl) v (jl-mem-raw)))]
       (n-fun-close! fun ret)
       (if (jsl-decl-cold? d) (n-mark-cold! (n-fun-entry fun)) 0)
       ; A failure recorded DURING lowering (a loop that cannot iterate or cannot exit) has to be
@@ -1318,5 +1389,5 @@
                       (store! i (+ (load i) 1))
                       0)))
           (store! (index p n)
-                  (n-new1 OP-ARG (t-mem-alias JS-PROPERTY-ALIAS (t-undef)) ctrl))
+                  (n-new1 (Arg (t-mem-alias JS-PROPERTY-ALIAS (t-undef))) ctrl))
           (n-call! ctrl (jsl-decl-fun d) (slice-new [i64] p (+ n 1)))))))

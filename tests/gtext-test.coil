@@ -126,46 +126,46 @@
 (deftest dynamic_representation_nodes_round_trip_exactly
   (let [ba (stack (array u8 8192)) bb (stack (array u8 8192))]
     (graph-reset! 1)
-    (let [a (n-new1 OP-ARG (t-dyn) (g-start))
-          b (n-new2 OP-BOX 0 NO-NODE a)
-          u (n-new2 OP-UNBOX (t-int) NO-NODE b)
-          q (n-new2 OP-TYPETEST (t-int) NO-NODE a)
-          r1 (n-new2 OP-RETURN 0 (g-start) u)
-          r2 (n-new2 OP-RETURN 0 (g-start) q)]
+    (let [a (n-new1 (Arg (t-dyn)) (g-start))
+          b (n-new2 (Box 0) NO-NODE a)
+          u (n-new2 (Unbox (t-int)) NO-NODE b)
+          q (n-new2 (TypeTest (t-int)) NO-NODE a)
+          r1 (n-new2 (Return) (g-start) u)
+          r2 (n-new2 (Return) (g-start) q)]
       (n-add-def! (g-stop) r1) (n-add-def! (g-stop) r2) (g-analyze!)
       (assert (= (g-verify) 0))
-      (assert (= (count-live-op OP-BOX) 1))
-      (assert (= (count-live-op OP-UNBOX) 1))
-      (assert (= (count-live-op OP-TYPETEST) 1))
+      (assert (= (count-live-op OPTAG-BOX) 1))
+      (assert (= (count-live-op OPTAG-UNBOX) 1))
+      (assert (= (count-live-op OPTAG-TYPETEST) 1))
       (let [ta (g-render (cast (ptr i8) ba) 8192)]
         (assert (= (g-try-parse ta) GERR-NONE))
         (let [tb (g-render (cast (ptr i8) bb) 8192)] (assert (str-eq ta tb)))
         (assert (= (g-verify) 0))
-        (assert (= (count-live-op OP-BOX) 1))
-        (assert (= (count-live-op OP-UNBOX) 1))
-        (assert (= (count-live-op OP-TYPETEST) 1))))))
+        (assert (= (count-live-op OPTAG-BOX) 1))
+        (assert (= (count-live-op OPTAG-UNBOX) 1))
+        (assert (= (count-live-op OPTAG-TYPETEST) 1))))))
 
 (deftest function_and_closure_nodes_round_trip_exactly
   (let [ba (stack (array u8 8192)) bb (stack (array u8 8192))]
     (graph-reset! 1)
     (let [fun (n-fun-open! 3) cap (n-parm! fun 0) arg (n-parm! fun 1)
-          body (n-new2 OP-RETURN 0 (n-fun-entry fun)
-                  (n-peephole (n-new3 OP-ADD 0 NO-NODE cap arg)))]
+          body (n-new2 (Return) (n-fun-entry fun)
+                  (n-peephole (n-new3 (Add) NO-NODE cap arg)))]
       (n-fun-close! fun body)
       (let [clos (n-closure1! fun (n-const (t-int-con 40)))
             call (n-call1! (g-start) clos (n-const (t-int-con 2)))
-            ret (n-new2 OP-RETURN 0 (call-end call) (call-value call))]
+            ret (n-new2 (Return) (call-end call) (call-value call))]
         (n-add-def! (g-stop) ret) (iterate!)
         (assert (= (g-verify) 0))
         (let [ta (g-render (cast (ptr i8) ba) 8192)]
           (assert (= (g-try-parse ta) GERR-NONE))
           (let [tb (g-render (cast (ptr i8) bb) 8192)] (assert (str-eq ta tb)))
           (assert (= (g-verify) 0))
-          (assert (= (count-live-op OP-FUN) 1))
-          (assert (= (count-live-op OP-FUNSTART) 1))
-          (assert (= (count-live-op OP-CLOSURE) 1))
-          (assert (= (count-live-op OP-CALL) 1))
-          (assert (= (count-live-op OP-CALLEND) 1)))))))
+          (assert (= (count-live-op OPTAG-FUN) 1))
+          (assert (= (count-live-op OPTAG-FUNSTART) 1))
+          (assert (= (count-live-op OPTAG-CLOSURE) 1))
+          (assert (= (count-live-op OPTAG-CALL) 1))
+          (assert (= (count-live-op OPTAG-CALLEND) 1)))))))
 
 (defn show-gerr [] (-> i64)
   (let [w (stderr)]
@@ -197,7 +197,7 @@
   (let [n (n-count) (mut i) 0 (mut k) 0]
     (loop
       (if (>= (load i) n) (break)
-        (do (if (and (not (n-dead? (load i))) (= (n-op (load i)) op))
+        (do (if (and (not (n-dead? (load i))) (= (op-encode-tag (n-op (load i))) op))
                 (store! k (+ (load k) 1))
               0)
             (store! i (+ (load i) 1))
@@ -208,7 +208,7 @@
   (let [n (n-count) (mut i) 0 (mut found) NO-NODE]
     (loop
       (if (>= (load i) n) (break)
-        (do (if (and (and (not (n-dead? (load i))) (= (n-op (load i)) op))
+        (do (if (and (and (not (n-dead? (load i))) (= (op-encode-tag (n-op (load i))) op))
                      (= (load found) NO-NODE))
                 (store! found (load i))
               0)
@@ -216,7 +216,7 @@
             0)))
     (if (= (load found) NO-NODE)
         (do (gfail-head "no live node with the op this test is about")
-            (ps (stderr) (op-name op)) (ps (stderr) "\n")
+            (ps (stderr) (op-tag-name op)) (ps (stderr) "\n")
             (gdump) (abort) NO-NODE)
       (load found))))
 
@@ -227,8 +227,8 @@
   (let [n (n-count) (mut i) 0 (mut acc) 1]
     (loop
       (if (>= (load i) n) (break)
-        (do (if (and (not (n-dead? (load i))) (= (n-op (load i)) OP-ARG))
-                (store! acc (+ (* (load acc) 1000003) (n-aux (load i))))
+        (do (if (and (not (n-dead? (load i))) (op-is? (load i) Arg [_]))
+                (store! acc (+ (* (load acc) 1000003) (n-arg-type (load i))))
               0)
             (store! i (+ (load i) 1))
             0)))
@@ -461,15 +461,15 @@
 ;; `Arg`, `Const`, one binary node, a `Return`. Built with `n-new`/`n-add-def!` only: nothing is
 ;; peepholed and nothing is analysed, so the graph is exactly what the arguments say it is.
 ;; Returns the binary node, so the type variant can move its type without touching anything else.
-(defn build-arith! [(op i64) (argty i64) (conty i64)
+(defn build-arith! [(op Op) (argty i64) (conty i64)
                     (arg-first bool) (same-node bool) (dup-stop bool)] (-> i64)
   (graph-reset! 1)
-  (let [x (n-new1 OP-ARG   argty (g-start))
-        z (n-new1 OP-CONST conty (g-start))
+  (let [x (n-new1 (Arg argty) (g-start))
+        z (n-new1 (Const conty) (g-start))
         other (if same-node x z)
-        b (if arg-first (n-new3 op 0 NO-NODE x other)
-                        (n-new3 op 0 NO-NODE other x))
-        ret (n-new2 OP-RETURN 0 (g-start) b)]
+        b (if arg-first (n-new3 op NO-NODE x other)
+                        (n-new3 op NO-NODE other x))
+        ret (n-new2 (Return) (g-start) b)]
     (n-add-def! (g-stop) ret)
     (if dup-stop (n-add-def! (g-stop) ret) 0)
     b))
@@ -477,18 +477,18 @@
 ;; An If with ONE projection, so the pair differs only in the printed slot index.
 (defn build-if! [(slot i64)] (-> i64)
   (graph-reset! 1)
-  (let [x   (n-new1 OP-ARG (t-dyn) (g-start))
-        iff (n-new2 OP-IF 0 (g-start) x)
-        pr  (n-new1 OP-CPROJ slot iff)
-        ret (n-new2 OP-RETURN 0 pr x)]
+  (let [x   (n-new1 (Arg (t-dyn)) (g-start))
+        iff (n-new2 (If) (g-start) x)
+        pr  (n-new1 (CProj slot) iff)
+        ret (n-new2 (Return) pr x)]
     (n-add-def! (g-stop) ret)
     pr))
 
 (defn build-cast! [(target i64)] (-> i64)
   (graph-reset! 1)
-  (let [x (n-new1 OP-ARG (t-dyn) (g-start))
-        c (n-new2 OP-CAST target (g-start) x)
-        ret (n-new2 OP-RETURN 0 (g-start) c)]
+  (let [x (n-new1 (Arg (t-dyn)) (g-start))
+        c (n-new2 (Cast target) (g-start) x)
+        ret (n-new2 (Return) (g-start) c)]
     (n-add-def! (g-stop) ret)
     c))
 
@@ -496,28 +496,28 @@
 ;; paths with. Deleting it deletes the declaration a guard rests on.
 (defn build-phi! [(declared i64)] (-> i64)
   (graph-reset! 1)
-  (let [x   (n-new1 OP-ARG (t-dyn) (g-start))
-        iff (n-new2 OP-IF 0 (g-start) x)
-        t   (n-new1 OP-CPROJ 0 iff)
-        f   (n-new1 OP-CPROJ 1 iff)
-        r   (n-new OP-REGION 0)]
+  (let [x   (n-new1 (Arg (t-dyn)) (g-start))
+        iff (n-new2 (If) (g-start) x)
+        t   (n-new1 (CProj 0) iff)
+        f   (n-new1 (CProj 1) iff)
+        r   (n-new (Region))]
     (n-add-def! r NO-NODE) (n-add-def! r t) (n-add-def! r f)
-    (let [ph (n-new OP-PHI declared)]
+    (let [ph (n-new (Phi declared))]
       (n-add-def! ph r) (n-add-def! ph x) (n-add-def! ph x)
-      (let [ret (n-new2 OP-RETURN 0 r ph)]
+      (let [ret (n-new2 (Return) r ph)]
         (n-add-def! (g-stop) ret)
         ph))))
 
 (defn variant-build! [(v i64)] (-> i64)
   (case v
-    V-BASE      (build-arith! OP-ADD (t-int) (t-int-con 0) true  false false)
-    V-OP        (build-arith! OP-SUB (t-int) (t-int-con 0) true  false false)
-    V-IN-NODE   (build-arith! OP-ADD (t-int) (t-int-con 0) true  true  false)
-    V-IN-ORDER  (build-arith! OP-ADD (t-int) (t-int-con 0) false false false)
-    V-ARITY     (build-arith! OP-ADD (t-int) (t-int-con 0) true  false true)
-    V-CONST-AUX (build-arith! OP-ADD (t-int) (t-int-con 1) true  false false)
-    V-ARG-AUX   (build-arith! OP-ADD (t-dyn) (t-int-con 0) true  false false)
-    V-TYPE      (let [b (build-arith! OP-ADD (t-int) (t-int-con 0) true false false)]
+    V-BASE      (build-arith! (Add) (t-int) (t-int-con 0) true  false false)
+    V-OP        (build-arith! (Sub) (t-int) (t-int-con 0) true  false false)
+    V-IN-NODE   (build-arith! (Add) (t-int) (t-int-con 0) true  true  false)
+    V-IN-ORDER  (build-arith! (Add) (t-int) (t-int-con 0) false false false)
+    V-ARITY     (build-arith! (Add) (t-int) (t-int-con 0) true  false true)
+    V-CONST-AUX (build-arith! (Add) (t-int) (t-int-con 1) true  false false)
+    V-ARG-AUX   (build-arith! (Add) (t-dyn) (t-int-con 0) true  false false)
+    V-TYPE      (let [b (build-arith! (Add) (t-int) (t-int-con 0) true false false)]
                   (n-set-ty! b (t-int)) b)
     V-SLOT-0    (build-if! 0)
     V-SLOT-1    (build-if! 1)
@@ -781,13 +781,13 @@
     (if (= (g-try-parse (raw-add-text)) GERR-NONE) 0
       (do (gfail-head "the raw Add text") (show-gerr) (abort) 0))
     ; the Add survived, and its edges are the ones the text names
-    (assert (= (count-live-op OP-ADD) 1))
-    (let [a (find-live-op OP-ADD)]
+    (assert (= (count-live-op OPTAG-ADD) 1))
+    (let [a (find-live-op OPTAG-ADD)]
       (assert (= (n-nins a) 3))
       (assert (= (n-in a 0) NO-NODE))                    ; the `_` control anchor, printed and read
-      (assert (= (n-op (n-in a 1)) OP-ARG))
-      (assert (= (n-op (n-in a 2)) OP-CONST))
-      (assert (= (n-aux (n-in a 2)) (t-int-con 0)))
+      (assert (op-is? (n-in a 1) Arg [_]))
+      (assert (op-is? (n-in a 2) Const [_]))
+      (assert (= (n-const-type (n-in a 2)) (t-int-con 0)))
       ; and its type is the one the text restored, not one recomputed from ANY
       (assert (= (n-ty a) (n-compute a))))
     ; structurally sound, which is what says the restored types are the ones `compute` produces
@@ -801,11 +801,11 @@
     ; NON-VACUITY, measured: the same program built EAGERLY loses the Add, which is what says the
     ; peephole this text survives is a real one that really fires.
     (graph-reset! 1)
-    (let [x (n-peephole (n-new1 OP-ARG (t-int) (g-start)))
+    (let [x (n-peephole (n-new1 (Arg (t-int)) (g-start)))
           z (n-const (t-int-con 0))
-          a (n-peephole (n-new3 OP-ADD 0 NO-NODE x z))]
+          a (n-peephole (n-new3 (Add) NO-NODE x z))]
       (assert (= a x))                       ; add-idealize handed back the argument itself
-      (assert (= (count-live-op OP-ADD) 0)))
+      (assert (= (count-live-op OPTAG-ADD) 0)))
     (ps w "  the Add is kept by the parser and deleted by the eager builder\n")
     0))
 
@@ -824,7 +824,7 @@
   (let [n (n-count) (mut i) 0 (mut bad) 0]
     (loop
       (if (>= (load i) n) (break)
-        (do (if (and (not (n-dead? (load i))) (= (n-op (load i)) OP-PHI))
+        (do (if (and (not (n-dead? (load i))) (op-is? (load i) Phi [_]))
                 (let [r (n-in (load i) 0)]
                   (if (and (!= r NO-NODE) (op-merge? (n-op r)))
                       (if (= (n-nins (load i)) (n-nins r)) 0
@@ -842,7 +842,7 @@
         (let [n (n-count) (mut i) 0]
           (loop
             (if (>= (load i) n) (break)
-              (do (if (and (not (n-dead? (load i))) (= (n-op (load i)) OP-PHI))
+              (do (if (and (not (n-dead? (load i))) (op-is? (load i) Phi [_]))
                       (let [r (n-in (load i) 0)]
                         (fmt (stderr) "    n{d} has {d} inputs, its input 0 is n{d}\n"
                              (load i) (n-nins (load i)) r)
@@ -851,7 +851,7 @@
                   (store! i (+ (load i) 1))
                   0))))
         (gdump) (abort) 0))
-  (count-live-op OP-PHI))
+  (count-live-op OPTAG-PHI))
 
 ;; Every Loop has exactly three inputs, slot 0 null, the ENTRY in slot 1 and the BACK EDGE in slot
 ;; 2. The slot claim is read through the dominator depths rather than restated as a definition:
@@ -862,7 +862,7 @@
   (let [n (n-count) (mut i) 0 (mut loops) 0]
     (loop
       (if (>= (load i) n) (break)
-        (do (if (and (not (n-dead? (load i))) (= (n-op (load i)) OP-LOOP))
+        (do (if (and (not (n-dead? (load i))) (op-is? (load i) Loop []))
                 (let [lp (load i)]
                   (if (= (n-nins lp) 3) 0
                     (do (gfail-head label)

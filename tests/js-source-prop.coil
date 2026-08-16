@@ -26,8 +26,12 @@
 (import "jsstring" :use *)
 (import "frontendnative" :use *)
 (import "frontendnativegraph" :use *)
+(import "oparbitrary" :use *)
+(import "jstemplates" :use *)
 (import "coil.assert" :use *)
 (import "coil.prop" :use *)
+(import "coil.derive" :use *)
+(import "coil.arraylist" :use *)
 (import "coil.io" :use *)
 (import "coil.fmt" :use *)
 (import "coil.slice" :use *)
@@ -36,55 +40,15 @@
 (import "coil.str" :use *)
 
 (const JS-BUDGET i64 100000)
-;; Eight statements keeps the emitted source well inside the buffer and the case fast.
-(const JS-MAX-OPS i64 8)
 
-;; ONLY `+` AND `-`, and the omission is the whole reason this property can compare anything.
-;; JavaScript's `&`, `|` and `^` are int32 operators: they run ToInt32 on both operands and yield a
-;; signed 32-bit result. The IR's bitwise nodes do not. Generating them would produce a disagreement
-;; on every wide value and report the language's own semantics as a compiler bug.
-(defn js-op-add? [(b i64)] (-> bool) (= (% b 2) 0))
+;; The fuzzer mutates real payload-bearing opcodes.  Adding a variant to `Op` automatically makes
+;; it part of this input space; the lowering below decides whether it has a JavaScript expression
+;; spelling with semantics shared by the direct-IR oracle.  The impl itself lives in
+;; `src/op_arbitrary.coil` because `tests/backend-parity-prop.coil` generates `Op` too.
 
-;; Does this step use a fresh constant, or an earlier variable?
-(defn js-uses-const? [(b i64)] (-> bool) (= (% (/ b 4) 2) 0))
-(defn js-const-of [(b i64)] (-> i64) (+ 1 (% (/ b 8) 7)))
-(defn js-var-of [(b i64) (n i64)] (-> i64) (% (/ b 8) n))
 
-(defn js-limit [(ops (slice u8))] (-> i64)
-  (if (> (slice-len ops) JS-MAX-OPS) JS-MAX-OPS (slice-len ops)))
 
-;; ---------------------------------------------------------------------------
-;; Backend 1: TypeScript source
-;; ---------------------------------------------------------------------------
-(defn lift-js! [(ops (slice u8)) (buf (ptr i8)) (cap i64)] (-> (slice u8))
-  (let [fb (stack FixBuf)
-        w (stack Writer)]
-    (store! (field fb data) buf)
-    (store! (field fb cap) cap)
-    (store! (field fb len) 0)
-    (fixed-buffer-writer w fb)
-    (ps w "function main(n: number): number {\n")
-    ;; v0 seeds from the parameter so the argument is always live.
-    (ps w "  let v0 = n + 3;\n")
-    (let [(mut k) 0
-          limit (js-limit ops)]
-      (loop (if (>= (load k) limit) (break)
-              (let [b (cast i64 (slice-get ops (load k)))
-                    cur (+ (load k) 1)]
-                (fmt w "  let v{d} = v{d} " cur (load k))
-                (ps w (if (js-op-add? b) "+ " "- "))
-                (if (js-uses-const? b)
-                    (fmt w "{d};\n" (js-const-of b))
-                  (fmt w "v{d};\n" (js-var-of b cur)))
-                (store! k (+ (load k) 1))
-                0)))
-      (fmt w "  return v{d};\n" (js-limit ops))
-      (ps w "}\n"))
-    (let [n (load (field fb len))]
-      (if (>= n cap)
-          (do (fmt (stderr) "lift-js!: source did not fit the buffer\n") (abort) 0)
-          0)
-      (slice-new [u8] (cast (ptr u8) buf) n))))
+
 
 ;; ---------------------------------------------------------------------------
 ;; Backend 2: the same program, straight to IR
@@ -92,8 +56,8 @@
 (defn build-ir! [(ops (slice u8))] (-> i64)
   (let [pool (stack (array i64 32))
         p (cast (ptr i64) pool)
-        a0 (n-new1 OP-ARG (t-int) (g-start))
-        v0 (n-new3 OP-ADD 0 NO-NODE a0 (n-new1 OP-CONST (t-int-con 3) (g-start)))]
+        a0 (n-new1 (Arg (t-int)) (g-start))
+        v0 (n-new3 (Add) NO-NODE a0 (n-new1 (Const (t-int-con 3)) (g-start)))]
     (store! (index p 0) v0)
     (let [(mut n) 1
           (mut cur) v0
@@ -102,14 +66,53 @@
       (loop (if (>= (load k) limit) (break)
               (let [b (cast i64 (slice-get ops (load k)))
                     other (if (js-uses-const? b)
-                              (n-new1 OP-CONST (t-int-con (js-const-of b)) (g-start))
+                              (n-new1 (Const (t-int-con (js-const-of b))) (g-start))
                             (load (index p (js-var-of b (load n)))))]
-                (store! cur (n-new3 (if (js-op-add? b) OP-ADD OP-SUB) 0 NO-NODE (load cur) other))
+                (store! cur (n-new3 (if (js-op-add? b) (Add) (Sub)) NO-NODE (load cur) other))
                 (store! (index p (load n)) (load cur))
                 (store! n (+ (load n) 1))
                 (store! k (+ (load k) 1))
                 0)))
-      (let [ret (n-new2 OP-RETURN 0 (g-start) (load cur))]
+      (let [ret (n-new2 (Return) (g-start) (load cur))]
+        (n-add-def! (g-stop) ret)
+        (g-analyze!)
+        ret))))
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+(defn build-ir-ops! [(ops (ArrayList Op)) (choices (slice u8))] (-> i64)
+  (let [pool (stack (array i64 32))
+        p (cast (ptr i64) pool)
+        a0 (n-new1 (Arg (t-int)) (g-start))
+        v0 (n-new3 (Add) NO-NODE a0 (n-new1 (Const (t-int-con 3)) (g-start)))]
+    (store! (index p 0) v0)
+    (let [(mut n) 1
+          (mut cur) v0
+          (mut k) 0
+          limit (js-op-list-limit ops)]
+      (loop (if (>= (load k) limit) (break)
+              (let [b (js-choice choices (load k))
+                    other (if (or (js-mul-op? (al-get [Op] ops (load k))) (js-uses-const? b))
+                              (n-new1 (Const (t-int-con (js-const-of b))) (g-start))
+                            (load (index p (js-var-of b (load n)))))]
+                (store! cur (n-new3 (js-exact-op (al-get [Op] ops (load k)))
+                                    NO-NODE (load cur) other))
+                (store! (index p (load n)) (load cur))
+                (store! n (+ (load n) 1))
+                (store! k (+ (load k) 1))
+                0)))
+      (let [ret (n-new2 (Return) (g-start) (load cur))]
         (n-add-def! (g-stop) ret)
         (g-analyze!)
         ret))))
@@ -124,13 +127,14 @@
   (jss-reset!)
   0)
 
-;; The graph's single OP-ARG node, whichever backend produced the graph.
+;; The graph's single OPTAG-ARG node, whichever backend produced the graph.
 (defn js-find-arg [] (-> i64)
   (let [n (n-count)
         (mut i) 0
         (mut found) NO-NODE]
     (loop (if (>= (load i) n) (break)
-            (do (if (and (not (n-dead? (load i))) (= (n-op (load i)) OP-ARG))
+            (do (if (and (and (not (n-dead? (load i))) (op-is? (load i) Arg [_]))
+                         (not (ty-mem? (n-arg-type (load i)))))
                     (do (store! found (load i)) 0)
                     0)
                 (store! i (+ (load i) 1))
@@ -138,13 +142,54 @@
     (load found)))
 
 (defn js-eval-current [(arg i64)] (-> i64)
+  ;; The verdict, not just the assertion. A property runs hundreds of cases in one process, so a
+  ;; failure here has to say WHICH rule broke or the only way to find out is to bisect by hand.
+  (if (!= (g-verify) 0)
+      (do (g-verify-print (stderr))
+          (let [bad (g-verify-node)]
+            (fmt (stderr) "\n  n{d}:{s} stored=" bad (op-name (n-op bad)))
+            (ty-print (stderr) (n-ty bad))
+            (ps (stderr) " computed=")
+            (ty-print (stderr) (n-compute bad))
+            (let [(mut k) 0]
+              (loop (if (>= (load k) (n-nins bad)) (break)
+                      (do (let [in (n-in bad (load k))]
+                            (fmt (stderr) "\n    in[{d}]=n{d}:{s} " (load k) in
+                                 (if (= in NO-NODE) "NONE" (op-name (n-op in))))
+                            (if (= in NO-NODE) 0 (ty-print (stderr) (n-ty in))))
+                          (store! k (+ (load k) 1))
+                          0))))
+            (ps (stderr) "\n"))
+          0)
+      0)
   (assert (= (g-verify) 0))
   (ev-reset!)
+  ;; Frontend graphs introduce memory Args as soon as control flow, objects or arrays appear.
+  ;; Give every graph-level input a valid inhabitant first, then override the source parameter with
+  ;; the exact value being compared against Node.
+  (ev-bind-args! arg)
   (let [a (js-find-arg)]
     (if (!= a NO-NODE) (do (ev-bind! a (RInt arg)) 0) 0))
-  (assert (= (ev-run-nobind JS-BUDGET) EV-OK))
-  (assert (= (rt-tag (ev-result)) RT-INT))
-  (rt-payload (ev-result)))
+  (let [status (ev-run-nobind JS-BUDGET)]
+    (if (= status EV-OK) 0
+      (do (ps (stderr) "JavaScript property evaluator stopped: ")
+          (ps (stderr) (ev-status-name status))
+          (ps (stderr) "\n")
+          (g-print-flat (stderr))
+          (abort) 0)))
+  ;; AN INTEGRAL ANSWER MAY ARRIVE FLOAT-TAGGED. A JavaScript number is a double, and now that the
+  ;; arithmetic operators are `lib/`'s their result comes back through the tagged domain the DSL
+  ;; speaks -- so `7 + 3` can be RT-FLT holding exactly 10. Demanding RT-INT rejected a correct
+  ;; program, which is the one thing a differential oracle must not do; a fractional result is
+  ;; still a real mismatch and stays loud.
+  (cond (= (rt-tag (ev-result)) RT-INT) (rt-payload (ev-result))
+        (= (rt-tag (ev-result)) RT-FLT)
+          (let [value (bits-f64 (rt-payload (ev-result)))
+                as-int (cast i64 value)]
+            (if (= (f64-bits (cast f64 as-int)) (rt-payload (ev-result)))
+                as-int
+                (do (ps (stderr) "js-eval-current: a non-integral result\n") (assert false) 0)))
+        :else (do (ps (stderr) "js-eval-current: neither an int nor a float\n") (assert false) 0)))
 
 (defn eval-via-ir [(ops (slice u8)) (arg i64)] (-> i64)
   (js-reset-world!)
@@ -161,6 +206,548 @@
       (let [r (js-eval-current arg)]
         (fe-native-free! (mut fe))
         r))))
+
+(defn eval-via-ir-ops [(ops (ArrayList Op)) (choices (slice u8)) (arg i64)] (-> i64)
+  (js-reset-world!)
+  (build-ir-ops! ops choices)
+  (js-eval-current arg))
+
+(defn eval-via-source-ops [(ops (ArrayList Op)) (choices (slice u8)) (arg i64)] (-> i64)
+  (let [buf (stack (array i8 8192))
+        source (lift-js-ops! ops choices (cast (ptr i8) buf) 8192)]
+    (js-reset-world!)
+    (let [(mut fe) (fe-native-new source)]
+      (assert (= (fe-native-index! (mut fe)) FE-OK))
+      (frontend-native-build! (mut fe) 6201 true)
+      (let [r (js-eval-current arg)]
+        (fe-native-free! (mut fe))
+        r))))
+
+(defn eval-via-source-text [(source (slice u8)) (arg i64)] (-> i64)
+  (js-reset-world!)
+  (let [(mut fe) (fe-native-new source)]
+    (assert (= (fe-native-index! (mut fe)) FE-OK))
+    (frontend-native-build! (mut fe) 6201 true)
+    (let [r (js-eval-current arg)]
+      (fe-native-free! (mut fe))
+      r)))
+
+;; THE BRIDGE REPORTS EVERY SYNTAX IT DOES NOT ENUMERATE AS KIND 0
+;; (native/typescript-go-bridge/main.go, the `default` of the kind switch), and until this was
+;; fixed nothing rejected it: `x as number` segfaulted the builder, the spread element in
+;; `[...a, 3]` was DROPPED so it evaluated to length 2 where node says 3, and `for...of` produced a
+;; graph whose control was stuck at the Start node. All three now abort with a message naming the
+;; construct -- see docs/FUZZ-FINDINGS.md.
+;;
+;; THOSE THREE CANNOT BE PINNED BY A DEFTEST HERE. The check would have to be "this build kills the
+;; process", which means running it in a fork, and this process holds a live Go runtime for the
+;; TypeScript bridge -- forking it and then calling back into it deadlocks. What CAN be pinned is
+;; the case the fix had to be careful about, and it is the one a blanket kind-0 rejection would
+;; have broken: an elision is ALSO bridge kind 0, separated from a spread only by having an empty
+;; extent.
+(deftest array_holes_still_compile
+  (let [source "function main(n: number): number {
+  let a = [n, , 3];
+  return (a.length + n) | 0;
+}
+"]
+    (assert (= (eval-via-source-text source 10) 13))
+    0))
+
+;; A LOOP PHI'S TYPE IS AN INPUT TO ITS OWN COMPUTATION -- `ty-widen-from` takes its fuel from a
+;; counter inside the phi's current type -- and `g-analyze!` re-queued only a changed node's OUTS.
+;; So the phi advanced its widening one step per visit and the pass returned with `n-compute` still
+;; disagreeing with `n-ty`. The type left behind was NARROWER than the truth, which is the
+;; miscompile direction, and `g-verify` was the only thing that noticed.
+;;
+;; `eval-via-source-text` asserts `(= (g-verify) 0)`, so each of these three fails outright without
+;; the fix. They are three symptoms of the one cause: a loop-carried local updated through `| 0`,
+;; an array element read in a loop, and a field of an object allocated in the loop. `z += d` in
+;; place of `z = (z + d) | 0` passed even when broken, which is how narrow the trigger was.
+(deftest loop_carried_int32_local_reaches_its_type_fixpoint
+  (assert (= (eval-via-source-text "function main(n: number): number {
+  let acc = n | 0; let z = 0; let d = 0;
+  while (d < 2) { z = (z + d) | 0; d++; }
+  return (acc + z) | 0;
+}
+" 10) 11))
+  (assert (= (eval-via-source-text "function main(n: number): number {
+  let a = [n, 2, 3]; let s = 0;
+  for (let i = 0; i < a.length; i++) { s = (s + a[i]) | 0; }
+  return s;
+}
+" 10) 15))
+  (assert (= (eval-via-source-text "function main(n: number): number {
+  let s = 0;
+  for (let i = 0; i < 3; i++) { let o = {x: i, y: n}; s = (s + o.x + o.y) | 0; }
+  return s | 0;
+}
+" 10) 33))
+  0)
+
+;; `fng-do-loop` was a copy of `fng-loop` that had missed two of its fixes.
+;;
+;; It did not reset `index` before building the carried-symbol phis, so `index` still held the
+;; length of the ACTIVE MEMORY list -- which is why the failure needed an allocation before the
+;; loop to appear at all, and why plain `while` and `for` were fine. With any object allocated
+;; first, the carried phis were never created and the reconcile pass indexed an empty list:
+;; `n-in: input index out of range`, or a segfault once the object was wide.
+;;
+;; And its memory phis carried a `(t-undef)` content type, which `fng-loop`'s comment at the
+;; matching site describes as telling inference the loop-carried memory holds undefined, letting
+;; the fold pass replace every load through it with a constant. The last two cases here are that
+;; half: a field written in the body, and a field read in the body.
+(deftest do_while_after_an_allocation_builds_its_carried_phis
+  (assert (= (eval-via-source-text "function main(n: number): number {
+  let acc = n | 0;
+  { let o = {a: acc}; acc = o.a | 0; }
+  { let d = 0; do { acc = (acc + d) | 0; d++; } while (d < 1); }
+  return acc | 0;
+}
+" 10) 10))
+  (assert (= (eval-via-source-text "function main(n: number): number {
+  let acc = n | 0;
+  { let w = {a: acc, b: 1, c: 3, d: 4}; acc = (w.a + w.b + w.c + w.d) | 0; }
+  { let d = 0; do { acc = (acc + d) | 0; d++; } while (d < 3); }
+  return acc | 0;
+}
+" 10) 21))
+  (assert (= (eval-via-source-text "function main(n: number): number {
+  let acc = n | 0; let o = {a: 0}; let d = 0;
+  do { o.a = (o.a + d) | 0; d++; } while (d < 4);
+  return (acc + o.a) | 0;
+}
+" 10) 16))
+  (assert (= (eval-via-source-text "function main(n: number): number {
+  let acc = n | 0; let o = {a: 5}; let s = 0; let d = 0;
+  do { s = (s + o.a) | 0; d++; } while (d < 3);
+  return (acc + s) | 0;
+}
+" 10) 25))
+  0)
+
+;; EVERY `Math.*` CALL RETURNS A TAGGED VALUE -- `fng-math-call` ends in `n-to-number!` -- while
+;; inference reports the result as a plain number. Consumers that decided whether to unbox from the
+;; STATIC type therefore skipped the unbox, and consumers built while a value looked tagged were
+;; left holding an Unbox after analysis narrowed it. Three symptoms, one cause:
+;;
+;;   Math.trunc(x); i++         Add slot 1 <- ToNumber is tagged, needs raw-num
+;;   Math.trunc(x); if (true)   Unbox slot 1 <- Phi is raw-num, needs tagged
+;;   Math.trunc(x); if (false)  already fixed, above
+;;
+;; `fng-update-local` now asks `fng-machine-number-value?` -- does this value carry a raw machine
+;; number -- instead of asking what the source was declared to be, and `fng-merge-snapshots!` boxes
+;; a raw arm when the other arm is tagged so a phi has ONE representation.
+;; repros/truncate-then-increment-stays-tagged.js, repros/truncate-then-live-branch.js.
+(deftest a_builtin_result_meets_its_consumers_in_one_representation
+  (assert (= (eval-via-source-text "function main(n: number): number {
+  let acc = n | 0;
+  acc = Math.trunc(acc / 2);
+  { let i1 = acc; i1++; ++i1; i1--; --i1; acc = i1 + 3; }
+  return acc | 0;
+}
+" 7) 6))
+  (assert (= (eval-via-source-text "function main(n: number): number {
+  let acc = n | 0;
+  acc = Math.trunc(acc);
+  if (true) { acc += 1000; }
+  return acc | 0;
+}
+" 7) 1007))
+  ;; Two raw arms must stay raw -- a coercion applied unconditionally would box ordinary
+  ;; arithmetic and this is what notices.
+  (assert (= (eval-via-source-text "function main(n: number): number {
+  let acc = n | 0;
+  if (acc > 3) { acc = (acc + 1) | 0; } else { acc = (acc - 1) | 0; }
+  return acc | 0;
+}
+" 7) 8))
+  0)
+
+;; TWO SHAPES THAT SHARE A FIELD NAME AT THE SAME OFFSET SHARE AN ENTRY, because
+;; `fng-unique-field-index` accepts any field of the right name whose local index matches and
+;; returns the FIRST owner. That is sound for the load and the store -- they need the alias and the
+;; offset -- and it is a lie about which object this is, so it may not be asserted. It was, as an
+;; `Unbox` target and then as a `Cast` target, and the evaluator checks both.
+;;
+;; Renaming either field makes it pass, which is how it was localised; both spellings are here so a
+;; regression cannot hide behind the name.
+;; repros/nested-object-write-after-an-object-literal.js.
+(deftest a_shared_field_name_does_not_assert_the_wrong_shape
+  (assert (= (eval-via-source-text "function main(n: number): number {
+  let acc = n | 0;
+  { let o0 = {x: acc, y: 2}; acc = (o0.x + o0.y) | 0; }
+  { let o1 = {inner: {x: acc}}; o1.inner.x = (o1.inner.x + 3) | 0; acc = o1.inner.x | 0; }
+  return acc | 0;
+}
+" 7) 12))
+  (assert (= (eval-via-source-text "function main(n: number): number {
+  let acc = n | 0;
+  { let o0 = {x: acc, y: 2}; acc = (o0.x + o0.y) | 0; }
+  { let o1 = {inner: {q: acc}}; o1.inner.q = (o1.inner.q + 3) | 0; acc = o1.inner.q | 0; }
+  return acc | 0;
+}
+" 7) 12))
+  0)
+
+;; UNARY `+` IS ToNumber, and this returned its operand unchanged -- right for a number, wrong for
+;; everything else. `fng-number-value` was not enough either: `fng-needs-to-number?` asks whether
+;; the value is `dyn`, and a string is not `dyn`. The operand is boxed before `ToNumberValue` for
+;; the same reason `Number(x)` boxes: reaching the macro with an unboxed operand left the string's
+;; node collected out from under it. repros/unary-plus-does-not-coerce.js.
+(deftest unary_plus_coerces_a_string
+  (assert (= (eval-via-source-text "function main(n: number): number {
+  let acc = n | 0;
+  acc = (+String(acc) + 2) | 0;
+  return acc | 0;
+}
+" 7) 9))
+  (assert (= (eval-via-source-text "function main(n: number): number {
+  let acc = n | 0;
+  { let s = \"5\"; acc = (+s + 2) | 0; }
+  return acc | 0;
+}
+" 7) 7))
+  ;; `+` on a number stays free.
+  (assert (= (eval-via-source-text "function main(n: number): number {
+  let acc = n | 0;
+  acc = (+acc + 2) | 0;
+  return acc | 0;
+}
+" 7) 9))
+  0)
+
+;; `unshift` NEVER TERMINATED, at any length including zero: its write-back loop stored at `i + 1`,
+;; which reaches the end and EXTENDS the receiver, and the loop's bound followed the growing array.
+;; The bound now comes from the copy, which is written once and never grown.
+;; repros/array-unshift-does-not-terminate.js.
+(deftest array_unshift_terminates
+  (assert (= (eval-via-source-text "function main(n: number): number {
+  let acc = n | 0;
+  { let a: number[] = []; a.unshift(2); acc = (acc + a.length) | 0; }
+  return acc | 0;
+}
+" 7) 8))
+  (assert (= (eval-via-source-text "function main(n: number): number {
+  let acc = n | 0;
+  { let a: number[] = [1, 2]; a.unshift(3); acc = (acc + a[0] + a.length) | 0; }
+  return acc | 0;
+}
+" 7) 13))
+  0)
+
+;; `instanceof` AGAINST A USER CONSTRUCTOR, which is the path the crash fix had to leave alone.
+;;
+;; `x instanceof Object` corrupted the graph: no user constructor resolves, so the lowering fell
+;; back to passing the right operand as a VALUE, and `Object` has no value node here. NO-NODE
+;; reached the JSL layer and aborted inside the callee. The operand is checked at the source now.
+;;
+;; That refusal aborts, so it cannot be pinned here -- the check would have to be "this build kills
+;; the process", which needs a fork, and this process holds a live Go runtime. What CAN be pinned
+;; is the arm the fix must not have broken, and it is the one that matters: a constructor the
+;; frontend can resolve still lowers to `OrdinaryHasInstance` and still answers correctly.
+;; repros/open/instanceof-against-a-global.js.
+(deftest instanceof_against_a_resolvable_constructor_still_works
+  (assert (= (eval-via-source-text "function B(v) { this.v = v; }
+function main(n: number): number {
+  let acc = n | 0;
+  { let b = new B(1); acc += (b instanceof B) ? 2 : 9; }
+  return acc | 0;
+}
+" 7) 9))
+  0)
+
+;; `==` IS NOT `===` WITH BOXING.
+;;
+;; `7 == "7"` came out FALSE, in both operand orders, and `!=` was wrong with it. The strict
+;; lowering unboxes a tagged operand as a float on the evidence that the OTHER side is numeric --
+;; no evidence about the tagged one -- so a string's tagged word was read as a double and equalled
+;; nothing. A well-formed graph, no diagnostic, and an answer off by exactly the difference between
+;; the two arms. `fng-loose-equal` now routes anything not PROVABLY a pair of raw machine numbers
+;; to `LooseEqual` in lib/abstract/conversions.jsl.
+;;
+;; The last three cases are the falsification, and they matter more than the first four: a fix that
+;; coerced unconditionally would break strict equality, boolean-to-number comparison, and
+;; `null == undefined`, and all three pass here for the right reason rather than by luck.
+;; repros/loose-equality-number-to-string.js.
+(deftest loose_equality_coerces_a_string_to_a_number
+  (assert (= (eval-via-source-text "function main(n: number): number {
+  let acc = n | 0;
+  acc += (acc == String(acc)) ? 2 : 1;
+  return acc | 0;
+}
+" 7) 9))
+  (assert (= (eval-via-source-text "function main(n: number): number {
+  let acc = n | 0;
+  acc += (String(acc) == acc) ? 2 : 1;
+  return acc | 0;
+}
+" 7) 9))
+  ;; `!=` shares the lowering, so it shares the defect.
+  (assert (= (eval-via-source-text "function main(n: number): number {
+  let acc = n | 0;
+  acc += (acc != String(acc)) ? 2 : 1;
+  return acc | 0;
+}
+" 7) 8))
+  ;; Neither operand statically typed: the case a frontend-only fix cannot reach.
+  (assert (= (eval-via-source-text "function main(n: number): number {
+  let acc = n | 0;
+  { let a: any = acc; let b: any = String(acc); acc += (a == b) ? 2 : 1; }
+  return acc | 0;
+}
+" 7) 9))
+  (assert (= (eval-via-source-text "function main(n: number): number {
+  let acc = n | 0;
+  acc += (String(acc) === String(acc)) ? 2 : 1;
+  return acc | 0;
+}
+" 7) 9))
+  (assert (= (eval-via-source-text "function main(n: number): number {
+  let acc = n | 0;
+  { let b: any = true; acc += (b == 1) ? 2 : 1; }
+  return acc | 0;
+}
+" 7) 9))
+  (assert (= (eval-via-source-text "function main(n: number): number {
+  let acc = n | 0;
+  { let z: any = null; acc += (z == undefined) ? 2 : 1; }
+  return acc | 0;
+}
+" 7) 9))
+  0)
+
+;; A REST PARAMETER IS REFUSED BY NAME RATHER THAN SILENTLY BOUND TO NOTHING.
+;;
+;; Nothing here implements `...xs`, and nothing noticed: it was indexed as an ordinary parameter
+;; named `xs`, the call site passed it nothing, and every read came back undefined. `xs.length` was
+;; therefore `undefined`, and `undefined | 0` is 0 -- so `(...xs) => xs.length` returned zero for
+;; every call, with a well-formed graph and no diagnostic anywhere. A wrong answer nothing signals
+;; is the worst outcome available, and it is what the sweep in docs/SWEEP-CATALOGUE.md found first.
+;;
+;; THIS PINS THE REFUSAL, NOT THE FEATURE. Rest parameters are still unimplemented; the fix is that
+;; saying so is now distinguishable from computing zero. The second case is the falsification: the
+;; same function without the ellipsis must still index, or the check would pass by refusing
+;; everything. repros/open/rest-parameters-report-length-zero.js.
+(deftest a_rest_parameter_is_refused_rather_than_bound_to_nothing
+  (js-reset-world!)
+  (let [(mut fe) (fe-native-new "function main(n: number): number {
+  const f = (...xs: number[]): number => xs.length;
+  return (n + f(1, 2, 3)) | 0;
+}
+")]
+    (assert (!= (fe-native-index! (mut fe)) FE-OK))
+    (assert (= (load (field fe error-code)) FE-CODE-UNSUPPORTED-SYNTAX))
+    (fe-native-free! (mut fe)))
+  (js-reset-world!)
+  (let [(mut ok) (fe-native-new "function main(n: number): number {
+  const f = (a: number, b: number, c: number): number => 3;
+  return (n + f(1, 2, 3)) | 0;
+}
+")]
+    (assert (= (fe-native-index! (mut ok)) FE-OK))
+    (fe-native-free! (mut ok)))
+  0)
+
+;; A BUILTIN CALL FOLLOWED BY A PROVABLY-DEAD BRANCH ABORTED THE COMPILER.
+;;
+;;   graph corruption: n-in: input index out of range
+;;     phi-idealize -> n-peephole -> fng-analyze-fresh!
+;;
+;; The call lowers through a ToNumber diamond, so the dead branch holds a Region with a Phi.
+;; `region-idealize` drops proven-dead paths one at a time, and each removal takes the matching
+;; arm off every attached Phi -- so taking a two-input Region down to one left its phis holding
+;; only their control, and the next visit turned the Region into XCtrl and retargeted them onto
+;; it. `region-idealize` now collapses one step earlier, while each phi still has a value to
+;; reduce to. repros/dead-branch-after-builtin.js.
+;;
+;; The generator reaches this on its own: `Div` emits `Math.trunc(acc / c)` and `XCtrl` emits a
+;; `if (false)` branch, and `ops = ((Div) (XCtrl))` is what reported it.
+(deftest a_dead_branch_after_a_builtin_call_collapses_cleanly
+  (assert (= (eval-via-source-text "function main(n: number): number {
+  let acc = n | 0;
+  acc = Math.trunc(acc / 2);
+  if (false) { acc += 1000; }
+  return acc | 0;
+}
+" 7) 3))
+  ;; Any builtin, and an `else` arm as well as none -- the Region is two-armed either way.
+  (assert (= (eval-via-source-text "function main(n: number): number {
+  let acc = n | 0;
+  acc = Math.abs(acc);
+  if (false) { acc += 1000; } else { acc = (acc + 2) | 0; }
+  return acc | 0;
+}
+" 7) 9))
+  (assert (= (eval-via-source-text "function main(n: number): number {
+  let acc = n | 0;
+  acc = Math.max(acc, 1);
+  if (false) { acc += 1000; }
+  return acc | 0;
+}
+" 7) 7))
+  0)
+
+;; A PARAMETER LIVE ACROSS A SELF-RECURSIVE CALL CAME BACK UNBOUND.
+;;
+;;   evaluator: a Call did not match a closed-world function definition at n5
+;;
+;; n5 is the `Parm`, not a `Call`. `ev-call` saves the caller's parameter bindings before binding
+;; the callee's and restores them afterwards, but the save pushed an entry only for slots that
+;; actually have a `Parm` node while the restore indexed by PARAMETER SLOT. The frontend's calling
+;; convention leaves the leading env and receiver slots empty, so the two were always out of step:
+;; the restore read past the end of a one-element list and the parameter came back unbound.
+;;
+;; Only SELF-recursion could show it. A call to a different function restores that function's
+;; parameters and never touches the caller's own, and a parameter not live across the call is
+;; never read afterwards -- which is why tail position, a non-recursive call with a live parameter,
+;; and `return (1 + g(x - 1)) | 0` all passed. `tests/eval-test.coil` covers this for hand-built
+;; fib IR and passes for the same reason: a hand-built graph has no empty ABI slots.
+;; repros/parm-live-across-recursive-call.js.
+(deftest a_parameter_live_across_a_self_recursive_call_is_restored
+  (assert (= (eval-via-source-text "function g(x: number): number {
+  if (x <= 0) { return 0; }
+  return (x + g(x - 1)) | 0;
+}
+function main(n: number): number { return (n + g(1)) | 0; }
+" 10) 11))
+  ;; Two recursive calls per frame, and a parameter read after BOTH of them.
+  (assert (= (eval-via-source-text "function fib(x: number): number {
+  if (x < 2) { return x; }
+  return (fib(x - 1) + fib(x - 2)) | 0;
+}
+function main(n: number): number { return (fib(12) + (n | 0)) | 0; }
+" 10) 154))
+  ;; Two parameters, both live across the call, so a restore that is merely off by one is caught
+  ;; as well as one that runs off the end.
+  (assert (= (eval-via-source-text "function g(x: number, y: number): number {
+  if (x <= 0) { return y; }
+  return (x + g(x - 1, y + 1) + y) | 0;
+}
+function main(n: number): number { return (n + g(6, 2)) | 0; }
+" 10) 66))
+  0)
+
+;; A `do`/`while` BUILT MEMORY PHIS OVER ITS DECLARED FIELDS AND NOTHING ELSE.
+;;
+;; `fng-loop` carries the control alias list -- declared fields, every dynamic alias, the runtime
+;; property heap force-included, and the captured cell. `fng-do-loop` called `fng-active-memory!`
+;; alone, which publishes declared fields only, so an array element, a computed property or a
+;; captured cell got no phi and the header read pre-loop memory on every iteration.
+;;
+;; THIS ONE PRODUCED A WRONG ANSWER RATHER THAN A CRASH, and the graph verifies either way, so
+;; only the oracle could find it. Each case below is correct when written as `while`, which is
+;; what localised it to the do-while lowering rather than to loops or to memory.
+;; repros/do-while-drops-dynamic-memory.js.
+(deftest do_while_carries_memory_for_dynamic_aliases_and_captured_cells
+  (assert (= (eval-via-source-text "function main(n: number): number {
+  let acc = n | 0;
+  let a = [0, 0, 0, 0];
+  let d = 0;
+  do { a[d] = (a[0] + d + 1) | 0; d++; } while (d < 4);
+  return (acc + a[0] + a[1] + a[2] + a[3]) | 0;
+}
+" 10) 23))
+  (assert (= (eval-via-source-text "function main(n: number): number {
+  let acc = n | 0;
+  let c = 0;
+  const bump = function (): number { c = (c + 1) | 0; return c; };
+  let d = 0;
+  do { acc = (acc + bump()) | 0; d++; } while (d < 3);
+  return (acc + c) | 0;
+}
+" 10) 19))
+  0)
+
+;; A JUMP RECORDS THE MEMORY FOR EACH ALIAS BY NODE ID, and the graph keeps moving afterwards.
+;; A loop whose body never touches an alias hands its memory phi back as its own back edge, and
+;; `fng-loop` collapses that self-referential phi into its entry value -- but a `break` inside the
+;; body had already captured the phi. `jump-values` is a frontend table rather than a def-use
+;; edge, so `n-subsume!` did not retarget it and the exit merge wired a DEAD node into a phi:
+;; VERR-DEAD-INPUT, repros/loop-exit-then-allocation.js.
+;;
+;; The `break` alone never showed it. It needed an allocation AFTERWARDS, because that is what
+;; makes the merged memory reach a consumer the verifier walks. The last case is the labelled
+;; form, which is the one that proves the retarget has to scan the whole jump log: a `break`
+;; aimed at an OUTER loop is captured while the inner loop's phis are current, and merged long
+;; after the inner loop has collapsed them.
+(deftest an_abrupt_loop_exit_before_an_allocation_keeps_its_memory_phi_live
+  (assert (= (eval-via-source-text "function main(n: number): number {
+  let acc = n | 0;
+  { let bk0 = 0; for (let i0 = 0; i0 < 4; i0++) { if (i0 > 0) { break; } bk0 = (bk0 + 1) | 0; } acc = (acc + bk0) | 0; }
+  { let o = {a: acc}; acc = o.a | 0; }
+  return acc | 0;
+}
+" 10) 11))
+  (assert (= (eval-via-source-text "function main(n: number): number {
+  let acc = n | 0;
+  { let d = 0; do { if (d > 1) { break; } acc = (acc + d) | 0; d++; } while (d < 5); }
+  { let o = {a: acc, b: 1}; o.b = (o.a + 1) | 0; acc = (o.a + o.b) | 0; }
+  return acc | 0;
+}
+" 10) 23))
+  (assert (= (eval-via-source-text "function main(n: number): number {
+  let acc = n | 0;
+  { let lb0 = 0; ou0: for (let i0 = 0; i0 < 3; i0++) {
+      for (let j0 = 0; j0 < 3; j0++) { if (j0 > i0) { continue ou0; } lb0 = (lb0 + 1) | 0; }
+    } acc = (acc + lb0) | 0; }
+  { let o = {a: acc}; acc = o.a | 0; }
+  return acc | 0;
+}
+" 10) 16))
+  0)
+
+;; A FIELD COPIED STRAIGHT INTO ANOTHER FIELD. `p` is initialised from a variable and carries a
+;; boxed `dyn`; `q` is initialised from a literal and its slot is raw. The read forwards through
+;; the store that wrote `p`, so the copy handed the raw slot `p`'s boxed word with nothing
+;; between: `Store slot 3 <- Box is tagged, needs raw-num`.
+;;
+;; It survived because the frontend decided whether to unbox by asking `(= (shape-alias-ty alias)
+;; (t-flt))` while the verifier classified by `ty-kinds` -- two rules, and every field typed `int`
+;; or `bool` or a numeric union fell in the gap. `shape-alias-rep` is now the single rule both
+;; read. repros/field-copy-stays-boxed.js.
+;;
+;; The nested case is the same defect one slot over: `o.inner` is a tagged field, so the object
+;; operand of the inner access was a boxed word under a `Cast`, and a `Cast` relabels the type
+;; without changing the representation.
+(deftest a_field_copied_into_a_field_of_another_representation_is_unboxed
+  (assert (= (eval-via-source-text "function main(n: number): number {
+  let acc = n | 0;
+  let o = {p: acc, q: 1};
+  o.q = o.p;
+  return (o.p + o.q) | 0;
+}
+" 10) 20))
+  (assert (= (eval-via-source-text "function main(n: number): number {
+  let acc = n | 0;
+  let o = {p: acc, q: 1};
+  let t = o.p;
+  o.q = t;
+  return o.q | 0;
+}
+" 10) 10))
+  (assert (= (eval-via-source-text "function main(n: number): number {
+  let o = {inner: {x: n | 0}};
+  o.inner.x = (o.inner.x + 5) | 0;
+  return o.inner.x | 0;
+}
+" 10) 15))
+  0)
+
+;; Two structural object declarations may share the alias for a compatible field such as `x`.
+;; Object construction once retained both the first object's old alias state and the second
+;; object's new Store in one MemMerge; the following load then selected the stale first state.
+(deftest object_literal_replaces_shared_field_alias_state
+  (let [source "function main(n: number): number {
+  let acc = n | 0;
+  { let a = {x: acc}; acc = a.x | 0; }
+  { let b = {x: acc, y: 3}; b.x += b.y; acc = b.x | 0; }
+  return acc | 0;
+}
+"]
+    (assert (= (eval-via-source-text source 10) 13))
+    (assert (= (eval-via-source-text source -4) -1))
+    0))
 
 ;; The frontend must translate the source into a graph that means what the program means.
 ;;
@@ -186,6 +773,15 @@
 }
 ")))
     0))
+
+;; The frontend used to be table-driven because the TypeScript-Go bridge could not survive the
+;; property runner's fork.  The runner now launches tests without inheriting a live Go runtime, so
+;; keep the fixed witnesses above and put the same differential under generated input as well.
+(defprop frontend_translates_arbitrary_generated_javascript_faithfully
+  [(ops (ArrayList Op)) (choices (slice u8)) (arg i64)]
+  (assume (> (al-len [Op] ops) 0))
+  (let [arg (% arg 1048576)]
+    (= (eval-via-ir-ops ops choices arg) (eval-via-source-ops ops choices arg))))
 
 ; ============================================================================
 ; A real external oracle
@@ -228,6 +824,33 @@
       (fgets (cast (ptr i8) out) 256 f)
       (pclose f)
       (atoll (cast (ptr i8) out)))))
+
+(defn node-run-source [(source (slice u8)) (arg i64)] (-> i64)
+  (let [cmdbuf (stack (array i8 32768))
+        modebuf (stack (array i8 2))
+        fb (stack FixBuf) w (stack Writer)]
+    (store! (index (cast (ptr i8) modebuf) 0) (cast i8 114))
+    (store! (index (cast (ptr i8) modebuf) 1) (cast i8 0))
+    (store! (field fb data) (cast (ptr i8) cmdbuf))
+    (store! (field fb cap) 32768)
+    (store! (field fb len) 0)
+    (fixed-buffer-writer w fb)
+    (fmt w "node -e '{s}; console.log(String(main({d})))'" source arg)
+    (store! (index (cast (ptr i8) cmdbuf) (load (field fb len))) (cast i8 0))
+    (let [f (popen (cast (ptr i8) cmdbuf) (cast (ptr i8) modebuf))
+          out (stack (array i8 256))]
+      (assert (!= (cast i64 f) 0))
+      (fgets (cast (ptr i8) out) 256 f)
+      (assert (= (pclose f) 0))
+      (atoll (cast (ptr i8) out)))))
+
+(defprop opcode_generated_javascript_agrees_with_node
+  [(ops (ArrayList Op)) (choices (slice u8)) (arg i64)]
+  (assume (> (al-len [Op] ops) 0))
+  (let [buf (stack (array i8 16384))
+        arg (% arg 1048576)
+        source (lift-js-opcode-program! ops choices (cast (ptr i8) buf) 16384)]
+    (= (node-run-source source arg) (eval-via-source-text source arg))))
 
 (defprop node_agrees_with_the_compiler
   [(ops (slice u8)) (arg i64)]

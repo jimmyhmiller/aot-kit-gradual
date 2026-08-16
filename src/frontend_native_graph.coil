@@ -164,24 +164,61 @@
               (do
                 (if (n-dead? (load index)) 0 (n-set-ty! (load index) (t-top)))
                 (store! index (+ (load index) 1)))))
-    (g-analyze!)
-    ;; Analysis proves; this is what acts on the proof. See g-fold-proven!.
-    (g-fold-proven!)))
+    ;; ANALYSE, FOLD, AND THEN ANALYSE WHAT THE FOLD LEFT.
+    ;;
+    ;; `g-fold-proven!` REWIRES the graph -- it replaces proven nodes with constants, collapses the
+    ;; branches that then become dead, and reduces the phis on the regions those collapses remove.
+    ;; Every one of those is an input change for something downstream, and nothing re-queued them,
+    ;; so the pass returned with types describing the graph as it was BEFORE the fold. `g-verify`
+    ;; says VERR-STALE-TYPE, and the stale type is the pre-fold one, which is wider than the truth
+    ;; in some places and narrower in others.
+    ;;
+    ;; It was invisible while little folded. Once `box-compute` began carrying its input's kind,
+    ;; the DSL's tag guards started proving and the amount of folding went up sharply, which is
+    ;; what surfaced it. See docs/DSL-OWNERSHIP.md.
+    ;;
+    ;; Bounded because each round must FOLD something to earn the next one, and folding is
+    ;; monotone: it only ever replaces nodes with constants and deletes control.
+    (let [(mut rounds) 0
+          (mut stable) 0]
+      (loop (do (g-analyze!)
+                (let [before (g-live-count)]
+                  (g-fold-proven!)
+                  ;; `g-fold-proven!` turns a proven predicate into a constant; `iterate!` is what
+                  ;; then collapses the `If`, retires the unreachable projection and reduces the
+                  ;; phis on the region that loses an arm. Folding without it leaves the branch
+                  ;; standing with one dead side -- every guard proved and none of them removed,
+                  ;; which is most of the cost the DSL was being blamed for.
+                  (iterate!)
+                  (store! rounds (+ (load rounds) 1))
+                  ;; TWO STABLE ROUNDS, not one. A round that folds nothing may still have PROVEN
+                  ;; something -- the analysis at the top of it -- and that proof only becomes a
+                  ;; deletion in the round after. Stopping on the first quiet round left a CProj
+                  ;; typed `~ctrl` still wired into a live Region, which the evaluator walks into:
+                  ;; "control reached a dead node".
+                  (if (= (g-live-count) before)
+                      (store! stable (+ (load stable) 1))
+                      (store! stable 0))
+                  (if (or (>= (load stable) 2) (> (load rounds) 12))
+                      (break)
+                      0))))
+      ;; One last analysis so the types describe the graph that actually survived.
+      (g-analyze!))))
 
 (defn fng-peep [(node i64)] (-> i64)
   (if (load (fng-optimize-ptr)) (n-peephole node) node))
 
 (defn fng-const [(value i64)] (-> i64)
-  (n-new1 OP-CONST (t-int-con value) (g-start)))
+  (n-new1 (Const (t-int-con value)) (g-start)))
 
 (defn fng-bool [(value bool)] (-> i64)
-  (n-new1 OP-CONST (t-bool-con value) (g-start)))
+  (n-new1 (Const (t-bool-con value)) (g-start)))
 
 (defn fng-null [] (-> i64)
-  (n-new1 OP-CONST (t-null) (g-start)))
+  (n-new1 (Const (t-null)) (g-start)))
 
 (defn fng-undefined [] (-> i64)
-  (n-new1 OP-CONST (t-undef) (g-start)))
+  (n-new1 (Const (t-undef)) (g-start)))
 
 (defn fng-string-literal [(ast TsAst) (node i64)] (-> i64)
   (let [(mut bytes) (al-new [u8] (malloc-allocator))
@@ -230,10 +267,10 @@
              (and (<= number 9007199254740991.0)
                   (= bits (f64-bits (cast f64 (cast i64 number))))))
         (fng-const (cast i64 number))
-        (n-new1 OP-CONST (t-flt-bits bits) (g-start)))))
+        (n-new1 (Const (t-flt-bits bits)) (g-start)))))
 
-(defn fng-bin [(op i64) (left i64) (right i64)] (-> i64)
-  (fng-peep (n-new3 op 0 NO-NODE left right)))
+(defn fng-bin [(op Op) (left i64) (right i64)] (-> i64)
+  (fng-peep (n-new3 op NO-NODE left right)))
 
 (defn fng-string-coerce [(context FngContext) (source i64) (value i64)] (-> i64)
   (if (= (fng-infer context source FNG-DYNAMIC) FNG-STRING)
@@ -241,16 +278,16 @@
       (fng-jsl-call1 context "ToStringValue" value)))
 
 (defn fng-direct-call-object-type [(value i64)] (-> i64)
-  (if (and (>= value 0) (= (n-op value) OP-CALL))
+  (if (and (>= value 0) (op-is? value Call [_]))
       (let [callee (n-in value 1)
-            target (if (= (n-op callee) OP-CLOSURE) (n-in callee 0) callee)
+            target (if (op-is? callee Closure [_]) (n-in callee 0) callee)
             (mut index) 1
             (mut answer) (t-top)
-            (mut valid) (= (n-op target) OP-FUN)]
+            (mut valid) (op-is? target Fun [_])]
         (loop (if (or (>= (load index) (n-nins target)) (not (load valid)))
                   (break)
                   (let [ret (n-in target (load index))]
-                    (if (= (n-op ret) OP-RETURN)
+                    (if (op-is? ret Return [])
                         (let [result-type (n-ty (n-in ret 1))]
                           (if (ty-only-obj? result-type)
                               (if (= (load answer) (t-top))
@@ -267,7 +304,7 @@
   ;; Lift the representation conversion through the merge so raw null/object arms are boxed,
   ;; while inputs already produced in the tagged ABI remain unchanged by backend selection.
   (let [(mut closed) true (mut probe) 1]
-    (if (and (>= value 0) (= (n-op value) OP-PHI))
+    (if (and (>= value 0) (op-is? value Phi [_]))
         (loop (if (or (>= (load probe) (n-nins value)) (not (load closed)))
                   (break)
                   (do
@@ -275,8 +312,8 @@
                     (store! probe (+ (load probe) 1))
                     0)))
         0)
-  (if (and (>= value 0) (and (= (n-op value) OP-PHI) (load closed)))
-      (let [boxed (n-new OP-PHI (t-dyn))
+  (if (and (>= value 0) (and (op-is? value Phi [_]) (load closed)))
+      (let [boxed (n-new (Phi (t-dyn)))
             (mut index) 1]
         (n-add-def! boxed (n-in value 0))
         (loop (if (>= (load index) (n-nins value))
@@ -291,17 +328,48 @@
       (let [object-type (fng-direct-call-object-type value)]
         (n-box! (if (= object-type (t-top))
                     value
-                    (n-new2 OP-CAST object-type (n-in value 0) value)))))))
+                    (n-new2 (Cast object-type) (n-in value 0) value)))))))
 
 (defn fng-tagged-dynamic-value? [(value i64)] (-> bool)
   ;; Type computation can lag graph construction, so `n-ty == dyn` alone is not reliable while
   ;; lowering a body. These producers have a defined tagged-JavaScript-value machine ABI.
   (if (< value 0)
       false
-      (let [op (n-op value)]
-        (or (= op OP-PROPLOAD)
-            (or (= op OP-ARRAYLOAD)
-                (and (= op OP-LOAD) (= (shape-alias-ty (n-aux value)) (t-dyn))))))))
+      (match (n-op value)
+        (PropLoad [_] true)
+        (ArrayLoad [_] true)
+        (Load [alias] (= (shape-alias-ty alias) (t-dyn)))
+        (_ false))))
+
+;; `fng-tagged-dynamic-value?` answers for the producers whose ABI is tagged by DECLARATION. A
+;; `Box` is tagged by construction and belongs in the same answer, and it is the one this file
+;; reaches most often, because a load that forwards through a store lands on the boxed value the
+;; store wrote rather than on a Load node at all.
+(defn fng-value-tagged? [(value i64)] (-> bool)
+  (if (< value 0)
+      false
+      (if (fng-tagged-dynamic-value? value)
+          true
+          (match (n-op value)
+            (Box [_] true)
+            (_ (= (n-ty value) (t-dyn)))))))
+
+;; PUT `value` IN THE REPRESENTATION THIS ALIAS'S SLOT HOLDS.
+;;
+;; Every write through a declared field goes through here, so the frontend cannot emit a slot in
+;; one representation and a value in another -- which is what `o.q = o.p` did whenever `p` and `q`
+;; disagreed, since the forwarded load handed the store `p`'s boxed word directly. The
+;; classification is `shape-alias-rep`, the same one the verifier judges by.
+(defn fng-coerce-to-alias [(alias i64) (value i64)] (-> i64)
+  (let [rep (shape-alias-rep alias)]
+    (cond (= rep REP-TAGGED) (fng-box-dynamic-argument! value)
+          (= rep REP-RAW-NUM)
+            (if (fng-value-tagged? value) (n-unbox! value (t-flt)) value)
+          (= rep REP-RAW-PTR)
+            ;; Unbox to the slot's own object type, not to a generic pointer: the verifier reads
+            ;; the Unbox's target to decide it produced raw-ptr.
+            (if (fng-value-tagged? value) (n-unbox! value (shape-alias-ty alias)) value)
+          :else value)))
 
 ;; Mark array, walk stack, and generation stamp for `fng-boxed-dynamic-value?`, following the
 ;; backend's fp-walk discipline exactly (backend_core's fp-mark/fp-stack): one shared buffer,
@@ -364,22 +432,21 @@
                           (al-set! [i64] (field u mark) m gen)
                           (if (fng-tagged-dynamic-value? m)
                               (store! found true)
-                              (let [op (n-op m)]
-                                (cond (= op OP-BOX) (store! found true)
-                                      (= op OP-TONUMBER) (store! found true)
-                                      (= op OP-CAST)
-                                        (do (al-push! [i64] (field u stack) (n-in m 1)) 0)
-                                      (= op OP-PHI)
-                                        (let [(mut input) 1]
-                                          (loop (if (>= (load input) (n-nins m))
-                                                    (break)
-                                                    (do
-                                                      (al-push! [i64] (field u stack)
-                                                                (n-in m (load input)))
-                                                      (store! input (+ (load input) 1))
-                                                      0)))
-                                          0)
-                                      :else 0)))
+                              (match (n-op m)
+                                (Box [_] (store! found true))
+                                (ToNumber [] (store! found true))
+                                (Cast [_] (do (al-push! [i64] (field u stack) (n-in m 1)) 0))
+                                (Phi [_]
+                                  (let [(mut input) 1]
+                                    (loop (if (>= (load input) (n-nins m))
+                                              (break)
+                                              (do
+                                                (al-push! [i64] (field u stack)
+                                                          (n-in m (load input)))
+                                                (store! input (+ (load input) 1))
+                                                0)))
+                                    0))
+                                (_ 0)))
                           0))))))
       (store! (field u busy) false)
       (load found))))
@@ -397,10 +464,10 @@
               (break)
               (do
                 (if (and (not (n-dead? (load node)))
-                         (= (n-op (load node)) OP-BOX))
+                         (op-is? (load node) Box [_]))
                     (let [value (n-in (load node) 1)]
                       (if (and (!= value NO-NODE)
-                               (and (not (n-dead? value)) (= (n-op value) OP-PHI)))
+                               (and (not (n-dead? value)) (op-is? value Phi [_])))
                           (let [(mut input) 1
                                 (mut closed) true]
                             (loop (if (or (>= (load input) (n-nins value))
@@ -412,7 +479,7 @@
                                             0)
                                         (store! input (+ (load input) 1)))))
                             (if (load closed)
-                                (let [boxed (n-new OP-PHI (t-dyn))]
+                                (let [boxed (n-new (Phi (t-dyn)))]
                                   (n-add-def! boxed (n-in value 0))
                                   (store! input 1)
                                   (loop (if (>= (load input) (n-nins value))
@@ -516,10 +583,10 @@
   ;; Property inference may know the declared class field while the actual load still crosses the
   ;; tagged PropertyKey ABI. Choose the comparison from the value representation, not only the
   ;; source-level declaration, so `undefined == null` remains true after a generic field load.
-  (if (or (= (n-ty value) (t-dyn)) (fng-tagged-dynamic-value? value))
-      (fng-bin OP-BITOR
-               (fng-bin OP-EQ value (n-box! (fng-null)))
-               (fng-bin OP-EQ value (n-box! (fng-undefined))))
+  (if (fng-value-tagged? value)
+      (fng-bin (BitOr)
+               (fng-bin (Eq) value (n-box! (fng-null)))
+               (fng-bin (Eq) value (n-box! (fng-undefined))))
       ;; A value that is not provably in the tagged ABI may still ARRIVE tagged: a callee with
       ;; mixed return representations (satisfy returns both `null` and an object) has every
       ;; return boxed by the backend, while raw null/undefined constants materialize as zero.
@@ -527,12 +594,12 @@
       ;; pointer can never equal the tagged nullish constants, and a tagged object can never
       ;; equal zero. Numeric kinds keep the raw-only compare: raw zero must not look nullish.
       (if (= (& (ty-kinds (n-ty value)) (| VK-INT VK-FLT)) 0)
-          (fng-bin OP-BITOR
-                   (fng-bin OP-EQ value (fng-null))
-                   (fng-bin OP-BITOR
-                            (fng-bin OP-EQ value (n-box! (fng-null)))
-                            (fng-bin OP-EQ value (n-box! (fng-undefined)))))
-          (fng-bin OP-EQ value (fng-null)))))
+          (fng-bin (BitOr)
+                   (fng-bin (Eq) value (fng-null))
+                   (fng-bin (BitOr)
+                            (fng-bin (Eq) value (n-box! (fng-null)))
+                            (fng-bin (Eq) value (n-box! (fng-undefined)))))
+          (fng-bin (Eq) value (fng-null)))))
 
 ;; The dynamic-to-number seam, and the difference between an UNBOX and a COERCION.
 ;;
@@ -547,7 +614,7 @@
 ;; ToNumber is what JavaScript specifies here, and it already existed on both sides of the compiler:
 ;; `ev-to-number-value` in eval.coil and `aot_js_to_number_double` in the runtime implement the same
 ;; table (undefined is NaN, null is +0, a boolean is 0 or 1, a string parses). The graph was the only
-;; place that did not say so. `OP-TONUMBER` returns a BOXED number, so the unbox stays — but now its
+;; place that did not say so. `OPTAG-TONUMBER` returns a BOXED number, so the unbox stays — but now its
 ;; promise is one the producer keeps.
 ;;
 ;; It is emitted ONLY where the value is dynamic. A value the frontend already types as a number is
@@ -586,7 +653,7 @@
           false
           (if (ty-isa (n-ty v) (t-num))
               true
-              (if (= (n-op v) OP-PHI)
+              (if (op-is? v Phi [_])
                   (let [(mut i) 1
                         (mut ok) (> (n-nins v) 1)]
                     (loop (if (or (>= (load i) (n-nins v)) (not (load ok)))
@@ -602,9 +669,9 @@
                     (load ok))
                   ;; A delegated result: `() => f()` returns f's raw representation, so follow the
                   ;; direct callee the same way the backend's return-kind analysis does.
-                  (if (and (= (n-op v) OP-CALL)
-                           (or (= (n-op (n-in v 1)) OP-FUN)
-                               (= (n-op (n-in v 1)) OP-CLOSURE)))
+                  (if (and (op-is? v Call [_])
+                           (or (op-is? (n-in v 1) Fun [_])
+                               (op-is? (n-in v 1) Closure [_])))
                       (fng-call-returns-machine-number-fuel? v (- fuel 1))
                       false))))))
 
@@ -616,8 +683,8 @@
 ;; Returns, so the callee's actual return types are inspectable at the call site.
 (defn fng-call-returns-machine-number-fuel? [(value i64) (fuel i64)] (-> bool)
   (let [callee (n-in value 1)
-        fun (if (= (n-op callee) OP-CLOSURE) (n-in callee 0) callee)]
-    (if (or (<= fuel 0) (!= (n-op fun) OP-FUN))
+        fun (if (op-is? callee Closure [_]) (n-in callee 0) callee)]
+    (if (or (<= fuel 0) (not (op-is? fun Fun [_])))
         false
     ;; A Fun with no Return inputs is NOT BUILT YET: nested function bodies lower after the
     ;; enclosing body that calls them, so their returns are uninspectable here. Keep the old
@@ -632,7 +699,7 @@
                     (break)
                     (do
                       (let [ret (n-in fun (load i))]
-                        (if (and (!= ret NO-NODE) (= (n-op ret) OP-RETURN))
+                        (if (and (!= ret NO-NODE) (op-is? ret Return []))
                             (if (fng-machine-number-value? (n-in ret 1) fuel)
                                 0
                                 (store! ok false))
@@ -676,7 +743,7 @@
                     (do
                       (let [arm (n-in phi (load at))]
                         (if (and (and (!= arm NO-NODE) (!= arm phi))
-                                 (and (!= (n-op arm) OP-PHI)
+                                 (and (not (op-is? arm Phi [_]))
                                       (and (not (fng-boxed-dynamic-value? arm))
                                            (fng-machine-number-value? arm 8))))
                             (do (n-set-def! phi (load at) (n-box! arm)) 0)
@@ -693,7 +760,7 @@
   ;; tagged 3 read as NaN, NaN*5|0 == 0). The boxed walk extends the same structural test
   ;; through Phi joins of Box arms (inlined JSL macros like StringCodePointAt).
   (or captured-cell
-      (or (= (n-ty value) (t-dyn))
+      (or (fng-value-tagged? value)
           (fng-boxed-dynamic-value? value))))
 
 (defn fng-int-value [(context FngContext) (source i64) (value i64)] (-> i64)
@@ -709,16 +776,16 @@
       ;; NOT exempt: it returns a BOXED dyn value, and passing it raw fed a double's bit
       ;; pattern to the integer op — the low 32 bits of any small double are zero, which
       ;; silently zeroed `f() | 0` for every dispatched callee.
-      (if (or (and (= (n-op value) OP-CALL)
-                   (and (or (= (n-op (n-in value 1)) OP-FUN)
-                            (= (n-op (n-in value 1)) OP-CLOSURE))
+      (if (or (and (op-is? value Call [_])
+                   (and (or (op-is? (n-in value 1) Fun [_])
+                            (op-is? (n-in value 1) Closure [_]))
                         (fng-call-returns-machine-number? value)))
-              (or (= (n-op value) OP-ADD)
-                  (or (= (n-op value) OP-SUB)
-                      (or (= (n-op value) OP-MUL)
-                          (or (= (n-op value) OP-DIV) (= (n-op value) OP-MOD))))))
+              (or (op-is? value Add [])
+                  (or (op-is? value Sub [])
+                      (or (op-is? value Mul [])
+                          (or (op-is? value Div []) (op-is? value Mod []))))))
           value
-          (fng-bin OP-BITOR (fng-to-number-operand context value) (fng-const 0)))
+          (fng-bin (BitOr) (fng-to-number-operand context value) (fng-const 0)))
       value)))
 
 (defn fng-number-value [(context FngContext) (source i64) (value i64)] (-> i64)
@@ -740,14 +807,14 @@
       ;; Same rule as fng-int-value: direct-callee calls and arithmetic are machine numbers,
       ;; but a DYNAMICALLY dispatched call returns a BOXED dyn value and needs the guarded
       ;; conversion — passing it raw fed double bit patterns into numeric ops.
-      (if (or (and (= (n-op value) OP-CALL)
-                   (and (or (= (n-op (n-in value 1)) OP-FUN)
-                            (= (n-op (n-in value 1)) OP-CLOSURE))
+      (if (or (and (op-is? value Call [_])
+                   (and (or (op-is? (n-in value 1) Fun [_])
+                            (op-is? (n-in value 1) Closure [_]))
                         (fng-call-returns-machine-number? value)))
-              (or (= (n-op value) OP-ADD)
-                  (or (= (n-op value) OP-SUB)
-                      (or (= (n-op value) OP-MUL)
-                          (or (= (n-op value) OP-DIV) (= (n-op value) OP-MOD))))))
+              (or (op-is? value Add [])
+                  (or (op-is? value Sub [])
+                      (or (op-is? value Mul [])
+                          (or (op-is? value Div []) (op-is? value Mod []))))))
           value
           (fng-to-number-operand context value))
       value))))
@@ -756,7 +823,7 @@
   (let [ty (n-ty value)]
     (and (and (!= (ty-kinds ty) VK-NULL) (!= (ty-kinds ty) VK-UNDEF))
          (and (ty-isa ty (t-num))
-         (if (!= (n-op value) OP-PHI)
+         (if (not (op-is? value Phi [_]))
              true
              ;; An open Phi initially has bottom type, which is below every concrete type.  Its
              ;; first real value is the only available evidence until the backedge is installed.
@@ -769,14 +836,14 @@
 (defn fng-equal-value [(context FngContext)
                        (left-source i64) (left i64)
                        (right-source i64) (right i64)] (-> i64)
-  (let [left-dynamic (or (= (n-ty left) (t-dyn)) (fng-tagged-dynamic-value? left))
-        right-dynamic (or (= (n-ty right) (t-dyn)) (fng-tagged-dynamic-value? right))]
+  (let [left-dynamic (fng-value-tagged? left)
+        right-dynamic (fng-value-tagged? right)]
     ;; `dyn` includes numeric values, so `ty-isa dyn num` is true.  It is not proof that a
     ;; particular dynamic value is numeric.  In particular, an open loop Phi has bottom type before
     ;; its backedge arrives; bottom satisfies every `ty-isa` query and is not numeric evidence.
     (cond (or (fng-nullish-literal? context left-source)
               (fng-nullish-literal? context right-source))
-            (fng-bin OP-EQ
+            (fng-bin (Eq)
                      (if left-dynamic left (n-box! left))
                      (if right-dynamic right (n-box! right)))
           ;; The dynamic side is a TAGGED word of unknown numeric representation — an INT-tagged
@@ -785,14 +852,94 @@
           ;; flt (its own unbox of the guarded ToNumberValue), so no second unbox here — the
           ;; earlier attempt double-unboxed and died in MLIVE-CLASS.
           (and left-dynamic (fng-numeric-equality-peer? right))
-            (fng-bin OP-EQ (n-unbox! left (t-flt)) right)
+            (fng-bin (Eq) (n-unbox! left (t-flt)) right)
           (and right-dynamic (fng-numeric-equality-peer? left))
-            (fng-bin OP-EQ left (n-unbox! right (t-flt)))
+            (fng-bin (Eq) left (n-unbox! right (t-flt)))
           (or left-dynamic right-dynamic)
-            (fng-bin OP-EQ
+            (fng-bin (Eq)
                      (if left-dynamic left (n-box! left))
                      (if right-dynamic right (n-box! right)))
-          :else (fng-bin OP-EQ left right))))
+          :else (fng-bin (Eq) left right))))
+
+;; `==` AND `!=`, WHICH ARE NOT `===` WITH BOXING.
+;;
+;; `fng-equal-value` above is STRICT equality's lowering, and `switch` shares it because `switch`
+;; matches with `===`. Loose equality coerces, and routing it through the strict lowering is what
+;; made `7 == "7"` false: that lowering unboxes a tagged operand as a float on the evidence that
+;; the OTHER side is numeric, which is no evidence about the tagged one at all, and a string's
+;; tagged word read as a double equals nothing.
+;;
+;; ONE FAST PATH, AND IT NEEDS A PROOF. Both operands PROVABLY raw machine numbers is the only
+;; case where a machine compare is exact, because it is the only case where no coercion can apply.
+;; The proof has to be `fng-machine-number-value?` and not "is the type `dyn`": a string is not
+;; `dyn`-typed either, so an is-it-tagged test lets `acc == String(acc)` through to the raw compare
+;; and reproduces the original bug exactly. It was written that way first, and the repro did not
+;; move.
+;;
+;; Everything else goes to the library, because the answer depends on runtime tags. That costs a
+;; call on comparisons that used to be inline; `docs/DECISIONS.md` and this project's policy put
+;; correctness ahead of that, and the alternative is a wrong answer with no diagnostic.
+;;
+;; repros/open/loose-equality-number-to-string.js.
+;; THE RELATIONAL OPERATORS ARE THE DSL'S, WHOLE. `IsLessThan` and `IsLessEqual` in
+;; `lib/abstract/conversions.jsl` are the entire meaning of `<`, `<=`, `>` and `>=`; nothing here
+;; decides anything about operands.
+;;
+;; The frontend used to spell all four out: a static "did inference say both sides are strings?"
+;; test with a numeric compare as the fallback, over a coercion helper that only fires on `dyn`.
+;; A string beside a number matched neither, and `"5" < 6` stopped the evaluator where node says
+;; true; `true < 2` and `null < 1` were wrong for the same reason. Four hand-written copies of one
+;; abstract operation, each wrong for the operands its author did not picture.
+;;
+;; NO FAST PATH HERE, DELIBERATELY. One was tried -- "both operands provably raw machine numbers,
+;; compare directly" -- and it works, and it is still the compiler holding an opinion about what
+;; JavaScript comparison means. The specialisation belongs in the definition, and it is there: the
+;; DSL macros lead with the Number/Number case so two numbers cost tag tests and no calls.
+;; See docs/DSL-OWNERSHIP.md.
+(defn fng-relational [(context FngContext) (name (slice u8)) (a i64) (b i64)] (-> i64)
+  (fng-jsl-call2 context name (n-box! a) (n-box! b)))
+
+;; THE BITWISE OPERATORS ARE THE DSL'S. `BitwiseAnd`, `BitwiseOr`, `BitwiseXor`, `BitwiseNot`,
+;; `ShiftLeft`, `ShiftRight` and `ShiftRightUnsigned` in `lib/abstract/conversions.jsl` are their
+;; whole meaning: ToInt32 on each operand and then the machine operation.
+;;
+;; The frontend used to write that out ELEVEN TIMES -- once per operator in the binary form and
+;; again in the compound-assignment form -- as `fng-int-value` on each side followed by the raw
+;; node. `fng-int-value` decides whether to coerce by asking whether the value is `dyn`, which a
+;; string is not, so the same class of operand that broke `==` and `<` broke these too.
+;;
+;; Wiring these is also what finally calls `ToInt32` and `ToUint32`: they were defined in `lib/` and
+;; called by nothing, because the frontend had its own copy. See docs/DSL-OWNERSHIP.md.
+;; THE ARITHMETIC OPERATORS ARE THE DSL'S. `JsAdd`, `JsSub`, `JsMul`, `JsDiv`, `JsMod` and
+;; `JsNegate` in `lib/abstract/conversions.jsl` are their whole meaning.
+;;
+;; `+` is the one that could not be a peephole: its RESULT TYPE depends on its operands -- a String
+;; on either side makes it concatenation. The frontend decided that STATICALLY, asking `fng-infer`
+;; whether either side looked like a string, and fell back to a numeric add over `fng-number-value`,
+;; whose coercion only fires on `dyn`. Every operand the static test could not classify took the
+;; numeric arm regardless of what it actually held.
+;;
+;; The precision is not lost by moving it: `:ret` is recorded and never read, so a call's type is
+;; whatever the graph computes, and the guards fold when the operands are known. `1 + 2` keeps its
+;; integer range; only a genuinely dynamic operand produces a dynamic result.
+(defn fng-arith2 [(context FngContext) (name (slice u8)) (a i64) (b i64)] (-> i64)
+  (fng-jsl-call2 context name (n-box! a) (n-box! b)))
+
+(defn fng-arith1 [(context FngContext) (name (slice u8)) (a i64)] (-> i64)
+  (fng-jsl-call1 context name (n-box! a)))
+
+(defn fng-bitwise2 [(context FngContext) (name (slice u8)) (a i64) (b i64)] (-> i64)
+  (fng-jsl-call2 context name (n-box! a) (n-box! b)))
+
+(defn fng-bitwise1 [(context FngContext) (name (slice u8)) (a i64)] (-> i64)
+  (fng-jsl-call1 context name (n-box! a)))
+
+(defn fng-loose-equal [(context FngContext) (left i64) (right i64)] (-> i64)
+  (if (and (fng-machine-number-value? left 8) (fng-machine-number-value? right 8))
+      (fng-bin (Eq) left right)
+      (fng-jsl-call2 context "LooseEqual"
+                     (fng-box-dynamic-argument! left)
+                     (fng-box-dynamic-argument! right))))
 
 (defn fng-type-tag [(frontend (ptr NativeFrontend)) (type-node i64)] (-> i64)
   (if (<= type-node -1)
@@ -921,13 +1068,12 @@
   ;; A function-entry memory argument represents an existing heap, not a freshly undefined field.
   ;; Static shape aliases carry their declared field type across calls; dynamic/runtime aliases
   ;; retain the conservative undefined seed until an explicit effect supplies stronger evidence.
-  (n-new1 OP-ARG
-          (t-mem-alias alias
-                       (if (shape-alias-defined? alias) (shape-alias-ty alias) (t-undef)))
+  (n-new1 (Arg (t-mem-alias alias
+                       (if (shape-alias-defined? alias) (shape-alias-ty alias) (t-undef))))
           ctrl))
 
 (defn fng-merge [(memories (ptr (ArrayList i64)))] (-> i64)
-  (let [merge (n-new OP-MEMMERGE 0)
+  (let [merge (n-new (MemMerge))
         (mut index) 0]
     (n-add-def! merge NO-NODE)
     (loop (if (>= (load index) (al-len [i64] (load memories)))
@@ -940,53 +1086,44 @@
 (defn fng-memory-has-alias? [(memory i64) (alias i64)] (-> bool)
   (if (= memory NO-NODE)
       false
-      (let [op (n-op memory)]
-        (cond (= op OP-STORE) (= (n-aux memory) alias)
-              (or (= op OP-PROPSTORE)
-                  (or (= op OP-PROPDELETE)
-                      (or (= op OP-SETPROTO)
-                          (or (= op OP-ARRAYSTORE)
-                              (or (= op OP-ARRAYRESIZE) (= op OP-ARRAYCOPY))))))
-                (= alias JS-PROPERTY-ALIAS)
-              (= op OP-MEMMERGE)
-                (let [(mut index) 1
-                      (mut found) false]
-                  (loop (if (or (>= (load index) (n-nins memory)) (load found))
-                            (break)
-                            (do
-                              (if (fng-memory-has-alias? (n-in memory (load index)) alias)
-                                  (store! found true)
-                                  0)
-                              (store! index (+ (load index) 1)))))
-                  (load found))
-              (and (= op OP-PROJ) (= (n-op (n-in memory 0)) OP-NEW))
-                (let [projection (n-aux memory)
-                      nw (n-in memory 0)]
-                  (and (> projection 0)
-                       (= (shape-field-alias (n-aux nw) (- projection 1)) alias)))
-              :else
-              ;; A freshly built Phi has not computed its type yet; its declared memory slice is aux.
-              (let [t (if (= op OP-PHI) (n-aux memory) (n-ty memory))]
-                (and (ty-mem? t) (!= (& (ty-mem-aliases t) (<< 1 alias)) 0)))))))
+      (match (n-op memory)
+        (Store [stored-alias] (= stored-alias alias))
+        (PropStore [_] (= alias JS-PROPERTY-ALIAS))
+        (PropDelete [_] (= alias JS-PROPERTY-ALIAS))
+        (SetProto [] (= alias JS-PROPERTY-ALIAS))
+        (ArrayStore [] (= alias JS-PROPERTY-ALIAS))
+        (ArrayResize [] (= alias JS-PROPERTY-ALIAS))
+        (ArrayCopy [] (= alias JS-PROPERTY-ALIAS))
+        (MemMerge []
+          (let [(mut index) 1 (mut found) false]
+            (loop (if (or (>= (load index) (n-nins memory)) (load found))
+                      (break)
+                      (do (if (fng-memory-has-alias? (n-in memory (load index)) alias)
+                              (store! found true) 0)
+                          (store! index (+ (load index) 1)))))
+            (load found)))
+        (Proj [projection]
+          (if (op-is? (n-in memory 0) New [_])
+              (let [nw (n-in memory 0)]
+                (and (> projection 0)
+                     (= (shape-field-alias (n-new-shape nw) (- projection 1)) alias)))
+              (let [t (n-ty memory)]
+                (and (ty-mem? t) (!= (& (ty-mem-aliases t) (<< 1 alias)) 0)))))
+        ;; A freshly built Phi has not computed its type yet; its declared memory slice is payload.
+        (Phi [declared]
+          (and (ty-mem? declared) (!= (& (ty-mem-aliases declared) (<< 1 alias)) 0)))
+        (_ (let [t (n-ty memory)]
+             (and (ty-mem? t) (!= (& (ty-mem-aliases t) (<< 1 alias)) 0)))))))
 
 (defn fng-memory-node? [(memory i64)] (-> bool)
   (if (= memory NO-NODE)
       false
-      (let [op (n-op memory)]
-        (or (= op OP-STORE)
-            (or (= op OP-PROPSTORE)
-                (or (= op OP-PROPDELETE)
-                    (or (= op OP-SETPROTO)
-                        (or (= op OP-ARRAYSTORE)
-                            (or (= op OP-ARRAYRESIZE)
-                                (or (= op OP-ARRAYCOPY)
-                                    (or (= op OP-MEMMERGE)
-                                        (or (and (= op OP-PROJ)
-                                                 (= (n-op (n-in memory 0)) OP-NEW))
-                                            (let [t (if (= op OP-PHI)
-                                                        (n-aux memory)
-                                                        (n-ty memory))]
-                                              (ty-mem? t))))))))))))))
+      (match (n-op memory)
+        (Store [_] true) (PropStore [_] true) (PropDelete [_] true) (SetProto [] true)
+        (ArrayStore [] true) (ArrayResize [] true) (ArrayCopy [] true) (MemMerge [] true)
+        (Proj [_] (or (op-is? (n-in memory 0) New [_]) (ty-mem? (n-ty memory))))
+        (Phi [declared] (ty-mem? declared))
+        (_ (ty-mem? (n-ty memory))))))
 
 ;; The single non-merge state that carries `alias` inside a (possibly nested) MemMerge. Answering
 ;; a per-alias query with a whole merge is how merges ended up NESTED in bigger merges: the outer
@@ -994,7 +1131,7 @@
 ;; the newer states it was merged with — two states claiming one alias, which is ambiguous (the
 ;; IR evaluator rejects it as EV-MEM; the backend just happens to schedule the newer one).
 (defn fng-alias-leaf [(memory i64) (alias i64) (fuel i64)] (-> i64)
-  (if (or (<= fuel 0) (!= (n-op memory) OP-MEMMERGE))
+  (if (or (<= fuel 0) (not (op-is? memory MemMerge [])))
       memory
       (let [(mut index) 1
             (mut answer) NO-NODE]
@@ -1011,7 +1148,7 @@
   (let [memory (load (load (field context memory)))]
     (if (= memory NO-NODE)
         (fng-memory (load (load (field context ctrl))) alias)
-        (if (= (n-op memory) OP-MEMMERGE)
+        (if (op-is? memory MemMerge [])
             (let [(mut index) 1
                   (mut answer) NO-NODE]
               (loop (if (or (>= (load index) (n-nins memory)) (!= (load answer) NO-NODE))
@@ -1087,7 +1224,7 @@
               (break)
               (do
                 (if (and (not (n-dead? (load node)))
-                         (and (= (n-op (load node)) OP-MEMMERGE)
+                         (and (op-is? (load node) MemMerge [])
                               (= (n-nouts (load node)) 0)))
                     (n-discard-scaffolding! (load node))
                     0)
@@ -1108,7 +1245,7 @@
                                         (and (!= (load node) (g-stop))
                                              ;; Parameter position is part of the callable ABI even
                                              ;; when this body does not read the value.
-                                             (!= (n-op (load node)) OP-PARM))))))
+                                             (not (op-is? (load node) Parm [_])))))))
                     (n-kill! (load node))
                     0)
                 (store! node (- (load node) 1)))))
@@ -1435,7 +1572,7 @@
         name-id (fng-script-global-name frontend symbol)]
     (fng-record-dynamic-alias! context JS-PROPERTY-ALIAS)
     (n-peephole
-      (n-new3 OP-PROPLOAD name-id
+      (n-new3 (PropLoad name-id)
               (load (load (field context ctrl)))
               (fng-current-memory context JS-PROPERTY-ALIAS)
               (fng-const (fng-script-owner-id frontend))))))
@@ -1446,7 +1583,7 @@
     (fng-record-dynamic-alias! context JS-PROPERTY-ALIAS)
     (let [stored
             (n-peephole
-              (n-new4 OP-PROPSTORE name-id
+              (n-new4 (PropStore name-id)
                       (load (load (field context ctrl)))
                       (fng-current-memory context JS-PROPERTY-ALIAS)
                       (fng-const (fng-script-owner-id frontend))
@@ -1463,8 +1600,7 @@
           (let [cell (fng-symbol-storage context symbol)
                 alias (load (field context cell-alias))
                 cast-node
-                  (n-new2 OP-CAST
-                          (t-obj-shape (load (field context cell-shape)))
+                  (n-new2 (Cast (t-obj-shape (load (field context cell-shape))))
                           (load (load (field context ctrl)))
                           cell)]
             (n-load! (fng-current-memory context alias) cast-node alias)))))
@@ -1494,8 +1630,7 @@
                 (store! (load (field context memory)) (fng-preserve-active-memory context stored))
                 node))
             (let [cast-node
-                    (n-new2 OP-CAST
-                            (t-obj-shape (load (field context cell-shape)))
+                    (n-new2 (Cast (t-obj-shape (load (field context cell-shape))))
                             (load (load (field context ctrl)))
                             cell)
                   stored
@@ -1794,6 +1929,46 @@
                           (fng-infer context (ts-child ast node 0) FNG-DYNAMIC))))
               :else FNG-DYNAMIC))))
 
+;; The one report for syntax the builder has no lowering for. `kind` is worth printing because the
+;; interesting case is kind 0: that is the bridge's `default`, so it means "the Go side does not
+;; enumerate this syntax at all" rather than "this kind is known and unhandled", and the two want
+;; different fixes.
+;; THE RECEIVER SLOT TAKES A TAGGED OBJECT-ISH VALUE, and this is the verifier's own rule --
+;; `VERR-CALL-RECEIVER-TAG` accepts `undefined`, an object or a function and nothing else.
+;;
+;; A method on a PRIMITIVE therefore has nowhere to go: `(acc / 4).toFixed(2)` put a raw `Div`
+;; straight into the slot, and `'aXa'.replace(...)` did the same with a string. JavaScript answers
+;; this by boxing the primitive into a wrapper object, and this compiler has no wrapper objects --
+;; so the honest outcome is a refusal, not a Call the verifier will reject afterwards. Neither
+;; method is implemented anyway: there is no `toFixed` in `lib/`, and `lib/string/replace-all.jsl`
+;; is `replaceAll`, which has different semantics from `replace`.
+;;
+;; Checked HERE rather than left to `g-verify` because the frontend is what knows the source text.
+;; See repros/open/method-call-on-primitive-receiver.js.
+(defn fng-valid-receiver? [(value i64)] (-> bool)
+  (if (= value NO-NODE)
+      true
+      ;; A HIGH type passes. The builder analyses lazily, so a node built a moment ago still reads
+      ;; as unanalysed and there is nothing to conclude from it -- and `fng-machine-number-value?`
+      ;; is not the way to fill that gap, whatever it looks like: `ty-isa ANY num` is true, so it
+      ;; reports every unanalysed value as a machine number. Tried here, it refused `reset()` and
+      ;; five NavierStokes repros. The numeric case is caught from the SOURCE instead, at the
+      ;; receiver-call site below, where the frontend has a declared type to read.
+      (let [t (n-ty value)]
+        (if (ty-high? t)
+            true
+            (or (= (ty-kinds t) VK-UNDEF)
+                (or (!= (& (ty-kinds t) VK-OBJ) 0)
+                    (!= (& (ty-kinds t) VK-FUN) 0)))))))
+
+(defn fng-unsupported-syntax! [(position (slice u8)) (kind i64) (text (slice u8))] (-> i64)
+  (let [w (stderr)]
+    (fmt w "frontend: unsupported {s} syntax (bridge kind {d}): " position kind)
+    (ps w text)
+    (ps w "\n"))
+  (abort)
+  0)
+
 (defn fng-expression [(context FngContext) (node i64)] (-> i64)
   (fng-expression-expected context node FNG-DYNAMIC))
 
@@ -1951,8 +2126,8 @@
 (defn fng-pin-after-call! [(context FngContext) (dependency i64) (value i64)] (-> i64)
   ; Both truthiness arms rejoin immediately. The branch exists only to make the post-call control
   ; dependency explicit; unlike `dependency === dependency`, it cannot fold away under peep.
-  (let [arms (n-if-arms! (n-new2 OP-IF 0 (load (load (field context ctrl))) dependency))
-        region (n-new OP-REGION 0)]
+  (let [arms (n-if-arms! (n-new2 (If) (load (load (field context ctrl))) dependency))
+        region (n-new (Region))]
     (n-add-def! region NO-NODE)
     (n-add-def! region (arms-t arms))
     (n-add-def! region (arms-f arms))
@@ -2356,16 +2531,16 @@
       ;; arguments reach here and anything else is rejected before this point.
       ;;
       ;; WHAT MAKES THIS FREE IS `typetest-idealize`, NOT THIS CODE. The library's MathFloor is
-      ;; `if (%IsInt v) v else (%FloorNum v)`, and `%FloorNum` lowers to the same OP-JSBUILTIN the
+      ;; `if (%IsInt v) v else (%FloorNum v)`, and `%FloorNum` lowers to the same OPTAG-JSBUILTIN the
       ;; hand-written form emitted — so the conversion is that node plus a guard. The guard folds
       ;; against a boxed argument whose input type is proven, which is why the box is built here
       ;; from a value the frontend has already typed rather than from something opaque.
       ;;
-      ;; THE RESULT GOES THROUGH ToNumber, NOT AN UNBOX TO `flt`. OP-JSBUILTIN always answers a
+      ;; THE RESULT GOES THROUGH ToNumber, NOT AN UNBOX TO `flt`. OPTAG-JSBUILTIN always answers a
       ;; double, so unboxing its result as a float is right. A JSL definition is not the same:
       ;; `MathAbs` of a boxed integer returns a boxed INTEGER, and reading that as a float
       ;; reinterprets the bits. Math.abs(-7) takes exactly that path.
-      ;; `sign` and `trunc` are the only two here that do not also exist as an `OP-JSBUILTIN`. The
+      ;; `sign` and `trunc` are the only two here that do not also exist as an `OPTAG-JSBUILTIN`. The
       ;; other four have a descriptor-runtime implementation underneath — the library's contribution
       ;; to `MathFloor` is the `if (%IsInt v)` guard around `%FloorNum`, which is real but partial —
       ;; where `MathSign` and `MathTrunc` are the whole operation, written in the DSL and reachable
@@ -3182,9 +3357,9 @@
 
 (defn fng-select [(context FngContext) (predicate i64) (when-true i64) (when-false i64)] (-> i64)
   (let [entry (load (load (field context ctrl)))
-        arms (n-if-arms! (fng-peep (n-new2 OP-IF 0 entry predicate)))
-        region (n-new OP-REGION 0)
-        phi (n-new OP-PHI (t-int))]
+        arms (n-if-arms! (fng-peep (n-new2 (If) entry predicate)))
+        region (n-new (Region))
+        phi (n-new (Phi (t-int)))]
     (n-add-def! region NO-NODE)
     (n-add-def! region (arms-t arms))
     (n-add-def! region (arms-f arms))
@@ -3195,20 +3370,20 @@
     phi))
 
 (defn fng-min [(context FngContext) (left i64) (right i64)] (-> i64)
-  (fng-select context (fng-bin OP-LT left right) left right))
+  (fng-select context (fng-bin (Lt) left right) left right))
 
 (defn fng-max [(context FngContext) (left i64) (right i64)] (-> i64)
-  (fng-select context (fng-bin OP-LT left right) right left))
+  (fng-select context (fng-bin (Lt) left right) right left))
 
 (defn fng-slice-bound [(context FngContext) (raw i64) (length i64)] (-> i64)
-  (if (and (= (n-op raw) OP-CONST)
-           (and (ty-int-only? (n-aux raw)) (ty-const? (n-aux raw))))
-      (let [value (ty-int-lo (n-aux raw))]
+  (if (and (op-is? raw Const [_])
+           (and (ty-int-only? (n-const-type raw)) (ty-const? (n-const-type raw))))
+      (let [value (ty-int-lo (n-const-type raw))]
         (if (< value 0)
-            (fng-max context (fng-bin OP-ADD length raw) (fng-const 0))
+            (fng-max context (fng-bin (Add) length raw) (fng-const 0))
             (fng-min context raw length)))
-      (let [negative (fng-bin OP-LT raw (fng-const 0))
-            from-end (fng-max context (fng-bin OP-ADD length raw) (fng-const 0))
+      (let [negative (fng-bin (Lt) raw (fng-const 0))
+            from-end (fng-max context (fng-bin (Add) length raw) (fng-const 0))
             from-start (fng-min context raw length)]
         (fng-select context negative from-end from-start))))
 
@@ -3673,8 +3848,8 @@
                     ; function constant. Tag bits are disjoint from every other representation, so
                     ; raw 64-bit equality IS JavaScript function identity here — no StrictEqual
                     ; type ladder needed per arm.
-                    condition (fng-bin OP-EQ loaded (n-box! fun-node))
-                    arms (n-if-arms! (fng-peep (n-new2 OP-IF 0
+                    condition (fng-bin (Eq) loaded (n-box! fun-node))
+                    arms (n-if-arms! (fng-peep (n-new2 (If)
                                                       (load (load (field context ctrl)))
                                                       condition)))
                     branch-start (fng-snapshot! context
@@ -3744,7 +3919,7 @@
                                    (mut snapshots)
                                    (al-get [i64] (load arm-starts) 0))
             (store! answer (al-get [i64] (load arm-values) 0)))
-          (let [region (n-new OP-REGION 0)
+          (let [region (n-new (Region))
                 (mut memories) (al-new [i64] (malloc-allocator))
                 (mut arm) 0]
             (n-add-def! region NO-NODE)
@@ -3757,7 +3932,7 @@
             (loop (if (>= (load index) (al-len [i64] (load active)))
                       (break)
                       (let [alias (al-get [i64] (load active) (load index))
-                            phi (n-new OP-PHI (t-mem-alias alias (t-undef)))]
+                            phi (n-new (Phi (t-mem-alias alias (t-undef))))]
                         (n-add-def! phi region)
                         (store! arm 0)
                         (loop (if (>= (load arm) (al-len [i64] (load arm-ctrls)))
@@ -3775,7 +3950,7 @@
                 (store! (load (field context memory)) (fng-merge memories))
                 0)
             (store! (load (field context ctrl)) region)
-            (let [phi (n-new OP-PHI (t-dyn))]
+            (let [phi (n-new (Phi (t-dyn)))]
               (n-add-def! phi region)
               (store! arm 0)
               (loop (if (>= (load arm) (al-len [i64] (load arm-values)))
@@ -3915,11 +4090,25 @@
                   (fng-expression context (ts-child ast node 1))
                   (if receiver-aware
                   (if receiver-call
-                      (let [first (fng-expression context (ts-child ast callee-node 0))]
+                      (let [receiver-source (ts-child ast callee-node 0)
+                            ;; A METHOD ON A NUMBER HAS NO RECEIVER TO PASS. JavaScript boxes the
+                            ;; primitive into a wrapper object; this compiler has no wrapper
+                            ;; objects, and the receiver slot takes an object, a function or
+                            ;; undefined. `(acc / 4).toFixed(2)` put a raw `Div` in it and the
+                            ;; verifier rejected the Call afterwards -- a graph built wrong and
+                            ;; caught late, rather than a construct refused where it is written.
+                            ;; The declared type is read here because the built node's type is
+                            ;; still unanalysed at this point.
+                            _ (if (= (fng-infer context receiver-source FNG-DYNAMIC) FNG-NUMBER)
+                                  (fng-unsupported-syntax! "method receiver"
+                                                           (ts-kind ast node)
+                                                           (ts-text ast node))
+                                  0)
+                            first (fng-expression context receiver-source)]
                         (if (load (fng-omit-receiver-ptr))
                             (fng-undefined)
                             (if (load (fng-duplicate-receiver-ptr))
-                                (fng-expression context (ts-child ast callee-node 0))
+                                (fng-expression context receiver-source)
                                 first)))
                       (fng-undefined))
                   NO-NODE)))
@@ -3931,7 +4120,7 @@
               ; tagged receiver to raw-load through.
               (if (= (ty-kinds (n-ty raw-receiver)) VK-FUN)
                   (n-box! raw-receiver)
-                  (if (and (>= receiver-owner 0) (= (n-ty raw-receiver) (t-dyn)))
+                  (if (and (>= receiver-owner 0) (fng-value-tagged? raw-receiver))
                       (n-unbox! raw-receiver
                                 (t-obj-shape
                                   (al-get [i64] (load (load (field context shapes))) receiver-owner)))
@@ -3950,7 +4139,7 @@
                                                (ts-text ast (ts-child ast callee-node 1)))))
                           targets method-targets]
                       (if (> targets 0)
-                          (n-new2 OP-CAST (t-fun-set targets)
+                          (n-new2 (Cast (t-fun-set targets))
                                   (load (load (field context ctrl))) loaded)
                           loaded)))
                   (fng-expression context callee-node)))
@@ -3960,7 +4149,7 @@
         ;; runtime dispatch against a function the unit never built.
         direct-value-callee
           (and (< function-index 0)
-               (or (= (n-op target) OP-FUN) (= (n-op target) OP-CLOSURE)))
+               (or (op-is? target Fun [_]) (op-is? target Closure [_])))
         ;; The hidden environment argument. A generic site passes the callee value itself — a
         ;; closure is its own environment and a bare function ignores the slot. An exact site
         ;; passes the boxed closure value for a capture-carrying target and undefined otherwise.
@@ -3980,8 +4169,8 @@
         argument-function-index
           (if (or (>= argument-function-index 0) (not direct-value-callee))
               argument-function-index
-              (let [target-fun (if (= (n-op target) OP-CLOSURE) (n-in target 0) target)]
-                (fng-function-index frontend (- (n-aux target-fun) 1))))
+              (let [target-fun (if (op-is? target Closure [_]) (n-in target 0) target)]
+                (fng-function-index frontend (- (n-fun-index target-fun) 1))))
         argument-fn
           (if (>= argument-function-index 0)
               (al-get [FeFunction] (load (field frontend functions)) argument-function-index)
@@ -4023,7 +4212,7 @@
                                  (mut optional-symbols)
                                  (mut optional-active)
                                  (mut optional-snapshots))
-                arms (n-if-arms! (fng-peep (n-new2 OP-IF 0 saved-ctrl condition)))]
+                arms (n-if-arms! (fng-peep (n-new2 (If) saved-ctrl condition)))]
             (store! (load (field context ctrl)) (arms-t arms))
             (store! optional-nullish-ctrl (load (load (field context ctrl))))
             (store! optional-nullish-start
@@ -4076,11 +4265,11 @@
     ;; Recover that identity from the graph target before freezing the native call descriptor, so
     ;; omitted JavaScript arguments still arrive as `undefined` instead of uninitialised registers.
     (if (and (< argument-function-index 0)
-             (or (= (n-op target) OP-FUN) (= (n-op target) OP-CLOSURE)))
-        ;; OP-FUN reserves callable identity zero as invalid, so its aux is FeFunction.id + 1.
+             (or (op-is? target Fun [_]) (op-is? target Closure [_])))
+        ;; OPTAG-FUN reserves callable identity zero as invalid, so its aux is FeFunction.id + 1.
         ;; A Closure's function identity is its input 0.
-        (let [target-fun (if (= (n-op target) OP-CLOSURE) (n-in target 0) target)
-              target-function-index (fng-function-index frontend (- (n-aux target-fun) 1))]
+        (let [target-fun (if (op-is? target Closure [_]) (n-in target 0) target)
+              target-function-index (fng-function-index frontend (- (n-fun-index target-fun) 1))]
           (if (>= target-function-index 0)
               (let [target-fn
                       (al-get [FeFunction]
@@ -4116,20 +4305,25 @@
     (let [callable-target
             (let [resolved-target (if (= target NO-NODE) (fng-undefined) target)]
               (if conditional-optional
-                  (n-new2 OP-CAST (t-fun) (load (load (field context ctrl))) resolved-target)
+                  (n-new2 (Cast (t-fun)) (load (load (field context ctrl))) resolved-target)
                   resolved-target))
           ; Every JavaScript call uses the receiver form — a plain `f(x)` passes undefined in the
           ; reserved receiver slot. A call whose target is not statically known is marked DYNAMIC
           ; so selection always dispatches the runtime callee value.
           call
-            (let [site (n-call-receiver! (load (load (field context ctrl)))
+            (let [_ (if (fng-valid-receiver? receiver)
+                        0
+                        (fng-unsupported-syntax! "method receiver"
+                                                 (ts-kind ast node)
+                                                 (ts-text ast node)))
+                  site (n-call-receiver! (load (load (field context ctrl)))
                                          callable-target
                                          call-env
                                          (if (= receiver NO-NODE) (fng-undefined) receiver)
                                          (al-slice [i64] (load args)))]
               (if (and (< function-index 0)
                        (and (not conditional-optional) (not direct-value-callee)))
-                  (do (n-set-aux! (call-value site) CALL-ABI-DYNAMIC-RECEIVER) 0)
+                  (do (n-set-op! (call-value site) (Call CALL-ABI-DYNAMIC-RECEIVER)) 0)
                   0)
               (load site))
           value (call-value call)]
@@ -4144,11 +4338,10 @@
                               (fe-type-index-for-node frontend (load (field fn result-node)))
                               -1)]
                     (if (>= result-owner 0)
-                        (n-new2 OP-CAST
-                                (t-obj-shape
+                        (n-new2 (Cast (t-obj-shape
                                   (al-get [i64]
                                           (load (load (field context shapes)))
-                                          result-owner))
+                                          result-owner)))
                                 (load (load (field context ctrl)))
                                 value)
                         (fng-pin-after-call! context value receiver)))
@@ -4175,7 +4368,7 @@
                         (= present-ctrl NO-NODE)
                           (store! answer (n-box! (fng-undefined)))
                         :else
-                          (let [phi (n-new OP-PHI (t-dyn))]
+                          (let [phi (n-new (Phi (t-dyn)))]
                             (n-add-def! phi (load (load (field context ctrl))))
                             (n-add-def! phi (n-box! (fng-undefined)))
                             (n-add-def! phi present-value)
@@ -4254,6 +4447,37 @@
         (fng-intrinsic-call context node intrinsic)
         (fng-user-call context node)))))
 
+;; A SPREAD IN AN OBJECT LITERAL IS SILENTLY DROPPED, so it is refused here instead.
+;;
+;; `fe-index-object-layouts!` gives a literal a static shape only when every property is a plain
+;; `TSK-PROPERTY-ASSIGNMENT`; a spread element is a different kind, so the literal gets no layout
+;; and the spread contributes nothing. `{...a, y: 2}` then had a shape carrying `y` and not `x`,
+;; and reading `b.x` stopped the evaluator with "an object's shape does not carry that field".
+;;
+;; This is the same defect the ARRAY spread had, and it was fixed the same way: the bridge maps
+;; unenumerated syntax to kind 0, `[...a, 3]` silently evaluated to length 2, and the repair was to
+;; make the drop loud rather than to guess at semantics. `Object.assign({}, a, {y: 2})` -- the same
+;; operation spelled without spread -- is supported and is the workaround.
+;;
+;; A shorthand property (`{x}`) is also not a `TSK-PROPERTY-ASSIGNMENT`, so it is named here too
+;; rather than being lumped in with spread: whatever this refuses, it says exactly what it saw.
+;; repros/open/object-spread-narrows-without-proof.js.
+(defn fng-refuse-object-spread! [(context FngContext) (node i64)] (-> i64)
+  (let [frontend (load (field context frontend))
+        ast (field frontend ast)
+        (mut index) 0]
+    (loop (if (>= (load index) (ts-child-count ast node))
+              (break)
+              (let [property (ts-child ast node (load index))]
+                (if (= (ts-kind ast property) TSK-PROPERTY-ASSIGNMENT)
+                    0
+                    (fng-unsupported-syntax! "object literal element"
+                                             (ts-kind ast property)
+                                             (ts-text ast property)))
+                (store! index (+ (load index) 1))
+                0)))
+    0))
+
 (defn fng-object [(context FngContext) (node i64) (owner i64)] (-> i64)
   (let [frontend (load (field context frontend))
         ast (field frontend ast)
@@ -4301,7 +4525,13 @@
                                                   (fng-box-dynamic-argument! field-value)
                                                   field-value))
                                             alias)))
-                      (al-push! [i64] (mut stores) (fng-current-memory context alias)))
+                      ;; Compatible fields in different structural declarations deliberately share
+                      ;; an alias.  If this shape supplies that alias, its Store above is the new
+                      ;; state: retaining an older declaration's state as a second MemMerge input
+                      ;; makes a later lookup select the stale object's chain.
+                      (if (= (shape-field-by-alias shape alias) SHAPE-NO-FIELD)
+                          (al-push! [i64] (mut stores) (fng-current-memory context alias))
+                          0))
                   (store! index (+ (load index) 1)))))
       (if (> (al-len [FeCapture] (load (field frontend captures))) 0)
           (al-push! [i64]
@@ -4353,13 +4583,24 @@
     (loop (if (>= (load index) (ts-child-count ast node))
               (break)
               (let [element (ts-child ast node (load index))]
-                (if (!= (ts-kind ast element) 0)
+                ;; TWO DIFFERENT THINGS ARRIVE AS BRIDGE KIND 0, and skipping both is how
+                ;; `[...a, 3]` came to evaluate to length 2 where node says 3 -- a wrong answer
+                ;; with no diagnostic anywhere. An ELISION is kind 0 with an EMPTY extent, and
+                ;; skipping it is right: `[1, , 3]` really does have a hole at index 1, and the
+                ;; `ResizeArray` below still counts it. Any other kind 0 is syntax the bridge does
+                ;; not enumerate -- a spread element is the reachable case -- and it has real
+                ;; source text, which is the only thing here that separates the two.
+                (if (= (ts-kind ast element) 0)
+                    (if (> (slice-len (ts-text ast element)) 0)
+                        (fng-unsupported-syntax! "array element"
+                                                 (ts-kind ast element)
+                                                 (ts-text ast element))
+                        0)
                     (let [value (fng-expression context element)
                           stored
                             (fng-jsl-call3 context "SetElement" array
                                            (fng-const (load index)) value)]
-                      0)
-                    0)
+                      0))
                 (store! index (+ (load index) 1)))))
     (let [resized
             (fng-jsl-call3 context "ResizeArray" array
@@ -4398,8 +4639,8 @@
         ;; against the interned `(t-dyn)` never matches here.
         lexical-this
           (and (= (ts-kind ast object-node) TSK-THIS)
-               (and (!= (n-op raw-object) OP-PARM)
-                    (!= (n-op raw-object) OP-CAST)))
+               (and (not (op-is? raw-object Parm [_]))
+                    (not (op-is? raw-object Cast [_]))))
         object
           ;; The dyn test is STRUCTURAL (fng-tagged-dynamic-value?), not a seed-type read: a
           ;; fresh Load's type is not computed until inference runs, and `w.inner` — a field
@@ -4407,13 +4648,21 @@
           ;; while the test compared the seed against the interned (t-dyn).
           (if (and (>= field-owner 0)
                    (or lexical-this
-                       (and (or (= (n-ty raw-object) (t-dyn))
-                                (fng-tagged-dynamic-value? raw-object))
-                            (and (!= (n-op raw-object) OP-CAST)
+                       (and (fng-value-tagged? raw-object)
+                            (and (not (op-is? raw-object Cast [_]))
                                  (!= (ts-kind ast object-node) TSK-THIS)))))
-              (n-unbox! raw-object
-                        (t-obj-shape
-                          (al-get [i64] (load (load (field context shapes))) field-owner)))
+              ;; A GENERIC OBJECT, NOT `field-owner`'S SHAPE. `field-owner` comes from
+              ;; `fng-unique-field-index`, which accepts any field of the right NAME whose local
+              ;; index matches -- so two shapes that both begin with `x` share one entry and the
+              ;; FIRST owner wins. That approximation is sound for the load, which needs only the
+              ;; alias and the offset, and it is a lie about which object this is.
+              ;;
+              ;; An `Unbox` target is CHECKED by the evaluator, so the lie stopped the program:
+              ;; `{x: acc}` nested inside `{inner: {x: acc}}` was unboxed as the OUTER shape
+              ;; (`Unbox : obj@4` over an `obj@2`) and failed with "an Unbox input did not satisfy
+              ;; its requested type". Asking only for the representation keeps the part that is
+              ;; true. repros/nested-object-write-after-an-object-literal.js.
+              (n-unbox! raw-object (t-obj))
               raw-object)]
     (if (and (= owner FNG-STRING) (str-eq (ts-text ast name-node) "length"))
         (fng-jsl-call1 context "StringLength" object)
@@ -4425,7 +4674,20 @@
                                (fng-const (shape-name-intern! (ts-text ast name-node))))
                 (let [alias (al-get [i64] (load (load (field context aliases))) field-index)
                       shape (al-get [i64] (load (load (field context shapes))) field-owner)
-                      cast-node (n-new2 OP-CAST (t-obj-shape shape) (load (load (field context ctrl))) object)]
+                      ;; `owner < 0` MEANS THE SHAPE IS A GUESS, and this line already knew it: the
+                      ;; memory below switches to `fng-compatible-field-memory` for exactly that
+                      ;; case, because `field-owner` then comes from `fng-unique-field-index` --
+                      ;; any field of the right NAME at a matching local index, first owner wins.
+                      ;; The Cast was asserting that guess as fact, so `{x: acc}` inside
+                      ;; `{inner: {x: acc}}` was cast to the OUTER shape and the evaluator stopped
+                      ;; with "a Cast was not satisfied: the compiler narrowed without proof".
+                      ;;
+                      ;; The alias carries the offset either way, so dropping to a plain object
+                      ;; type costs precision and nothing else.
+                      ;; repros/nested-object-write-after-an-object-literal.js.
+                      cast-node (n-new2 (Cast (if (< owner 0) (t-obj) (t-obj-shape shape)))
+                                        (load (load (field context ctrl)))
+                                        object)]
                   (n-load! (if (< owner 0)
                                (fng-compatible-field-memory context name-node field-index)
                                (fng-current-memory context alias))
@@ -4454,7 +4716,7 @@
     (fng-active-memory! context (mut active))
     (fng-control-aliases! context (mut active))
     (let [saved-start (fng-snapshot! context (mut symbols) (mut active) (mut snapshots))
-          arms (n-if-arms! (fng-peep (n-new2 OP-IF 0 saved-ctrl condition)))]
+          arms (n-if-arms! (fng-peep (n-new2 (If) saved-ctrl condition)))]
       (store! (load (field context ctrl)) (arms-t arms))
       (let [nullish-value (n-box! (fng-undefined))
             nullish-ctrl (load (load (field context ctrl)))
@@ -4471,7 +4733,7 @@
               (cond (= nullish-ctrl NO-NODE) (store! answer present-value)
                     (= present-ctrl NO-NODE) (store! answer nullish-value)
                     :else
-                      (let [phi (n-new OP-PHI (t-dyn))]
+                      (let [phi (n-new (Phi (t-dyn)))]
                         (n-add-def! phi (load (load (field context ctrl))))
                         (n-add-def! phi nullish-value)
                         (n-add-def! phi present-value)
@@ -4567,6 +4829,38 @@
                     0)))))
     (load value)))
 
+;; THE OBJECT OPERAND OF A FIELD ACCESS HAS TO BE A RAW POINTER, and a `Cast` does not make it
+;; one: `Cast` relabels the TYPE and leaves the machine word alone. When the object itself came
+;; out of a `dyn` slot -- `o.inner.x` where `inner` is a tagged field -- the word is a boxed value
+;; and the Store below took a tagged pointer (`Cast is tagged, needs raw-ptr`). The unbox has to
+;; happen before the cast.
+;;
+;; ASSERT ONLY WHAT IS PROVEN. `fng-lvalue` records a shape from `fng-unique-field-index`, which
+;; accepts any field of the right NAME whose local index matches -- so two shapes that both begin
+;; with `x` share one entry and the FIRST owner wins. That approximation is sound for the load and
+;; the store, which need only the alias and the offset, and it is a lie about which object this is.
+;;
+;; The evaluator checks both `Unbox` targets and `Cast` targets, so the lie stopped the program
+;; either way: first as `Unbox : obj@4` over an `obj@2` ("an Unbox input did not satisfy its
+;; requested type"), then, once the unbox was made generic, as the Cast ("a Cast was not satisfied:
+;; the compiler narrowed without proof"). So when the object arrives tagged -- the case where the
+;; frontend is working from the approximate shape rather than a known allocation -- neither the
+;; unbox nor the cast names a shape. Only the representation is claimed, which is the part that is
+;; true, and the alias still carries the offset.
+;;
+;; Both the read and the write build this, so they build it here. The write was the half the
+;; verifier rejected, because `v-rep-slot-required` pins the Store's pointer slot and not the
+;; Load's -- which made the read look correct rather than making it correct.
+;; repros/nested-object-write-after-an-object-literal.js.
+(defn fng-object-pointer [(context FngContext) (shape i64) (object i64)] (-> i64)
+  (if (fng-value-tagged? object)
+      (n-new2 (Cast (t-obj))
+              (load (load (field context ctrl)))
+              (n-unbox! object (t-obj)))
+      (n-new2 (Cast (t-obj-shape shape))
+              (load (load (field context ctrl)))
+              object)))
+
 (defn fng-lvalue-read [(context FngContext) (value FngLValue)] (-> i64)
   (if (= (load (field value kind)) FNG-LVALUE-LOCAL)
       (fng-symbol-node context (load (field value symbol)))
@@ -4575,11 +4869,9 @@
               (fng-jsl-call2 context "GetNamedProperty"
                              (load (field value object))
                              (fng-const (load (field value key))))
-              (let [cast-node
-                      (n-new2 OP-CAST
-                              (t-obj-shape (load (field value shape)))
-                              (load (load (field context ctrl)))
-                              (load (field value object)))]
+              (let [cast-node (fng-object-pointer context
+                                                  (load (field value shape))
+                                                  (load (field value object)))]
                 (n-load! (fng-current-memory context (load (field value alias)))
                          cast-node
                          (load (field value alias)))))
@@ -4629,7 +4921,7 @@
     (fng-active-memory! context (mut active))
     (fng-control-aliases! context (mut active))
     (let [saved-start (fng-snapshot! context (mut symbols) (mut active) (mut snapshots))
-          arms (n-if-arms! (fng-peep (n-new2 OP-IF 0 saved-ctrl condition)))]
+          arms (n-if-arms! (fng-peep (n-new2 (If) saved-ctrl condition)))]
       (store! (load (field context ctrl)) (arms-t arms))
       (let [nullish-value (n-box! (fng-undefined))
             nullish-ctrl (load (load (field context ctrl)))
@@ -4646,7 +4938,7 @@
               (cond (= nullish-ctrl NO-NODE) (store! answer present-value)
                     (= present-ctrl NO-NODE) (store! answer nullish-value)
                     :else
-                      (let [phi (n-new OP-PHI (t-dyn))]
+                      (let [phi (n-new (Phi (t-dyn)))]
                         (n-add-def! phi (load (load (field context ctrl))))
                         (n-add-def! phi nullish-value)
                         (n-add-def! phi present-value)
@@ -4667,18 +4959,17 @@
                              (fng-const (load (field target key)))
                              new-value)
               (let [alias (load (field target alias))
-                    cast-node
-                      (n-new2 OP-CAST
-                              (t-obj-shape (load (field target shape)))
-                              (load (load (field context ctrl)))
-                              (load (field target object)))
-                    stored-value
-                      (if (= (shape-alias-ty alias) (t-dyn))
-                          (fng-box-dynamic-argument! new-value)
-                          (if (and (= (shape-alias-ty alias) (t-flt))
-                                   (= (n-ty new-value) (t-dyn)))
-                              (n-unbox! new-value (t-flt))
-                              new-value))
+                    cast-node (fng-object-pointer context
+                                                (load (field target shape))
+                                                (load (field target object)))
+                    ;; THE SLOT'S REPRESENTATION DECIDES, not an exact match on its type id. The
+                    ;; test here used to be `(= (shape-alias-ty alias) (t-flt))`, which is one of
+                    ;; the several types `shape-alias-rep` calls raw: a field typed `int`, `bool`
+                    ;; or a numeric union took the fallthrough and a boxed value went straight
+                    ;; into a raw slot. That is invisible until the verifier runs, and only
+                    ;; because the verifier was already classifying by representation -- the two
+                    ;; now read the same function. See repros/field-copy-stays-boxed.js.
+                    stored-value (fng-coerce-to-alias alias new-value)
                     stored
                       (n-store! (fng-current-memory context alias) cast-node stored-value alias)
                     (mut memories) (al-new [i64] (malloc-allocator))
@@ -4710,19 +5001,31 @@
         ast (field frontend ast)
         target (fng-lvalue context (ts-child ast node 0))
         raw-old (fng-lvalue-read context target)
-        dynamic (= (fng-infer context (ts-child ast node 0) FNG-DYNAMIC) FNG-DYNAMIC)
+        ;; ASK THE VALUE, NOT ITS DECLARED TYPE. This tested `fng-infer ... = FNG-DYNAMIC`, which is
+        ;; a claim about the SOURCE and not about the machine word: every `Math.*` call returns a
+        ;; `ToNumber`, which is tagged, while inference reports the local as a plain number. So
+        ;; `Math.trunc(x)` followed by `i++` skipped the unbox and fed a tagged word to an Add that
+        ;; needs a raw one -- `Add slot 1 <- ToNumber is tagged, needs raw-num`.
+        ;;
+        ;; `fng-machine-number-value?` is the question actually being asked: does this value carry
+        ;; a raw machine number? It follows the graph with fuel instead of trusting a seed type,
+        ;; which is what a representation decision requires. Same lesson as `fng-loose-equal`.
+        ;; repros/truncate-then-increment-stays-tagged.js.
+        raw-number (fng-machine-number-value? raw-old 8)
         old
-          (if dynamic
-              (n-unbox! raw-old (t-flt))
-              raw-old)
+          (if raw-number
+              raw-old
+              (n-unbox! raw-old (t-flt)))
         text (ts-text ast node)
         length (slice-len text)
         operator
           (if prefix
               (if (>= length 2) (substr text 0 2) "")
               (if (>= length 2) (substr text (- length 2) length) ""))
-        numeric-value (fng-bin (if (str-eq operator "++") OP-ADD OP-SUB) old (fng-const 1))
-        value (if dynamic (n-box! numeric-value) numeric-value)]
+        numeric-value (fng-bin (if (str-eq operator "++") (Add) (Sub)) old (fng-const 1))
+        ;; Write back in the representation the local already had, so a later read is consistent
+        ;; with every other reader of the same symbol.
+        value (if raw-number numeric-value (n-box! numeric-value))]
     (fng-lvalue-write context target value)
     (if prefix value raw-old)))
 
@@ -4762,7 +5065,7 @@
             (fng-control-aliases! context (mut active)))
         0)
     (let [saved-start (fng-snapshot! context (mut changed) (mut active) (mut snapshots))
-          arms (n-if-arms! (fng-peep (n-new2 OP-IF 0 saved-ctrl condition)))]
+          arms (n-if-arms! (fng-peep (n-new2 (If) saved-ctrl condition)))]
       (store! (load (field context ctrl)) (arms-t arms))
       (let [raw-then-value (if (= then-node -1) then-fixed (fng-expression context then-node))
             then-value (if box-arms (n-box! raw-then-value) raw-then-value)
@@ -4781,7 +5084,7 @@
               (cond (= then-ctrl NO-NODE) (store! answer else-value)
                     (= else-ctrl NO-NODE) (store! answer then-value)
                     :else
-                      (let [value-phi (n-new OP-PHI (t-dyn))]
+                      (let [value-phi (n-new (Phi (t-dyn)))]
                         (n-add-def! value-phi (load (load (field context ctrl))))
                         (n-add-def! value-phi then-value)
                         (n-add-def! value-phi else-value)
@@ -4792,14 +5095,33 @@
     (al-free! [i64] (mut snapshots))
     (load answer)))
 
+;; A TYPED CONTEXT IS A REPRESENTATION BOUNDARY, decided HERE from the DECLARED type, because the
+;; declaration is the one fact available while the graph is still being built. The value's shape
+;; cannot decide it: the DSL's arithmetic returns its result TAGGED behind guards that have not
+;; folded yet -- `n + 1` at this point is a `Phi dyn` over the concat and numeric arms -- so a
+;; shape test written against the folded boxed-Add shape never fires. (`fng-return-representation` was
+;; exactly that test; it matched nothing, and `main` returned a NaN-boxed word to a native caller
+;; expecting a raw number.)
+;;
+;; This used to live inside the identifier case only, which coerced `return n` and left `return
+;; n + 1` tagged. It applies to EVERY expression a number-typed context consumes: `fng-number-value`
+;; leaves alone what is already raw, so a literal or raw arithmetic chain costs nothing, and a
+;; tagged value takes the DSL's `ToNumberValue`, whose guards fold against the producer's own
+;; boxing once analysis proves the types.
 (defn fng-expression-expected [(context FngContext) (node i64) (expected i64)] (-> i64)
+  (let [value (fng-expression-lowered context node expected)]
+    (if (and (= expected FNG-NUMBER) (!= value NO-NODE))
+        (fng-number-value context node value)
+        value)))
+
+(defn fng-expression-lowered [(context FngContext) (node i64) (expected i64)] (-> i64)
   (let [frontend (load (field context frontend))
         ast (field frontend ast)
         kind (ts-kind ast node)]
     (cond (= kind TSK-IDENTIFIER)
             (let [symbol (fe-resolution-symbol frontend node)]
               (cond (= symbol FE-INTRINSIC-UNDEFINED) (fng-undefined)
-                    (= symbol FE-INTRINSIC-NAN) (n-new1 OP-CONST (t-flt-bits JSV-NAN) (g-start))
+                    (= symbol FE-INTRINSIC-NAN) (n-new1 (Const (t-flt-bits JSV-NAN)) (g-start))
                     (= symbol FE-INTRINSIC-INFINITY) (fng-jsl-call0 context "Infinity")
                     (< symbol 0) NO-NODE
                     :else
@@ -4816,13 +5138,7 @@
                                       (al-get [i64] (load (load (field context functions))) declaration)
                                       stored)
                                   stored)]
-                        ;; Parameter nodes use the tagged JavaScript call ABI. When a typed
-                        ;; context consumes a numeric identifier directly (object fields,
-                        ;; annotated initializers, and returns), make the representation boundary
-                        ;; explicit just as arithmetic lowering does.
-                        (if (= expected FNG-NUMBER)
-                            (fng-number-value context node value)
-                            value))))
+                        value)))
           (= kind TSK-THIS) (load (field context receiver))
           (= kind TSK-NUMERIC-LITERAL)
             (fng-numeric-literal ast node)
@@ -4841,24 +5157,48 @@
                   (fng-update-local context node true)
                   (let [source (ts-child ast node 0)
                         value (fng-expression context source)]
-                    (cond (str-eq operator "+") value
+                    ;; UNARY `+` IS ToNumber, NOT A NO-OP. This returned the operand unchanged,
+                    ;; which is right for a number and wrong for everything else: `+String(acc)`
+                    ;; handed a string straight to the arithmetic that consumed it. The same
+                    ;; guarded coercion unary `-` already uses is what this needs, and
+                    ;; `fng-number-value` exempts values that are already machine numbers, so
+                    ;; `+x` on a number still costs nothing.
+                    ;; repros/unary-plus-does-not-coerce.js.
+                    ;; UNARY `+` IS ToNumber, NOT A NO-OP. This returned the operand unchanged,
+                    ;; which is right for a number and wrong for everything else: `+String(acc)`
+                    ;; handed a string straight to the arithmetic that consumed it.
+                    ;;
+                    ;; `fng-number-value` is not enough either, because `fng-needs-to-number?`
+                    ;; asks whether the value is `dyn` -- and a string is not `dyn`, so it was
+                    ;; waved through a second time. The question is whether the value IS a number,
+                    ;; which is what `fng-machine-number-value?` answers; `ToNumberValue` carries
+                    ;; the spec's own "already a Number" step, so the guarded call costs nothing on
+                    ;; the numeric path. Same lesson as `fng-loose-equal`.
+                    ;; repros/unary-plus-does-not-coerce.js.
+                    (cond (str-eq operator "+")
+                            (if (= (fng-infer context source FNG-DYNAMIC) FNG-STRING)
+                                ;; The same lowering `Number(x)` uses, BOXING FIRST. Reaching
+                                ;; `ToNumberValue` through `fng-to-number-operand` instead --
+                                ;; which passes the operand unboxed, because its callers hand it
+                                ;; an already-tagged `dyn` -- left the string's node collected out
+                                ;; from under the inlined macro and produced `VERR-DEAD-INPUT`.
+                                (n-unbox! (fng-jsl-call1 context "ToNumberValue" (n-box! value))
+                                          (t-flt))
+                                value)
                           (str-eq operator "!")
-                            (fng-bin OP-EQ
+                            (fng-bin (Eq)
                                      (if (= (fng-infer context source FNG-DYNAMIC) FNG-STRING)
                                          (fng-jsl-call1 context "StringLength" value)
                                          value)
                                      (fng-const 0))
-                          ;; The operand must go through the same guarded ToNumber as binary
-                          ;; arithmetic: a raw OP-SUB on a tagged dynamic value negates the NaN-box
-                          ;; BITS (x[1] = -x[5] zeroed the cell when the element was float-boxed —
-                          ;; low32 of a negated double is 0). fng-number-value exempts values that
-                          ;; are already machine numbers, so `-(a*b)` stays direct.
+                          ;; UNARY `-` IS THE DSL'S `JsNegate`, the last arithmetic operator that
+                          ;; was still hand-written here as `Sub(0, ToNumber(x))`. Same argument
+                          ;; as the binary operators at `fng-arith2`: the coercion is ECMAScript's,
+                          ;; and the guards fold to a bare negate when the operand proves numeric.
                           (str-eq operator "-")
-                            (fng-bin OP-SUB (fng-const 0)
-                                     (fng-number-value context source value))
+                            (fng-arith1 context "JsNegate" value)
                           (str-eq operator "~")
-                            (n-new2 OP-BITNOT 0 NO-NODE
-                                    (fng-int-value context source value))
+                            (fng-bitwise1 context "BitwiseNot" value)
                           :else NO-NODE))))
           (= kind TSK-POSTFIX-UNARY) (fng-update-local context node false)
           (= kind TSK-VOID-EXPRESSION)
@@ -4940,55 +5280,27 @@
                             value
                               (cond (str-eq operator "=") right
                                     (str-eq operator "+=")
-                                      (if (and (not (load (fng-numeric-string-add-ptr)))
-                                               (or (= (fng-infer context left-node FNG-DYNAMIC) FNG-STRING)
-                                                   (= (fng-infer context right-node FNG-DYNAMIC) FNG-STRING)))
-                                          (fng-jsl-call2 context "StringConcat"
-                                                         (fng-string-coerce context left-node left)
-                                                         (fng-string-coerce context right-node right))
-                                          (fng-bin OP-ADD
-                                                   (fng-number-value context left-node left)
-                                                   (fng-number-value context right-node right)))
+                                      (fng-arith2 context "JsAdd" left right)
                                     (str-eq operator "-=")
-                                      (fng-bin OP-SUB
-                                               (fng-number-value context left-node left)
-                                               (fng-number-value context right-node right))
+                                      (fng-arith2 context "JsSub" left right)
                                     (str-eq operator "*=")
-                                      (fng-bin OP-MUL
-                                               (fng-number-value context left-node left)
-                                               (fng-number-value context right-node right))
+                                      (fng-arith2 context "JsMul" left right)
                                     (str-eq operator "/=")
-                                      (fng-bin OP-DIV
-                                               (fng-number-value context left-node left)
-                                               (fng-number-value context right-node right))
+                                      (fng-arith2 context "JsDiv" left right)
                                     (str-eq operator "%=")
-                                      (fng-bin OP-MOD
-                                               (fng-number-value context left-node left)
-                                               (fng-number-value context right-node right))
+                                      (fng-arith2 context "JsMod" left right)
                                     (str-eq operator "&=")
-                                      (fng-bin OP-BITAND
-                                               (fng-int-value context left-node left)
-                                               (fng-int-value context right-node right))
+                                      (fng-bitwise2 context "BitwiseAnd" left right)
                                     (str-eq operator "|=")
-                                      (fng-bin OP-BITOR
-                                               (fng-int-value context left-node left)
-                                               (fng-int-value context right-node right))
+                                      (fng-bitwise2 context "BitwiseOr" left right)
                                     (str-eq operator "^=")
-                                      (fng-bin OP-BITXOR
-                                               (fng-int-value context left-node left)
-                                               (fng-int-value context right-node right))
+                                      (fng-bitwise2 context "BitwiseXor" left right)
                                     (str-eq operator "<<=")
-                                      (fng-bin OP-SHL
-                                               (fng-int-value context left-node left)
-                                               (fng-int-value context right-node right))
+                                      (fng-bitwise2 context "ShiftLeft" left right)
                                     (str-eq operator ">>=")
-                                      (fng-bin OP-SHR
-                                               (fng-int-value context left-node left)
-                                               (fng-int-value context right-node right))
+                                      (fng-bitwise2 context "ShiftRight" left right)
                                     :else
-                                      (fng-bin OP-USHR
-                                               (fng-int-value context left-node left)
-                                               (fng-int-value context right-node right)))]
+                                      (fng-bitwise2 context "ShiftRightUnsigned" left right))]
                         (if (= value NO-NODE)
                             (do (panic-corrupt (ts-text ast node)) 0)
                             0)
@@ -4996,89 +5308,52 @@
                       (let [left (fng-expression context left-node)
                             right (fng-expression context right-node)]
                         (cond (str-eq operator "+")
-                                (if (and (not (load (fng-numeric-string-add-ptr)))
-                                         (or (= (fng-infer context left-node FNG-DYNAMIC) FNG-STRING)
-                                             (= (fng-infer context right-node FNG-DYNAMIC) FNG-STRING)))
-                                    (fng-jsl-call2 context "StringConcat"
-                                                   (fng-string-coerce context left-node left)
-                                                   (fng-string-coerce context right-node right))
-                                    (fng-bin OP-ADD
-                                             (fng-number-value context left-node left)
-                                             (fng-number-value context right-node right)))
+                                (fng-arith2 context "JsAdd" left right)
                               (str-eq operator "-")
-                                (fng-bin OP-SUB
-                                         (fng-number-value context left-node left)
-                                         (fng-number-value context right-node right))
+                                (fng-arith2 context "JsSub" left right)
                               (str-eq operator "*")
-                                (fng-bin OP-MUL
-                                         (fng-number-value context left-node left)
-                                         (fng-number-value context right-node right))
+                                (fng-arith2 context "JsMul" left right)
                               (str-eq operator "/")
-                                (fng-bin OP-DIV
-                                         (fng-number-value context left-node left)
-                                         (fng-number-value context right-node right))
+                                (fng-arith2 context "JsDiv" left right)
                               (str-eq operator "%")
-                                (fng-bin OP-MOD
-                                         (fng-number-value context left-node left)
-                                         (fng-number-value context right-node right))
+                                (fng-arith2 context "JsMod" left right)
                               (str-eq operator "&")
-                                (fng-bin OP-BITAND
-                                         (fng-int-value context left-node left)
-                                         (fng-int-value context right-node right))
+                                (fng-bitwise2 context "BitwiseAnd" left right)
                               (str-eq operator "|")
-                                (fng-bin OP-BITOR
-                                         (fng-int-value context left-node left)
-                                         (fng-int-value context right-node right))
+                                (fng-bitwise2 context "BitwiseOr" left right)
                               (str-eq operator "^")
-                                (fng-bin OP-BITXOR
-                                         (fng-int-value context left-node left)
-                                         (fng-int-value context right-node right))
+                                (fng-bitwise2 context "BitwiseXor" left right)
                               (str-eq operator "<<")
-                                (fng-bin OP-SHL
-                                         (fng-int-value context left-node left)
-                                         (fng-int-value context right-node right))
+                                (fng-bitwise2 context "ShiftLeft" left right)
                               (str-eq operator ">>")
-                                (fng-bin OP-SHR
-                                         (fng-int-value context left-node left)
-                                         (fng-int-value context right-node right))
+                                (fng-bitwise2 context "ShiftRight" left right)
                               (str-eq operator ">>>")
-                                (fng-bin OP-USHR
-                                         (fng-int-value context left-node left)
-                                         (fng-int-value context right-node right))
+                                (fng-bitwise2 context "ShiftRightUnsigned" left right)
+                              ;; THE RELATIONAL OPERATORS ARE THE DSL'S, not four hand-written
+                              ;; shapes. Each was a static test -- "did inference say both sides
+                              ;; are strings?" -- with a numeric compare as the fallback, over a
+                              ;; coercion helper that only fires on `dyn`. A string beside a number
+                              ;; matched neither, and `"5" < 6` stopped the evaluator where node
+                              ;; says true.
+                              ;;
+                              ;; `>` and `>=` are the same operations with the operands swapped,
+                              ;; which is what the spec says they are; `<=` is NOT `not (< )` and
+                              ;; has its own definition, because that identity is false for NaN.
+                              ;; See docs/DSL-OWNERSHIP.md.
                               (str-eq operator "<")
-                                (if (and (= (fng-infer context left-node FNG-DYNAMIC) FNG-STRING)
-                                         (= (fng-infer context right-node FNG-DYNAMIC) FNG-STRING))
-                                    (fng-bin OP-LT (fng-jsl-call2 context "StringCompare" left right) (fng-const 0))
-                                    (fng-bin OP-LT
-                                             (fng-number-value context left-node left)
-                                             (fng-number-value context right-node right)))
+                                (fng-relational context "IsLessThan" left right)
                               (str-eq operator "<=")
-                                (if (and (= (fng-infer context left-node FNG-DYNAMIC) FNG-STRING)
-                                         (= (fng-infer context right-node FNG-DYNAMIC) FNG-STRING))
-                                    (fng-bin OP-LE (fng-jsl-call2 context "StringCompare" left right) (fng-const 0))
-                                    (fng-bin OP-LE
-                                             (fng-number-value context left-node left)
-                                             (fng-number-value context right-node right)))
+                                (fng-relational context "IsLessEqual" left right)
                               (str-eq operator ">")
-                                (if (and (= (fng-infer context left-node FNG-DYNAMIC) FNG-STRING)
-                                         (= (fng-infer context right-node FNG-DYNAMIC) FNG-STRING))
-                                    (fng-bin OP-LT (fng-const 0) (fng-jsl-call2 context "StringCompare" left right))
-                                    (fng-bin OP-LT
-                                             (fng-number-value context right-node right)
-                                             (fng-number-value context left-node left)))
+                                (fng-relational context "IsLessThan" right left)
                               (str-eq operator ">=")
-                                (if (and (= (fng-infer context left-node FNG-DYNAMIC) FNG-STRING)
-                                         (= (fng-infer context right-node FNG-DYNAMIC) FNG-STRING))
-                                    (fng-bin OP-LE (fng-const 0) (fng-jsl-call2 context "StringCompare" left right))
-                                    (fng-bin OP-LE
-                                             (fng-number-value context right-node right)
-                                             (fng-number-value context left-node left)))
+                                (fng-relational context "IsLessEqual" right left)
                               (str-eq operator "===")
                                 (cond (and (= (fng-infer context left-node FNG-DYNAMIC) FNG-NUMBER)
                                            (and (= (fng-infer context right-node FNG-DYNAMIC) FNG-NUMBER)
                                                 (and (!= (n-ty left) (t-dyn))
                                                      (!= (n-ty right) (t-dyn)))))
-                                        (fng-bin OP-EQ left right)
+                                        (fng-bin (Eq) left right)
                                       (and (= (fng-infer context left-node FNG-DYNAMIC) FNG-STRING)
                                            (= (fng-infer context right-node FNG-DYNAMIC) FNG-STRING))
                                         (fng-jsl-call2 context "StringEquals" left right)
@@ -5092,7 +5367,7 @@
                                                    (and (= (fng-infer context right-node FNG-DYNAMIC) FNG-NUMBER)
                                                         (and (!= (n-ty left) (t-dyn))
                                                              (!= (n-ty right) (t-dyn)))))
-                                                (fng-bin OP-EQ left right)
+                                                (fng-bin (Eq) left right)
                                               (and (= (fng-infer context left-node FNG-DYNAMIC) FNG-STRING)
                                                    (= (fng-infer context right-node FNG-DYNAMIC) FNG-STRING))
                                                 (fng-jsl-call2 context "StringEquals" left right)
@@ -5100,7 +5375,7 @@
                                                 (fng-jsl-call2 context "StrictEqual"
                                                                (fng-box-dynamic-argument! left)
                                                                (fng-box-dynamic-argument! right)))]
-                                  (fng-bin OP-EQ equal (fng-const 0)))
+                                  (fng-bin (Eq) equal (fng-const 0)))
                               (str-eq operator "!=")
                                 (let [equal
                                         (if (fng-nullish-literal? context left-node)
@@ -5110,8 +5385,8 @@
                                                 (if (and (= (fng-infer context left-node FNG-DYNAMIC) FNG-STRING)
                                                          (= (fng-infer context right-node FNG-DYNAMIC) FNG-STRING))
                                                     (fng-jsl-call2 context "StringEquals" left right)
-                                                    (fng-equal-value context left-node left right-node right))))]
-                                  (fng-bin OP-EQ equal (fng-const 0)))
+                                                    (fng-loose-equal context left right))))]
+                                  (fng-bin (Eq) equal (fng-const 0)))
                               (str-eq operator "==")
                                 (if (fng-nullish-literal? context left-node)
                                     (fng-nullish-equal context right-node right)
@@ -5120,7 +5395,7 @@
                                         (if (and (= (fng-infer context left-node FNG-DYNAMIC) FNG-STRING)
                                                  (= (fng-infer context right-node FNG-DYNAMIC) FNG-STRING))
                                             (fng-jsl-call2 context "StringEquals" left right)
-                                            (fng-equal-value context left-node left right-node right))))
+                                            (fng-loose-equal context left right))))
                               (str-eq operator "in")
                                 (if (or (= (ts-kind ast left-node) TSK-STRING-LITERAL)
                                         (= (ts-kind ast left-node) TSK-NUMERIC-LITERAL))
@@ -5136,7 +5411,23 @@
                                               (fng-constructor-prototype! context constructor)]
                                         (fng-jsl-call2 context "OrdinaryHasInstance"
                                                        left prototype))
-                                      (fng-jsl-call2 context "OrdinaryInstanceOf" left right)))
+                                      ;; NO CONSTRUCTOR AND NO VALUE EITHER. `x instanceof Object`
+                                      ;; resolves no user function, and `Object` has no value node
+                                      ;; to fall back on -- it is a name this frontend knows only
+                                      ;; as the owner of `Object.keys` and friends, never as a
+                                      ;; value. `right` is then NO-NODE, and handing that to the
+                                      ;; JSL layer aborted with `jsl argument 1 is NO-NODE`: the
+                                      ;; graph was already corrupt by the time anything complained,
+                                      ;; and the message named the callee rather than the source.
+                                      ;;
+                                      ;; The operand is checked here because this is where the
+                                      ;; evidence is. See repros/instanceof-against-a-global.js.
+                                      (if (= right NO-NODE)
+                                          (fng-unsupported-syntax!
+                                            "instanceof right-operand"
+                                            (ts-kind ast right-node)
+                                            (ts-text ast right-node))
+                                          (fng-jsl-call2 context "OrdinaryInstanceOf" left right))))
                               (str-eq operator ",") right
                               :else NO-NODE)))))
           (= kind TSK-CALL)
@@ -5180,7 +5471,8 @@
           (= kind TSK-NEW-EXPRESSION)
             (if (fng-error-constructor? context node) (fng-error-constructor context node) (fng-call context node))
           (= kind TSK-OBJECT-LITERAL)
-            (let [inferred (fe-type-index-for-decl-node frontend node)]
+            (let [_ (fng-refuse-object-spread! context node)
+                  inferred (fe-type-index-for-decl-node frontend node)]
             (if (and (= expected FNG-DYNAMIC) (< inferred 0))
                 (fng-dynamic-object context node)
                 (fng-object context node (if (= expected FNG-DYNAMIC) inferred expected))))
@@ -5195,13 +5487,21 @@
               (if (>= math-member 0)
                   NO-NODE
                   (if (str-eq (ts-text ast node) "Math.LN2")
-                      (n-new1 OP-CONST (t-flt-con 0.6931471805599453) (g-start))
+                      (n-new1 (Const (t-flt-con 0.6931471805599453)) (g-start))
                       (fng-field-load context node))))))
           (= kind TSK-ELEMENT-ACCESS)
             (if (!= (ts-role ast node TS-ROLE-OPERATOR 0) -1)
                 (fng-optional-element-load context node)
                 (fng-lvalue-read context (fng-lvalue context node)))
-          :else NO-NODE)))
+          ;; AN UNRECOGNISED EXPRESSION KIND MUST NOT RETURN `NO-NODE`. The bridge maps every
+          ;; syntax it does not enumerate to kind 0 (native/typescript-go-bridge/main.go, the
+          ;; `default` of the kind switch), so this arm is where unsupported syntax arrives.
+          ;; Returning NO-NODE handed a non-node to whatever asked for a value: `x as number`
+          ;; segfaulted the builder, and a spread element inside an array literal was dropped
+          ;; silently, so `[...a, 3]` evaluated to length 2 where node says 3. A wrong answer
+          ;; with no diagnostic is strictly worse than a crash, and both are worse than saying
+          ;; which construct is not supported.
+          :else (do (fng-unsupported-syntax! "expression" kind (ts-text ast node)) NO-NODE))))
 
 (defn fng-ensure-memory! [(context FngContext)] (-> i64)
   (if (and (!= (load (load (field context memory))) NO-NODE)
@@ -5234,6 +5534,11 @@
         (al-free! [i64] (mut memories))
         0)))
 
+;; THE RETURN IS A REPRESENTATION BOUNDARY only when the function DECLARES a numeric result, and
+;; that case is handled where the return expression is lowered: `fng-statement`'s TSK-RETURN passes
+;; the declared type to `fng-expression-expected`, which coerces to the raw representation the
+;; native ABI reads. Nothing here inspects the value -- a shape test at this point cannot work,
+;; because the DSL's guards have not folded yet (see `fng-expression-expected`).
 (defn fng-add-return! [(context FngContext) (value i64)] (-> i64)
   (fng-ensure-memory! context)
   (let [ctrl (load (load (field context ctrl)))
@@ -5241,14 +5546,14 @@
     (if (load (field context top-level))
         (let [ret
                 (if (= memory NO-NODE)
-                    (n-new2 OP-RETURN 0 ctrl value)
-                    (n-new3 OP-RETURN 0 ctrl value memory))]
+                    (n-new2 (Return) ctrl value)
+                    (n-new3 (Return) ctrl value memory))]
           (n-add-def! (g-stop) ret)
           ret)
         (let [ret
                 (if (= memory NO-NODE)
-                    (n-new2 OP-RETURN 0 ctrl value)
-                    (n-new3 OP-RETURN 0 ctrl value memory))
+                    (n-new2 (Return) ctrl value)
+                    (n-new3 (Return) ctrl value memory))
               first (load (field context first-return))
               fun (load (field context fun))]
           (if (= (load first) NO-NODE)
@@ -5288,7 +5593,7 @@
           (fng-active-memory! context (mut active))
           (fng-control-aliases! context (mut active))
           (let [saved-start (fng-snapshot! context (mut symbols) (mut active) (mut snapshots))
-                arms (n-if-arms! (fng-peep (n-new2 OP-IF 0 saved-ctrl condition)))]
+                arms (n-if-arms! (fng-peep (n-new2 (If) saved-ctrl condition)))]
             (store! (load (field context ctrl)) (arms-t arms))
             (let [expected parameter-type
                   raw-default (fng-expression-expected context initializer expected)
@@ -5309,10 +5614,9 @@
                     (cond (= default-ctrl NO-NODE) (store! answer incoming-value)
                           (= incoming-ctrl NO-NODE) (store! answer default-value)
                           :else
-                            (let [phi (n-new OP-PHI
-                                             (if (= parameter-type FNG-NUMBER)
+                            (let [phi (n-new (Phi (if (= parameter-type FNG-NUMBER)
                                                  (t-num)
-                                                 (t-dyn)))]
+                                                 (t-dyn))))]
                               (n-add-def! phi (load (load (field context ctrl))))
                               (n-add-def! phi default-value)
                               (n-add-def! phi incoming-value)
@@ -5377,8 +5681,7 @@
                       (let [prototype (fng-constructor-prototype! context (load (field fn id)))
                           stored
                             (n-peephole
-                              (n-new4 OP-PROPSTORE
-                                      (shape-name-intern! "prototype")
+                              (n-new4 (PropStore (shape-name-intern! "prototype"))
                                       (load (load (field context ctrl)))
                                       (fng-current-memory context JS-PROPERTY-ALIAS)
                                       object
@@ -5427,25 +5730,29 @@
           (= kind TSK-PREFIX-UNARY)
             (let [value (fng-static-global-value frontend values (ts-child ast node 0))
                   text (ts-text ast node)]
-              (cond (str-eq (substr text 0 1) "~") (n-new2 OP-BITNOT 0 NO-NODE value)
-                    (str-eq (substr text 0 1) "-") (n-new2 OP-MINUS 0 NO-NODE value)
-                    (str-eq (substr text 0 1) "!") (n-new2 OP-NOT 0 NO-NODE value)
+              ;; STATIC GLOBAL INITIALISERS, not runtime semantics: the operand is a literal that
+              ;; `fng-static-global-value` has already reduced to a constant, there is no
+              ;; `FngContext` here to make a library call with, and the only inputs reachable are
+              ;; numbers. Recorded in `DSL-OWED` so it is a decision rather than an oversight.
+              (cond (str-eq (substr text 0 1) "~") (n-new2 (BitNot) NO-NODE value)
+                    (str-eq (substr text 0 1) "-") (n-new2 (Minus) NO-NODE value)
+                    (str-eq (substr text 0 1) "!") (n-new2 (Not) NO-NODE value)
                     :else value))
           (= kind TSK-BINARY)
             (let [left (fng-static-global-value frontend values (ts-child ast node 0))
                   right (fng-static-global-value frontend values (ts-child ast node 2))
                   operator (ts-text ast (ts-child ast node 1))]
-              (fng-bin (cond (str-eq operator "+") OP-ADD
-                             (str-eq operator "-") OP-SUB
-                             (str-eq operator "*") OP-MUL
-                             (str-eq operator "/") OP-DIV
-                             (str-eq operator "%") OP-MOD
-                             (str-eq operator "&") OP-BITAND
-                             (str-eq operator "|") OP-BITOR
-                             (str-eq operator "^") OP-BITXOR
-                             (str-eq operator "<<") OP-SHL
-                             (str-eq operator ">>") OP-SHR
-                             :else OP-USHR)
+              (fng-bin (cond (str-eq operator "+") (Add)
+                             (str-eq operator "-") (Sub)
+                             (str-eq operator "*") (Mul)
+                             (str-eq operator "/") (Div)
+                             (str-eq operator "%") (Mod)
+                             (str-eq operator "&") (BitAnd)
+                             (str-eq operator "|") (BitOr)
+                             (str-eq operator "^") (BitXor)
+                             (str-eq operator "<<") (Shl)
+                             (str-eq operator ">>") (Shr)
+                             :else (UShr))
                        left right))
           :else NO-NODE)))
 
@@ -5674,6 +5981,30 @@
 (defn fng-capture-jump! [(context FngContext) (node i64) (kind i64)] (-> i64)
   (fng-capture-target! context (fng-find-target context node kind) kind))
 
+;; A RECORDED JUMP HOLDS NODE IDS, AND THE GRAPH KEEPS MOVING AFTER THE JUMP IS RECORDED.
+;;
+;; `jump-values` is a frontend table, not a def-use edge, so `n-subsume!` does not retarget it: a
+;; node captured by a `break` and then replaced leaves the id of a DEAD node in the log, and
+;; `fng-merge-target!` wires that id straight into a phi. That is VERR-DEAD-INPUT --
+;; repros/loop-exit-then-allocation.js -- and it is silent until the verifier runs, because
+;; nothing between the two ever dereferences the stale entry.
+;;
+;; The scan covers the WHOLE log rather than the target's own slice. A `break`/`continue` aimed at
+;; an OUTER loop from inside this one captured this loop's memory as well, and that jump belongs to
+;; a target whose merge has not happened yet, so restricting the scan would miss exactly the
+;; labelled-jump case.
+(defn fng-retarget-jumps! [(context FngContext) (old i64) (new i64)] (-> i64)
+  (let [values (load (field context jump-values))
+        (mut index) 0]
+    (loop (if (>= (load index) (al-len [i64] (load values)))
+              (break)
+              (do
+                (if (= (al-get [i64] (load values) (load index)) old)
+                    (al-set! [i64] (mut values) (load index) new)
+                    0)
+                (store! index (+ (load index) 1)))))
+    0))
+
 (defn fng-merge-target! [(context FngContext)
                          (target-index i64)
                          (kind i64)
@@ -5740,7 +6071,7 @@
                         (store! (load (field context memory)) (fng-merge memory-phis))
                         0)))
             :else
-              (let [region (n-new OP-REGION 0)]
+              (let [region (n-new (Region))]
                 (n-add-def! region NO-NODE)
                 (if normal (n-add-def! region (load (load (field context ctrl)))) 0)
                 (store! index 0)
@@ -5759,7 +6090,7 @@
                                   (al-get [i64]
                                           (load symbols)
                                           (+ (load (field target symbol-start)) (load index)))
-                                phi (n-new OP-PHI (fng-symbol-coil-type context symbol))
+                                phi (n-new (Phi (fng-symbol-coil-type context symbol)))
                                 (mut ji) 0]
                             (n-add-def! phi region)
                             (if normal
@@ -5791,7 +6122,7 @@
                                           (load active)
                                           (+ (load (field target active-start)) (load index)))
                                 alias (al-get [i64] (load (load (field context aliases))) field-index)
-                                phi (n-new OP-PHI (t-mem-alias alias (t-undef)))
+                                phi (n-new (Phi (t-mem-alias alias (t-undef))))
                                 (mut ji) 0]
                             (n-add-def! phi region)
                             (if normal (n-add-def! phi (al-get [i64] (load normal-memory) (load index))) 0)
@@ -5913,8 +6244,7 @@
                         (store! default-index (load index))
                         (let [test (fng-expression context (ts-role ast clause TS-ROLE-EXPRESSION 0))
                               arms
-                                (n-if-arms! (fng-peep (n-new2 OP-IF
-                                                              0
+                                (n-if-arms! (fng-peep (n-new2 (If)
                                                               (load (load (field context ctrl)))
                                                               (fng-equal-value
                                                                 context
@@ -6051,7 +6381,7 @@
             (fng-restore-snapshot! context symbols active values left-start)
             true)
         :else
-          (let [region (n-new OP-REGION 0)
+          (let [region (n-new (Region))
                 (mut memories) (al-new [i64] (malloc-allocator))
                 symbol-count (al-len [i64] (load symbols))
                 (mut index) 0]
@@ -6061,10 +6391,38 @@
             (loop (if (>= (load index) symbol-count)
                       (break)
                       (let [symbol (al-get [i64] (load symbols) (load index))
-                            phi (n-new OP-PHI (fng-symbol-coil-type context symbol))]
+                            phi (n-new (Phi (fng-symbol-coil-type context symbol)))
+                            left-value (al-get [i64] (load values) (+ left-start (load index)))
+                            right-value (al-get [i64] (load values) (+ right-start (load index)))
+                            ;; A PHI HAS ONE REPRESENTATION, and these arms need not arrive with
+                            ;; the same one. `Math.trunc(x)` is a `ToNumber`, which is TAGGED,
+                            ;; while the arm that went through `x += 1000` is a raw machine number
+                            ;; -- so `Math.trunc(acc); if (c) { acc += 1000; }` merged a tagged
+                            ;; value with a raw one and consumers had to guess.
+                            ;;
+                            ;; It surfaced when the guess went stale rather than when it was made:
+                            ;; with `if (true)` the tagged arm is dead, the phi narrows to the raw
+                            ;; arm's type, and an `Unbox` built while the phi looked tagged is left
+                            ;; unboxing a raw number (`Unbox slot 1 <- Phi is raw-num, needs
+                            ;; tagged`). The same mismatch with a live condition is a phi whose two
+                            ;; halves mean different things.
+                            ;;
+                            ;; Boxing the raw arm is the direction that always exists: any consumer
+                            ;; can unbox a tagged value, and there is no tagged word to recover
+                            ;; from a raw one once the other arm's tag is gone. Two raw arms stay
+                            ;; raw, so the ordinary arithmetic case pays nothing.
+                            ;; repros/truncate-then-live-branch.js.
+                            left-raw (fng-machine-number-value? left-value 8)
+                            right-raw (fng-machine-number-value? right-value 8)]
                         (n-add-def! phi region)
-                        (n-add-def! phi (al-get [i64] (load values) (+ left-start (load index))))
-                        (n-add-def! phi (al-get [i64] (load values) (+ right-start (load index))))
+                        (n-add-def! phi
+                                    (if (and left-raw (not right-raw))
+                                        (n-box! left-value)
+                                        left-value))
+                        (n-add-def! phi
+                                    (if (and right-raw (not left-raw))
+                                        (n-box! right-value)
+                                        right-value))
                         (fng-set-symbol! context symbol phi)
                         (store! index (+ (load index) 1)))))
             (store! index 0)
@@ -6076,11 +6434,10 @@
                       ;; with constants (an ArrayLoad through the captured-cell alias read
                       ;; undefined instead of the array the branch stored).
                       (let [alias (al-get [i64] (load active) (load index))
-                            phi (n-new OP-PHI
-                                       (t-mem-alias alias
+                            phi (n-new (Phi (t-mem-alias alias
                                                     (if (shape-alias-defined? alias)
                                                         (shape-alias-ty alias)
-                                                        (t-undef))))]
+                                                        (t-undef)))))]
                         (n-add-def! phi region)
                         (n-add-def! phi
                                     (al-get [i64]
@@ -6154,7 +6511,7 @@
     (let [condition (fng-condition-expression context condition-node)
           condition-ctrl (load (load (field context ctrl)))
           saved-start (fng-snapshot! context (mut changed) (mut active) (mut snapshots))
-          arms (n-if-arms! (fng-peep (n-new2 OP-IF 0 condition-ctrl condition)))]
+          arms (n-if-arms! (fng-peep (n-new2 (If) condition-ctrl condition)))]
       (store! (load (field context ctrl)) (arms-t arms))
       (let [then-continues (fng-statement context then-node)
             then-ctrl (if then-continues (load (load (field context ctrl))) NO-NODE)
@@ -6185,7 +6542,7 @@
         (mut phis) (al-new [i64] (malloc-allocator))
         (mut active) (al-new [i64] (malloc-allocator))
         (mut memory-phis) (al-new [i64] (malloc-allocator))
-        loop-node (n-new OP-LOOP 0)
+        loop-node (n-new (Loop))
         (mut index) 0]
     (fng-assigned! frontend body-node (mut carried))
     (if (!= increment-node -1) (fng-assigned! frontend increment-node (mut carried)) 0)
@@ -6219,11 +6576,10 @@
                       ;; `fng-memory`: a `(t-undef)` content told inference the loop-carried
                       ;; memory holds undefined and the fold pass replaced every load through
                       ;; it with a constant.
-                      phi (n-new OP-PHI
-                                 (t-mem-alias alias
+                      phi (n-new (Phi (t-mem-alias alias
                                               (if (shape-alias-defined? alias)
                                                   (shape-alias-ty alias)
-                                                  (t-undef))))]
+                                                  (t-undef)))))]
                   (n-add-def! phi loop-node)
                   (n-add-def! phi (fng-current-memory context alias))
                   (n-add-def! phi NO-NODE)
@@ -6238,7 +6594,7 @@
                 (break)
                 (do
                   (let [symbol (al-get [i64] (load carried) (load index))
-                        phi (n-new OP-PHI (fng-symbol-coil-type context symbol))]
+                        phi (n-new (Phi (fng-symbol-coil-type context symbol)))]
                     (al-push! [i64] (mut phis) phi))
                   (store! index (+ (load index) 1)))))
       (store! index 0)
@@ -6256,7 +6612,7 @@
             ; The condition may itself emit control (a ToNumber diamond, a short-circuit merge, an
             ; inlined JSL call). The loop test must anchor at whatever control the condition left
             ; behind; pinning it to the Loop node put two Ifs on one control and broke the CFG.
-            arms (n-if-arms! (fng-peep (n-new2 OP-IF 0
+            arms (n-if-arms! (fng-peep (n-new2 (If)
                                                (load (load (field context ctrl)))
                                                condition)))]
         (store! (load (field context ctrl)) (arms-t arms))
@@ -6282,6 +6638,10 @@
                       ;; self-referential node alive leaks it once consumers fold to the init.
                       (if (= back phi)
                           (let [init (n-in phi 1)]
+                            ;; A jump out of this body may have captured the phi as its memory for
+                            ;; this alias; that entry has to follow the replacement or the merge
+                            ;; wires a dead node into a phi. See `fng-retarget-jumps!`.
+                            (fng-retarget-jumps! context phi init)
                             (n-subsume! phi init)
                             (al-set! [i64] (mut memory-phis) (load index) init)
                             0)
@@ -6326,7 +6686,7 @@
         (mut phis) (al-new [i64] (malloc-allocator))
         (mut active) (al-new [i64] (malloc-allocator))
         (mut memory-phis) (al-new [i64] (malloc-allocator))
-        loop-node (n-new OP-LOOP 0)
+        loop-node (n-new (Loop))
         (mut index) 0]
     (fng-assigned! frontend body-node (mut carried))
     (fng-assigned! frontend condition-node (mut carried))
@@ -6334,13 +6694,38 @@
       (n-add-def! loop-node NO-NODE)
       (n-add-def! loop-node (load (load (field context ctrl))))
       (n-add-def! loop-node NO-NODE)
+      ;; THE SAME ALIAS SET `fng-loop` CARRIES, and for the reasons stated at its matching site.
+      ;; This copy took `fng-active-memory!` alone, which publishes DECLARED FIELDS only, so a
+      ;; `do`/`while` had no memory phi for the runtime property heap, for any dynamic alias, or
+      ;; for a captured cell. The header then read pre-loop memory on every iteration and the
+      ;; loop computed the wrong answer -- silently, since the graph is well formed:
+      ;;
+      ;;   do { a[d] = (a[0] + d + 1) | 0; d++; } while (d < 4);   // dynamic alias
+      ;;   do { acc = (acc + bump()) | 0; d++; } while (d < 3);    // captured cell
+      ;;
+      ;; Both are correct written as `while`, which is what named the divergence.
+      ;;
+      ;; `fng-control-aliases!` rewrites the list IN PLACE from field indices to aliases, so
+      ;; everything below reads an alias directly, as `fng-loop` does.
+      (fng-record-dynamic-alias! context JS-PROPERTY-ALIAS)
       (fng-active-memory! context (mut active))
+      (fng-control-aliases! context (mut active))
+      (if (and (> (al-len [FeCapture] (load (field frontend captures))) 0)
+               (not (fng-list-has (mut active) (load (field context cell-alias)))))
+          (al-push! [i64] (mut active) (load (field context cell-alias)))
+          0)
       (store! index 0)
       (loop (if (>= (load index) (al-len [i64] (load active)))
                 (break)
-                (let [field-index (al-get [i64] (load active) (load index))
-                      alias (al-get [i64] (load (load (field context aliases))) field-index)
-                      phi (n-new OP-PHI (t-mem-alias alias (t-undef)))]
+                (let [alias (al-get [i64] (load active) (load index))
+                      ;; The alias's DECLARED content type, for the reason `fng-loop` states at the
+                      ;; matching site: a `(t-undef)` content tells inference the loop-carried
+                      ;; memory holds undefined, and the fold pass then replaces every load through
+                      ;; it with a constant.
+                      phi (n-new (Phi (t-mem-alias alias
+                                              (if (shape-alias-defined? alias)
+                                                  (shape-alias-ty alias)
+                                                  (t-undef)))))]
                   (n-add-def! phi loop-node)
                   (n-add-def! phi (fng-current-memory context alias))
                   (n-add-def! phi NO-NODE)
@@ -6349,10 +6734,17 @@
       (if (> (al-len [i64] (load memory-phis)) 0)
           (store! (load (field context memory)) (fng-merge memory-phis))
           0)
+      ;; RESET. `index` still holds the length of `active` from the memory-phi loop above, so
+      ;; without this the carried-symbol phis are simply not created whenever the loop is preceded
+      ;; by an allocation -- and the reconcile pass below, which DOES iterate `carried` from zero,
+      ;; then indexes a `phis` list that is short or empty. That is the `n-in: input index out of
+      ;; range` on an object literal followed by a `do`/`while`, and a segfault once the object is
+      ;; wide enough. `fng-loop` resets at the matching site; this copy did not.
+      (store! index 0)
       (loop (if (>= (load index) (al-len [i64] (load carried)))
                 (break)
                 (let [symbol (al-get [i64] (load carried) (load index))
-                      phi (n-new OP-PHI (fng-symbol-coil-type context symbol))]
+                      phi (n-new (Phi (fng-symbol-coil-type context symbol)))]
                   (n-add-def! phi loop-node)
                   (n-add-def! phi (fng-symbol-node context symbol))
                   (n-add-def! phi NO-NODE)
@@ -6366,7 +6758,7 @@
                 (if reaches-condition
                     (fng-condition-expression context condition-node)
                     (fng-const 0))
-              arms (n-if-arms! (fng-peep (n-new2 OP-IF 0 (load (load (field context ctrl))) condition)))]
+              arms (n-if-arms! (fng-peep (n-new2 (If) (load (load (field context ctrl))) condition)))]
           (store! index 0)
           (loop (if (>= (load index) (al-len [i64] (load carried)))
                     (break)
@@ -6378,11 +6770,25 @@
           (store! index 0)
           (loop (if (>= (load index) (al-len [i64] (load active)))
                     (break)
-                    (let [field-index (al-get [i64] (load active) (load index))
-                          alias (al-get [i64] (load (load (field context aliases))) field-index)]
-                      (n-set-def! (al-get [i64] (load memory-phis) (load index))
-                                  2
-                                  (fng-current-memory context alias))
+                    (let [alias (al-get [i64] (load active) (load index))
+                          phi (al-get [i64] (load memory-phis) (load index))
+                          back (fng-current-memory context alias)]
+                      ;; A body that never touched this alias hands the phi ITSELF back as the
+                      ;; backedge, and `fng-loop` subsumes it for that reason. This copy set the
+                      ;; back edge unconditionally, so the self-referential phi survived and
+                      ;; `verify` reported VERR-PHI-ARITY. It needed an alias that was ACTIVE but
+                      ;; untouched by the body to show up at all, which is why it took a control
+                      ;; merge before the loop -- a `do`/`while` on its own has no such alias.
+                      (if (= back phi)
+                          (let [init (n-in phi 1)]
+                            ;; A jump out of this body may have captured the phi as its memory for
+                            ;; this alias; that entry has to follow the replacement or the merge
+                            ;; wires a dead node into a phi. See `fng-retarget-jumps!`.
+                            (fng-retarget-jumps! context phi init)
+                            (n-subsume! phi init)
+                            (al-set! [i64] (mut memory-phis) (load index) init)
+                            0)
+                          (do (n-set-def! phi 2 back) 0))
                       (store! index (+ (load index) 1)))))
           (n-set-def! loop-node 2 (arms-t arms))
           (if (not (load (fng-optimize-ptr)))
@@ -6435,8 +6841,7 @@
                       (store! default-index (load index))
                       (let [case-value (fng-expression context (ts-role ast clause TS-ROLE-EXPRESSION 0))
                             arms
-                              (n-if-arms! (fng-peep (n-new2 OP-IF
-                                                            0
+                              (n-if-arms! (fng-peep (n-new2 (If)
                                                             (load (load (field context ctrl)))
                                                             (fng-equal-value
                                                               context
@@ -6671,7 +7076,12 @@
           ;; compiled as its own graph function. It MUST report fall-through: the default `false`
           ;; means "control diverged" and silently dropped every statement after the declaration.
           (= kind TSK-FUNCTION-DECLARATION) true
-          :else false)))
+          ;; Same reasoning as the expression dispatch, and the note above is the evidence: a
+          ;; default of `false` says "control diverged", so an unrecognised statement does not
+          ;; merely fail to compile -- it silently deletes every statement after it. `for (const v
+          ;; of xs)` reached here as bridge kind 0 and produced a graph whose control was stuck at
+          ;; the Start node, with nothing to say why.
+          :else (do (fng-unsupported-syntax! "statement" kind (ts-text ast node)) false))))
 
 (defn fng-node-has-kind [(frontend (ptr NativeFrontend)) (node i64) (wanted i64)] (-> bool)
   (let [ast (field frontend ast)
@@ -6942,8 +7352,7 @@
                           (break)
                           (let [symbol (fng-capture-symbol frontend fun-id (load index))
                                 alias (shape-field-alias env-shape (+ (load index) 1))
-                                incoming (n-new1 OP-ARG
-                                                 (t-mem-alias alias (shape-alias-ty alias))
+                                incoming (n-new1 (Arg (t-mem-alias alias (shape-alias-ty alias)))
                                                  entry)]
                             (al-push! [i64] (mut saved-capture-symbols) symbol)
                             (al-push! [i64]
@@ -6953,8 +7362,7 @@
                             (store! index (+ (load index) 1)))))
                 (if (fng-lexical-this? frontend fun-id)
                     (let [alias (shape-field-alias env-shape (+ symbol-capture-count 1))
-                          incoming (n-new1 OP-ARG
-                                           (t-mem-alias alias (shape-alias-ty alias))
+                          incoming (n-new1 (Arg (t-mem-alias alias (shape-alias-ty alias)))
                                            entry)]
                       (store! receiver (n-load! incoming env alias))
                       0)
@@ -7193,8 +7601,7 @@
                 (al-set! [i64]
                          (mut values)
                          (load (field symbol id))
-                         (n-new1 OP-ARG
-                                 (fng-coil-type frontend shapes (load (field symbol type-node)))
+                         (n-new1 (Arg (fng-coil-type frontend shapes (load (field symbol type-node))))
                                  (g-start)))
                 (store! index (+ (load index) 1)))))
     ;; Bodies retain source declaration order, excluding main until the end.

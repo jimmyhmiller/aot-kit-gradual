@@ -18,12 +18,12 @@
 (defn bt-peep [(node i64)] (-> i64)
   (if (load (bt-optimize-ptr)) (n-peephole node) node))
 
-(defn bt-const [(v i64)] (-> i64) (n-new1 OP-CONST (t-int-con v) (g-start)))
-(defn bt-null [] (-> i64) (n-new1 OP-CONST (t-null) (g-start)))
-(defn bt-bin [(op i64) (a i64) (b i64)] (-> i64)
-  (bt-peep (n-new3 op 0 NO-NODE a b)))
+(defn bt-const [(v i64)] (-> i64) (n-new1 (Const (t-int-con v)) (g-start)))
+(defn bt-null [] (-> i64) (n-new1 (Const (t-null)) (g-start)))
+(defn bt-bin [(op Op) (a i64) (b i64)] (-> i64)
+  (bt-peep (n-new3 op NO-NODE a b)))
 (defn bt-memory [(ctrl i64) (alias i64)] (-> i64)
-  (n-new1 OP-ARG (t-mem-alias alias (t-undef)) ctrl))
+  (n-new1 (Arg (t-mem-alias alias (t-undef))) ctrl))
 
 (defn bt-result-name [(i i64)] (-> (slice u8))
   (case i
@@ -62,17 +62,17 @@
 (defn bt-build-bottom! [(tree-shape i64) (left-alias i64) (right-alias i64)] (-> i64)
   (let [fun (n-fun-open! 0) depth (n-parm! fun 0)
         arms (n-if-arms!
-               (bt-peep (n-new2 OP-IF 0 (n-fun-entry fun)
-                                    (bt-bin OP-LT depth (bt-const 1)))))
+               (bt-peep (n-new2 (If) (n-fun-entry fun)
+                                    (bt-bin (Lt) depth (bt-const 1)))))
         leaf (bt-tree-node! (arms-t arms) tree-shape left-alias right-alias
                             (bt-null) (bt-null))
-        leaf-ret (n-new3 OP-RETURN 0 (arms-t arms) (index leaf 0) (index leaf 1))
-        next (bt-bin OP-SUB depth (bt-const 1))
+        leaf-ret (n-new3 (Return) (arms-t arms) (index leaf 0) (index leaf 1))
+        next (bt-bin (Sub) depth (bt-const 1))
         left-call (n-call1! (arms-f arms) fun next)
         right-call (n-call1! (call-end left-call) fun next)
         parent (bt-tree-node! (call-end right-call) tree-shape left-alias right-alias
                               (call-value left-call) (call-value right-call))
-        parent-ret (n-new3 OP-RETURN 0 (call-end right-call)
+        parent-ret (n-new3 (Return) (call-end right-call)
                            (index parent 0) (index parent 1))]
     (n-fun-close! fun leaf-ret)
     (n-fun-add-return! fun parent-ret)
@@ -80,18 +80,18 @@
 
 (defn bt-build-check! [(tree-shape i64) (left-alias i64) (right-alias i64)] (-> i64)
   (let [fun (n-fun-open! 1) node (n-parm! fun 0)
-        cast (n-new2 OP-CAST (t-obj-shape tree-shape) (n-fun-entry fun) node)
+        cast (n-new2 (Cast (t-obj-shape tree-shape)) (n-fun-entry fun) node)
         left (n-load! (bt-memory (n-fun-entry fun) left-alias) cast left-alias)
         arms (n-if-arms!
-               (bt-peep (n-new2 OP-IF 0 (n-fun-entry fun)
-                                    (bt-bin OP-EQ left (bt-null)))))
-        leaf-ret (n-new2 OP-RETURN 0 (arms-t arms) (bt-const 1))
+               (bt-peep (n-new2 (If) (n-fun-entry fun)
+                                    (bt-bin (Eq) left (bt-null)))))
+        leaf-ret (n-new2 (Return) (arms-t arms) (bt-const 1))
         right (n-load! (bt-memory (n-fun-entry fun) right-alias) cast right-alias)
         lc (n-call1! (arms-f arms) fun left)
         rc (n-call1! (call-end lc) fun right)
-        branch-ret (n-new2 OP-RETURN 0 (call-end rc)
-                     (bt-bin OP-ADD (bt-const 1)
-                       (bt-bin OP-ADD (call-value lc) (call-value rc))))]
+        branch-ret (n-new2 (Return) (call-end rc)
+                     (bt-bin (Add) (bt-const 1)
+                       (bt-bin (Add) (call-value lc) (call-value rc))))]
     (n-fun-close! fun leaf-ret)
     (n-fun-add-return! fun branch-ret)
     fun))
@@ -99,35 +99,35 @@
 (defn bt-build-pow2! [] (-> i64)
   (let [fun (n-fun-open! 2) exponent (n-parm! fun 0)
         arms (n-if-arms!
-               (bt-peep (n-new2 OP-IF 0 (n-fun-entry fun)
-                                    (bt-bin OP-LT exponent (bt-const 1)))))
-        base (n-new2 OP-RETURN 0 (arms-t arms) (bt-const 1))
-        rec (n-call1! (arms-f arms) fun (bt-bin OP-SUB exponent (bt-const 1)))
-        step (n-new2 OP-RETURN 0 (call-end rec)
-                     (bt-bin OP-MUL (bt-const 2) (call-value rec)))]
+               (bt-peep (n-new2 (If) (n-fun-entry fun)
+                                    (bt-bin (Lt) exponent (bt-const 1)))))
+        base (n-new2 (Return) (arms-t arms) (bt-const 1))
+        rec (n-call1! (arms-f arms) fun (bt-bin (Sub) exponent (bt-const 1)))
+        step (n-new2 (Return) (call-end rec)
+                     (bt-bin (Mul) (bt-const 2) (call-value rec)))]
     (n-fun-close! fun base)
     (n-fun-add-return! fun step)
     fun))
 
 (defn bt-build-work! [(bottom i64) (check i64)] (-> i64)
   (let [fun (n-fun-open! 3) depth (n-parm! fun 0) iterations (n-parm! fun 1)
-        lp (n-new OP-LOOP 0)]
+        lp (n-new (Loop))]
     (n-add-def! lp NO-NODE) (n-add-def! lp (n-fun-entry fun)) (n-add-def! lp NO-NODE)
-    (let [i (n-new OP-PHI (t-int)) sum (n-new OP-PHI (t-int))]
+    (let [i (n-new (Phi (t-int))) sum (n-new (Phi (t-int)))]
       (n-add-def! i lp) (n-add-def! i (bt-const 0)) (n-add-def! i NO-NODE)
       (n-add-def! sum lp) (n-add-def! sum (bt-const 0)) (n-add-def! sum NO-NODE)
-      (let [arms (n-if-arms! (bt-peep (n-new2 OP-IF 0 lp (bt-bin OP-LT i iterations))))
+      (let [arms (n-if-arms! (bt-peep (n-new2 (If) lp (bt-bin (Lt) i iterations))))
             tree (n-call1! (arms-t arms) bottom depth)
             checked (n-call1! (call-end tree) check (call-value tree))
-            ret (n-new2 OP-RETURN 0 (arms-f arms) sum)]
-        (n-set-def! i 2 (bt-bin OP-ADD i (bt-const 1)))
-        (n-set-def! sum 2 (bt-bin OP-ADD sum (call-value checked)))
+            ret (n-new2 (Return) (arms-f arms) sum)]
+        (n-set-def! i 2 (bt-bin (Add) i (bt-const 1)))
+        (n-set-def! sum 2 (bt-bin (Add) sum (call-value checked)))
         (n-set-def! lp 2 (call-end checked))
         (n-fun-close! fun ret)
         fun))))
 
 (defn bt-merge-memories! [(mems (ptr i64)) (count i64)] (-> i64)
-  (let [merge (n-new OP-MEMMERGE 0) (mut i) 0]
+  (let [merge (n-new (MemMerge)) (mut i) 0]
     (n-add-def! merge NO-NODE)
     (loop
       (if (>= (load i) count) (break)
@@ -154,7 +154,7 @@
                                 (load (index values (load i)))
                                 (shape-field-alias shape (load i))))
               (store! i (+ (load i) 1)) 0)))
-      (let [ret (n-new3 OP-RETURN 0 ctrl obj
+      (let [ret (n-new3 (Return) ctrl obj
                          (bt-merge-memories! (cast (ptr i64) stores) BT-RESULT-FIELDS))]
         (n-add-def! (g-stop) ret)
         obj))))
@@ -171,8 +171,8 @@
         bottom (bt-build-bottom! tree-shape left-alias right-alias)
         check (bt-build-check! tree-shape left-alias right-alias)
         pow2 (bt-build-pow2!) work (bt-build-work! bottom check)
-        max-depth (n-new1 OP-ARG (t-int) (g-start))
-        stretch-depth (bt-bin OP-ADD max-depth (bt-const 1))
+        max-depth (n-new1 (Arg (t-int)) (g-start))
+        stretch-depth (bt-bin (Add) max-depth (bt-const 1))
         stretch (n-call1! (g-start) bottom stretch-depth)
         stretch-check (n-call1! (call-end stretch) check (call-value stretch))
         long-tree (n-call1! (call-end stretch-check) bottom max-depth)
@@ -185,19 +185,19 @@
         (do
           (let [depth (+ BT-MIN-DEPTH (* (load slot) 2))
                 arms (n-if-arms!
-                       (bt-peep (n-new2 OP-IF 0 (load ctrl)
-                                            (bt-bin OP-LE (bt-const depth) max-depth))))
+                       (bt-peep (n-new2 (If) (load ctrl)
+                                            (bt-bin (Le) (bt-const depth) max-depth))))
                 iterations (n-call1! (arms-t arms) pow2
-                              (bt-bin OP-ADD
-                                (bt-bin OP-SUB max-depth (bt-const depth))
+                              (bt-bin (Add)
+                                (bt-bin (Sub) max-depth (bt-const depth))
                                 (bt-const BT-MIN-DEPTH)))
                 checked (n-call2! (call-end iterations) work (bt-const depth)
                                   (call-value iterations))
-                join (n-new OP-REGION 0)]
+                join (n-new (Region))]
             (n-add-def! join NO-NODE)
             (n-add-def! join (call-end checked))
             (n-add-def! join (arms-f arms))
-            (let [iter-phi (n-new OP-PHI (t-int)) check-phi (n-new OP-PHI (t-int))]
+            (let [iter-phi (n-new (Phi (t-int))) check-phi (n-new (Phi (t-int)))]
               (n-add-def! iter-phi join) (n-add-def! iter-phi (call-value iterations))
               (n-add-def! iter-phi (bt-const 0))
               (n-add-def! check-phi join) (n-add-def! check-phi (call-value checked))

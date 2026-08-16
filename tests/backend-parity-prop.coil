@@ -32,8 +32,11 @@
 (import "jsstring" :use *)
 (import "corpus" :use *)
 (import "eval" :use *)
+(import "gtext" :use *)
 (import "coil.assert" :use *)
+(import "oparbitrary" :use *)
 (import "coil.prop" :use *)
+(import "coil.derive" :use *)
 (import "coil.alloc" :use *)
 (import "coil.control" :use *)
 (import "coil.io" :use *)
@@ -47,6 +50,24 @@
 (extern sys_icache_invalidate :cc c [(ptr u8) i64] (-> void))
 
 (const PROP-BUDGET i64 100000)
+
+(defprop arbitrary-op-values-round-trip-through-the-text-boundary [(op Op)]
+  (let [round-tripped (op-decode-tag (op-encode-tag op) (op-encode-payload op))]
+    (and (= (op-encode-tag round-tripped) (op-encode-tag op))
+         (= (op-encode-payload round-tripped) (op-encode-payload op)))))
+
+(defprop arbitrary-op-classifications-obey-their-structural-laws [(op Op)]
+  (let [classes (op-class op)
+        control (!= (& classes OPC-CONTROL) 0)
+        value (!= (& classes OPC-VALUE) 0)
+        phi (!= (& classes OPC-PHI) 0)
+        merge (!= (& classes OPC-MERGE) 0)
+        commutes (!= (& classes OPC-COMMUTES) 0)
+        binary (!= (& classes OPC-BINARY) 0)]
+    (and (!= control value)
+         (and (or (not phi) value)
+              (and (or (not merge) control)
+                   (or (not commutes) binary))))))
 ;; Enough nodes to force spilling at one register, few enough that 200 cases stay quick.
 (const MAX-OPS i64 24)
 ;; The generous register count, and the ceiling of the floor search.
@@ -64,14 +85,14 @@
 ;; so a MUL property would spend its cases comparing an `RT-FLT` against a wrapped integer and
 ;; calling the difference a bug. Covering MUL needs the comparison to model that promotion; it is
 ;; listed in docs/DEFTESTS-OWED.md rather than faked here.
-(defn prop-op [(k i64)] (-> i64)
-  (if (= k 0) OP-ADD
-    (if (= k 1) OP-SUB
-      (if (= k 2) OP-BITAND
-        (if (= k 3) OP-BITOR
-          (if (= k 4) OP-BITXOR
-            (if (= k 5) OP-SHL
-              (if (= k 6) OP-SHR OP-USHR))))))))
+(defn prop-op [(k i64)] (-> Op)
+  (if (= k 0) (Add)
+    (if (= k 1) (Sub)
+      (if (= k 2) (BitAnd)
+        (if (= k 3) (BitOr)
+          (if (= k 4) (BitXor)
+            (if (= k 5) (Shl)
+              (if (= k 6) (Shr) (UShr)))))))))
 ;; The three shifts join the set for the same reason the bitwise operators did: total on integers,
 ;; no trap, no path out of the integer domain. A shift count is masked identically by both sides --
 ;; the evaluator and AArch64 implement the same OP -- so a disagreement about masking would be a
@@ -96,16 +117,16 @@
 ;; touches none of them, which is why the first version of this property saturated at 6.5% of the
 ;; backend's edges no matter how long it fuzzed.
 (defn emit-branch! [(ctrl i64) (a i64) (b i64)] (-> i64)
-  (let [cond (n-new3 OP-LT 0 NO-NODE a b)
-        arms (n-if-arms! (n-peephole (n-new2 OP-IF 0 ctrl cond)))
-        region (n-new OP-REGION 0)]
+  (let [cond (n-new3 (Lt) NO-NODE a b)
+        arms (n-if-arms! (n-peephole (n-new2 (If) ctrl cond)))
+        region (n-new (Region))]
     (n-add-def! region NO-NODE)
     (n-add-def! region (arms-t arms))
     (n-add-def! region (arms-f arms))
-    (let [phi (n-new OP-PHI (t-int))]
+    (let [phi (n-new (Phi (t-int)))]
       (n-add-def! phi region)
-      (n-add-def! phi (n-new3 OP-ADD 0 NO-NODE a b))
-      (n-add-def! phi (n-new3 OP-SUB 0 NO-NODE a b))
+      (n-add-def! phi (n-new3 (Add) NO-NODE a b))
+      (n-add-def! phi (n-new3 (Sub) NO-NODE a b))
       phi)))
 
 ;; Build an integer program over `arg` and return its Return node.
@@ -122,9 +143,9 @@
 (defn build-program! [(ops (slice u8))] (-> i64)
   (let [pool (stack (array i64 32))
         p (cast (ptr i64) pool)
-        a0 (n-new1 OP-ARG (t-int) (g-start))
-        k0 (n-new1 OP-CONST (t-int-con 3) (g-start))
-        seed (n-new3 OP-ADD 0 NO-NODE a0 k0)]
+        a0 (n-new1 (Arg (t-int)) (g-start))
+        k0 (n-new1 (Const (t-int-con 3)) (g-start))
+        seed (n-new3 (Add) NO-NODE a0 k0)]
     ;; `seed` uses both roots, so the argument and the constant are reachable too.
     (store! (index p 0) a0)
     (store! (index p 1) k0)
@@ -144,7 +165,7 @@
                 ;; saturation. Three of four steps are arithmetic and one is a branch, so programs
                 ;; keep a straight-line spine with diamonds through it.
                 (if (< (% b 4) 3)
-                    (store! cur (n-new3 (prop-op (% (/ b 4) PROP-OPS)) 0 NO-NODE (load cur) other))
+                    (store! cur (n-new3 (prop-op (% (/ b 4) PROP-OPS)) NO-NODE (load cur) other))
                     (let [phi (emit-branch! (load ctrl) (load cur) other)]
                       (store! ctrl (n-in phi 0))
                       (store! cur phi)
@@ -153,7 +174,7 @@
                 (store! n (+ (load n) 1))
                 (store! i (+ (load i) 1))
                 0)))
-      (let [ret (n-new2 OP-RETURN 0 (load ctrl) (load cur))]
+      (let [ret (n-new2 (Return) (load ctrl) (load cur))]
         (n-add-def! (g-stop) ret)
         (g-analyze!)
         ret))))
@@ -188,13 +209,13 @@
   (be-encode!)
   (native1 arg))
 
-;; The graph's single OP-ARG node.
+;; The graph's single OPTAG-ARG node.
 (defn find-arg [] (-> i64)
   (let [n (n-count)
         (mut i) 0
         (mut found) NO-NODE]
     (loop (if (>= (load i) n) (break)
-            (do (if (and (not (n-dead? (load i))) (= (n-op (load i)) OP-ARG))
+            (do (if (and (not (n-dead? (load i))) (op-is? (load i) Arg [_]))
                     (do (store! found (load i)) 0)
                     0)
                 (store! i (+ (load i) 1))
@@ -235,6 +256,61 @@
   (assert (= (ev-run-nobind PROP-BUDGET) EV-OK))
   (assert (= (rt-tag (ev-result)) RT-INT))
   (rt-payload (ev-result)))
+
+; ============================================================================
+; Generated graph boundaries
+; ============================================================================
+;; `build-program!` is more useful than a generator of disconnected Nodes: its running-value spine
+;; makes every generated node reachable, and its diamonds keep Region/Phi arities in lockstep.  The
+;; same arbitrary byte slice can therefore fuzz the boundaries that consume WHOLE valid graphs.
+;;
+;; Verification is required to be observationally read-only.  Rendering on both sides checks every
+;; serialized op payload, type and input edge.  The subsequent round trip replaces the graph with a
+;; parse, so the final verifier call checks the rebuilt topology rather than the original arena.
+(defprop generated_valid_graphs_verify_read_only_and_round_trip
+  [(ops (slice u8))]
+  (assume (> (slice-len ops) 0))
+  (let [before (stack (array u8 32768))
+        after  (stack (array u8 32768))]
+    (graph-reset! 909)
+    (build-program! ops)
+    (let [live (g-live-count)
+          a (g-render (cast (ptr i8) before) 32768)
+          clean (= (g-verify) 0)
+          b (g-render (cast (ptr i8) after) 32768)]
+      (and clean
+           (and (gbytes-eq? a b)
+                (and (= (g-live-count) live)
+                     (and (= (g-round-trip-check) GRT-OK)
+                          (and (= (g-live-count) live)
+                               (= (g-verify) 0)))))))))
+
+;; One mutation after a valid generated prefix.  Unlike a generic "nonzero is fine" corruption
+;; property, each arm names the check that must win, so reordered or accidentally weakened verifier
+;; passes become a counterexample.  The selector is separate from the graph bytes: shrinking the
+;; program cannot silently change which corruption is under test.
+(defprop generated_single_faults_are_rejected_by_their_exact_name
+  [(ops (slice u8)) (selector i64)]
+  (assume (> (slice-len ops) 0))
+  (graph-reset! 909)
+  (let [ret (build-program! ops)
+        kind (& selector 3)
+        expected (if (= kind 0) VERR-STOP-INPUT
+                   (if (= kind 1) VERR-CTRL-SLOT
+                     (if (= kind 2) VERR-LEAK VERR-ARITY)))]
+    (if (= kind 0)
+        ;; The value is already reachable, so adding it to Stop introduces only a bad exit kind.
+        (n-add-def! (g-stop) (n-in ret 1))
+      (if (= kind 1)
+          ;; Return slot zero must be control, never its result value.
+          (n-set-def! ret 0 (n-in ret 1))
+        (if (= kind 2)
+            ;; Peepholing gives the orphan its correct type; reachability is its sole defect.
+            (do (n-peephole (n-new1 (Const (t-int-con 99)) (g-start))) 0)
+          ;; Return permits two or three inputs.  Four is unambiguously an arity fault.
+          (do (n-add-def! ret (n-in ret 1)) (n-add-def! ret (n-in ret 1)) 0))))
+    (let [violations (g-verify)]
+      (and (> violations 0) (= (g-verify-code) expected)))))
 
 
 ;; Does the allocator claim to have solved this program at `regs` registers?
@@ -320,8 +396,8 @@
 ;;
 ;; No trap to worry about either -- IEEE division is total, so `x/0` is an infinity rather than a
 ;; fault, which is why DIV appears here and not in the integer operator set.
-(defn flt-op [(k i64)] (-> i64)
-  (if (= k 0) OP-ADD (if (= k 1) OP-SUB (if (= k 2) OP-MUL OP-DIV))))
+(defn flt-op [(k i64)] (-> Op)
+  (if (= k 0) (Add) (if (= k 1) (Sub) (if (= k 2) (Mul) (Div)))))
 (const FLT-OPS i64 4)
 
 ;; The identities an optimiser is tempted to shortcut, and the values those shortcuts break on.
@@ -356,24 +432,24 @@
 ;; class the integer path never touches -- which is the rule the deleted B05 gate policed as a
 ;; negative test ("cross-register-class: named liveness rejection").
 (defn emit-flt-branch! [(ctrl i64) (a i64) (b i64)] (-> i64)
-  (let [cond (n-new3 OP-LT 0 NO-NODE a b)
-        arms (n-if-arms! (n-peephole (n-new2 OP-IF 0 ctrl cond)))
-        region (n-new OP-REGION 0)]
+  (let [cond (n-new3 (Lt) NO-NODE a b)
+        arms (n-if-arms! (n-peephole (n-new2 (If) ctrl cond)))
+        region (n-new (Region))]
     (n-add-def! region NO-NODE)
     (n-add-def! region (arms-t arms))
     (n-add-def! region (arms-f arms))
-    (let [phi (n-new OP-PHI (t-flt))]
+    (let [phi (n-new (Phi (t-flt)))]
       (n-add-def! phi region)
-      (n-add-def! phi (n-new3 OP-ADD 0 NO-NODE a b))
-      (n-add-def! phi (n-new3 OP-SUB 0 NO-NODE a b))
+      (n-add-def! phi (n-new3 (Add) NO-NODE a b))
+      (n-add-def! phi (n-new3 (Sub) NO-NODE a b))
       phi)))
 
 (defn build-flt-program! [(ops (slice u8))] (-> i64)
   (let [pool (stack (array i64 32))
         p (cast (ptr i64) pool)
-        a0 (n-new1 OP-ARG (t-flt) (g-start))
-        k0 (n-new1 OP-CONST (flt-const 2) (g-start))
-        seed (n-new3 OP-ADD 0 NO-NODE a0 k0)]
+        a0 (n-new1 (Arg (t-flt)) (g-start))
+        k0 (n-new1 (Const (flt-const 2)) (g-start))
+        seed (n-new3 (Add) NO-NODE a0 k0)]
     (store! (index p 0) a0)
     (store! (index p 1) k0)
     (store! (index p 2) seed)
@@ -388,7 +464,7 @@
                     ;; leave the unused ones unreferenced, which the verifier reports as a LEAK;
                     ;; created on demand, a constant is used the moment it exists.
                     other (if (= (% (/ b 4) 2) 0)
-                              (n-new1 OP-CONST (flt-const (% (/ b 8) FLT-CONSTS)) (g-start))
+                              (n-new1 (Const (flt-const (% (/ b 8) FLT-CONSTS))) (g-start))
                             (load (index p (% (/ b 8) (load n)))))]
                 ;; One step in four is a diamond. Low bits, not high: the (slice u8) generator
                 ;; produces printable bytes, and a step chosen from the top bits never fires.
@@ -397,12 +473,12 @@
                       (store! ctrl (n-in phi 0))
                       (store! cur phi)
                       0)
-                  (store! cur (n-new3 (flt-op (% (/ b 4) FLT-OPS)) 0 NO-NODE (load cur) other)))
+                  (store! cur (n-new3 (flt-op (% (/ b 4) FLT-OPS)) NO-NODE (load cur) other)))
                 (store! (index p (load n)) (load cur))
                 (store! n (+ (load n) 1))
                 (store! i (+ (load i) 1))
                 0)))
-      (let [ret (n-new2 OP-RETURN 0 (load ctrl) (load cur))]
+      (let [ret (n-new2 (Return) (load ctrl) (load cur))]
         (n-add-def! (g-stop) ret)
         (g-analyze!)
         ret))))
@@ -552,36 +628,36 @@
     (loop (if (>= (load k) limit) (break)
             (let [b (cast i64 (slice-get body (load k)))
                   other (if (= (% (/ b 4) 2) 0)
-                            (n-new1 OP-CONST (t-int-con (+ 1 (% (/ b 8) 7))) (g-start))
+                            (n-new1 (Const (t-int-con (+ 1 (% (/ b 8) 7)))) (g-start))
                           (load (index p (% (/ b 8) (load n)))))]
-              (store! cur (n-new3 (prop-op (% b PROP-OPS)) 0 NO-NODE (load cur) other))
+              (store! cur (n-new3 (prop-op (% b PROP-OPS)) NO-NODE (load cur) other))
               (store! (index p (load n)) (load cur))
               (store! n (+ (load n) 1))
               (store! k (+ (load k) 1))
               0)))
     ;; Always fold `i` in, so the loop counter is a real input to the carried value rather than
     ;; something the optimiser can prove irrelevant and delete along with the loop.
-    (n-new3 OP-ADD 0 NO-NODE (load cur) i)))
+    (n-new3 (Add) NO-NODE (load cur) i)))
 
 (defn build-loop-program! [(trips i64) (opk i64) (body (slice u8))] (-> i64)
-  (let [lp (n-new OP-LOOP 0)]
+  (let [lp (n-new (Loop))]
     (n-add-def! lp NO-NODE)
     (n-add-def! lp (g-start))
     (n-add-def! lp NO-NODE)
     (n-peephole lp)
-    (let [i (n-new OP-PHI (t-int))
-          acc (n-new OP-PHI (t-int))
-          a0 (n-new1 OP-ARG (t-int) (g-start))]
+    (let [i (n-new (Phi (t-int)))
+          acc (n-new (Phi (t-int)))
+          a0 (n-new1 (Arg (t-int)) (g-start))]
       (n-add-def! i lp)
-      (n-add-def! i (n-new1 OP-CONST (t-int-con 0) (g-start)))
+      (n-add-def! i (n-new1 (Const (t-int-con 0)) (g-start)))
       (n-add-def! i NO-NODE)
       (n-add-def! acc lp)
       (n-add-def! acc a0)
       (n-add-def! acc NO-NODE)
-      (let [limit (n-new1 OP-CONST (t-int-con trips) (g-start))
-            test (n-new3 OP-LT 0 NO-NODE i limit)
-            arms (n-if-arms! (n-peephole (n-new2 OP-IF 0 lp test)))
-            inext (n-new3 OP-ADD 0 NO-NODE i (n-new1 OP-CONST (t-int-con 1) (g-start)))
+      (let [limit (n-new1 (Const (t-int-con trips)) (g-start))
+            test (n-new3 (Lt) NO-NODE i limit)
+            arms (n-if-arms! (n-peephole (n-new2 (If) lp test)))
+            inext (n-new3 (Add) NO-NODE i (n-new1 (Const (t-int-con 1)) (g-start)))
             ;; THE BODY IS GENERATED, not a single operation. A one-op body made the whole input
             ;; space 8 trip counts by 5 operators, which is why the corpus stopped growing at six
             ;; entries: there was nothing left to find. The chain below runs the same
@@ -591,7 +667,7 @@
         (n-set-def! i 2 inext)
         (n-set-def! acc 2 anext)
         (n-set-def! lp 2 (arms-t arms))
-        (let [ret (n-new2 OP-RETURN 0 (arms-f arms) acc)]
+        (let [ret (n-new2 (Return) (arms-f arms) acc)]
           (n-add-def! (g-stop) ret)
           (wl-push! lp) (wl-push! i) (wl-push! acc)
           (iterate!)
@@ -670,7 +746,7 @@
         (mut i) 0
         (mut found) false]
     (loop (if (or (>= (load i) n) (load found)) (break)
-            (do (if (and (not (n-dead? (load i))) (= (n-op (load i)) op))
+            (do (if (and (not (n-dead? (load i))) (= (op-encode-tag (n-op (load i))) op))
                     (do (store! found true) 0)
                     0)
                 (store! i (+ (load i) 1))
@@ -681,26 +757,26 @@
   ;; byte 3: (% 3 4) = 3 -> the branch arm in both generators.
   (graph-reset! 909)
   (build-program! "\x03")
-  (assert (graph-has-op? OP-PHI))
-  (assert (graph-has-op? OP-REGION))
-  (assert (graph-has-op? OP-IF))
+  (assert (graph-has-op? OPTAG-PHI))
+  (assert (graph-has-op? OPTAG-REGION))
+  (assert (graph-has-op? OPTAG-IF))
   (graph-reset! 909)
   (build-flt-program! "\x03")
-  (assert (graph-has-op? OP-PHI))
-  (assert (graph-has-op? OP-REGION))
-  (assert (graph-has-op? OP-IF))
+  (assert (graph-has-op? OPTAG-PHI))
+  (assert (graph-has-op? OPTAG-REGION))
+  (assert (graph-has-op? OPTAG-IF))
   ;; byte 0: (% 0 4) = 0 -> the arithmetic arm, and NO control flow.
   (graph-reset! 909)
   (build-program! "\x00")
-  (assert (not (graph-has-op? OP-IF)))
+  (assert (not (graph-has-op? OPTAG-IF)))
   (graph-reset! 909)
   (build-flt-program! "\x00")
-  (assert (not (graph-has-op? OP-IF)))
+  (assert (not (graph-has-op? OPTAG-IF)))
   ;; the loop generator always builds its loop
   (graph-reset! 909)
   (build-loop-program! 3 0 "ab")
-  (assert (graph-has-op? OP-LOOP))
-  (assert (graph-has-op? OP-PHI)))
+  (assert (graph-has-op? OPTAG-LOOP))
+  (assert (graph-has-op? OPTAG-PHI)))
 
 ; ============================================================================
 ; Calls
@@ -717,15 +793,15 @@
   ;; callee: f(x) = x * 3 + 1, small enough that the interesting part stays the caller.
   (let [callee (n-fun-open! 0)
         px (n-parm! callee 0)
-        body (n-new3 OP-ADD 0 NO-NODE
-                     (n-new3 OP-MUL 0 NO-NODE px (n-new1 OP-CONST (t-int-con 3) (g-start)))
-                     (n-new1 OP-CONST (t-int-con 1) (g-start)))
-        cret (n-new2 OP-RETURN 0 (n-fun-entry callee) body)]
+        body (n-new3 (Add) NO-NODE
+                     (n-new3 (Mul) NO-NODE px (n-new1 (Const (t-int-con 3)) (g-start)))
+                     (n-new1 (Const (t-int-con 1)) (g-start)))
+        cret (n-new2 (Return) (n-fun-entry callee) body)]
     (n-fun-close! callee cret)
     (let [pool (stack (array i64 32))
           p (cast (ptr i64) pool)
-          a0 (n-new1 OP-ARG (t-int) (g-start))
-          v0 (n-new3 OP-ADD 0 NO-NODE a0 (n-new1 OP-CONST (t-int-con 3) (g-start)))]
+          a0 (n-new1 (Arg (t-int)) (g-start))
+          v0 (n-new3 (Add) NO-NODE a0 (n-new1 (Const (t-int-con 3)) (g-start)))]
       (store! (index p 0) v0)
       ;; Build a handful of values first; each becomes live across the call below.
       (let [(mut n) 1
@@ -734,8 +810,8 @@
             limit (if (> (slice-len ops) 6) 6 (slice-len ops))]
         (loop (if (>= (load k) limit) (break)
                 (let [b (cast i64 (slice-get ops (load k)))]
-                  (store! cur (n-new3 (prop-op (% b PROP-OPS)) 0 NO-NODE (load cur)
-                                      (n-new1 OP-CONST (t-int-con (+ 1 (% (/ b 8) 7))) (g-start))))
+                  (store! cur (n-new3 (prop-op (% b PROP-OPS)) NO-NODE (load cur)
+                                      (n-new1 (Const (t-int-con (+ 1 (% (/ b 8) 7)))) (g-start))))
                   (store! (index p (load n)) (load cur))
                   (store! n (+ (load n) 1))
                   (store! k (+ (load k) 1))
@@ -746,10 +822,10 @@
           ;; EVERY pre-call value folded in AFTER the call. This is the whole point: each one had
           ;; to survive a boundary the allocator does not own.
           (loop (if (>= (load j) (load n)) (break)
-                  (do (store! acc (n-new3 OP-ADD 0 NO-NODE (load acc) (load (index p (load j)))))
+                  (do (store! acc (n-new3 (Add) NO-NODE (load acc) (load (index p (load j)))))
                       (store! j (+ (load j) 1))
                       0)))
-          (let [ret (n-new2 OP-RETURN 0 (call-end site) (load acc))]
+          (let [ret (n-new2 (Return) (call-end site) (load acc))]
             (n-add-def! (g-stop) ret)
             (g-analyze!)
             ret))))))
@@ -823,15 +899,15 @@
 ;; commons and eliminates memory operations, and every one of those is a rewrite the graph verifier
 ;; will happily accept while being wrong. Interpreting before and after is what catches it.
 (defn heap-store [(alias i64) (mem i64) (ptr i64) (v i64)] (-> i64)
-  (n-new4 OP-STORE alias NO-NODE mem ptr v))
+  (n-new4 (Store alias) NO-NODE mem ptr v))
 (defn heap-load [(alias i64) (mem i64) (ptr i64)] (-> i64)
-  (n-new3 OP-LOAD alias NO-NODE mem ptr))
+  (n-new3 (Load alias) NO-NODE mem ptr))
 
 (defn build-heap-program! [(ops (slice u8))] (-> i64)
   (shape-reset!)
   (let [sx (shape-transition SHAPE-ROOT "x" (t-int))
         ax (shape-field-alias sx 0)
-        a0 (n-new1 OP-ARG (t-int) (g-start))
+        a0 (n-new1 (Arg (t-int)) (g-start))
         o1 (n-new-obj1! (g-start) sx (mk-mem-in ax))
         p1 (n-obj-ptr o1)
         o2 (n-new-obj1! (g-start) sx (n-obj-mem o1 0))
@@ -843,7 +919,7 @@
           (mut k) 0
           limit (if (> (slice-len ops) 10) 10 (slice-len ops))]
       (store! mem (heap-store ax (load mem) p2
-                              (n-new3 OP-ADD 0 NO-NODE a0 (n-new1 OP-CONST (t-int-con 1) (g-start)))))
+                              (n-new3 (Add) NO-NODE a0 (n-new1 (Const (t-int-con 1)) (g-start)))))
       (loop (if (>= (load k) limit) (break)
               (let [b (cast i64 (slice-get ops (load k)))
                     ptr (if (= (% b 2) 0) p1 p2)]
@@ -851,18 +927,18 @@
                     ;; store the running value
                     (do (store! mem (heap-store ax (load mem) ptr (load cur))) 0)
                   ;; or read a field back and fold it in
-                  (do (store! cur (n-new3 (prop-op (% (/ b 4) PROP-OPS)) 0 NO-NODE
+                  (do (store! cur (n-new3 (prop-op (% (/ b 4) PROP-OPS)) NO-NODE
                                           (load cur) (heap-load ax (load mem) ptr)))
                       0))
                 (store! k (+ (load k) 1))
                 0)))
-      (let [ret (n-new3 OP-RETURN 0 (g-start) (load cur) (load mem))]
+      (let [ret (n-new3 (Return) (g-start) (load cur) (load mem))]
         (n-add-def! (g-stop) ret)
         (g-analyze!)
         ret))))
 
 ;; NOT `find-arg`. A heap program has TWO arguments -- the integer and the memory that
-;; `mk-mem-in` threads in -- and `find-arg` returns whichever OP-ARG it meets first. Binding an
+;; `mk-mem-in` threads in -- and `find-arg` returns whichever OPTAG-ARG it meets first. Binding an
 ;; integer into the memory argument leaves the evaluator with no heap and it stops, which is what
 ;; the first version of this property reported as a crash on every input.
 (defn find-int-arg [] (-> i64)
@@ -870,7 +946,7 @@
         (mut i) 0
         (mut found) NO-NODE]
     (loop (if (or (>= (load i) n) (!= (load found) NO-NODE)) (break)
-            (do (if (and (and (not (n-dead? (load i))) (= (n-op (load i)) OP-ARG))
+            (do (if (and (and (not (n-dead? (load i))) (op-is? (load i) Arg [_]))
                          (= (n-ty (load i)) (t-int)))
                     (do (store! found (load i)) 0)
                     0)
@@ -930,7 +1006,7 @@
 ; Arrays
 ; ============================================================================
 ;; An array is an allocation the runtime treats specially -- marked, indexed, length-carrying -- so
-;; it reaches OP-ARRAYMARK, OP-ARRAYSTORE, OP-ARRAYLOAD, OP-ARRAYLEN and the boxing that indexed
+;; it reaches OPTAG-ARRAYMARK, OPTAG-ARRAYSTORE, OPTAG-ARRAYLOAD, OPTAG-ARRAYLEN and the boxing that indexed
 ;; storage requires, none of which the object property touches. Storing at GENERATED indices is the
 ;; part that matters: the length is a function of the largest index written, so an optimiser that
 ;; reorders or drops a store changes the answer.
@@ -940,24 +1016,24 @@
         alias (shape-field-alias shape 0)
         allocation (n-new-obj1! (g-start) shape (mk-mem-in alias))
         array (n-array-mark! (g-start) (n-obj-ptr allocation))
-        a0 (n-new1 OP-ARG (t-int) (g-start))]
+        a0 (n-new1 (Arg (t-int)) (g-start))]
     (let [(mut mem) (mk-mem-in JS-PROPERTY-ALIAS)
           (mut k) 0
           limit (if (> (slice-len ops) 8) 8 (slice-len ops))]
       (loop (if (>= (load k) limit) (break)
               (let [b (cast i64 (slice-get ops (load k)))
-                    idx (n-new1 OP-CONST (t-int-con (% b 6)) (g-start))]
+                    idx (n-new1 (Const (t-int-con (% b 6))) (g-start))]
                 (store! mem (n-array-store! (load mem) array idx
-                                            (n-box! (n-new1 OP-CONST (t-int-con (% (/ b 8) 9))
+                                            (n-box! (n-new1 (Const (t-int-con (% (/ b 8) 9)))
                                                             (g-start)))))
                 (store! k (+ (load k) 1))
                 0)))
-      ;; The argument is folded into the result. Creating an OP-ARG and never referencing it is a
+      ;; The argument is folded into the result. Creating an OPTAG-ARG and never referencing it is a
       ;; LEAK to the verifier -- correctly, since an unread parameter is a graph that lies about
       ;; what it consumes.
-      (let [value (n-new3 OP-ADD 0 NO-NODE (n-array-length! (load mem) array) a0)
+      (let [value (n-new3 (Add) NO-NODE (n-array-length! (load mem) array) a0)
             memory (n-memmerge2! (n-obj-mem allocation 0) (load mem))
-            ret (n-new3 OP-RETURN 0 (g-start) value memory)]
+            ret (n-new3 (Return) (g-start) value memory)]
         (n-add-def! (g-stop) ret)
         (g-analyze!)
         ret))))
@@ -987,14 +1063,14 @@
     (if (= kind 7)
         ;; a malformed graph: the verifier reaches a verdict and names any rejection
         (do (graph-reset! 909)
-            (let [a0 (n-new1 OP-ARG (t-int) (g-start))
-                  c3 (n-new1 OP-CONST (t-int-con 3) (g-start))
-                  v (n-new3 OP-ADD 0 NO-NODE a0 c3)]
+            (let [a0 (n-new1 (Arg (t-int)) (g-start))
+                  c3 (n-new1 (Const (t-int-con 3)) (g-start))
+                  v (n-new3 (Add) NO-NODE a0 c3)]
               (if (= (% (cast i64 (slice-get ops 0)) 3) 0)
-                  (do (n-new1 OP-CONST (t-int-con 99) (g-start))
-                      (n-add-def! (g-stop) (n-new2 OP-RETURN 0 (g-start) v)) 0)
+                  (do (n-new1 (Const (t-int-con 99)) (g-start))
+                      (n-add-def! (g-stop) (n-new2 (Return) (g-start) v)) 0)
                 (if (= (% (cast i64 (slice-get ops 0)) 3) 1)
-                    (do (n-add-def! (g-stop) (n-new2 OP-RETURN 0 v v)) 0)
+                    (do (n-add-def! (g-stop) (n-new2 (Return) v v)) 0)
                   0))
               (g-analyze!)
               (if (= (g-verify) 0) true (!= (g-verify-code) 0))))
@@ -1011,11 +1087,10 @@
     (if (= kind 6)
         ;; a program the backend cannot compile: refused by name, nothing published
         (do (graph-reset! 909)
-            (let [a0 (n-new1 OP-ARG (t-int) (g-start))
-                  v (n-new3 OP-ADD 0 NO-NODE a0 (n-new1 OP-CONST (t-int-con 3) (g-start)))
-                  bad (n-new3 (unsupported-op (% (cast i64 (slice-get ops 0)) UNSUPPORTED-OPS))
-                              0 NO-NODE v v)
-                  ret (n-new2 OP-RETURN 0 (g-start) bad)]
+            (let [a0 (n-new1 (Arg (t-int)) (g-start))
+                  v (n-new3 (Add) NO-NODE a0 (n-new1 (Const (t-int-con 3)) (g-start)))
+                  bad (n-new3 (unsupported-op (% (cast i64 (slice-get ops 0)) UNSUPPORTED-OPS)) NO-NODE v v)
+                  ret (n-new2 (Return) (g-start) bad)]
               (n-add-def! (g-stop) ret)
               (g-analyze!)
               (if (be-select-machine-program!)
@@ -1054,14 +1129,14 @@
 ;; The law: a program the backend cannot compile is refused BY NAME, and nothing is published. A
 ;; backend that quietly emits something for input it does not understand is the defect this catches
 ;; -- which is not hypothetical here, since exactly that was found and fixed in the legacy selector.
-(defn unsupported-op [(k i64)] (-> i64)
-  (if (= k 0) OP-STRINGCONCAT
-    (if (= k 1) OP-PROPLOAD
-      (if (= k 2) OP-NUMBERTOSTRING
-        (if (= k 3) OP-PARSEINT
-          (if (= k 4) OP-TOSTRING
-            (if (= k 5) OP-OBJECTFREEZE
-              (if (= k 6) OP-STRINGUPPER OP-PROTOHAS))))))))
+(defn unsupported-op [(k i64)] (-> Op)
+  (if (= k 0) (StringConcat)
+    (if (= k 1) (PropLoad 0)
+      (if (= k 2) (NumberToString)
+        (if (= k 3) (ParseInt)
+          (if (= k 4) (ToString)
+            (if (= k 5) (ObjectFreeze)
+              (if (= k 6) (StringUpper) (ProtoHas)))))))))
 (const UNSUPPORTED-OPS i64 8)
 
 (defprop an_uncompilable_program_is_refused_by_name_and_publishes_nothing
@@ -1070,10 +1145,10 @@
   (let [b (cast i64 (slice-get ops 0))]
     (graph-reset! 909)
     ;; a valid prefix, then one node the backend has no rule for
-    (let [a0 (n-new1 OP-ARG (t-int) (g-start))
-          v (n-new3 OP-ADD 0 NO-NODE a0 (n-new1 OP-CONST (t-int-con 3) (g-start)))
-          bad (n-new3 (unsupported-op (% b UNSUPPORTED-OPS)) 0 NO-NODE v v)
-          ret (n-new2 OP-RETURN 0 (g-start) bad)]
+    (let [a0 (n-new1 (Arg (t-int)) (g-start))
+          v (n-new3 (Add) NO-NODE a0 (n-new1 (Const (t-int-con 3)) (g-start)))
+          bad (n-new3 (unsupported-op (% b UNSUPPORTED-OPS)) NO-NODE v v)
+          ret (n-new2 (Return) (g-start) bad)]
       (n-add-def! (g-stop) ret)
       (g-analyze!)
       (if (be-select-machine-program!)
@@ -1099,23 +1174,23 @@
   (let [b (cast i64 (slice-get ops 0))
         kind (% b 4)]
     (graph-reset! 909)
-    (let [a0 (n-new1 OP-ARG (t-int) (g-start))
-          c3 (n-new1 OP-CONST (t-int-con 3) (g-start))
-          v (n-new3 OP-ADD 0 NO-NODE a0 c3)]
+    (let [a0 (n-new1 (Arg (t-int)) (g-start))
+          c3 (n-new1 (Const (t-int-con 3)) (g-start))
+          v (n-new3 (Add) NO-NODE a0 c3)]
       (if (= kind 0)
           ;; a node nothing references
-          (do (n-new1 OP-CONST (t-int-con 99) (g-start))
-              (n-add-def! (g-stop) (n-new2 OP-RETURN 0 (g-start) v)) 0)
+          (do (n-new1 (Const (t-int-con 99)) (g-start))
+              (n-add-def! (g-stop) (n-new2 (Return) (g-start) v)) 0)
         (if (= kind 1)
             ;; a Phi with no region behind it
-            (let [phi (n-new OP-PHI (t-int))]
+            (let [phi (n-new (Phi (t-int)))]
               (n-add-def! phi NO-NODE)
               (n-add-def! phi v)
               (n-add-def! phi c3)
-              (n-add-def! (g-stop) (n-new2 OP-RETURN 0 (g-start) phi)) 0)
+              (n-add-def! (g-stop) (n-new2 (Return) (g-start) phi)) 0)
           (if (= kind 2)
               ;; a Return whose control input is a value
-              (do (n-add-def! (g-stop) (n-new2 OP-RETURN 0 v v)) 0)
+              (do (n-add-def! (g-stop) (n-new2 (Return) v v)) 0)
             ;; nothing added to Stop at all
             0)))
       (g-analyze!)
@@ -1155,12 +1230,12 @@
     (loop (if (>= (load k) limit) (break)
             (let [b (cast i64 (slice-get ops (load k)))
                   other (n-string-const! (jss-of (% (/ b 4) JSS-COUNT)))]
-              (store! cur (n-new3 OP-STRINGCONCAT 0 NO-NODE (load cur) other))
+              (store! cur (n-new3 (StringConcat) NO-NODE (load cur) other))
               (store! k (+ (load k) 1))
               0)))
     ;; the result is a LENGTH, an integer the evaluator can report
-    (let [value (n-new2 OP-STRINGLEN 0 NO-NODE (load cur))
-          ret (n-new2 OP-RETURN 0 (g-start) value)]
+    (let [value (n-new2 (StringLen) NO-NODE (load cur))
+          ret (n-new2 (Return) (g-start) value)]
       (n-add-def! (g-stop) ret)
       (g-analyze!)
       ret)))

@@ -1,0 +1,292 @@
+;; EVERY OPCODE, AND EVERY PAIR OF OPCODES, CATALOGUED.
+;;
+;;   coil build tools/js-sweep.coil -o out/js-sweep
+;;   tools/js-sweep.sh                       # the whole matrix, crash-resumable
+;;   out/js-sweep --from 0 --to 500          # one range, directly
+;;
+;; A `defprop` SHRINKS: it finds one counterexample, minimises it, and reports that. That is the
+;; right shape for "is this law true", and the wrong shape for "what is broken", because the first
+;; failure hides every other one -- and because a body the frontend cannot lower poisons a large
+;; share of all generated cases, so the search converges on the defect already known instead of
+;; exploring. The whole of docs/FUZZ-FINDINGS.md's template discipline exists to work around that.
+;;
+;; This sweeps instead. It enumerates the opcode space directly rather than sampling it, runs every
+;; program past the same node oracle, and prints ONE LINE PER CASE. Nothing is minimised and
+;; nothing stops the run, so a hundred distinct failures come back as a hundred lines that
+;; `tools/js-sweep.sh` groups into a catalogue.
+;;
+;; TWO ENUMERATIONS:
+;;   singles -- every opcode alone, at several payloads
+;;   pairs   -- every ordered pair, which is where composition defects live (a memory phi captured
+;;              by one block and collapsed by the next, a representation written by one block and
+;;              read by another). Every finding in FUZZ-FINDINGS.md so far needed two blocks.
+;;
+;; The templates come from `src/js_templates.coil`, the same module the property lifts from, so a
+;; finding here is a finding there.
+(module jssweep)
+
+(import "ty" :use *)
+(import "node" :use *)
+(import "verify" :use *)
+(import "shape" :use *)
+(import "eval" :use *)
+(import "jsstring" :use *)
+(import "jstemplates" :use *)
+(import "jsprobes" :use *)
+(import "typescriptnative" :use *)
+(import "frontendnative" :use *)
+(import "frontendnativegraph" :use *)
+(import "coil.alloc" :use *)
+(import "coil.args" :use *)
+(import "coil.arraylist" :use *)
+(import "coil.control" :use *)
+(import "coil.fmt" :use *)
+(import "coil.io" :use *)
+(import "coil.slice" :use *)
+
+;; Generous, because a sweep case is run once and deliberately: the property's 100k cap exists so
+;; one slow case cannot stall a search, and there is no search here.
+(const SWEEP-BUDGET i64 20000000)
+(const SWEEP-ARG i64 7)
+
+(extern js_oracle_run :cc c [(ptr i8) i64 i64 (ptr i8) i64] (-> i32))
+(extern atoll :cc c [(ptr i8)] (-> i64))
+
+;; ---------------------------------------------------------------------------
+;; The opcode space
+;; ---------------------------------------------------------------------------
+;; Tags, not a hand-written list. `js-emit-feature!` dispatches on the `Op` value, so enumerating
+;; tags is enumerating exactly what the generator can be handed -- and it cannot silently omit an
+;; opcode the way a typed-out list does. The payload varies too, because several templates read it
+;; (`js-small`) and a payload-free op ignores it.
+;; ---------------------------------------------------------------------------
+;; One case
+;; ---------------------------------------------------------------------------
+(defn sweep-reset! [] (-> i64)
+  (graph-reset! 4242)
+  (shape-reset!)
+  (jss-reset!)
+  0)
+
+(defn sweep-find-arg [] (-> i64)
+  (let [n (n-count)
+        (mut i) 0
+        (mut found) NO-NODE]
+    (loop (if (>= (load i) n)
+              (break)
+              (do
+                (if (and (and (not (n-dead? (load i))) (op-is? (load i) Arg [_]))
+                         (not (ty-mem? (n-arg-type (load i)))))
+                    (do (store! found (load i)) 0)
+                    0)
+                (store! i (+ (load i) 1))
+                0)))
+    (load found)))
+
+;; The result of one case, as a machine-readable line. The STATUS word is what the catalogue groups
+;; on, so each distinct way of failing gets its own word:
+;;
+;;   OK       node and we agree
+;;   DIFF     both produced a number and they differ            <- the miscompiles
+;;   VERIFY   the graph is not well formed                      <- names the VERR and the node
+;;   EVAL     the evaluator stopped                             <- names the status
+;;   NODEERR  node refused the program (a bad template, not a compiler defect)
+;;
+;; A case that ABORTS prints nothing at all, and the shell driver records it as CRASH from the gap
+;; in the indices -- which is the only way to catalogue a panic without being able to catch one.
+;; The offending source, on ONE line and bounded: `ts-text` hands back a whole statement, and a
+;; newline inside it would split one result across two lines and desynchronise the catalogue.
+(defn sweep-print-snippet! [(w (ptr Writer)) (t (slice u8))] (-> i64)
+  (let [n (if (> (slice-len t) 70) 70 (slice-len t))
+        (mut i) 0]
+    (loop (if (>= (load i) n)
+              (break)
+              (do
+                (let [ch (slice-get t (load i))]
+                  (write-byte w (if (or (= ch 10) (or (= ch 13) (= ch 9))) 32 ch)))
+                (store! i (+ (load i) 1))
+                0)))
+    (if (> (slice-len t) 70) (do (ps w "...") 0) 0))
+  0)
+
+(defn sweep-node-error? [(out (ptr i8))] (-> bool)
+  (and (= (cast i64 (load (index out 0))) 69)
+       (= (cast i64 (load (index out 1))) 82)))
+
+(defn sweep-report-ours! [(w (ptr Writer)) (idx i64) (label (slice u8)) (theirs i64)] (-> i64)
+  (ev-reset!)
+  (ev-bind-args! SWEEP-ARG)
+  (let [a (sweep-find-arg)]
+    (if (!= a NO-NODE) (do (ev-bind! a (RInt SWEEP-ARG)) 0) 0))
+  (let [status (ev-run-nobind SWEEP-BUDGET)]
+    (if (!= status EV-OK)
+        (fmt w "{d} EVAL {s} :: {s}\n" idx label (ev-status-name status))
+        (let [tag (rt-tag (ev-result))]
+          (if (and (!= tag RT-INT) (!= tag RT-FLT))
+              (fmt w "{d} NONNUM {s}\n" idx label)
+              (let [ours
+                      (if (= tag RT-INT)
+                          (rt-payload (ev-result))
+                          (cast i64 (bits-f64 (rt-payload (ev-result)))))]
+                (if (= theirs ours)
+                    (fmt w "{d} OK {s}\n" idx label)
+                    (fmt w "{d} DIFF {s} :: node={d} ours={d}\n" idx label theirs ours)))))))
+  0)
+
+(defn sweep-compile-and-report! [(w (ptr Writer))
+                                 (idx i64)
+                                 (label (slice u8))
+                                 (source (slice u8))
+                                 (theirs i64)] (-> i64)
+  (sweep-reset!)
+  (let [(mut fe) (fe-native-new source)]
+    (if (!= (fe-native-index! (mut fe)) FE-OK)
+        ;; NAME WHAT IT REFUSED. The frontend records `status`, `error-code` and `error-node`, and
+        ;; the tools were reading none of them -- so the largest bucket in the sweep, 5508 cases,
+        ;; came back as the bare word INDEX and said nothing about which construct it was. A
+        ;; refusal that does not name its cause is only marginally better than a wrong answer: it
+        ;; tells you to look, and nothing about where.
+        (do
+          (fmt w
+               "{d} INDEX {s} :: {s}/{s} at `"
+               idx
+               label
+               (fe-status-name (load (field fe status)))
+               (fe-code-name (load (field fe error-code))))
+          (sweep-print-snippet! w (fe-error-text (mut fe)))
+          (fmt w "`\n")
+          (fe-native-free! (mut fe))
+          0)
+        (do
+          (frontend-native-build! (mut fe) 6201 true)
+          (fe-native-free! (mut fe))
+          (if (!= [i64] (g-verify) 0)
+              ;; `g-verify-print` ends its own line, so adding one here split every VERIFY result
+              ;; across two lines and put 860 blanks in the catalogue.
+              (do
+                (fmt w "{d} VERIFY {s} :: " idx label)
+                (g-verify-print w)
+                0)
+              (sweep-report-ours! w idx label theirs))))))
+
+(defn sweep-run! [(idx i64) (source (slice u8)) (label (slice u8))] (-> i64)
+  (let [w (stdout)
+        out (stack (array i8 4096))]
+    (if (!= [i64]
+            (cast i64
+                  (js_oracle_run (cast (ptr i8) (slice-data source))
+                                 (slice-len source)
+                                 SWEEP-ARG
+                                 (cast (ptr i8) out)
+                                 4096))
+            0)
+        (do (fmt (stderr) "the node oracle could not be reached (is `node` on PATH?)\n") (abort) 0)
+        0)
+    ;; A template node itself refuses is a defect in the TEMPLATE, not in the compiler, and the
+    ;; catalogue keeps the two apart: NODEERR never means we are wrong.
+    (if (sweep-node-error? (cast (ptr i8) out))
+        (do (fmt w "{d} NODEERR {s}\n" idx label) 0)
+        (sweep-compile-and-report! w idx label source (atoll (cast (ptr i8) out))))
+    0))
+
+;; ---------------------------------------------------------------------------
+;; The matrix
+;; ---------------------------------------------------------------------------
+;; Case indices are STABLE and contiguous, because the shell driver resumes by index after a crash
+;; and the catalogue names a defect by the index that produced it. Singles occupy the first
+;; `count * SWEEP-PAYLOADS`; ordered pairs follow.
+;;
+;; PAIRS, not just singles, because that is where the defects are. Every finding in
+;; docs/FUZZ-FINDINGS.md so far needed two blocks: a memory phi captured by one and collapsed by
+;; the next, a representation written by one and read by another, a dead branch that only matters
+;; after something has allocated. A probe alone mostly exercises a lowering; a probe after another
+;; probe exercises what the compiler carried across the join.
+(const SWEEP-PAYLOADS i64 3)
+
+(defn sweep-unit-count [] (-> i64)
+  (js-probe-count))
+(defn sweep-single-count [] (-> i64)
+  (* (sweep-unit-count) SWEEP-PAYLOADS))
+(defn sweep-pair-count [] (-> i64)
+  (* (sweep-unit-count) (sweep-unit-count)))
+(defn sweep-total [] (-> i64)
+  (+ (sweep-single-count) (sweep-pair-count)))
+
+;; The program for one case, written straight from the probe table rather than through
+;; `lift-js-opcode-program!`: the sweep chooses its blocks by index, not from an `Op`.
+(defn sweep-emit! [(buf (ptr i8)) (cap i64) (idx i64) (label (ptr Writer))] (-> (slice u8))
+  (let [fb (stack FixBuf)
+        w (stack Writer)]
+    (store! (field fb data) buf)
+    (store! (field fb cap) cap)
+    (store! (field fb len) 0)
+    (fixed-buffer-writer w fb)
+    (ps w "function main(n: number): number {\n  let acc = n | 0;\n")
+    (if (< idx (sweep-single-count))
+        (let [u (/ idx SWEEP-PAYLOADS)
+              pay (% idx SWEEP-PAYLOADS)]
+          (js-emit-probe! w u (+ 1 pay) 0)
+          (fmt label "{s}/{d}" (js-probe-name u) pay)
+          0)
+        (let [p (- idx (sweep-single-count))
+              a (/ p (sweep-unit-count))
+              b (% p (sweep-unit-count))]
+          (js-emit-probe! w a 2 0)
+          (js-emit-probe! w b 3 1)
+          (fmt label "{s}+{s}" (js-probe-name a) (js-probe-name b))
+          0))
+    (ps w "  return acc | 0;\n}\n")
+    (let [n (load (field fb len))]
+      (if (>= n cap) (do (fmt (stderr) "sweep-emit!: source overflow\n") (abort) 0) 0)
+      (slice-new [u8] (cast (ptr u8) buf) n))))
+
+(defn sweep-case! [(idx i64)] (-> i64)
+  (let [buf (stack (array i8 16384))
+        lb (stack (array i8 128))
+        lfb (stack FixBuf)
+        lw (stack Writer)]
+    (store! (field lfb data) (cast (ptr i8) lb))
+    (store! (field lfb cap) 128)
+    (store! (field lfb len) 0)
+    (fixed-buffer-writer lw lfb)
+    (let [source (sweep-emit! (cast (ptr i8) buf) 16384 idx lw)
+          label (slice-new [u8] (cast (ptr u8) lb) (load (field lfb len)))]
+      ;; ANNOUNCED ON STDERR BEFORE IT RUNS, and that is the entire mechanism for cataloguing a
+      ;; panic. A case that aborts prints no result line, so the driver recovers which case died
+      ;; from the last announcement -- there is no way to catch an abort from inside the process,
+      ;; and a crash is exactly the class of failure most worth having in the catalogue.
+      (fmt (stderr) "CASE {d} {s}\n" idx label)
+      (sweep-run! idx source label))
+    0))
+
+(defn sweep-arg [(name (slice u8)) (dflt i64)] (-> i64)
+  (let [v (args-value name)]
+    (if (slice-empty? v)
+        dflt
+        (let [buf (stack (array i8 32))
+              n (if (> (slice-len v) 31) 31 (slice-len v))
+              (mut j) 0]
+          (loop (if (>= (load j) n)
+                    (break)
+                    (do
+                      (store! (index (cast (ptr i8) buf) (load j))
+                              (cast i8 (slice-get v (load j))))
+                      (store! j (+ (load j) 1))
+                      0)))
+          (store! (index (cast (ptr i8) buf) n) (cast i8 0))
+          (atoll (cast (ptr i8) buf))))))
+
+(defn main [(argc i32) (argv (ptr (ptr i8)))] (-> i64)
+  (args-set! argc argv)
+  (if (args-has? "--total")
+      (do (fmt (stdout) "{d}\n" (sweep-total)) 0)
+      (let [from (sweep-arg "--from" 0)
+            to (if (args-has? "--to") (sweep-arg "--to" 0) (sweep-total))
+            (mut i) from]
+        (loop (if (>= (load i) (if (> to (sweep-total)) (sweep-total) to))
+                  (break)
+                  (do
+                    (sweep-case! (load i))
+                    (store! i (+ (load i) 1))
+                    0)))))
+  0)

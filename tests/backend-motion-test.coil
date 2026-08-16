@@ -12,12 +12,12 @@
 (import "coil.alloc" :use *)
 
 (defn motion-const [(v i64)] (-> i64)
-  (n-new1 OP-CONST (t-int-con v) (g-start)))
-(defn motion-bin [(op i64) (a i64) (b i64)] (-> i64)
-  (n-peephole (n-new3 op (t-int) NO-NODE a b)))
+  (n-new1 (Const (t-int-con v)) (g-start)))
+(defn motion-bin [(op Op) (a i64) (b i64)] (-> i64)
+  (n-peephole (n-new3 op NO-NODE a b)))
 
 (defn motion-finish! [(ctrl i64)] (-> i64)
-  (let [ret (n-new2 OP-RETURN 0 ctrl (motion-const 7))]
+  (let [ret (n-new2 (Return) ctrl (motion-const 7))]
     (n-add-def! (g-stop) ret)
     (g-analyze!)
     ret))
@@ -52,9 +52,9 @@
 
 (defn build-motion-diamond! [] (-> i64)
   (graph-reset! 801)
-  (let [pred (n-new1 OP-ARG (t-bool) (g-start))
-        arms (n-if-arms! (n-peephole (n-new2 OP-IF 0 (g-start) pred)))
-        join (n-new OP-REGION 0)]
+  (let [pred (n-new1 (Arg (t-bool)) (g-start))
+        arms (n-if-arms! (n-peephole (n-new2 (If) (g-start) pred)))
+        join (n-new (Region))]
     (n-add-def! join NO-NODE)
     (n-add-def! join (arms-t arms))
     (n-add-def! join (arms-f arms))
@@ -63,15 +63,15 @@
 
 (defn build-motion-loop! [] (-> i64)
   (graph-reset! 802)
-  (let [lp (n-new OP-LOOP 0)]
+  (let [lp (n-new (Loop))]
     (n-add-def! lp NO-NODE)
     (n-add-def! lp (g-start))
     (n-add-def! lp NO-NODE)
     (n-peephole lp)
-    (let [pred (n-new1 OP-ARG (t-bool) (g-start))
-          arms (n-if-arms! (n-peephole (n-new2 OP-IF 0 lp pred)))]
+    (let [pred (n-new1 (Arg (t-bool)) (g-start))
+          arms (n-if-arms! (n-peephole (n-new2 (If) lp pred)))]
       (n-set-def! lp 2 (arms-t arms))
-      (let [ret (n-new2 OP-RETURN 0 (arms-f arms) (motion-const 1))]
+      (let [ret (n-new2 (Return) (arms-f arms) (motion-const 1))]
         (n-add-def! (g-stop) ret)
         (wl-push! lp)
         (iterate!)
@@ -165,10 +165,10 @@
   (let [sx (shape-transition SHAPE-ROOT "x" (t-dyn)) ax (shape-field-alias sx 0)
         nw (n-new-obj1! (g-start) sx (mk-mem-in ax)) obj (n-obj-ptr nw)
         mem0 (n-obj-mem nw 0)
-        init (n-new4 OP-STORE ax NO-NODE mem0 obj (motion-const 1))
-        loaded (n-new3 OP-LOAD ax NO-NODE init obj)
-        later (n-new4 OP-STORE ax NO-NODE init obj (motion-const 2))
-        ret (n-new3 OP-RETURN 0 (g-start) loaded later)]
+        init (n-new4 (Store ax) NO-NODE mem0 obj (motion-const 1))
+        loaded (n-new3 (Load ax) NO-NODE init obj)
+        later (n-new4 (Store ax) NO-NODE init obj (motion-const 2))
+        ret (n-new3 (Return) (g-start) loaded later)]
     (n-add-def! (g-stop) ret)
     (g-analyze!)
     (assert (ms-select!))
@@ -182,17 +182,17 @@
 
 (deftest phi_source_latest_bound_is_the_incoming_edge_source
   (graph-reset! 804)
-  (let [pred (n-new1 OP-ARG (t-bool) (g-start))
-        arms (n-if-arms! (n-peephole (n-new2 OP-IF 0 (g-start) pred)))
-        join (n-new OP-REGION 0) yes (motion-const 11) no (motion-const 22)]
+  (let [pred (n-new1 (Arg (t-bool)) (g-start))
+        arms (n-if-arms! (n-peephole (n-new2 (If) (g-start) pred)))
+        join (n-new (Region)) yes (motion-const 11) no (motion-const 22)]
     (n-add-def! join NO-NODE)
     (n-add-def! join (arms-t arms))
     (n-add-def! join (arms-f arms))
-    (let [phi (n-new OP-PHI (t-int))]
+    (let [phi (n-new (Phi (t-int)))]
       (n-add-def! phi join)
       (n-add-def! phi yes)
       (n-add-def! phi no)
-      (n-add-def! (g-stop) (n-new2 OP-RETURN 0 join phi))
+      (n-add-def! (g-stop) (n-new2 (Return) join phi))
       (g-analyze!)
       (assert (ms-select!))
       (let [at (motion-inst-for yes) latest (ms-inst-latest at)]
@@ -212,24 +212,24 @@
 
 (deftest loop_invariant_arithmetic_hoists_out_of_the_loop
   (graph-reset! 805)
-  (let [limit-arg (n-new1 OP-ARG (t-int) (g-start))
-        invariant (motion-bin OP-ADD limit-arg (motion-const 3))
-        lp (n-new OP-LOOP 0)]
+  (let [limit-arg (n-new1 (Arg (t-int)) (g-start))
+        invariant (motion-bin (Add) limit-arg (motion-const 3))
+        lp (n-new (Loop))]
     (n-add-def! lp NO-NODE)
     (n-add-def! lp (g-start))
     (n-add-def! lp NO-NODE)
     (n-peephole lp)
-    (let [phi (n-new OP-PHI (t-int))]
+    (let [phi (n-new (Phi (t-int)))]
       (n-add-def! phi lp)
       (n-add-def! phi (motion-const 0))
       (n-add-def! phi NO-NODE)
       (n-peephole phi)
-      (let [next (motion-bin OP-ADD phi (motion-const 1))
-            pred (motion-bin OP-LT phi invariant)
-            arms (n-if-arms! (n-peephole (n-new2 OP-IF 0 lp pred)))]
+      (let [next (motion-bin (Add) phi (motion-const 1))
+            pred (motion-bin (Lt) phi invariant)
+            arms (n-if-arms! (n-peephole (n-new2 (If) lp pred)))]
         (n-set-def! phi 2 next)
         (n-set-def! lp 2 (arms-t arms))
-        (let [ret (n-new2 OP-RETURN 0 (arms-f arms) phi)]
+        (let [ret (n-new2 (Return) (arms-f arms) phi)]
           (n-add-def! (g-stop) ret)
           (wl-push! lp)
           (wl-push! phi)

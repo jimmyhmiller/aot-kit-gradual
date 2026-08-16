@@ -20,9 +20,9 @@
 (extern sys_icache_invalidate :cc c [(ptr u8) i64] (-> void))
 
 (defn sched-const [(v i64)] (-> i64)
-  (n-new1 OP-CONST (t-int-con v) (g-start)))
-(defn sched-bin [(op i64) (a i64) (b i64)] (-> i64)
-  (n-peephole (n-new3 op (t-int) NO-NODE a b)))
+  (n-new1 (Const (t-int-con v)) (g-start)))
+(defn sched-bin [(op Op) (a i64) (b i64)] (-> i64)
+  (n-peephole (n-new3 op NO-NODE a b)))
 
 (defn sched-inst-for [(node i64)] (-> i64)
   (let [(mut i) 0 (mut found) -1]
@@ -44,11 +44,11 @@
 
 (defn build-independent-arithmetic! [] (-> i64)
   (graph-reset! 901)
-  (let [x (n-new1 OP-ARG (t-int) (g-start))
-        left (sched-bin OP-ADD x (sched-const 1))
-        right (sched-bin OP-MUL x (sched-const 2))
-        result (sched-bin OP-ADD left right)
-        ret (n-new2 OP-RETURN 0 (g-start) result)]
+  (let [x (n-new1 (Arg (t-int)) (g-start))
+        left (sched-bin (Add) x (sched-const 1))
+        right (sched-bin (Mul) x (sched-const 2))
+        result (sched-bin (Add) left right)
+        ret (n-new2 (Return) (g-start) result)]
     (n-add-def! (g-stop) ret)
     (g-analyze!)
     result))
@@ -112,10 +112,10 @@
   (let [sx (shape-transition SHAPE-ROOT "x" (t-dyn)) ax (shape-field-alias sx 0)
         nw (n-new-obj1! (g-start) sx (mk-mem-in ax)) obj (n-obj-ptr nw)
         mem0 (n-obj-mem nw 0)
-        init (n-new4 OP-STORE ax NO-NODE mem0 obj (sched-const 1))
-        loaded (n-new3 OP-LOAD ax NO-NODE init obj)
-        later (n-new4 OP-STORE ax NO-NODE init obj (sched-const 2))
-        ret (n-new3 OP-RETURN 0 (g-start) loaded later)]
+        init (n-new4 (Store ax) NO-NODE mem0 obj (sched-const 1))
+        loaded (n-new3 (Load ax) NO-NODE init obj)
+        later (n-new4 (Store ax) NO-NODE init obj (sched-const 2))
+        ret (n-new3 (Return) (g-start) loaded later)]
     (n-add-def! (g-stop) ret)
     (g-analyze!)
     (assert (be-select-machine-program!))
@@ -129,14 +129,13 @@
 (deftest property_load_store_anti_dependency_forces_load_first
   (graph-reset! 903)
   (shape-reset!)
-  (let [object (n-new1 OP-ARG (t-obj) (g-start))
+  (let [object (n-new1 (Arg (t-obj)) (g-start))
         memory
-          (n-new1 OP-ARG
-                  (t-mem-alias JS-PROPERTY-ALIAS (t-undef))
+          (n-new1 (Arg (t-mem-alias JS-PROPERTY-ALIAS (t-undef)))
                   (g-start))
         loaded (n-prop-load-at! (g-start) memory object "value")
         later (n-prop-store-at! (g-start) memory object (n-box! (sched-const 2)) "value")
-        ret (n-new3 OP-RETURN 0 (g-start) loaded later)]
+        ret (n-new3 (Return) (g-start) loaded later)]
     (n-add-def! (g-stop) ret)
     (g-analyze!)
     (assert (be-select-machine-program!))
@@ -174,11 +173,11 @@
 (deftest sequential_calls_keep_their_effect_order
   (graph-reset! 903)
   (let [identity (n-fun-open! 0) x (n-parm! identity 0)]
-    (n-fun-close! identity (n-new2 OP-RETURN 0 (n-fun-entry identity) x))
+    (n-fun-close! identity (n-new2 (Return) (n-fun-entry identity) x))
     (let [first (n-call1! (g-start) identity (sched-const 1))
           second (n-call1! (call-end first) identity (sched-const 2))
-          result (sched-bin OP-ADD (call-value first) (call-value second))
-          ret (n-new2 OP-RETURN 0 (call-end second) result)]
+          result (sched-bin (Add) (call-value first) (call-value second))
+          ret (n-new2 (Return) (call-end second) result)]
       (n-add-def! (g-stop) ret)
       (g-analyze!)
       (assert (be-select-machine-program!))

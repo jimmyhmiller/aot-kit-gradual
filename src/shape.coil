@@ -380,6 +380,44 @@
 (defn shape-alias-ty [(a i64)] (-> i64)
   (let [e (shape-edge-at (shape-alias-edge a))] (se-ty e)))
 
+; ============================================================================
+; What a load or store through an alias carries
+; ============================================================================
+;; THE MACHINE REPRESENTATION OF A FIELD IS A PROPERTY OF THE SHAPE, so it is decided here and
+;; nowhere else. It used to be decided twice: the verifier classified by `ty-kinds`, so every
+;; integer, float and boolean field was raw; the frontend decided whether to unbox before a store
+;; by asking `(= (shape-alias-ty alias) (t-flt))`, an exact type-id match that a field typed
+;; `int`, `bool`, or any union missed. A field the verifier called raw and the frontend called
+;; tagged is a store of a boxed value into a raw slot -- `o.q = o.p` between two fields of
+;; different representation, repros/field-copy-stays-boxed.js.
+;;
+;; The two answers have to come from one function, because the disagreement is not detectable by
+;; either side alone: the frontend emits what it believes and the verifier rejects what it
+;; believes, and each is internally consistent.
+(const REP-UNKNOWN i64 0)
+(const REP-TAGGED i64 1)
+(const REP-RAW-PTR i64 2)
+(const REP-RAW-NUM i64 3)
+
+(defn rep-name [(rep i64)] (-> (slice u8))
+  (cond (= rep REP-TAGGED) "tagged"
+        (= rep REP-RAW-PTR) "raw-ptr"
+        (= rep REP-RAW-NUM) "raw-num"
+        :else "unknown"))
+
+;; An alias with no shape behind it is a dynamic property, and those are carried tagged.
+(defn shape-alias-rep [(a i64)] (-> i64)
+  (if (not (shape-alias-defined? a))
+      REP-TAGGED
+      (let [content (shape-alias-ty a)]
+        (cond (= content (t-dyn)) REP-TAGGED
+              (= content (t-undef)) REP-TAGGED
+              (= (ty-kinds content) VK-OBJ) REP-RAW-PTR
+              (or (= (ty-kinds content) VK-INT)
+                  (or (= (ty-kinds content) VK-FLT) (= (ty-kinds content) VK-BOOL)))
+                REP-RAW-NUM
+              :else REP-UNKNOWN))))
+
 ;; The byte offset of the word this alias names, read off the edge's PARENT: the field was
 ;; appended at index `shape-field-count from`, and no descendant moves it.
 (defn shape-alias-offset [(a i64)] (-> i64)

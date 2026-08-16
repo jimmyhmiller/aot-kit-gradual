@@ -137,14 +137,14 @@
   (let [n (n-count) (mut at) NO-NODE (mut i) 0]
     (loop
       (if (or (>= (load i) n) (!= (load at) NO-NODE)) (break)
-        (do (if (and (not (n-dead? (load i))) (= (n-op (load i)) op))
+        (do (if (and (not (n-dead? (load i))) (= (op-encode-tag (n-op (load i))) op))
                 (store! at (load i))
               0)
             (store! i (+ (load i) 1))
             0)))
     (if (= (load at) NO-NODE)
         (do (let [w (stderr)]
-              (ps w "\nfixture has no live ") (ps w (op-name op)) (ps w "\n")
+              (ps w "\nfixture has no live ") (ps w (op-tag-name op)) (ps w "\n")
               (g-print-flat w))
             (abort) 0)
       (load at))))
@@ -166,8 +166,8 @@
       (if (>= (load i) n) (break)
         (do (store! h (fp-step (load h) (load i)))
             (store! h (fp-step (load h) (if (n-dead? (load i)) 1 0)))
-            (store! h (fp-step (load h) (n-op (load i))))
-            (store! h (fp-step (load h) (n-aux (load i))))
+            (store! h (fp-step (load h) (op-encode-tag (n-op (load i)))))
+            (store! h (fp-step (load h) (op-encode-payload (n-op (load i)))))
             (store! h (fp-step (load h) (n-ty (load i))))
             (store! h (fp-step (load h) (n-nins (load i))))
             (store! h (fp-step (load h) (n-nouts (load i))))
@@ -279,7 +279,7 @@
 (deftest def_use_symmetry_is_a_multiset
   (graph-reset! 1)
   (let [a   (mk-arg (t-dyn))
-        add (mk-bin OP-ADD a a)]
+        add (mk-bin (Add) a a)]
     (mk-ret add)
     ; measured: the Add really does appear twice in the arg's outs, and the arg twice in the
     ; Add's ins. `dyn + dyn` is what stops a peephole from folding this away first.
@@ -299,9 +299,9 @@
 (deftest a_live_node_reading_a_dead_one_is_caught
   (graph-reset! 1)
   (let [a   (mk-arg (t-int))
-        add (mk-bin OP-ADD a (mk-int 2))]
+        add (mk-bin (Add) a (mk-int 2))]
     (mk-ret add)
-    (let [z (n-new1 OP-ARG (t-int) (g-start))]
+    (let [z (n-new1 (Arg (t-int)) (g-start))]
       (n-kill! z)
       (assert (n-dead? z))
       ; a rewrite that pointed a live node at a node it had just killed
@@ -317,7 +317,7 @@
 (deftest region_and_phi_arity_are_one_invariant
   ; direction one: a path deleted from the Region alone
   (corpus-build! CX-DIAMOND)
-  (let [r (find-op OP-REGION) p (find-op OP-PHI)]
+  (let [r (find-op OPTAG-REGION) p (find-op OPTAG-PHI)]
     (assert (= (n-nins p) (n-nins r)))
     (n-del-def! r 2)
     (expect-only "a Region path dropped without the matching Phi value" VERR-PHI-ARITY)
@@ -325,7 +325,7 @@
 
   ; direction two: a value added to the Phi alone
   (corpus-build! CX-DIAMOND)
-  (let [r (find-op OP-REGION) p (find-op OP-PHI)]
+  (let [r (find-op OPTAG-REGION) p (find-op OPTAG-PHI)]
     (n-add-def! p (mk-int 5))
     (assert (= (n-nins p) (+ (n-nins r) 1)))
     (expect-only "a Phi value added without the matching Region path" VERR-PHI-ARITY)
@@ -343,7 +343,7 @@
 
 (deftest a_phi_off_something_that_is_not_a_merge_is_caught
   (corpus-build! CX-DIAMOND)
-  (let [p (find-op OP-PHI)]
+  (let [p (find-op OPTAG-PHI)]
     (n-set-def! p 0 (g-start))
     (expect-only "a Phi whose input 0 is Start" VERR-PHI-REGION)
     (assert (= (g-verify-node) p))))
@@ -363,14 +363,14 @@
 (deftest a_value_slot_holding_control_is_caught
   (graph-reset! 1)
   (let [a   (mk-arg (t-int))
-        add (mk-bin OP-ADD a (mk-int 2))]
+        add (mk-bin (Add) a (mk-int 2))]
     (mk-ret add)
     (n-set-def! add 2 (g-start))
     (expect-only "Start as an Add operand" VERR-DATA-SLOT)
     (assert (= (g-verify-node) add))))
 
 ;; A MEMORY STATE IN A SLOT THAT MUST HOLD A VALUE, which is the mirror of VERR-MEM-SLOT and was
-;; missing entirely. `op-value?` is `>= OP-CONST` and Store is 24, so a memory producer satisfied
+;; missing entirely. `op-value?` is `>= OPTAG-CONST` and Store is 24, so a memory producer satisfied
 ;; every value slot in the IR: an If's predicate, a Return's value, a binop's operand and a
 ;; Store's own value slot all accepted one and verified clean.
 ;;
@@ -390,7 +390,7 @@
           (let [m1 (n-store! (n-obj-mem nw 0) o (mk-int 5) ax)]
             (n-keep! m1)
             ; a second Store whose VALUE is the first Store, which is a memory state
-            (let [m2 (n-new4 OP-STORE ax NO-NODE (n-obj-mem nw 0) o m1)]
+            (let [m2 (n-new4 (Store ax) NO-NODE (n-obj-mem nw 0) o m1)]
               (n-unkeep! m1)
               (ret-to-mem (g-start) (mk-int 0) m2)
               (expect-verr-at "a Store in another Store's value slot" VERR-VALUE-IS-MEM m2))))))))
@@ -407,30 +407,30 @@
   (shape-reset!)
   (let [sx (shape-transition SHAPE-ROOT "x" (t-dyn))]
     (let [ax (shape-field-alias sx 0)]
-      (let [min (n-new1 OP-ARG (t-mem-alias ax (t-top)) (g-start))]
-        (let [nw (n-new OP-NEW sx)]
+      (let [min (n-new1 (Arg (t-mem-alias ax (t-top))) (g-start))]
+        (let [nw (n-new (New sx))]
           (n-add-def! nw (g-start)) (n-add-def! nw min)
-          (let [o  (n-new1 OP-PROJ 0 nw)
-                m0 (n-new1 OP-PROJ 1 nw)
-                c8 (n-new1 OP-CONST (t-int-con 8) (g-start))]
+          (let [o  (n-new1 (Proj 0) nw)
+                m0 (n-new1 (Proj 1) nw)
+                c8 (n-new1 (Const (t-int-con 8)) (g-start))]
             ;; Built RAW and only ANALYSED. Nothing is peepholed, so nothing folds and nothing is
             ;; rewritten: the graph reaching the verifier is exactly the one written here, which is
             ;; what a corruption test needs. Every node has a reader, so VERR-LEAK cannot fire
             ;; first and steal the report.
             (let [bad (case which
-                        0 (let [st (n-new4 OP-STORE ax NO-NODE m0 o
-                                           (n-new1 OP-CONST (t-int-con 5) (g-start)))]
-                            (let [ld (n-new3 OP-LOAD ax NO-NODE st c8)]
-                              (n-add-def! (g-stop) (n-new3 OP-RETURN 0 (g-start) ld st))
+                        0 (let [st (n-new4 (Store ax) NO-NODE m0 o
+                                           (n-new1 (Const (t-int-con 5)) (g-start)))]
+                            (let [ld (n-new3 (Load ax) NO-NODE st c8)]
+                              (n-add-def! (g-stop) (n-new3 (Return) (g-start) ld st))
                               ld))
-                        1 (let [st (n-new4 OP-STORE ax NO-NODE m0 c8
-                                           (n-new1 OP-CONST (t-int-con 5) (g-start)))]
-                            (let [ld (n-new3 OP-LOAD ax NO-NODE st o)]
-                              (n-add-def! (g-stop) (n-new3 OP-RETURN 0 (g-start) ld st))
+                        1 (let [st (n-new4 (Store ax) NO-NODE m0 c8
+                                           (n-new1 (Const (t-int-con 5)) (g-start)))]
+                            (let [ld (n-new3 (Load ax) NO-NODE st o)]
+                              (n-add-def! (g-stop) (n-new3 (Return) (g-start) ld st))
                               st))
-                        (let [add (n-new3 OP-ADD 0 NO-NODE o c8)]
-                          (let [ld (n-new3 OP-LOAD ax NO-NODE m0 add)]
-                            (n-add-def! (g-stop) (n-new3 OP-RETURN 0 (g-start) ld m0))
+                        (let [add (n-new3 (Add) NO-NODE o c8)]
+                          (let [ld (n-new3 (Load ax) NO-NODE m0 add)]
+                            (n-add-def! (g-stop) (n-new3 (Return) (g-start) ld m0))
                             ld)))]
               (g-analyze!)
               bad)))))))
@@ -454,7 +454,7 @@
 ;; subtree alive.
 (deftest a_merge_with_a_non_null_input_zero_is_caught
   (corpus-build! CX-DIAMOND)
-  (let [r (find-op OP-REGION)]
+  (let [r (find-op OPTAG-REGION)]
     (n-set-def! r 0 (g-start))
     (expect-only "a Region whose input 0 is Start" VERR-MERGE-IN0)
     (assert (= (g-verify-node) r))))
@@ -464,7 +464,7 @@
 ;; what gets reported, while the phi arity it drags along is the consequence.
 (deftest a_truncated_loop_is_caught_as_arity
   (corpus-build! CX-LOOP)
-  (let [lp (find-op OP-LOOP)]
+  (let [lp (find-op OPTAG-LOOP)]
     (assert (= (n-nins lp) 3))
     (n-del-def! lp 2)
     (assert (= (n-nins lp) 2))
@@ -475,9 +475,9 @@
 ;; than as the error it is.
 (deftest a_projection_off_a_region_is_caught
   (corpus-build! CX-DIAMOND)
-  (let [r (find-op OP-REGION)
+  (let [r (find-op OPTAG-REGION)
         arm (n-in r 2)]
-    (assert (= (n-op arm) OP-CPROJ))
+    (assert (op-is? arm CProj [_]))
     (n-set-def! arm 0 r)
     (expect-only "a CProj whose parent is a Region" VERR-PROJ-SLOT)
     (assert (= (g-verify-node) arm))))
@@ -493,7 +493,7 @@
 ;; missing dependency and an optimiser that is only right under some visit orders.
 (deftest a_stale_type_is_caught
   (corpus-build! CX-GVN-AFTER)
-  (let [ret (find-op OP-RETURN)
+  (let [ret (find-op OPTAG-RETURN)
         v   (n-in ret 1)]
     ; the corruption is a type that is not what compute says, and nothing else
     (assert (= (n-ty v) (n-compute v)))
@@ -524,7 +524,7 @@
 ;; caller was looking for, so it is reported alone and first.
 (deftest an_open_merge_is_reported_as_in_progress
   (corpus-build! CX-GVN-AFTER)
-  (let [r (n-new OP-REGION 0)]
+  (let [r (n-new (Region))]
     (n-add-def! r NO-NODE)
     (n-add-def! r (g-start))
     (n-add-def! r NO-NODE)
@@ -549,30 +549,30 @@
 ;; The binary value computes, dispatched the way `n-compute` dispatches them. An op with no
 ;; entry is an error rather than a default: a new binary op silently inheriting the arithmetic
 ;; rules is how a monotonicity gate stops covering the op it was extended for.
-(defn compute2 [(op i64) (a i64) (b i64)] (-> i64)
-  (case op
-    OP-ADD (arith-compute OP-ADD a b)
-    OP-SUB (arith-compute OP-SUB a b)
-    OP-MUL (arith-compute OP-MUL a b)
-    OP-DIV (arith-compute OP-DIV a b)
-    OP-EQ  (cmp-compute OP-EQ a b)
-    OP-LT  (cmp-compute OP-LT a b)
-    OP-LE  (cmp-compute OP-LE a b)
-    (do (let [w (stderr)]
-          (ps w "\nmonotonicity gate has no binary compute for ") (ps w (op-name op)) (ps w "\n"))
-        (abort) 0)))
+(defn compute2 [(op Op) (a i64) (b i64)] (-> i64)
+  (match op
+    (Add [] (arith-compute (Add) a b))
+    (Sub [] (arith-compute (Sub) a b))
+    (Mul [] (arith-compute (Mul) a b))
+    (Div [] (arith-compute (Div) a b))
+    (Eq [] (cmp-compute (Eq) a b))
+    (Lt [] (cmp-compute (Lt) a b))
+    (Le [] (cmp-compute (Le) a b))
+    (_ (do (let [w (stderr)]
+          (ps w "\nmonotonicity gate has no binary compute for ") (ps w (op-value-name op)) (ps w "\n"))
+        (abort) 0))))
 
-(defn compute1 [(op i64) (a i64)] (-> i64)
-  (case op
-    OP-MINUS (minus-compute a)
-    OP-NOT   (not-compute a)
-    (do (let [w (stderr)]
-          (ps w "\nmonotonicity gate has no unary compute for ") (ps w (op-name op)) (ps w "\n"))
-        (abort) 0)))
+(defn compute1 [(op Op) (a i64)] (-> i64)
+  (match op
+    (Minus [] (minus-compute a))
+    (Not [] (not-compute a))
+    (_ (do (let [w (stderr)]
+          (ps w "\nmonotonicity gate has no unary compute for ") (ps w (op-value-name op)) (ps w "\n"))
+        (abort) 0))))
 
-(defn mono-fail [(op i64) (pos i64) (a i64) (b i64) (x i64) (ra i64) (rb i64)] (-> i64)
+(defn mono-fail [(op Op) (pos i64) (a i64) (b i64) (x i64) (ra i64) (rb i64)] (-> i64)
   (let [w (stderr)]
-    (ps w "\nCOMPUTE IS NOT MONOTONE: ") (ps w (op-name op))
+    (ps w "\nCOMPUTE IS NOT MONOTONE: ") (ps w (op-value-name op))
     (fmt w ", operand {d}\n" pos)
     (ps w "  a      = ") (ty-print w a) (ps w "\n")
     (ps w "  b      = ") (ty-print w b) (ps w "   (a isa b, so a is at or above b)\n")
@@ -599,7 +599,7 @@
 
 ;; Returns the number of checks performed, so the caller can require that the sample really was
 ;; explored. A monotonicity test over an empty pair set passes trivially.
-(defn mono-check-binary [(op i64)] (-> i64)
+(defn mono-check-binary [(op Op)] (-> i64)
   (let [n (nsamples) (mut checks) 0 (mut bads) 0 (mut i) 0]
     (loop
       (if (>= (load i) n) (break)
@@ -630,7 +630,7 @@
     (if (= (load bads) 0) 0 (do (abort) 0))
     (load checks)))
 
-(defn mono-check-unary [(op i64)] (-> i64)
+(defn mono-check-unary [(op Op)] (-> i64)
   (let [n (nsamples) (mut checks) 0 (mut bads) 0 (mut i) 0]
     (loop
       (if (>= (load i) n) (break)
@@ -652,9 +652,9 @@
     (if (= (load bads) 0) 0 (do (abort) 0))
     (load checks)))
 
-(defn mono-report [(op i64) (checks i64) (floor i64)] (-> i64)
+(defn mono-report [(op Op) (checks i64) (floor i64)] (-> i64)
   (let [w (stdout)]
-    (ps w "  ") (ps w (op-name op)) (fmt w "\t{d} checks\n" checks))
+    (ps w "  ") (ps w (op-value-name op)) (fmt w "\t{d} checks\n" checks))
   ; the sample really was explored: a narrowed sample fails here instead of passing quietly
   (assert (>= checks floor))
   0)
@@ -665,15 +665,15 @@
          (nsamples) pairs)
     (assert (>= (nsamples) SAMPLE-FLOOR))
     (assert (>= pairs MONO-PAIRS-FLOOR))
-    (mono-report OP-ADD   (mono-check-binary OP-ADD)   MONO-BIN-FLOOR)
-    (mono-report OP-SUB   (mono-check-binary OP-SUB)   MONO-BIN-FLOOR)
-    (mono-report OP-MUL   (mono-check-binary OP-MUL)   MONO-BIN-FLOOR)
-    (mono-report OP-DIV   (mono-check-binary OP-DIV)   MONO-BIN-FLOOR)
-    (mono-report OP-EQ    (mono-check-binary OP-EQ)    MONO-BIN-FLOOR)
-    (mono-report OP-LT    (mono-check-binary OP-LT)    MONO-BIN-FLOOR)
-    (mono-report OP-LE    (mono-check-binary OP-LE)    MONO-BIN-FLOOR)
-    (mono-report OP-MINUS (mono-check-unary OP-MINUS)  MONO-PAIRS-FLOOR)
-    (mono-report OP-NOT   (mono-check-unary OP-NOT)    MONO-PAIRS-FLOOR)
+    (mono-report (Add)   (mono-check-binary (Add))   MONO-BIN-FLOOR)
+    (mono-report (Sub)   (mono-check-binary (Sub))   MONO-BIN-FLOOR)
+    (mono-report (Mul)   (mono-check-binary (Mul))   MONO-BIN-FLOOR)
+    (mono-report (Div)   (mono-check-binary (Div))   MONO-BIN-FLOOR)
+    (mono-report (Eq)    (mono-check-binary (Eq))    MONO-BIN-FLOOR)
+    (mono-report (Lt)    (mono-check-binary (Lt))    MONO-BIN-FLOOR)
+    (mono-report (Le)    (mono-check-binary (Le))    MONO-BIN-FLOOR)
+    (mono-report (Minus) (mono-check-unary (Minus))  MONO-PAIRS-FLOOR)
+    (mono-report (Not)   (mono-check-unary (Not))    MONO-PAIRS-FLOOR)
     0))
 
 ;; `if-compute` reads two slots and is the one control compute that is a function of its inputs'
@@ -685,9 +685,9 @@
 ;; them; they exist so `n-in-ty` has something to read.
 (deftest if_compute_is_monotone_in_both_slots
   (graph-reset! 1)
-  (let [c   (n-new OP-ARG (t-top))
-        p   (n-new OP-ARG (t-top))
-        iff (n-new2 OP-IF 0 c p)
+  (let [c   (n-new (Arg (t-top)))
+        p   (n-new (Arg (t-top)))
+        iff (n-new2 (If) c p)
         n   (nsamples) (mut checks) 0 (mut bads) 0 (mut i) 0]
     (loop
       (if (>= (load i) n) (break)
@@ -707,7 +707,7 @@
                               (n-set-ty! c b)
                               (let [rb (if-compute iff)]
                                 (if (ty-isa ra rb) 0
-                                  (store! bads (+ (load bads) (mono-fail OP-IF 0 a b x ra rb))))))
+                                  (store! bads (+ (load bads) (mono-fail (If) 0 a b x ra rb))))))
                             ; slot 1: the predicate, where JavaScript truthiness decides
                             (n-set-ty! c x)
                             (n-set-ty! p a)
@@ -715,7 +715,7 @@
                               (n-set-ty! p b)
                               (let [rb (if-compute iff)]
                                 (if (ty-isa ra rb) 0
-                                  (store! bads (+ (load bads) (mono-fail OP-IF 1 a b x ra rb))))))
+                                  (store! bads (+ (load bads) (mono-fail (If) 1 a b x ra rb))))))
                             (store! checks (+ (load checks) 2))
                             (store! k (+ (load k) 1))
                             0)))
@@ -726,17 +726,17 @@
           (store! i (+ (load i) 1))
           0)))
     (assert (= (load bads) 0))
-    (mono-report OP-IF (load checks) MONO-BIN-FLOOR)))
+    (mono-report (If) (load checks) MONO-BIN-FLOOR)))
 
 ;; `proj-compute` is a function of the parent's tuple type and the slot index. An out-of-range
 ;; slot answers ALL, which is the deliberate reading of "this projection is nonsense" rather than
 ;; a crash, so slot 2 of a two-slot tuple is in the sweep on purpose.
 (deftest proj_compute_is_monotone
   (graph-reset! 1)
-  (let [m  (n-new OP-ARG (t-top))
-        p0 (n-new1 OP-PROJ 0 m)
-        p1 (n-new1 OP-PROJ 1 m)
-        p2 (n-new1 OP-PROJ 2 m)
+  (let [m  (n-new (Arg (t-top)))
+        p0 (n-new1 (Proj 0) m)
+        p1 (n-new1 (Proj 1) m)
+        p2 (n-new1 (Proj 2) m)
         n  (nsamples) (mut checks) 0 (mut bads) 0 (mut i) 0]
     (loop
       (if (>= (load i) n) (break)
@@ -755,7 +755,7 @@
                               (let [rb (proj-compute pn)]
                                 (if (ty-isa ra rb) 0
                                   (store! bads
-                                          (+ (load bads) (mono-fail OP-PROJ (load s) a b a ra rb))))))
+                                          (+ (load bads) (mono-fail (Proj 0) (load s) a b a ra rb))))))
                             (store! checks (+ (load checks) 1))
                             (store! s (+ (load s) 1))
                             0)))
@@ -767,7 +767,7 @@
           0)))
     (assert (= (load bads) 0))
     ; three slots per comparable pair
-    (mono-report OP-PROJ (load checks) (* MONO-PAIRS-FLOOR 3))))
+    (mono-report (Proj 0) (load checks) (* MONO-PAIRS-FLOOR 3))))
 
 ; ===========================================================================
 ; 6. A rising type is a hard error
@@ -822,7 +822,7 @@
     ; falling-type check is exercised rather than merely compiled in
     (graph-reset! 1)
     (let [a    (raw-arg (t-int-range 0 10))
-          add  (raw-bin OP-ADD a (raw-int 2))]
+          add  (raw-bin (Add) a (raw-int 2))]
       (raw-ret add)
       (fmt w "\n--- monotonicity in sequence ---\n  raw fixture: {d} falling-type checks performed\n"
            (g-analyze-checks))

@@ -16,6 +16,8 @@
 (import "coil.fmt" :use *)
 (import "coil.slice" :use *)
 
+;; `-1` MEANS "NO SINGLE TAG", NOT "UNSUPPORTED". The numeric union has two tags and is selected
+;; as two tests and an OR at the `TypeTest` site; every other union genuinely has no encoding.
 (defn be-js-tag-for-type [(t i64)] (-> i64)
   (case (ty-kinds t) VK-UNDEF
         JSV-UNDEFINED VK-NULL
@@ -34,9 +36,10 @@
 (defn be-array-value? [(node i64) (fuel i64)] (-> bool)
   (if (or (= node NO-NODE) (or (<= fuel 0) (n-dead? node)))
       false
-      (case (n-op node) OP-ARRAYMARK
-            true OP-CAST
-            (be-array-value? (n-in node 1) (- fuel 1)) OP-PHI
+      (match (n-op node)
+        (ArrayMark [] true)
+        (Cast [target] (be-array-value? (n-in node 1) (- fuel 1)))
+        (Phi [declared]
             (let [(mut input) 1
                   (mut evidence) false
                   (mut valid) true]
@@ -49,8 +52,8 @@
                                   (store! evidence true)
                                   (store! valid false)))
                           (store! input (+ (load input) 1)))))
-              (and (load evidence) (load valid)))
-              false)))
+              (and (load evidence) (load valid))))
+        (_ false))))
 
 (defn be-function-return-kind-fuel [(owner i64) (fuel i64)] (-> i64)
   (let [count (mu-function-return-count owner)
@@ -62,9 +65,9 @@
               (break)
               (let [bid (mu-function-return-block owner (load i))
                     term (mu-block-terminator bid)]
-                (if (and (!= term NO-NODE) (= (n-op term) OP-RETURN))
+                (if (and (!= term NO-NODE) (op-is? term Return []))
                     (let [value (n-in term 1)]
-                      (if (= (n-op value) OP-CALL)
+                      (if (op-is? value Call [_])
                           ;; Call nodes have lattice type `dyn` regardless of their eventual native
                           ;; ABI. Looking only at that type labels every delegated numeric return as
                           ;; boxed. Follow the bounded call graph instead; recursive edges exhaust
@@ -115,7 +118,7 @@
               (break)
               (let [term (mu-block-terminator (mu-function-return-block owner (load index)))]
                 (if (and (!= term NO-NODE)
-                         (and (= (n-op term) OP-RETURN)
+                         (and (op-is? term Return [])
                               (be-node-fp-value? (n-in term 1))))
                     (store! found true)
                     0)
@@ -139,7 +142,7 @@
               (break)
               (let [fun (mu-function-ideal (load owner))]
                 (if (and (!= fun NO-NODE)
-                         (and (= (n-op fun) OP-FUN)
+                         (and (op-is? fun Fun [_])
                               (infer-call-reaches-fun? call fun)))
                     (let [kind (be-function-return-kind-fuel (load owner) fuel)]
                       (store! saw true)
@@ -163,9 +166,9 @@
     (loop (if (or (>= (load i) count) (load mixed))
               (break)
               (let [term (mu-block-terminator (mu-function-return-block owner (load i)))]
-                (if (and (!= term NO-NODE) (= (n-op term) OP-RETURN))
+                (if (and (!= term NO-NODE) (op-is? term Return []))
                     (let [value (n-in term 1)]
-                      (if (= (n-op value) OP-CALL)
+                      (if (op-is? value Call [_])
                           0
                           (let [kind (if (be-node-fp-value? value)
                                          MLK-SCALAR
@@ -185,9 +188,9 @@
     (loop (if (or (>= (load i) count) (not (load consistent)))
               (break)
               (let [term (mu-block-terminator (mu-function-return-block owner (load i)))]
-                (if (and (!= term NO-NODE) (= (n-op term) OP-RETURN))
+                (if (and (!= term NO-NODE) (op-is? term Return []))
                     (let [value (n-in term 1)]
-                      (if (= (n-op value) OP-CALL)
+                      (if (op-is? value Call [_])
                           (let [tag
                                   (if (> fuel 0)
                                       (be-call-return-tag-fuel value (- fuel 1))
@@ -226,7 +229,7 @@
               (break)
               (let [fun (mu-function-ideal (load owner))]
                 (if (and (!= fun NO-NODE)
-                         (and (= (n-op fun) OP-FUN)
+                         (and (op-is? fun Fun [_])
                               (infer-call-reaches-fun? call fun)))
                     (let [tag (be-function-return-tag-fuel (load owner) fuel)]
                       (store! saw true)
@@ -247,15 +250,17 @@
   ;; an OBJECT-tagged word. The generic dispatcher recognizes that tag and reads the callable
   ;; id from the environment's __closure_target field — a function tag here would send the env
   ;; pointer down the bare-function payload path.
-  (if (and (= (n-op node) OP-CLOSURE) (= (n-nins node) (+ (n-aux node) 2)))
+  (if (match (n-op node)
+        (Closure [captures] (= (n-nins node) (+ captures 2)))
+        (_ false))
       JSV-OBJECT
   (if (be-array-value? node 64)
       JSV-ARRAY
       (if (ml-raw-nullable-value? node 32)
           JSV-RAW-NULLABLE-OBJECT
-          (if (and (= (n-op node) OP-CALL) (!= (be-call-return-kind node) MLK-BOXED))
+          (if (and (op-is? node Call [_]) (!= (be-call-return-kind node) MLK-BOXED))
               (be-call-return-tag node)
-          (if (and (= (n-op node) OP-PARM)
+          (if (and (op-is? node Parm [_])
                (= (ml-kind-for-parm-representation node) MLK-RAW-MANAGED))
           JSV-OBJECT
           (let [tag (be-js-tag-for-type (n-ty node))]
@@ -269,9 +274,9 @@
                 tag))))))))
 
 (defn be-box-input-already-tagged? [(node i64)] (-> bool)
-  (if (= (n-op node) OP-BOX)
+  (if (op-is? node Box [_])
       true
-  (if (= (n-op node) OP-CALL)
+  (if (op-is? node Call [_])
       (= (be-call-return-kind node) MLK-BOXED)
       (= (ml-kind-for-node node) MLK-BOXED))))
 
@@ -288,26 +293,27 @@
     (TTuple [o l] 0)
     (TMem [a c] 0)))
 
-(defn be-fp-op [(op i64)] (-> i64)
-  (case op OP-ADD
-        MI-FADD OP-SUB
-        MI-FSUB OP-MUL
-        MI-FMUL OP-DIV
-        MI-FDIV OP-EQ
-        MI-FEQ OP-LT
-        MI-FLT OP-LE
-        MI-FLE -1))
+(defn be-fp-op [(op Op)] (-> i64)
+  (match op
+    (Add [] MI-FADD)
+    (Sub [] MI-FSUB)
+    (Mul [] MI-FMUL)
+    (Div [] MI-FDIV)
+    (Eq [] MI-FEQ)
+    (Lt [] MI-FLT)
+    (Le [] MI-FLE)
+    (_ -1)))
 
 (defn be-parm-fp-value? [(node i64)] (-> bool)
   (let [fun (n-in node 0)
-        slot (n-aux node)
+        slot (n-parm-index node)
         (mut at) 0
         (mut found) false]
     (loop (if (or (>= (load at) (n-count)) (load found))
               (break)
               (do
                 (if (and (not (n-dead? (load at)))
-                         (and (= (n-op (load at)) OP-CALL)
+                         (and (op-is? (load at) Call [_])
                               (and (> (n-nins (load at)) (+ slot 2))
                                    (= (n-in (load at) 1) fun))))
                     (let [actual (n-in (load at) (+ slot 2))]
@@ -325,22 +331,19 @@
               (do (al-push! [i64] (field u fp-mark) 0) 0)))
     0))
 
-;; A node is floating-point at the source: nothing below it needs looking at. `OP-PARM` is terminal
+;; A node is floating-point at the source: nothing below it needs looking at. `OPTAG-PARM` is terminal
 ;; either way — a parameter's representation comes from the actual arguments, not from its own type.
 (defn be-fp-source? [(node i64)] (-> bool)
-  (let [op (n-op node)]
-    (if (= op OP-MOD)
-        true
-        (if (= op OP-PARM)
-            (be-parm-fp-value? node)
-            (or (be-float-only? (n-ty node))
-                (and (= op OP-DIV) (not (ty-int-only? (n-ty node)))))))))
+  (match (n-op node)
+    (Mod [] true)
+    (Parm [_] (be-parm-fp-value? node))
+    (Div [] (or (be-float-only? (n-ty node)) (not (ty-int-only? (n-ty node)))))
+    (_ (be-float-only? (n-ty node)))))
 
 ;; The operands whose representation this node's own representation is derived from.
 (defn be-fp-push-operands! [(node i64)] (-> i64)
-  (let [u (machine-unit)
-        op (n-op node)]
-    (if (= op OP-PHI)
+  (let [u (machine-unit)]
+    (if (op-is? node Phi [_])
         ;; Loop Phis are initially bounded by the declared TypeScript type. A numeric backedge can
         ;; nevertheless require an FPR (for example an integer accumulator updated by a
         ;; floating-point call result), so every incoming value counts. The mark array terminates
@@ -353,23 +356,24 @@
                       (store! input (+ (load input) 1))
                       0)))
           0)
-        (if (or (= op OP-ADD) (or (= op OP-SUB) (or (= op OP-MUL) (= op OP-DIV))))
+        (if (or (op-is? node Add []) (or (op-is? node Sub [])
+                (or (op-is? node Mul []) (op-is? node Div []))))
             (do
               (al-push! [i64] (field u fp-stack) (n-in node 1))
               (al-push! [i64] (field u fp-stack) (n-in node 2))
               0)
-            (if (= op OP-MINUS)
+            (if (op-is? node Minus [])
                 (do (al-push! [i64] (field u fp-stack) (n-in node 1)) 0)
-                (if (= op OP-CALL)
+                (if (op-is? node Call [_])
                     (let [callee (n-in node 1)
-                          target (if (= (n-op callee) OP-CLOSURE) (n-in callee 0) callee)]
-                      (if (= (n-op target) OP-FUN)
+                          target (if (op-is? callee Closure [_]) (n-in callee 0) callee)]
+                      (if (op-is? target Fun [_])
                           (let [(mut input) 1]
                             (loop (if (>= (load input) (n-nins target))
                                       (break)
                                       (do
                                         (let [ret (n-in target (load input))]
-                                          (if (and (!= ret NO-NODE) (= (n-op ret) OP-RETURN))
+                                          (if (and (!= ret NO-NODE) (op-is? ret Return []))
                                               (do
                                                 (al-push! [i64] (field u fp-stack) (n-in ret 1))
                                                 0)
@@ -423,12 +427,9 @@
 ; backend fixtures also use t-dyn for unconstrained machine integers, so type alone is
 ; not enough to justify a runtime JavaScript equality or truthiness call.
 (defn be-js-dynamic-boundary? [(node i64)] (-> bool)
-  (let [op (n-op node)]
-    (or (= op OP-CALL)
-        (or (= op OP-PROPLOAD)
-            (or (= op OP-ARRAYLOAD)
-                (or (= op OP-BOX)
-                    (= op OP-PHI)))))))
+  (match (n-op node)
+    (Call [_] true) (PropLoad [_] true) (ArrayLoad [_] true) (Box [_] true) (Phi [_] true)
+    (_ false)))
 
 
 (defn graph-arg-index [(n i64)] (-> i64)
@@ -439,8 +440,8 @@
               (break)
               (do
                 (if (and (not (n-dead? (load i)))
-                         (and (= (n-op (load i)) OP-ARG)
-                              (and (not (ty-mem? (n-aux (load i))))
+                         (and (op-is? (load i) Arg [_])
+                              (and (not (ty-mem? (n-arg-type (load i))))
                                    (and (> (n-nins (load i)) 0)
                                         (and (= (n-in (load i) 0) (g-start))
                                              (= (be-float-only? (n-ty (load i))) want-fp))))))
@@ -458,16 +459,16 @@
       (loop (if (>= (load i) (n-count)) (break)
               (do
                 (if (and (not (n-dead? (load i)))
-                         (and (= (n-op (load i)) OP-PARM)
+                         (and (op-is? (load i) Parm [_])
                               (and (= (n-in (load i) 0) fun)
-                                   (= (n-aux (load i)) position))))
+                                   (= (n-parm-index (load i)) position))))
                     (return-from :done (be-node-fp-value? (load i)))
                     0)
                 (store! i (+ (load i) 1))))))
     (let [(mut call) 0]
       (loop (if (>= (load call) (n-count)) (break)
               (do
-                (if (and (not (n-dead? (load call))) (= (n-op (load call)) OP-CALL))
+                (if (and (not (n-dead? (load call))) (op-is? (load call) Call [_]))
                     (let [source (infer-parm-source (load call) fun position)]
                       (if (!= source NO-NODE)
                           (return-from :done (be-node-fp-value? source))
@@ -479,7 +480,7 @@
 (defn graph-parm-abi-index [(n i64)] (-> i64)
   (let [fun (n-in n 0)
         want-fp (be-node-fp-value? n)
-        limit (n-aux n)
+        limit (n-parm-index n)
         (mut position) 0
         (mut idx) 0]
     (loop (if (>= (load position) limit)
@@ -499,7 +500,7 @@
               (break)
               (do
                 (if (and (not (n-dead? (load i)))
-                         (and (= (n-op (load i)) OP-PARM)
+                         (and (op-is? (load i) Parm [_])
                               (and (= (n-in (load i) 0) fun)
                                    (>= (graph-parm-abi-index (load i)) 8))))
                     (store! idx (+ (load idx) 1))
@@ -514,7 +515,7 @@
     (loop (if (>= (load i) n)
               (break)
               (do
-                (if (and (not (n-dead? (load i))) (= (n-op (load i)) OP-NEW))
+                (if (and (not (n-dead? (load i))) (op-is? (load i) New [_]))
                     (store! idx (+ (load idx) 1))
                     0)
                 (store! i (+ (load i) 1))
@@ -643,39 +644,27 @@
             0
             (do
               (al-push! [i64] (mut deps) node)
-              (case (n-op node) OP-MEMMERGE
-                    (let [(mut i) 1]
+              (match (n-op node)
+                (MemMerge [] (let [(mut i) 1]
                       (loop (if (>= (load i) (n-nins node))
                                 (break)
                                 (do
                                   (ms-push-memory-dep-tree!
                                     first (n-in node (load i)) (- fuel 1))
-                                  (store! i (+ (load i) 1))))))
-                    OP-STORE
-                    (ms-push-memory-dep-tree! first (n-in node 1) (- fuel 1))
-                    OP-PROPSTORE
-                    (ms-push-memory-dep-tree! first (n-in node 1) (- fuel 1))
-                    OP-PROPDELETE
-                    (ms-push-memory-dep-tree! first (n-in node 1) (- fuel 1))
-                    OP-PROPSTOREKEY
-                    (ms-push-memory-dep-tree! first (n-in node 1) (- fuel 1))
-                    OP-PROPDELETEKEY
-                    (ms-push-memory-dep-tree! first (n-in node 1) (- fuel 1))
-                    OP-SETPROTO
-                    (ms-push-memory-dep-tree! first (n-in node 1) (- fuel 1))
-                    OP-OBJECTFREEZE
-                    (ms-push-memory-dep-tree! first (n-in node 1) (- fuel 1))
-                    OP-INTERNALSTORE
-                    (ms-push-memory-dep-tree! first (n-in node 1) (- fuel 1))
-                    OP-ARRAYSTORE
-                    (ms-push-memory-dep-tree! first (n-in node 1) (- fuel 1))
-                    OP-ARRAYRESIZE
-                    (ms-push-memory-dep-tree! first (n-in node 1) (- fuel 1))
-                    OP-ARRAYCOPY
-                    (ms-push-memory-dep-tree! first (n-in node 1) (- fuel 1))
-                    OP-STRINGSPLIT
-                    (ms-push-memory-dep-tree! first (n-in node 1) (- fuel 1))
-                    0)
+                                  (store! i (+ (load i) 1)))))))
+                (Store [alias] (ms-push-memory-dep-tree! first (n-in node 1) (- fuel 1)))
+                (PropStore [name] (ms-push-memory-dep-tree! first (n-in node 1) (- fuel 1)))
+                (PropDelete [name] (ms-push-memory-dep-tree! first (n-in node 1) (- fuel 1)))
+                (PropStoreKey [] (ms-push-memory-dep-tree! first (n-in node 1) (- fuel 1)))
+                (PropDeleteKey [] (ms-push-memory-dep-tree! first (n-in node 1) (- fuel 1)))
+                (SetProto [] (ms-push-memory-dep-tree! first (n-in node 1) (- fuel 1)))
+                (ObjectFreeze [] (ms-push-memory-dep-tree! first (n-in node 1) (- fuel 1)))
+                (InternalStore [operation] (ms-push-memory-dep-tree! first (n-in node 1) (- fuel 1)))
+                (ArrayStore [] (ms-push-memory-dep-tree! first (n-in node 1) (- fuel 1)))
+                (ArrayResize [] (ms-push-memory-dep-tree! first (n-in node 1) (- fuel 1)))
+                (ArrayCopy [] (ms-push-memory-dep-tree! first (n-in node 1) (- fuel 1)))
+                (StringSplit [] (ms-push-memory-dep-tree! first (n-in node 1) (- fuel 1)))
+                (_ 0))
               0)))))
 
 (defn ms-add-memory-deps! [(at i64) (node i64) (first-slot i64) (count i64)] (-> i64)
@@ -716,7 +705,7 @@
 ;; the parent New before the calls that compute its fields. Besides changing source evaluation
 ;; order, that exposes a partially initialized parent to moving collection.
 (defn ms-select-control-effects! [(owner i64) (ctrl i64) (bid i64)] (-> bool)
-  (if (or (< ctrl 0) (!= (n-op ctrl) OP-CALLEND))
+  (if (or (< ctrl 0) (not (op-is? ctrl CallEnd [])))
       true
       (if (not (ms-select-control-effects! owner (n-in ctrl 0) bid))
           false
@@ -728,7 +717,7 @@
 (defn ms-value-anchor-block [(owner i64) (node i64) (fuel i64)] (-> i64)
   (if (or (= node NO-NODE) (<= fuel 0))
       -1
-      (if (= (n-op node) OP-PROJ)
+      (if (op-is? node Proj [_])
           (ms-value-anchor-block owner (n-in node 0) (- fuel 1))
           (if (and (> (n-nins node) 0) (!= (n-in node 0) NO-NODE))
               (ms-node-block owner node)
@@ -785,46 +774,39 @@
     (if (>= pinned 0) (do (store! answer pinned) (store! done true)) 0)
     (loop (if (load done)
               (break)
-              (case (n-op (load current)) OP-STORE
-                    (store! current (n-in (load current) 1)) OP-LOAD
-                    (store! current (n-in (load current) 1)) OP-PROPSTORE
-                    (store! current (n-in (load current) 1)) OP-PROPDELETE
-                    (store! current (n-in (load current) 1)) OP-SETPROTO
-                    (store! current (n-in (load current) 1)) OP-PROPLOAD
-                    (store! current (n-in (load current) 1)) OP-PROPHAS
-                    (store! current (n-in (load current) 1))
-                    OP-PROTOHAS
-                    (store! current (n-in (load current) 1))
-                    OP-PROPLOADKEY
-                    (store! current (n-in (load current) 1)) OP-PROPHASKEY
-                    (store! current (n-in (load current) 1))
-                    OP-OWNKEYCOUNT
-                    (store! current (n-in (load current) 1)) OP-OWNKEYAT
-                    (store! current (n-in (load current) 1))
-                    OP-PROPSTOREKEY
-                    (store! current (n-in (load current) 1)) OP-PROPDELETEKEY
-                    (store! current (n-in (load current) 1))
-                    OP-OBJECTFREEZE
-                    (store! current (n-in (load current) 1))
-                    OP-INTERNALLOAD
-                    (store! current (n-in (load current) 1)) OP-INTERNALSTORE
-                    (store! current (n-in (load current) 1))
-                    OP-ARRAYSTORE
-                    (store! current (n-in (load current) 1)) OP-ARRAYRESIZE
-                    (store! current (n-in (load current) 1)) OP-ARRAYLOAD
-                    (store! current (n-in (load current) 1)) OP-ARRAYLEN
-                    (store! current (n-in (load current) 1)) OP-ARRAYCOPY
-                    (store! current (n-in (load current) 1)) OP-STRINGSPLIT
-                    (store! current (n-in (load current) 1)) OP-PROJ
-                    (do
+              (match (n-op (load current))
+                (Store [alias] (store! current (n-in (load current) 1)))
+                (Load [alias] (store! current (n-in (load current) 1)))
+                (PropStore [name] (store! current (n-in (load current) 1)))
+                (PropDelete [name] (store! current (n-in (load current) 1)))
+                (SetProto [] (store! current (n-in (load current) 1)))
+                (PropLoad [name] (store! current (n-in (load current) 1)))
+                (PropHas [name] (store! current (n-in (load current) 1)))
+                (ProtoHas [] (store! current (n-in (load current) 1)))
+                (PropLoadKey [] (store! current (n-in (load current) 1)))
+                (PropHasKey [] (store! current (n-in (load current) 1)))
+                (OwnKeyCount [] (store! current (n-in (load current) 1)))
+                (OwnKeyAt [] (store! current (n-in (load current) 1)))
+                (PropStoreKey [] (store! current (n-in (load current) 1)))
+                (PropDeleteKey [] (store! current (n-in (load current) 1)))
+                (ObjectFreeze [] (store! current (n-in (load current) 1)))
+                (InternalLoad [slot] (store! current (n-in (load current) 1)))
+                (InternalStore [operation] (store! current (n-in (load current) 1)))
+                (ArrayStore [] (store! current (n-in (load current) 1)))
+                (ArrayResize [] (store! current (n-in (load current) 1)))
+                (ArrayLoad [alias] (store! current (n-in (load current) 1)))
+                (ArrayLen [] (store! current (n-in (load current) 1)))
+                (ArrayCopy [] (store! current (n-in (load current) 1)))
+                (StringSplit [] (store! current (n-in (load current) 1)))
+                (Proj [slot] (do
                       (store! answer
-                              (if (= (n-op (n-in (load current) 0)) OP-NEW)
+                              (if (match (n-op (n-in (load current) 0)) (New [shape] true) (_ false))
                                   (ms-node-block owner (n-in (load current) 0))
                                   (ms-node-block owner (load current))))
-                      (store! done true))
-                      (do
+                      (store! done true)))
+                (_ (do
                         (store! answer (ms-node-block owner (load current)))
-                        (store! done true)))))
+                        (store! done true))))))
     ; Only shaped cell/field stores take the operand bound: their alias chains legitimately
     ; root at function entry while the stored allocation is pinned deeper. Property-table ops
     ; can carry values from a SIBLING branch arm (the value crosses the merge in a register),
@@ -833,13 +815,13 @@
     (if (>= pinned 0)
         (load answer)
         (let [bounded
-                (if (= (n-op node) OP-STORE)
+                (if (op-is? node Store [_])
                     (ms-memory-operand-bound owner node (load answer))
                     (load answer))
               mem-in (if (> (n-nins node) 1) (n-in node 1) NO-NODE)
               pred-block
                 (if (and (!= mem-in NO-NODE)
-                         (and (!= mem-in node) (= (n-op mem-in) OP-STORE)))
+                         (and (!= mem-in node) (op-is? mem-in Store [_])))
                     (ms-memory-block owner mem-in)
                     -1)]
           (if (and (>= pred-block 0)
@@ -852,79 +834,82 @@
 (defn ms-memory-chain-phi? [(node i64)] (-> bool)
   (if (< node 0)
       false
-      (case (n-op node) OP-PHI
-            true OP-STORE
-            (ms-memory-chain-phi? (n-in node 1)) OP-PROPSTORE
-            (ms-memory-chain-phi? (n-in node 1)) OP-PROPDELETE
-            (ms-memory-chain-phi? (n-in node 1)) OP-PROPSTOREKEY
-            (ms-memory-chain-phi? (n-in node 1)) OP-PROPDELETEKEY
-            (ms-memory-chain-phi? (n-in node 1)) OP-SETPROTO
-            (ms-memory-chain-phi? (n-in node 1)) OP-OBJECTFREEZE
-            (ms-memory-chain-phi? (n-in node 1)) OP-INTERNALSTORE
-            (ms-memory-chain-phi? (n-in node 1)) OP-ARRAYSTORE
-            (ms-memory-chain-phi? (n-in node 1)) OP-ARRAYRESIZE
-            (ms-memory-chain-phi? (n-in node 1)) OP-ARRAYCOPY
-            (ms-memory-chain-phi? (n-in node 1)) OP-STRINGSPLIT
-            (ms-memory-chain-phi? (n-in node 1)) OP-MEMMERGE
-            (let [(mut i) 1
+      (match (n-op node)
+        (Phi [declared] true)
+        (Store [alias] (ms-memory-chain-phi? (n-in node 1)))
+        (PropStore [name] (ms-memory-chain-phi? (n-in node 1)))
+        (PropDelete [name] (ms-memory-chain-phi? (n-in node 1)))
+        (PropStoreKey [] (ms-memory-chain-phi? (n-in node 1)))
+        (PropDeleteKey [] (ms-memory-chain-phi? (n-in node 1)))
+        (SetProto [] (ms-memory-chain-phi? (n-in node 1)))
+        (ObjectFreeze [] (ms-memory-chain-phi? (n-in node 1)))
+        (InternalStore [operation] (ms-memory-chain-phi? (n-in node 1)))
+        (ArrayStore [] (ms-memory-chain-phi? (n-in node 1)))
+        (ArrayResize [] (ms-memory-chain-phi? (n-in node 1)))
+        (ArrayCopy [] (ms-memory-chain-phi? (n-in node 1)))
+        (StringSplit [] (ms-memory-chain-phi? (n-in node 1)))
+        (MemMerge [] (let [(mut i) 1
                   (mut found) false]
               (loop (if (or (>= (load i) (n-nins node)) (load found))
                         (break)
                         (do
                           (store! found (ms-memory-chain-phi? (n-in node (load i))))
                           (store! i (+ (load i) 1)))))
-              (load found))
-              false)))
+              (load found)))
+        (_ false))))
 
 (defn ms-array-owner-block [(owner i64) (array i64)] (-> i64)
-  (if (= (n-op array) OP-ARRAYMARK)
+  (match (n-op array)
+    (ArrayMark []
       (let [ptr (n-in array 1)]
-        (if (and (= (n-op ptr) OP-PROJ) (= (n-op (n-in ptr 0)) OP-NEW))
-            (ms-node-block owner (n-in ptr 0))
-            (ms-node-block owner ptr)))
-      (ms-node-block owner array)))
+        (match (n-op ptr)
+          (Proj [slot]
+            (let [parent (n-in ptr 0)]
+              (if (and (!= parent NO-NODE)
+                       (match (n-op parent) (New [shape] true) (_ false)))
+                  (ms-node-block owner parent)
+                  (ms-node-block owner ptr))))
+          (_ (ms-node-block owner ptr)))))
+    (_ (ms-node-block owner array))))
 
 (defn ms-selected-effect-node-block [(owner i64) (node i64) (fallback i64)] (-> i64)
-  (case (n-op node) OP-PROPSTORE
-        (let [value-block (ms-node-block owner (n-in node 3))
+  (match (n-op node)
+    (PropStore [name] (let [value-block (ms-node-block owner (n-in node 3))
               object-block (ms-node-block owner (n-in node 2))]
           (if (and (>= value-block 0) (!= value-block (ms-entry-block owner)))
               value-block
               (if (and (>= object-block 0) (!= object-block (ms-entry-block owner)))
                   object-block
-                  fallback))) OP-PROPDELETE
-        (let [object-block (ms-node-block owner (n-in node 2))]
+                  fallback))))
+    (PropDelete [name] (let [object-block (ms-node-block owner (n-in node 2))]
           (if (and (>= object-block 0) (!= object-block (ms-entry-block owner)))
-              object-block fallback)) OP-PROPSTOREKEY
-        (let [value-block (ms-node-block owner (n-in node 4))
+              object-block fallback)))
+    (PropStoreKey [] (let [value-block (ms-node-block owner (n-in node 4))
               key-block (ms-node-block owner (n-in node 3))]
           (if (and (>= value-block 0) (!= value-block (ms-entry-block owner)))
               value-block
               (if (and (>= key-block 0) (!= key-block (ms-entry-block owner)))
-                  key-block fallback))) OP-PROPDELETEKEY
-        (let [key-block (ms-node-block owner (n-in node 3))]
+                  key-block fallback))))
+    (PropDeleteKey [] (let [key-block (ms-node-block owner (n-in node 3))]
           (if (and (>= key-block 0) (!= key-block (ms-entry-block owner)))
-              key-block fallback)) OP-SETPROTO
-        (let [prototype-block (ms-node-block owner (n-in node 3))
+              key-block fallback)))
+    (SetProto [] (let [prototype-block (ms-node-block owner (n-in node 3))
               object-block (ms-node-block owner (n-in node 2))]
           (if (and (>= prototype-block 0) (!= prototype-block (ms-entry-block owner)))
               prototype-block
               (if (and (>= object-block 0) (!= object-block (ms-entry-block owner)))
                   object-block
-                  fallback)))
-          OP-OBJECTFREEZE
-        (let [object-block (ms-node-block owner (n-in node 2))]
+                  fallback))))
+    (ObjectFreeze [] (let [object-block (ms-node-block owner (n-in node 2))]
           (if (and (>= object-block 0) (!= object-block (ms-entry-block owner)))
-              object-block fallback))
-          OP-INTERNALLOAD
-        (let [object-block (ms-node-block owner (n-in node 2))]
+              object-block fallback)))
+    (InternalLoad [slot] (let [object-block (ms-node-block owner (n-in node 2))]
           (if (and (>= object-block 0) (!= object-block (ms-entry-block owner)))
-              object-block fallback))
-          OP-INTERNALSTORE
-        (let [object-block (ms-node-block owner (n-in node 2))]
+              object-block fallback)))
+    (InternalStore [operation] (let [object-block (ms-node-block owner (n-in node 2))]
           (if (and (>= object-block 0) (!= object-block (ms-entry-block owner)))
-              object-block fallback))
-          fallback))
+              object-block fallback)))
+    (_ fallback)))
 
 (defn ms-array-effect-block [(owner i64) (memory i64) (array i64) (fallback i64)] (-> i64)
   (let [(mut at) 0
@@ -990,19 +975,20 @@
           (if (and (>= mapped 0) (= (mu-block-owner mapped) owner)) mapped fallback)))))
 
 (defn ms-linear-memory-effect? [(node i64)] (-> bool)
-  (case (n-op node) OP-STORE true
-        OP-PROPSTORE true
-        OP-PROPDELETE true
-        OP-PROPSTOREKEY true
-        OP-PROPDELETEKEY true
-        OP-SETPROTO true
-        OP-OBJECTFREEZE true
-        OP-INTERNALSTORE true
-        OP-ARRAYSTORE true
-        OP-ARRAYRESIZE true
-        OP-ARRAYCOPY true
-        OP-STRINGSPLIT true
-        false))
+  (match (n-op node)
+    (Store [alias] true)
+    (PropStore [name] true)
+    (PropDelete [name] true)
+    (PropStoreKey [] true)
+    (PropDeleteKey [] true)
+    (SetProto [] true)
+    (ObjectFreeze [] true)
+    (InternalStore [operation] true)
+    (ArrayStore [] true)
+    (ArrayResize [] true)
+    (ArrayCopy [] true)
+    (StringSplit [] true)
+    (_ false)))
 
 (defn ms-select-memory-at! [(owner i64) (node i64) (bid i64)] (-> bool)
   (if (ms-seen? owner node)
@@ -1046,14 +1032,14 @@
   (if (ms-seen? owner node)
       true
       (let [(mut ok) true]
-        (case (n-op node) OP-STORE
-              (if (not (ms-select-memory-at! owner (n-in node 1) bid))
+        (match (n-op node)
+            (Store [alias] (if (not (ms-select-memory-at! owner (n-in node 1) bid))
                   (store! ok false)
                   (let [ptr (ms-select-value-at! owner (n-in node 2) bid)
                         raw-value (ms-select-value-at! owner (n-in node 3) bid)
                         value
                           (if (and (>= raw-value 0)
-                                   (and (= (shape-alias-ty (n-aux node)) (t-flt))
+                                   (and (= (shape-alias-ty alias) (t-flt))
                                         (not (be-node-fp-value? (n-in node 3)))))
                               (ms-fp-input! owner (n-in node 3) raw-value bid)
                               raw-value)]
@@ -1066,15 +1052,13 @@
                                                   -1
                                                   ptr
                                                   value
-                                                  (be-field-off (n-aux node))
+                                                  (be-field-off alias)
                                                   node))]
-                          (ms-add-memory-deps! at node 1 1)))))
-                OP-PROJ
-              (if (= (n-op (n-in node 0)) OP-NEW)
+                          (ms-add-memory-deps! at node 1 1))))))
+            (Proj [slot] (if (op-is? (n-in node 0) New [_])
                   (if (< (ms-select-value-at! owner (n-in node 0) bid) 0) (store! ok false) 0)
-                  0)
-                OP-PROPSTORE
-              (if (not (ms-select-memory-at! owner (n-in node 1) bid))
+                  0))
+            (PropStore [name] (if (not (ms-select-memory-at! owner (n-in node 1) bid))
                   (store! ok false)
                   (let [object (ms-select-value-at! owner (n-in node 2) bid)
                         value (ms-select-value-at! owner (n-in node 3) bid)]
@@ -1085,9 +1069,8 @@
                               key (ms-select-property-key! owner node effect-bid)
                               at (ms-emit! owner effect-bid (mi-new MI-JSPROP fresh object value 1 node))]
                           (ms-add-single-arg! at key)
-                          (ms-add-memory-deps! at node 1 1)))))
-                OP-PROPDELETE
-              (if (not (ms-select-memory-at! owner (n-in node 1) bid))
+                          (ms-add-memory-deps! at node 1 1))))))
+            (PropDelete [name] (if (not (ms-select-memory-at! owner (n-in node 1) bid))
                   (store! ok false)
                   (let [object (ms-select-value-at! owner (n-in node 2) bid)]
                     (if (< object 0)
@@ -1098,9 +1081,8 @@
                               at (ms-emit! owner effect-bid
                                            (mi-new MI-JSPROP fresh object object 4 node))]
                           (ms-add-single-arg! at key)
-                          (ms-add-memory-deps! at node 1 1)))))
-                OP-PROPSTOREKEY
-              (if (not (ms-select-memory-at! owner (n-in node 1) bid))
+                          (ms-add-memory-deps! at node 1 1))))))
+            (PropStoreKey [] (if (not (ms-select-memory-at! owner (n-in node 1) bid))
                   (store! ok false)
                   (let [object (ms-select-value-at! owner (n-in node 2) bid)
                         key (ms-select-value-at! owner (n-in node 3) bid)
@@ -1111,9 +1093,8 @@
                               at (ms-emit! owner bid
                                            (mi-new MI-JSPROP fresh object value 1 node))]
                           (ms-add-single-arg! at key)
-                          (ms-add-memory-deps! at node 1 1)))))
-                OP-PROPDELETEKEY
-              (if (not (ms-select-memory-at! owner (n-in node 1) bid))
+                          (ms-add-memory-deps! at node 1 1))))))
+            (PropDeleteKey [] (if (not (ms-select-memory-at! owner (n-in node 1) bid))
                   (store! ok false)
                   (let [object (ms-select-value-at! owner (n-in node 2) bid)
                         key (ms-select-value-at! owner (n-in node 3) bid)]
@@ -1123,9 +1104,8 @@
                               at (ms-emit! owner bid
                                            (mi-new MI-JSPROP fresh object object 4 node))]
                           (ms-add-single-arg! at key)
-                          (ms-add-memory-deps! at node 1 1)))))
-                OP-ARRAYSTORE
-              (if (not (ms-select-memory-at! owner (n-in node 1) bid))
+                          (ms-add-memory-deps! at node 1 1))))))
+            (ArrayStore [] (if (not (ms-select-memory-at! owner (n-in node 1) bid))
                   (store! ok false)
                   (let [object (ms-select-value-at! owner (n-in node 2) bid)
                         index (ms-array-index! owner (n-in node 3) bid)
@@ -1149,9 +1129,8 @@
                                           effect-bid
                                           (mi-new MI-JSARRAY fresh object index 2 node))]
                           (ms-add-single-arg! at value)
-                          (ms-add-memory-deps! at node 1 1)))))
-                OP-ARRAYRESIZE
-              (if (not (ms-select-memory-at! owner (n-in node 1) bid))
+                          (ms-add-memory-deps! at node 1 1))))))
+            (ArrayResize [] (if (not (ms-select-memory-at! owner (n-in node 1) bid))
                   (store! ok false)
                   (let [object (ms-select-value-at! owner (n-in node 2) bid)
                         length (ms-array-index! owner (n-in node 3) bid)
@@ -1175,9 +1154,8 @@
                                           effect-bid
                                           (mi-new MI-JSARRAY fresh object length 4 node))]
                           (ms-add-single-arg! at ordered)
-                          (ms-add-memory-deps! at node 1 1)))))
-                OP-ARRAYCOPY
-              (if (not (ms-select-memory-at! owner (n-in node 1) bid))
+                          (ms-add-memory-deps! at node 1 1))))))
+            (ArrayCopy [] (if (not (ms-select-memory-at! owner (n-in node 1) bid))
                   (store! ok false)
                   (let [source (ms-select-value-at! owner (n-in node 2) bid)
                         result (ms-select-value-at! owner (n-in node 3) bid)
@@ -1201,9 +1179,8 @@
                                           effect-bid
                                           (mi-new MI-JSARRAY fresh source start 5 node))]
                           (ms-add-single-arg! at result)
-                          (ms-add-memory-deps! at node 1 1)))))
-                OP-STRINGSPLIT
-              (if (not (ms-select-memory-at! owner (n-in node 1) bid))
+                          (ms-add-memory-deps! at node 1 1))))))
+            (StringSplit [] (if (not (ms-select-memory-at! owner (n-in node 1) bid))
                   (store! ok false)
                   (let [string (ms-select-value-at! owner (n-in node 2) bid)
                         delimiter (ms-select-value-at! owner (n-in node 3) bid)
@@ -1221,9 +1198,8 @@
                                                   JSSOP-SPLIT
                                                   node))]
                           (ms-add-single-arg! at result)
-                          (ms-add-memory-deps! at node 1 1)))))
-                OP-SETPROTO
-              (if (not (ms-select-memory-at! owner (n-in node 1) bid))
+                          (ms-add-memory-deps! at node 1 1))))))
+            (SetProto [] (if (not (ms-select-memory-at! owner (n-in node 1) bid))
                   (store! ok false)
                   (let [object (ms-select-value-at! owner (n-in node 2) bid)
                         prototype (ms-select-value-at! owner (n-in node 3) bid)]
@@ -1237,9 +1213,8 @@
                                           effect-bid
                                           (mi-new MI-JSPROP fresh object prototype 2 node))]
                           (ms-add-single-arg! at key)
-                          (ms-add-memory-deps! at node 1 1)))))
-                OP-OBJECTFREEZE
-              (if (not (ms-select-memory-at! owner (n-in node 1) bid))
+                          (ms-add-memory-deps! at node 1 1))))))
+            (ObjectFreeze [] (if (not (ms-select-memory-at! owner (n-in node 1) bid))
                   (store! ok false)
                   (let [object (ms-select-value-at! owner (n-in node 2) bid)]
                     (if (< object 0)
@@ -1249,30 +1224,28 @@
                               at (ms-emit! owner bid
                                            (mi-new MI-JSPROP fresh object object 8 node))]
                           (ms-add-single-arg! at key)
-                          (ms-add-memory-deps! at node 1 1)))))
-                OP-INTERNALSTORE
-              (if (not (ms-select-memory-at! owner (n-in node 1) bid))
+                          (ms-add-memory-deps! at node 1 1))))))
+            (InternalStore [operation] (if (not (ms-select-memory-at! owner (n-in node 1) bid))
                   (store! ok false)
                   (let [object (ms-select-value-at! owner (n-in node 2) bid)
                         value (ms-select-value-at! owner (n-in node 3) bid)
-                        extra (if (= (n-aux node) INTERNAL-INIT)
+                        extra (if (= operation INTERNAL-INIT)
                                   (ms-select-value-at! owner (n-in node 4) bid)
                                   value)]
                     (if (or (< object 0) (or (< value 0) (< extra 0)))
                         (store! ok false)
                         (let [fresh (ms-new-vreg!)
-                              operation (if (= (n-aux node) INTERNAL-INIT) 9 13)
-                              key (if (= (n-aux node) INTERNAL-INIT)
+                              machine-opcode (if (= operation INTERNAL-INIT) 9 13)
+                              key (if (= operation INTERNAL-INIT)
                                       value
                                       (ms-immediate! owner bid 0))
                               at (ms-emit! owner bid
-                                           (mi-new MI-JSPROP fresh object extra operation node))]
+                                           (mi-new MI-JSPROP fresh object extra machine-opcode node))]
                           (ms-add-single-arg! at key)
-                          (ms-add-memory-deps! at node 1 1)))))
-                OP-ARG
-              0 OP-PARM
-              0 OP-MEMMERGE
-              (let [len (n-nins node)
+                          (ms-add-memory-deps! at node 1 1))))))
+            (Arg [ty] 0)
+            (Parm [index] 0)
+            (MemMerge [] (let [len (n-nins node)
                     (mut i) 1]
                 (loop (if (or (>= (load i) len) (not (load ok)))
                           (break)
@@ -1284,9 +1257,9 @@
                                 (store! ok false)
                                 0)
                             (store! i (+ (load i) 1))
-                            0))))
-                OP-PHI
-              (do (ms-fail! MSEL-UNSUPPORTED node) (store! ok false)) 0)
+                            0)))))
+            (Phi [declared] (do (ms-fail! MSEL-UNSUPPORTED node) (store! ok false)))
+            (_ 0))
         (if (load ok) (do (ms-seen! owner node) true) false))))
 
 (defn ms-select-memory! [(owner i64) (node i64)] (-> bool)
@@ -1345,9 +1318,9 @@
 ;; converting something. The refusal is recorded and a well-formed instruction still emitted, so
 ;; the rest of selection walks a consistent program on its way to reporting the failure.
 (defn ms-value-is-tagged? [(node i64)] (-> bool)
-  (or (= (n-op node) OP-ARRAYLOAD)
-      (or (= (n-op node) OP-PROPLOAD)
-          (or (= (n-op node) OP-BOX)
+  (or (op-is? node ArrayLoad [_])
+      (or (op-is? node PropLoad [_])
+          (or (op-is? node Box [_])
               (ms-call-returns-tagged? node)))))
 
 (defn ms-fp-input! [(owner i64) (node i64) (vreg i64) (bid i64)] (-> i64)
@@ -1385,11 +1358,11 @@
 ;; the nodes where a value actually crosses the JavaScript-value ABI, and a return through one of
 ;; those is the evidence the lattice type cannot supply.
 (defn ms-call-returns-tagged? [(node i64)] (-> bool)
-  (and (= (n-op node) OP-CALL)
+  (and (op-is? node Call [_])
        (and (= (be-call-return-kind node) MLK-BOXED)
             (let [callee (n-in node 1)
-                  target (if (= (n-op callee) OP-CLOSURE) (n-in callee 0) callee)]
-              (and (= (n-op target) OP-FUN)
+                  target (if (op-is? callee Closure [_]) (n-in callee 0) callee)]
+              (and (op-is? target Fun [_])
                    (let [(mut input) 1
                          (mut found) false]
                      (loop (if (or (>= (load input) (n-nins target)) (load found))
@@ -1397,7 +1370,7 @@
                                (do
                                  (let [ret (n-in target (load input))]
                                    (if (and (!= ret NO-NODE)
-                                            (and (= (n-op ret) OP-RETURN)
+                                            (and (op-is? ret Return [])
                                                  (be-js-dynamic-boundary? (n-in ret 1))))
                                        (store! found true)
                                        0))
@@ -1488,13 +1461,18 @@
     (load result)))
 
 (defn ms-select-string-const! [(owner i64) (node i64) (bid i64)] (-> i64)
-  (ms-select-string-id! owner (n-aux node) node bid))
+  (ms-select-string-id! owner (n-stringconst-id node) node bid))
 
 ;; Static property names enter the same runtime string-key space as computed keys. The ideal IR
 ;; keeps compact interned ids in AUX; selection materializes their UTF-16 key at the call boundary.
 (defn ms-select-property-key! [(owner i64) (node i64) (bid i64)] (-> i64)
   (ms-select-string-id! owner
-                        (jss-from-utf8! (shape-name-bytes (n-aux node)))
+                        (jss-from-utf8!
+                          (shape-name-bytes
+                            (match (n-op node)
+                              (PropLoad [name] name) (PropStore [name] name)
+                              (PropHas [name] name) (PropDelete [name] name)
+                              (_ (do (panic-corrupt "expected named property Op") 0)))))
                         NO-NODE
                         bid))
 
@@ -1509,10 +1487,9 @@
   (let [prior (ms-vget owner node)]
     (if (>= prior 0)
         prior
-        (let [op (n-op node)
-              (mut vr) -1]
-          (case op OP-CONST
-                (if (or (= (ty-kinds (n-ty node)) VK-NULL)
+        (let [(mut vr) -1]
+          (match (n-op node)
+            (Const [ty] (if (or (= (ty-kinds (n-ty node)) VK-NULL)
                         (or (= (ty-kinds (n-ty node)) VK-UNDEF)
                             (or (and (= (ty-kinds (n-ty node)) VK-BOOL)
                                      (ty-const? (n-ty node)))
@@ -1536,10 +1513,9 @@
                                     (ms-entry-block owner)
                                     (mi-new MI-FMOVI fresh -1 -1 (be-float-bits (n-ty node)) node))
                           (store! vr fresh))
-                        0))
-                  OP-STRINGCONST
-                (store! vr (ms-select-string-const! owner node bid)) OP-STRINGLEN
-                (let [string (ms-select-value-at! owner (n-in node 1) bid)]
+                        0)))
+            (StringConst [id] (store! vr (ms-select-string-const! owner node bid)))
+            (StringLen [] (let [string (ms-select-value-at! owner (n-in node 1) bid)]
                   (if (>= string 0)
                       (store! vr
                               (ms-jsstring! owner
@@ -1549,11 +1525,10 @@
                                             (ms-immediate! owner bid 0)
                                             (ms-immediate! owner bid 0)
                                             JSSOP-LENGTH))
-                      0))
-                  OP-STRINGEQ
-                (store! vr (ms-select-string-binary! owner node bid JSSOP-EQUAL)) OP-STRINGCONCAT
-                (store! vr (ms-select-string-binary! owner node bid JSSOP-CONCAT)) OP-STRINGCHARCODE
-                (let [string (ms-select-value-at! owner (n-in node 1) bid)
+                      0)))
+            (StringEq [] (store! vr (ms-select-string-binary! owner node bid JSSOP-EQUAL)))
+            (StringConcat [] (store! vr (ms-select-string-binary! owner node bid JSSOP-CONCAT)))
+            (StringCharCode [] (let [string (ms-select-value-at! owner (n-in node 1) bid)
                       index (ms-select-value-at! owner (n-in node 2) bid)]
                   (if (or (< string 0) (< index 0))
                       0
@@ -1564,9 +1539,8 @@
                                             string
                                             index
                                             (ms-immediate! owner bid 0)
-                                            JSSOP-CHAR-CODE))))
-                  OP-STRINGSUBSTRING
-                (let [string (ms-select-value-at! owner (n-in node 1) bid)
+                                            JSSOP-CHAR-CODE)))))
+            (StringSubstring [mode] (let [string (ms-select-value-at! owner (n-in node 1) bid)
                       start (ms-select-value-at! owner (n-in node 2) bid)
                       end (ms-select-value-at! owner (n-in node 3) bid)]
                   (if (or (< string 0) (or (< start 0) (< end 0)))
@@ -1578,9 +1552,8 @@
                                             string
                                             start
                                             end
-                                            (+ JSSOP-SUBSTRING (n-aux node))))))
-                  OP-TOSTRING
-                (let [value-node (n-in node 1)
+                                            (+ JSSOP-SUBSTRING mode))))))
+            (ToString [] (let [value-node (n-in node 1)
                       value (ms-select-value-at! owner value-node bid)
                       operation
                         (let [kinds (ty-kinds (n-ty value-node))]
@@ -1603,9 +1576,8 @@
                                                 value
                                                 (ms-immediate! owner bid 0)
                                                 (ms-immediate! owner bid 0)
-                                                operation)))))
-                  OP-PARSEINT
-                (let [value-node (n-in node 1)
+                                                operation))))))
+            (ParseInt [] (let [value-node (n-in node 1)
                       value (ms-select-value-at! owner value-node bid)
                       radix (ms-select-value-at! owner (n-in node 2) bid)]
                   (if (or (< value 0) (< radix 0))
@@ -1637,17 +1609,15 @@
                                                   radix
                                                   (ms-immediate! owner bid 0)
                                                   JSSOP-PARSE-INT))
-                            0))))
-                  OP-PARSEFLOAT
-                (let [string (ms-select-value-at! owner (n-in node 1) bid)]
+                            0)))))
+            (ParseFloat [] (let [string (ms-select-value-at! owner (n-in node 1) bid)]
                   (if (>= string 0)
                       (store! vr (ms-jsstring! owner bid node string
                                                (ms-immediate! owner bid 0)
                                                (ms-immediate! owner bid 0)
                                                JSSOP-PARSE-FLOAT))
-                      0))
-                  OP-ISNAN
-                (let [value-node (n-in node 1)
+                      0)))
+            (IsNaN [] (let [value-node (n-in node 1)
                       value (ms-select-value-at! owner value-node bid)
                       kinds (ty-kinds (n-ty value-node))]
                   (if (< value 0)
@@ -1661,7 +1631,7 @@
                                                 (ms-immediate! owner bid 0)
                                                 (ms-immediate! owner bid 0)
                                                 JSSOP-IS-NAN))
-                          (if (= (n-op value-node) OP-STRINGCHARCODE)
+                          (if (op-is? value-node StringCharCode [])
                               (store! vr
                                       (ms-jsstring! owner
                                                     bid
@@ -1675,9 +1645,8 @@
                                   (store! vr (ms-immediate! owner bid 0))
                                   (if (= kinds VK-UNDEF)
                                       (store! vr (ms-immediate! owner bid 1))
-                                      0))))))
-                  OP-STRINGFROMCODEUNIT
-                (let [value (ms-select-value-at! owner (n-in node 1) bid)]
+                                      0)))))))
+            (StringFromCodeUnit [] (let [value (ms-select-value-at! owner (n-in node 1) bid)]
                   (if (>= value 0)
                       (store! vr
                               (ms-jsstring! owner
@@ -1687,9 +1656,8 @@
                                             (ms-immediate! owner bid 0)
                                             (ms-immediate! owner bid 0)
                                             JSSOP-FROM-CODE-UNIT))
-                      0))
-                  OP-NUMBERTOSTRING
-                (let [value (ms-select-value-at! owner (n-in node 1) bid)
+                      0)))
+            (NumberToString [] (let [value (ms-select-value-at! owner (n-in node 1) bid)
                       radix (ms-select-value-at! owner (n-in node 2) bid)]
                   (if (or (< value 0) (< radix 0))
                       0
@@ -1700,9 +1668,8 @@
                                             value
                                             radix
                                             (ms-immediate! owner bid 0)
-                                            JSSOP-FROM-INT-RADIX))))
-                  OP-STRINGLOWER
-                (let [value (ms-select-value-at! owner (n-in node 1) bid)]
+                                            JSSOP-FROM-INT-RADIX)))))
+            (StringLower [] (let [value (ms-select-value-at! owner (n-in node 1) bid)]
                   (if (>= value 0)
                       (store! vr
                               (ms-jsstring! owner
@@ -1712,9 +1679,8 @@
                                             (ms-immediate! owner bid 0)
                                             (ms-immediate! owner bid 0)
                                             JSSOP-LOWER))
-                      0))
-                  OP-STRINGUPPER
-                (let [value (ms-select-value-at! owner (n-in node 1) bid)]
+                      0)))
+            (StringUpper [] (let [value (ms-select-value-at! owner (n-in node 1) bid)]
                   (if (>= value 0)
                       (store! vr
                               (ms-jsstring! owner
@@ -1724,41 +1690,36 @@
                                             (ms-immediate! owner bid 0)
                                             (ms-immediate! owner bid 0)
                                             JSSOP-UPPER))
-                      0))
-                  OP-STRINGINDEXOF
-                (let [value (ms-select-value-at! owner (n-in node 1) bid)
+                      0)))
+            (StringIndexOf [] (let [value (ms-select-value-at! owner (n-in node 1) bid)
                       needle (ms-select-value-at! owner (n-in node 2) bid)
                       start (ms-select-value-at! owner (n-in node 3) bid)]
                   (if (or (< value 0) (or (< needle 0) (< start 0)))
                       0
-                      (store! vr (ms-jsstring! owner bid node value needle start JSSOP-INDEX-OF))))
-                  OP-STRINGCOMPARE
-                (let [left (ms-select-value-at! owner (n-in node 1) bid)
+                      (store! vr (ms-jsstring! owner bid node value needle start JSSOP-INDEX-OF)))))
+            (StringCompare [] (let [left (ms-select-value-at! owner (n-in node 1) bid)
                       right (ms-select-value-at! owner (n-in node 2) bid)]
                   (if (or (< left 0) (< right 0))
                       0
                       (store! vr
                               (ms-jsstring! owner bid node left right
-                                            (ms-immediate! owner bid 0) JSSOP-COMPARE))))
-                  OP-STRINGNORMALIZE
-                (let [string (ms-select-value-at! owner (n-in node 1) bid)
+                                            (ms-immediate! owner bid 0) JSSOP-COMPARE)))))
+            (StringNormalize [] (let [string (ms-select-value-at! owner (n-in node 1) bid)
                       form (ms-select-value-at! owner (n-in node 2) bid)]
                   (if (or (< string 0) (< form 0))
                       0
                       (store! vr
                               (ms-jsstring! owner bid node string form
-                                            (ms-immediate! owner bid 0) JSSOP-NORMALIZE))))
-                  OP-JSBUILTIN
-                (let [left (ms-select-value-at! owner (n-in node 1) bid)
+                                            (ms-immediate! owner bid 0) JSSOP-NORMALIZE)))))
+            (JsBuiltin [descriptor] (let [left (ms-select-value-at! owner (n-in node 1) bid)
                       right (ms-select-value-at! owner (n-in node 2) bid)]
                   (if (or (< left 0) (< right 0))
                       0
                       (store! vr
                               (ms-jsstring! owner bid node left right
                                             (ms-immediate! owner bid 0)
-                                            (+ JSSOP-BUILTIN-BASE (n-aux node))))))
-                  OP-JSTHROW
-                (let [throw-bid (ms-node-block owner node)
+                                            (+ JSSOP-BUILTIN-BASE descriptor))))))
+            (JsThrow [] (let [throw-bid (ms-node-block owner node)
                       value (if (< throw-bid 0) -1
                                 (ms-select-value-at! owner (n-in node 1) throw-bid))]
                   (if (or (< throw-bid 0) (< value 0))
@@ -1766,15 +1727,13 @@
                       (store! vr
                               (ms-jsstring! owner throw-bid node value
                                             (ms-immediate! owner throw-bid 0)
-                                            (ms-immediate! owner throw-bid 0) 200))))
-                  OP-FUN
-                (let [fresh (ms-new-vreg!)]
+                                            (ms-immediate! owner throw-bid 0) 200)))))
+            (Fun [index] (let [fresh (ms-new-vreg!)]
                   (ms-emit! owner
                             (ms-entry-block owner)
-                            (mi-new MI-MOVI fresh -1 -1 (n-aux node) node))
-                  (store! vr fresh))
-                  OP-ARG
-                (let [fixed (ms-new-vreg!)
+                            (mi-new MI-MOVI fresh -1 -1 index node))
+                  (store! vr fresh)))
+            (Arg [ty] (let [fixed (ms-new-vreg!)
                       fresh (ms-new-vreg!)]
                   (ms-emit! owner
                             (ms-entry-block owner)
@@ -1782,9 +1741,8 @@
                   (ms-emit! owner
                             (ms-entry-block owner)
                             (mi-new MI-ABI-COPY fresh fixed -1 0 NO-NODE))
-                  (store! vr fresh))
-                  OP-PARM
-                (let [fixed (ms-new-vreg!)
+                  (store! vr fresh)))
+            (Parm [index] (let [fixed (ms-new-vreg!)
                       fresh (ms-new-vreg!)
                       abi-index (graph-parm-abi-index node)]
                   (ms-emit! owner
@@ -1800,9 +1758,8 @@
                   (ms-emit! owner
                             (ms-entry-block owner)
                             (mi-new MI-ABI-COPY fresh fixed -1 0 NO-NODE))
-                  (store! vr fresh))
-                  OP-NEW
-                (let [len (n-nins node)
+                  (store! vr fresh)))
+            (New [shape] (let [len (n-nins node)
                       (mut i) 1
                       (mut ok)
                         (ms-select-control-effects! owner
@@ -1825,17 +1782,15 @@
                                                   fresh
                                                   -1
                                                   -1
-                                                  (n-aux node)
+                                                  shape
                                                   node))]
                           (ms-add-memory-deps! at node 1 (- len 1)))
                         (store! vr fresh))
-                      0))
-                  OP-PROJ
-                (if (and (= (n-aux node) 0) (= (n-op (n-in node 0)) OP-NEW))
+                      0)))
+            (Proj [slot] (if (and (= slot 0) (op-is? (n-in node 0) New [_]))
                     (store! vr (ms-select-value-at! owner (n-in node 0) bid))
-                    0)
-                  OP-LOAD
-                (if (not (ms-select-memory! owner (n-in node 1)))
+                    0))
+            (Load [alias] (if (not (ms-select-memory! owner (n-in node 1)))
                     0
                     (let [ptr (ms-select-value-at! owner (n-in node 2) (ms-memory-block owner node))]
                       (if (< ptr 0)
@@ -1848,16 +1803,15 @@
                                                       fresh
                                                       ptr
                                                       -1
-                                                      (be-field-off (n-aux node))
+                                                      (be-field-off alias)
                                                       node))]
                               (ms-add-memory-deps! at node 1 1))
-                            (store! vr fresh)))))
-                  OP-ADD
-                (store! vr (ms-select-numeric-binary! owner node MI-ADD bid)) OP-SUB
-                (store! vr (ms-select-numeric-binary! owner node MI-SUB bid)) OP-MUL
-                (store! vr (ms-select-numeric-binary! owner node MI-MUL bid)) OP-DIV
-                (store! vr (ms-select-numeric-binary! owner node MI-SDIV bid)) OP-EQ
-                (if (or (and (= (n-ty (n-in node 1)) (t-dyn))
+                            (store! vr fresh))))))
+            (Add [] (store! vr (ms-select-numeric-binary! owner node MI-ADD bid)))
+            (Sub [] (store! vr (ms-select-numeric-binary! owner node MI-SUB bid)))
+            (Mul [] (store! vr (ms-select-numeric-binary! owner node MI-MUL bid)))
+            (Div [] (store! vr (ms-select-numeric-binary! owner node MI-SDIV bid)))
+            (Eq [] (if (or (and (= (n-ty (n-in node 1)) (t-dyn))
                              (be-js-dynamic-boundary? (n-in node 1))
                              (and (ty-int-only? (n-ty (n-in node 2)))
                                   (and (ty-const? (n-ty (n-in node 2)))
@@ -1883,17 +1837,17 @@
                             (and (= (n-ty (n-in node 2)) (t-dyn))
                                  (be-js-dynamic-boundary? (n-in node 2))))
                         (store! vr (ms-select-string-binary! owner node bid JSSOP-VALUE-EQUAL))
-                        (store! vr (ms-select-numeric-binary! owner node MI-EQ bid)))) OP-LT
-                (store! vr (ms-select-numeric-binary! owner node MI-LT bid)) OP-LE
-                (store! vr (ms-select-numeric-binary! owner node MI-LE bid)) OP-MOD
-                (store! vr (ms-select-mod! owner node bid)) OP-BITAND
-                (store! vr (ms-select-int32-binary! owner node MI-BITAND bid)) OP-BITOR
-                (store! vr (ms-select-int32-binary! owner node MI-BITOR bid)) OP-BITXOR
-                (store! vr (ms-select-int32-binary! owner node MI-BITXOR bid)) OP-SHL
-                (store! vr (ms-select-int32-binary! owner node MI-SHL bid)) OP-SHR
-                (store! vr (ms-select-int32-binary! owner node MI-SHR bid)) OP-USHR
-                (store! vr (ms-select-int32-binary! owner node MI-USHR bid)) OP-BITNOT
-                (let [an (n-in node 1)
+                        (store! vr (ms-select-numeric-binary! owner node MI-EQ bid)))))
+            (Lt [] (store! vr (ms-select-numeric-binary! owner node MI-LT bid)))
+            (Le [] (store! vr (ms-select-numeric-binary! owner node MI-LE bid)))
+            (Mod [] (store! vr (ms-select-mod! owner node bid)))
+            (BitAnd [] (store! vr (ms-select-int32-binary! owner node MI-BITAND bid)))
+            (BitOr [] (store! vr (ms-select-int32-binary! owner node MI-BITOR bid)))
+            (BitXor [] (store! vr (ms-select-int32-binary! owner node MI-BITXOR bid)))
+            (Shl [] (store! vr (ms-select-int32-binary! owner node MI-SHL bid)))
+            (Shr [] (store! vr (ms-select-int32-binary! owner node MI-SHR bid)))
+            (UShr [] (store! vr (ms-select-int32-binary! owner node MI-USHR bid)))
+            (BitNot [] (let [an (n-in node 1)
                       raw-a (ms-select-value-at! owner an bid)]
                   (if (< raw-a 0)
                       0
@@ -1907,27 +1861,16 @@
                                   raw-a)
                             fresh (ms-new-vreg!)]
                         (ms-emit! owner bid (mi-new MI-BITNOT fresh a -1 0 node))
-                        (store! vr fresh))))
-;; Logical NOT over JavaScript truthiness. Two shapes, and the split matters for code quality
-                ;; rather than correctness: an operand already known to be an integer or a boolean is
-                ;; falsy exactly when it is zero, so `MI-EQ` against zero is the whole instruction and
-                ;; no runtime call is needed. Anything dynamic goes through the same
-                ;; `JSSOP-VALUE-TRUTHY` helper the If predicate and dynamic `Eq` already use, then is
-                ;; compared against zero to invert it.
-;; ToNumber and ToIntegerOrInfinity go to the runtime, which is where a correctly-rounded
-                ;; string-to-double belongs: the alternative is open-coding strtod in the compiler.
-                  OP-TONUMBER
-                (let [a (ms-select-value-at! owner (n-in node 1) bid)
+                        (store! vr fresh)))))
+            (ToNumber [] (let [a (ms-select-value-at! owner (n-in node 1) bid)
                       zero (ms-immediate! owner bid 0)]
                   (if (< a 0) 0
-                    (store! vr (ms-jsstring! owner bid node a zero zero JSSOP-TO-NUMBER))))
-                  OP-TOINTEGER
-                (let [a (ms-select-value-at! owner (n-in node 1) bid)
+                    (store! vr (ms-jsstring! owner bid node a zero zero JSSOP-TO-NUMBER)))))
+            (ToInteger [] (let [a (ms-select-value-at! owner (n-in node 1) bid)
                       zero (ms-immediate! owner bid 0)]
                   (if (< a 0) 0
-                    (store! vr (ms-jsstring! owner bid node a zero zero JSSOP-TO-INTEGER))))
-                  OP-NOT
-                (let [an (n-in node 1)
+                    (store! vr (ms-jsstring! owner bid node a zero zero JSSOP-TO-INTEGER)))))
+            (Not [] (let [an (n-in node 1)
                       a (ms-select-value-at! owner an bid)
                       zero (ms-immediate! owner bid 0)]
                   (if (< a 0)
@@ -1938,9 +1881,8 @@
                                   (ms-jsstring! owner bid NO-NODE a zero zero JSSOP-VALUE-TRUTHY))
                             fresh (ms-new-vreg!)]
                         (ms-emit! owner bid (mi-new MI-EQ fresh operand zero 0 node))
-                        (store! vr fresh))))
-                  OP-MINUS
-                (let [a (ms-select-value-at! owner (n-in node 1) bid)]
+                        (store! vr fresh)))))
+            (Minus [] (let [a (ms-select-value-at! owner (n-in node 1) bid)]
                   (if (< a 0)
                       0
                       (let [fresh (ms-new-vreg!)]
@@ -1952,10 +1894,9 @@
                                           -1
                                           0
                                           node))
-                        (store! vr fresh))))
-                  OP-CAST
-                (store! vr (ms-select-value-at! owner (n-in node 1) bid)) OP-PROPLOAD
-                (let [pinned-bid (ms-pinned-read-block owner node bid)]
+                        (store! vr fresh)))))
+            (Cast [target] (store! vr (ms-select-value-at! owner (n-in node 1) bid)))
+            (PropLoad [name] (let [pinned-bid (ms-pinned-read-block owner node bid)]
                   (if (or (not (ms-select-control-effects! owner (n-in node 0) pinned-bid))
                           (not (ms-select-memory-at! owner (n-in node 1) pinned-bid)))
                       (ms-fail! MSEL-UNSUPPORTED node)
@@ -1970,9 +1911,8 @@
                                             (mi-new MI-JSPROP fresh object object 0 node))]
                             (ms-add-single-arg! at key)
                             (ms-add-memory-deps! at node 1 1)
-                            (store! vr fresh))))))
-                  OP-PROPHAS
-                (let [pinned-bid (ms-pinned-read-block owner node bid)]
+                            (store! vr fresh)))))))
+            (PropHas [name] (let [pinned-bid (ms-pinned-read-block owner node bid)]
                   (if (or (not (ms-select-control-effects! owner (n-in node 0) pinned-bid))
                           (not (ms-select-memory-at! owner (n-in node 1) pinned-bid)))
                       (ms-fail! MSEL-UNSUPPORTED node)
@@ -1985,9 +1925,8 @@
                                                (mi-new MI-JSPROP fresh object object 3 node))]
                               (ms-add-single-arg! at key)
                               (ms-add-memory-deps! at node 1 1)
-                              (store! vr fresh))))))
-                  OP-PROTOHAS
-                (let [pinned-bid (ms-pinned-read-block owner node bid)]
+                              (store! vr fresh)))))))
+            (ProtoHas [] (let [pinned-bid (ms-pinned-read-block owner node bid)]
                   (if (or (not (ms-select-control-effects! owner (n-in node 0) pinned-bid))
                           (not (ms-select-memory-at! owner (n-in node 1) pinned-bid)))
                       (ms-fail! MSEL-UNSUPPORTED node)
@@ -2001,9 +1940,8 @@
                                                (mi-new MI-JSPROP fresh object prototype 5 node))]
                               (ms-add-single-arg! at key)
                               (ms-add-memory-deps! at node 1 1)
-                              (store! vr fresh))))))
-                  OP-PROPLOADKEY
-                (let [pinned-bid (ms-pinned-read-block owner node bid)]
+                              (store! vr fresh)))))))
+            (PropLoadKey [] (let [pinned-bid (ms-pinned-read-block owner node bid)]
                   (if (or (not (ms-select-control-effects! owner (n-in node 0) pinned-bid))
                           (not (ms-select-memory-at! owner (n-in node 1) pinned-bid)))
                       (ms-fail! MSEL-UNSUPPORTED node)
@@ -2016,9 +1954,8 @@
                                                (mi-new MI-JSPROP fresh object object 0 node))]
                               (ms-add-single-arg! at key)
                               (ms-add-memory-deps! at node 1 1)
-                              (store! vr fresh))))))
-                  OP-PROPHASKEY
-                (let [pinned-bid (ms-pinned-read-block owner node bid)]
+                              (store! vr fresh)))))))
+            (PropHasKey [] (let [pinned-bid (ms-pinned-read-block owner node bid)]
                   (if (or (not (ms-select-control-effects! owner (n-in node 0) pinned-bid))
                           (not (ms-select-memory-at! owner (n-in node 1) pinned-bid)))
                       (ms-fail! MSEL-UNSUPPORTED node)
@@ -2031,9 +1968,8 @@
                                                (mi-new MI-JSPROP fresh object object 3 node))]
                               (ms-add-single-arg! at key)
                               (ms-add-memory-deps! at node 1 1)
-                              (store! vr fresh))))))
-                  OP-OWNKEYCOUNT
-                (let [pinned-bid (ms-pinned-read-block owner node bid)]
+                              (store! vr fresh)))))))
+            (OwnKeyCount [] (let [pinned-bid (ms-pinned-read-block owner node bid)]
                   (if (or (not (ms-select-control-effects! owner (n-in node 0) pinned-bid))
                           (not (ms-select-memory-at! owner (n-in node 1) pinned-bid)))
                       (ms-fail! MSEL-UNSUPPORTED node)
@@ -2046,9 +1982,8 @@
                                                (mi-new MI-JSPROP fresh object object 6 node))]
                               (ms-add-single-arg! at zero)
                               (ms-add-memory-deps! at node 1 1)
-                              (store! vr fresh))))))
-                  OP-OWNKEYAT
-                (let [pinned-bid (ms-pinned-read-block owner node bid)]
+                              (store! vr fresh)))))))
+            (OwnKeyAt [] (let [pinned-bid (ms-pinned-read-block owner node bid)]
                   (if (or (not (ms-select-control-effects! owner (n-in node 0) pinned-bid))
                           (not (ms-select-memory-at! owner (n-in node 1) pinned-bid)))
                       (ms-fail! MSEL-UNSUPPORTED node)
@@ -2061,9 +1996,8 @@
                                                (mi-new MI-JSPROP fresh object object 7 node))]
                               (ms-add-single-arg! at ordinal)
                               (ms-add-memory-deps! at node 1 1)
-                              (store! vr fresh))))))
-                  OP-INTERNALLOAD
-                (let [pinned-bid (ms-pinned-read-block owner node bid)]
+                              (store! vr fresh)))))))
+            (InternalLoad [slot] (let [pinned-bid (ms-pinned-read-block owner node bid)]
                   (if (or (not (ms-select-control-effects! owner (n-in node 0) pinned-bid))
                           (not (ms-select-memory-at! owner (n-in node 1) pinned-bid)))
                       (ms-fail! MSEL-UNSUPPORTED node)
@@ -2072,17 +2006,16 @@
                             (ms-fail! MSEL-UNSUPPORTED node)
                             (let [fresh (ms-new-vreg!)
                                   zero (ms-immediate! owner pinned-bid 0)
-                                  operation (+ 10 (n-aux node))
+                                  operation (+ 10 slot)
                                   at (ms-emit! owner pinned-bid
                                                (mi-new MI-JSPROP fresh object object operation node))]
                               (ms-add-single-arg! at zero)
                               (ms-add-memory-deps! at node 1 1)
-                              (store! vr fresh))))))
-                  OP-ARRAYMARK
-                (let [ptr (n-in node 1)
+                              (store! vr fresh)))))))
+            (ArrayMark [] (let [ptr (n-in node 1)
                       source
-                        (if (and (= (n-op ptr) OP-PROJ)
-                                 (= (n-op (n-in ptr 0)) OP-NEW))
+                        (if (and (op-is? ptr Proj [_])
+                                 (op-is? (n-in ptr 0) New [_]))
                             (n-in ptr 0)
                             ptr)
                       ; Prefer the mark's own control anchor; fall back to the allocation's
@@ -2106,9 +2039,8 @@
                                           mark-bid
                                           (mi-new MI-JSARRAY fresh object object 0 node))]
                           (ms-add-single-arg! at object)
-                          (store! vr fresh)))))
-                  OP-ARRAYLOAD
-                (let [pinned-bid (ms-pinned-read-block owner node bid)]
+                          (store! vr fresh))))))
+            (ArrayLoad [alias] (let [pinned-bid (ms-pinned-read-block owner node bid)]
                 (if (or (not (ms-select-control-effects! owner (n-in node 0) pinned-bid))
                         (not (ms-select-memory-at! owner (n-in node 1) pinned-bid)))
                     (ms-fail! MSEL-UNSUPPORTED node)
@@ -2134,9 +2066,8 @@
                                             (mi-new MI-JSARRAY fresh object index 1 node))]
                             (ms-add-single-arg! at object)
                             (ms-add-memory-deps! at node 1 1)
-                            (store! vr fresh))))))
-                  OP-ARRAYLEN
-                (let [pinned-bid (ms-pinned-read-block owner node bid)]
+                            (store! vr fresh)))))))
+            (ArrayLen [] (let [pinned-bid (ms-pinned-read-block owner node bid)]
                 (if (or (not (ms-select-control-effects! owner (n-in node 0) pinned-bid))
                         (not (ms-select-memory-at! owner (n-in node 1) pinned-bid)))
                     (ms-fail! MSEL-UNSUPPORTED node)
@@ -2158,15 +2089,14 @@
                                             (mi-new MI-JSARRAY fresh object object 3 node))]
                             (ms-add-single-arg! at object)
                             (ms-add-memory-deps! at node 1 1)
-                            (store! vr fresh))))))
-                  OP-BOX
-                (let [a (ms-select-value-at! owner (n-in node 1) bid)
-                      tag (if (= (n-aux node) BOX-AUX-ARRAY)
+                            (store! vr fresh)))))))
+            (Box [mode] (let [a (ms-select-value-at! owner (n-in node 1) bid)
+                      tag (if (= mode BOX-AUX-ARRAY)
                               JSV-ARRAY
                               (if (be-node-fp-value? (n-in node 1))
                                   0
                                   (be-js-tag-for-value (n-in node 1))))]
-                  (if (and (= (n-aux node) BOX-AUX-INFER)
+                  (if (and (= mode BOX-AUX-INFER)
                            (and (>= a 0)
                            (and (not (be-node-fp-value? (n-in node 1)))
                                 (be-box-input-already-tagged? (n-in node 1)))))
@@ -2175,21 +2105,39 @@
                           (do (ms-fail! MSEL-UNSUPPORTED node) 0)
                           (let [fresh (ms-new-vreg!)]
                             (ms-emit! owner bid (mi-new MI-JSBOX fresh a -1 tag node))
-                            (store! vr fresh)))))
-                  OP-UNBOX
-                (let [a (ms-select-value-at! owner (n-in node 1) bid)
-                      tag (be-js-tag-for-type (n-aux node))]
+                            (store! vr fresh))))))
+            (Unbox [target] (let [a (ms-select-value-at! owner (n-in node 1) bid)
+                      tag (be-js-tag-for-type target)]
                   (if (or (< a 0) (= tag -1))
                       (do (ms-fail! MSEL-UNSUPPORTED node) 0)
                       (let [fresh (ms-new-vreg!)]
                         (ms-emit! owner bid (mi-new MI-JSUNBOX fresh a -1 tag node))
-                        (store! vr fresh))))
-                  OP-TYPETEST
-                (let [a (ms-select-value-at! owner (n-in node 1) bid)
-                      tag (be-js-tag-for-type (n-aux node))]
-                  (if (or (< a 0) (= tag -1))
+                        (store! vr fresh)))))
+            (TypeTest [target] (let [a (ms-select-value-at! owner (n-in node 1) bid)
+                      tag (be-js-tag-for-type target)
+                      numeric (= target (t-num))]
+                  (if (or (< a 0) (and (= tag -1) (not numeric)))
                       (do (ms-fail! MSEL-UNSUPPORTED node) 0)
-                      (if (= (n-aux node) (t-fun))
+                      ;; A NUMBER IS TWO TAGS. An immediate integer and an IEEE double are
+                      ;; genuinely different NaN-box tags, so `be-js-tag-for-type` has no single
+                      ;; answer for `int|flt` and used to refuse the test outright -- which is why
+                      ;; `IsNumber` in `lib/` is written as `%IsInt` OR `%IsFlt` and why neither
+                      ;; half can ever prove on a boxed operand.
+                      ;;
+                      ;; Selecting it as two tests and an OR needs no new instruction: it is the
+                      ;; same shape the callable test three lines down already uses for
+                      ;; function-or-closure. The double arm is `MI-JSTEST` with tag 0, which is
+                      ;; the NaN-box range check rather than a tag compare.
+                      ;; See docs/DSL-OWNERSHIP.md.
+                      (if numeric
+                          (let [as-int (ms-new-vreg!)]
+                            (ms-emit! owner bid (mi-new MI-JSTEST as-int a -1 JSV-INTEGER NO-NODE))
+                            (let [as-flt (ms-new-vreg!)]
+                              (ms-emit! owner bid (mi-new MI-JSTEST as-flt a -1 0 NO-NODE))
+                              (let [fresh (ms-new-vreg!)]
+                                (ms-emit! owner bid (mi-new MI-BITOR fresh as-int as-flt 0 node))
+                                (store! vr fresh))))
+                      (if (= target (t-fun))
                           (let [direct (ms-new-vreg!)]
                             (ms-emit! owner bid (mi-new MI-JSTEST direct a -1 JSV-FUNCTION NO-NODE))
                             (let [closure (ms-new-vreg!)]
@@ -2199,35 +2147,31 @@
                                 (store! vr fresh))))
                           (let [fresh (ms-new-vreg!)]
                             (ms-emit! owner bid (mi-new MI-JSTEST fresh a -1 tag node))
-                            (store! vr fresh)))))
-                  OP-ARRAYTEST
-                (let [a (ms-select-value-at! owner (n-in node 1) bid)]
+                            (store! vr fresh)))))))
+            (ArrayTest [] (let [a (ms-select-value-at! owner (n-in node 1) bid)]
                   (if (< a 0)
                       (ms-fail! MSEL-UNSUPPORTED node)
                       (let [fresh (ms-new-vreg!)]
                         (ms-emit! owner bid (mi-new MI-JSTEST fresh a -1 JSV-ARRAY node))
-                        (store! vr fresh))))
-                  OP-ARRAYUNBOX
-                (let [a (ms-select-value-at! owner (n-in node 1) bid)]
+                        (store! vr fresh)))))
+            (ArrayUnbox [] (let [a (ms-select-value-at! owner (n-in node 1) bid)]
                   (if (< a 0)
                       (ms-fail! MSEL-UNSUPPORTED node)
                       (let [fresh (ms-new-vreg!)]
                         (ms-emit! owner bid (mi-new MI-JSUNBOX fresh a -1 JSV-ARRAY node))
-                        (store! vr fresh))))
-                  OP-CLOSURE
-                (if (= (n-nins node) (+ (n-aux node) 2))
+                        (store! vr fresh)))))
+            (Closure [captures] (if (= (n-nins node) (+ captures 2))
                     (store! vr (ms-select-value-at! owner (n-in node 1) bid))
-                    (ms-fail! MSEL-UNSUPPORTED node))
-                  OP-PHI
-                0 OP-CALL
-                (let [callee-node (n-in node 1)
+                    (ms-fail! MSEL-UNSUPPORTED node)))
+            (Phi [declared] 0)
+            (Call [abi] (let [callee-node (n-in node 1)
                       callee (mu-direct-callee node)
                       targets (ty-fun-targets (n-ty callee-node))
                       ;; A dynamic JSL call must validate and dispatch the runtime callee even when
                       ;; closed-world analysis finds one possible target. Treating a singleton as
                       ;; direct silently ignored the heap-loaded value and called that target for
                       ;; `undefined` and non-callable properties alike.
-                      polymorphic (or (= (n-aux node) CALL-ABI-DYNAMIC-RECEIVER)
+                      polymorphic (or (= abi CALL-ABI-DYNAMIC-RECEIVER)
                                       (and (= callee NO-NODE)
                                            (> (popcount64 targets) 1)))
                       raw-argc (- (n-nins node) 2)
@@ -2238,19 +2182,19 @@
                       ; Captured-receiver calls carry their normalized capture prefix directly on
                       ; the Call node.  Do not also prepend the Closure inputs or the receiver is
                       ; shifted by the capture count (for four captures, from x4 to x8).
-                      explicit-captures (>= (n-aux node) CALL-ABI-CAPTURE-BASE)
+                      explicit-captures (>= abi CALL-ABI-CAPTURE-BASE)
                       capturec
-                        (if (and (= (n-op callee-node) OP-CLOSURE)
+                        (if (and (op-is? callee-node Closure [_])
                                  (and (not explicit-captures)
                                       ; The uniform receiver ABI passes captures through the
                                       ; hidden environment argument; prepending the Closure's
                                       ; capture inputs as registers would shift the receiver
                                       ; and every declared argument.
-                                      (!= (n-aux node) CALL-ABI-RECEIVER)))
-                            (n-aux callee-node)
+                                      (!= abi CALL-ABI-RECEIVER)))
+                            (n-closure-capture-count callee-node)
                             0)
                       materialized
-                        (and (= (n-op callee-node) OP-CLOSURE)
+                        (and (op-is? callee-node Closure [_])
                              (= (n-nins callee-node) (+ capturec 2)))
                       argc (+ capturec source-argc)
                       call-bid (ms-node-block owner node)]
@@ -2327,8 +2271,8 @@
                                               (ms-add-memory-deps! at node (- (n-nins node) 1) 1)
                                               0)
                                           (store! vr fresh)))
-                                      0))))))))
-                  (ms-fail! MSEL-UNSUPPORTED node))
+                                      0)))))))))
+            (_ (ms-fail! MSEL-UNSUPPORTED node)))
           (if (< (load vr) 0)
               -1
               (do (ms-vset! owner node (load vr)) (load vr)))))))
@@ -2337,7 +2281,7 @@
   (ms-select-value-at! owner node (ms-entry-block owner)))
 
 (defn ms-phi-block [(owner i64) (phi i64)] (-> i64)
-  (if (or (!= (n-op phi) OP-PHI) (= (n-in phi 0) NO-NODE))
+  (if (or (not (op-is? phi Phi [_])) (= (n-in phi 0) NO-NODE))
       -1
       (let [bid (al-get (load (field (machine-unit) ctrl-block)) (n-in phi 0))]
         (if (and (>= bid 0) (= (mu-block-owner bid) owner)) bid -1))))
@@ -2351,7 +2295,7 @@
               (break)
               (do
                 (if (and (not (n-dead? (load node)))
-                         (and (= (n-op (load node)) OP-PHI)
+                         (and (op-is? (load node) Phi [_])
                               (>= (ms-phi-block owner (load node)) 0)))
                     (if (ty-mem? (n-ty (load node)))
                         (ms-seen! owner (load node))
@@ -2384,7 +2328,7 @@
                                   (break)
                                   (do
                                     (if (and (not (n-dead? (load node)))
-                                             (and (= (n-op (load node)) OP-PHI)
+                                             (and (op-is? (load node) Phi [_])
                                                   (= (ms-phi-block owner (load node)) target)))
                                         (if (>= slot (n-nins (load node)))
                                             (ms-fail! MSEL-DEPENDENCY (load node))
@@ -2533,7 +2477,7 @@
               (do
                 (let [target (mu-block-succ-target bid (load i))
                       ctrl (mu-block-control target)]
-                  (if (and (= (n-op ctrl) OP-CPROJ) (= (n-aux ctrl) arm))
+                  (if (match (n-op ctrl) (CProj [label] (= label arm)) (_ false))
                       (store! found target)
                       0))
                 (store! i (+ (load i) 1))
@@ -2550,7 +2494,7 @@
                 (let [bid (mu-function-return-block owner (load i))
                       term (mu-block-terminator bid)]
                   (if (and (!= term NO-NODE)
-                           (and (= (n-op term) OP-RETURN)
+                           (and (op-is? term Return [])
                                 (be-node-fp-value? (n-in term 1))))
                       (store! fp true)
                       0))
@@ -2559,12 +2503,12 @@
     (load fp)))
 
 (defn ms-ingress-owned-by? [(owner i64) (node i64)] (-> bool)
-  (if (= (n-op node) OP-PARM)
+  (if (op-is? node Parm [_])
       (= (mu-find-function (n-in node 0)) owner)
       (let [ctrl (n-in node 0)]
-        (if (= (n-op ctrl) OP-START)
+        (if (op-is? ctrl Start [])
             (= owner 0)
-            (and (= (n-op ctrl) OP-FUNSTART)
+            (and (op-is? ctrl FunStart [])
                  (= (mu-find-function (n-in ctrl 0)) owner))))))
 
 (defn ms-preselect-function! [(owner i64)] (-> i64)
@@ -2578,7 +2522,7 @@
               (break)
               (do
                 (if (and (not (n-dead? (load node)))
-                         (and (or (= (n-op (load node)) OP-ARG) (= (n-op (load node)) OP-PARM))
+                         (and (or (op-is? (load node) Arg [_]) (op-is? (load node) Parm [_]))
                               (not (ty-mem? (n-ty (load node))))))
                     (let [bid (ms-node-block owner (load node))]
                       (if (and (ms-ingress-owned-by? owner (load node))
@@ -2594,9 +2538,9 @@
                       term (mu-block-terminator bid)]
                   (if (= term NO-NODE)
                       0
-                      (case (n-op term) OP-IF
-                            (ms-select-value-at! owner (n-in term 1) bid) OP-RETURN
-                            (do
+                      (match (n-op term)
+                        (If [] (ms-select-value-at! owner (n-in term 1) bid))
+                        (Return [] (do
                               (ms-select-control-effects! owner (n-in term 0) bid)
                               (if (> (n-nins term) 2)
                                   (do (ms-select-memory! owner (n-in term 2)) 0)
@@ -2625,7 +2569,7 @@
                                     kernel-fp-return
                                       (and (= owner 0)
                                            (and (> (g-rep-strict?) 0)
-                                                (if (= (n-op node) OP-CALL)
+                                                (if (op-is? node Call [_])
                                                     (let [direct (infer-direct-callee-fun node)
                                                           towner (if (= direct NO-NODE)
                                                                      -1
@@ -2664,8 +2608,8 @@
                                     (ms-fail! MSEL-UNSUPPORTED term)
                                     (if (or kernel-fp-return boxed-return)
                                         (do (ms-vset! owner term value) value)
-                                        value))))
-                              (ms-fail! MSEL-TERMINATOR term))))
+                                        value)))))
+                        (_ (ms-fail! MSEL-TERMINATOR term)))))
                 (store! rpo (+ (load rpo) 1))
                 0)))
     ;; Dynamic JavaScript effects are not represented in a function's fixed-field Return memory
@@ -2676,7 +2620,7 @@
               (break)
               (do
                 (if (not (n-dead? (load node)))
-                    (if (= (n-op (load node)) OP-CALL)
+                    (if (op-is? (load node) Call [_])
                         (let [bid (ms-node-block owner (load node))]
                           (if (and (>= bid 0) (= (mu-block-owner bid) owner))
                               (do (ms-select-value-at! owner (load node) bid) 0)
@@ -2722,8 +2666,8 @@
                               (mu-block-succ-target bid 0)
                               (mu-block-control bid)))
             (ms-fail! MSEL-TERMINATOR bid))
-        (case (n-op term) OP-IF
-              (let [pred-node (n-in term 1)
+        (match (n-op term)
+          (If [] (let [pred-node (n-in term 1)
                     raw-pred (ms-vget owner pred-node)
                     pred
                       (if (and (>= raw-pred 0)
@@ -2742,9 +2686,8 @@
                     no (ms-if-target bid 1)]
                 (if (or (< pred 0) (or (< yes 0) (< no 0)))
                     (ms-fail! MSEL-TERMINATOR term)
-                    (ms-emit! owner bid (mi-new MI-CBR -1 pred yes no term))))
-                OP-RETURN
-              (let [node (n-in term 1)
+                    (ms-emit! owner bid (mi-new MI-CBR -1 pred yes no term)))))
+          (Return [] (let [node (n-in term 1)
                     raw (ms-vget owner node)
                     normalized (ms-vget owner term)
                     value
@@ -2755,8 +2698,8 @@
                               raw))]
                 (if (< value 0)
                     (ms-fail! MSEL-DEPENDENCY term)
-                    (ms-emit! owner bid (mi-new MI-RET -1 value -1 0 term))))
-                (ms-fail! MSEL-TERMINATOR term)))))
+                    (ms-emit! owner bid (mi-new MI-RET -1 value -1 0 term)))))
+          (_ (ms-fail! MSEL-TERMINATOR term))))))
 
 (defn ms-emit-function! [(owner i64) (base i64)] (-> i64)
   (let [nblocks (mu-function-block-count owner)
@@ -2916,16 +2859,11 @@
 ;; loop-invariant motion this pass is for is over pure ops like `%StringIndexOf`, which have no
 ;; control input at all.
 (defn ms-anchored-memory-op? [(node i64)] (-> bool)
-  (let [op (n-op node)]
-    (or (ms-linear-memory-effect? node)
-        (or (= op OP-LOAD)
-            (or (= op OP-PROPLOAD)
-                (or (= op OP-PROPHAS)
-                    (or (= op OP-PROTOHAS)
-                        (or (= op OP-PROPLOADKEY)
-                            (or (= op OP-PROPHASKEY)
-                                (or (= op OP-INTERNALLOAD)
-                                    (or (= op OP-ARRAYLOAD) (= op OP-ARRAYLEN))))))))))))
+  (or (ms-linear-memory-effect? node)
+      (match (n-op node)
+        (Load [_] true) (PropLoad [_] true) (PropHas [_] true) (ProtoHas [] true)
+        (PropLoadKey [] true) (PropHasKey [] true) (InternalLoad [_] true)
+        (ArrayLoad [_] true) (ArrayLen [] true) (_ false))))
 
 ;; The block a control-anchored heap operation belongs to, or -1 when it has none.
 (defn ms-inst-anchor-block [(owner i64) (at i64)] (-> i64)
@@ -3722,32 +3660,36 @@
     (load found)))
 
 (defn ms-memory-node-before? [(owner i64) (node i64) (at i64)] (-> bool)
-  (case (n-op node) OP-ARG
+  (match (n-op node)
+    (Arg [ty]
         ;; A memory argument rooted at CallEnd is the post-call heap state. It is not an
         ;; entry-like root: consumers must remain after the call that produced that state.
         (let [ctrl (if (> (n-nins node) 0) (n-in node 0) NO-NODE)]
-          (if (and (>= ctrl 0) (= (n-op ctrl) OP-CALLEND))
+          (if (and (>= ctrl 0) (match (n-op ctrl) (CallEnd [] true) (_ false)))
               (>= (ms-node-inst-before owner (n-in ctrl 1) at) 0)
-              true)) OP-PARM
-        true OP-PROJ
-        (if (= (n-op (n-in node 0)) OP-NEW)
-            (>= (ms-node-inst-before owner (n-in node 0) at) 0)
-            true)
-          OP-STORE
-        (>= (ms-node-inst-before owner node at) 0) OP-PROPSTORE
-        (>= (ms-node-inst-before owner node at) 0) OP-PROPDELETE
-        (>= (ms-node-inst-before owner node at) 0) OP-PROPSTOREKEY
-        (>= (ms-node-inst-before owner node at) 0) OP-PROPDELETEKEY
-        (>= (ms-node-inst-before owner node at) 0) OP-SETPROTO
-        (>= (ms-node-inst-before owner node at) 0) OP-OBJECTFREEZE
-        (>= (ms-node-inst-before owner node at) 0) OP-INTERNALSTORE
-        (>= (ms-node-inst-before owner node at) 0) OP-ARRAYSTORE
-        (>= (ms-node-inst-before owner node at) 0) OP-ARRAYRESIZE
-        (>= (ms-node-inst-before owner node at) 0) OP-ARRAYCOPY
-        (>= (ms-node-inst-before owner node at) 0) OP-STRINGSPLIT
-        (>= (ms-node-inst-before owner node at) 0) OP-NEW
-        (>= (ms-node-inst-before owner node at) 0) OP-MEMMERGE
-        (let [len (n-nins node)
+              true)))
+    (Parm [index] true)
+    (Proj [slot]
+      (let [parent (n-in node 0)]
+        (if (and (!= parent NO-NODE)
+                 (match (n-op parent) (New [shape] true) (_ false)))
+            (>= (ms-node-inst-before owner parent at) 0)
+            true)))
+    (Store [alias] (>= (ms-node-inst-before owner node at) 0))
+    (PropStore [name] (>= (ms-node-inst-before owner node at) 0))
+    (PropDelete [name] (>= (ms-node-inst-before owner node at) 0))
+    (PropStoreKey [] (>= (ms-node-inst-before owner node at) 0))
+    (PropDeleteKey [] (>= (ms-node-inst-before owner node at) 0))
+    (SetProto [] (>= (ms-node-inst-before owner node at) 0))
+    (ObjectFreeze [] (>= (ms-node-inst-before owner node at) 0))
+    (InternalStore [operation] (>= (ms-node-inst-before owner node at) 0))
+    (ArrayStore [] (>= (ms-node-inst-before owner node at) 0))
+    (ArrayResize [] (>= (ms-node-inst-before owner node at) 0))
+    (ArrayCopy [] (>= (ms-node-inst-before owner node at) 0))
+    (StringSplit [] (>= (ms-node-inst-before owner node at) 0))
+    (New [shape] (>= (ms-node-inst-before owner node at) 0))
+    (MemMerge []
+      (let [len (n-nins node)
               (mut i) 1
               (mut ok) true]
           (loop (if (or (>= (load i) len) (not (load ok)))
@@ -3758,9 +3700,9 @@
                           0)
                       (store! i (+ (load i) 1))
                       0)))
-          (load ok))
-          OP-PHI
-        (and (ty-mem? (n-ty node)) (>= (ms-phi-block owner node) 0)) false))
+          (load ok)))
+    (Phi [declared] (and (ty-mem? declared) (>= (ms-phi-block owner node) 0)))
+    (_ false)))
 
 (defn ms-memory-node-on-incoming-edge? [(owner i64) (node i64) (at i64)] (-> bool)
   (let [consumer-block (ms-inst-block at)
@@ -4103,9 +4045,10 @@
          (and (mi-op-terminator? (ms-inst-op (- (+ first count) 1)))
               (if (= term NO-NODE)
                   (and (= succ 1) (= (load last-op) MI-JMP))
-                  (case (n-op term) OP-IF
-                        (and (= succ 2) (= (load last-op) MI-CBR)) OP-RETURN
-                        (and (= succ 0) (= (load last-op) MI-RET)) false))))))
+                  (match (n-op term)
+                    (If [] (and (= succ 2) (= (load last-op) MI-CBR)))
+                    (Return [] (and (= succ 0) (= (load last-op) MI-RET)))
+                    (_ false)))))))
 
 (defn ms-definition-unique? [(at i64)] (-> bool)
   (let [m (be-inst at)
@@ -4314,7 +4257,7 @@
                             kind (load (field c kind))]
                         (if (or (!= (load (field c edge)) edge)
                                 (or (= phi NO-NODE)
-                                    (or (!= (n-op phi) OP-PHI)
+                                    (or (not (op-is? phi Phi [_]))
                                         (or (!= (ms-phi-block owner phi) target)
                                             (>= slot (n-nins phi))))))
                             (store! ok false)
@@ -4347,7 +4290,7 @@
                       (break)
                       (do
                         (if (and (not (n-dead? (load node)))
-                                 (and (= (n-op (load node)) OP-PHI)
+                                 (and (op-is? (load node) Phi [_])
                                       (= (ms-phi-block owner (load node)) target)))
                             (let [(mut j) 0
                                   (mut matches) 0]
@@ -4704,48 +4647,48 @@
 ;; call operands so a moving collection never interprets that raw pointer as an already-tagged word.
 (defn ml-kind-for-source-representation [(node i64)] (-> i64)
   (let [(mut current) node (mut fuel) 64]
-    (loop (if (or (<= (load fuel) 0) (!= (n-op (load current)) OP-CAST))
+    (loop (if (or (<= (load fuel) 0) (not (op-is? (load current) Cast [_])))
               (break)
               (do
                 (store! current (n-in (load current) 1))
                 (store! fuel (- (load fuel) 1))
                 0)))
-    (if (= (n-op (load current)) OP-CALL)
+    (if (op-is? (load current) Call [_])
         ;; Call nodes deliberately retain the open `dyn` lattice type, but their native return ABI
         ;; is a closed-world property of the target set. Publish that representation to liveness
         ;; and stack maps so a raw managed result held across another safepoint is relocated as a
         ;; pointer instead of being mistaken for an already-tagged JavaScript word.
         (let [kind (be-call-return-kind (load current))]
           (if (>= kind 0) kind (ml-kind-for-type (n-ty (load current)))))
-    (if (or (= (n-op (load current)) OP-ADD)
-            (or (= (n-op (load current)) OP-SUB)
-                (or (= (n-op (load current)) OP-MUL)
-                    (or (= (n-op (load current)) OP-DIV)
-                        (or (= (n-op (load current)) OP-MOD)
-                            (or (= (n-op (load current)) OP-EQ)
-                                (or (= (n-op (load current)) OP-LT)
-                                    (or (= (n-op (load current)) OP-LE)
-                                        (or (= (n-op (load current)) OP-BITAND)
-                                            (or (= (n-op (load current)) OP-BITOR)
-                                                (or (= (n-op (load current)) OP-BITXOR)
-                                                    (or (= (n-op (load current)) OP-SHL)
-                                                        (or (= (n-op (load current)) OP-SHR)
-                                                            (or (= (n-op (load current)) OP-USHR)
-                                                                (= (n-op (load current)) OP-BITNOT)))))))))))))))
+    (if (or (op-is? (load current) Add [])
+            (or (op-is? (load current) Sub [])
+                (or (op-is? (load current) Mul [])
+                    (or (op-is? (load current) Div [])
+                        (or (op-is? (load current) Mod [])
+                            (or (op-is? (load current) Eq [])
+                                (or (op-is? (load current) Lt [])
+                                    (or (op-is? (load current) Le [])
+                                        (or (op-is? (load current) BitAnd [])
+                                            (or (op-is? (load current) BitOr [])
+                                                (or (op-is? (load current) BitXor [])
+                                                    (or (op-is? (load current) Shl [])
+                                                        (or (op-is? (load current) Shr [])
+                                                            (or (op-is? (load current) UShr [])
+                                                                (op-is? (load current) BitNot [])))))))))))))))
         ;; These nodes always select to an unboxed GPR/FPR result even when a dynamic input makes
         ;; their lattice type broad. In particular, recursive numeric calls must not turn an
         ;; enclosing arithmetic result into the boxed return ABI merely because its type is dyn.
         MLK-SCALAR
         (if (ml-raw-nullable-value? (load current) 32)
         MLK-RAW-MANAGED
-        (if (= (n-op (load current)) OP-BOX)
+        (if (op-is? (load current) Box [_])
         MLK-BOXED
         (ml-kind-for-type (n-ty (load current)))))))))
 
 (defn ml-raw-nullable-value? [(node i64) (fuel i64)] (-> bool)
   (if (or (<= fuel 0) (or (= node NO-NODE) (n-dead? node)))
       false
-      (if (= (n-op node) OP-PHI)
+      (if (op-is? node Phi [_])
           (let [kinds (ty-kinds (n-ty node))]
             (if (= kinds (| VK-NULL VK-OBJ))
                 true
@@ -4767,8 +4710,8 @@
 
 (defn ml-kind-for-parm-representation [(parm i64)] (-> i64)
   (let [fun (n-in parm 0)
-        fidx (n-aux fun)
-        idx (n-aux parm)
+        fidx (n-fun-index fun)
+        idx (n-parm-index parm)
         lim (n-count)
         (mut call) 0
         (mut answer) -1
@@ -4776,7 +4719,7 @@
     (loop (if (or (>= (load call) lim) (not (load consistent)))
               (break)
               (do
-                (if (or (n-dead? (load call)) (!= (n-op (load call)) OP-CALL))
+                (if (or (n-dead? (load call)) (not (op-is? (load call) Call [_])))
                     0
                     (if (not (infer-call-reaches-fun? (load call) fun))
                         0
@@ -4796,7 +4739,7 @@
         (ml-kind-for-type (n-ty parm)))))
 
 (defn ml-kind-for-node [(node i64)] (-> i64)
-  (if (= (n-op node) OP-PARM)
+  (if (op-is? node Parm [_])
       (ml-kind-for-parm-representation node)
       (ml-kind-for-source-representation node)))
 
@@ -4923,12 +4866,12 @@
                         (al-get (load (field (machine-unit) selection-memory-deps))
                                 (+ first (load i)))
                       ctrl (if (and (>= memory 0)
-                                    (and (= (n-op memory) OP-ARG)
+                                    (and (op-is? memory Arg [_])
                                          (> (n-nins memory) 0)))
                                (n-in memory 0)
                                NO-NODE)]
                   (if (and (>= ctrl 0)
-                           (and (= (n-op ctrl) OP-CALLEND)
+                           (and (op-is? ctrl CallEnd [])
                                 (= (n-in ctrl 1) producer-node)))
                       (store! found true)
                       0))

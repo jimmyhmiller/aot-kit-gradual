@@ -69,7 +69,7 @@
 
 ;; A LOAD OR STORE WHOSE POINTER CANNOT BE A MANAGED REFERENCE. This is R1 (D2) made checkable,
 ;; and until now it held only because nothing in the IR was NAMED an address: the pointer slot
-;; asks `v-need-value`, which is satisfied by any op at or past OP-CONST, so `Load(mem, Const
+;; asks `v-need-value`, which is satisfied by any op at or past OPTAG-CONST, so `Load(mem, Const
 ;; int=8)` and `Load(mem, Add(o, 8))` both build, verify, round trip and run. D2 claims both GC
 ;; rules are machine-checked on every phase; that claim was not true for R1, and the moment M8's
 ;; safepoints or any address-computing lowering exists there would be nothing to go red.
@@ -103,7 +103,7 @@
 ;; A value edge whose producer and consumer disagree about machine REPRESENTATION — a tagged
 ;; NaN-boxed word where a raw pointer belongs, a raw pointer in a tagged slot, float bits fed
 ;; to an integer op. Nearly every hard bug in the NavierStokes campaign was an instance; the
-;; classification is structural and only certain disagreements fail (see v-rep-of).
+;; classification is structural and only certain disagreements fail (see n-rep-of in node.coil).
 (const VERR-REPRESENTATION i64 28)
 
 (defn verr-name [(c i64)] (-> (slice u8))
@@ -272,124 +272,133 @@
 ;; An op with no entry here is an ERROR rather than a default, because a new op silently
 ;; inheriting "three inputs" is how a verifier stops verifying the thing it was added for.
 (defn v-check-arity [(n i64)] (-> i64)
-  (let [op (n-op n)
-        k (n-nins n)]
-    (case op OP-START
-          (v-need (= k 0) VERR-ARITY n) OP-XCTRL
-          (v-need (= k 0) VERR-ARITY n) OP-STOP
-          0
-          ; ctrl and a value, plus the program's final memory when it carries one
-          OP-RETURN (v-need (or (= k 2) (= k 3)) VERR-ARITY n)
-          OP-IF (v-need (= k 2) VERR-ARITY n)
-          OP-REGION (v-need (>= k 2) VERR-ARITY n)  ; the unused slot 0 plus at least one path
-          OP-LOOP (v-need (= k 3) VERR-ARITY n)  ; slot 0, the entry, the back edge
-          OP-CPROJ (v-need (= k 1) VERR-ARITY n)
-          OP-PROJ (v-need (= k 1) VERR-ARITY n)
-          OP-CONST (v-need (= k 1) VERR-ARITY n)  ; anchored to control so it is rooted
-          OP-ARG (v-need (= k 1) VERR-ARITY n)
-          OP-PHI (v-need (>= k 2) VERR-ARITY n)  ; the region plus at least one value
-          OP-CAST (v-need (= k 2) VERR-ARITY n)
-          OP-BOX (v-need (= k 2) VERR-ARITY n)
-          OP-UNBOX (v-need (= k 2) VERR-ARITY n)
-          OP-TYPETEST (v-need (= k 2) VERR-ARITY n)
-          OP-CALLEND (v-need (= k 2) VERR-ARITY n)
-          OP-FUN (v-need (>= k 2) VERR-ARITY n)
-          OP-PARM (v-need (= k 1) VERR-ARITY n)
-          OP-CALL (v-need (>= k 2) VERR-ARITY n)
-          OP-FUNSTART (v-need (= k 1) VERR-ARITY n)
-          OP-CLOSURE (v-need (>= k 1) VERR-ARITY n)
-          OP-SAFEPOINT (v-need (>= k 1) VERR-ARITY n)
-          OP-BARRIER (v-need (= k 4) VERR-ARITY n)
-          OP-MINUS (v-need (= k 2) VERR-ARITY n)
-          OP-NOT (v-need (= k 2) VERR-ARITY n)
-          OP-BITNOT (v-need (= k 2) VERR-ARITY n)
+  (let [k (n-nins n)]
+    (match (n-op n)
+      (Start [] (v-need (= k 0) VERR-ARITY n))
+      (XCtrl [] (v-need (= k 0) VERR-ARITY n))
+      (Stop [] 0)
+      (Return [] (v-need (or (= k 2) (= k 3)) VERR-ARITY n))
+      (If [] (v-need (= k 2) VERR-ARITY n))
+      (Region [] (v-need (>= k 2) VERR-ARITY n))
+      (Loop [] (v-need (= k 3) VERR-ARITY n))
+      (CProj [slot] (v-need (= k 1) VERR-ARITY n))
+      (Proj [slot] (v-need (= k 1) VERR-ARITY n))
+      (Const [ty] (v-need (= k 1) VERR-ARITY n))
+      (Arg [ty] (v-need (= k 1) VERR-ARITY n))
+      (Phi [declared] (v-need (>= k 2) VERR-ARITY n))
+      (Cast [target] (v-need (= k 2) VERR-ARITY n))
+      (Box [mode] (v-need (= k 2) VERR-ARITY n))
+      (Unbox [target] (v-need (= k 2) VERR-ARITY n))
+      (TypeTest [target] (v-need (= k 2) VERR-ARITY n))
+      (CallEnd [] (v-need (= k 2) VERR-ARITY n))
+      (Fun [index] (v-need (>= k 2) VERR-ARITY n))
+      (Parm [index] (v-need (= k 1) VERR-ARITY n))
+      (Call [abi] (v-need (>= k 2) VERR-ARITY n))
+      (FunStart [] (v-need (= k 1) VERR-ARITY n))
+      (Closure [captures] (v-need (>= k 1) VERR-ARITY n))
+      (Safepoint [] (v-need (>= k 1) VERR-ARITY n))
+      (Barrier [] (v-need (= k 4) VERR-ARITY n))
+      (Minus [] (v-need (= k 2) VERR-ARITY n))
+      (Not [] (v-need (= k 2) VERR-ARITY n))
+      (BitNot [] (v-need (= k 2) VERR-ARITY n))
           ;; A NEW'S ARITY IS ITS SHAPE'S, which is why the shape is checked first and the count is
           ;; not checked at all when it is wrong: `shape-field-count` aborts by name on an undefined
           ;; id, and an abort inside the verifier would take the process with it on exactly the
           ;; corrupted graph the verifier exists to report on.
-          OP-NEW
-            (if (not (shape-defined? (n-aux n)))
+      (New [shape]
+            (if (not (shape-defined? shape))
                 (v-fail! VERR-SHAPE n)
-                (v-need (= k (+ 1 (shape-field-count (n-aux n)))) VERR-ARITY n))
-          OP-LOAD
+                (v-need (= k (+ 1 (shape-field-count shape))) VERR-ARITY n)))
+      (Load [alias]
             (do
-              (v-need (shape-alias-defined? (n-aux n)) VERR-ALIAS n)
+              (v-need (shape-alias-defined? alias) VERR-ALIAS n)
               (v-need (= k 3) VERR-ARITY n)
-              0)
-          OP-STORE
+              0))
+      (Store [alias]
             (do
-              (v-need (shape-alias-defined? (n-aux n)) VERR-ALIAS n)
+              (v-need (shape-alias-defined? alias) VERR-ALIAS n)
               (v-need (= k 4) VERR-ARITY n)
-              0)
-          OP-PROPLOAD
+              0))
+      (PropLoad [name]
             (do
-              (v-need (and (>= (n-aux n) 0) (< (n-aux n) (shape-name-count))) VERR-ALIAS n)
+              (v-need (and (>= name 0) (< name (shape-name-count))) VERR-ALIAS n)
               (v-need (= k 3) VERR-ARITY n)
-              0)
-          OP-PROPHAS
+              0))
+      (PropHas [name]
             (do
-              (v-need (and (>= (n-aux n) 0) (< (n-aux n) (shape-name-count))) VERR-ALIAS n)
+              (v-need (and (>= name 0) (< name (shape-name-count))) VERR-ALIAS n)
               (v-need (= k 3) VERR-ARITY n)
-              0)
-          OP-PROPDELETE
+              0))
+      (PropDelete [name]
             (do
-              (v-need (and (>= (n-aux n) 0) (< (n-aux n) (shape-name-count))) VERR-ALIAS n)
+              (v-need (and (>= name 0) (< name (shape-name-count))) VERR-ALIAS n)
               (v-need (= k 3) VERR-ARITY n)
-              0)
-          OP-PROTOHAS (v-need (= k 4) VERR-ARITY n)
-          OP-PROPLOADKEY (v-need (= k 4) VERR-ARITY n)
-          OP-PROPSTOREKEY (v-need (= k 5) VERR-ARITY n)
-          OP-PROPHASKEY (v-need (= k 4) VERR-ARITY n)
-          OP-PROPDELETEKEY (v-need (= k 4) VERR-ARITY n)
-          OP-OWNKEYCOUNT (v-need (= k 3) VERR-ARITY n)
-          OP-OWNKEYAT (v-need (= k 4) VERR-ARITY n)
-          OP-OBJECTFREEZE (v-need (= k 3) VERR-ARITY n)
-          OP-INTERNALLOAD
-            (do (v-need (and (>= (n-aux n) INTERNAL-TARGET) (<= (n-aux n) INTERNAL-KIND)) VERR-ARITY n)
-                (v-need (= k 3) VERR-ARITY n) 0)
-          OP-INTERNALSTORE
-            (do (v-need (or (= (n-aux n) INTERNAL-INIT) (= (n-aux n) INTERNAL-SET-INDEX)) VERR-ARITY n)
-                (v-need (= k (if (= (n-aux n) INTERNAL-INIT) 5 4)) VERR-ARITY n) 0)
-          OP-PROPSTORE
+              0))
+      (ProtoHas [] (v-need (= k 4) VERR-ARITY n))
+      (PropLoadKey [] (v-need (= k 4) VERR-ARITY n))
+      (PropStoreKey [] (v-need (= k 5) VERR-ARITY n))
+      (PropHasKey [] (v-need (= k 4) VERR-ARITY n))
+      (PropDeleteKey [] (v-need (= k 4) VERR-ARITY n))
+      (OwnKeyCount [] (v-need (= k 3) VERR-ARITY n))
+      (OwnKeyAt [] (v-need (= k 4) VERR-ARITY n))
+      (ObjectFreeze [] (v-need (= k 3) VERR-ARITY n))
+      (InternalLoad [slot]
+        (do (v-need (and (>= slot INTERNAL-TARGET) (<= slot INTERNAL-KIND)) VERR-ARITY n)
+            (v-need (= k 3) VERR-ARITY n) 0))
+      (InternalStore [operation]
+        (do (v-need (or (= operation INTERNAL-INIT) (= operation INTERNAL-SET-INDEX)) VERR-ARITY n)
+            (v-need (= k (if (= operation INTERNAL-INIT) 5 4)) VERR-ARITY n) 0))
+      (PropStore [name]
             (do
-              (v-need (and (>= (n-aux n) 0) (< (n-aux n) (shape-name-count))) VERR-ALIAS n)
+              (v-need (and (>= name 0) (< name (shape-name-count))) VERR-ALIAS n)
               (v-need (= k 4) VERR-ARITY n)
-              0)
-          OP-SETPROTO (v-need (= k 4) VERR-ARITY n)
-          OP-ARRAYMARK (v-need (= k 2) VERR-ARITY n)
-          OP-ARRAYLOAD (v-need (= k 4) VERR-ARITY n)
-          OP-ARRAYSTORE (v-need (= k 5) VERR-ARITY n)
-          OP-ARRAYLEN (v-need (= k 3) VERR-ARITY n)
-          OP-ARRAYRESIZE (v-need (= k 5) VERR-ARITY n)
-          OP-ARRAYCOPY (v-need (= k 5) VERR-ARITY n)
-          OP-STRINGCONST (v-need (= k 1) VERR-ARITY n)
-          OP-STRINGLEN (v-need (= k 2) VERR-ARITY n)
-          OP-STRINGEQ (v-need (= k 3) VERR-ARITY n)
-          OP-STRINGCONCAT (v-need (= k 3) VERR-ARITY n)
-          OP-STRINGCHARCODE (v-need (= k 3) VERR-ARITY n)
-          OP-STRINGSUBSTRING (v-need (= k 4) VERR-ARITY n)
-          OP-TOSTRING (v-need (= k 2) VERR-ARITY n)
-          OP-TOINTEGER (v-need (= k 2) VERR-ARITY n)
-          OP-TONUMBER (v-need (= k 2) VERR-ARITY n)
-          OP-ARRAYTEST (v-need (= k 2) VERR-ARITY n)
-          OP-ARRAYUNBOX (v-need (= k 2) VERR-ARITY n)
-          OP-PARSEFLOAT (v-need (= k 2) VERR-ARITY n)
-          OP-PARSEINT (v-need (= k 3) VERR-ARITY n)
-          OP-ISNAN (v-need (= k 2) VERR-ARITY n)
-          OP-STRINGSPLIT (v-need (= k 5) VERR-ARITY n)
-          OP-STRINGFROMCODEUNIT (v-need (= k 2) VERR-ARITY n)
-          OP-NUMBERTOSTRING (v-need (= k 3) VERR-ARITY n)
-          OP-STRINGLOWER (v-need (= k 2) VERR-ARITY n)
-          OP-STRINGUPPER (v-need (= k 2) VERR-ARITY n)
-          OP-STRINGINDEXOF (v-need (= k 4) VERR-ARITY n)
-          OP-STRINGCOMPARE (v-need (= k 3) VERR-ARITY n)
-          OP-STRINGNORMALIZE (v-need (= k 3) VERR-ARITY n)
-          OP-JSBUILTIN (v-need (= k 3) VERR-ARITY n)
-          OP-JSTHROW (v-need (= k 2) VERR-ARITY n)
-          OP-MEMMERGE (v-need (>= k 2) VERR-ARITY n)  ; the unused slot 0 plus at least one memory
-          (if (op-binary? op)
-              (v-need (= k 3) VERR-ARITY n)
-              (do (panic-corrupt "v-check-arity: op has no arity contract") 0)))))
+              0))
+      (SetProto [] (v-need (= k 4) VERR-ARITY n))
+      (ArrayMark [] (v-need (= k 2) VERR-ARITY n))
+      (ArrayLoad [alias] (v-need (= k 4) VERR-ARITY n))
+      (ArrayStore [] (v-need (= k 5) VERR-ARITY n))
+      (ArrayLen [] (v-need (= k 3) VERR-ARITY n))
+      (ArrayResize [] (v-need (= k 5) VERR-ARITY n))
+      (ArrayCopy [] (v-need (= k 5) VERR-ARITY n))
+      (StringConst [id] (v-need (= k 1) VERR-ARITY n))
+      (StringLen [] (v-need (= k 2) VERR-ARITY n))
+      (StringEq [] (v-need (= k 3) VERR-ARITY n))
+      (StringConcat [] (v-need (= k 3) VERR-ARITY n))
+      (StringCharCode [] (v-need (= k 3) VERR-ARITY n))
+      (StringSubstring [mode] (v-need (= k 4) VERR-ARITY n))
+      (ToString [] (v-need (= k 2) VERR-ARITY n))
+      (ToInteger [] (v-need (= k 2) VERR-ARITY n))
+      (ToNumber [] (v-need (= k 2) VERR-ARITY n))
+      (ArrayTest [] (v-need (= k 2) VERR-ARITY n))
+      (ArrayUnbox [] (v-need (= k 2) VERR-ARITY n))
+      (ParseFloat [] (v-need (= k 2) VERR-ARITY n))
+      (ParseInt [] (v-need (= k 3) VERR-ARITY n))
+      (IsNaN [] (v-need (= k 2) VERR-ARITY n))
+      (StringSplit [] (v-need (= k 5) VERR-ARITY n))
+      (StringFromCodeUnit [] (v-need (= k 2) VERR-ARITY n))
+      (NumberToString [] (v-need (= k 3) VERR-ARITY n))
+      (StringLower [] (v-need (= k 2) VERR-ARITY n))
+      (StringUpper [] (v-need (= k 2) VERR-ARITY n))
+      (StringIndexOf [] (v-need (= k 4) VERR-ARITY n))
+      (StringCompare [] (v-need (= k 3) VERR-ARITY n))
+      (StringNormalize [] (v-need (= k 3) VERR-ARITY n))
+      (JsBuiltin [descriptor] (v-need (= k 3) VERR-ARITY n))
+      (JsThrow [] (v-need (= k 2) VERR-ARITY n))
+      (MemMerge [] (v-need (>= k 2) VERR-ARITY n))
+      (Add [] (v-need (= k 3) VERR-ARITY n))
+      (Sub [] (v-need (= k 3) VERR-ARITY n))
+      (Mul [] (v-need (= k 3) VERR-ARITY n))
+      (Div [] (v-need (= k 3) VERR-ARITY n))
+      (Eq [] (v-need (= k 3) VERR-ARITY n))
+      (Lt [] (v-need (= k 3) VERR-ARITY n))
+      (Le [] (v-need (= k 3) VERR-ARITY n))
+      (Mod [] (v-need (= k 3) VERR-ARITY n))
+      (BitAnd [] (v-need (= k 3) VERR-ARITY n))
+      (BitOr [] (v-need (= k 3) VERR-ARITY n))
+      (BitXor [] (v-need (= k 3) VERR-ARITY n))
+      (Shl [] (v-need (= k 3) VERR-ARITY n))
+      (Shr [] (v-need (= k 3) VERR-ARITY n))
+      (UShr [] (v-need (= k 3) VERR-ARITY n)))))
 
 ;; How many slots a multi-output node's tuple has. Only meaningful for a multi node, so asking
 ;; about anything else is a caller bug rather than a question with a harmless answer.
@@ -399,15 +408,16 @@
 ;; whether it carries memory. Asking the op alone would have to pick one, and a projection checked
 ;; against the wrong arity is either a false report or a missed one.
 (defn v-multi-arity [(n i64)] (-> i64)
-  (case (n-op n) OP-IF
-        2 OP-RETURN
-        (n-nins n) OP-NEW
-        (if (shape-defined? (n-aux n))
-            (+ 1 (shape-field-count (n-aux n)))
+  (match (n-op n)
+    (If [] 2)
+    (Return [] (n-nins n))
+    (New [shape]
+        (if (shape-defined? shape)
+            (+ 1 (shape-field-count shape))
             ; the arity pass already reported VERR-SHAPE; no slot index can be in range
-            0)
-          OP-SAFEPOINT
-        (n-nins n) (do (panic-corrupt "v-multi-arity: not a multi-output op") 0)))
+            0))
+    (Safepoint [] (n-nins n))
+    (_ (do (panic-corrupt "v-multi-arity: not a multi-output op") 0))))
 
 ; ============================================================================
 ; Slots
@@ -442,28 +452,31 @@
 ;; only while this predicate had one direction: now that `v-need-value` rejects a memory producer,
 ;; it would report every store's own pointer as a memory state in a value slot.
 (defn v-mem-producer? [(d i64)] (-> bool)
-  (let [op (n-op d)]
-    (cond (= op OP-PROJ)
-            (and (>= (n-nins d) 1)
-                 (and (= (n-op (n-in d 0)) OP-NEW) (>= (n-aux d) 1)))
-          (or (= op OP-STORE)
-              (or (= op OP-PROPSTORE)
-                  (or (= op OP-PROPDELETE)
-                      (or (= op OP-PROPSTOREKEY)
-                          (or (= op OP-PROPDELETEKEY)
-                          (or (= op OP-OBJECTFREEZE)
-                          (or (= op OP-INTERNALSTORE)
-                      (or (= op OP-SETPROTO)
-                      (or (= op OP-ARRAYSTORE)
-                          (or (= op OP-ARRAYRESIZE)
-                              (or (= op OP-ARRAYCOPY)
-                                  (or (= op OP-STRINGSPLIT)
-                                      (or (= op OP-MEMMERGE) (= op OP-BARRIER))))))))))))))
-            true
-          (or (op-phi? op) (= op OP-ARG)) (ty-mem? (n-aux d))
-          :else false)))
+  (match (n-op d)
+    (Proj [slot]
+      (and (>= (n-nins d) 1)
+           (let [parent (n-in d 0)]
+             (and (!= parent NO-NODE)
+                  (match (n-op parent) (New [shape] (>= slot 1)) (_ false))))))
+    (Store [alias] true)
+    (PropStore [name] true)
+    (PropDelete [name] true)
+    (PropStoreKey [] true)
+    (PropDeleteKey [] true)
+    (ObjectFreeze [] true)
+    (InternalStore [operation] true)
+    (SetProto [] true)
+    (ArrayStore [] true)
+    (ArrayResize [] true)
+    (ArrayCopy [] true)
+    (StringSplit [] true)
+    (MemMerge [] true)
+    (Barrier [] true)
+    (Phi [declared] (ty-mem? declared))
+    (Arg [ty] (ty-mem? ty))
+    (_ false)))
 
-;; THE MIRROR OF `v-need-mem`, AND IT IS NOT SYMMETRIC BY ACCIDENT. `op-value?` is `>= OP-CONST`
+;; THE MIRROR OF `v-need-mem`, AND IT IS NOT SYMMETRIC BY ACCIDENT. `op-value?` is `>= OPTAG-CONST`
 ;; and Store is 24, MemMerge 25, so every memory producer already satisfied the value test: a
 ;; memory state parked in an If's predicate, a Return's value, a binop's operand or a Store's
 ;; value slot verified CLEAN. src/eval.coil documents that hole for the If predicate and works
@@ -538,28 +551,31 @@
 ;; failure it catches (a phi reading the arm of a path that was dropped) is a miscompile that
 ;; typechecks cleanly and shows up in no golden string.
 (defn v-check-phi [(n i64)] (-> i64)
-  (let [r (if (>= (n-nins n) 1) (n-in n 0) NO-NODE)]
-    (if (or (= r NO-NODE) (not (op-merge? (n-op r))))
-        (v-fail! VERR-PHI-REGION n)
-        (do
-          (v-need (= (n-nins n) (n-nins r)) VERR-PHI-ARITY n)
+  (match (n-op n)
+    (Phi [declared]
+      (let [r (if (>= (n-nins n) 1) (n-in n 0) NO-NODE)]
+        (if (or (= r NO-NODE) (not (op-merge? (n-op r))))
+            (v-fail! VERR-PHI-REGION n)
+            (do
+              (v-need (= (n-nins n) (n-nins r)) VERR-PHI-ARITY n)
           ;; A MEMORY PHI'S ARMS ARE MEMORY, and which kind of Phi this is is its DECLARED type,
           ;; which no analysis writes. Before `v-need-value` learned to reject a memory producer
           ;; the two cases were one line, because every memory producer is also a value op by the
           ;; numbering; now they have to be told apart, and telling them apart is a strictly
           ;; better check in both directions.
-          (if (ty-mem? (n-aux n)) (v-need-mem-from n 1) (v-need-value-from n 1))
-          0))))
+              (if (ty-mem? declared) (v-need-mem-from n 1) (v-need-value-from n 1))
+              0))))
+    (_ (do (panic-corrupt "v-check-phi: not a Phi") 0))))
 
 ;; A projection reads a slot of a tuple, so its parent has to actually produce one and the slot
 ;; has to exist. `aux` is the slot index, and an out-of-range one would have `proj-compute`
 ;; reporting ALL, which reads as "anything at all" rather than as the error it is.
 (defn v-check-proj [(n i64)] (-> i64)
-  (let [m (if (>= (n-nins n) 1) (n-in n 0) NO-NODE)]
+  (let [m (if (>= (n-nins n) 1) (n-in n 0) NO-NODE)
+        idx (match (n-op n) (CProj [slot] slot) (Proj [slot] slot) (_ -1))]
     (if (or (= m NO-NODE) (not (op-multi? (n-op m))))
         (v-fail! VERR-PROJ-SLOT n)
-        (let [idx (n-aux n)]
-          (v-need (and (>= idx 0) (< idx (v-multi-arity m))) VERR-PROJ-SLOT n)))))
+        (v-need (and (>= idx 0) (< idx (v-multi-arity m))) VERR-PROJ-SLOT n))))
 
 ;; Stop collects Returns and nothing else. Anything else in there means some rewrite pointed the
 ;; program's exit at a node that does not end a path.
@@ -570,7 +586,7 @@
               (break)
               (do
                 (let [d (n-in n (load i))]
-                  (v-need (and (!= d NO-NODE) (= (n-op d) OP-RETURN)) VERR-STOP-INPUT n))
+                  (v-need (and (!= d NO-NODE) (v-return-node? d)) VERR-STOP-INPUT n))
                 (store! i (+ (load i) 1))
                 0))))
   0)
@@ -581,163 +597,169 @@
 ;; it is null today and will hold control once a division has to be pinned to the block that
 ;; proved its divisor non-zero. Constraining it now would encode "always null" as a law, and
 ;; that is not the law.
+(defn v-call-node? [(n i64)] (-> bool)
+  (match (n-op n) (Call [abi] true) (_ false)))
+(defn v-fun-node? [(n i64)] (-> bool)
+  (match (n-op n) (Fun [index] true) (_ false)))
+(defn v-funstart-node? [(n i64)] (-> bool)
+  (match (n-op n) (FunStart [] true) (_ false)))
+(defn v-return-node? [(n i64)] (-> bool)
+  (match (n-op n) (Return [] true) (_ false)))
+
 (defn v-check-slots [(n i64)] (-> i64)
-  (let [op (n-op n)]
-    (case op OP-START
-          0 OP-XCTRL
-          0 OP-STOP
-          (v-check-stop n) OP-RETURN
-          (do
+  (match (n-op n)
+    (Start [] 0)
+    (XCtrl [] 0)
+    (Stop [] (v-check-stop n))
+    (Return [] (do
             (v-need-ctrl n 0)
             (v-need-value n 1)
             (if (>= (n-nins n) 3) (v-need-mem n 2) 0)
-            0)
-            OP-IF
-          (do (v-need-ctrl n 0) (v-need-value n 1) 0) OP-REGION
-          (v-check-merge n) OP-LOOP
-          (v-check-merge n) OP-CPROJ
-          (v-check-proj n) OP-PROJ
-          (v-check-proj n) OP-CONST
-          (v-need-ctrl n 0) OP-ARG
-          (v-need-ctrl n 0) OP-PHI
-          (v-check-phi n) OP-CAST
-          (do (v-need-ctrl n 0) (v-need-value n 1) 0) OP-BOX
-          (do
+            0))
+    (If [] (do (v-need-ctrl n 0) (v-need-value n 1) 0))
+    (Region [] (v-check-merge n))
+    (Loop [] (v-check-merge n))
+    (CProj [slot] (v-check-proj n))
+    (Proj [slot] (v-check-proj n))
+    (Const [ty] (v-need-ctrl n 0))
+    (Arg [ty] (v-need-ctrl n 0))
+    (Phi [declared] (v-check-phi n))
+    (Cast [target] (do (v-need-ctrl n 0) (v-need-value n 1) 0))
+    (Box [mode] (do
             (if (= (n-in n 0) NO-NODE) 0 (v-need-ctrl n 0))
             (v-need-value n 1)
-            0)
-            OP-UNBOX
-          (do
+            0))
+    (Unbox [target] (do
             (if (= (n-in n 0) NO-NODE) 0 (v-need-ctrl n 0))
             (v-need-value n 1)
-            0)
-            OP-TYPETEST
-          (do
+            0))
+    (TypeTest [target] (do
             (if (= (n-in n 0) NO-NODE) 0 (v-need-ctrl n 0))
             (v-need-value n 1)
-            0)
-            OP-CALLEND
-          (do
+            0))
+    (CallEnd [] (do
             (v-need-ctrl n 0)
-            (v-need (= (n-op (n-in n 1)) OP-CALL) VERR-DATA-SLOT n)
-            0)
-            OP-FUN
-          (let [(mut i) 1]
-            (v-need (= (n-op (n-in n 0)) OP-FUNSTART) VERR-CTRL-SLOT n)
+            (v-need (v-call-node? (n-in n 1)) VERR-DATA-SLOT n)
+            0))
+    (Fun [index] (let [(mut i) 1]
+            (v-need (v-funstart-node? (n-in n 0)) VERR-CTRL-SLOT n)
             (loop (if (>= (load i) (n-nins n))
                       (break)
                       (do
-                        (v-need (= (n-op (n-in n (load i))) OP-RETURN) VERR-DATA-SLOT n)
+                        (v-need (v-return-node? (n-in n (load i))) VERR-DATA-SLOT n)
                         (store! i (+ (load i) 1))
                         0)))
-            0)
-            OP-PARM
-          (v-need (= (n-op (n-in n 0)) OP-FUN) VERR-DATA-SLOT n) OP-CALL
-          (do (v-need-ctrl n 0) (v-need-value n 1) (v-need-call-args n) 0) OP-FUNSTART
-          (v-need (= (n-op (n-in n 0)) OP-FUN) VERR-DATA-SLOT n) OP-CLOSURE
-          (do
-            (v-need (= (n-op (n-in n 0)) OP-FUN) VERR-DATA-SLOT n)
+            0))
+    (Parm [index] (v-need (v-fun-node? (n-in n 0)) VERR-DATA-SLOT n))
+    (Call [abi] (do (v-need-ctrl n 0) (v-need-value n 1) (v-need-call-args n) 0))
+    (FunStart [] (v-need (v-fun-node? (n-in n 0)) VERR-DATA-SLOT n))
+    (Closure [captures] (do
+            (v-need (v-fun-node? (n-in n 0)) VERR-DATA-SLOT n)
             (v-need-value-from n 1)
-            0)
-            OP-SAFEPOINT
-          (do (v-need-ctrl n 0) (v-need-value-from n 1) 0) OP-BARRIER
-          (do
+            0))
+    (Safepoint [] (do (v-need-ctrl n 0) (v-need-value-from n 1) 0))
+    (Barrier [] (do
             (v-need-ctrl n 0)
             (v-need-mem n 1)
             (v-need-value n 2)
             (v-need-value n 3)
-            0)
-            OP-MINUS
-          (v-need-value n 1) OP-NOT
-          (v-need-value n 1) OP-BITNOT
-          (v-need-value n 1)
+            0))
+    (Minus [] (v-need-value n 1))
+    (Not [] (v-need-value n 1))
+    (BitNot [] (v-need-value n 1))
           ;; A New's control input is REAL, unlike a Load's or a Store's slot 0: two executions of an
           ;; allocation are two objects, so it cannot float out of the block it is in. Everything from
           ;; slot 1 is the incoming memory of one field, in field order.
-          OP-NEW (do (v-need-ctrl n 0) (v-need-mem-from n 1) 0)
-          OP-LOAD (do (v-need-mem n 1) (v-need-value n 2) 0)
-          OP-STORE (do (v-need-mem n 1) (v-need-value n 2) (v-need-value n 3) 0)
-          OP-PROPLOAD (do (v-need-mem n 1) (v-need-value n 2) 0)
-          OP-PROPHAS (do (v-need-mem n 1) (v-need-value n 2) 0)
-          OP-PROPDELETE (do (v-need-mem n 1) (v-need-value n 2) 0)
-          OP-PROTOHAS (do (v-need-mem n 1) (v-need-value n 2) (v-need-value n 3) 0)
-          OP-PROPLOADKEY (do (v-need-mem n 1) (v-need-value n 2) (v-need-value n 3) 0)
-          OP-PROPSTOREKEY (do (v-need-mem n 1) (v-need-value n 2) (v-need-value n 3) (v-need-value n 4) 0)
-          OP-PROPHASKEY (do (v-need-mem n 1) (v-need-value n 2) (v-need-value n 3) 0)
-          OP-PROPDELETEKEY (do (v-need-mem n 1) (v-need-value n 2) (v-need-value n 3) 0)
-          OP-OWNKEYCOUNT (do (v-need-mem n 1) (v-need-value n 2) 0)
-          OP-OWNKEYAT (do (v-need-mem n 1) (v-need-value n 2) (v-need-value n 3) 0)
-          OP-OBJECTFREEZE (do (v-need-mem n 1) (v-need-value n 2) 0)
-          OP-INTERNALLOAD (do (v-need-mem n 1) (v-need-value n 2) 0)
-          OP-INTERNALSTORE
-            (do (v-need-mem n 1) (v-need-value n 2) (v-need-value n 3)
-                (if (= (n-aux n) INTERNAL-INIT) (v-need-value n 4) 0) 0)
-          OP-PROPSTORE (do (v-need-mem n 1) (v-need-value n 2) (v-need-value n 3) 0)
-          OP-SETPROTO (do (v-need-mem n 1) (v-need-value n 2) (v-need-value n 3) 0)
-          OP-ARRAYMARK (v-need-value n 1)
-          OP-ARRAYLOAD (do (v-need-mem n 1) (v-need-value n 2) (v-need-value n 3) 0)
-          OP-ARRAYSTORE
-            (do
+    (New [shape] (do (v-need-ctrl n 0) (v-need-mem-from n 1) 0))
+    (Load [alias] (do (v-need-mem n 1) (v-need-value n 2) 0))
+    (Store [alias] (do (v-need-mem n 1) (v-need-value n 2) (v-need-value n 3) 0))
+    (PropLoad [name] (do (v-need-mem n 1) (v-need-value n 2) 0))
+    (PropHas [name] (do (v-need-mem n 1) (v-need-value n 2) 0))
+    (PropDelete [name] (do (v-need-mem n 1) (v-need-value n 2) 0))
+    (ProtoHas [] (do (v-need-mem n 1) (v-need-value n 2) (v-need-value n 3) 0))
+    (PropLoadKey [] (do (v-need-mem n 1) (v-need-value n 2) (v-need-value n 3) 0))
+    (PropStoreKey [] (do (v-need-mem n 1) (v-need-value n 2) (v-need-value n 3) (v-need-value n 4) 0))
+    (PropHasKey [] (do (v-need-mem n 1) (v-need-value n 2) (v-need-value n 3) 0))
+    (PropDeleteKey [] (do (v-need-mem n 1) (v-need-value n 2) (v-need-value n 3) 0))
+    (OwnKeyCount [] (do (v-need-mem n 1) (v-need-value n 2) 0))
+    (OwnKeyAt [] (do (v-need-mem n 1) (v-need-value n 2) (v-need-value n 3) 0))
+    (ObjectFreeze [] (do (v-need-mem n 1) (v-need-value n 2) 0))
+    (InternalLoad [slot] (do (v-need-mem n 1) (v-need-value n 2) 0))
+    (InternalStore [operation]
+      (do (v-need-mem n 1) (v-need-value n 2) (v-need-value n 3)
+          (if (= operation INTERNAL-INIT) (v-need-value n 4) 0) 0))
+    (PropStore [name] (do (v-need-mem n 1) (v-need-value n 2) (v-need-value n 3) 0))
+    (SetProto [] (do (v-need-mem n 1) (v-need-value n 2) (v-need-value n 3) 0))
+    (ArrayMark [] (v-need-value n 1))
+    (ArrayLoad [alias] (do (v-need-mem n 1) (v-need-value n 2) (v-need-value n 3) 0))
+    (ArrayStore [] (do
               (v-need-mem n 1)
               (v-need-value n 2)
               (v-need-value n 3)
               (v-need-value n 4)
-              0)
-          OP-ARRAYLEN (do (v-need-mem n 1) (v-need-value n 2) 0)
-          OP-ARRAYRESIZE
-            (do
+              0))
+    (ArrayLen [] (do (v-need-mem n 1) (v-need-value n 2) 0))
+    (ArrayResize [] (do
               (v-need-mem n 1)
               (v-need-value n 2)
               (v-need-value n 3)
               (v-need-value n 4)
-              0)
-          OP-ARRAYCOPY
-            (do
+              0))
+    (ArrayCopy [] (do
               (v-need-mem n 1)
               (v-need-value n 2)
               (v-need-value n 3)
               (v-need-value n 4)
-              0)
-          OP-STRINGCONST (v-need-ctrl n 0)
-          OP-STRINGLEN (v-need-value n 1)
-          OP-STRINGEQ (do (v-need-value n 1) (v-need-value n 2) 0)
-          OP-STRINGCONCAT (do (v-need-value n 1) (v-need-value n 2) 0)
-          OP-STRINGCHARCODE (do (v-need-value n 1) (v-need-value n 2) 0)
-          OP-STRINGSUBSTRING (do (v-need-value n 1) (v-need-value n 2) (v-need-value n 3) 0)
-          OP-TOSTRING (v-need-value n 1)
-          OP-TOINTEGER (v-need-value n 1)
-          OP-TONUMBER (v-need-value n 1)
-          OP-ARRAYTEST (v-need-value n 1)
-          OP-ARRAYUNBOX (v-need-value n 1)
-          OP-PARSEFLOAT (v-need-value n 1)
-          OP-PARSEINT (do (v-need-value n 1) (v-need-value n 2) 0)
-          OP-ISNAN (v-need-value n 1)
-          OP-STRINGSPLIT
-            (do
+              0))
+    (StringConst [id] (v-need-ctrl n 0))
+    (StringLen [] (v-need-value n 1))
+    (StringEq [] (do (v-need-value n 1) (v-need-value n 2) 0))
+    (StringConcat [] (do (v-need-value n 1) (v-need-value n 2) 0))
+    (StringCharCode [] (do (v-need-value n 1) (v-need-value n 2) 0))
+    (StringSubstring [mode] (do (v-need-value n 1) (v-need-value n 2) (v-need-value n 3) 0))
+    (ToString [] (v-need-value n 1))
+    (ToInteger [] (v-need-value n 1))
+    (ToNumber [] (v-need-value n 1))
+    (ArrayTest [] (v-need-value n 1))
+    (ArrayUnbox [] (v-need-value n 1))
+    (ParseFloat [] (v-need-value n 1))
+    (ParseInt [] (do (v-need-value n 1) (v-need-value n 2) 0))
+    (IsNaN [] (v-need-value n 1))
+    (StringSplit [] (do
               (v-need-mem n 1)
               (v-need-value n 2)
               (v-need-value n 3)
               (v-need-value n 4)
-              0)
-          OP-STRINGFROMCODEUNIT (v-need-value n 1)
-          OP-NUMBERTOSTRING (do (v-need-value n 1) (v-need-value n 2) 0)
-          OP-STRINGLOWER (v-need-value n 1)
-          OP-STRINGUPPER (v-need-value n 1)
-          OP-STRINGINDEXOF (do (v-need-value n 1) (v-need-value n 2) (v-need-value n 3) 0)
-          OP-STRINGCOMPARE (do (v-need-value n 1) (v-need-value n 2) 0)
-          OP-STRINGNORMALIZE (do (v-need-value n 1) (v-need-value n 2) 0)
-          OP-JSBUILTIN (do (v-need-value n 1) (v-need-value n 2) 0)
-          OP-JSTHROW (v-need-value n 1)
+              0))
+    (StringFromCodeUnit [] (v-need-value n 1))
+    (NumberToString [] (do (v-need-value n 1) (v-need-value n 2) 0))
+    (StringLower [] (v-need-value n 1))
+    (StringUpper [] (v-need-value n 1))
+    (StringIndexOf [] (do (v-need-value n 1) (v-need-value n 2) (v-need-value n 3) 0))
+    (StringCompare [] (do (v-need-value n 1) (v-need-value n 2) 0))
+    (StringNormalize [] (do (v-need-value n 1) (v-need-value n 2) 0))
+    (JsBuiltin [descriptor] (do (v-need-value n 1) (v-need-value n 2) 0))
+    (JsThrow [] (v-need-value n 1))
           ;; Slot 0 is unused for the same reason a Region's is, and reported with the same code: a
           ;; node parked in it is a use nothing reads, which is how a stale edge survives a rewrite.
-          OP-MEMMERGE
-            (do
+    (MemMerge [] (do
               (if (>= (n-nins n) 1) (v-need (= (n-in n 0) NO-NODE) VERR-MERGE-IN0 n) 0)
               (v-need-mem-from n 1)
-              0)
-          (if (op-binary? op)
-              (do (v-need-value n 1) (v-need-value n 2) 0)
-              (do (panic-corrupt "v-check-slots: op has no slot contract") 0)))))
+              0))
+    (Add [] (do (v-need-value n 1) (v-need-value n 2) 0))
+    (Sub [] (do (v-need-value n 1) (v-need-value n 2) 0))
+    (Mul [] (do (v-need-value n 1) (v-need-value n 2) 0))
+    (Div [] (do (v-need-value n 1) (v-need-value n 2) 0))
+    (Eq [] (do (v-need-value n 1) (v-need-value n 2) 0))
+    (Lt [] (do (v-need-value n 1) (v-need-value n 2) 0))
+    (Le [] (do (v-need-value n 1) (v-need-value n 2) 0))
+    (Mod [] (do (v-need-value n 1) (v-need-value n 2) 0))
+    (BitAnd [] (do (v-need-value n 1) (v-need-value n 2) 0))
+    (BitOr [] (do (v-need-value n 1) (v-need-value n 2) 0))
+    (BitXor [] (do (v-need-value n 1) (v-need-value n 2) 0))
+    (Shl [] (do (v-need-value n 1) (v-need-value n 2) 0))
+    (Shr [] (do (v-need-value n 1) (v-need-value n 2) 0))
+    (UShr [] (do (v-need-value n 1) (v-need-value n 2) 0))))
 
 ; ============================================================================
 ; The passes
@@ -811,13 +833,18 @@
 ;; in `g-analyze!`.
 ;; The pointer contract, per node. See VERR-PTR-SLOT.
 (defn v-check-ptr [(n i64)] (-> i64)
-  (let [op (n-op n)]
-    (if (or (= op OP-LOAD) (= op OP-STORE))
-        (if (>= (n-nins n) 3)
-            (let [t (n-in-ty n 2)]
-              (if (ty-high? t) 0 (v-need (ty-only-obj? t) VERR-PTR-SLOT n)))
-            0)  ; the arity pass already reported the missing slot
-        0)))
+  (match (n-op n)
+    (Load [alias]
+      (if (>= (n-nins n) 3)
+          (let [t (n-in-ty n 2)]
+            (if (ty-high? t) 0 (v-need (ty-only-obj? t) VERR-PTR-SLOT n)))
+          0))
+    (Store [alias]
+      (if (>= (n-nins n) 3)
+          (let [t (n-in-ty n 2)]
+            (if (ty-high? t) 0 (v-need (ty-only-obj? t) VERR-PTR-SLOT n)))
+          0))
+    (_ 0)))
 
 (defn v-fun-parm-count [(fun i64)] (-> i64)
   (let [lim (n-count)
@@ -827,7 +854,8 @@
               (break)
               (do
                 (if (and (not (n-dead? (load i)))
-                         (and (= (n-op (load i)) OP-PARM) (= (n-in (load i) 0) fun)))
+                         (and (match (n-op (load i)) (Parm [index] true) (_ false))
+                              (= (n-in (load i) 0) fun)))
                     (store! count (+ (load count) 1))
                     0)
                 (store! i (+ (load i) 1))
@@ -835,15 +863,16 @@
     (load count)))
 
 (defn v-direct-callee-fun [(callee i64)] (-> i64)
-  (case (n-op callee) OP-FUN
-        callee OP-CLOSURE
-        (n-in callee 0) NO-NODE))
+  (match (n-op callee)
+    (Fun [index] callee)
+    (Closure [captures] (n-in callee 0))
+    (_ NO-NODE)))
 
 (defn v-check-closure-contract [(n i64)] (-> i64)
-  (if (= (n-op n) OP-CLOSURE)
+  (match (n-op n)
+    (Closure [captures]
       (let [fun (n-in n 0)
-            captures (n-aux n)
-            fidx (n-aux fun)
+            fidx (match (n-op fun) (Fun [index] index) (_ -1))
             materialized (= (n-nins n) (+ captures 2))]
         (v-need (or (= (n-nins n) (+ captures 1)) materialized) VERR-CLOSURE-LAYOUT n)
         (if materialized (v-need (ty-only-obj? (n-ty (n-in n 1))) VERR-CLOSURE-LAYOUT n) 0)
@@ -851,15 +880,15 @@
         ; larger programs remains on Fun.aux / Closure.input0.
         (if (< fidx 63)
             (v-need (= (ty-fun-targets (n-ty n)) (<< 1 fidx)) VERR-CALL-TARGETS n)
-            0))
-      (if (= (n-op n) OP-CALL)
-          (let [callee (n-in n 1)
+            0)))
+    (Call [abi]
+      (let [callee (n-in n 1)
                 targets (ty-fun-targets (n-ty callee))]
-            (v-need (or (= (n-aux n) CALL-ABI-LEGACY)
-                        (>= (n-aux n) CALL-ABI-RECEIVER))
+            (v-need (or (= abi CALL-ABI-LEGACY)
+                        (>= abi CALL-ABI-RECEIVER))
                     VERR-CALL-RECEIVER
                     n)
-            (if (or (= (n-aux n) CALL-ABI-RECEIVER) (= (n-aux n) CALL-ABI-DYNAMIC-RECEIVER))
+            (if (or (= abi CALL-ABI-RECEIVER) (= abi CALL-ABI-DYNAMIC-RECEIVER))
                 (do
                   ;; Input 2 is the hidden closure environment, input 3 the receiver: every
                   ;; callable reserves exactly one environment slot, which is what lets generic
@@ -881,20 +910,22 @@
                 0)
             (v-need (!= (& (ty-kinds (n-ty callee)) VK-FUN) 0) VERR-CALL-TAG n)
             (let [direct (v-direct-callee-fun callee)
-                  fidx (if (= direct NO-NODE) (ty-fun-singleton (n-ty callee)) (n-aux direct))]
+                  fidx (if (= direct NO-NODE)
+                           (ty-fun-singleton (n-ty callee))
+                           (match (n-op direct) (Fun [index] index) (_ -1)))]
               (if (< fidx 0)
                   0
                   (let [fun (if (= direct NO-NODE) (n-find-fun-index fidx) direct)
                         raw (- (n-nins n) 2)
                         mem (and (> raw 0) (v-mem-producer? (n-in n (- (n-nins n) 1))))
                         explicit (- raw (if mem 1 0))
-                        captures (if (= (n-op callee) OP-CLOSURE) (n-aux callee) 0)
+                        captures (match (n-op callee) (Closure [count] count) (_ 0))
                         parms (if (= fun NO-NODE) 0 (v-fun-parm-count fun))]
                     (v-need (and (!= fun NO-NODE)
                                  (or (= parms 0) (>= (+ captures explicit) parms)))
                             VERR-CALL-ARITY
-                            n)))))
-          0)))
+                            n))))))
+    (_ 0)))
 
 (defn v-pass-types [] (-> i64)
   (let [n (n-count)
@@ -926,11 +957,10 @@
 (defn v-ctrl-after-safepoint? [(ctrl i64) (sp i64)] (-> bool)
   (if (or (= ctrl NO-NODE) (n-dead? ctrl))
       false
-      (if (and (= (n-op ctrl) OP-CPROJ) (= (n-in ctrl 0) sp))
-          true
-          (if (= (n-op ctrl) OP-CALLEND)
-              (v-ctrl-after-safepoint? (n-in ctrl 0) sp)
-              false))))
+      (match (n-op ctrl)
+        (CProj [slot] (= (n-in ctrl 0) sp))
+        (CallEnd [] (v-ctrl-after-safepoint? (n-in ctrl 0) sp))
+        (_ false))))
 
 (defn v-check-safepoint [(sp i64)] (-> i64)
   (let [(mut i) 1]
@@ -963,9 +993,11 @@
     (loop (if (>= (load i) lim)
               (break)
               (do
-                (if (or (n-dead? (load i)) (!= (n-op (load i)) OP-SAFEPOINT))
+                (if (n-dead? (load i))
                     0
-                    (v-check-safepoint (load i)))
+                    (match (n-op (load i))
+                      (Safepoint [] (v-check-safepoint (load i)))
+                      (_ 0)))
                 (store! i (+ (load i) 1))
                 0)))
     0))
@@ -992,146 +1024,57 @@
 ; promoted into the classification as their contracts are pinned down, so this pass only ever
 ; reports certain violations.
 ; ============================================================================
-(const REP-UNKNOWN i64 0)
-(const REP-TAGGED i64 1)
-(const REP-RAW-PTR i64 2)
-(const REP-RAW-NUM i64 3)
 
-(defn v-rep-name [(rep i64)] (-> (slice u8))
-  (cond (= rep REP-TAGGED) "tagged"
-        (= rep REP-RAW-PTR) "raw-ptr"
-        (= rep REP-RAW-NUM) "raw-num"
-        :else "unknown"))
 
-;; What a load/store through this alias carries: the declared field content decides.
-(defn v-rep-of-alias [(alias i64)] (-> i64)
-  (if (not (shape-alias-defined? alias))
-      REP-TAGGED
-      (let [content (shape-alias-ty alias)]
-        (cond (= content (t-dyn)) REP-TAGGED
-              (= content (t-undef)) REP-TAGGED
-              (= (ty-kinds content) VK-OBJ) REP-RAW-PTR
-              (or (= (ty-kinds content) VK-INT)
-                  (or (= (ty-kinds content) VK-FLT) (= (ty-kinds content) VK-BOOL)))
-                REP-RAW-NUM
-              :else REP-UNKNOWN))))
 
-(defn v-rep-of [(n i64) (fuel i64)] (-> i64)
-  (if (or (< n 0) (or (<= fuel 0) (n-dead? n)))
-      REP-UNKNOWN
-      (let [op (n-op n)]
-        (cond (= op OP-BOX) REP-TAGGED
-              (= op OP-TONUMBER) REP-TAGGED
-              (= op OP-PROPLOAD) REP-TAGGED
-              (= op OP-PROPLOADKEY) REP-TAGGED
-              (= op OP-ARRAYLOAD) REP-TAGGED
-              (= op OP-JSBUILTIN) REP-TAGGED
-              (= op OP-JSTHROW) REP-TAGGED
-              (= op OP-ARRAYUNBOX) REP-RAW-PTR
-              (= op OP-ARRAYMARK) REP-RAW-PTR
-              (= op OP-UNBOX)
-                (let [t (n-aux n)]
-                  (cond (= (ty-kinds t) VK-OBJ) REP-RAW-PTR
-                        (or (= (ty-kinds t) VK-INT) (= (ty-kinds t) VK-FLT)) REP-RAW-NUM
-                        :else REP-UNKNOWN))
-              (= op OP-PROJ)
-                (if (= (n-op (n-in n 0)) OP-NEW) REP-RAW-PTR REP-UNKNOWN)
-              (= op OP-CAST) (v-rep-of (n-in n 1) (- fuel 1))
-              (= op OP-LOAD) (v-rep-of-alias (n-aux n))
-              (= op OP-PHI)
-                (let [(mut i) 1 (mut joined) REP-UNKNOWN (mut mixed) false]
-                  (loop (if (or (>= (load i) (n-nins n)) (load mixed))
-                            (break)
-                            (do
-                              (let [input (n-in n (load i))]
-                                (if (or (= input NO-NODE) (= input n))
-                                    0
-                                    (let [rep (v-rep-of input (- fuel 1))]
-                                      (cond (= rep REP-UNKNOWN) (store! mixed true)
-                                            (= (load joined) REP-UNKNOWN) (store! joined rep)
-                                            (!= (load joined) rep) (store! mixed true)
-                                            :else 0))))
-                              (store! i (+ (load i) 1))
-                              0)))
-                  (if (load mixed) REP-UNKNOWN (load joined)))
-              (or (= op OP-ADD)
-                  (or (= op OP-SUB)
-                      (or (= op OP-MUL)
-                          (or (= op OP-DIV)
-                              (or (= op OP-MOD) (= op OP-MINUS))))))
-                REP-RAW-NUM
-              (or (= op OP-BITAND)
-                  (or (= op OP-BITOR)
-                      (or (= op OP-BITXOR)
-                          (or (= op OP-SHL)
-                              (or (= op OP-SHR)
-                                  (or (= op OP-USHR) (= op OP-BITNOT)))))))
-                REP-RAW-NUM
-              (or (= op OP-EQ)
-                  (or (= op OP-LT)
-                      (or (= op OP-LE)
-                          (or (= op OP-NOT)
-                              (or (= op OP-TYPETEST)
-                                  (or (= op OP-ARRAYTEST) (= op OP-ISNAN)))))))
-                REP-RAW-NUM
-              ;; ToInteger is a RUNTIME call (JSSOP-TO-INTEGER) and returns a tagged value —
-              ;; its result can be +/-Infinity, which has no raw integer form.
-              (= op OP-TOINTEGER) REP-TAGGED
-              (or (= op OP-ARRAYLEN)
-                  (or (= op OP-STRINGLEN)
-                      (or (= op OP-STRINGCHARCODE)
-                          (or (= op OP-STRINGINDEXOF)
-                              (or (= op OP-STRINGCOMPARE) (= op OP-OWNKEYCOUNT))))))
-                REP-RAW-NUM
-              (or (= op OP-STRINGEQ)
-                  (or (= op OP-PROPHAS) (or (= op OP-PROPHASKEY) (= op OP-PROTOHAS))))
-                REP-RAW-NUM
-              :else REP-UNKNOWN))))
+;; The classifier itself is `n-rep-of` in node.coil, because the verifier is not its only reader:
+;; `box-idealize` and `unbox-idealize` must answer "is this value certainly tagged" before they
+;; delete a representation conversion, and two copies of the table would disagree eventually.
+;; One difference matters to the verifier not at all and to the idealizations completely: a Phi
+;; with an absent arm classifies UNKNOWN (see the note on `n-rep-of`).
 
 ;; What representation this consumer requires at this input slot, REP-UNKNOWN for slots the
 ;; contract has not been pinned down for. One table serves the verbose report and the hard
 ;; verify pass so they can never disagree.
 (defn v-rep-slot-required [(n i64) (slot i64)] (-> i64)
-  (let [op (n-op n)]
-    (cond (and (= slot 1)
-               (or (= op OP-UNBOX)
-                   (or (= op OP-TYPETEST)
-                       (or (= op OP-ARRAYTEST) (= op OP-ARRAYUNBOX)))))
-            REP-TAGGED
-          (and (= op OP-STORE) (= slot 2)) REP-RAW-PTR
-          (and (= op OP-STORE) (= slot 3)) (v-rep-of-alias (n-aux n))
-          (and (= op OP-LOAD) (= slot 2)) REP-RAW-PTR
-          (and (= op OP-ARRAYSTORE) (= slot 3)) REP-RAW-NUM
-          (and (= op OP-ARRAYSTORE) (= slot 4)) REP-TAGGED
-          (and (= op OP-ARRAYLOAD) (= slot 3)) REP-RAW-NUM
-          (and (= op OP-ARRAYRESIZE) (= slot 3)) REP-RAW-NUM
-          (and (= op OP-PROPSTORE) (= slot 3)) REP-TAGGED
-          (and (= op OP-PROPSTOREKEY) (= slot 4)) REP-TAGGED
-          (and (= op OP-CALL)
-               (and (= slot 2)
-                    (or (= (n-aux n) CALL-ABI-RECEIVER)
-                        (= (n-aux n) CALL-ABI-DYNAMIC-RECEIVER))))
-            REP-TAGGED
+  (match (n-op n)
+    (Unbox [target] (if (= slot 1) REP-TAGGED REP-UNKNOWN))
+    (TypeTest [target] (if (= slot 1) REP-TAGGED REP-UNKNOWN))
+    (ArrayTest [] (if (= slot 1) REP-TAGGED REP-UNKNOWN))
+    (ArrayUnbox [] (if (= slot 1) REP-TAGGED REP-UNKNOWN))
+    (Store [alias]
+      (cond (= slot 2) REP-RAW-PTR (= slot 3) (shape-alias-rep alias) :else REP-UNKNOWN))
+    (Load [alias] (if (= slot 2) REP-RAW-PTR REP-UNKNOWN))
+    (ArrayStore []
+      (cond (= slot 3) REP-RAW-NUM (= slot 4) REP-TAGGED :else REP-UNKNOWN))
+    (ArrayLoad [alias] (if (= slot 3) REP-RAW-NUM REP-UNKNOWN))
+    (ArrayResize [] (if (= slot 3) REP-RAW-NUM REP-UNKNOWN))
+    (PropStore [name] (if (= slot 3) REP-TAGGED REP-UNKNOWN))
+    (PropStoreKey [] (if (= slot 4) REP-TAGGED REP-UNKNOWN))
+    (Call [abi]
+      (if (and (= slot 2)
+               (or (= abi CALL-ABI-RECEIVER) (= abi CALL-ABI-DYNAMIC-RECEIVER)))
+          REP-TAGGED REP-UNKNOWN))
           ;; Numeric arithmetic and bitwise ops consume MACHINE NUMBERS. A tagged word in one of
           ;; these slots makes the op compute on the NaN-box bits themselves — unary minus on an
           ;; ArrayLoad negated the box bits and zeroed the cell (repros/negload.js). The frontend's
           ;; guarded ToNumber (fng-number-value / fng-int-value) is what satisfies this contract.
           ;; EQ/LT/LE are NOT here: equality legitimately consumes tagged operands through the
           ;; dyn-boundary runtime call.
-          (and (or (= slot 1) (= slot 2))
-               (or (= op OP-ADD)
-                   (or (= op OP-SUB)
-                       (or (= op OP-MUL)
-                           (or (= op OP-DIV)
-                               (or (= op OP-MOD)
-                                   (or (= op OP-BITAND)
-                                       (or (= op OP-BITOR)
-                                           (or (= op OP-BITXOR)
-                                               (or (= op OP-SHL)
-                                                   (or (= op OP-SHR) (= op OP-USHR))))))))))))
-            REP-RAW-NUM
-          (and (= slot 1) (or (= op OP-MINUS) (= op OP-BITNOT))) REP-RAW-NUM
-          :else REP-UNKNOWN)))
+    (Add [] (if (or (= slot 1) (= slot 2)) REP-RAW-NUM REP-UNKNOWN))
+    (Sub [] (if (or (= slot 1) (= slot 2)) REP-RAW-NUM REP-UNKNOWN))
+    (Mul [] (if (or (= slot 1) (= slot 2)) REP-RAW-NUM REP-UNKNOWN))
+    (Div [] (if (or (= slot 1) (= slot 2)) REP-RAW-NUM REP-UNKNOWN))
+    (Mod [] (if (or (= slot 1) (= slot 2)) REP-RAW-NUM REP-UNKNOWN))
+    (BitAnd [] (if (or (= slot 1) (= slot 2)) REP-RAW-NUM REP-UNKNOWN))
+    (BitOr [] (if (or (= slot 1) (= slot 2)) REP-RAW-NUM REP-UNKNOWN))
+    (BitXor [] (if (or (= slot 1) (= slot 2)) REP-RAW-NUM REP-UNKNOWN))
+    (Shl [] (if (or (= slot 1) (= slot 2)) REP-RAW-NUM REP-UNKNOWN))
+    (Shr [] (if (or (= slot 1) (= slot 2)) REP-RAW-NUM REP-UNKNOWN))
+    (UShr [] (if (or (= slot 1) (= slot 2)) REP-RAW-NUM REP-UNKNOWN))
+    (Minus [] (if (= slot 1) REP-RAW-NUM REP-UNKNOWN))
+    (BitNot [] (if (= slot 1) REP-RAW-NUM REP-UNKNOWN))
+    (_ REP-UNKNOWN)))
 
 ;; The first slot of `n` whose input's representation certainly disagrees with the slot's
 ;; requirement, or -1.
@@ -1142,7 +1085,7 @@
               (do
                 (let [required (v-rep-slot-required n (load slot))
                       input (n-in n (load slot))
-                      actual (if (= input NO-NODE) REP-UNKNOWN (v-rep-of input 8))]
+                      actual (if (= input NO-NODE) REP-UNKNOWN (n-rep-of input 8))]
                   (if (and (!= required REP-UNKNOWN)
                            (and (!= actual REP-UNKNOWN) (!= actual required)))
                       (store! found (load slot))
@@ -1169,8 +1112,8 @@
                             (fmt w "REP n{d}:{s} slot {d} <- n{d}:{s} is {s}, needs {s}\n"
                                  (load i) (op-name (n-op (load i))) slot
                                  input (op-name (n-op input))
-                                 (v-rep-name (v-rep-of input 8))
-                                 (v-rep-name (v-rep-slot-required (load i) slot)))
+                                 (rep-name (n-rep-of input 8))
+                                 (rep-name (v-rep-slot-required (load i) slot)))
                             (store! count (+ (load count) 1))
                             0)
                           0)))
@@ -1193,8 +1136,8 @@
                             (fmt w "REP n{d}:{s} slot {d} <- n{d}:{s} is {s}, needs {s}\n"
                                  (load i) (op-name (n-op (load i))) slot
                                  input (op-name (n-op input))
-                                 (v-rep-name (v-rep-of input 8))
-                                 (v-rep-name (v-rep-slot-required (load i) slot)))
+                                 (rep-name (n-rep-of input 8))
+                                 (rep-name (v-rep-slot-required (load i) slot)))
                             (v-fail! VERR-REPRESENTATION (load i))
                             0)
                           0)))

@@ -186,7 +186,7 @@
 ;; operand is not data the resize consumes; it is the value whose read must happen first. `pop`
 ;; loads the last element and then shortens the array, and nothing in the memory chain says the
 ;; load precedes the write that destroys what it read, so the load floats past it and selection
-;; refuses the block with `MSEL-MEMORY-ORDER`. `OP-ARRAYRESIZE`'s fifth input exists for exactly
+;; refuses the block with `MSEL-MEMORY-ORDER`. `OPTAG-ARRAYRESIZE`'s fifth input exists for exactly
 ;; this, and JSL has to name it because JSL has no other way to say "after".
 (const JSP-ARRAYRESIZE      i64 48)
 (const JSP-UNBOXOBJ         i64 49)
@@ -231,7 +231,24 @@
 (const JSP-INTERNALSETINDEX i64 88)
 (const JSP-STRINGNORMALIZE  i64 89)
 (const JSP-BOXARRAY         i64 90)
-(const JSP-COUNT            i64 91)
+;; `%IsNumber` -- one test against the numeric union, where `%IsInt`/`%IsFlt` are the two single
+;; tags underneath it. It exists because the disjunction is PROVABLE where neither half is: a
+;; boxed operand carries the kind `int|flt`, so `ty-isa num num` decides and `ty-isa num int` does
+;; not, and without this every `ToNumberValue` guard in `lib/` survives into the final graph.
+;; Selection emits two `MI-JSTEST`s and an OR, exactly as the callable test already does.
+;; `%UnboxNumber` -- a tagged number as a raw double, as a CONVERSION rather than an assertion.
+;;
+;; `%UnboxFlt` lowers through `jl-unbox`, which wraps its operand in a `Cast` to the target type,
+;; and the evaluator checks that Cast. A number that is int-tagged does not satisfy `Cast flt`,
+;; even though the unbox underneath converts it correctly -- `ev-unbox` turns RT-INT into RFlt and
+;; aarch64 emits `sxt48`/`scvtf`. So the assertion refuses exactly the values the operation
+;; handles.
+;;
+;; This is the node the frontend has always used for the same job: `fng-to-number-operand` is
+;; `n-unbox!` with no Cast in front of it.
+(const JSP-UNBOXNUMBER      i64 92)
+(const JSP-ISNUMBER         i64 91)
+(const JSP-COUNT            i64 93)
 
 (defn jsp-name [(id i64)] (-> (slice u8))
   (case id
@@ -271,6 +288,8 @@
         JSP-TONUMBER       "%ToNumber"
         JSP-ISINT          "%IsInt"
         JSP-ISFLT          "%IsFlt"
+        JSP-ISNUMBER       "%IsNumber"
+        JSP-UNBOXNUMBER    "%UnboxNumber"
         JSP-ISSTRING       "%IsString"
         JSP-ARRAYLEN       "%ArrayLen"
         JSP-ARRAYLOAD      "%ArrayLoad"
@@ -328,100 +347,102 @@
         JSP-BOXARRAY       "%BoxArray"
         "<unknown jsl primitive>"))
 
-(defn jsp-op [(id i64)] (-> i64)
+(defn jsp-op [(id i64)] (-> Op)
   (case id
-        JSP-ADD            OP-ADD
-        JSP-SUB            OP-SUB
-        JSP-MUL            OP-MUL
-        JSP-DIV            OP-DIV
-        JSP-MOD            OP-MOD
-        JSP-NEG            OP-MINUS
-        JSP-NOT            OP-NOT
-        JSP-EQ             OP-EQ
-        JSP-LT             OP-LT
-        JSP-LE             OP-LE
-        JSP-BITAND         OP-BITAND
-        JSP-BITOR          OP-BITOR
-        JSP-BITXOR         OP-BITXOR
-        JSP-SHL            OP-SHL
-        JSP-SHR            OP-SHR
-        JSP-USHR           OP-USHR
-        JSP-BITNOT         OP-BITNOT
-        JSP-STRINGLEN      OP-STRINGLEN
-        JSP-STRINGEQ       OP-STRINGEQ
-        JSP-STRINGCONCAT   OP-STRINGCONCAT
-        JSP-STRINGCHARCODE OP-STRINGCHARCODE
-        JSP-STRINGINDEXOF  OP-STRINGINDEXOF
-        JSP-STRINGCOMPARE  OP-STRINGCOMPARE
-        JSP-STRINGFROMCODE OP-STRINGFROMCODEUNIT
-        JSP-STRINGLOWER    OP-STRINGLOWER
-        JSP-STRINGUPPER    OP-STRINGUPPER
-        JSP-TOSTRING       OP-TOSTRING
-        JSP-PARSEINT       OP-PARSEINT
-        JSP-ISNAN          OP-ISNAN
-        JSP-NUMBERTOSTRING OP-NUMBERTOSTRING
-        JSP-THROW          OP-JSTHROW
-        JSP-TOINTEGER      OP-TOINTEGER
-        JSP-SUBSTRING      OP-STRINGSUBSTRING
-        JSP-TONUMBER       OP-TONUMBER
-        JSP-ISINT          OP-TYPETEST
-        JSP-ISFLT          OP-TYPETEST
-        JSP-ISSTRING       OP-TYPETEST
-        JSP-ARRAYLEN       OP-ARRAYLEN
-        JSP-ARRAYLOAD      OP-ARRAYLOAD
-        JSP-NEWARRAY       OP-NEW
-        JSP-ARRAYSTORE     OP-ARRAYSTORE
-        JSP-BOX            OP-BOX
-        JSP-UNBOXINT       OP-UNBOX
-        JSP-UNBOXFLT       OP-UNBOX
-        JSP-FLOORNUM       OP-JSBUILTIN
-        JSP-CEILNUM        OP-JSBUILTIN
-        JSP-ROUNDNUM       OP-JSBUILTIN
-        JSP-UNBOXBOOL      OP-UNBOX
-        JSP-ARRAYRESIZE    OP-ARRAYRESIZE
-        JSP-UNBOXOBJ       OP-UNBOX
-        JSP-PROPLOADNAMED  OP-PROPLOAD
-        JSP-PROPSTORENAMED OP-PROPSTORE
-        JSP-ISARRAY        OP-ARRAYTEST
-        JSP-UNBOXARRAY     OP-ARRAYUNBOX
-        JSP-UNBOXSTRING    OP-UNBOX
-        JSP-PARSEFLOAT     OP-PARSEFLOAT
-        JSP-ISUNDEFINED    OP-TYPETEST
-        JSP-ISNULL         OP-TYPETEST
-        JSP-ISBOOL         OP-TYPETEST
-        JSP-ISOBJECT       OP-TYPETEST
-        JSP-ISFUNCTION     OP-TYPETEST
-        JSP-PROPHASNAMED   OP-PROPHAS
-        JSP-PROPDELETENAMED OP-PROPDELETE
-        JSP-PROTOTYPEHAS   OP-PROTOHAS
-        JSP-EXPNUM         OP-JSBUILTIN
-        JSP-LOGNUM         OP-JSBUILTIN
-        JSP-SINNUM         OP-JSBUILTIN
-        JSP-COSNUM         OP-JSBUILTIN
-        JSP-TANNUM         OP-JSBUILTIN
-        JSP-ASINNUM        OP-JSBUILTIN
-        JSP-ACOSNUM        OP-JSBUILTIN
-        JSP-ATANNUM        OP-JSBUILTIN
-        JSP-SQRTNUM        OP-JSBUILTIN
-        JSP-POWNUM         OP-JSBUILTIN
-        JSP-RANDOMNUM      OP-JSBUILTIN
-        JSP-SETPROTOTYPE   OP-SETPROTO
-        JSP-PROPLOADKEY    OP-PROPLOADKEY
-        JSP-PROPSTOREKEY   OP-PROPSTOREKEY
-        JSP-PROPHASKEY     OP-PROPHASKEY
-        JSP-PROPDELETEKEY  OP-PROPDELETEKEY
-        JSP-NEWOBJECT      OP-NEW
-        JSP-OWNKEYCOUNT    OP-OWNKEYCOUNT
-        JSP-OWNKEYAT       OP-OWNKEYAT
-        JSP-OBJECTFREEZE   OP-OBJECTFREEZE
-        JSP-INTERNALINIT   OP-INTERNALSTORE
-        JSP-INTERNALTARGET OP-INTERNALLOAD
-        JSP-INTERNALINDEX  OP-INTERNALLOAD
-        JSP-INTERNALKIND   OP-INTERNALLOAD
-        JSP-INTERNALSETINDEX OP-INTERNALSTORE
-        JSP-STRINGNORMALIZE OP-STRINGNORMALIZE
-        JSP-BOXARRAY       OP-BOX
-        -1))
+        JSP-ADD            (Add)
+        JSP-SUB            (Sub)
+        JSP-MUL            (Mul)
+        JSP-DIV            (Div)
+        JSP-MOD            (Mod)
+        JSP-NEG            (Minus)
+        JSP-NOT            (Not)
+        JSP-EQ             (Eq)
+        JSP-LT             (Lt)
+        JSP-LE             (Le)
+        JSP-BITAND         (BitAnd)
+        JSP-BITOR          (BitOr)
+        JSP-BITXOR         (BitXor)
+        JSP-SHL            (Shl)
+        JSP-SHR            (Shr)
+        JSP-USHR           (UShr)
+        JSP-BITNOT         (BitNot)
+        JSP-STRINGLEN      (StringLen)
+        JSP-STRINGEQ       (StringEq)
+        JSP-STRINGCONCAT   (StringConcat)
+        JSP-STRINGCHARCODE (StringCharCode)
+        JSP-STRINGINDEXOF  (StringIndexOf)
+        JSP-STRINGCOMPARE  (StringCompare)
+        JSP-STRINGFROMCODE (StringFromCodeUnit)
+        JSP-STRINGLOWER    (StringLower)
+        JSP-STRINGUPPER    (StringUpper)
+        JSP-TOSTRING       (ToString)
+        JSP-PARSEINT       (ParseInt)
+        JSP-ISNAN          (IsNaN)
+        JSP-NUMBERTOSTRING (NumberToString)
+        JSP-THROW          (JsThrow)
+        JSP-TOINTEGER      (ToInteger)
+        JSP-SUBSTRING      (StringSubstring (jsp-aux id))
+        JSP-TONUMBER       (ToNumber)
+        JSP-ISINT          (TypeTest (jsp-aux id))
+        JSP-ISFLT          (TypeTest (jsp-aux id))
+        JSP-ISNUMBER       (TypeTest (jsp-aux id))
+        JSP-UNBOXNUMBER    (Unbox (jsp-aux id))
+        JSP-ISSTRING       (TypeTest (jsp-aux id))
+        JSP-ARRAYLEN       (ArrayLen)
+        JSP-ARRAYLOAD      (ArrayLoad (jsp-aux id))
+        JSP-NEWARRAY       (New (jsp-aux id))
+        JSP-ARRAYSTORE     (ArrayStore)
+        JSP-BOX            (Box (jsp-aux id))
+        JSP-UNBOXINT       (Unbox (jsp-aux id))
+        JSP-UNBOXFLT       (Unbox (jsp-aux id))
+        JSP-FLOORNUM       (JsBuiltin (jsp-aux id))
+        JSP-CEILNUM        (JsBuiltin (jsp-aux id))
+        JSP-ROUNDNUM       (JsBuiltin (jsp-aux id))
+        JSP-UNBOXBOOL      (Unbox (jsp-aux id))
+        JSP-ARRAYRESIZE    (ArrayResize)
+        JSP-UNBOXOBJ       (Unbox (jsp-aux id))
+        JSP-PROPLOADNAMED  (PropLoad (jsp-aux id))
+        JSP-PROPSTORENAMED (PropStore (jsp-aux id))
+        JSP-ISARRAY        (ArrayTest)
+        JSP-UNBOXARRAY     (ArrayUnbox)
+        JSP-UNBOXSTRING    (Unbox (jsp-aux id))
+        JSP-PARSEFLOAT     (ParseFloat)
+        JSP-ISUNDEFINED    (TypeTest (jsp-aux id))
+        JSP-ISNULL         (TypeTest (jsp-aux id))
+        JSP-ISBOOL         (TypeTest (jsp-aux id))
+        JSP-ISOBJECT       (TypeTest (jsp-aux id))
+        JSP-ISFUNCTION     (TypeTest (jsp-aux id))
+        JSP-PROPHASNAMED   (PropHas (jsp-aux id))
+        JSP-PROPDELETENAMED (PropDelete (jsp-aux id))
+        JSP-PROTOTYPEHAS   (ProtoHas)
+        JSP-EXPNUM         (JsBuiltin (jsp-aux id))
+        JSP-LOGNUM         (JsBuiltin (jsp-aux id))
+        JSP-SINNUM         (JsBuiltin (jsp-aux id))
+        JSP-COSNUM         (JsBuiltin (jsp-aux id))
+        JSP-TANNUM         (JsBuiltin (jsp-aux id))
+        JSP-ASINNUM        (JsBuiltin (jsp-aux id))
+        JSP-ACOSNUM        (JsBuiltin (jsp-aux id))
+        JSP-ATANNUM        (JsBuiltin (jsp-aux id))
+        JSP-SQRTNUM        (JsBuiltin (jsp-aux id))
+        JSP-POWNUM         (JsBuiltin (jsp-aux id))
+        JSP-RANDOMNUM      (JsBuiltin (jsp-aux id))
+        JSP-SETPROTOTYPE   (SetProto)
+        JSP-PROPLOADKEY    (PropLoadKey)
+        JSP-PROPSTOREKEY   (PropStoreKey)
+        JSP-PROPHASKEY     (PropHasKey)
+        JSP-PROPDELETEKEY  (PropDeleteKey)
+        JSP-NEWOBJECT      (New (jsp-aux id))
+        JSP-OWNKEYCOUNT    (OwnKeyCount)
+        JSP-OWNKEYAT       (OwnKeyAt)
+        JSP-OBJECTFREEZE   (ObjectFreeze)
+        JSP-INTERNALINIT   (InternalStore (jsp-aux id))
+        JSP-INTERNALTARGET (InternalLoad (jsp-aux id))
+        JSP-INTERNALINDEX  (InternalLoad (jsp-aux id))
+        JSP-INTERNALKIND   (InternalLoad (jsp-aux id))
+        JSP-INTERNALSETINDEX (InternalStore (jsp-aux id))
+        JSP-STRINGNORMALIZE (StringNormalize)
+        JSP-BOXARRAY       (Box (jsp-aux id))
+        (do (panic-corrupt "jsp-op: unknown primitive id") (Start))))
 
 ;; How many OPERANDS the primitive takes. Slot 0 of every one of these ops is the ordinary control
 ;; anchor and is not an operand, so the node built in `jsl_lower` has arity+1 inputs.
@@ -463,6 +484,8 @@
         JSP-TONUMBER       1
         JSP-ISINT          1
         JSP-ISFLT          1
+        JSP-ISNUMBER      1
+        JSP-UNBOXNUMBER   1
         JSP-ISSTRING       1
         JSP-ARRAYLEN       1
         JSP-ARRAYLOAD      2
@@ -520,7 +543,7 @@
         JSP-BOXARRAY       1
         -1))
 
-;; The aux word a primitive's node carries. Almost every op takes 0, but `OP-TYPETEST` takes the
+;; The aux word a primitive's node carries. Almost every op takes 0, but `OPTAG-TYPETEST` takes the
 ;; TESTED TYPE, and a type id is interned at run time rather than being a compile-time constant —
 ;; which is why this is a function evaluated at lowering rather than a column of literals.
 ;; How a primitive relates to the heap. Memory is IMPLICIT in JSL: a definition never writes memory
@@ -581,12 +604,14 @@
   (case id
         JSP-ISINT    (t-int)
         JSP-ISFLT    (t-flt)
+        JSP-ISNUMBER (t-num)
+        JSP-UNBOXNUMBER (t-flt)
         JSP-UNBOXINT (t-int)
         JSP-UNBOXFLT (t-flt)
         JSP-UNBOXBOOL (t-bool)
         JSP-UNBOXOBJ  (t-obj)
         JSP-UNBOXSTRING (t-str)
-        ;; The descriptor id the `OP-JSBUILTIN` runtime dispatches on. Rounding a double needs a
+        ;; The descriptor id the `OPTAG-JSBUILTIN` runtime dispatches on. Rounding a double needs a
         ;; real rounding operation, which is the machine surface rather than something JSL can
         ;; compose; the descriptor table already has libc behind it and both execution modes take
         ;; the same dynamic-value ABI.
@@ -629,13 +654,13 @@
 ; ============================================================================
 ; The declaration table
 ; ============================================================================
-;; A cap rather than an unbounded list, because a parameter index becomes an `OP-PARM` aux and the
+;; A cap rather than an unbounded list, because a parameter index becomes an `OPTAG-PARM` aux and the
 ;; call ABI lays arguments out positionally. Sixteen accommodates internal spec algorithms which
 ;; carry several pieces of state even though public ECMAScript signatures are much narrower; the
 ;; refusal remains named, so a wider definition is diagnosed rather than silently truncated.
 (const JSL-MAX-PARAMS i64 16)
 
-;; A `builtin` gets its own `OP-FUN` and is reached through `OP-CALL`; a `macro` is INLINED into the
+;; A `builtin` gets its own `OPTAG-FUN` and is reached through `OPTAG-CALL`; a `macro` is INLINED into the
 ;; caller's graph. Only a macro may carry a label, and the reason is structural rather than a
 ;; simplification: a label is a control edge into the caller's CFG, and a control edge cannot cross
 ;; a call boundary. Torque draws the same line for the same reason.
@@ -661,7 +686,7 @@
    (usesmem       bool)         ; reads the heap, so it takes memory as a trailing parameter
    (heapparams    i64)          ; bitset: parameters whose value reaches a heap-array operand
    (body          (ptr rd/Sexp))
-   (fun           i64)])        ; the OP-FUN node once lowered; NO-NODE until then
+   (fun           i64)])        ; the OPTAG-FUN node once lowered; NO-NODE until then
 
 ;; SOURCE RANGES ON EVERY REFUSAL. The roadmap requires that unsupported input "fail before object
 ;; publication with a stable diagnostic and source range", and `coil.reader` puts `lo`/`hi`/`source`
@@ -803,10 +828,10 @@
 ;;
 ;; JavaScript-visible function identities below 63 can be bits in `Val.fidxs`; exact direct JSL
 ;; functions may live above that finite summary. Macros still must not consume identities because
-;; they have no `OP-FUN`, and both eager and on-demand lowering must assign each builtin the same id.
+;; they have no `OPTAG-FUN`, and both eager and on-demand lowering must assign each builtin the same id.
 ;;
 ;; This used to be the declaration index, which meant every `macro` — 55 of the 88 entries, and none
-;; of which has an `OP-FUN` at all — consumed a bit. The library crossed 63 declarations and
+;; of which has an `OPTAG-FUN` at all — consumed a bit. The library crossed 63 declarations and
 ;; `StringIndexOfFrom` landed at index 66. Its bit fell outside the mask, so `be-call-return-kind`
 ;; could not identify the callee of a call to it, `be-js-tag-for-value` answered -1 for the boxed
 ;; result, and `String.prototype.indexOf` failed selection with `MSEL-UNSUPPORTED` — a definition

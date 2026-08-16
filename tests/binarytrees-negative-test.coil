@@ -52,7 +52,7 @@
   (let [(mut i) 0 (mut found) NO-NODE]
     (loop
       (if (or (>= (load i) (n-count)) (!= (load found) NO-NODE)) (break)
-        (do (if (and (not (n-dead? (load i))) (= (n-op (load i)) op))
+        (do (if (and (not (n-dead? (load i))) (= (op-encode-tag (n-op (load i))) op))
                 (store! found (load i)) 0)
             (store! i (+ (load i) 1)) 0)))
     (load found)))
@@ -62,8 +62,8 @@
     (loop
       (if (or (>= (load i) (n-count)) (!= (load found) NO-NODE)) (break)
         (do (if (and (not (n-dead? (load i)))
-                     (and (= (n-op (load i)) OP-PHI)
-                          (= (n-op (n-in (load i) 0)) OP-LOOP)))
+                     (and (op-is? (load i) Phi [_])
+                          (op-is? (n-in (load i) 0) Loop [])))
                 (store! found (load i)) 0)
             (store! i (+ (load i) 1)) 0)))
     (load found)))
@@ -73,9 +73,9 @@
     (loop
       (if (or (>= (load i) (n-count)) (!= (load found) NO-NODE)) (break)
         (do (if (and (not (n-dead? (load i)))
-                     (and (= (n-op (load i)) OP-ADD)
-                          (and (= (n-op (n-in (load i) 1)) OP-CALL)
-                               (= (n-op (n-in (load i) 2)) OP-CALL))))
+                     (and (op-is? (load i) Add [])
+                          (and (op-is? (n-in (load i) 1) Call [_])
+                               (op-is? (n-in (load i) 2) Call [_]))))
                 (store! found (load i)) 0)
             (store! i (+ (load i) 1)) 0)))
     (load found)))
@@ -85,9 +85,9 @@
     (loop
       (if (>= (load i) (n-count)) (break)
         (do (if (and (not (n-dead? (load i)))
-                     (and (= (n-op (load i)) OP-CALL)
-                          (and (= (n-aux (n-in (load i) 1)) 1)
-                               (= (n-op (n-in (load i) 0)) OP-REGION))))
+                     (and (op-is? (load i) Call [_])
+                          (and (= (n-fun-index (n-in (load i) 1)) 1)
+                               (op-is? (n-in (load i) 0) Region []))))
                 (store! found (load i)) 0)
             (store! i (+ (load i) 1)) 0)))
     (load found)))
@@ -97,13 +97,13 @@
     (loop
       (if (>= (load i) (n-count)) (break)
         (do (if (and (not (n-dead? (load i)))
-                     (and (= (n-op (load i)) OP-FUN) (= (n-aux (load i)) 2)))
+                     (match (n-op (load i)) (Fun [index] (= index 2)) (_ false)))
                 (let [fun (load i) (mut r) 1]
                   (loop
                     (if (>= (load r) (n-nins fun)) (break)
                       (do (let [ret (n-in fun (load r))]
-                            (if (and (= (n-op ret) OP-RETURN)
-                                     (and (= (n-op (n-in ret 1)) OP-CONST)
+                            (if (and (op-is? ret Return [])
+                                     (and (op-is? (n-in ret 1) Const [_])
                                           (= (ty-int-lo (n-ty (n-in ret 1))) 1)))
                                 (store! found (n-in ret 1)) 0))
                           (store! r (+ (load r) 1)) 0)))) 0)
@@ -113,14 +113,14 @@
 (defn neg-run-caught! [(kind i64)] (-> bool)
   (let [arg (binarytrees-build! (+ 2400 kind))]
     (case kind
-      0 (let [load-node (neg-find-op OP-LOAD)]
-          (store! (field (nd load-node) aux) (+ (n-aux load-node) 2)))
-      1 (let [eq (neg-find-op OP-EQ)] (store! (field (nd eq) op) OP-LT))
+      0 (let [load-node (neg-find-op OPTAG-LOAD)]
+          (n-set-op! load-node (Load (+ (n-load-alias load-node) 2))))
+      1 (let [eq (neg-find-op OPTAG-EQ)] (store! (field (nd eq) op) (Lt)))
       2 (let [add (neg-find-recursive-add)] (n-set-def! add 2 (bt-const 0)))
       3 (let [phi (neg-find-loop-phi) entry (n-in phi 1) back (n-in phi 2)]
           (n-set-def! phi 1 back) (n-set-def! phi 2 entry))
       4 (let [constant (neg-find-pow-base-constant)]
-          (store! (field (nd constant) aux) (t-int-con 2))
+          (n-set-op! constant (Const (t-int-con 2)))
           (n-set-ty! constant (t-int-con 2)))
       5 (let [call (neg-find-final-check-call)] (n-set-def! call 2 (bt-null)))
       0)
@@ -134,8 +134,8 @@
         tree-shape (shape-transition left-shape "right" (t-obj))
         left-alias (shape-field-alias tree-shape 0)
         right-alias (shape-field-alias tree-shape 1)
-        initial-left (n-new1 OP-ARG (t-mem-alias left-alias (t-undef)) (g-start))
-        initial-right (n-new1 OP-ARG (t-mem-alias right-alias (t-undef)) (g-start))
+        initial-left (n-new1 (Arg (t-mem-alias left-alias (t-undef))) (g-start))
+        initial-right (n-new1 (Arg (t-mem-alias right-alias (t-undef))) (g-start))
         first-new (n-new-obj2! (g-start) tree-shape initial-left initial-right)
         first (n-obj-ptr first-new)
         first-left (n-store! (n-obj-mem first-new 0) first (bt-null) left-alias)
@@ -150,7 +150,7 @@
         parent-right (n-store! (n-obj-mem parent-new 1) parent second right-alias)
         merged (n-memmerge2! parent-left parent-right)
         loaded (n-load! merged parent (if swap right-alias left-alias))
-        ret (n-new3 OP-RETURN 0 (g-start) (bt-bin OP-EQ loaded first) merged)]
+        ret (n-new3 (Return) (g-start) (bt-bin (Eq) loaded first) merged)]
     (n-add-def! (g-stop) ret) (g-analyze!) 0))
 
 (defn neg-find-long-tree-call [] (-> i64)
@@ -158,10 +158,10 @@
     (loop
       (if (>= (load i) (n-count)) (break)
         (do (if (and (not (n-dead? (load i)))
-                     (and (= (n-op (load i)) OP-CALL)
-                          (and (= (n-op (n-in (load i) 1)) OP-FUN)
-                               (and (= (n-aux (n-in (load i) 1)) 0)
-                                    (= (n-op (n-in (load i) 2)) OP-ARG)))))
+                     (and (op-is? (load i) Call [_])
+                          (and (op-is? (n-in (load i) 1) Fun [_])
+                               (and (= (n-fun-index (n-in (load i) 1)) 0)
+                                    (op-is? (n-in (load i) 2) Arg [_])))))
                 (store! found (load i)) 0)
             (store! i (+ (load i) 1)) 0)))
     (load found)))

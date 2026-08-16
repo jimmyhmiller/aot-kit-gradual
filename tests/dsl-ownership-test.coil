@@ -1,0 +1,378 @@
+;; THE DSL IS SUPPOSED TO BE THE SOURCE OF JAVASCRIPT SEMANTICS. THIS CHECKS THAT IT IS.
+;;
+;; `lib/` is a Torque-like DSL holding the ECMAScript abstract operations, and the frontend is
+;; supposed to lower syntax into calls on them. Nothing enforced that, and the drift is measurable:
+;; `ToInt32` is defined in `lib/abstract/conversions.jsl` as `(%BitOr v 0)`, and
+;; `frontend_native_graph.coil` writes `(fng-bin (BitOr) value (fng-const 0))` by hand and never
+;; calls it. Two implementations of one operation, and the frontend's is the one that runs.
+;;
+;; That is how a whole session's worth of defects got fixed in the compiler instead of in the DSL:
+;; the frontend already had a hand-written version of nearly everything, so reaching for it was the
+;; path of least resistance and nothing objected.
+;;
+;; TWO INVARIANTS, both of which fail loudly rather than drifting:
+;;
+;;   1. NO DEAD DEFINITION. A `lib/` definition reached from neither the frontend nor another `lib/`
+;;      definition is dead. That is exactly what reimplementing an operation in the frontend leaves
+;;      behind, so it is the trip-wire for the specific mistake this file exists to prevent.
+;;
+;;   2. A WIRED OPERATION STAYS WIRED. `DSL-WIRED` names operations the frontend currently
+;;      delegates. If a change hand-rolls one of them, its call disappears and this fails.
+;;
+;; `DSL-OWED` is the debt: operations the DSL defines and the frontend does NOT call, because it
+;; open-codes them instead. The test asserts the list is EXACT -- wiring one up fails here until it
+;; is moved to `DSL-WIRED`, and open-coding a new one fails because it must be added deliberately.
+;; The list may shrink. It is not allowed to grow by accident.
+(module dslownershiptest)
+
+(import "coil.alloc" :use *)
+(import "coil.assert" :use *)
+(import "coil.control" :use *)
+(import "coil.fmt" :use *)
+(import "coil.fs" :use *)
+(import "coil.io" :use *)
+(import "coil.result" :use *)
+(import "coil.slice" :use *)
+(import "coil.str" :use *)
+(import "ty" :use *)
+(import "node" :use *)
+(import "shape" :use *)
+(import "jsl" :use *)
+
+;; The frontend is the only consumer that matters here: the backend and the evaluator run the graph
+;; the frontend built, so a semantic decision the frontend open-codes never reaches the DSL at all.
+(defn frontend-sources [(i i64)] (-> (slice u8))
+  (case i
+    0 "src/frontend_native_graph.coil"
+    1 "src/frontend_native.coil"
+    ""))
+(defn frontend-source-count [] (-> i64) 2)
+
+;; Operations the frontend calls today. Each is a JavaScript semantic the DSL owns.
+(defn dsl-wired [(i i64)] (-> (slice u8))
+  (case i
+    0 "ToNumberValue"
+    1 "StrictEqual"
+    2 "LooseEqual"
+    3 "ToStringValue"
+    4 "IsNullishValue"
+    5 "TypeOfValue"
+    6 "StringEquals"
+    7 "IsLessThan"
+    8 "IsLessEqual"
+    9 "BitwiseAnd"
+    10 "BitwiseOr"
+    11 "BitwiseXor"
+    12 "BitwiseNot"
+    13 "ShiftLeft"
+    14 "ShiftRight"
+    15 "ShiftRightUnsigned"
+    16 "JsAdd"
+    17 "JsSub"
+    18 "JsMul"
+    19 "JsDiv"
+    20 "JsMod"
+    21 "JsNegate"
+    ""))
+(defn dsl-wired-count [] (-> i64) 22)
+
+;; Operations the DSL defines and the frontend open-codes instead. Each entry is a duplicate
+;; implementation waiting to disagree with its DSL twin.
+;;
+;;   ToInt32 / ToUint32   the frontend emits BitOr/Ushr against a zero constant
+;;   ToBoolean            `fng-condition-expression` builds truthiness directly
+;;   ToLength             array length clamping is open-coded at each use
+;;   SameValueZero        `includes`/`indexOf` comparisons are built inline
+;;   RelativeIndex        negative-index normalisation is repeated per method
+;;   ToPropertyKey        property-name coercion is done at each access site
+(defn dsl-owed [(i i64)] (-> (slice u8))
+  (case i
+    0 "ToBoolean"
+    1 "ToLength"
+    2 "SameValueZero"
+    3 "RelativeIndex"
+    4 "ToPropertyKey"
+    ""))
+(defn dsl-owed-count [] (-> i64) 5)
+
+;; DEFINITIONS WITH NO CALLER ANYWHERE -- the recorded debt for invariant 1.
+;;
+;; `ToBoolean` and `ToInt32` are the two that make the point. Both are ECMAScript abstract
+;; operations, both are defined in `lib/abstract/conversions.jsl`, and nothing in the compiler or
+;; the library calls either: the frontend open-codes truthiness and the bitwise-or-with-zero
+;; itself. They are simultaneously on this list and on `DSL-OWED`, which is the signature of an
+;; operation that was written in the DSL and then reimplemented somewhere else.
+;;
+;; The rest are capabilities written ahead of a caller. That is not a defect, and it is still
+;; worth a count that cannot grow without someone saying so.
+(defn dsl-orphan-allowed [(name (slice u8))] (-> bool)
+  (or (str-eq name "ArrayIota")
+      (or (str-eq name "ArrayMapDouble")
+      (or (str-eq name "ArrayRepeat")
+      (or (str-eq name "BoxedInf")
+      (or (str-eq name "BoxedNaN")
+      (or (str-eq name "BoxedNegInf")
+      (or (str-eq name "FltAbs")
+      (or (str-eq name "FltCeilFrom")
+      (or (str-eq name "FltFloorFrom")
+      (or (str-eq name "FltSign")
+      (or (str-eq name "FltTrunc")
+      (or (str-eq name "IntAbs")
+      (or (str-eq name "IntSign")
+      (or (str-eq name "NegInfinity")
+      (or (str-eq name "NewObject")
+      (or (str-eq name "NumLt")
+      (or (str-eq name "ObjectCoercible")
+      (or (str-eq name "String.prototype.indexOf")
+      (or (str-eq name "ToBoolean")
+      (or (str-eq name "ToInt32")
+      (str-eq name "ToUint32"))))))))))))))))))))))
+
+(defn read-text [(a (ptr Allocator)) (path (slice u8))] (-> (slice u8))
+  (match (read-file a path)
+    (Err [_] (do (fmt (stderr) "dsl-ownership: cannot read {s}\n" path) (abort) ""))
+    (Ok [text] text)))
+
+;; `"Name"` with the quotes: the frontend names a DSL routine only as a string literal argument to
+;; `fng-jsl-call*`, so quoting the needle is what separates a real call from a coincidental mention
+;; in a comment.
+(defn quoted-in? [(text (slice u8)) (name (slice u8)) (buf (ptr i8))] (-> bool)
+  (let [n (slice-len name)]
+    (store! (index buf 0) (cast i8 34))
+    (let [(mut i) 0]
+      (loop (if (>= (load i) n) (break)
+              (do (store! (index buf (+ (load i) 1)) (cast i8 (slice-get name (load i))))
+                  (store! i (+ (load i) 1))
+                  0))))
+    (store! (index buf (+ n 1)) (cast i8 34))
+    (match (str-find text (slice-new [u8] (cast (ptr u8) buf) (+ n 2)))
+      (Some [_] true)
+      (None [] false))))
+
+(defn called-by-frontend? [(a (ptr Allocator)) (name (slice u8))] (-> bool)
+  (let [buf (stack (array i8 128))
+        (mut i) 0
+        (mut found) false]
+    (loop (if (or (>= (load i) (frontend-source-count)) (load found))
+              (break)
+              (let [text (read-text a (frontend-sources (load i)))]
+                (if (quoted-in? text name (cast (ptr i8) buf)) (store! found true) 0)
+                (store! i (+ (load i) 1))
+                0)))
+    (load found)))
+
+(deftest every_operation_the_frontend_delegates_stays_delegated
+  (let [a (malloc-allocator) (mut i) 0]
+    (loop (if (>= (load i) (dsl-wired-count))
+              (break)
+              (let [name (dsl-wired (load i))]
+                (if (called-by-frontend? a name)
+                    0
+                    (do (fmt (stderr)
+                             "dsl-ownership: the frontend no longer calls `{s}`. If it was replaced by hand-written\n  graph building, put the semantics back in lib/ and call it; if it was genuinely removed,\n  delete it from DSL-WIRED.\n"
+                             name)
+                        (assert false)
+                        0))
+                (store! i (+ (load i) 1))
+                0))))
+  0)
+
+;; EXACT, not "at least". Wiring one of these up is good news and still fails here, because the
+;; list is the record of what is owed and a shrinking debt has to be written down to have shrunk.
+(deftest the_open_coded_operations_are_exactly_the_recorded_debt
+  (let [a (malloc-allocator) (mut i) 0]
+    (loop (if (>= (load i) (dsl-owed-count))
+              (break)
+              (let [name (dsl-owed (load i))]
+                (if (called-by-frontend? a name)
+                    (do (fmt (stderr)
+                             "dsl-ownership: the frontend now calls `{s}` -- move it from DSL-OWED to DSL-WIRED.\n"
+                             name)
+                        (assert false)
+                        0)
+                    0)
+                (store! i (+ (load i) 1))
+                0))))
+  0)
+
+;; ---------------------------------------------------------------------------
+;; No dead definition
+;; ---------------------------------------------------------------------------
+;; A `lib/` definition reached from neither the frontend nor another `lib/` definition is dead --
+;; and that is precisely the residue of reimplementing an operation in the compiler: the DSL copy
+;; stays, stops being called, and quietly stops being the source of truth. Catching the residue is
+;; the closest automatable thing to catching the act.
+;;
+;; A call in this DSL is `(Name ...)` or `(Name)`, so those are the two needles. A bare mention in
+;; a comment does not count as a use, which is the point.
+(defn lib-files [(i i64)] (-> (slice u8))
+  (case i
+    0 "lib/abstract/repr.jsl"       1 "lib/abstract/constants.jsl"
+    2 "lib/abstract/clamp.jsl"      3 "lib/abstract/coercions.jsl"
+    4 "lib/abstract/conversions.jsl" 5 "lib/abstract/property.jsl"
+    6 "lib/abstract/relative-index.jsl"
+    7 "lib/array/build.jsl"         8 "lib/array/read.jsl"
+    9 "lib/array/iterator.jsl"      10 "lib/number/predicates.jsl"
+    11 "lib/string/case.jsl"        12 "lib/string/char.jsl"
+    13 "lib/string/ends-with.jsl"   14 "lib/string/includes.jsl"
+    15 "lib/string/index-of.jsl"    16 "lib/string/last-index-of.jsl"
+    17 "lib/string/normalize.jsl"   18 "lib/string/ops.jsl"
+    19 "lib/string/pad-end.jsl"     20 "lib/string/pad-start.jsl"
+    21 "lib/string/raw.jsl"         22 "lib/string/repeat.jsl"
+    23 "lib/string/replace-all.jsl"
+    24 "lib/string/slice.jsl"       25 "lib/string/split.jsl"
+    26 "lib/string/starts-with.jsl" 27 "lib/string/substring.jsl"
+    28 "lib/string/trim.jsl"        29 "lib/json/stringify.jsl"
+    30 "lib/json/parse.jsl"
+    ""))
+(defn lib-file-count [] (-> i64) 31)
+
+(defn wrapped-in? [(text (slice u8)) (name (slice u8)) (buf (ptr i8)) (close i64)] (-> bool)
+  (let [n (slice-len name)]
+    (store! (index buf 0) (cast i8 40))
+    (let [(mut i) 0]
+      (loop (if (>= (load i) n) (break)
+              (do (store! (index buf (+ (load i) 1)) (cast i8 (slice-get name (load i))))
+                  (store! i (+ (load i) 1))
+                  0))))
+    (store! (index buf (+ n 1)) (cast i8 close))
+    (match (str-find text (slice-new [u8] (cast (ptr u8) buf) (+ n 2)))
+      (Some [_] true)
+      (None [] false))))
+
+(defn called-by-lib? [(a (ptr Allocator)) (name (slice u8))] (-> bool)
+  (let [buf (stack (array i8 128))
+        (mut i) 0
+        (mut found) false]
+    (loop (if (or (>= (load i) (lib-file-count)) (load found))
+              (break)
+              (let [path (lib-files (load i))]
+                (if (slice-empty? path)
+                    0
+                    (let [text (read-text a path)]
+                      (if (or (wrapped-in? text name (cast (ptr i8) buf) 32)
+                              (wrapped-in? text name (cast (ptr i8) buf) 41))
+                          (store! found true)
+                          0)))
+                (store! i (+ (load i) 1))
+                0)))
+    (load found)))
+
+;; Every declaration the loaded library holds, by name, straight from `jsl-*` rather than by
+;; re-parsing the files: the loader is what decides what exists.
+(deftest no_dsl_definition_is_dead
+  ;; The loader decides what exists, so the names come from it rather than from re-parsing.
+  (graph-reset! 91000)
+  (shape-reset!)
+  (assert (= (jsl-load-index! "lib/index") JSL-OK))
+  (let [a (malloc-allocator) (mut i) 0 (mut dead) 0]
+    (loop (if (>= (load i) (jsl-decl-count))
+              (break)
+              (let [name (jsl-decl-name (load i))]
+                (if (or (called-by-frontend? a name) (called-by-lib? a name))
+                    0
+                    (if (dsl-orphan-allowed name)
+                        0
+                        (do (fmt (stderr)
+                                 "dsl-ownership: `{s}` is defined in lib/ and called from nowhere. If the frontend now\n  open-codes it, put the semantics back in lib/ and call it rather than leaving two copies.\n"
+                                 name)
+                            (store! dead (+ (load dead) 1))
+                            0)))
+                (store! i (+ (load i) 1))
+                0)))
+    (assert (= (load dead) 0)))
+  0)
+
+;; ---------------------------------------------------------------------------
+;; The frontend may build STRUCTURE. It may not build MEANING.
+;; ---------------------------------------------------------------------------
+;; The two invariants above catch a DSL definition going quiet. Neither catches the thing that
+;; actually happens: a semantic written directly into the frontend that the DSL never had. This
+;; one does, by asking a question with a mechanical answer -- WHICH IR OPCODES DOES THE FRONTEND
+;; CONSTRUCT?
+;;
+;; THE LINE. The frontend lowers syntax, so it legitimately builds structure: control (`If`,
+;; `Region`, `Loop`, `Phi`, `CProj`, `Return`), memory (`New`, `Load`, `Store`, `MemMerge`, `Proj`),
+;; calls (`Call`, `Closure`, `Fun`, `Parm`), representation (`Box`, `Unbox`, `Cast`), and `Const`
+;; and `Arg`. None of those mean anything in JavaScript by themselves.
+;;
+;; An ARITHMETIC, COMPARISON or BITWISE opcode is different: `Add` is not JavaScript's `+`, it is
+;; the part of `+` that is left after somebody decided what the operands are. That decision is
+;; ECMAScript's `ApplyStringOrNumericBinaryOperator`, and writing it in the frontend means writing
+;; it once per operator, by hand, from memory. Measured against node, the hand-written versions are
+;; wrong for every operand nobody thought of:
+;;
+;;   "5" * 2     node 10     we stop      "5" < 6     node true   we stop
+;;   true + 1    node 2      we stop      null + 1    node 1      we stop
+;;
+;; So the count below is a debt, and it is exactly the size of the migration owed. Each number is
+;; how many times `frontend_native_graph.coil` constructs that opcode directly. THEY MAY ONLY GO
+;; DOWN. Adding a construction fails here; removing one fails here too, until the number is
+;; updated -- which is the point, because a debt that shrinks silently was never being watched.
+;;
+;; Three migrations so far. The relational operators -- `<`, `<=`, `>`, `>=` -- are now
+;; `IsLessThan`/`IsLessEqual` in `lib/`: `(Lt)` 7 to 3, `(Le)` 4 to 0. The bitwise operators are
+;; `BitwiseAnd`/`BitwiseOr`/`BitwiseXor`/`BitwiseNot`/`ShiftLeft`/`ShiftRight`/
+;; `ShiftRightUnsigned`, which took the six binary forms from 3 each to 1 and `(BitOr)` from 7 to 5.
+;; The arithmetic operators are `JsAdd`/`JsSub`/`JsMul`/`JsDiv`/`JsMod`/`JsNegate`: `(Add)` 6 to 4,
+;; `(Sub)` 5 to 2, and `(Mul)`/`(Div)`/`(Mod)` 3 each to 1.
+;;
+;; WHAT REMAINS IS NOT OPERATOR MEANING. The surviving `(Lt)` are string-compare plumbing; the
+;; surviving `(BitOr)` are `fng-nullish-equal` using it as a logical OR over two booleans, plus
+;; `fng-int-value` for array lengths and element keys; two `(Add)` are the relative-index clamp
+;; (`length + raw`, floored at zero -- `RelativeIndex` on DSL-OWED is the plan for those); one
+;; `(Add)` and one `(Sub)` are `++`/`--` over a value `fng-update-local` proved to be a raw
+;; machine number; and one of each op is `fng-static-global-value`, the constant evaluator for
+;; global initialisers, which has no `FngContext` to make a library call with and can only ever
+;; see literals.
+;;
+;; See docs/DSL-OWNERSHIP.md.
+(defn semantic-op [(i i64)] (-> (slice u8))
+  (case i
+    0 "(Eq)"   1 "(Lt)"     2 "(Le)"     3 "(Add)"    4 "(Sub)"
+    5 "(Mul)"  6 "(Div)"    7 "(Mod)"    8 "(Minus)"  9 "(Not)"
+    10 "(BitOr)" 11 "(BitAnd)" 12 "(BitXor)" 13 "(BitNot)"
+    14 "(Shl)" 15 "(Shr)"   16 "(UShr)"
+    ""))
+
+(defn semantic-op-budget [(i i64)] (-> i64)
+  (case i
+    0 18   1 3    2 0    3 4    4 2
+    5 1    6 1    7 1    8 1    9 1
+    10 5   11 1   12 1   13 1
+    14 1   15 1   16 1
+    -1))
+(defn semantic-op-count [] (-> i64) 17)
+
+(defn occurrences [(text (slice u8)) (needle (slice u8))] (-> i64)
+  (let [(mut from) 0 (mut seen) 0 (mut going) true]
+    (loop (if (not (load going))
+              (break)
+              (match (str-find-from text needle (load from))
+                (Some [at] (do (store! seen (+ (load seen) 1))
+                               (store! from (+ at 1))
+                               0))
+                (None [] (do (store! going false) 0)))))
+    (load seen)))
+
+(deftest the_frontend_builds_structure_not_meaning
+  (let [a (malloc-allocator)
+        text (read-text a "src/frontend_native_graph.coil")
+        (mut i) 0
+        (mut wrong) 0]
+    (loop (if (>= (load i) (semantic-op-count))
+              (break)
+              (let [op (semantic-op (load i))
+                    budget (semantic-op-budget (load i))
+                    found (occurrences text op)]
+                (if (= found budget)
+                    0
+                    (do (fmt (stderr)
+                             "dsl-ownership: the frontend constructs {s} {d} times; the recorded debt is {d}.\n  Building an arithmetic, comparison or bitwise opcode by hand IS writing JavaScript semantics\n  in the compiler. Put the operator in lib/ and call it. If you removed one, lower the number.\n"
+                             op found budget)
+                        (store! wrong (+ (load wrong) 1))
+                        0))
+                (store! i (+ (load i) 1))
+                0)))
+    (assert (= (load wrong) 0)))
+  0)

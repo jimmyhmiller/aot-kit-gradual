@@ -14,19 +14,19 @@
 (import "coil.str" :use *)
 
 (defn cfg-const [(v i64)] (-> i64)
-  (n-new1 OP-CONST (t-int-con v) (g-start)))
+  (n-new1 (Const (t-int-con v)) (g-start)))
 
 (defn cfg-finish! [(ctrl i64) (value i64)] (-> i64)
-  (let [ret (n-new2 OP-RETURN 0 ctrl value)]
+  (let [ret (n-new2 (Return) ctrl value)]
     (n-add-def! (g-stop) ret)
     (g-analyze!)
     ret))
 
 (defn build-cfg-diamond! [(seed i64)] (-> i64)
   (graph-reset! seed)
-  (let [pred (n-new1 OP-ARG (t-bool) (g-start))
-        arms (n-if-arms! (n-peephole (n-new2 OP-IF 0 (g-start) pred)))
-        join (n-new OP-REGION 0)]
+  (let [pred (n-new1 (Arg (t-bool)) (g-start))
+        arms (n-if-arms! (n-peephole (n-new2 (If) (g-start) pred)))
+        join (n-new (Region))]
     (n-add-def! join NO-NODE)
     (n-add-def! join (arms-t arms))
     (n-add-def! join (arms-f arms))
@@ -46,15 +46,15 @@
 
 (defn build-cfg-loop! [(seed i64)] (-> i64)
   (graph-reset! seed)
-  (let [lp (n-new OP-LOOP 0)]
+  (let [lp (n-new (Loop))]
     (n-add-def! lp NO-NODE)
     (n-add-def! lp (g-start))
     (n-add-def! lp NO-NODE)
     (n-peephole lp)
-    (let [pred (n-new1 OP-ARG (t-bool) (g-start))
-          arms (n-if-arms! (n-peephole (n-new2 OP-IF 0 lp pred)))]
+    (let [pred (n-new1 (Arg (t-bool)) (g-start))
+          arms (n-if-arms! (n-peephole (n-new2 (If) lp pred)))]
       (n-set-def! lp 2 (arms-t arms))
-      (let [ret (n-new2 OP-RETURN 0 (arms-f arms) (cfg-const 1))]
+      (let [ret (n-new2 (Return) (arms-f arms) (cfg-const 1))]
         (n-add-def! (g-stop) ret)
         (wl-push! lp)
         (iterate!)
@@ -62,15 +62,15 @@
 
 (defn build-cfg-nested-diamond! [(seed i64)] (-> i64)
   (graph-reset! seed)
-  (let [p (n-new1 OP-ARG (t-bool) (g-start))
-        q (n-new1 OP-ARG (t-bool) (g-start))
-        outer (n-if-arms! (n-peephole (n-new2 OP-IF 0 (g-start) p)))
-        inner (n-if-arms! (n-peephole (n-new2 OP-IF 0 (arms-t outer) q)))
-        inner-join (n-new OP-REGION 0)]
+  (let [p (n-new1 (Arg (t-bool)) (g-start))
+        q (n-new1 (Arg (t-bool)) (g-start))
+        outer (n-if-arms! (n-peephole (n-new2 (If) (g-start) p)))
+        inner (n-if-arms! (n-peephole (n-new2 (If) (arms-t outer) q)))
+        inner-join (n-new (Region))]
     (n-add-def! inner-join NO-NODE)
     (n-add-def! inner-join (arms-t inner))
     (n-add-def! inner-join (arms-f inner))
-    (let [outer-join (n-new OP-REGION 0)]
+    (let [outer-join (n-new (Region))]
       (n-add-def! outer-join NO-NODE)
       (n-add-def! outer-join inner-join)
       (n-add-def! outer-join (arms-f outer))
@@ -79,23 +79,23 @@
 
 (defn build-cfg-nested-loop! [(seed i64)] (-> i64)
   (graph-reset! seed)
-  (let [outer (n-new OP-LOOP 0)]
+  (let [outer (n-new (Loop))]
     (n-add-def! outer NO-NODE)
     (n-add-def! outer (g-start))
     (n-add-def! outer NO-NODE)
     (n-peephole outer)
-    (let [p (n-new1 OP-ARG (t-bool) (g-start))
-          q (n-new1 OP-ARG (t-bool) (g-start))
-          outer-arms (n-if-arms! (n-peephole (n-new2 OP-IF 0 outer p)))
-          inner (n-new OP-LOOP 0)]
+    (let [p (n-new1 (Arg (t-bool)) (g-start))
+          q (n-new1 (Arg (t-bool)) (g-start))
+          outer-arms (n-if-arms! (n-peephole (n-new2 (If) outer p)))
+          inner (n-new (Loop))]
       (n-add-def! inner NO-NODE)
       (n-add-def! inner (arms-t outer-arms))
       (n-add-def! inner NO-NODE)
       (n-peephole inner)
-      (let [inner-arms (n-if-arms! (n-peephole (n-new2 OP-IF 0 inner q)))]
+      (let [inner-arms (n-if-arms! (n-peephole (n-new2 (If) inner q)))]
         (n-set-def! inner 2 (arms-t inner-arms))
         (n-set-def! outer 2 (arms-f inner-arms))
-        (let [ret (n-new2 OP-RETURN 0 (arms-f outer-arms) (cfg-const 4))]
+        (let [ret (n-new2 (Return) (arms-f outer-arms) (cfg-const 4))]
           (n-add-def! (g-stop) ret)
           (wl-push! inner)
           (wl-push! outer)
@@ -110,7 +110,7 @@
          (assert (= (mu-function-count) 1))
          (assert (= (mu-block-count) 1))
          (assert (= (mu-edge-count) 0))
-         (assert (= (n-op (mu-block-control 0)) OP-START)))
+         (assert (op-is? (mu-block-control 0) Start [])))
 
 (deftest diamond_preserves_both_arms_and_region_predecessor_slots
          (let [join (build-cfg-diamond! 102)]
@@ -178,8 +178,8 @@
                x (n-parm! f0 0)
                f1 (n-fun-open! 1)
                y (n-parm! f1 0)]
-           (n-fun-close! f0 (n-new2 OP-RETURN 0 (n-fun-entry f0) x))
-           (n-fun-close! f1 (n-new2 OP-RETURN 0 (n-fun-entry f1) y))
+           (n-fun-close! f0 (n-new2 (Return) (n-fun-entry f0) x))
+           (n-fun-close! f1 (n-new2 (Return) (n-fun-entry f1) y))
            (g-analyze!)
            (assert (= (g-verify) 0))
            (assert (mu-build!))
@@ -198,10 +198,10 @@
                z (n-parm! unused 0)
                entry (n-fun-open! 0)
                y (n-parm! entry 0)]
-           (n-fun-close! callee (n-new2 OP-RETURN 0 (n-fun-entry callee) x))
-           (n-fun-close! unused (n-new2 OP-RETURN 0 (n-fun-entry unused) z))
+           (n-fun-close! callee (n-new2 (Return) (n-fun-entry callee) x))
+           (n-fun-close! unused (n-new2 (Return) (n-fun-entry unused) z))
            (let [site (n-call1! (n-fun-entry entry) callee y)]
-             (n-fun-close! entry (n-new2 OP-RETURN 0 (call-end site) (call-value site))))
+             (n-fun-close! entry (n-new2 (Return) (call-end site) (call-value site))))
            (g-analyze!)
            (assert (= (g-verify) 0))
            (assert (mu-build-entry! entry))
@@ -212,10 +212,10 @@
 
 (deftest unreachable_ideal_control_is_not_a_machine_block
          (graph-reset! 110)
-         (let [pred (n-new1 OP-CONST (t-bool-con true) (g-start))
-               arms (n-if-arms! (n-peephole (n-new2 OP-IF 0 (g-start) pred)))
-               live (n-new2 OP-RETURN 0 (arms-t arms) (cfg-const 5))
-               dead (n-new2 OP-RETURN 0 (arms-f arms) (cfg-const 6))]
+         (let [pred (n-new1 (Const (t-bool-con true)) (g-start))
+               arms (n-if-arms! (n-peephole (n-new2 (If) (g-start) pred)))
+               live (n-new2 (Return) (arms-t arms) (cfg-const 5))
+               dead (n-new2 (Return) (arms-f arms) (cfg-const 6))]
            (n-add-def! (g-stop) live)
            (n-add-def! (g-stop) dead)
            (iterate!)
@@ -291,14 +291,14 @@
          (graph-reset! 115)
          (let [branching (n-fun-open! 0)
                p (n-parm! branching 0)
-               arms (n-if-arms! (n-peephole (n-new2 OP-IF 0 (n-fun-entry branching) p)))
-               r0 (n-new2 OP-RETURN 0 (arms-t arms) (cfg-const 1))
-               r1 (n-new2 OP-RETURN 0 (arms-f arms) (cfg-const 2))
+               arms (n-if-arms! (n-peephole (n-new2 (If) (n-fun-entry branching) p)))
+               r0 (n-new2 (Return) (arms-t arms) (cfg-const 1))
+               r1 (n-new2 (Return) (arms-f arms) (cfg-const 2))
                other (n-fun-open! 1)
                x (n-parm! other 0)]
            (n-fun-close! branching r0)
            (n-fun-add-return! branching r1)
-           (n-fun-close! other (n-new2 OP-RETURN 0 (n-fun-entry other) x))
+           (n-fun-close! other (n-new2 (Return) (n-fun-entry other) x))
            (g-analyze!)
            (assert (mu-build!))
            (let [branch-owner (mu-find-function branching)]

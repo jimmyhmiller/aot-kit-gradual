@@ -173,24 +173,24 @@
 ;; fourth copy.
 
 ; --- eager builders: peephole as we go ---------------------------------------
-(defn mk-arg [(t i64)] (-> i64) (n-peephole (n-new1 OP-ARG t (g-start))))
+(defn mk-arg [(t i64)] (-> i64) (n-peephole (n-new1 (Arg t) (g-start))))
 (defn mk-int [(v i64)] (-> i64) (n-const (t-int-con v)))
-(defn mk-bin [(op i64) (a i64) (b i64)] (-> i64) (n-peephole (n-new3 op 0 NO-NODE a b)))
-(defn mk-un  [(op i64) (a i64)] (-> i64) (n-peephole (n-new2 op 0 NO-NODE a)))
+(defn mk-bin [(op Op) (a i64) (b i64)] (-> i64) (n-peephole (n-new3 op NO-NODE a b)))
+(defn mk-un  [(op Op) (a i64)] (-> i64) (n-peephole (n-new2 op NO-NODE a)))
 (defn mk-ret [(v i64)] (-> i64)
-  (let [r (n-peephole (n-new2 OP-RETURN 0 (g-start) v))]
+  (let [r (n-peephole (n-new2 (Return) (g-start) v))]
     (n-add-def! (g-stop) r)
     (n-peephole (g-stop))
     (iterate!)
     r))
 
 ; --- raw builders: create nodes, peephole nothing ----------------------------
-(defn raw-arg [(t i64)] (-> i64) (n-new1 OP-ARG t (g-start)))
-(defn raw-int [(v i64)] (-> i64) (n-new1 OP-CONST (t-int-con v) (g-start)))
-(defn raw-bin [(op i64) (a i64) (b i64)] (-> i64) (n-new3 op 0 NO-NODE a b))
-(defn raw-un  [(op i64) (a i64)] (-> i64) (n-new2 op 0 NO-NODE a))
+(defn raw-arg [(t i64)] (-> i64) (n-new1 (Arg t) (g-start)))
+(defn raw-int [(v i64)] (-> i64) (n-new1 (Const (t-int-con v)) (g-start)))
+(defn raw-bin [(op Op) (a i64) (b i64)] (-> i64) (n-new3 op NO-NODE a b))
+(defn raw-un  [(op Op) (a i64)] (-> i64) (n-new2 op NO-NODE a))
 (defn raw-ret [(v i64)] (-> i64)
-  (let [r (n-new2 OP-RETURN 0 (g-start) v)]
+  (let [r (n-new2 (Return) (g-start) v)]
     (n-add-def! (g-stop) r)
     ; analysis WITHOUT rewriting: the before picture should show what the lattice concluded,
     ; not a graph of ANYs, which would say nothing about the analysis at all
@@ -198,23 +198,23 @@
     r))
 
 ; --- control-flow builders ---------------------------------------------------
-(defn mk-if [(ctrl i64) (pred i64)] (-> i64) (n-peephole (n-new2 OP-IF 0 ctrl pred)))
+(defn mk-if [(ctrl i64) (pred i64)] (-> i64) (n-peephole (n-new2 (If) ctrl pred)))
 ;; There is deliberately no `mk-cproj` here. One projection at a time is the shape that kills the
 ;; If between the two arms (see `n-multi-open!`); `n-if-arms!` in node.coil is the builder, and
 ;; `cproj-idealize` aborts by name if anything builds them the other way.
-(defn mk-cast [(ctrl i64) (t i64) (v i64)] (-> i64) (n-peephole (n-new2 OP-CAST t ctrl v)))
+(defn mk-cast [(ctrl i64) (t i64) (v i64)] (-> i64) (n-peephole (n-new2 (Cast t) ctrl v)))
 
 ;; A merge is created UNPEEPHOLED: a two-armed region with no Phi yet is a degenerate diamond
 ;; and collapses on sight. A real parser has the same problem and solves it the same way,
 ;; which is why the builders are shaped like this rather than being a convenience.
 (defn new-region2 [(a i64) (b i64)] (-> i64)
-  (let [r (n-new OP-REGION 0)]
+  (let [r (n-new (Region))]
     (n-add-def! r NO-NODE) (n-add-def! r a) (n-add-def! r b) r))
 (defn new-phi2 [(r i64) (declared i64) (a i64) (b i64)] (-> i64)
-  (let [p (n-new OP-PHI declared)]
+  (let [p (n-new (Phi declared))]
     (n-add-def! p r) (n-add-def! p a) (n-add-def! p b) p))
 (defn ret-to [(ctrl i64) (v i64)] (-> i64)
-  (let [r (n-peephole (n-new2 OP-RETURN 0 ctrl v))]
+  (let [r (n-peephole (n-new2 (Return) ctrl v))]
     (n-add-def! (g-stop) r) (n-peephole (g-stop)) r))
 
 ;; A Return that also carries the program's final memory. Every memory fixture ends with one,
@@ -223,7 +223,7 @@
 ;; elimination would be gated against a program whose stores had already been deleted for
 ;; unrelated reasons.
 (defn ret-to-mem [(ctrl i64) (v i64) (m i64)] (-> i64)
-  (let [r (n-peephole (n-new3 OP-RETURN 0 ctrl v m))]
+  (let [r (n-peephole (n-new3 (Return) ctrl v m))]
     (n-add-def! (g-stop) r) (n-peephole (g-stop)) r))
 
 ;; THE INITIAL MEMORY OF ONE ALIAS CLASS. A whole program starts with an EMPTY heap, so its
@@ -243,23 +243,23 @@
 ;; 1 + 2*3, entirely constant, so the optimiser should leave a single literal behind.
 (defn fx-fold-raw [] (-> i64)
   (graph-reset! 1)
-  (raw-ret (raw-bin OP-ADD (raw-int 1) (raw-bin OP-MUL (raw-int 2) (raw-int 3)))) 0)
+  (raw-ret (raw-bin (Add) (raw-int 1) (raw-bin (Mul) (raw-int 2) (raw-int 3)))) 0)
 (defn fx-fold [] (-> i64)
   (graph-reset! 1)
-  (mk-ret (mk-bin OP-ADD (mk-int 1) (mk-bin OP-MUL (mk-int 2) (mk-int 3)))) 0)
+  (mk-ret (mk-bin (Add) (mk-int 1) (mk-bin (Mul) (mk-int 2) (mk-int 3)))) 0)
 
 ;; (arg+2) - (2+arg). Needs operand canonicalisation, then value numbering, then x-x, and
 ;; all three have to fire for this to reach zero.
 (defn fx-gvn-raw [] (-> i64)
   (graph-reset! 1)
   (let [a (raw-arg (t-int))]
-    (raw-ret (raw-bin OP-SUB (raw-bin OP-ADD a (raw-int 2))
-                             (raw-bin OP-ADD (raw-int 2) a)))) 0)
+    (raw-ret (raw-bin (Sub) (raw-bin (Add) a (raw-int 2))
+                             (raw-bin (Add) (raw-int 2) a)))) 0)
 (defn fx-gvn [] (-> i64)
   (graph-reset! 1)
   (let [a (mk-arg (t-int))]
-    (mk-ret (mk-bin OP-SUB (mk-bin OP-ADD a (mk-int 2))
-                           (mk-bin OP-ADD (mk-int 2) a)))) 0)
+    (mk-ret (mk-bin (Sub) (mk-bin (Add) a (mk-int 2))
+                           (mk-bin (Add) (mk-int 2) a)))) 0)
 
 ;; Ranges, not constants: nothing folds to a literal, but every node carries what the lattice
 ;; worked out. This is the fixture that shows the analysis rather than the rewriting.
@@ -268,34 +268,34 @@
   (let [a (mk-arg (t-int-range 0 10))
         b (mk-arg (t-int-range 2 3))
         c (mk-arg (t-dyn))
-        e (mk-bin OP-ADD (mk-bin OP-MUL a b) (mk-int 5))]
-    (mk-ret (mk-bin OP-ADD e (mk-bin OP-SUB c (mk-int 1))))) 0)
+        e (mk-bin (Add) (mk-bin (Mul) a b) (mk-int 5))]
+    (mk-ret (mk-bin (Add) e (mk-bin (Sub) c (mk-int 1))))) 0)
 
 ;; The M1 test fixture: nine expressions that collapse to one multiply.
 (defn fx-big-raw [] (-> i64)
   (graph-reset! 1)
   (let [a  (raw-arg (t-int-range 0 100))
         b  (raw-arg (t-int-range 1 4))
-        e1 (raw-bin OP-ADD a (raw-int 0))
-        e2 (raw-bin OP-MUL e1 (raw-int 1))
-        e3 (raw-bin OP-ADD (raw-int 3) e2)
-        e4 (raw-bin OP-ADD e2 (raw-int 3))
-        e5 (raw-bin OP-SUB e3 e4)
-        e6 (raw-bin OP-MUL b (raw-int 2))
-        e7 (raw-bin OP-ADD e5 e6)]
-    (raw-ret (raw-un OP-MINUS (raw-un OP-MINUS e7)))) 0)
+        e1 (raw-bin (Add) a (raw-int 0))
+        e2 (raw-bin (Mul) e1 (raw-int 1))
+        e3 (raw-bin (Add) (raw-int 3) e2)
+        e4 (raw-bin (Add) e2 (raw-int 3))
+        e5 (raw-bin (Sub) e3 e4)
+        e6 (raw-bin (Mul) b (raw-int 2))
+        e7 (raw-bin (Add) e5 e6)]
+    (raw-ret (raw-un (Minus) (raw-un (Minus) e7)))) 0)
 (defn fx-big [] (-> i64)
   (graph-reset! 1)
   (let [a  (mk-arg (t-int-range 0 100))
         b  (mk-arg (t-int-range 1 4))
-        e1 (mk-bin OP-ADD a (mk-int 0))
-        e2 (mk-bin OP-MUL e1 (mk-int 1))
-        e3 (mk-bin OP-ADD (mk-int 3) e2)
-        e4 (mk-bin OP-ADD e2 (mk-int 3))
-        e5 (mk-bin OP-SUB e3 e4)
-        e6 (mk-bin OP-MUL b (mk-int 2))
-        e7 (mk-bin OP-ADD e5 e6)]
-    (mk-ret (mk-un OP-MINUS (mk-un OP-MINUS e7)))) 0)
+        e1 (mk-bin (Add) a (mk-int 0))
+        e2 (mk-bin (Mul) e1 (mk-int 1))
+        e3 (mk-bin (Add) (mk-int 3) e2)
+        e4 (mk-bin (Add) e2 (mk-int 3))
+        e5 (mk-bin (Sub) e3 e4)
+        e6 (mk-bin (Mul) b (mk-int 2))
+        e7 (mk-bin (Add) e5 e6)]
+    (mk-ret (mk-un (Minus) (mk-un (Minus) e7)))) 0)
 
 ;; `if (arg) return 1; else return 2;` with an unknown predicate: both arms survive.
 (defn fx-branch [] (-> i64)
@@ -309,11 +309,11 @@
 ;; what the analysis concluded without any rewriting having happened yet.
 (defn fx-branch-dead-raw [] (-> i64)
   (graph-reset! 1)
-  (let [iff (n-new2 OP-IF 0 (g-start) (n-new1 OP-CONST (t-int-con 0) (g-start)))
-        t   (n-new1 OP-CPROJ 0 iff)
-        f   (n-new1 OP-CPROJ 1 iff)]
-    (let [r1 (n-new2 OP-RETURN 0 t (n-new1 OP-CONST (t-int-con 1) (g-start)))
-          r2 (n-new2 OP-RETURN 0 f (n-new1 OP-CONST (t-int-con 2) (g-start)))]
+  (let [iff (n-new2 (If) (g-start) (n-new1 (Const (t-int-con 0)) (g-start)))
+        t   (n-new1 (CProj 0) iff)
+        f   (n-new1 (CProj 1) iff)]
+    (let [r1 (n-new2 (Return) t (n-new1 (Const (t-int-con 1)) (g-start)))
+          r2 (n-new2 (Return) f (n-new1 (Const (t-int-con 2)) (g-start)))]
       (n-add-def! (g-stop) r1)
       (n-add-def! (g-stop) r2)))
   (g-analyze!) 0)
@@ -331,7 +331,7 @@
         t   (arms-t arms)
         f   (arms-f arms)
         r   (new-region2 t f)
-        ph  (new-phi2 r (t-dyn) (mk-int 1) (mk-bin OP-ADD (mk-arg (t-int-range 0 9)) (mk-int 2)))]
+        ph  (new-phi2 r (t-dyn) (mk-int 1) (mk-bin (Add) (mk-arg (t-int-range 0 9)) (mk-int 2)))]
     (ret-to r ph)
     (wl-push! r) (wl-push! ph))
   (iterate!) 0)
@@ -348,14 +348,14 @@
 ;; fixture no differential test covers, so it has a real exit test now and actually counts to 5.
 (defn fx-loop [] (-> i64)
   (graph-reset! 1)
-  (let [lp (n-new OP-LOOP 0)]
+  (let [lp (n-new (Loop))]
     (n-add-def! lp NO-NODE) (n-add-def! lp (g-start)) (n-add-def! lp NO-NODE)
     (n-peephole lp)
-    (let [ph (n-new OP-PHI (t-int))]
+    (let [ph (n-new (Phi (t-int)))]
       (n-add-def! ph lp) (n-add-def! ph (mk-int 0)) (n-add-def! ph NO-NODE)
       (n-peephole ph)
-      (let [nx   (mk-bin OP-ADD ph (mk-int 1))
-            test (mk-bin OP-LT ph (mk-int 5))
+      (let [nx   (mk-bin (Add) ph (mk-int 1))
+            test (mk-bin (Lt) ph (mk-int 5))
             arms (n-if-arms! (mk-if lp test))
             body (arms-t arms)
             exit (arms-f arms)]
@@ -368,11 +368,11 @@
 (defn fx-guard [] (-> i64)
   (graph-reset! 1)
   (let [x   (mk-arg (t-dyn))
-        arms (n-if-arms! (mk-if (g-start) (mk-bin OP-LT x (mk-int 100))))
+        arms (n-if-arms! (mk-if (g-start) (mk-bin (Lt) x (mk-int 100))))
         t   (arms-t arms)
         f   (arms-f arms)
-        fast (mk-bin OP-ADD (mk-cast t (t-int) x) (mk-int 1))
-        slow (mk-bin OP-ADD x (mk-int 1))
+        fast (mk-bin (Add) (mk-cast t (t-int) x) (mk-int 1))
+        slow (mk-bin (Add) x (mk-int 1))
         r    (new-region2 t f)
         ph   (new-phi2 r (t-dyn) fast slow)]
     (ret-to r ph)
@@ -384,10 +384,10 @@
 ;; from once there is a scheduler.
 (defn fx-nested [] (-> i64)
   (graph-reset! 1)
-  (let [outer (n-new OP-LOOP 0)]
+  (let [outer (n-new (Loop))]
     (n-add-def! outer NO-NODE) (n-add-def! outer (g-start)) (n-add-def! outer NO-NODE)
     (n-peephole outer)
-    (let [inner (n-new OP-LOOP 0)]
+    (let [inner (n-new (Loop))]
       (n-add-def! inner NO-NODE) (n-add-def! inner outer) (n-add-def! inner NO-NODE)
       (n-peephole inner)
       (let [iarms (n-if-arms! (mk-if inner (mk-arg (t-dyn))))
@@ -479,15 +479,15 @@
 (defn fx-diamond-raw [] (-> i64)
   (graph-reset! 1)
   (let [p   (raw-arg (t-dyn))
-        iff (n-new2 OP-IF 0 (g-start) p)]
-    (let [tt (n-new1 OP-CPROJ 0 iff)
-          ff (n-new1 OP-CPROJ 1 iff)
-          r  (n-new OP-REGION 0)]
+        iff (n-new2 (If) (g-start) p)]
+    (let [tt (n-new1 (CProj 0) iff)
+          ff (n-new1 (CProj 1) iff)
+          r  (n-new (Region))]
       (n-add-def! r NO-NODE) (n-add-def! r tt) (n-add-def! r ff)
-      (let [ph (n-new OP-PHI (t-int))]
+      (let [ph (n-new (Phi (t-int)))]
         (n-add-def! ph r) (n-add-def! ph (raw-int 8)) (n-add-def! ph (raw-int 0))
-        (let [add (raw-bin OP-ADD ph (raw-int 1))
-              ret (n-new2 OP-RETURN 0 r add)]
+        (let [add (raw-bin (Add) ph (raw-int 1))
+              ret (n-new2 (Return) r add)]
           (n-add-def! (g-stop) ret)
           (g-analyze!)))))
   0)
@@ -550,14 +550,14 @@
   (let [sx (shape-transition SHAPE-ROOT "x" (t-dyn))
         ax (shape-field-alias sx 0)]
     (let [m0 (raw-arg (t-mem-alias ax (t-top)))
-          nw (n-new OP-NEW sx)]
+          nw (n-new (New sx))]
       (n-add-def! nw (g-start))
       (n-add-def! nw m0)
-      (let [o  (n-new1 OP-PROJ 0 nw)
-            m1 (n-new1 OP-PROJ 1 nw)]
-        (let [m2 (n-new4 OP-STORE ax NO-NODE m1 o (raw-int 5))]
-          (let [ld  (n-new3 OP-LOAD ax NO-NODE m2 o)
-                ret (n-new3 OP-RETURN 0 (g-start) NO-NODE NO-NODE)]
+      (let [o  (n-new1 (Proj 0) nw)
+            m1 (n-new1 (Proj 1) nw)]
+        (let [m2 (n-new4 (Store ax) NO-NODE m1 o (raw-int 5))]
+          (let [ld  (n-new3 (Load ax) NO-NODE m2 o)
+                ret (n-new3 (Return) (g-start) NO-NODE NO-NODE)]
             ; the Return's value and memory are wired after it exists, because `n-new3` cannot
             ; take a node that does not exist yet; nothing is peepholed either way
             (n-set-def! ret 1 ld)
@@ -630,19 +630,19 @@
     (let [ax (shape-field-alias sx 0)]
       (let [nw (n-new-obj1! (g-start) sx (mk-mem-in ax))]
         (let [o (n-obj-ptr nw) m0 (n-obj-mem nw 0)]
-          (let [lp (n-new OP-LOOP 0)]
+          (let [lp (n-new (Loop))]
             (n-add-def! lp NO-NODE) (n-add-def! lp (g-start)) (n-add-def! lp NO-NODE)
             (n-peephole lp)
             ; both phis are opened before the body is built and closed before the control back
             ; edge, which is the in-progress contract in node.coil
-            (let [ph (n-new OP-PHI (t-int))
-                  mp (n-new OP-PHI (t-mem-alias ax (t-dyn)))]
+            (let [ph (n-new (Phi (t-int)))
+                  mp (n-new (Phi (t-mem-alias ax (t-dyn))))]
               (n-add-def! ph lp) (n-add-def! ph (mk-int 0)) (n-add-def! ph NO-NODE)
               (n-peephole ph)
               (n-add-def! mp lp) (n-add-def! mp m0) (n-add-def! mp NO-NODE)
               (n-peephole mp)
-              (let [nx   (mk-bin OP-ADD ph (mk-int 1))
-                    test (mk-bin OP-LT ph (mk-int 3))]
+              (let [nx   (mk-bin (Add) ph (mk-int 1))
+                    test (mk-bin (Lt) ph (mk-int 3))]
                 (let [arms (n-if-arms! (mk-if lp test))]
                   (let [st (n-store! mp o ph ax)]
                     (n-set-def! ph 2 nx)
@@ -791,15 +791,15 @@
   (let [sx (shape-transition SHAPE-ROOT "x" (t-dyn))
         ax (shape-field-alias sx 0)]
     (let [m0 (raw-arg (t-mem-alias ax (t-top)))
-          nw (n-new OP-NEW sx)]
+          nw (n-new (New sx))]
       (n-add-def! nw (g-start))
       (n-add-def! nw m0)
-      (let [o  (n-new1 OP-PROJ 0 nw)
-            mm (n-new1 OP-PROJ 1 nw)]
-        (let [m1 (n-new4 OP-STORE ax NO-NODE mm o (raw-int 1))]
-          (let [m2 (n-new4 OP-STORE ax NO-NODE m1 o (raw-int 2))]
-            (let [ld  (n-new3 OP-LOAD ax NO-NODE m2 o)
-                  ret (n-new3 OP-RETURN 0 (g-start) NO-NODE NO-NODE)]
+      (let [o  (n-new1 (Proj 0) nw)
+            mm (n-new1 (Proj 1) nw)]
+        (let [m1 (n-new4 (Store ax) NO-NODE mm o (raw-int 1))]
+          (let [m2 (n-new4 (Store ax) NO-NODE m1 o (raw-int 2))]
+            (let [ld  (n-new3 (Load ax) NO-NODE m2 o)
+                  ret (n-new3 (Return) (g-start) NO-NODE NO-NODE)]
               ; the Return's value and memory are wired after it exists, because `n-new3` cannot
               ; take a node that does not exist yet; nothing is peepholed either way
               (n-set-def! ret 1 ld)

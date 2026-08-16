@@ -10,14 +10,14 @@
 (import "coil.control" :use *)
 
 (defn i-int [(v i64)] (-> i64) (n-const (t-int-con v)))
-(defn i-bin [(op i64) (a i64) (b i64)] (-> i64)
-  (n-peephole (n-new3 op 0 NO-NODE a b)))
+(defn i-bin [(op Op) (a i64) (b i64)] (-> i64)
+  (n-peephole (n-new3 op NO-NODE a b)))
 
 (defn live-op-count [(op i64)] (-> i64)
   (let [lim (n-count) (mut i) 0 (mut count) 0]
     (loop
       (if (>= (load i) lim) (break)
-        (do (if (and (not (n-dead? (load i))) (= (n-op (load i)) op))
+        (do (if (and (not (n-dead? (load i))) (= (op-encode-tag (n-op (load i))) op))
                 (store! count (+ (load count) 1)) 0)
             (store! i (+ (load i) 1)) 0)))
     (load count)))
@@ -28,12 +28,12 @@
 (deftest direct_call_inference_is_more_precise_than_the_pessimistic_pass
   (graph-reset! 1)
   (let [fun (n-fun-open! 0) a (n-parm! fun 0) b (n-parm! fun 1)
-        sum (i-bin OP-ADD a b)
-        body (n-new2 OP-RETURN 0 (n-fun-entry fun) sum)]
+        sum (i-bin (Add) a b)
+        body (n-new2 (Return) (n-fun-entry fun) sum)]
     (n-fun-close! fun body)
     (let [site (n-call2! (g-start) fun (i-int 20) (i-int 22))
           call (call-value site)
-          ret (n-new2 OP-RETURN 0 (call-end site) call)]
+          ret (n-new2 (Return) (call-end site) call)]
       (n-add-def! (g-stop) ret)
       (g-analyze!)
       (let [pa (n-ty a) pb (n-ty b) pc (n-ty call)]
@@ -55,11 +55,11 @@
 (deftest direct_internal_call_inference_uses_exact_identity_above_the_target_mask
   (graph-reset! 11)
   (let [fun (n-fun-open! 70) x (n-parm! fun 0)
-        body (n-new2 OP-RETURN 0 (n-fun-entry fun) x)]
+        body (n-new2 (Return) (n-fun-entry fun) x)]
     (n-fun-close! fun body)
     (let [site (n-call1! (g-start) fun (i-int 42))
           call (call-value site)]
-      (n-add-def! (g-stop) (n-new2 OP-RETURN 0 (call-end site) call))
+      (n-add-def! (g-stop) (n-new2 (Return) (call-end site) call))
       (g-infer!)
       ;; The finite type is intentionally generic, but direct-node identity remains exact.
       (assert (= (n-ty fun) (t-fun)))
@@ -71,13 +71,13 @@
 (deftest closure_captures_and_arguments_have_explicit_expected_types
   (graph-reset! 2)
   (let [fun (n-fun-open! 0) cap (n-parm! fun 0) arg (n-parm! fun 1)
-        sum (i-bin OP-ADD cap arg)
-        body (n-new2 OP-RETURN 0 (n-fun-entry fun) sum)]
+        sum (i-bin (Add) cap arg)
+        body (n-new2 (Return) (n-fun-entry fun) sum)]
     (n-fun-close! fun body)
     (let [clos (n-closure1! fun (i-int 40))
           site (n-call1! (g-start) clos (i-int 2))
           call (call-value site)
-          ret (n-new2 OP-RETURN 0 (call-end site) call)]
+          ret (n-new2 (Return) (call-end site) call)]
       (n-add-def! (g-stop) ret)
       (g-infer!)
       (expect-inferred cap (t-int-con 40))
@@ -90,11 +90,11 @@
 (deftest polymorphic_reaching_arguments_form_the_expected_union
   (graph-reset! 3)
   (let [fun (n-fun-open! 0) x (n-parm! fun 0)
-        body (n-new2 OP-RETURN 0 (n-fun-entry fun) x)]
+        body (n-new2 (Return) (n-fun-entry fun) x)]
     (n-fun-close! fun body)
     (let [one (n-call1! (g-start) fun (i-int 1))
           two (n-call1! (call-end one) fun (n-const (t-bool-con true)))
-          ret (n-new2 OP-RETURN 0 (call-end two) (call-value two))
+          ret (n-new2 (Return) (call-end two) (call-value two))
           want (ty-meet (t-int-con 1) (t-bool-con true))]
       (n-add-def! (g-stop) ret)
       (g-infer!)
@@ -107,18 +107,18 @@
 (deftest a_proved_annotation_cast_disappears_after_whole_world_inference
   (graph-reset! 4)
   (let [fun (n-fun-open! 0) x (n-parm! fun 0)
-        annotation (n-peephole (n-new2 OP-CAST (t-int) NO-NODE x))
-        body (n-new2 OP-RETURN 0 (n-fun-entry fun) annotation)]
+        annotation (n-peephole (n-new2 (Cast (t-int)) NO-NODE x))
+        body (n-new2 (Return) (n-fun-entry fun) annotation)]
     (n-fun-close! fun body)
     (let [site (n-call1! (g-start) fun (i-int 7))
-          ret (n-new2 OP-RETURN 0 (call-end site) (call-value site))]
+          ret (n-new2 (Return) (call-end site) (call-value site))]
       (n-add-def! (g-stop) ret)
       (g-infer!)
-      (assert (= (live-op-count OP-CAST) 1))
+      (assert (= (live-op-count OPTAG-CAST) 1))
       (assert (n-ty-proven? x))
       (assert (ty-isa (n-ty x) (t-int)))
       (iterate!)
-      (assert (= (live-op-count OP-CAST) 0))
+      (assert (= (live-op-count OPTAG-CAST) 0))
       (assert (= (g-verify) 0)))))
 
 (deftest optimistic_inference_reaches_a_bounded_fixpoint_on_the_whole_corpus

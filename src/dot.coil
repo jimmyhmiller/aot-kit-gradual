@@ -41,16 +41,14 @@
 
 ;; Control is the spine of the graph and worth spotting instantly. Constants are visually
 ;; quiet on purpose: there are a lot of them and they are rarely what you are looking for.
-(defn dot-node-style [(w (ptr Writer)) (op i64)] (-> i64)
+(defn dot-node-style [(w (ptr Writer)) (op Op)] (-> i64)
   (if (op-control? op)
       (ps w "shape=box style=\"filled,rounded\" fillcolor=\"#FFDFA6\" color=\"#B26B00\" ")
-    (if (= op OP-CONST)
-        (ps w "shape=ellipse style=filled fillcolor=\"#EAF2FD\" color=\"#7FA8D8\" ")
-      (if (= op OP-ARG)
-          (ps w "shape=ellipse style=filled fillcolor=\"#EDEDED\" color=\"#8A8A8A\" ")
-        (if (op-phi? op)
-            (ps w "shape=ellipse style=filled fillcolor=\"#FFF6D0\" color=\"#B8A24A\" ")
-          (ps w "shape=ellipse color=\"#555555\" "))))))
+      (match op
+        (Const [ty] (ps w "shape=ellipse style=filled fillcolor=\"#EAF2FD\" color=\"#7FA8D8\" "))
+        (Arg [ty] (ps w "shape=ellipse style=filled fillcolor=\"#EDEDED\" color=\"#8A8A8A\" "))
+        (Phi [declared] (ps w "shape=ellipse style=filled fillcolor=\"#FFF6D0\" color=\"#B8A24A\" "))
+        (_ (ps w "shape=ellipse color=\"#555555\" ")))))
 
 ; ---------------------------------------------------------------------------
 ; Nodes
@@ -61,21 +59,23 @@
 ;; identical boxes marked `CProj` say nothing at all.
 (defn dot-node-label [(w (ptr Writer)) (n i64)] (-> i64)
   (ps w "label=\"")
-  (if (= (n-op n) OP-CONST) (ty-print w (n-ty n))
-    (if (= (n-op n) OP-CPROJ) (ps w (cproj-label n))
-      (if (= (n-op n) OP-PROJ) (do (fmt w "Proj.{d}" (n-aux n)) 0)
+  (if (op-is? n Const [_]) (ty-print w (n-ty n))
+    (if (op-is? n CProj [_]) (ps w (cproj-label n))
+      (if (op-is? n Proj [_]) (do (fmt w "Proj.{d}" (n-proj-slot n)) 0)
         ;; A New's shape and a memory op's alias are the whole content of those boxes: three
         ;; identical `Store` ellipses say nothing about which words a program writes. The alias
         ;; prints as the field name for the same reason `cproj-label` prints True and False.
-        (if (= (n-op n) OP-NEW)
-            (do (fmt w "New #{d}" (n-aux n)) 0)
-          (if (or (= (n-op n) OP-LOAD) (= (n-op n) OP-STORE))
+        (if (op-is? n New [_])
+            (do (fmt w "New #{d}" (n-new-shape n)) 0)
+          (if (or (op-is? n Load [_]) (op-is? n Store [_]))
               (do (ps w (op-name (n-op n))) (ps w " .")
-                  (field-print w (n-aux n)) (ps w "\\n") (ty-print w (n-ty n)) 0)
-            (if (or (= (n-op n) OP-CAST) (or (= (n-op n) OP-UNBOX) (= (n-op n) OP-TYPETEST)))
-                (do (ps w (if (= (n-op n) OP-CAST) "Cast to "
-                            (if (= (n-op n) OP-UNBOX) "Unbox to " "TypeTest ")))
-                    (ty-print w (n-aux n)) 0)
+                  (field-print w (match (n-op n) (Load [a] a) (Store [a] a) (_ 0)))
+                  (ps w "\\n") (ty-print w (n-ty n)) 0)
+            (if (or (op-is? n Cast [_]) (or (op-is? n Unbox [_]) (op-is? n TypeTest [_])))
+                (do (ps w (if (op-is? n Cast [_]) "Cast to "
+                            (if (op-is? n Unbox [_]) "Unbox to " "TypeTest ")))
+                    (ty-print w (match (n-op n)
+                                  (Cast [t] t) (Unbox [t] t) (TypeTest [t] t) (_ (t-top)))) 0)
               (do (ps w (op-name (n-op n)))
                   (if (op-shows-type? (n-op n)) (do (ps w "\\n") (ty-print w (n-ty n)) 0) 0)
                   0)))))))
@@ -98,7 +98,7 @@
 ;; type of a projection drawn directly beneath the box, and those labels carry it. Before M4 this
 ;; was true by accident — an If and a Return are control nodes and were excluded already — and a
 ;; `New` is the first multi node that is not.
-(defn op-shows-type? [(op i64)] (-> bool)
+(defn op-shows-type? [(op Op)] (-> bool)
   (and (not (op-control? op)) (not (op-multi? op))))
 
 (defn dot-nodes [(w (ptr Writer))] (-> i64)
@@ -129,7 +129,7 @@
 (defn anchor-edge? [(use i64) (def i64) (i i64)] (-> bool)
   (and (= i 0)
    (and (op-control? (n-op def))
-        (or (= (n-op use) OP-CONST) (= (n-op use) OP-ARG)))))
+        (or (op-is? use Const [_]) (op-is? use Arg [_])))))
 
 ;; An edge is memory when its SOURCE produces a memory state, and that is a question about the
 ;; node rather than about its op: a `Proj` is memory at a New's field slots and a value at slot 0,
