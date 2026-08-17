@@ -4420,14 +4420,25 @@
 ;; A shorthand property (`{x}`) is also not a `TSK-PROPERTY-ASSIGNMENT`, so it is named here too
 ;; rather than being lumped in with spread: whatever this refuses, it says exactly what it saw.
 ;; repros/open/object-spread-narrows-without-proof.js.
-(defn fng-refuse-object-spread! [(context FngContext) (node i64)] (-> i64)
+;; A SPREAD ELEMENT arrives as bridge kind 0 with real source text starting `...` -- the same
+;; kind-0 disambiguation the array literal already does for elisions. It is legal ONLY on the
+;; dynamic-object path (`allow-spread`), because a spread precludes the static layout by
+;; construction: `fe-index-object-layouts!` gives a literal a shape only when every element is a
+;; plain property assignment.
+(defn fng-object-spread-element? [(ast (ptr TsAst)) (property i64)] (-> bool)
+  (let [text (ts-text ast property)]
+    (and (= (ts-kind ast property) 0)
+         (and (>= (slice-len text) 3) (str-eq (substr text 0 3) "...")))))
+
+(defn fng-refuse-object-spread! [(context FngContext) (node i64) (allow-spread bool)] (-> i64)
   (let [frontend (load (field context frontend))
         ast (field frontend ast)
         (mut index) 0]
     (loop (if (>= (load index) (ts-child-count ast node))
               (break)
               (let [property (ts-child ast node (load index))]
-                (if (= (ts-kind ast property) TSK-PROPERTY-ASSIGNMENT)
+                (if (or (= (ts-kind ast property) TSK-PROPERTY-ASSIGNMENT)
+                        (and allow-spread (fng-object-spread-element? ast property)))
                     0
                     (fng-unsupported-syntax! "object literal element"
                                              (ts-kind ast property)
@@ -4512,22 +4523,34 @@
     (fng-record-dynamic-alias! context JS-PROPERTY-ALIAS)
     (loop (if (>= (load index) (ts-child-count ast node))
               (break)
-              (let [property (ts-child ast node (load index))
-                    name-node (ts-child ast property 0)
-                    value-node (ts-child ast property (- (ts-child-count ast property) 1))
-                    computed (= (ts-kind ast name-node) TSK-COMPUTED-PROPERTY-NAME)
-                    key (if computed (fng-expression context (ts-child ast name-node 0)) NO-NODE)
-                    value (fng-expression context value-node)
-                    probe (if (= value NO-NODE)
-                              (panic-corrupt (ts-text ast name-node))
-                              0)
-                    stored
-                      (if computed
-                          (fng-jsl-call3 context "SetProperty" object key value)
-                          (fng-jsl-call3 context "SetNamedProperty" object
-                                         (fng-const
-                                           (shape-name-intern! (ts-text ast name-node)))
-                                         value))]
+              (do
+                (let [property (ts-child ast node (load index))]
+                  ;; `{...a, b: 1}` in source order: a spread copies the source's own enumerable
+                  ;; properties through the DSL's `ObjectAssignSource` -- the same step
+                  ;; `Object.assign` takes, so the semantics (null/undefined sources are no-ops,
+                  ;; later keys overwrite earlier) live in one definition.
+                  (if (fng-object-spread-element? ast property)
+                      (let [source (fng-expression context (ts-child ast property 0))
+                            copied (fng-jsl-call2 context "ObjectAssignSource"
+                                                  (fng-box-dynamic-argument! object)
+                                                  (fng-box-dynamic-argument! source))]
+                        0)
+                      (let [name-node (ts-child ast property 0)
+                            value-node (ts-child ast property (- (ts-child-count ast property) 1))
+                            computed (= (ts-kind ast name-node) TSK-COMPUTED-PROPERTY-NAME)
+                            key (if computed (fng-expression context (ts-child ast name-node 0)) NO-NODE)
+                            value (fng-expression context value-node)
+                            probe (if (= value NO-NODE)
+                                      (panic-corrupt (ts-text ast name-node))
+                                      0)
+                            stored
+                              (if computed
+                                  (fng-jsl-call3 context "SetProperty" object key value)
+                                  (fng-jsl-call3 context "SetNamedProperty" object
+                                                 (fng-const
+                                                   (shape-name-intern! (ts-text ast name-node)))
+                                                 value))]
+                        0)))
                 (store! index (+ (load index) 1)))))
     object))
 
@@ -4566,6 +4589,25 @@
       0)
     array))
 
+;; Is this value CERTAINLY a SHAPE-ROOT allocation by construction -- the dynamic object or
+;; array `fng-dynamic-object`/`fng-array-literal` builds? Its properties live in the runtime
+;; property table, never in shape slots, so a field access on one must take the PropertyKey path
+;; even when the property NAME happens to exist in some static shape. `fng-unique-field-index`'s
+;; name-guess assumed the collision could not happen; object spread made it routine, because
+;; `{...a}` copies from a statically-shaped source and then reads back the same names.
+(defn fng-shape-root-object? [(value i64)] (-> bool)
+  (if (or (= value NO-NODE) (n-dead? value))
+      false
+      (match (n-op value)
+        (Proj [slot]
+          (and (= slot 0)
+               (let [parent (n-in value 0)]
+                 (and (!= parent NO-NODE)
+                      (match (n-op parent) (New [shape] (= shape SHAPE-ROOT)) (_ false))))))
+        (ArrayMark [] (fng-shape-root-object? (n-in value 1)))
+        (Cast [_] (fng-shape-root-object? (n-in value 1)))
+        (_ false))))
+
 (defn fng-field-load-value [(context FngContext)
                             (node i64)
                             (object-node i64)
@@ -4580,7 +4622,7 @@
           ;; assign the same name at incompatible offsets, prototype methods with a dynamic `this`
           ;; cannot address a shape slot soundly; route even statically-known constructor writes
           ;; through the PropertyKey table instead.
-          (if (= globally-compatible -1)
+          (if (or (= globally-compatible -1) (fng-shape-root-object? raw-object))
               -1
               (if (< owner 0) globally-compatible
                   (fng-field-index frontend owner name-node)))
@@ -4733,9 +4775,13 @@
             (let [object-node (ts-child ast node 0)
                   name-node (ts-child ast node 1)
                   owner (fng-infer context object-node FNG-DYNAMIC)
+                  object-value (fng-expression context object-node)
                   globally-compatible (fng-unique-field-index frontend name-node)
                   field-index
-                    (if (= globally-compatible -1)
+                    ;; Same SHAPE-ROOT veto as `fng-field-load-value`: a certainly-dynamic
+                    ;; object's writes go through the PropertyKey table whatever static shape
+                    ;; happens to share the name.
+                    (if (or (= globally-compatible -1) (fng-shape-root-object? object-value))
                         -1
                         (if (< owner 0) globally-compatible
                             (fng-field-index frontend owner name-node)))
@@ -4745,7 +4791,7 @@
                         (load (field (index (load (field (field frontend fields) data)) field-index)
                                      owner)))]
               (store! (field value kind) FNG-LVALUE-FIELD)
-              (store! (field value object) (fng-expression context object-node))
+              (store! (field value object) object-value)
               (if (= field-index -1)
                   (do
                     (store! (field value kind) FNG-LVALUE-PROPERTYKEY)
@@ -5427,9 +5473,10 @@
           (= kind TSK-NEW-EXPRESSION)
             (if (fng-error-constructor? context node) (fng-error-constructor context node) (fng-call context node))
           (= kind TSK-OBJECT-LITERAL)
-            (let [_ (fng-refuse-object-spread! context node)
-                  inferred (fe-type-index-for-decl-node frontend node)]
-            (if (and (= expected FNG-DYNAMIC) (< inferred 0))
+            (let [inferred (fe-type-index-for-decl-node frontend node)
+                  dynamic (and (= expected FNG-DYNAMIC) (< inferred 0))
+                  _ (fng-refuse-object-spread! context node dynamic)]
+            (if dynamic
                 (fng-dynamic-object context node)
                 (fng-object context node (if (= expected FNG-DYNAMIC) inferred expected))))
           (= kind TSK-ARRAY-LITERAL) (fng-array-literal context node)

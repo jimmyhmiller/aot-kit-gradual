@@ -1,4 +1,11 @@
-// PARTLY FIXED. The silent drop is now a named refusal; object spread is still unimplemented.
+// FIXED, in three stages: the silent drop became a named refusal, and then spread was
+// implemented on the dynamic-object path -- each `...a` is one `ObjectAssignSource` step, the
+// same DSL definition `Object.assign` repeats, so null/undefined sources are no-ops and later
+// keys overwrite earlier ones in one place. Two supporting facts had to be stated:
+// a program containing spread disables static object layouts (the enumeration primitives read
+// the runtime property table, and shape slots are invisible to them -- the same rule that
+// already applied to `Object` and `JSON`), and a certainly-dynamic object's property access
+// never takes `fng-unique-field-index`'s static-shape name-guess (the SHAPE-ROOT veto).
 //
 // WAS: object spread produced a Cast the evaluator would not accept.
 //
