@@ -85,29 +85,33 @@
 ;; Operations the DSL defines and the frontend open-codes instead. Each entry is a duplicate
 ;; implementation waiting to disagree with its DSL twin.
 ;;
-;;   ToInt32 / ToUint32   the frontend emits BitOr/Ushr against a zero constant
-;;   ToBoolean            `fng-condition-expression` builds truthiness directly
-;;   ToLength             array length clamping is open-coded at each use
-;;   SameValueZero        `includes`/`indexOf` comparisons are built inline
-;;   RelativeIndex        negative-index normalisation is repeated per method
-;;   ToPropertyKey        property-name coercion is done at each access site
+;; THE LIST IS EMPTY, and each departure had a distinct reason worth keeping:
+;;   ToInt32 / ToUint32   wired by the bitwise migration -- the frontend's BitOr/Ushr copies died
+;;   ToLength             reached through `StringIndexOf`/string.raw; no frontend clamp remains
+;;   SameValueZero        reached through `ArrayIncludes`; the inline comparisons died with the
+;;                        array-search migration
+;;   RelativeIndex        reached through `ArrayAt`/`StringAt`; the last frontend copy was
+;;                        `fng-slice-bound`, deleted as dead code
+;;   ToPropertyKey        reached through `GetProperty`/`SetProperty`/`GetNamedProperty`
+;;   ToBoolean            the frontend no longer builds truthiness AT ALL -- `If` owns it as an
+;;                        IR contract, and `lib/`'s definition awaits its first caller
+;;                        (`Boolean(x)`, still unimplemented); it stays on the orphan allowlist
+;;
+;; An operation reached only THROUGH other DSL definitions is not owed: interior use is the
+;; healthy end state (`StringEquals` is the same shape), and the no-dead-definition invariant
+;; still guards it.
 (defn dsl-owed [(i i64)] (-> (slice u8))
   (case i
-    0 "ToBoolean"
-    1 "ToLength"
-    2 "SameValueZero"
-    3 "RelativeIndex"
-    4 "ToPropertyKey"
     ""))
-(defn dsl-owed-count [] (-> i64) 5)
+(defn dsl-owed-count [] (-> i64) 0)
 
 ;; DEFINITIONS WITH NO CALLER ANYWHERE -- the recorded debt for invariant 1.
 ;;
-;; `ToBoolean` and `ToInt32` are the two that make the point. Both are ECMAScript abstract
-;; operations, both are defined in `lib/abstract/conversions.jsl`, and nothing in the compiler or
-;; the library calls either: the frontend open-codes truthiness and the bitwise-or-with-zero
-;; itself. They are simultaneously on this list and on `DSL-OWED`, which is the signature of an
-;; operation that was written in the DSL and then reimplemented somewhere else.
+;; `ToInt32` and `ToUint32` used to sit here beside `ToBoolean`, defined and called by nothing
+;; while the frontend open-coded them -- the signature of an operation written in the DSL and
+;; then reimplemented elsewhere. The bitwise migration wired both; `ToBoolean` remains, no longer
+;; because anything open-codes it (nothing does -- `If` owns truthiness as an IR contract) but
+;; because its caller, `Boolean(x)`, is not implemented yet.
 ;;
 ;; The rest are capabilities written ahead of a caller. That is not a defect, and it is still
 ;; worth a count that cannot grow without someone saying so.
@@ -130,9 +134,7 @@
       (or (str-eq name "NumLt")
       (or (str-eq name "ObjectCoercible")
       (or (str-eq name "String.prototype.indexOf")
-      (or (str-eq name "ToBoolean")
-      (or (str-eq name "ToInt32")
-      (str-eq name "ToUint32"))))))))))))))))))))))
+      (str-eq name "ToBoolean"))))))))))))))))))))
 
 (defn read-text [(a (ptr Allocator)) (path (slice u8))] (-> (slice u8))
   (match (read-file a path)
