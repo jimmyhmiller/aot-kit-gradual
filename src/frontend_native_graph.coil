@@ -5016,22 +5016,29 @@
         ;; which is what a representation decision requires. Same lesson as `fng-loose-equal`.
         ;; repros/truncate-then-increment-stays-tagged.js.
         raw-number (fng-machine-number-value? raw-old 8)
-        old
-          (if raw-number
-              raw-old
-              (n-unbox! raw-old (t-flt)))
         text (ts-text ast node)
         length (slice-len text)
         operator
           (if prefix
               (if (>= length 2) (substr text 0 2) "")
               (if (>= length 2) (substr text (- length 2) length) ""))
-        numeric-value (fng-bin (if (str-eq operator "++") (Add) (Sub)) old (fng-const 1))
-        ;; Write back in the representation the local already had, so a later read is consistent
-        ;; with every other reader of the same symbol.
-        value (if raw-number numeric-value (n-box! numeric-value))]
+        ;; `++` IS ToNumeric THEN A NUMERIC ADD, and both halves are the DSL's: `x++` on a string
+        ;; is NaN, never concatenation, so the coercion comes first and `JsAdd`'s concat arm can
+        ;; never fire. The spec also says POSTFIX returns the COERCED old value, not the raw one.
+        ;; For a proven raw number the guards fold and the unboxes below cancel, so `i++` in a
+        ;; counted loop still costs one Add.
+        old-value (fng-jsl-call1 context "ToNumberValue"
+                                 (fng-box-dynamic-argument! raw-old))
+        new-value (fng-arith2 context
+                              (if (str-eq operator "++") "JsAdd" "JsSub")
+                              old-value
+                              (fng-const 1))
+        ;; Write back in the REPRESENTATION the local already had, so a later read is consistent
+        ;; with every other reader of the same symbol. That is the frontend's one remaining
+        ;; decision here, and it is structural: `fng-machine-number-value?` follows the graph.
+        value (if raw-number (n-unbox! new-value (t-flt)) new-value)]
     (fng-lvalue-write context target value)
-    (if prefix value raw-old)))
+    (if prefix value (if raw-number (n-unbox! old-value (t-flt)) old-value))))
 
 ;; Lower a value-producing branch. An arm node of -1 uses its already-evaluated fixed value; this
 ;; is how && and || evaluate their left operand once while still returning that operand.
