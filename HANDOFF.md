@@ -6,8 +6,11 @@ logical not, `++`/`--`, `instanceof`, spread — reaches its meaning through `li
 EMPTY. What remains is Phase 1/5 enforcement residue and two feature gaps, listed at the end.
 
 Read `docs/DSL-OWNERSHIP.md` for the phases and the enforcement. **`docs/DSL-CHECKLIST.md` is
-the definition of done** — every remaining item as a checkable box with its own verification;
-update it as boxes close. This file is what is in flight.
+the definition of done**, and **`docs/DEMOLITION.md` is the standing order**: the owner decided
+(2026-08-16) to push the primitive line down — fat primitives become DSL definitions, both
+hand-written copies (eval.coil + runtime.c) are deleted in the same commit, breakage accepted.
+Work the strikes in DEMOLITION.md in order; it is written to be executed step-by-step. This
+file is what is in flight.
 
 ---
 

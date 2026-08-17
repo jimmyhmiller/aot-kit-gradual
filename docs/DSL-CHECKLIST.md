@@ -86,36 +86,38 @@ guards, re-record any golden graphs, gate with `--cases 600` fuzz.
 ## E. The primitive layer: one meaning per primitive, not two hand-written copies
 
 Today every `%` primitive is implemented twice: `eval.coil` (the oracle, ~163 `ev-*` functions)
-and `native/gc/runtime.c` + `js-value.h` (~2,300 lines C). The owner's stated intent is to PORT
-this layer. **DECIDE E0 first; it shapes every item below.**
+and `native/gc/runtime.c` + `js-value.h` (~2,300 lines C).
 
-- [ ] E0. **DECIDE** the target shape: (a) runtime stays C but is generated/checked against a
-      single source, (b) runtime is rewritten in Coil and linked as today, or (c) runtime is
-      emitted from the DSL itself where expressible. Record the choice here.
-- [ ] E1. Value ops ported/unified: truthiness, strict-equal, ToNumber table, ToInteger,
+- [x] E0. **DECIDED (owner, 2026-08-16): push the primitive line down.** Fat primitives become
+      DSL definitions over a small atom set; BOTH hand-written copies are deleted in the same
+      commit; what remains duplicated is only the atom interpreter + atom selection, plus the
+      GC as permanent native substrate. Breakage and lost functionality are acceptable in
+      exchange for deleted lines. **The execution plan, written for a less capable model to run
+      step-by-step, is `docs/DEMOLITION.md`** — the items below map onto its strikes.
+- [ ] E1. (DEMOLITION S9) Value ops pushed down: truthiness, strict-equal, ToNumber table, ToInteger,
       ToFixed (`AOT_JS_VALUE_*` ops 26–32; eval twins `rt-truthy?`, `aot_js_strict_equal`'s
       twin, `ev-to-number-value`, `ev-to-integer`, `ev-to-fixed`).
-- [ ] E2. String ops ported/unified (`AOT_JS_STRING_*` 0–25, 30–31: new/set-unit/length/equal/
+- [ ] E2. (DEMOLITION S0–S5, S8) String ops pushed down (`AOT_JS_STRING_*` 0–25, 30–31: new/set-unit/length/equal/
       concat/char-code/substring/substr/slice/char-at/from-int/from-bool/from-null/
       from-undefined/parse-int/is-nan/split/is-nan-value/from-code-unit/from-int-radix/
       from-double-bits/lower/upper/index-of/compare/from-value/parse-float/normalize; eval
       twins in `jsstring.coil` + `ev-string-*`).
-- [ ] E3. Number→string formatting is CONFORMANT and single-sourced: shortest-round-trip
+- [ ] E3. (DEMOLITION S6–S7) Number→string formatting CONFORMANT and single-sourced in the DSL: shortest-round-trip
       ToString (today `%.17g` noise natively, no exponential form in eval —
       repros/open/large-double-tostring-not-exponential.js). **Done when:** that repro moves
       out of open/ and `String(0.1)`/`String(1e21)`/`String(123456789012345680000)` match node.
-- [ ] E4. Array ops ported/unified (`aot_js_array` dispatcher; eval twins in `jsarray.coil` /
+- [ ] E4. (DEMOLITION S9+) Array ops pushed down (`aot_js_array` dispatcher; eval twins in `jsarray.coil` /
       `ev-array-*`).
-- [ ] E5. Property/prototype ops ported/unified (`aot_js_property`; eval twins in
+- [ ] E5. (DEMOLITION S9+) Property/prototype ops pushed down (`aot_js_property`; eval twins in
       `jsobject.coil`: own-key order, prototype chains, delete, freeze).
 - [ ] E6. Enumeration sees every object: either static shapes are enumerable (own-key
       count/at/load know shape slots in BOTH runtimes) or the layout-safety list (D4) is proven
       complete. **Done when:** `Object.keys` on a statically-shaped literal is correct without
       the program-wide demotion, or D4's test blesses the demotion.
-- [ ] E7. Allocation, GC, safepoints, trampoline (`_aot_alloc_slow`, `aot_gc_enter`,
-      trampoline.S): **DECIDE** — this is machine plumbing, not JS semantics; expected outcome
-      is a permanent bless as native substrate, recorded here.
-- [ ] E8. Math builtins (`AOT_JS_BUILTIN_*` 0–16: abs/floor/ceil/round/exp/log/sin/cos/tan/
+- [x] E7. **DECIDED with E0**: allocation, GC, safepoints, trampoline are permanent native
+      substrate — machine plumbing, not JS semantics. Never on the demolition list.
+- [x] E8. **DECIDED with E0**: libm calls (sin/cos/pow/…) ARE atoms; they stay primitive.
+      (Was: Math builtins (`AOT_JS_BUILTIN_*` 0–16: abs/floor/ceil/round/exp/log/sin/cos/tan/
       asin/acos/atan/sqrt/pow/max/min/random) — same treatment as E1.
 
 ## F. Missing features (absent, not misplaced)
@@ -152,5 +154,5 @@ this layer. **DECIDE E0 first; it shapes every item below.**
 
 ---
 
-Ledger: 12 done, 27 open (5 of them DECIDE items).
+Ledger: 15 done, 24 open (2 remaining DECIDE items: B3, D2/D3). Execution manual: docs/DEMOLITION.md.
 When a box is checked, name the commit that did it next to the box.
