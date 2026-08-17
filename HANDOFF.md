@@ -1,140 +1,120 @@
 # Handoff: move JavaScript semantics into the DSL
 
-**THE TREE IS GREEN. 564 passed, 0 failed.** The arithmetic migration is landed: the five failures
-the previous handoff recorded are fixed, and what fixed them is written down below because each was
-a general lesson, not a local patch.
+**THE TREE IS GREEN. 566 passed, 0 failed.** The operator migration is essentially COMPLETE:
+every JavaScript operator the frontend lowers — arithmetic, comparison, equality, bitwise,
+logical not, `++`/`--`, `instanceof`, spread — reaches its meaning through `lib/`. `DSL-OWED` is
+EMPTY. What remains is Phase 1/5 enforcement residue and two feature gaps, listed at the end.
 
-Read `docs/DSL-OWNERSHIP.md` for the measurement, the phases and the enforcement. This file is what
-is in flight.
+Read `docs/DSL-OWNERSHIP.md` for the phases and the enforcement. This file is what is in flight.
 
 ---
 
 ## The mandate, stated here so it is not a pointer
 
-**Every JavaScript semantic moves into `lib/`. Not most of it, not the convenient parts — all of
-it.** The frontend's job is to lower *syntax* into structure: control flow, scoping, memory and
-alias plumbing, the call ABI, closure environments, shapes. The meaning of every operator, every
-coercion and every builtin belongs to the DSL.
+**Every JavaScript semantic moves into `lib/`.** The frontend lowers *syntax* into structure:
+control flow, scoping, memory and alias plumbing, the call ABI, closures, shapes,
+REPRESENTATION. The meaning of every operator, coercion and builtin belongs to the DSL, reached
+through `fng-jsl-call*`. **The DSL's expressiveness is never the limit** — a `%` primitive is the
+correct way to reach a runtime capability it cannot spell (`%ToFixed` was added this way; a
+regexp engine is the one still owed). **Do not accept a partial conversion as done**, and **no
+fast path in the frontend** — the specialisation lives in the definition and folds when types
+prove.
 
-**The DSL's current expressiveness is never the limit.** If something cannot be written in `lib/`
-today, the DSL is what is wrong and gets extended. A `%` primitive is the correct way for the DSL
-to reach a runtime capability it cannot express — number formatting and a regexp engine are the two
-still owed.
+## Current state of the debt (all ratcheted in tests/dsl-ownership-test.coil)
 
-**The goal is not "the frontend delegates". It is that the frontend CANNOT hold a semantic.**
-Phase 1 in `docs/DSL-OWNERSHIP.md` is deleting the six helpers that exist so it can
-(`fng-bin`, `fng-number-value`, `fng-int-value`, `fng-to-number-operand`,
-`fng-condition-expression`, `fng-equal-value`) and splitting `Op` so the arithmetic and comparison
-variants are unnameable outside `jsl_lower` — a compile error rather than a lint. Phase 5 is
-deleting the surface entirely, so a future change that wants a hand-written semantic has to add the
-door back in a commit that says so.
+| opcode | count | what it is |
+|---|---|---|
+| `Eq` | 1 | dynamic-callee identity compare — tag bits ARE function identity here |
+| `Lt` `Le` | 0 | — |
+| `Add` `Sub` `Mul` `Div` `Mod` `Minus` `Not` `BitAnd` `BitXor` `BitNot` `Shl` `Shr` `UShr` | 1 each | `fng-static-global-value`, the literal-only constant evaluator (numeric operands enforced) |
+| `BitOr` | 2 | the above plus `fng-int-value`'s index coercion |
 
-**Do not accept a partial conversion as done.** Every time a remainder looked inherent it was not:
-"the guards cannot fold" was a missing primitive, "the round trip is genuine work" was a missing
-fold rule, "arithmetic is unaffordable" was both. When something looks like it must stay in the
-compiler, the burden is to prove it is structure and not meaning.
+`DSL-OWED` is empty. Of Phase 1's six helpers: `fng-equal-value` and `fng-bin` are DELETED,
+`fng-condition-expression` is renamed `fng-condition-representation` (`If` owns truthiness
+end-to-end; the helper only boxes a raw string pointer). Three remain — `fng-number-value`,
+`fng-int-value`, `fng-to-number-operand` — reachable only from the declared-type boundary
+(`fng-expression-expected`), array index/length positions, and parameter defaults.
 
----
+## What landed this session, most recent first
 
-## What is done and green
+- **`++`/`--`** are `ToNumberValue` then `JsAdd`/`JsSub` (spec: ToNumeric then a NUMERIC add,
+  never concat; postfix returns the COERCED old value). The write-back representation stays the
+  frontend's, decided structurally with `fng-machine-number-value?`.
+- **Object spread** — each `...a` is one `ObjectAssignSource` step (the definition Object.assign
+  repeats). Two supporting rules: a program containing spread disables static object layouts
+  (enumeration reads the runtime property table; shape slots are invisible to it), and a
+  certainly-SHAPE-ROOT object never takes `fng-unique-field-index`'s static-shape name-guess.
+- **`instanceof Object` / `instanceof Array`** — name-dispatch (only when the name has no user
+  binding) to `InstanceOfObjectValue`/`InstanceOfArrayValue` in lib/abstract/property.jsl.
+- **`Number.prototype.toFixed`** — the owed number-formatting primitive, built: `%ToFixed`
+  computes round(x·10^f) EXACTLY on the double's binary decomposition, ties away from zero
+  (printf rounds ties to even and cannot express the spec). Mirrored in `ev-to-fixed`
+  (eval.coil) and `aot_js_to_fixed_format` (native/gc/runtime.c). ≥1e21 delegates to ToString
+  and inherits repros/open/large-double-tostring-not-exponential.js.
+- **`String.prototype.replace`** (string pattern, first occurrence) — `StringReplaceFirst`.
+- **Equality, whole**: `===`/`!==`/`==`/`!=`/`!` and `switch` matching are
+  `StrictEqual`/`StrictNotEqual`/`LooseEqual`/`LooseNotEqual`/`LogicalNot`. Deleted
+  `fng-equal-value`, `fng-loose-equal`, `fng-nullish-equal` and the number/number and
+  string/string fast paths. `StringEquals` is interior to the DSL now.
+- **Conditions hold no semantics** — `If` owns truthiness (evaluator `rt-truthy?`; selection
+  dispatches tagged→VALUE-TRUTHY, float→MI-FTRUTH, int→zero test). String conditions box.
+- **`fng-static-global-value` is numbers-only** — its qualifier refuses `true + 1` etc., which
+  fall to the ordinary top-level path where the DSL owns the coercions.
+- Earlier in the session: the arithmetic migration landed green (declared-type coercion at
+  `fng-expression-expected`, `n-rep-of` as the one representation classifier shared by verifier
+  and idealize, `Box(tagged)` peels as identity, `Unbox` folds vetoed for certainly-tagged).
 
-- **Phase 0 — a DSL call is free when the types are known.** `box-compute` carries the input's kind
-  (widened over the numeric union — a soundness requirement, not an optimisation);
-  `fng-analyze-fresh!` iterates analyse → fold → `iterate!` to a fixpoint; `jl-if` lowers the arm
-  before collecting a proven predicate; JSL bindings are pinned for their scope.
-- **The relational operators** are `IsLessThan`/`IsLessEqual` in `lib/`.
-- **The bitwise operators** are the DSL's, which also wired `ToInt32`/`ToUint32`.
-- **The arithmetic operators** are the DSL's: `JsAdd`, `JsSub`, `JsMul`, `JsDiv`, `JsMod` and
-  `JsNegate` (unary `-` included — it was still a hand-written `Sub(0, ToNumber(x))` until the
-  dead-definition ratchet flagged `JsNegate` as defined-but-uncalled). Two primitives were added to
-  make this affordable, `%IsNumber` and `%UnboxNumber` — see the recorded reasons below.
-- **The ownership ratchets are re-recorded**: `DSL-WIRED` includes the six arithmetic operations;
-  the opcode budgets are `Add` 4, `Sub` 2, `Mul`/`Div`/`Mod` 1 each (the survivors are the
-  relative-index clamp, the `++`/`--` raw fast path, and `fng-static-global-value`); the golden
-  graph text for `return n + 1` is re-pinned with the six-node value path plus the memory
-  scaffolding.
+## The compiler was updated mid-session, and the fallout is instructive
 
-## What fixed the five failures, because each is a rule
+The coil binary (and its stdlib) changed at 21:28 on 2026-08-16. Four things broke, none of them
+new code:
 
-**1. A representation boundary is decided from the DECLARED type, at the site that knows it —
-never from the value's shape.** `main : number` returned a NaN-boxed word to a native caller
-because the unboxing hack (`fng-return-representation`) tested for the folded shape `Box(Add)` at
-build time, when the DSL's result is still an unfolded `Phi dyn` over the concat/numeric arms. The
-shape it looked for does not exist until analysis folds the guards, so it matched nothing, ever.
-The fix: `fng-expression-expected` now applies the `FNG-NUMBER` coercion (`fng-number-value`) to
-EVERY expression kind, not just identifiers, and the shape hack is deleted. The coercion is built
-eagerly and folds against the DSL's own boxing when analysis proves the types.
+1. **Reader**: `\xNN` escapes now need `\xNN;`; `SexpKind` gained `KView` (jl-float-bits match).
+2. **`fng-coerce-to-alias` keyed on a momentary `n-ty` read** whose value depended on peephole
+   visit order; the order changed and `o.x = acc` after `acc += 1` stored a tagged word raw.
+   Fixed structurally with the boxed walk. **Build-time decisions key on SHAPE, never on a
+   mid-construction type read** — this trap has now bitten twice.
+3. **The stdlib hashmap masks buckets with `hash & (cap-1)`** and `hash-step`'s FNV multiply
+   leaves low bits structured: ty-intern went quadratic and ns.js ran 90+ CPU-minutes.
+   `ty-hash-finalize` (splitmix64 finalizer) now ends every repo-owned KeyOps hash
+   (ty, gvn, ev-array-slot). ns.js: 1:38, correct. Any new custom hash must end in it.
+4. **Two fields sharing one alias** left a duplicate entry in control snapshots' active lists;
+   divergent states under one alias appeared once processing order changed
+   (repros/shared-field-alias-snapshot-duplicate.js). `fng-control-aliases!` dedupes.
 
-**2. A type proof is not a representation proof, in the folds as much as anywhere.**
-The opcode fuzzer's `((If) (New))` counterexample: an if/else merges two boxed arms into
-`Phi(Box, Box) : num`; an object field forwards it; `unbox-idealize` deleted `Unbox(Box(v))` on
-the evidence that `v` proves `num` — and handed the tagged Phi to a raw `Add`, which consumed the
-NaN-box bits. Three changes in node.coil:
-- The verifier's representation classifier moved to **`n-rep-of` in node.coil** — one table, read
-  by the verifier's REP pass and by the idealizations, so they can never disagree. One deliberate
-  difference: a Phi with an ABSENT arm classifies UNKNOWN, because the idealizations run during
-  construction where an open loop Phi's backedge is still unknown (this is what keeps the deferred
-  `Box(Phi)` placeholders alive for `fng-distribute-deferred-phi-boxes!`).
-- `unbox-idealize` vetoes both fold arms when the boxed value is certainly tagged.
-- `box-idealize` peels `Box(x)` whenever `x` is certainly tagged: **boxing a tagged word is the
-  identity**, and `Box(Box(x)) → Box(x)` was only the easiest case of that rule. The frontend
-  boxes DSL operands blindly (`fng-arith2`), so tagged-without-being-a-Box values (a Phi of Box
-  arms, a PropLoad) arrive under a second tag the backend would corrupt.
+## Traps that cost real time (cumulative)
 
-**3. The ratchet counter is textual.** `occurrences` counts `(Add)` anywhere in
-`frontend_native_graph.coil`, comments included — a comment saying `Box(Add)` inflates the debt.
-Word comments accordingly.
-
-## The two primitives, and why they exist
-
-**`%IsNumber`** (`JSP-ISNUMBER`, lowers to `TypeTest (t-num)`). A boxed operand must carry the kind
-`int|flt` — a field declared `flt` holds an int-tagged 0 after `{a: 0}`, so the static type cannot
-determine the runtime tag — and against that union `ty-isa num num` decides while `ty-isa num int`
-does not. Selection emits two `MI-JSTEST`s and an OR; no new encoding.
-
-**`%UnboxNumber`** (`JSP-UNBOXNUMBER`, a bare `Unbox (t-flt)`). `%UnboxFlt` lowers through
-`jl-unbox`, which wraps its operand in a `Cast` the evaluator checks — an int-tagged number fails
-`Cast flt` even though the unbox beneath converts correctly (`ev-unbox` turns RT-INT into RFlt;
-aarch64 emits `sxt48`/`scvtf`).
-
-## Traps that cost real time
-
-- **A type is not a representation.** `ty-isa int flt` is false, and that says nothing about the
-  machine. `n-rep-of` is now the one answer to representation questions; do not re-derive from the
-  lattice.
-- **`ty-isa ANY num` is true.** An unanalysed node reads as a machine number, so
-  `fng-machine-number-value?` over-reports and cannot be used as "is this a primitive".
-- **Build-time type tests do not fire.** `n-ty-proven?` is false for everything while the graph is
-  being constructed. A coercion decided at build time keys on the DECLARED type (see rule 1) or on
-  shape — and shapes that only exist post-fold do not count.
-- **Do not put a fast path in the frontend.** Specialisation belongs in the DSL definition, which
-  leads with the common case.
+- **A type is not a representation.** `n-rep-of` (node.coil) is the one answer; the verifier and
+  the idealizations read the same table. A Phi with an absent arm is UNKNOWN by design.
+- **Build-time type reads are momentary state.** Key on shape/structure: the boxed walk,
+  `fng-machine-number-value?`, `fng-shape-root-object?`.
+- **An `If`'s control operand is read before an argument-position JSL call runs** — the call
+  inlines guard diamonds that ADVANCE control. Lower the call first, then build the If
+  (both switch lowerings record this).
+- **The ratchet counter is textual** — a comment saying `(Add)` counts.
+- **Piping `coil test` output masks its exit status** — check before committing.
 
 ## Tools
 
-- `coil build tools/js-repro.coil -o out/js-repro` then `out/js-repro FILE.js ARG [--dump] [--tag]`
-  — node's answer beside ours in milliseconds, naming which of frontend/verifier/evaluator refused
-  it and at which node.
-- `tools/js-sweep.sh` — 29,068 cases, catalogued, crash-resumable. `docs/SWEEP-CATALOGUE.md`.
-- `repros/*.js` all pass; `repros/open/*.js` all fail. Sweep with
-  `for f in repros/*.js; do ./out/js-repro "$f" 10 >/dev/null || echo "FAIL $f"; done`.
-  **`ns.js` needs the raised budget in `tools/js-repro.coil` and takes ~2 minutes.**
-- The fuzz property: `coil test tests/js-source-prop.coil --cases N` (append `--seed S` to replay).
+- `coil build tools/js-repro.coil -o out/js-repro`; `out/js-repro FILE.js ARG [--dump]` — node's
+  answer beside ours in ms. Sweep: `for f in repros/*.js; do ./out/js-repro "$f" 10 >/dev/null
+  || echo "FAIL $f"; done` (ns.js ~1:40 with the raised budget).
+- Fuzz: `coil test tests/js-source-prop.coil --filter opcode_generated --cases 600`. The default
+  gate runs fewer cases — run a big-case pass before declaring a frontend change safe.
+- `sample <pid>` when anything is slow; ty-eq under hm-get means a hash went weak.
 
 ## Next, in order
 
-Continue the plan in `docs/DSL-OWNERSHIP.md`, and finish it:
-
-1. `Eq` (18 sites) → `IsStrictlyEqual`, `Not` → `ToBoolean`, and the four remaining owed abstract
-   operations (`ToLength`, `SameValueZero`, `RelativeIndex`, `ToPropertyKey`). None need a new
-   primitive — they are wiring. The two `(Add)` relative-index clamps in `fng-relative-index`
-   territory are `RelativeIndex`'s to absorb.
-2. `fng-static-global-value`, the build-time constant evaluator, is the one site with a real
-   argument for staying: no `FngContext` and literals only. It is also demonstrably wrong today
-   (`true + 1` there builds a raw `Add` on a boolean). Either thread a context to it or fix it —
-   do not leave it as an unexamined exception.
-3. The intrinsics currently REFUSED at the frontend rather than implemented: `Number.prototype.
-   toFixed`, `String.prototype.replace`, `instanceof` against a global, object spread. Two need a
-   new `%` primitive — correctly-rounded number formatting, and a regexp engine. Build them.
-4. Then Phase 1 and Phase 5: delete the six helpers, split `Op`, and leave nowhere to put a
-   hand-written semantic.
+1. **Phase 1 residue**: convert the three remaining coercion helpers' sites to unconditional
+   DSL calls (`ToNumberValue`/`ToInt32`) and let folding remove them — the mandate's own
+   prescription — then delete the helpers. Then **split `Op`** so arithmetic/comparison/bitwise
+   variants are unnameable outside `jsl_lower` (big mechanical refactor across node/eval/verify/
+   backend/gtext/templates; the exhaustive-match compiler drives it; consider hivemind with the
+   test suite as gate).
+2. **The regexp engine** — the last owed `%` primitive family (String.replace/match/split with
+   RegExp patterns). `Boolean(x)` to give `ToBoolean` its caller.
+3. **Open repros**: closure-capturing-a-loop-variable, rest-parameters,
+   undefined-for-these-values, large-double-tostring-not-exponential (wants the real
+   shortest-round-trip digit generator; the native side prints %.17g noise today).
+4. The stdlib's own `bytewise-hash` likely shares the low-bits weakness — that fix belongs in
+   the compiler repo.
