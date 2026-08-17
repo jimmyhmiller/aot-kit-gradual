@@ -1222,32 +1222,53 @@
           (and (not (load (field fn arrow)))
                (!= (load (field fn receiver-type-node)) -1))))))
 
-(defn fng-static-global-expression? [(frontend (ptr NativeFrontend)) (node i64) (fuel i64)] (-> bool)
+;; WHAT THE STATIC EVALUATOR MAY SEE, and the boundary is SEMANTIC, so it is stated here rather
+;; than left to the evaluator: the raw IR arithmetic IS JavaScript's arithmetic FOR NUMBERS --
+;; `arith-compute`'s Div is float division and its Add promotes overflow to float -- and for
+;; nothing else. `true + 1`, `"a" + "b"` and `null * 2` all passed the old qualifier and reached
+;; a raw `Add`/`Mul` over a non-numeric constant, which is a hand-written (and wrong) copy of
+;; ApplyStringOrNumericBinaryOperator. So an OPERAND position demands a numeric expression, while
+;; a VALUE position (the initializer itself, `const G = "abc"`) still admits any literal.
+;; An initializer that fails the test is not an error: it simply is not static, and lowers on the
+;; ordinary top-level path where the DSL owns the coercions.
+(defn fng-static-global-expression-mode? [(frontend (ptr NativeFrontend))
+                                          (node i64)
+                                          (fuel i64)
+                                          (numeric bool)] (-> bool)
   (if (<= fuel 0)
       false
       (let [ast (field frontend ast)
             kind (ts-kind ast node)]
         (cond (= kind TSK-NUMERIC-LITERAL) true
-              (= kind TSK-STRING-LITERAL) true
-              (= kind TSK-NULL) true
-              (= kind TSK-TRUE) true
-              (= kind TSK-FALSE) true
+              (= kind TSK-STRING-LITERAL) (not numeric)
+              (= kind TSK-NULL) (not numeric)
+              (= kind TSK-TRUE) (not numeric)
+              (= kind TSK-FALSE) (not numeric)
               (= kind TSK-PARENTHESIZED-EXPRESSION)
-                (fng-static-global-expression? frontend (ts-child ast node 0) (- fuel 1))
+                (fng-static-global-expression-mode? frontend (ts-child ast node 0) (- fuel 1) numeric)
               (= kind TSK-IDENTIFIER)
-                (fng-static-global-symbol-fuel? frontend (fe-resolution-symbol frontend node) (- fuel 1))
+                (fng-static-global-symbol-mode? frontend
+                                                (fe-resolution-symbol frontend node)
+                                                (- fuel 1)
+                                                numeric)
               (= kind TSK-PREFIX-UNARY)
-                (fng-static-global-expression? frontend (ts-child ast node 0) (- fuel 1))
+                (fng-static-global-expression-mode? frontend (ts-child ast node 0) (- fuel 1) true)
               (= kind TSK-BINARY)
-                (and (fng-static-global-expression? frontend (ts-child ast node 0) (- fuel 1))
-                     (fng-static-global-expression? frontend (ts-child ast node 2) (- fuel 1)))
+                (and (fng-static-global-expression-mode? frontend (ts-child ast node 0) (- fuel 1) true)
+                     (fng-static-global-expression-mode? frontend (ts-child ast node 2) (- fuel 1) true))
               :else false))))
+
+(defn fng-static-global-expression? [(frontend (ptr NativeFrontend)) (node i64) (fuel i64)] (-> bool)
+  (fng-static-global-expression-mode? frontend node fuel false))
 
 ;; An immutable primitive constant expression has no runtime environment identity. Publish it as a
 ;; compilation-unit value so every function can reference it without manufacturing closure cells.
-(defn fng-static-global-symbol-fuel? [(frontend (ptr NativeFrontend))
+;; `numeric` narrows the check to a NUMERIC initializer, for identifiers read in an operand
+;; position of the static evaluator's raw arithmetic.
+(defn fng-static-global-symbol-mode? [(frontend (ptr NativeFrontend))
                                       (symbol-id i64)
-                                      (fuel i64)] (-> bool)
+                                      (fuel i64)
+                                      (numeric bool)] (-> bool)
   (let [ast (field frontend ast)
         (mut symbol-index) 0
         (mut declaration) -1
@@ -1277,7 +1298,12 @@
         false
         (let [initializer (ts-child ast (load declaration)
                                     (- (ts-child-count ast (load declaration)) 1))]
-          (fng-static-global-expression? frontend initializer (- fuel 1))))))
+          (fng-static-global-expression-mode? frontend initializer (- fuel 1) numeric)))))
+
+(defn fng-static-global-symbol-fuel? [(frontend (ptr NativeFrontend))
+                                      (symbol-id i64)
+                                      (fuel i64)] (-> bool)
+  (fng-static-global-symbol-mode? frontend symbol-id fuel false))
 
 (defn fng-static-global-symbol? [(frontend (ptr NativeFrontend)) (symbol-id i64)] (-> bool)
   (fng-static-global-symbol-fuel? frontend symbol-id 32))
