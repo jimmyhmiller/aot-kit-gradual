@@ -1,4 +1,8 @@
-// PARTLY FIXED. The graph corruption is gone; `instanceof` against a global is still unimplemented.
+// FIXED, in two stages. The graph corruption went first; then `instanceof Object` and
+// `instanceof Array` lowered to the DSL's `InstanceOfObjectValue`/`InstanceOfArrayValue`
+// (lib/abstract/property.jsl) -- the prototype-chain question specialised to the two chains the
+// runtime itself maintains. The dispatch is by NAME and only when the name resolves to no user
+// binding, so a shadowing constructor still takes `OrdinaryHasInstance`.
 //
 // WAS:
 //
@@ -22,9 +26,7 @@
 //
 //   function B(v) { this.v = v; } let b = new B(1); b instanceof B      // 9, correct
 //
-// This file stays here because `instanceof Object` and `instanceof Array` still do not run.
-// Implementing them means giving the frontend value bindings for the globals, which is the same
-// missing-globals work as `Map`, `Set` and `Symbol`.
+// `instanceof Function` remains refused: `Function` is not an indexed global name at all.
 //
 // node says 9 for main(7).
 function main(n) {
