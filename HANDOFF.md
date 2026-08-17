@@ -5,7 +5,9 @@ every JavaScript operator the frontend lowers — arithmetic, comparison, equali
 logical not, `++`/`--`, `instanceof`, spread — reaches its meaning through `lib/`. `DSL-OWED` is
 EMPTY. What remains is Phase 1/5 enforcement residue and two feature gaps, listed at the end.
 
-Read `docs/DSL-OWNERSHIP.md` for the phases and the enforcement. This file is what is in flight.
+Read `docs/DSL-OWNERSHIP.md` for the phases and the enforcement. **`docs/DSL-CHECKLIST.md` is
+the definition of done** — every remaining item as a checkable box with its own verification;
+update it as boxes close. This file is what is in flight.
 
 ---
 
