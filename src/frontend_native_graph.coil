@@ -269,9 +269,6 @@
         (fng-const (cast i64 number))
         (n-new1 (Const (t-flt-bits bits)) (g-start)))))
 
-(defn fng-bin [(op Op) (left i64) (right i64)] (-> i64)
-  (fng-peep (n-new3 op NO-NODE left right)))
-
 (defn fng-string-coerce [(context FngContext) (source i64) (value i64)] (-> i64)
   (if (= (fng-infer context source FNG-DYNAMIC) FNG-STRING)
       value
@@ -584,7 +581,7 @@
 ;; no truthy contract -- an empty and a non-empty string are both non-zero addresses -- so a
 ;; string-valued condition boxes and takes the tagged path. This used to be a `StringLength`
 ;; call, which was the frontend spelling out string truthiness (`length != 0`) by hand.
-(defn fng-condition-expression [(context FngContext) (source i64)] (-> i64)
+(defn fng-condition-representation [(context FngContext) (source i64)] (-> i64)
   (let [value (fng-expression context source)]
     (if (= (fng-infer context source FNG-DYNAMIC) FNG-STRING)
         (n-box! value)
@@ -774,7 +771,7 @@
                       (or (op-is? value Mul [])
                           (or (op-is? value Div []) (op-is? value Mod []))))))
           value
-          (fng-bin (BitOr) (fng-to-number-operand context value) (fng-const 0)))
+          (fng-peep (n-new3 (BitOr) NO-NODE (fng-to-number-operand context value) (fng-const 0))))
       value)))
 
 (defn fng-number-value [(context FngContext) (source i64) (value i64)] (-> i64)
@@ -3806,7 +3803,7 @@
                     ; function constant. Tag bits are disjoint from every other representation, so
                     ; raw 64-bit equality IS JavaScript function identity here — no StrictEqual
                     ; type ladder needed per arm.
-                    condition (fng-bin (Eq) loaded (n-box! fun-node))
+                    condition (fng-peep (n-new3 (Eq) NO-NODE loaded (n-box! fun-node)))
                     arms (n-if-arms! (fng-peep (n-new2 (If)
                                                       (load (load (field context ctrl)))
                                                       condition)))
@@ -5234,7 +5231,7 @@
             (let [condition-node (ts-role ast node TS-ROLE-CONDITION 0)
                   then-node (ts-role ast node TS-ROLE-WHEN-TRUE 0)
                   else-node (ts-role ast node TS-ROLE-WHEN-FALSE 0)
-                  condition (fng-condition-expression context condition-node)]
+                  condition (fng-condition-representation context condition-node)]
               (fng-branch-expression context condition then-node NO-NODE else-node NO-NODE false))
           (= kind TSK-BINARY)
             (let [left-node (ts-child ast node 0)
@@ -5252,7 +5249,7 @@
                                                left
                                                true)
                     ;; A string-valued condition BOXES rather than measuring its length -- `If`
-                    ;; owns truthiness; see `fng-condition-expression`.
+                    ;; owns truthiness; see `fng-condition-representation`.
                     (if (str-eq operator "&&")
                         (fng-branch-expression context
                                                (if (= (fng-infer context left-node FNG-DYNAMIC) FNG-STRING)
@@ -5752,7 +5749,7 @@
             (let [left (fng-static-global-value frontend values (ts-child ast node 0))
                   right (fng-static-global-value frontend values (ts-child ast node 2))
                   operator (ts-text ast (ts-child ast node 1))]
-              (fng-bin (cond (str-eq operator "+") (Add)
+              (fng-peep (n-new3 (cond (str-eq operator "+") (Add)
                              (str-eq operator "-") (Sub)
                              (str-eq operator "*") (Mul)
                              (str-eq operator "/") (Div)
@@ -5763,7 +5760,7 @@
                              (str-eq operator "<<") (Shl)
                              (str-eq operator ">>") (Shr)
                              :else (UShr))
-                       left right))
+                       NO-NODE left right)))
           :else NO-NODE)))
 
 (defn fng-initialize-static-globals! [(frontend (ptr NativeFrontend))
@@ -6551,7 +6548,7 @@
     (fng-control-aliases! context (mut active))
     ;; Condition evaluation may itself contain calls, assignments, or short-circuit control.
     ;; Both branch snapshots and the outer If must begin after those effects have completed.
-    (let [condition (fng-condition-expression context condition-node)
+    (let [condition (fng-condition-representation context condition-node)
           condition-ctrl (load (load (field context ctrl)))
           saved-start (fng-snapshot! context (mut changed) (mut active) (mut snapshots))
           arms (n-if-arms! (fng-peep (n-new2 (If) condition-ctrl condition)))]
@@ -6651,7 +6648,7 @@
                   (fng-set-symbol! context symbol phi)
                   (store! index (+ (load index) 1)))))
       (store! (load (field context ctrl)) loop-node)
-      (let [condition (fng-condition-expression context condition-node)
+      (let [condition (fng-condition-representation context condition-node)
             ; The condition may itself emit control (a ToNumber diamond, a short-circuit merge, an
             ; inlined JSL call). The loop test must anchor at whatever control the condition left
             ; behind; pinning it to the Loop node put two Ifs on one control and broke the CFG.
@@ -6799,7 +6796,7 @@
             reaches-condition (fng-merge-target! context target-index FNG-JUMP-CONTINUE body-continues)]
         (let [condition
                 (if reaches-condition
-                    (fng-condition-expression context condition-node)
+                    (fng-condition-representation context condition-node)
                     (fng-const 0))
               arms (n-if-arms! (fng-peep (n-new2 (If) (load (load (field context ctrl))) condition)))]
           (store! index 0)
