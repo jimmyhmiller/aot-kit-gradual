@@ -6485,6 +6485,35 @@
                                  (load (load (field context aliases)))
                                  (al-get [i64] (load active) (load index))))
                 (store! index (+ (load index) 1)))))
+    ;; TWO FIELDS MAY SHARE ONE ALIAS -- `{p, q}` and a later `{p}` share `p`'s entry -- so the
+    ;; field->alias mapping above can leave the same alias in the list twice. A snapshot then
+    ;; records a state per LIST ENTRY, the two entries can disagree about which state is current,
+    ;; and the merge builds two phis for one alias class: `MemMerge` carrying `mem#1` twice, and
+    ;; the evaluator stops with "a memory edge does not describe the alias class being touched".
+    ;; Latent as long as duplicate entries happened to record identical states; a change in node
+    ;; processing order made them diverge. Compact to first occurrence.
+    (let [(mut w) 0 (mut r) 0]
+      (loop (if (>= (load r) (al-len [i64] (load active)))
+                (break)
+                (do
+                  (let [v (al-get [i64] (load active) (load r))
+                        (mut seen) false
+                        (mut s) 0]
+                    (loop (if (or (>= (load s) (load w)) (load seen))
+                              (break)
+                              (do (if (= (al-get [i64] (load active) (load s)) v)
+                                      (store! seen true)
+                                      0)
+                                  (store! s (+ (load s) 1)))))
+                    (if (load seen)
+                        0
+                        (do (al-set! [i64] (mut active) (load w) v)
+                            (store! w (+ (load w) 1))
+                            0)))
+                  (store! r (+ (load r) 1)))))
+      (loop (if (<= (al-len [i64] (load active)) (load w))
+                (break)
+                (do (al-pop! [i64] (mut active)) 0))))
     (store! index 0)
     (loop (if (>= (load index) (al-len [i64] (load (field context dynamic-aliases))))
               (break)
