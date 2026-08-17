@@ -25,11 +25,11 @@
 
 (defn jso-heap [] (-> (ptr JsObjectHeap))
   (let [heap (alloc/static JsObjectHeap)]
-    (if (load (field heap inited)) 0
-      (do (store! (field heap inited) true)
-          (store! (field heap objects) (al-new [JsObject] (malloc-allocator)))
-          (store! (field heap properties) (al-new [JsProperty] (malloc-allocator)))
-          (store! (field heap track-shapes) true)
+    (if (.inited heap) 0
+      (do (set! (.inited heap) true)
+          (set! (.objects heap) (al-new [JsObject] (malloc-allocator)))
+          (set! (.properties heap) (al-new [JsProperty] (malloc-allocator)))
+          (set! (.track-shapes heap) true)
           0))
     heap))
 
@@ -37,63 +37,63 @@
   (let [heap (jso-heap)]
     (al-clear! [JsObject] (field heap objects))
     (al-clear! [JsProperty] (field heap properties))
-    (store! (field heap status) JSO-OK)
-    (store! (field heap track-shapes) true)
+    (set! (.status heap) JSO-OK)
+    (set! (.track-shapes heap) true)
     0))
 
 ;; The compiler's shape arena is a 64-bit type lattice, not an unbounded runtime hidden-class
 ;; table. The ideal evaluator can disable runtime shape transitions while retaining property and
 ;; prototype semantics for whole programs with more than 64 insertion histories.
 (defn jso-track-shapes! [(enabled bool)] (-> i64)
-  (store! (field (jso-heap) track-shapes) enabled)
+  (set! (.track-shapes (jso-heap)) enabled)
   0)
 
 (defn jso-object-make [(prototype i64)] (-> JsObject)
-  (let [(mut object) (zeroed JsObject)]
-    (store! (field object shape) SHAPE-ROOT)
-    (store! (field object prototype) prototype)
-    (store! (field object property-head) JSO-NONE)
-    (store! (field object frozen) false)
-    (store! (field object internal-kind) JSO-NONE)
-    (store! (field object internal-target) 0)
-    (store! (field object internal-index) 0)
-    (load object)))
+  (JsObject :shape
+            SHAPE-ROOT
+            :prototype
+            prototype
+            :property-head
+            JSO-NONE
+            :frozen
+            false
+            :internal-kind
+            JSO-NONE
+            :internal-target
+            0
+            :internal-index
+            0))
 
 (defn jso-property-make [(owner i64) (name i64) (value i64) (next i64)] (-> JsProperty)
-  (let [(mut property) (zeroed JsProperty)]
-    (store! (field property owner) owner)
-    (store! (field property name) name)
-    (store! (field property value) value)
-    (store! (field property next) next)
-    (load property)))
+  (JsProperty :owner owner :name name :value value :next next))
 
 (defn jso-valid? [(object i64)] (-> bool)
-  (and (>= object 0) (< object (al-len [JsObject] (load (field (jso-heap) objects))))))
+  (and (>= object 0) (< object (al-len [JsObject] (.objects (jso-heap))))))
 
 (defn jso-new! [(prototype i64)] (-> i64)
-  (let [heap (jso-heap) id (al-len [JsObject] (load (field heap objects)))]
+  (let [heap (jso-heap) id (al-len [JsObject] (.objects heap))]
     (if (or (= prototype JSO-NONE) (jso-valid? prototype))
         (do (al-push! [JsObject] (field heap objects) (jso-object-make prototype)) id)
-      (do (store! (field heap status) JSO-BAD-OBJECT) JSO-NONE))))
+      (do (set! (.status heap) JSO-BAD-OBJECT) JSO-NONE))))
 
 (defn jso-shape [(object i64)] (-> i64)
   (if (jso-valid? object)
-      (let [record (al-get [JsObject] (load (field (jso-heap) objects)) object)]
-        (load (field record shape)))
+      (let [record (al-get [JsObject] (.objects (jso-heap)) object)]
+        (.shape record))
       SHAPE-ROOT))
 
 (defn jso-frozen? [(object i64)] (-> bool)
   (if (jso-valid? object)
       (let [record (al-get [JsObject]
-                           (load (field (jso-heap) objects)) object)]
-        (load (field record frozen)))
+                           (.objects (jso-heap)) object)]
+        (.frozen record))
       false))
 
 (defn jso-freeze! [(object i64)] (-> i64)
   (if (not (jso-valid? object)) JSO-BAD-OBJECT
       (let [heap (jso-heap)
-            (mut record) (al-get [JsObject] (load (field heap objects)) object)]
-        (store! (field record frozen) true)
+            (mut record) (al-get [JsObject] (.objects heap) object)]
+        (set! (.frozen record) true)
         (al-set! [JsObject] (field heap objects) object (load record))
         JSO-OK)))
 
@@ -102,53 +102,53 @@
 (defn jso-internal-init! [(object i64) (target i64) (kind i64)] (-> i64)
   (if (not (jso-valid? object)) JSO-BAD-OBJECT
       (let [heap (jso-heap)
-            (mut record) (al-get [JsObject] (load (field heap objects)) object)]
-        (store! (field record internal-kind) kind)
-        (store! (field record internal-target) target)
-        (store! (field record internal-index) 0)
+            (mut record) (al-get [JsObject] (.objects heap) object)]
+        (set! (.internal-kind record) kind)
+        (set! (.internal-target record) target)
+        (set! (.internal-index record) 0)
         (al-set! [JsObject] (field heap objects) object (load record))
         JSO-OK)))
 
 (defn jso-internal-kind [(object i64)] (-> i64)
   (if (jso-valid? object)
-      (let [record (al-get [JsObject] (load (field (jso-heap) objects)) object)]
-        (load (field record internal-kind)))
+      (let [record (al-get [JsObject] (.objects (jso-heap)) object)]
+        (.internal-kind record))
       JSO-NONE))
 (defn jso-internal-target [(object i64)] (-> i64)
   (if (jso-valid? object)
-      (let [record (al-get [JsObject] (load (field (jso-heap) objects)) object)]
-        (load (field record internal-target)))
+      (let [record (al-get [JsObject] (.objects (jso-heap)) object)]
+        (.internal-target record))
       0))
 (defn jso-internal-index [(object i64)] (-> i64)
   (if (jso-valid? object)
-      (let [record (al-get [JsObject] (load (field (jso-heap) objects)) object)]
-        (load (field record internal-index)))
+      (let [record (al-get [JsObject] (.objects (jso-heap)) object)]
+        (.internal-index record))
       JSO-NONE))
 (defn jso-internal-set-index! [(object i64) (index i64)] (-> i64)
   (if (not (jso-valid? object)) JSO-BAD-OBJECT
       (let [heap (jso-heap)
-            (mut record) (al-get [JsObject] (load (field heap objects)) object)]
-        (store! (field record internal-index) index)
+            (mut record) (al-get [JsObject] (.objects heap) object)]
+        (set! (.internal-index record) index)
         (al-set! [JsObject] (field heap objects) object (load record))
         JSO-OK)))
 
 (defn jso-prototype [(object i64)] (-> i64)
   (if (jso-valid? object)
-      (let [record (al-get [JsObject] (load (field (jso-heap) objects)) object)]
-        (load (field record prototype)))
+      (let [record (al-get [JsObject] (.objects (jso-heap)) object)]
+        (.prototype record))
       JSO-NONE))
 
 (defn jso-own-index-nid [(object i64) (name i64)] (-> i64)
   (let [heap (jso-heap)
-        properties (load (field heap properties))
-        record (al-get [JsObject] (load (field heap objects)) object)
-        (mut index) (load (field record property-head))
+        properties (.properties heap)
+        record (al-get [JsObject] (.objects heap) object)
+        (mut index) (.property-head record)
         (mut found) JSO-NONE]
     (loop (if (or (= (load index) JSO-NONE) (!= (load found) JSO-NONE)) (break)
       (let [entry (al-get [JsProperty] properties (load index))]
-        (if (= (load (field entry name)) name)
-            (store! found (load index)) 0)
-        (store! index (load (field entry next))))))
+        (if (= (.name entry) name)
+            (set! found (load index)) 0)
+        (set! index (.next entry)))))
     (load found)))
 
 (defn jso-own? [(object i64) (name (slice u8))] (-> bool)
@@ -165,42 +165,42 @@
         (mut at) 0
         (mut value) 0
         (mut valid) (> length 0)]
-    (if (and (> length 1) (= (cast i64 (slice-get bytes 0)) 48)) (store! valid false) 0)
+    (if (and (> length 1) (= (cast i64 (slice-get bytes 0)) 48)) (set! valid false) 0)
     (loop (if (or (>= (load at) length) (not (load valid)))
               (break)
               (let [byte (cast i64 (slice-get bytes (load at)))]
                 (if (or (< byte 48) (> byte 57))
-                    (store! valid false)
-                    (do (store! value (+ (* (load value) 10) (- byte 48)))
-                        (if (>= (load value) 4294967295) (store! valid false) 0)))
-                (store! at (+ (load at) 1)))))
+                    (set! valid false)
+                    (do (set! value (+ (* (load value) 10) (- byte 48)))
+                        (if (>= (load value) 4294967295) (set! valid false) 0)))
+                (set! at (+ (load at) 1)))))
     (if (load valid) (load value) -1)))
 
 (defn jso-own-key-count [(object i64)] (-> i64)
   (if (not (jso-valid? object)) 0
-      (let [properties (load (field (jso-heap) properties))
-            record (al-get [JsObject] (load (field (jso-heap) objects)) object)
-            (mut current) (load (field record property-head))
+      (let [properties (.properties (jso-heap))
+            record (al-get [JsObject] (.objects (jso-heap)) object)
+            (mut current) (.property-head record)
             (mut count) 0]
         (loop (if (= (load current) JSO-NONE) (break)
                   (let [entry (al-get [JsProperty] properties (load current))]
-                    (store! count (+ (load count) 1))
-                    (store! current (load (field entry next))))))
+                    (set! count (+ (load count) 1))
+                    (set! current (.next entry)))))
         (load count))))
 
 ;; Returns an interned shape-name id, or SHAPE-NO-NAME when ordinal is out of range.
 (defn jso-own-key-at [(object i64) (ordinal i64)] (-> i64)
   (if (or (not (jso-valid? object)) (< ordinal 0)) SHAPE-NO-NAME
-      (let [properties (load (field (jso-heap) properties))
-            record (al-get [JsObject] (load (field (jso-heap) objects)) object)
-            head (load (field record property-head))
+      (let [properties (.properties (jso-heap))
+            record (al-get [JsObject] (.objects (jso-heap)) object)
+            head (.property-head record)
             (mut current) head
             (mut numeric-count) 0]
         (loop (if (= (load current) JSO-NONE) (break)
                   (let [entry (al-get [JsProperty] properties (load current))]
-                    (if (>= (jso-name-array-index (load (field entry name))) 0)
-                        (store! numeric-count (+ (load numeric-count) 1)) 0)
-                    (store! current (load (field entry next))))))
+                    (if (>= (jso-name-array-index (.name entry)) 0)
+                        (set! numeric-count (+ (load numeric-count) 1)) 0)
+                    (set! current (.next entry)))))
         (if (< ordinal (load numeric-count))
             ;; Find the numeric key whose number of smaller numeric keys equals `ordinal`.
             (let [(mut candidate) head (mut answer) SHAPE-NO-NAME]
@@ -208,19 +208,19 @@
                             (!= (load answer) SHAPE-NO-NAME))
                         (break)
                         (let [entry (al-get [JsProperty] properties (load candidate))
-                              name (load (field entry name))
+                              name (.name entry)
                               index (jso-name-array-index name)]
                           (if (>= index 0)
                               (let [(mut scan) head (mut rank) 0]
                                 (loop (if (= (load scan) JSO-NONE) (break)
                                           (let [other (al-get [JsProperty] properties (load scan))
                                                 other-index
-                                                  (jso-name-array-index (load (field other name)))]
+                                                  (jso-name-array-index (.name other))]
                                             (if (and (>= other-index 0) (< other-index index))
-                                                (store! rank (+ (load rank) 1)) 0)
-                                            (store! scan (load (field other next))))))
-                                (if (= (load rank) ordinal) (store! answer name) 0)) 0)
-                          (store! candidate (load (field entry next))))))
+                                                (set! rank (+ (load rank) 1)) 0)
+                                            (set! scan (.next other)))))
+                                (if (= (load rank) ordinal) (set! answer name) 0)) 0)
+                          (set! candidate (.next entry)))))
               (load answer))
             ;; The list is newest-first, so reverse only the non-index string partition.
             (let [string-ordinal (- ordinal (load numeric-count))
@@ -233,38 +233,37 @@
                             (!= (load answer) SHAPE-NO-NAME))
                         (break)
                         (let [entry (al-get [JsProperty] properties (load scan))]
-                          (if (< (jso-name-array-index (load (field entry name))) 0)
+                          (if (< (jso-name-array-index (.name entry)) 0)
                               (do (if (= (load seen) target)
-                                      (store! answer (load (field entry name))) 0)
-                                  (store! seen (+ (load seen) 1))) 0)
-                          (store! scan (load (field entry next))))))
+                                      (set! answer (.name entry)) 0)
+                                  (set! seen (+ (load seen) 1))) 0)
+                          (set! scan (.next entry)))))
               (load answer))))))
 
 (defn jso-store! [(object i64) (name (slice u8)) (value i64)] (-> i64)
   (let [heap (jso-heap)]
     (if (not (jso-valid? object))
-        (do (store! (field heap status) JSO-BAD-OBJECT) JSO-BAD-OBJECT)
+        (do (set! (.status heap) JSO-BAD-OBJECT) JSO-BAD-OBJECT)
       (let [nid (shape-name-intern! name) index (jso-own-index-nid object nid)]
       (if (!= index JSO-NONE)
-          (let [(mut entry) (al-get [JsProperty] (load (field heap properties)) index)]
-            (store! (field entry value) value)
+          (let [(mut entry) (al-get [JsProperty] (.properties heap) index)]
+            (set! (.value entry) value)
             (al-set! [JsProperty] (field heap properties) index (load entry)))
-        (let [(mut record) (al-get [JsObject] (load (field heap objects)) object)]
-          (if (load (field heap track-shapes))
-              (if (shape-has-field? (load (field record shape)) name)
+        (let [(mut record) (al-get [JsObject] (.objects heap) object)]
+          (if (.track-shapes heap)
+              (if (shape-has-field? (.shape record) name)
                   0
                   (do
-                    (store! (field record shape)
-                            (shape-transition (load (field record shape)) name (t-dyn)))
+                    (set! (.shape record) (shape-transition (.shape record) name (t-dyn)))
                     (al-set! [JsObject] (field heap objects) object (load record))
                     0))
               0)
-          (let [property-index (al-len [JsProperty] (load (field heap properties)))]
+          (let [property-index (al-len [JsProperty] (.properties heap))]
             (al-push! [JsProperty] (field heap properties)
-                      (jso-property-make object nid value (load (field record property-head))))
-            (store! (field record property-head) property-index)
+                      (jso-property-make object nid value (.property-head record)))
+            (set! (.property-head record) property-index)
             (al-set! [JsObject] (field heap objects) object (load record)))))
-      (store! (field heap status) JSO-OK)
+      (set! (.status heap) JSO-OK)
       JSO-OK))))
 
 ;; Shapes record allocation/layout history and remain monotone; deletion removes the property-table
@@ -275,31 +274,31 @@
     (let [heap (jso-heap)
           nid (shape-name-find name)]
       (if (= nid SHAPE-NO-NAME) true
-        (let [(mut record) (al-get [JsObject] (load (field heap objects)) object)
-              (mut current) (load (field record property-head))
+        (let [(mut record) (al-get [JsObject] (.objects heap) object)
+              (mut current) (.property-head record)
               (mut prior) JSO-NONE
               (mut done) false]
           (loop (if (or (= (load current) JSO-NONE) (load done)) (break true)
-            (let [entry (al-get [JsProperty] (load (field heap properties)) (load current))]
-              (if (= (load (field entry name)) nid)
+            (let [entry (al-get [JsProperty] (.properties heap) (load current))]
+              (if (= (.name entry) nid)
                   (do
                     (if (= (load prior) JSO-NONE)
-                        (store! (field record property-head) (load (field entry next)))
+                        (set! (.property-head record) (.next entry))
                         (let [(mut previous)
-                                (al-get [JsProperty] (load (field heap properties)) (load prior))]
-                          (store! (field previous next) (load (field entry next)))
+                                (al-get [JsProperty] (.properties heap) (load prior))]
+                          (set! (.next previous) (.next entry))
                           (al-set! [JsProperty] (field heap properties) (load prior) (load previous))))
                     (al-set! [JsObject] (field heap objects) object (load record))
-                    (store! done true))
-                  (do (store! prior (load current))
-                      (store! current (load (field entry next)))))))
+                    (set! done true))
+                  (do (set! prior (load current))
+                      (set! current (.next entry))))))
           true))))))
 
 (defn jso-load-own-nid [(object i64) (name i64)] (-> i64)
   (let [index (jso-own-index-nid object name)]
     (if (= index JSO-NONE) JSV-UNDEFINED
-      (let [entry (al-get [JsProperty] (load (field (jso-heap) properties)) index)]
-        (load (field entry value))))))
+      (let [entry (al-get [JsProperty] (.properties (jso-heap)) index)]
+        (.value entry)))))
 
 (defn jso-load [(object i64) (name (slice u8))] (-> i64)
   (let [nid (shape-name-find name) (mut current) object (mut answer) JSV-UNDEFINED]
@@ -308,10 +307,10 @@
         (loop (if (= (load current) JSO-NONE) (break)
           (let [index (jso-own-index-nid (load current) nid)]
             (if (!= index JSO-NONE)
-                (let [entry (al-get [JsProperty] (load (field (jso-heap) properties)) index)]
-                  (store! answer (load (field entry value)))
-                    (store! current JSO-NONE))
-              (store! current (jso-prototype (load current)))))))
+                (let [entry (al-get [JsProperty] (.properties (jso-heap)) index)]
+                  (set! answer (.value entry))
+                    (set! current JSO-NONE))
+              (set! current (jso-prototype (load current)))))))
         (load answer)))))
 
 (defn jso-has? [(object i64) (name (slice u8))] (-> bool)
@@ -321,31 +320,31 @@
         (loop (if (or (= (load current) JSO-NONE) (load found)) (break)
           (do
             (if (!= (jso-own-index-nid (load current) nid) JSO-NONE)
-                (store! found true)
-                (store! current (jso-prototype (load current)))))))
+                (set! found true)
+                (set! current (jso-prototype (load current)))))))
         (load found)))))
 
 (defn jso-prototype-reaches? [(start i64) (target i64)] (-> bool)
   (let [(mut current) start (mut steps) 0 (mut found) false
-        limit (al-len [JsObject] (load (field (jso-heap) objects)))]
+        limit (al-len [JsObject] (.objects (jso-heap)))]
     (loop (if (or (= (load current) JSO-NONE) (load found)) (break)
-      (do (if (= (load current) target) (store! found true) 0)
-          (store! current (jso-prototype (load current)))
-          (store! steps (+ (load steps) 1))
-          (if (> (load steps) limit) (do (store! found true) (break)) 0))))
+      (do (if (= (load current) target) (set! found true) 0)
+          (set! current (jso-prototype (load current)))
+          (set! steps (+ (load steps) 1))
+          (if (> (load steps) limit) (do (set! found true) (break)) 0))))
     (load found)))
 
 (defn jso-set-prototype! [(object i64) (prototype i64)] (-> i64)
   (let [heap (jso-heap)]
     (if (or (not (jso-valid? object))
             (and (!= prototype JSO-NONE) (not (jso-valid? prototype))))
-        (do (store! (field heap status) JSO-BAD-OBJECT) JSO-BAD-OBJECT)
+        (do (set! (.status heap) JSO-BAD-OBJECT) JSO-BAD-OBJECT)
       (if (or (= object prototype) (jso-prototype-reaches? prototype object))
-          (do (store! (field heap status) JSO-CYCLE) JSO-CYCLE)
-        (let [(mut record) (al-get [JsObject] (load (field heap objects)) object)]
-          (store! (field record prototype) prototype)
+          (do (set! (.status heap) JSO-CYCLE) JSO-CYCLE)
+        (let [(mut record) (al-get [JsObject] (.objects heap) object)]
+          (set! (.prototype record) prototype)
           (al-set! [JsObject] (field heap objects) object (load record))
-          (store! (field heap status) JSO-OK)
+          (set! (.status heap) JSO-OK)
           JSO-OK)))))
 
-(defn jso-status [] (-> i64) (load (field (jso-heap) status)))
+(defn jso-status [] (-> i64) (.status (jso-heap)))

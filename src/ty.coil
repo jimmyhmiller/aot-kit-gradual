@@ -131,31 +131,37 @@
 
 (defn val-make [(kinds i64) (ilo i64) (ihi i64) (iwide i64)
                 (fsz i64) (fbits i64) (fidxs i64) (shapes i64)] (-> Val)
-  (let [(mut v) (zeroed Val)]
-    (store! (field v kinds)  kinds)
-    (store! (field v ilo)    ilo)
-    (store! (field v ihi)    ihi)
-    (store! (field v iwide)  iwide)
-    (store! (field v fsz)    fsz)
-    ; Canonical: a non-constant float carries no bits. Safe to normalise because `dual`
-    ; only flips the sign of fsz and never turns a non-constant into a constant.
-    (store! (field v fbits)  (if (= fsz FSZ-CON) fbits 0))
-    (store! (field v fidxs)  fidxs)
-    (store! (field v shapes) shapes)
-    (load v)))
+  (Val :kinds
+       kinds
+       :ilo
+       ilo
+       :ihi
+       ihi
+       :iwide
+       iwide
+       :fsz
+       fsz
+       :fbits
+       ; Canonical: a non-constant float carries no bits. Safe to normalise because `dual`
+       ; only flips the sign of fsz and never turns a non-constant into a constant.
+       (if (= fsz FSZ-CON) fbits 0)
+       :fidxs
+       fidxs
+       :shapes
+       shapes))
 
 ;; Field accessors. `match` binds a struct payload BY VALUE, and `field` needs a place, so
 ;; a matched `Val` cannot be poked at directly. Passing it to a function gives a read-only
 ;; reference, which is what these are for, and they read better than `(load (field …))` at
 ;; every use site.
-(defn val-kinds  [(x Val)] (-> i64) (load (field x kinds)))
-(defn val-ilo    [(x Val)] (-> i64) (load (field x ilo)))
-(defn val-ihi    [(x Val)] (-> i64) (load (field x ihi)))
-(defn val-iwide  [(x Val)] (-> i64) (load (field x iwide)))
-(defn val-fsz    [(x Val)] (-> i64) (load (field x fsz)))
-(defn val-fbits  [(x Val)] (-> i64) (load (field x fbits)))
-(defn val-fidxs  [(x Val)] (-> i64) (load (field x fidxs)))
-(defn val-shapes [(x Val)] (-> i64) (load (field x shapes)))
+(defn val-kinds  [(x Val)] (-> i64) (.kinds x))
+(defn val-ilo    [(x Val)] (-> i64) (.ilo x))
+(defn val-ihi    [(x Val)] (-> i64) (.ihi x))
+(defn val-iwide  [(x Val)] (-> i64) (.iwide x))
+(defn val-fsz    [(x Val)] (-> i64) (.fsz x))
+(defn val-fbits  [(x Val)] (-> i64) (.fbits x))
+(defn val-fidxs  [(x Val)] (-> i64) (.fidxs x))
+(defn val-shapes [(x Val)] (-> i64) (.shapes x))
 
 (defn val-eq [(x Val) (y Val)] (-> bool)
   (and (= (val-kinds x)  (val-kinds y))
@@ -290,8 +296,8 @@
   (let [(mut v) x (mut n) 0]
     (loop
       (if (= (load v) 0) (break)
-        (do (store! v (& (load v) (- (load v) 1)))
-            (store! n (+ (load n) 1))
+        (do (set! v (& (load v) (- (load v) 1)))
+            (set! n (+ (load n) 1))
             0)))
     (load n)))
 
@@ -351,24 +357,24 @@
 ;; accessor returns the same cell every call, which is the idiom for a singleton.
 (defn types [] (-> (ptr Types))
   (let [p (alloc/static Types)]
-    (if (load (field p inited)) 0
-      (do (store! (field p inited) true)   ; set FIRST: seeding re-enters through `types`
-          (store! (field p tab)    (al-new [Ty] (malloc-allocator)))
-          (store! (field p duals)  (al-new [i64] (malloc-allocator)))
-          (store! (field p kids)   (al-new [i64] (malloc-allocator)))
-          (store! (field p depths) (al-new [i64] (malloc-allocator)))
-          (store! (field p intern) (hm-new [Ty i64] (malloc-allocator) (ty-keyops)))
+    (if (.inited p) 0
+      (do (set! (.inited p) true)   ; set FIRST: seeding re-enters through `types`
+          (set! (.tab p) (al-new [Ty] (malloc-allocator)))
+          (set! (.duals p) (al-new [i64] (malloc-allocator)))
+          (set! (.kids p) (al-new [i64] (malloc-allocator)))
+          (set! (.depths p) (al-new [i64] (malloc-allocator)))
+          (set! (.intern p) (hm-new [Ty i64] (malloc-allocator) (ty-keyops)))
           (ty-seed p)
           0))
     p))
 
 (defn ty-kid [(off i64) (i i64)] (-> i64)
-  (al-get (load (field (types) kids)) (+ off i)))
+  (al-get (.kids (types)) (+ off i)))
 
 ;; How many member slots the kid array holds. Exported so a gate can assert that building,
 ;; meeting or PRINTING an already-interned tuple does not grow it: the array is append-only and
 ;; the growth would be unbounded in the number of CALLS. See `ty-tuple-close`.
-(defn ty-kids-len [] (-> i64) (al-len [i64] (load (field (types) kids))))
+(defn ty-kids-len [] (-> i64) (al-len [i64] (.kids (types))))
 
 (defn ty-panic [(msg (slice u8))] (-> i64)
   (let [w (stderr)] (ps w "type table: ") (ps w msg) (ps w "\n"))
@@ -393,27 +399,27 @@
 ;; through here, so there is exactly one way a member window comes into existence.
 (defstruct TupleBuild [(off i64) (len i64) (nty i64)])
 
-(defn tb-off [(b TupleBuild)] (-> i64) (load (field b off)))
-(defn tb-len [(b TupleBuild)] (-> i64) (load (field b len)))
-(defn tb-nty [(b TupleBuild)] (-> i64) (load (field b nty)))
+(defn tb-off [(b TupleBuild)] (-> i64) (.off b))
+(defn tb-len [(b TupleBuild)] (-> i64) (.len b))
+(defn tb-nty [(b TupleBuild)] (-> i64) (.nty b))
 
 ;; Reserve `len` member slots. They hold TY-NO-ID until written, which is not a type id, so a
 ;; slot nobody filled is detectable rather than a plausible index into the table.
 (defn ty-tuple-open [(len i64)] (-> TupleBuild)
   (if (< len 0) (do (ty-panic "ty-tuple-open: negative tuple arity") 0) 0)
   (let [p (types)
-        off (al-len [i64] (load (field p kids)))
+        off (al-len [i64] (.kids p))
         n0  (ty-count)
         (mut i) 0
         (mut b) (zeroed TupleBuild)]
     (loop
       (if (>= (load i) len) (break)
         (do (al-push! [i64] (field p kids) TY-NO-ID)
-            (store! i (+ (load i) 1))
+            (set! i (+ (load i) 1))
             0)))
-    (store! (field b off) off)
-    (store! (field b len) len)
-    (store! (field b nty) n0)
+    (set! (.off b) off)
+    (set! (.len b) len)
+    (set! (.nty b) n0)
     (load b)))
 
 (defn ty-tuple-put! [(b TupleBuild) (i i64) (t i64)] (-> i64)
@@ -426,7 +432,7 @@
 (defn ty-kids-truncate! [(off i64)] (-> i64)
   (let [p (types)]
     (loop
-      (if (<= (al-len [i64] (load (field p kids))) off) (break)
+      (if (<= (al-len [i64] (.kids p)) off) (break)
         (do (al-pop! [i64] (field p kids)) 0)))
     0))
 
@@ -455,7 +461,7 @@
         (do (if (= (ty-kid (tb-off b) (load i)) TY-NO-ID)
                 (do (ty-panic "ty-tuple-close: a member slot was never filled") 0)
               0)
-            (store! i (+ (load i) 1))
+            (set! i (+ (load i) 1))
             0))))
   (ty-tuple-check-depth b)
   (let [p (types) found (ty-lookup p (TTuple (tb-off b) (tb-len b)))]
@@ -478,8 +484,8 @@
     (loop
       (if (>= (load i) (tb-len b)) (break)
         (do (let [dm (ty-depth (ty-kid (tb-off b) (load i)))]
-              (if (> dm (load d)) (store! d dm) 0))
-            (store! i (+ (load i) 1))
+              (if (> dm (load d)) (set! d dm) 0))
+            (set! i (+ (load i) 1))
             0)))
     (if (> (+ (load d) 1) TY-MAX-TUPLE-DEPTH)
         (do (ty-panic "ty-tuple-close: tuple nesting is deeper than the textual form can represent (TY-MAX-TUPLE-DEPTH)") 0)
@@ -511,8 +517,8 @@
   (let [(mut i) 0 (mut same) true]
     (loop
       (if (or (>= (load i) n) (not (load same))) (break)
-        (do (if (!= (ty-kid oa (load i)) (ty-kid ob (load i))) (store! same false) 0)
-            (store! i (+ (load i) 1))
+        (do (if (!= (ty-kid oa (load i)) (ty-kid ob (load i))) (set! same false) 0)
+            (set! i (+ (load i) 1))
             0)))
     (load same)))
 
@@ -558,19 +564,19 @@
   (ty-eq (load (cast (ptr Ty) ka)) (load (cast (ptr Ty) kb))))
 (defn ty-keyops [] (-> (ptr KeyOps))
   (let [o (alloc/static KeyOps)]
-    (store! (field o hash) (fnptr-of ty-keyhash))
-    (store! (field o eq)   (fnptr-of ty-keyeq))
-    (store! (field o size) (sizeof Ty))
+    (set! (.hash o) (fnptr-of ty-keyhash))
+    (set! (.eq o) (fnptr-of ty-keyeq))
+    (set! (.size o) (sizeof Ty))
     o))
 
 ; ---------------------------------------------------------------------------
 ; Interning, with duals installed in pairs
 ; ---------------------------------------------------------------------------
-(defn ty-get [(t i64)] (-> Ty) (al-get (load (field (types) tab)) t))
-(defn ty-count [] (-> i64) (al-len [Ty] (load (field (types) tab))))
+(defn ty-get [(t i64)] (-> Ty) (al-get (.tab (types)) t))
+(defn ty-count [] (-> i64) (al-len [Ty] (.tab (types))))
 
 (defn ty-push [(p (ptr Types)) (t Ty)] (-> i64)
-  (let [id (al-len [Ty] (load (field p tab)))]
+  (let [id (al-len [Ty] (.tab p))]
     (al-push! [Ty]  (field p tab)   t)
     (al-push! [i64] (field p duals) TY-NO-ID)
     ; the depth is recorded ONCE, here, because every member is already interned by now and so
@@ -581,7 +587,7 @@
 
 ;; Tuple nesting depth: 0 for anything that is not a tuple, and one more than its deepest member
 ;; for one that is. A 0-tuple is depth 1: it is still a bracket the parser has to recurse into.
-(defn ty-depth [(t i64)] (-> i64) (al-get (load (field (types) depths)) t))
+(defn ty-depth [(t i64)] (-> i64) (al-get (.depths (types)) t))
 
 (defn ty-xdepth [(p (ptr Types)) (t Ty)] (-> i64)
   (match t
@@ -594,14 +600,14 @@
       (let [(mut i) 0 (mut d) 0]
         (loop
           (if (>= (load i) len) (break)
-            (do (let [dm (al-get (load (field p depths)) (ty-kid off (load i)))]
-                  (if (> dm (load d)) (store! d dm) 0))
-                (store! i (+ (load i) 1))
+            (do (let [dm (al-get (.depths p) (ty-kid off (load i)))]
+                  (if (> dm (load d)) (set! d dm) 0))
+                (set! i (+ (load i) 1))
                 0)))
         (+ (load d) 1)))))
 
 (defn ty-lookup [(p (ptr Types)) (t Ty)] (-> i64)
-  (match (hm-get (load (field p intern)) t) (Some [id] id) (None [] TY-NO-ID)))
+  (match (hm-get (.intern p) t) (Some [id] id) (None [] TY-NO-ID)))
 
 ;; Intern a type and return its id. A type and its dual are installed together, so
 ;; `ty-dual` is a table read rather than a computation, and `dual(dual(x)) == x` holds by
@@ -620,7 +626,7 @@
         id))))
 
 (defn ty-dual [(t i64)] (-> i64)
-  (al-get (load (field (types) duals)) t))
+  (al-get (.duals (types)) t))
 
 ;; The structural dual, used only while interning. Tuple members are already interned, so
 ;; their duals are a table read and this does not recurse indefinitely.
@@ -644,7 +650,7 @@
     (loop
       (if (>= (load i) len) (break)
         (do (ty-tuple-put! b (load i) (ty-dual (ty-kid off (load i))))
-            (store! i (+ (load i) 1))
+            (set! i (+ (load i) 1))
             0)))
     (TTuple (tb-off b) (tb-len b))))
 
@@ -709,7 +715,7 @@
     (loop
       (if (>= (load i) n) (break)
         (do (ty-tuple-put! b (load i) (ty-meet (ty-kid oa (load i)) (ty-kid ob (load i))))
-            (store! i (+ (load i) 1))
+            (set! i (+ (load i) 1))
             0)))
     (ty-tuple-close b)))
 
@@ -834,7 +840,7 @@
           (let [(mut i) 0]
             (loop
               (if (!= (& bits (<< 1 (load i))) 0) (break)
-                (store! i (+ (load i) 1))))
+                (set! i (+ (load i) 1))))
             (load i)))))
     (TBot [] -1) (TTop [] -1) (TCtrl [] -1) (TXCtrl [] -1)
     (TTuple [o l] -1) (TMem [a c] -1)))
@@ -1017,7 +1023,7 @@
     (loop
       (if (>= (load i) n) (break)
         (do (ty-tuple-put! tb (load i) (slice-get members (load i)))
-            (store! i (+ (load i) 1))
+            (set! i (+ (load i) 1))
             0)))
     (ty-tuple-close tb)))
 
@@ -1089,9 +1095,9 @@
 ;; A numeric `cast` between f64 and i64 converts the VALUE; a bit pattern needs a round
 ;; trip through memory, which LLVM folds to a register move.
 (defn f64-bits [(x f64)] (-> i64)
-  (let [p (alloc/stack f64)] (store! p x) (load (cast (ptr i64) p))))
+  (let [p (alloc/stack f64)] (set! p x) (load (cast (ptr i64) p))))
 (defn bits-f64 [(b i64)] (-> f64)
-  (let [p (alloc/stack i64)] (store! p b) (load (cast (ptr f64) p))))
+  (let [p (alloc/stack i64)] (set! p b) (load (cast (ptr f64) p))))
 
 ; ============================================================================
 ; Printing
@@ -1115,12 +1121,12 @@
         (mut k) 24
         (mut m) (if neg (- 0 n) n)]
     (if (= n 0)
-        (do (store! k 23) (store! (index buf 23) (cast u8 48)) 0)   ; 48 = '0'
+        (do (set! k 23) (set! (index buf 23) (cast u8 48)) 0)   ; 48 = '0'
       (do (loop
             (if (= (load m) 0) (break)
-              (do (store! k (- (load k) 1))
-                  (store! (index buf (load k)) (cast u8 (+ 48 (primitive/urem (load m) 10))))
-                  (store! m (primitive/udiv (load m) 10))
+              (do (set! k (- (load k) 1))
+                  (set! (index buf (load k)) (cast u8 (+ 48 (primitive/urem (load m) 10))))
+                  (set! m (primitive/udiv (load m) 10))
                   0)))
           0))
     (if neg (ps w "-") 0)
@@ -1171,7 +1177,7 @@
       (if (>= (load i) len) (break)
         (do (if (> (load i) 0) (ps w " ") 0)
             (ty-print w (ty-kid off (load i)))
-            (store! i (+ (load i) 1))
+            (set! i (+ (load i) 1))
             0))))
   (ps w "]"))
 
@@ -1263,10 +1269,10 @@
         (do (if (!= (& k (load bit)) 0)
                 (do (if (> (load done) 0) (ps w "|") 0)
                     (ps w (kind-name (load bit)))
-                    (store! done (+ (load done) 1))
+                    (set! done (+ (load done) 1))
                     0)
               0)
-            (store! bit (<< (load bit) 1))
+            (set! bit (<< (load bit) 1))
             0)))
     (load done)))
 

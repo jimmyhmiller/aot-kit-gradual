@@ -80,16 +80,16 @@
 ;; `match` and `al-get` hand a struct back BY VALUE and `field` needs a place, so these accessors
 ;; exist for the same reason `val-kinds` does in ty.coil: passing the record to a function gives a
 ;; read-only reference to poke at.
-(defn sf-name  [(x ShapeField)] (-> i64) (load (field x name)))
-(defn sf-ty    [(x ShapeField)] (-> i64) (load (field x ty)))
-(defn sf-alias [(x ShapeField)] (-> i64) (load (field x alias)))
-(defn sf-off   [(x ShapeField)] (-> i64) (load (field x off)))
+(defn sf-name  [(x ShapeField)] (-> i64) (.name x))
+(defn sf-ty    [(x ShapeField)] (-> i64) (.ty x))
+(defn sf-alias [(x ShapeField)] (-> i64) (.alias x))
+(defn sf-off   [(x ShapeField)] (-> i64) (.off x))
 
 ;; A shape is its field window, and nothing else. Everything else about a shape (its size, its
 ;; aliases, its offsets) is derived, so there is no second copy to drift.
 (defstruct ShapeRec [(foff i64) (flen i64)])
-(defn sr-foff [(x ShapeRec)] (-> i64) (load (field x foff)))
-(defn sr-flen [(x ShapeRec)] (-> i64) (load (field x flen)))
+(defn sr-foff [(x ShapeRec)] (-> i64) (.foff x))
+(defn sr-flen [(x ShapeRec)] (-> i64) (.flen x))
 
 ;; One transition edge, and it is the memo table: a lookup on `(from, name)` is what makes
 ;; `shape-transition` deterministic and idempotent. `ty` and `alias` are carried on the edge itself
@@ -101,11 +101,11 @@
    (ty    i64)
    (alias i64)
    (to    i64)])
-(defn se-from  [(x ShapeEdge)] (-> i64) (load (field x from)))
-(defn se-name  [(x ShapeEdge)] (-> i64) (load (field x name)))
-(defn se-ty    [(x ShapeEdge)] (-> i64) (load (field x ty)))
-(defn se-alias [(x ShapeEdge)] (-> i64) (load (field x alias)))
-(defn se-to    [(x ShapeEdge)] (-> i64) (load (field x to)))
+(defn se-from  [(x ShapeEdge)] (-> i64) (.from x))
+(defn se-name  [(x ShapeEdge)] (-> i64) (.name x))
+(defn se-ty    [(x ShapeEdge)] (-> i64) (.ty x))
+(defn se-alias [(x ShapeEdge)] (-> i64) (.alias x))
+(defn se-to    [(x ShapeEdge)] (-> i64) (.to x))
 
 ; ============================================================================
 ; The table
@@ -123,15 +123,15 @@
 ;; The one global, the same `alloc-static`-in-an-accessor idiom `types` and `graph` use.
 (defn shapes [] (-> (ptr Shapes))
   (let [p (alloc/static Shapes)]
-    (if (load (field p inited)) 0
-      (do (store! (field p inited) true)   ; set FIRST: `shape-reset!` re-enters through here
-          (store! (field p recs)   (al-new [ShapeRec] (malloc-allocator)))
-          (store! (field p fields) (al-new [ShapeField] (malloc-allocator)))
-          (store! (field p nbytes) (al-new [u8] (malloc-allocator)))
-          (store! (field p noff)   (al-new [i64] (malloc-allocator)))
-          (store! (field p nlen)   (al-new [i64] (malloc-allocator)))
-          (store! (field p edges)  (al-new [ShapeEdge] (malloc-allocator)))
-          (store! (field p nalias) 0)
+    (if (.inited p) 0
+      (do (set! (.inited p) true)   ; set FIRST: `shape-reset!` re-enters through here
+          (set! (.recs p) (al-new [ShapeRec] (malloc-allocator)))
+          (set! (.fields p) (al-new [ShapeField] (malloc-allocator)))
+          (set! (.nbytes p) (al-new [u8] (malloc-allocator)))
+          (set! (.noff p) (al-new [i64] (malloc-allocator)))
+          (set! (.nlen p) (al-new [i64] (malloc-allocator)))
+          (set! (.edges p) (al-new [ShapeEdge] (malloc-allocator)))
+          (set! (.nalias p) 0)
           (shape-seed!)
           0))
     p))
@@ -151,7 +151,7 @@
     (al-clear! [i64]        (field p noff))
     (al-clear! [i64]        (field p nlen))
     (al-clear! [ShapeEdge]  (field p edges))
-    (store! (field p nalias) 0)
+    (set! (.nalias p) 0)
     (shape-seed!)
     0))
 
@@ -160,23 +160,23 @@
 (defn shape-seed! [] (-> i64)
   (let [p (shapes)
         (mut r) (zeroed ShapeRec)]
-    (store! (field r foff) (al-len [ShapeField] (load (field p fields))))
-    (store! (field r flen) 0)
+    (set! (.foff r) (al-len [ShapeField] (.fields p)))
+    (set! (.flen r) 0)
     (al-push! [ShapeRec] (field p recs) (load r))
-    (if (= (al-len [ShapeRec] (load (field p recs))) 1) 0
+    (if (= (al-len [ShapeRec] (.recs p)) 1) 0
       (do (shape-panic "shape-seed!: the root shape is not id 0; the table was not empty") 0))))
 
 ; ---------------------------------------------------------------------------
 ; Sizes, and the "is this a shape" question
 ; ---------------------------------------------------------------------------
-(defn shape-count [] (-> i64) (al-len [ShapeRec] (load (field (shapes) recs))))
-(defn shape-alias-count [] (-> i64) (load (field (shapes) nalias)))
-(defn shape-edge-count [] (-> i64) (al-len [ShapeEdge] (load (field (shapes) edges))))
+(defn shape-count [] (-> i64) (al-len [ShapeRec] (.recs (shapes))))
+(defn shape-alias-count [] (-> i64) (.nalias (shapes)))
+(defn shape-edge-count [] (-> i64) (al-len [ShapeEdge] (.edges (shapes))))
 
 ;; How many field slots the side array holds. Exported for exactly the reason `ty-kids-len` is: a
 ;; gate asserts that RE-adding an existing field does not grow it, because the array is append-only
 ;; and a leak there would be unbounded in the number of CALLS rather than in program size.
-(defn shape-fields-len [] (-> i64) (al-len [ShapeField] (load (field (shapes) fields))))
+(defn shape-fields-len [] (-> i64) (al-len [ShapeField] (.fields (shapes))))
 
 ;; IS THIS A DEFINED SHAPE. It lives here because the lattice cannot answer it: `Val.shapes` is an
 ;; opaque bitset to `meet`, exactly as `fidxs` is, so a type may name shape 9 while only three
@@ -186,7 +186,7 @@
 (defn shape-rec [(s i64)] (-> ShapeRec)
   (if (shape-defined? s) 0
     (do (shape-panic "shape-rec: not a defined shape id") 0))
-  (al-get (load (field (shapes) recs)) s))
+  (al-get (.recs (shapes)) s))
 
 (defn shape-field-count [(s i64)] (-> i64)
   (let [r (shape-rec s)] (sr-flen r)))
@@ -216,7 +216,7 @@
     (+ (sr-foff r) i)))
 
 (defn shape-field-at [(slot i64)] (-> ShapeField)
-  (al-get (load (field (shapes) fields)) slot))
+  (al-get (.fields (shapes)) slot))
 
 (defn shape-field-name  [(s i64) (i i64)] (-> i64)
   (let [f (shape-field-at (shape-field-slot s i))] (sf-name f)))
@@ -235,12 +235,12 @@
 ;; table holds at most SHAPE-MAX shapes and a handful of names per shape, a scan is deterministic
 ;; with no hash seed anywhere near it, and a HashMap keyed by borrowed bytes would put a KeyOps
 ;; vtable between a name and its id for no measurable gain at this size.
-(defn shape-name-count [] (-> i64) (al-len [i64] (load (field (shapes) noff))))
+(defn shape-name-count [] (-> i64) (al-len [i64] (.noff (shapes))))
 
 (defn shape-name-len [(nid i64)] (-> i64)
   (if (and (>= nid 0) (< nid (shape-name-count))) 0
     (do (shape-panic "shape-name-len: not an interned name id") 0))
-  (al-get (load (field (shapes) nlen)) nid))
+  (al-get (.nlen (shapes)) nid))
 
 ;; The bytes, as a slice into the arena. IT BORROWS: the arena is append-only and never moves a
 ;; live name's bytes, but `al-push!` may REALLOCATE it, so a slice taken before a later intern must
@@ -250,23 +250,23 @@
     (do (shape-panic "shape-name-bytes: not an interned name id") 0))
   (let [p (shapes)
         d (load (field (field p nbytes) data))
-        o (al-get (load (field p noff)) nid)
-        n (al-get (load (field p nlen)) nid)]
+        o (al-get (.noff p) nid)
+        n (al-get (.nlen p) nid)]
     (slice-new [u8] (index d o) n)))
 
 (defn shape-name-eq? [(nid i64) (name (slice u8))] (-> bool)
   (let [p (shapes)
-        n (al-get (load (field p nlen)) nid)]
+        n (al-get (.nlen p) nid)]
     (if (!= n (slice-len name)) false
-      (let [o (al-get (load (field p noff)) nid)
+      (let [o (al-get (.noff p) nid)
             (mut i) 0
             (mut same) true]
         (loop
           (if (or (>= (load i) n) (not (load same))) (break)
-            (do (if (!= (cast i64 (al-get (load (field p nbytes)) (+ o (load i))))
+            (do (if (!= (cast i64 (al-get (.nbytes p) (+ o (load i))))
                         (cast i64 (slice-get name (load i))))
-                    (store! same false) 0)
-                (store! i (+ (load i) 1))
+                    (set! same false) 0)
+                (set! i (+ (load i) 1))
                 0)))
         (load same)))))
 
@@ -277,8 +277,8 @@
   (let [n (shape-name-count) (mut i) 0 (mut found) SHAPE-NO-NAME]
     (loop
       (if (or (>= (load i) n) (!= (load found) SHAPE-NO-NAME)) (break)
-        (do (if (shape-name-eq? (load i) name) (store! found (load i)) 0)
-            (store! i (+ (load i) 1))
+        (do (if (shape-name-eq? (load i) name) (set! found (load i)) 0)
+            (set! i (+ (load i) 1))
             0)))
     (load found)))
 
@@ -286,13 +286,13 @@
   (let [found (shape-name-find name)]
     (if (!= found SHAPE-NO-NAME) found
       (let [p (shapes)
-            o (al-len [u8] (load (field p nbytes)))
+            o (al-len [u8] (.nbytes p))
             n (slice-len name)
             (mut i) 0]
         (loop
           (if (>= (load i) n) (break)
             (do (al-push! [u8] (field p nbytes) (slice-get name (load i)))
-                (store! i (+ (load i) 1))
+                (set! i (+ (load i) 1))
                 0)))
         (al-push! [i64] (field p noff) o)
         (al-push! [i64] (field p nlen) n)
@@ -311,8 +311,8 @@
   (let [n (shape-field-count s) (mut i) 0 (mut found) SHAPE-NO-FIELD]
     (loop
       (if (or (>= (load i) n) (!= (load found) SHAPE-NO-FIELD)) (break)
-        (do (if (= (shape-field-name s (load i)) nid) (store! found (load i)) 0)
-            (store! i (+ (load i) 1))
+        (do (if (= (shape-field-name s (load i)) nid) (set! found (load i)) 0)
+            (set! i (+ (load i) 1))
             0)))
     (load found)))
 
@@ -334,8 +334,8 @@
   (let [n (shape-field-count s) (mut i) 0 (mut found) SHAPE-NO-FIELD]
     (loop
       (if (or (>= (load i) n) (!= (load found) SHAPE-NO-FIELD)) (break)
-        (do (if (= (shape-field-alias s (load i)) alias) (store! found (load i)) 0)
-            (store! i (+ (load i) 1))
+        (do (if (= (shape-field-alias s (load i)) alias) (set! found (load i)) 0)
+            (set! i (+ (load i) 1))
             0)))
     (load found)))
 
@@ -365,8 +365,8 @@
     (loop
       (if (or (>= (load i) n) (!= (load found) -1)) (break)
         (do (let [e (shape-edge-at (load i))]
-              (if (= (se-alias e) a) (store! found (load i)) 0))
-            (store! i (+ (load i) 1))
+              (if (= (se-alias e) a) (set! found (load i)) 0))
+            (set! i (+ (load i) 1))
             0)))
     ; An allocated number with no edge means some second allocator handed it out and did not
     ; record what it names. Answering 0, or the root's non-existent field, would put a load on
@@ -432,38 +432,38 @@
 ;; property that changes silently, which is why the discipline is here rather than an argument that
 ;; it is unnecessary.
 (defstruct FieldBuild [(off i64) (len i64)])
-(defn fb-off [(b FieldBuild)] (-> i64) (load (field b off)))
-(defn fb-len [(b FieldBuild)] (-> i64) (load (field b len)))
+(defn fb-off [(b FieldBuild)] (-> i64) (.off b))
+(defn fb-len [(b FieldBuild)] (-> i64) (.len b))
 
 (defn shape-fields-open [(len i64)] (-> FieldBuild)
   (if (>= len 0) 0
     (do (shape-panic "shape-fields-open: negative field count") 0))
   (let [p (shapes)
-        off (al-len [ShapeField] (load (field p fields)))
+        off (al-len [ShapeField] (.fields p))
         (mut hole) (zeroed ShapeField)
         (mut i) 0
         (mut b) (zeroed FieldBuild)]
-    (store! (field hole name)  SHAPE-UNFILLED)
-    (store! (field hole ty)    SHAPE-UNFILLED)
-    (store! (field hole alias) SHAPE-UNFILLED)
-    (store! (field hole off)   SHAPE-UNFILLED)
+    (set! (.name hole) SHAPE-UNFILLED)
+    (set! (.ty hole) SHAPE-UNFILLED)
+    (set! (.alias hole) SHAPE-UNFILLED)
+    (set! (.off hole) SHAPE-UNFILLED)
     (loop
       (if (>= (load i) len) (break)
         (do (al-push! [ShapeField] (field p fields) (load hole))
-            (store! i (+ (load i) 1))
+            (set! i (+ (load i) 1))
             0)))
-    (store! (field b off) off)
-    (store! (field b len) len)
+    (set! (.off b) off)
+    (set! (.len b) len)
     (load b)))
 
 (defn shape-fields-put! [(b FieldBuild) (i i64) (name i64) (ty i64) (alias i64) (off i64)] (-> i64)
   (if (and (>= i 0) (< i (fb-len b))) 0
     (do (shape-panic "shape-fields-put!: field index outside the reserved window") 0))
   (let [(mut f) (zeroed ShapeField)]
-    (store! (field f name)  name)
-    (store! (field f ty)    ty)
-    (store! (field f alias) alias)
-    (store! (field f off)   off)
+    (set! (.name f) name)
+    (set! (.ty f) ty)
+    (set! (.alias f) alias)
+    (set! (.off f) off)
     (al-set! [ShapeField] (field (shapes) fields) (+ (fb-off b) i) (load f))
     0))
 
@@ -477,7 +477,7 @@
               (if (= (sf-alias f) SHAPE-UNFILLED)
                   (do (shape-panic "shape-fields-close: a field slot was never filled") 0)
                 0))
-            (store! i (+ (load i) 1))
+            (set! i (+ (load i) 1))
             0)))
     ; THE BOUND IS CHECKED BEFORE THE ID IS HANDED OUT. `Val.shapes` is a 64-bit set, so shape 64
     ; has no bit; `t-obj-shape` would abort on it, but only once something tried to TYPE an object
@@ -485,8 +485,8 @@
     (if (< (shape-count) SHAPE-MAX) 0
       (do (shape-panic "shape-fields-close: no shape id left; the lattice's shape bitset is full (SHAPE-MAX)") 0))
     (let [(mut r) (zeroed ShapeRec)]
-      (store! (field r foff) (fb-off b))
-      (store! (field r flen) (fb-len b))
+      (set! (.foff r) (fb-off b))
+      (set! (.flen r) (fb-len b))
       (al-push! [ShapeRec] (field p recs) (load r))
       (- (shape-count) 1))))
 
@@ -500,10 +500,10 @@
 ;; real bound, kept because 4b adds a second allocator (the header word, and later array elements)
 ;; the moment memory ops exist, and at that point the relation stops holding.
 (defn shape-alias-new! [] (-> i64)
-  (let [p (shapes) a (load (field p nalias))]
+  (let [p (shapes) a (.nalias p)]
     (if (< a ALIAS-MAX) 0
       (do (shape-panic "shape-alias-new!: no alias number left; the memory type's alias bitset is full (ALIAS-MAX)") 0))
-    (store! (field p nalias) (+ a 1))
+    (set! (.nalias p) (+ a 1))
     a))
 
 ;; The tree relation, exposed so it is asserted rather than assumed. It is what makes the ALIAS-MAX
@@ -524,17 +524,17 @@
   (let [p (shapes) n (shape-edge-count) (mut i) 0 (mut found) -1]
     (loop
       (if (or (>= (load i) n) (!= (load found) -1)) (break)
-        (do (let [e (al-get (load (field p edges)) (load i))]
+        (do (let [e (al-get (.edges p) (load i))]
               (if (and (= (se-from e) from)
                        (and (= (se-name e) nid) (= (se-ty e) ty)))
-                  (store! found (load i))
+                  (set! found (load i))
                   0))
-            (store! i (+ (load i) 1))
+            (set! i (+ (load i) 1))
             0)))
     (load found)))
 
 (defn shape-edge-at [(i i64)] (-> ShapeEdge)
-  (al-get (load (field (shapes) edges)) i))
+  (al-get (.edges (shapes)) i))
 
 ;; ADD A FIELD, or find the shape that already has it added.
 ;;
@@ -583,17 +583,17 @@
                                (shape-field-ty s (load i))
                                (shape-field-alias s (load i))
                                (shape-field-offset s (load i)))
-            (store! i (+ (load i) 1))
+            (set! i (+ (load i) 1))
             0)))
     (shape-fields-put! b n nid ty alias (shape-offset-of-index n))
     (let [to (shape-fields-close b)
           p  (shapes)
           (mut e) (zeroed ShapeEdge)]
-      (store! (field e from)  s)
-      (store! (field e name)  nid)
-      (store! (field e ty)    ty)
-      (store! (field e alias) alias)
-      (store! (field e to)    to)
+      (set! (.from e) s)
+      (set! (.name e) nid)
+      (set! (.ty e) ty)
+      (set! (.alias e) alias)
+      (set! (.to e) to)
       (al-push! [ShapeEdge] (field p edges) (load e))
       to)))
 
@@ -606,8 +606,8 @@
   (let [n (slice-len names) (mut s) SHAPE-ROOT (mut i) 0]
     (loop
       (if (>= (load i) n) (break)
-        (do (store! s (shape-transition (load s) (slice-get names (load i)) (slice-get tys (load i))))
-            (store! i (+ (load i) 1))
+        (do (set! s (shape-transition (load s) (slice-get names (load i)) (slice-get tys (load i))))
+            (set! i (+ (load i) 1))
             0)))
     (load s)))
 
@@ -638,7 +638,7 @@
                   (dec-print w (shape-field-offset s (load i)))
                   (ps w "/a")
                   (dec-print w (shape-field-alias s (load i)))
-                  (store! i (+ (load i) 1))
+                  (set! i (+ (load i) 1))
                   0))))
         (ps w "}")
         0)))
