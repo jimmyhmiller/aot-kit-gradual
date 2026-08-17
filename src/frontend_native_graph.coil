@@ -360,15 +360,27 @@
 ;; one representation and a value in another -- which is what `o.q = o.p` did whenever `p` and `q`
 ;; disagreed, since the forwarded load handed the store `p`'s boxed word directly. The
 ;; classification is `shape-alias-rep`, the same one the verifier judges by.
+;; THE TAGGED TEST IS THE STRUCTURAL WALK, NOT ONLY `fng-value-tagged?`. That helper's last resort
+;; is `(= (n-ty value) (t-dyn))`, and during construction `n-ty` is a MOMENTARY state that depends
+;; on peephole visit order: a DSL call's result is a fresh Phi whose type may or may not have been
+;; computed by the time the store is lowered. It usually had been -- until a compiler update
+;; changed an unspecified iteration order and `o.x = acc` after `acc += 1` stored the tagged word
+;; raw, with the SOURCE tree unchanged. Same rule as everywhere else in this file: a decision made
+;; at build time keys on SHAPE. `fng-boxed-dynamic-value?` is the shape answer -- it walks to the
+;; Box/ToNumber arms a DSL result actually has, whatever its type currently reads.
 (defn fng-coerce-to-alias [(alias i64) (value i64)] (-> i64)
   (let [rep (shape-alias-rep alias)]
     (cond (= rep REP-TAGGED) (fng-box-dynamic-argument! value)
           (= rep REP-RAW-NUM)
-            (if (fng-value-tagged? value) (n-unbox! value (t-flt)) value)
+            (if (or (fng-value-tagged? value) (fng-boxed-dynamic-value? value))
+                (n-unbox! value (t-flt))
+                value)
           (= rep REP-RAW-PTR)
             ;; Unbox to the slot's own object type, not to a generic pointer: the verifier reads
             ;; the Unbox's target to decide it produced raw-ptr.
-            (if (fng-value-tagged? value) (n-unbox! value (shape-alias-ty alias)) value)
+            (if (or (fng-value-tagged? value) (fng-boxed-dynamic-value? value))
+                (n-unbox! value (shape-alias-ty alias))
+                value)
           :else value)))
 
 ;; Mark array, walk stack, and generation stamp for `fng-boxed-dynamic-value?`, following the
@@ -1783,6 +1795,8 @@
                           FNG-NUMBER
                       (if (and (= kind TSK-CALL) (fng-number-to-string? context node))
                           FNG-STRING
+                      (if (and (= kind TSK-CALL) (fng-number-to-fixed? context node))
+                          FNG-STRING
                           (if (and (= kind TSK-CALL) (fng-array-from? context node))
                               FNG-ARRAY
                           (if (and (= kind TSK-CALL) (fng-array-is-array? context node))
@@ -1826,7 +1840,7 @@
                                                   (fe-find-function-name frontend (ts-child ast callee-node 1))
                                                   (fe-resolution-symbol frontend callee-node))]
                                       (fng-call-result-type
-                                        frontend callee (= kind TSK-NEW-EXPRESSION))))))))))))))))))))))
+                                        frontend callee (= kind TSK-NEW-EXPRESSION)))))))))))))))))))))))
               (= kind TSK-PROPERTY-ACCESS)
                 (if (fng-number-max-safe? context node)
                     FNG-NUMBER
@@ -2842,6 +2856,30 @@
               (fng-expression context (ts-child ast node 1))
               (fng-const 10))]
     (fng-jsl-call2 context "NumberToStringValue" value radix)))
+
+;; `Number.prototype.toFixed`, out of `NumberToFixed` in lib/number/predicates.jsl and the
+;; `%ToFixed` primitive underneath it -- correctly-rounded fixed-point formatting is a runtime
+;; capability the DSL cannot spell, which is exactly what a `%` primitive is for. Both the
+;; receiver and the digit count cross the seam TAGGED: the definition asks ToNumber of one and
+;; ToIntegerOrInfinity of the other, and both of those read tagged words.
+(defn fng-number-to-fixed? [(context FngContext) (node i64)] (-> bool)
+  (let [frontend (load (field context frontend))
+        ast (field frontend ast)
+        callee (ts-child ast node 0)]
+    (and (= (ts-kind ast callee) TSK-PROPERTY-ACCESS)
+         (and (= (fng-infer context (ts-child ast callee 0) FNG-DYNAMIC) FNG-NUMBER)
+              (str-eq (ts-text ast (ts-child ast callee 1)) "toFixed")))))
+
+(defn fng-number-to-fixed [(context FngContext) (node i64)] (-> i64)
+  (let [frontend (load (field context frontend))
+        ast (field frontend ast)
+        callee (ts-child ast node 0)
+        value (fng-expression context (ts-child ast callee 0))
+        digits
+          (if (> (ts-child-count ast node) 1)
+              (fng-expression context (ts-child ast node 1))
+              (fng-const 0))]
+    (fng-jsl-call2 context "NumberToFixed" (n-box! value) (n-box! digits))))
 
 (defn fng-string-from-char-code [(context FngContext) (node i64)] (-> i64)
   (let [frontend (load (field context frontend))
@@ -5347,6 +5385,8 @@
                 (fng-number-convert context node)
             (if (fng-number-to-string? context node)
                 (fng-number-to-string context node)
+            (if (fng-number-to-fixed? context node)
+                (fng-number-to-fixed context node)
                 (if (fng-array-from? context node)
                     (fng-array-from context node)
                 (if (fng-array-is-array? context node)
@@ -5369,7 +5409,7 @@
                         (fng-string-call context node)
                         (if (fng-array-builtin? context node)
                             (fng-array-call context node)
-                            (fng-call context node)))))))))))))))))))
+                            (fng-call context node))))))))))))))))))))
           (= kind TSK-NEW-EXPRESSION)
             (if (fng-error-constructor? context node) (fng-error-constructor context node) (fng-call context node))
           (= kind TSK-OBJECT-LITERAL)

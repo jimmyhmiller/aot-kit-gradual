@@ -642,8 +642,116 @@ static AotJsValue aot_js_number_result(double d) {
   return (AotJsValue)encoded.bits;
 }
 
+/* Exact fixed-point decimal for toFixed, mirroring `tofix-format!` in src/eval.coil: the double
+   is m * 2^e exactly, so round(x * 10^f) is computed exactly with a 16-half (512-bit) integer --
+   multiply by 10^f, then shift left by e, or add 2^(s-1) and shift right by s. Adding half before
+   the shift IS the spec's ties-away-from-zero on the magnitude; snprintf cannot say this (printf
+   rounds ties to even: (2.5).toFixed(0) is "3" in JavaScript and "2" from printf). */
+static JsStringRec *aot_js_to_fixed_format(int neg, uint64_t m, int e, int64_t f) {
+  uint64_t h[16] = {0};
+  h[0] = m & 0xffffffffu;
+  h[1] = m >> 32;
+  for (int64_t i = 0; i < f; ++i) {
+    uint64_t carry = 0;
+    for (int j = 0; j < 16; ++j) {
+      uint64_t t = h[j] * 10u + carry;
+      h[j] = t & 0xffffffffu;
+      carry = t >> 32;
+    }
+  }
+  if (e >= 0) {
+    uint64_t mul = (uint64_t)1 << e, carry = 0; /* e <= 17 below 1e21 */
+    for (int j = 0; j < 16; ++j) {
+      uint64_t t = h[j] * mul + carry;
+      h[j] = t & 0xffffffffu;
+      carry = t >> 32;
+    }
+  } else {
+    int s = -e;
+    if (s >= 400) {
+      /* The working integer has at most 404 bits; shifted 400 the result is zero regardless. */
+      memset(h, 0, sizeof h);
+    } else {
+      int p = s - 1;
+      uint64_t carry = (uint64_t)1 << (p & 31);
+      for (int j = p >> 5; j < 16 && carry; ++j) {
+        uint64_t t = h[j] + carry;
+        h[j] = t & 0xffffffffu;
+        carry = t >> 32;
+      }
+      int w = s >> 5, bshift = s & 31;
+      for (int j = 0; j < 16; ++j) {
+        uint64_t cur = (j + w < 16) ? h[j + w] : 0;
+        uint64_t nxt = (j + w + 1 < 16) ? h[j + w + 1] : 0;
+        h[j] = bshift ? ((cur >> bshift) | ((nxt << (32 - bshift)) & 0xffffffffu)) : cur;
+      }
+    }
+  }
+  char d[160];
+  int len = 0;
+  for (;;) {
+    int all = 1;
+    for (int j = 0; j < 16; ++j)
+      if (h[j]) { all = 0; break; }
+    if (all) break;
+    uint64_t rem = 0;
+    for (int j = 15; j >= 0; --j) {
+      uint64_t cur = (rem << 32) | h[j];
+      h[j] = cur / 10u;
+      rem = cur % 10u;
+    }
+    d[len++] = (char)('0' + rem);
+  }
+  if (!len) d[len++] = '0';
+  int64_t nd = (f + 1 > len) ? f + 1 : len;
+  char out[208];
+  int wpos = 0;
+  if (neg) out[wpos++] = '-';
+  for (int64_t k = nd - 1; k >= 0; --k) {
+    out[wpos++] = (k < len) ? d[k] : '0';
+    if (f > 0 && k == f) out[wpos++] = '.';
+  }
+  out[wpos] = 0;
+  return js_string_ascii(out);
+}
+
 AotJsValue aot_js_string(uintptr_t a, int64_t b,
                          AotJsValue value, uint64_t operation) {
+  if (operation == AOT_JS_VALUE_TO_FIXED) {
+    AotJsValue input = (AotJsValue)a;
+    int64_t f = b;
+    uint64_t tag = aot_js_tag(input);
+    if (f < 0) f = 0;
+    if (f > 100) f = 100; /* the DSL definition range-checks; this is a backstop */
+    JsStringRec *r;
+    if (tag == AOT_JS_INTEGER) {
+      int64_t v = aot_js_unbox_int(input);
+      r = aot_js_to_fixed_format(v < 0, (uint64_t)(v < 0 ? -v : v), 0, f);
+      return r ? (AotJsValue)(uintptr_t)r : AOT_JS_UNDEFINED;
+    }
+    if (tag == AOT_JS_NAN) {
+      r = js_string_ascii("NaN");
+      return r ? (AotJsValue)(uintptr_t)r : AOT_JS_UNDEFINED;
+    }
+    union { uint64_t bits; double number; } dec = { .bits = (uint64_t)input };
+    if (isnan(dec.number)) {
+      r = js_string_ascii("NaN");
+      return r ? (AotJsValue)(uintptr_t)r : AOT_JS_UNDEFINED;
+    }
+    if (isinf(dec.number)) {
+      r = js_string_ascii(signbit(dec.number) ? "-Infinity" : "Infinity");
+      return r ? (AotJsValue)(uintptr_t)r : AOT_JS_UNDEFINED;
+    }
+    if (fabs(dec.number) >= 1e21)
+      return aot_js_string((uintptr_t)dec.bits, 0, 0, AOT_JS_STRING_FROM_DOUBLE_BITS);
+    uint64_t mag = dec.bits & UINT64_C(0x7fffffffffffffff);
+    int neg = (int)(dec.bits >> 63);
+    uint64_t ebits = mag >> 52, frac = mag & ((UINT64_C(1) << 52) - 1);
+    uint64_t m = ebits == 0 ? frac : (frac | (UINT64_C(1) << 52));
+    int e = ebits == 0 ? -1074 : (int)ebits - 1075;
+    r = aot_js_to_fixed_format(neg && m > 0, m, e, f);
+    return r ? (AotJsValue)(uintptr_t)r : AOT_JS_UNDEFINED;
+  }
   if (operation == AOT_JS_VALUE_TO_NUMBER || operation == AOT_JS_VALUE_TO_INTEGER) {
     int ok = 0;
     double d = aot_js_to_number_double((AotJsValue)a, &ok);

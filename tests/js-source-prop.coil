@@ -417,6 +417,42 @@
 " 7) 9))
   0)
 
+;; `Number.prototype.toFixed`, CORRECTLY ROUNDED. The `%ToFixed` primitive computes
+;; round(x * 10^f) exactly on the double's binary decomposition, with the spec's ties-away-from-
+;; zero -- which printf cannot provide (it rounds ties to even, so a printf-based toFixed says
+;; "2" where JavaScript says "3" for (2.5).toFixed(0)). The tie rows are the point of this pin;
+;; every expected value here is node's answer. `(1.005).toFixed(2)` and `(8.575).toFixed(2)` are
+;; the other direction: they LOOK like ties and are not (the doubles sit just below the half), so
+;; a fix that rounded all apparent halves up would fail here.
+;; repros/method-call-on-primitive-receiver.js.
+(deftest to_fixed_rounds_exactly_and_ties_away_from_zero
+  (assert (= (eval-via-source-text "function main(n: number): number {
+  let acc = n | 0;
+  acc += ((0.5).toFixed(0) === \"1\") ? 1 : 100;
+  acc += ((2.5).toFixed(0) === \"3\") ? 1 : 100;
+  acc += ((-1.5).toFixed(0) === \"-2\") ? 1 : 100;
+  acc += ((1.25).toFixed(1) === \"1.3\") ? 1 : 100;
+  acc += ((1.005).toFixed(2) === \"1.00\") ? 1 : 100;
+  acc += ((8.575).toFixed(2) === \"8.57\") ? 1 : 100;
+  acc += ((123.456).toFixed(2) === \"123.46\") ? 1 : 100;
+  acc += ((5).toFixed(3) === \"5.000\") ? 1 : 100;
+  acc += ((-0.4).toFixed(0) === \"-0\") ? 1 : 100;
+  acc += ((0 / 0).toFixed(2) === \"NaN\") ? 1 : 100;
+  acc += ((1 / 0).toFixed(2) === \"Infinity\") ? 1 : 100;
+  acc += ((2).toFixed() === \"2\") ? 1 : 100;
+  return acc | 0;
+}
+" 7) 19))
+  ;; The receiver comes off the DSL's own arithmetic, and the result feeds .length -- the shape
+  ;; the sweep found refused with VERR-CALL-RECEIVER-TAG.
+  (assert (= (eval-via-source-text "function main(n: number): number {
+  let acc = n | 0;
+  { let s = (acc / 4).toFixed(2); acc = (acc + s.length) | 0; }
+  return acc | 0;
+}
+" 7) 11))
+  0)
+
 ;; `unshift` NEVER TERMINATED, at any length including zero: its write-back loop stored at `i + 1`,
 ;; which reaches the end and EXTENDS the receiver, and the loop's bound followed the growing array.
 ;; The bound now comes from the copy, which is written once and never grown.
@@ -761,8 +797,8 @@ function main(n: number): number { return (n + g(6, 2)) | 0; }
     (assert (= (eval-via-ir "abcd" -7) (eval-via-source "abcd" -7)))
     (assert (= (eval-via-ir "abcdefgh" 0) (eval-via-source "abcdefgh" 0)))
     (assert (= (eval-via-ir "zqx" 1099511627775) (eval-via-source "zqx" 1099511627775)))
-    (assert (= (eval-via-ir "\x01\x02\x03" -1099511627775)
-               (eval-via-source "\x01\x02\x03" -1099511627775)))
+    (assert (= (eval-via-ir "\x01;\x02;\x03;" -1099511627775)
+               (eval-via-source "\x01;\x02;\x03;" -1099511627775)))
     ;; and the lifted text is the program it claims to be
     (let [buf (stack (array i8 8192))]
       (assert (str-eq (lift-js! "a" (cast (ptr i8) buf) 8192)

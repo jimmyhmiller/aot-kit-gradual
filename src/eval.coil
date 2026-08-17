@@ -1118,6 +1118,7 @@
                 (StringSplit [] (ev-effect-data n))
                 (StringFromCodeUnit [] (ev-string-from-code-unit n))
                 (NumberToString [] (ev-number-to-string n))
+                (ToFixed [] (ev-to-fixed n))
                 (StringLower [] (ev-string-case n false))
                 (StringUpper [] (ev-string-case n true))
                 (StringIndexOf [] (ev-string-index-of n))
@@ -2192,6 +2193,180 @@
           (if (or (< base 2) (> base 36))
               (do (ev-fail! EV-TYPE n) (RUndef))
               (RStr (jss-from-int-radix! (rt-payload value) base)))))))
+
+; ============================================================================
+; ToFixed: exact fixed-point decimal formatting
+; ============================================================================
+;; CORRECTLY ROUNDED, BY EXACT ARITHMETIC, because snprintf cannot say what the spec says: printf
+;; rounds ties to even where Number.prototype.toFixed rounds them away from zero -- node prints
+;; (2.5).toFixed(0) as "3" and (-1.5).toFixed(0) as "-2", printf says "2" both times. The double
+;; is m * 2^e exactly, so round(x * 10^f) is computed exactly: multiply m by 10^f, then either
+;; shift left by e or add 2^(s-1) and shift right by s (s = -e) -- adding half before the shift IS
+;; ties-away-from-zero on the magnitude. Values are bounded (m < 2^53, f <= 100, e <= 17 below
+;; 1e21), so the working integer fits 404 bits: sixteen 32-bit halves held in i64 slots, every
+;; intermediate product positive and well inside i64.
+(const TOFIX-H i64 16)
+(const TOFIX-BASE i64 4294967296)
+
+(defn tofix-pow2 [(b i64)] (-> i64)
+  (let [(mut r) 1 (mut i) 0]
+    (loop (if (>= (load i) b) (break)
+            (do (store! r (* (load r) 2)) (store! i (+ (load i) 1)) 0)))
+    (load r)))
+
+(defn tofix-mul-small! [(h (ptr i64)) (m i64)] (-> i64)
+  (let [(mut carry) 0 (mut i) 0]
+    (loop (if (>= (load i) TOFIX-H) (break)
+            (do (let [t (+ (* (load (index h (load i))) m) (load carry))]
+                  (store! (index h (load i)) (% t TOFIX-BASE))
+                  (store! carry (/ t TOFIX-BASE)))
+                (store! i (+ (load i) 1))
+                0)))
+    0))
+
+(defn tofix-add-bit! [(h (ptr i64)) (p i64)] (-> i64)
+  (let [(mut i) (/ p 32)
+        (mut carry) (tofix-pow2 (% p 32))]
+    (loop (if (or (>= (load i) TOFIX-H) (= (load carry) 0)) (break)
+            (do (let [t (+ (load (index h (load i))) (load carry))]
+                  (store! (index h (load i)) (% t TOFIX-BASE))
+                  (store! carry (/ t TOFIX-BASE)))
+                (store! i (+ (load i) 1))
+                0)))
+    0))
+
+(defn tofix-shr! [(h (ptr i64)) (s i64)] (-> i64)
+  (let [w (/ s 32)
+        b (% s 32)
+        lo (tofix-pow2 b)
+        hi-mul (if (= b 0) 0 (tofix-pow2 (- 32 b)))
+        (mut i) 0]
+    (loop (if (>= (load i) TOFIX-H) (break)
+            (do (let [src (+ (load i) w)
+                      cur (if (>= src TOFIX-H) 0 (load (index h src)))
+                      nxt (if (>= (+ src 1) TOFIX-H) 0 (load (index h (+ src 1))))]
+                  (store! (index h (load i))
+                          (if (= b 0)
+                              cur
+                              (+ (/ cur lo) (* (% nxt lo) hi-mul)))))
+                (store! i (+ (load i) 1))
+                0)))
+    0))
+
+(defn tofix-zero? [(h (ptr i64))] (-> bool)
+  (let [(mut i) 0 (mut all) true]
+    (loop (if (or (>= (load i) TOFIX-H) (not (load all))) (break)
+            (do (if (!= (load (index h (load i))) 0) (store! all false) 0)
+                (store! i (+ (load i) 1))
+                0)))
+    (load all)))
+
+(defn tofix-divmod10! [(h (ptr i64))] (-> i64)
+  (let [(mut rem) 0 (mut i) (- TOFIX-H 1)]
+    (loop (if (< (load i) 0) (break)
+            (do (let [cur (+ (* (load rem) TOFIX-BASE) (load (index h (load i))))]
+                  (store! (index h (load i)) (/ cur 10))
+                  (store! rem (% cur 10)))
+                (store! i (- (load i) 1))
+                0)))
+    (load rem)))
+
+;; The digit string of round(m * 2^e * 10^f) with the sign and the decimal point placed, as an
+;; interned JSString id. `neg` is the spec's `x < 0` -- negative zero arrives with neg=false.
+(defn tofix-format! [(neg bool) (m i64) (e i64) (f i64)] (-> i64)
+  (let [hb (stack (array i64 16))
+        h (cast (ptr i64) hb)
+        (mut i) 0]
+    (loop (if (>= (load i) TOFIX-H) (break)
+            (do (store! (index h (load i)) 0) (store! i (+ (load i) 1)) 0)))
+    (store! (index h 0) (% m TOFIX-BASE))
+    (store! (index h 1) (/ m TOFIX-BASE))
+    (store! i 0)
+    (loop (if (>= (load i) f) (break)
+            (do (tofix-mul-small! h 10) (store! i (+ (load i) 1)) 0)))
+    (if (>= e 0)
+        (tofix-mul-small! h (tofix-pow2 e))
+        (let [s (- 0 e)]
+          ;; The working integer has at most 404 bits, so a shift of 400 or more leaves zero no
+          ;; matter what the half-bit adds: the value is too small for f digits.
+          (if (>= s 400)
+              (let [(mut z) 0]
+                (loop (if (>= (load z) TOFIX-H) (break)
+                        (do (store! (index h (load z)) 0) (store! z (+ (load z) 1)) 0)))
+                0)
+              (do (tofix-add-bit! h (- s 1)) (tofix-shr! h s) 0))))
+    (let [db (stack (array i8 160))
+          d (cast (ptr i8) db)
+          (mut len) 0]
+      (loop (if (tofix-zero? h) (break)
+              (do (store! (index d (load len)) (cast i8 (+ 48 (tofix-divmod10! h))))
+                  (store! len (+ (load len) 1))
+                  0)))
+      (if (= (load len) 0)
+          (do (store! (index d 0) (cast i8 48)) (store! len 1) 0)
+          0)
+      ;; d holds the digits least-significant first. At least f+1 digits print, zero-padded, with
+      ;; the point after the digit whose index from the least-significant end is f.
+      (let [ndigits (if (> (+ f 1) (load len)) (+ f 1) (load len))
+            ob (stack (array i8 208))
+            o (cast (ptr i8) ob)
+            (mut w) 0
+            (mut k) (- ndigits 1)]
+        (if neg (do (store! (index o 0) (cast i8 45)) (store! w 1) 0) 0)
+        (loop (if (< (load k) 0) (break)
+                (do (store! (index o (load w))
+                            (if (< (load k) (load len))
+                                (load (index d (load k)))
+                                (cast i8 48)))
+                    (store! w (+ (load w) 1))
+                    (if (and (> f 0) (= (load k) f))
+                        (do (store! (index o (load w)) (cast i8 46))
+                            (store! w (+ (load w) 1))
+                            0)
+                        0)
+                    (store! k (- (load k) 1))
+                    0)))
+        (jss-from-utf8! (slice-new [u8] (cast (ptr u8) o) (load w)))))))
+
+(defn ev-to-fixed [(n i64)] (-> RtVal)
+  (let [value (ev-data (n-in n 1))
+        digits (ev-data (n-in n 2))]
+    (if (ev-failed?)
+        value
+        (if (!= (rt-tag digits) RT-INT)
+            (ev-fail! EV-TYPE n)
+            (let [f (rt-payload digits)]
+              (if (or (< f 0) (> f 100))
+                  (ev-fail! EV-TYPE n)
+                  (cond (= (rt-tag value) RT-INT)
+                          (let [v (rt-payload value)]
+                            (RStr (tofix-format! (< v 0) (if (< v 0) (- 0 v) v) 0 f)))
+                        (= (rt-tag value) RT-FLT)
+                          (let [bits (rt-payload value)]
+                            (if (f64-nan-bits? bits)
+                                (RStr (jss-from-utf8! "NaN"))
+                                (let [mag (& bits 9223372036854775807)
+                                      neg (< bits 0)]
+                                  (if (= mag 9218868437227405312)
+                                      (RStr (jss-from-utf8!
+                                              (if neg "-Infinity" "Infinity")))
+                                      ;; At or past 1e21 the spec answers with ToString(x); the
+                                      ;; magnitude comparison is exact on the bit patterns
+                                      ;; because positive doubles order by their bits.
+                                      (if (>= mag (f64-bits 1.0e21))
+                                          (let [s (ev-to-string-value value n)]
+                                            (if (ev-failed?) (RUndef) (RStr s)))
+                                          (let [ebits (/ mag 4503599627370496)
+                                                frac (% mag 4503599627370496)
+                                                m (if (= ebits 0)
+                                                      frac
+                                                      (+ frac 4503599627370496))
+                                                e (if (= ebits 0)
+                                                      -1074
+                                                      (- ebits 1075))]
+                                            (RStr (tofix-format!
+                                                    (and neg (> m 0)) m e f))))))))
+                        :else (ev-fail! EV-TYPE n))))))))
 
 (defn ev-string-case [(n i64) (upper bool)] (-> RtVal)
   (let [string (ev-need-string (ev-data (n-in n 1)) n)]

@@ -38,7 +38,12 @@ enum {
      string record is looked up, like STRICT_EQUAL and TRUTHY. */
   AOT_JS_VALUE_TO_NUMBER = 28,
   AOT_JS_VALUE_TO_INTEGER = 29,
-  AOT_JS_STRING_PARSE_FLOAT = 30
+  AOT_JS_STRING_PARSE_FLOAT = 30,
+  /* 31 is JSSOP-NORMALIZE, serviced elsewhere. */
+  /* Number.prototype.toFixed: a = the tagged number value, b = the digit count (already range-
+     checked by the DSL definition). Mirrors `ev-to-fixed` in src/eval.coil: exact fixed-point
+     conversion on the double's binary decomposition, ties away from zero. */
+  AOT_JS_VALUE_TO_FIXED = 32
 };
 enum {
   AOT_JS_BUILTIN_ABS = 0, AOT_JS_BUILTIN_FLOOR = 1, AOT_JS_BUILTIN_CEIL = 2,
