@@ -110,8 +110,8 @@
   (StringFromCodeUnit)
   (NumberToString)
   (ToFixed)
-  (StringLower)
-  (StringUpper)
+  (StringAlloc)
+  (StringSetUnit)
   (StringIndexOf)
   (StringCompare)
   (JsBuiltin [(descriptor i64)])
@@ -243,8 +243,8 @@
 (const OPTAG-STRINGSPLIT i64 63)  ; (_, memory, string, delimiter, result array) -> memory
 (const OPTAG-STRINGFROMCODEUNIT i64 64)  ; (_, integer) -> one UTF-16 code-unit string
 (const OPTAG-NUMBERTOSTRING i64 65)  ; (_, integer, radix) -> string
-(const OPTAG-STRINGLOWER i64 66)
-(const OPTAG-STRINGUPPER i64 67)
+;; 66 and 67 are retired: StringLower/StringUpper were an ASCII case shift the DSL now writes
+;; over the string atoms (lib/string/case.jsl). Ids are stable — never reused.
 (const OPTAG-STRINGINDEXOF i64 68)  ; (_, haystack, needle, start) -> integer
 (const OPTAG-STRINGCOMPARE i64 69)  ; (_, left, right) -> UTF-16 lexical ordering
 (const OPTAG-JSBUILTIN i64 70)  ; (_, boxed/dynamic arg0, arg1), aux = jsbuiltin descriptor id
@@ -273,9 +273,24 @@
 (const OPTAG-INTERNALSTORE i64 88); (_, property-memory, object, values...), aux = slot operation -> memory
 (const OPTAG-STRINGNORMALIZE i64 89); (_, string, normalization-form) -> string
 (const OPTAG-TOFIXED i64 90); (_, tagged number value, raw digit count) -> string
-(const OPTAG-COUNT i64 91)
+;; The two string ATOMS. Everything else in the string family is a loop over these two, which
+;; is why they are the only ones the DSL cannot be asked to express in terms of something
+;; smaller. A fresh string's units are all zero and, at run time, UNINITIALISED: the runtime
+;; refuses a read until every unit has been written, and refuses a write that is not the next
+;; one in order. That is not a restriction the DSL has to think about -- threading the string
+;; through a loop accumulator produces exactly that order from data dependence alone.
+(const OPTAG-STRINGALLOC i64 91)   ; (_, raw length) -> a fresh string, all units zero
+(const OPTAG-STRINGSETUNIT i64 92) ; (_, string, raw index, raw unit) -> the SAME string
+(const OPTAG-COUNT i64 93)
 
 ;; Temporary serialization/parser boundary while textual graph opcodes are still numeric.
+;; A RETIRED TAG IS A HOLE IN A DENSE, SCANNED ID SPACE. `gparse-op` walks 0..OPTAG-COUNT asking
+;; each tag for its name, so deleting an op mid-table leaves a number that decodes to nothing —
+;; and `op-decode-tag`'s panic on an unknown opcode is worth keeping, so the hole is declared here
+;; instead. The numbers are never reused, so this list only grows.
+(defn op-tag-retired? [(code i64)] (-> bool)
+  (or (= code 66) (= code 67)))  ; StringLower, StringUpper -- lib/string/case.jsl
+
 (defn op-decode-tag [(code i64) (aux i64)] (-> Op)
   (case code
         OPTAG-START (Start)
@@ -345,8 +360,8 @@
         OPTAG-STRINGFROMCODEUNIT (StringFromCodeUnit)
         OPTAG-NUMBERTOSTRING (NumberToString)
         OPTAG-TOFIXED (ToFixed)
-        OPTAG-STRINGLOWER (StringLower)
-        OPTAG-STRINGUPPER (StringUpper)
+        OPTAG-STRINGALLOC (StringAlloc)
+        OPTAG-STRINGSETUNIT (StringSetUnit)
         OPTAG-STRINGINDEXOF (StringIndexOf)
         OPTAG-STRINGCOMPARE (StringCompare)
         OPTAG-JSBUILTIN (JsBuiltin aux)
@@ -440,8 +455,8 @@
     (StringFromCodeUnit [] OPTAG-STRINGFROMCODEUNIT)
     (NumberToString [] OPTAG-NUMBERTOSTRING)
     (ToFixed [] OPTAG-TOFIXED)
-    (StringLower [] OPTAG-STRINGLOWER)
-    (StringUpper [] OPTAG-STRINGUPPER)
+    (StringAlloc [] OPTAG-STRINGALLOC)
+    (StringSetUnit [] OPTAG-STRINGSETUNIT)
     (StringIndexOf [] OPTAG-STRINGINDEXOF)
     (StringCompare [] OPTAG-STRINGCOMPARE)
     (JsBuiltin [descriptor] OPTAG-JSBUILTIN)
@@ -534,8 +549,8 @@
     (StringFromCodeUnit [] 0)
     (NumberToString [] 0)
     (ToFixed [] 0)
-    (StringLower [] 0)
-    (StringUpper [] 0)
+    (StringAlloc [] 0)
+    (StringSetUnit [] 0)
     (StringIndexOf [] 0)
     (StringCompare [] 0)
     (JsBuiltin [descriptor] descriptor)
@@ -637,8 +652,8 @@
     (StringFromCodeUnit [] "StringFromCodeUnit")
     (NumberToString [] "NumberToString")
     (ToFixed [] "ToFixed")
-    (StringLower [] "StringLower")
-    (StringUpper [] "StringUpper")
+    (StringAlloc [] "StringAlloc")
+    (StringSetUnit [] "StringSetUnit")
     (StringIndexOf [] "StringIndexOf")
     (StringCompare [] "StringCompare")
     (JsBuiltin [_] "JsBuiltin")
@@ -750,8 +765,11 @@
     (StringFromCodeUnit [] 98)
     (NumberToString [] 98)
     (ToFixed [] 98)
-    (StringLower [] 98)
-    (StringUpper [] 98)
+    ;; VALUE only. Two `StringAlloc`s of the same length are two DIFFERENT strings, so GVN
+    ;; must never merge them, and a unit store is a mutation, so folding must never run it
+    ;; at build time.
+    (StringAlloc [] 2)
+    (StringSetUnit [] 2)
     (StringIndexOf [] 98)
     (StringCompare [] 98)
     (JsBuiltin [_] 98)
@@ -1634,8 +1652,8 @@
     (StringFromCodeUnit [] (t-str))
     (NumberToString [] (t-str))
     (ToFixed [] (t-str))
-    (StringLower [] (t-str))
-    (StringUpper [] (t-str))
+    (StringAlloc [] (t-str))
+    (StringSetUnit [] (t-str))
     (StringIndexOf [] (t-int))
     (StringCompare [] (t-int))
     (JsBuiltin [descriptor] (t-dyn))
@@ -2336,10 +2354,13 @@
   (n-peephole (n-new3 (NumberToString) NO-NODE value radix)))
 (defn n-to-fixed! [(value i64) (digits i64)] (-> i64)
   (n-peephole (n-new3 (ToFixed) NO-NODE value digits)))
-(defn n-string-lower! [(value i64)] (-> i64)
-  (n-peephole (n-new2 (StringLower) NO-NODE value)))
-(defn n-string-upper! [(value i64)] (-> i64)
-  (n-peephole (n-new2 (StringUpper) NO-NODE value)))
+;; BOTH TAKE A CONTROL. An allocation and a mutation may not float — see `jl-prim`'s string-atom
+;; arm for what a floating one does to the evaluator — so the builder asks for the block rather
+;; than letting a caller forget it.
+(defn n-string-alloc! [(ctrl i64) (length i64)] (-> i64)
+  (n-peephole (n-new2 (StringAlloc) ctrl length)))
+(defn n-string-set-unit! [(ctrl i64) (string i64) (index i64) (unit i64)] (-> i64)
+  (n-peephole (n-new4 (StringSetUnit) ctrl string index unit)))
 (defn n-string-index-of! [(value i64) (needle i64) (start i64)] (-> i64)
   (n-peephole (n-new4 (StringIndexOf) NO-NODE value needle start)))
 (defn n-string-compare! [(left i64) (right i64)] (-> i64)
@@ -3932,8 +3953,8 @@
     (StringFromCodeUnit [] NO-NODE)
     (NumberToString [] NO-NODE)
     (ToFixed [] NO-NODE)
-    (StringLower [] NO-NODE)
-    (StringUpper [] NO-NODE)
+    (StringAlloc [] NO-NODE)
+    (StringSetUnit [] NO-NODE)
     (StringIndexOf [] NO-NODE)
     (StringCompare [] NO-NODE)
     (JsBuiltin [_] NO-NODE)

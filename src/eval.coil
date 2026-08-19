@@ -824,7 +824,9 @@
                       (if (or (op-is? node Call [_])
                               (or (op-is? node PropLoad [_])
                                   (or (op-is? node PropLoadKey [])
-                                      (or (op-is? node ArrayLoad [_]) (ev-effect-op? op-value)))))
+                                      (or (op-is? node ArrayLoad [_])
+                                          (or (ev-effect-op? op-value)
+                                              (ev-cached-value-op? op-value))))))
                           (let [control (ev-effect-control (load i))]
                             (if (>= control 0)
                                 (do
@@ -840,7 +842,9 @@
                               (or (op-is? node New [_])
                                   (or (op-is? node PropLoad [_])
                                       (or (op-is? node PropLoadKey [])
-                                          (or (op-is? node ArrayLoad [_]) (ev-effect-op? op-value))))))
+                                          (or (op-is? node ArrayLoad [_])
+                                              (or (ev-effect-op? op-value)
+                                                  (ev-cached-value-op? op-value)))))))
                           (al-push! [i64] (field p frame-nodes) (load i))
                           0))
                     0))))
@@ -1118,8 +1122,8 @@
                 (StringFromCodeUnit [] (ev-string-from-code-unit n))
                 (NumberToString [] (ev-number-to-string n))
                 (ToFixed [] (ev-to-fixed n))
-                (StringLower [] (ev-string-case n false))
-                (StringUpper [] (ev-string-case n true))
+                (StringAlloc [] (ev-string-atom n))
+                (StringSetUnit [] (ev-string-atom n))
                 (StringIndexOf [] (ev-string-index-of n))
                 (StringCompare [] (ev-string-compare n))
                 (StringNormalize [] (ev-string-normalize n))
@@ -2367,9 +2371,39 @@
                                                     (and neg (> m 0)) m e f))))))))
                         :else (ev-fail! EV-TYPE n))))))))
 
-(defn ev-string-case [(n i64) (upper bool)] (-> RtVal)
-  (let [string (ev-need-string (ev-data (n-in n 1)) n)]
-    (if (ev-failed?) (RUndef) (RStr (jss-ascii-case! string upper)))))
+;; The cache, checked BEFORE the atom runs — the whole point is not to run it twice, and Coil
+;; is strict, so an already-computed argument would defeat that. `ev-enter-effects!` clears the
+;; entry on every arrival at the block, so this is once per DYNAMIC arrival, not once ever.
+(defn ev-string-atom [(n i64)] (-> RtVal)
+  (let [p (ev)]
+    (if (al-get (.hasenv p) n)
+        (al-get (.env p) n)
+        (let [value (match (n-op n)
+                      (StringAlloc [] (ev-string-alloc n))
+                      (StringSetUnit [] (ev-string-set-unit n))
+                      (_ (do (ev-unknown-op n) (RUndef))))]
+          (if (ev-failed?)
+              value
+              (do
+                (al-set! [bool] (field p hasenv) n true)
+                (al-set! [RtVal] (field p env) n value)
+                value))))))
+
+;; The two string atoms. Both take RAW integers -- a length, an index, a code unit -- because
+;; the DSL reaches them through `%StringLen`/`%StringCharCode`, which are raw as well.
+(defn ev-string-alloc [(n i64)] (-> RtVal)
+  (let [length (ev-data (n-in n 1))]
+    (if (!= (rt-tag length) RT-INT)
+        (do (ev-fail! EV-TYPE n) (RUndef))
+        (RStr (jss-alloc! (rt-payload length))))))
+
+(defn ev-string-set-unit [(n i64)] (-> RtVal)
+  (let [string (ev-need-string (ev-data (n-in n 1)) n)
+        index (ev-data (n-in n 2))
+        unit (ev-data (n-in n 3))]
+    (if (or (ev-failed?) (or (!= (rt-tag index) RT-INT) (!= (rt-tag unit) RT-INT)))
+        (do (ev-fail! EV-TYPE n) (RUndef))
+        (RStr (jss-store-unit! string (rt-payload index) (rt-payload unit))))))
 
 (defn ev-string-index-of [(n i64)] (-> RtVal)
   (let [string (ev-need-string (ev-data (n-in n 1)) n)
@@ -2955,6 +2989,18 @@
     (ArrayResize [] true)
     (ArrayCopy [] true)
     (StringSplit [] true)
+    (_ false)))
+
+;; THE STRING ATOMS ARE NOT MEMORY EFFECTS. `ev-effect-op?` above means two things at once —
+;; run me on block entry, and my result IS a memory state to publish — and these two satisfy
+;; only the half nobody names: an allocation and a mutation whose result is a STRING. What
+;; they need is a `Call`'s treatment: on the per-control chain so each arrival clears the
+;; cache, computed on demand, then cached so a second demand does not allocate a second
+;; string or write the same unit twice.
+(defn ev-cached-value-op? [(op Op)] (-> bool)
+  (match op
+    (StringAlloc [] true)
+    (StringSetUnit [] true)
     (_ false)))
 
 ;; A memory-effect node may be demanded by several downstream tokens, but its mutation executes

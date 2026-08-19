@@ -1,16 +1,34 @@
-;; Immutable JavaScript strings stored as UTF-16 code units.  Source text arrives as UTF-8, but
-;; every observable JavaScript index and length is defined over UTF-16 units.
+;; JavaScript strings stored as UTF-16 code units.  Source text arrives as UTF-8, but every
+;; observable JavaScript index and length is defined over UTF-16 units.
+;;
+;; A string is IMMUTABLE ONCE BUILT, and building is the one exception: `jss-alloc!` answers a
+;; string whose units are not written yet and `jss-store-unit!` fills them in ascending order.
+;; Nothing may observe one in between — that is what `filled` is for, and both reads below
+;; refuse a partial string exactly as the native runtime does.
 (module jsstring)
 
 (import "coil.alloc" :use * :as alloc)
 (import "coil.arraylist" :use *)
 (import "coil.slice" :use *)
 (import "jsvalue" :use *)
+(import "coil.io" :use *)
+(import "coil.control" :use *)
+(import "coil.fmt" :use *)
+
+(defn jss-panic! [(msg (slice u8))] (-> i64)
+  (let [w (stderr)] (print-str w "string heap: ") (print-str w msg) (print-str w "\n"))
+  (abort)
+  0)
 
 (const JSS-NONE i64 -1)
 (const JSS-REPLACEMENT i64 65533)
 
-(defstruct JsString [(start i64) (length i64)])
+;; `filled` is how many units have been WRITTEN. Every string built by `jss-new-window!`
+;; arrives complete; only `jss-alloc!` produces one that is not, and `jss-store-unit!` fills
+;; it in ascending order. The native runtime keeps the same counter and refuses both an
+;; out-of-order write and a read of a partial string, so the evaluator has to refuse them too
+;; or a DSL definition that writes out of order would pass here and produce garbage natively.
+(defstruct JsString [(start i64) (length i64) (filled i64)])
 (defstruct JsStringHeap
   [(strings (ArrayList JsString))
    (units (ArrayList u16))
@@ -33,7 +51,7 @@
   0)
 
 (defn jss-record-make [(start i64) (length i64)] (-> JsString)
-  (JsString :start start :length length))
+  (JsString :start start :length length :filled length))
 
 (defn jss-valid? [(string i64)] (-> bool)
   (and (>= string 0) (< string (al-len [JsString] (.strings (jss-heap))))))
@@ -43,7 +61,13 @@
 
 (defn jss-length [(string i64)] (-> i64)
   (if (jss-valid? string)
-      (let [record (jss-record string)] (.length record))
+      (let [record (jss-record string)]
+        ;; The read side of the build discipline, and `jss-code-unit` inherits it by asking for the
+        ;; length first: a string with a hole in it is not observable, natively or here.
+        (if (!= (.filled record) (.length record))
+            (jss-panic! "jss-length: a string is read before all its units are written")
+            0)
+        (.length record))
       0))
 
 (defn jss-code-unit [(string i64) (index i64)] (-> i64)
@@ -54,6 +78,48 @@
               (al-get [u16]
                       (.units (jss-heap))
                       (+ (.start record) index))))))
+
+;; ATOM: a fresh string of `length` zero units, none of them written yet.
+(defn jss-alloc! [(length i64)] (-> i64)
+  (let [heap (jss-heap)
+        size (if (< length 0) 0 length)
+        first (al-len [u16] (.units heap))
+        id (al-len [JsString] (.strings heap))
+        (mut index) 0]
+    (loop (if (>= (load index) size)
+              (break)
+              (do
+                (al-push! [u16] (field heap units) (cast u16 0))
+                (set! index (+ (load index) 1)))))
+    (al-push! [JsString] (field heap strings) (JsString :start first :length size :filled 0))
+    id))
+
+;; ATOM: write one unit and answer the SAME string. The index must be the next unwritten one --
+;; a DSL definition that discards the returned string, or writes out of order, loses the data
+;; dependence that orders these writes at all, and the failure is reported here rather than
+;; silently producing a string with a hole in it.
+(defn jss-store-unit! [(string i64) (index i64) (unit i64)] (-> i64)
+  (if (not (jss-valid? string))
+      (jss-panic! "jss-store-unit!: not a string")
+      0)
+  (let [record (jss-record string)]
+    (if (or (!= index (.filled record)) (>= index (.length record)))
+        (do (fmt (stderr) "  string={d} index={d} filled={d} length={d}\n"
+                 string index (.filled record) (.length record))
+            (jss-panic! "jss-store-unit!: units must be written in ascending order from 0"))
+        0)
+    ;; The native runtime refuses a unit outside u16 rather than truncating it, so refuse it here
+    ;; too — a masked write would agree with node in the evaluator and disagree in the product.
+    (if (or (< unit 0) (> unit 65535))
+        (do (fmt (stderr) "  unit={d}\n" unit)
+            (jss-panic! "jss-store-unit!: a code unit outside 0..65535"))
+        0)
+    (al-set! [u16] (field (jss-heap) units) (+ (.start record) index) (cast u16 unit))
+    (al-set! [JsString]
+             (field (jss-heap) strings)
+             string
+             (JsString :start (.start record) :length (.length record) :filled (+ index 1)))
+    string))
 
 (defn jss-new-window! [(source (ptr (ArrayList u16))) (start i64) (length i64)] (-> i64)
   (let [heap (jss-heap)
@@ -248,25 +314,6 @@
   (let [(mut units) (al-new [u16] (malloc-allocator))]
     (al-push! [u16] (mut units) (cast u16 (& value 65535)))
     (let [result (jss-new-window! (mut units) 0 1)]
-      (al-free! [u16] (mut units))
-      result)))
-
-(defn jss-ascii-case! [(string i64) (upper bool)] (-> i64)
-  (let [(mut units) (al-new [u16] (malloc-allocator))
-        (mut index) 0]
-    (loop (if (>= (load index) (jss-length string))
-              (break)
-              (let [unit (jss-code-unit string (load index))]
-                (al-push! [u16]
-                          (mut units)
-                          (cast u16
-                                (if (and upper (and (>= unit 97) (<= unit 122)))
-                                    (- unit 32)
-                                    (if (and (not upper) (and (>= unit 65) (<= unit 90)))
-                                        (+ unit 32)
-                                        unit))))
-                (set! index (+ (load index) 1)))))
-    (let [result (jss-new-window! (mut units) 0 (al-len [u16] (load units)))]
       (al-free! [u16] (mut units))
       result)))
 

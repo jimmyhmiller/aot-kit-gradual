@@ -910,19 +910,6 @@ AotJsValue aot_js_string(uintptr_t a, int64_t b,
     aot_unicode_free(units);
     return (AotJsValue)(uintptr_t)result;
   }
-  if (operation == AOT_JS_STRING_TO_LOWER_ASCII ||
-      operation == AOT_JS_STRING_TO_UPPER_ASCII) {
-    JsStringRec *result = js_string_window(left, 0, left->length);
-    if (!result) return AOT_JS_UNDEFINED;
-    for (size_t i = 0; i < result->length; ++i) {
-      uint16_t unit = result->units[i];
-      if (operation == AOT_JS_STRING_TO_LOWER_ASCII && unit >= 'A' && unit <= 'Z')
-        result->units[i] = (uint16_t)(unit + ('a' - 'A'));
-      if (operation == AOT_JS_STRING_TO_UPPER_ASCII && unit >= 'a' && unit <= 'z')
-        result->units[i] = (uint16_t)(unit - ('a' - 'A'));
-    }
-    return (AotJsValue)(uintptr_t)result;
-  }
   if (operation == AOT_JS_STRING_PARSE_FLOAT) {
     size_t start = 0;
     while (start < left->length && (left->units[start] == ' ' ||

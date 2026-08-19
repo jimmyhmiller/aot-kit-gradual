@@ -158,8 +158,7 @@
 (const JSP-STRINGINDEXOF    i64 21)
 (const JSP-STRINGCOMPARE    i64 22)
 (const JSP-STRINGFROMCODE   i64 23)
-(const JSP-STRINGLOWER      i64 24)
-(const JSP-STRINGUPPER      i64 25)
+;; 24 and 25 are retired: `%StringLower`/`%StringUpper` are lib/string/case.jsl now.
 (const JSP-TOSTRING         i64 26)
 (const JSP-PARSEINT         i64 27)
 (const JSP-ISNAN            i64 28)
@@ -249,7 +248,17 @@
 (const JSP-UNBOXNUMBER      i64 92)
 (const JSP-ISNUMBER         i64 91)
 (const JSP-TOFIXED          i64 93)
-(const JSP-COUNT            i64 94)
+;; The string atoms. `%StringNew` answers a fresh string whose units must then be written in
+;; ascending order by `%StringSetUnit`, which answers the SAME string so the writes order
+;; themselves by data dependence: `(recur (%Add i 1) (%StringSetUnit out i u))`.
+(const JSP-STRINGNEW        i64 94)
+(const JSP-STRINGSETUNIT    i64 95)
+(const JSP-COUNT            i64 96)
+
+;; Retired primitive ids, for the reason `op-tag-retired?` exists: this space is dense and
+;; scanned, and `jsp-op` panics on an id with no row. Never reused.
+(defn jsp-retired? [(id i64)] (-> bool)
+  (or (= id 24) (= id 25)))  ; %StringLower, %StringUpper -- lib/string/case.jsl
 
 (defn jsp-name [(id i64)] (-> (slice u8))
   (case id
@@ -277,8 +286,6 @@
         JSP-STRINGINDEXOF  "%StringIndexOf"
         JSP-STRINGCOMPARE  "%StringCompare"
         JSP-STRINGFROMCODE "%StringFromCode"
-        JSP-STRINGLOWER    "%StringLower"
-        JSP-STRINGUPPER    "%StringUpper"
         JSP-TOSTRING       "%ToString"
         JSP-PARSEINT       "%ParseInt"
         JSP-ISNAN          "%IsNaN"
@@ -347,6 +354,8 @@
         JSP-STRINGNORMALIZE "%StringNormalize"
         JSP-BOXARRAY       "%BoxArray"
         JSP-TOFIXED        "%ToFixed"
+        JSP-STRINGNEW      "%StringNew"
+        JSP-STRINGSETUNIT  "%StringSetUnit"
         "<unknown jsl primitive>"))
 
 (defn jsp-op [(id i64)] (-> Op)
@@ -375,8 +384,6 @@
         JSP-STRINGINDEXOF  (StringIndexOf)
         JSP-STRINGCOMPARE  (StringCompare)
         JSP-STRINGFROMCODE (StringFromCodeUnit)
-        JSP-STRINGLOWER    (StringLower)
-        JSP-STRINGUPPER    (StringUpper)
         JSP-TOSTRING       (ToString)
         JSP-PARSEINT       (ParseInt)
         JSP-ISNAN          (IsNaN)
@@ -445,6 +452,8 @@
         JSP-STRINGNORMALIZE (StringNormalize)
         JSP-BOXARRAY       (Box (jsp-aux id))
         JSP-TOFIXED        (ToFixed)
+        JSP-STRINGNEW      (StringAlloc)
+        JSP-STRINGSETUNIT  (StringSetUnit)
         (do (panic-corrupt "jsp-op: unknown primitive id") (Start))))
 
 ;; How many OPERANDS the primitive takes. Slot 0 of every one of these ops is the ordinary control
@@ -475,8 +484,6 @@
         JSP-STRINGINDEXOF  3
         JSP-STRINGCOMPARE  2
         JSP-STRINGFROMCODE 1
-        JSP-STRINGLOWER    1
-        JSP-STRINGUPPER    1
         JSP-TOSTRING       1
         JSP-PARSEINT       2
         JSP-ISNAN          1
@@ -545,6 +552,8 @@
         JSP-STRINGNORMALIZE 2
         JSP-BOXARRAY       1
         JSP-TOFIXED        2
+        JSP-STRINGNEW      1
+        JSP-STRINGSETUNIT  3
         -1))
 
 ;; The aux word a primitive's node carries. Almost every op takes 0, but `OPTAG-TYPETEST` takes the
@@ -651,7 +660,12 @@
     (loop (if (or (>= (load id) JSP-COUNT) (!= (load found) JSP-NONE))
               (break)
               (do
-                (if (= name (jsp-name (load id))) (set! found (load id)) 0)
+                ;; A retired id has no name row, so every one of them would answer the same
+                ;; "<unknown>" marker and the first would win a lookup for it. Skip them: a
+                ;; retired primitive cannot be reached by name from anywhere.
+                (if (and (not (jsp-retired? (load id))) (= name (jsp-name (load id))))
+                    (set! found (load id))
+                    0)
                 (set! id (+ (load id) 1)))))
     (load found)))
 

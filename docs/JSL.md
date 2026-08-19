@@ -380,8 +380,12 @@ The layer is deliberately thin, and it is the whole porting surface:
 
 - arithmetic and comparison — `%Add %Sub %Mul %Div %Mod %Neg %Not %Eq %Lt %Le`
 - bitwise — `%BitAnd %BitOr %BitXor %Shl %Shr %Ushr %BitNot`
-- strings — `%StringLen %StringEq %StringConcat %StringCharCode %StringIndexOf %StringCompare
-  %StringFromCode %StringLower %StringUpper`
+- string ATOMS — `%StringNew %StringSetUnit %StringLen %StringCharCode`. These four are the
+  irreducible set: allocate, write one unit in order, ask the length, read one unit. Everything
+  else about a string is a loop over them, written in `lib/` (`lib/string/case.jsl` is the first
+  and smallest example). See docs/DEMOLITION.md.
+- strings, still primitive and owed a DSL definition — `%StringEq %StringConcat %StringIndexOf
+  %StringCompare %StringFromCode` (strikes 2 and 4)
 - conversions — `%ToString %ToInteger %ParseInt %IsNaN %NumberToString`
 - heap — `%NewArray %ArrayLen %ArrayLoad %ArrayStore %ArrayResize %PropLoadNamed
   %PropStoreNamed`

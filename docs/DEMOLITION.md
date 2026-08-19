@@ -212,14 +212,27 @@ wrong once already.
 - **GVN and allocation**: any op that creates identity or mutates gets op-class 2, never 98.
 - **Do not delete** `JSSOP-NEW`/`SET-UNIT` runtime cases, `ms-select-string-id!`, the GC, or
   the trampoline. `jss-from-utf8!`/`jss-utf8!` stay (the evaluator's own I/O needs them).
+- **AN ALLOCATION OR A MUTATION MUST BE CONTROL-PINNED, and op-class 2 is not enough** (S0 cost an
+  hour here). The evaluator is demand-driven and recomputes an ordinary value node at EVERY
+  demand, so a floating `%StringNew` allocates a second string and a floating `%StringSetUnit`
+  writes the same unit twice — `jss-store-unit!` reports exactly that, by design. Two things fix
+  it together: lower the primitive with `(jl-ctrl)` as slot 0 (see `jl-prim`'s string-atom arm),
+  and put the op on the evaluator's per-control chain so each arrival clears its cache
+  (`ev-cached-value-op?` + `ev-string-atom`). Do NOT reach for `ev-effect-op?` — that list means
+  "runs on block entry AND its result is a memory state to publish", and an atom answering a
+  string fails the second half with `EV-MEM`.
+- **A DELETED OP LEAVES A HOLE IN A DENSE, SCANNED ID SPACE.** `gparse-op` walks every OPTAG and
+  `jsp-find` walks every JSP id, so a retired number must be declared — `op-tag-retired?`
+  (node.coil) and `jsp-retired?` (jsl.coil) — or the parser aborts on its own table. Add the
+  number to the list in the same commit that retires it.
 
 ## Part 6 — Progress ledger (update per strike, with commit hashes)
 
 | strike | status | eval.coil | runtime.c | notes |
 |---|---|---|---|---|
 | baseline | — | 4330 | 2274 | 2026-08-16 |
-| S0 atoms | open | | | |
-| S1 case | open | | | |
+| S0 atoms | **done** | 4373 | 2274 | 2026-08-18. `StringAlloc`/`StringSetUnit`, OPTAGs 91/92, JSP 94/95. Registration ADDS lines; the deletions start at S1. |
+| S1 case | **done** | 4373 | 2261 | 2026-08-18. lib/string/case.jsl is a loop over the atoms; `StringLower`/`StringUpper`, `ev-string-case`, `jss-ascii-case!`, JSSOP 21/22 and the C case are gone. |
 | S2 build/compare | open | | | |
 | S3 substring | open | | | |
 | S4 search | open | | | |

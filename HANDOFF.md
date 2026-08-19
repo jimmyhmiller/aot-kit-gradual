@@ -1,6 +1,12 @@
 # Handoff: move JavaScript semantics into the DSL
 
-**THE TREE IS GREEN. 566 passed, 0 failed.** The operator migration is essentially COMPLETE:
+**THE TREE IS GREEN. 568 passed, 0 failed.** THE DEMOLITION HAS STARTED: strikes 0 and 1 of
+`docs/DEMOLITION.md` are done (2026-08-18) — the string atoms exist, and `toLowerCase`/
+`toUpperCase` are a DSL loop written over them with both hand-written copies deleted. **Strike 2
+(`StringFromCodeUnit`, `StringConcat`, `StringEq`) is next**, and the two traps S0 paid for are
+now written down in DEMOLITION Part 5; read them before writing another atom-level definition.
+
+The operator migration before it is COMPLETE:
 every JavaScript operator the frontend lowers — arithmetic, comparison, equality, bitwise,
 logical not, `++`/`--`, `instanceof`, spread — reaches its meaning through `lib/`. `DSL-OWED` is
 EMPTY. What remains is Phase 1/5 enforcement residue and two feature gaps, listed at the end.
@@ -41,6 +47,28 @@ end-to-end; the helper only boxes a raw string pointer). Three remain — `fng-n
 (`fng-expression-expected`), array index/length positions, and parameter defaults.
 
 ## What landed this session, most recent first
+
+- **DEMOLITION S0 — the string atoms.** `StringAlloc`/`StringSetUnit` (OPTAG 91/92, JSP 94/95,
+  `%StringNew`/`%StringSetUnit`, JSSOP 0/1 which the C already had). The evaluator's string heap
+  grew a `filled` counter and refuses BOTH an out-of-order write and a read of a partial string,
+  because the native runtime already refused both and a silent divergence there would only show
+  up in the product. Two traps, both now in DEMOLITION Part 5: an allocation or mutation must be
+  CONTROL-PINNED (`(jl-ctrl)` in `jl-prim`) *and* on the evaluator's per-control cache chain
+  (`ev-cached-value-op?`), because the evaluator recomputes a floating value node at every demand
+  — op-class 2 is necessary and not sufficient; and `ev-effect-op?` is the WRONG list to join,
+  since it means "publishes a memory state" and an atom answering a string fails that with
+  `EV-MEM`.
+- **DEMOLITION S1 — case.** `lib/string/case.jsl` is a loop over the atoms; ops `StringLower`/
+  `StringUpper`, `ev-string-case`, `jss-ascii-case!`, JSSOP 21/22 and the C case are all gone
+  (runtime.c 2,274 → 2,261). The file's old comment claimed case mapping was an irreducible
+  Unicode table — it was an ASCII shift open-coded twice, and the comment now says so. Retiring
+  an op leaves a hole in a DENSE SCANNED id space: `op-tag-retired?` and `jsp-retired?` declare
+  it, or `gparse-op`/`jsp-find` walk into a number with no row.
+- **The syntax migration's one casualty**: the Aug 17 commit stripped the leading spaces inside a
+  multi-line string literal in `tests/js-source-prop.coil`, so the lifted-JS pin no longer matched
+  the emitter. Restored. The rest of that commit's reindentation was code, not string content.
+
+### Before the demolition, the operator migration
 
 - **`++`/`--`** are `ToNumberValue` then `JsAdd`/`JsSub` (spec: ToNumeric then a NUMERIC add,
   never concat; postfix returns the COERCED old value). The write-back representation stays the
@@ -110,7 +138,12 @@ new code:
 
 ## Next, in order
 
-1. **Phase 1 residue**: convert the three remaining coercion helpers' sites to unconditional
+1. **DEMOLITION strike 2** — `StringFromCodeUnit`, `StringConcat`, `StringEq` as DSL loops over
+   the atoms, then delete the three ops and both copies of each. `%StringConcat` has 52 uses in
+   `lib/` and `%StringEq` 6, all of which stay as calls to the new `builtin`s. This is the first
+   strike where `ns.js` (2:07 today, gate budget ~2 minutes) may go over: raise the budget in the
+   protocol deliberately rather than treating it as a hang. Then S3–S8 in order.
+2. **Phase 1 residue**: convert the three remaining coercion helpers' sites to unconditional
    DSL calls (`ToNumberValue`/`ToInt32`) and let folding remove them — the mandate's own
    prescription — then delete the helpers. Then **split `Op`** so arithmetic/comparison/bitwise
    variants are unnameable outside `jsl_lower` (big mechanical refactor across node/eval/verify/

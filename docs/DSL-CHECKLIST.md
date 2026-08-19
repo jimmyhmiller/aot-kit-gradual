@@ -102,6 +102,9 @@ and `native/gc/runtime.c` + `js-value.h` (~2,300 lines C).
       from-undefined/parse-int/is-nan/split/is-nan-value/from-code-unit/from-int-radix/
       from-double-bits/lower/upper/index-of/compare/from-value/parse-float/normalize; eval
       twins in `jsstring.coil` + `ev-string-*`).
+      *Progress:* S0 exposed the two ATOMS (`%StringNew`/`%StringSetUnit`, ops 0/1 — these two
+      stay; they are what everything else is written over). S1 deleted `lower`/`upper` (21/22)
+      and both hand-written copies: `lib/string/case.jsl` is the only ASCII case shift left.
 - [ ] E3. (DEMOLITION S6–S7) Number→string formatting CONFORMANT and single-sourced in the DSL: shortest-round-trip
       ToString (today `%.17g` noise natively, no exponential form in eval —
       repros/open/large-double-tostring-not-exponential.js). **Done when:** that repro moves
