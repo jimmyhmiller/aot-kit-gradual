@@ -1,0 +1,255 @@
+(module nativedifferentialtest)
+;; EVERY METHOD THE FRONTEND DISPATCHES, RUN ON THE CPU, AGAINST NODE.
+;;
+;; `tests/native-capability-test.coil` answers "does it compile" for 216 cells and says so at
+;; length: compiling is the CEILING, not the floor. This file answers the stronger question for the
+;; same derived list -- does the compiled program compute what node computes -- and it is the only
+;; place in the repo that asks it of more than a handful of cases.
+;;
+;; THE PROBE HASHES THE RESULT'S STRING FORM, character by character. Comparing `String(r).length`
+;; is what the first draft of the array test did, and it is blind to exactly the thing these
+;; definitions decide: changing `join`'s separator from "," to ";" left every test green. A rolling
+;; hash over `String(r)` fails on any difference in any character.
+;;
+;; ONE PROGRAM, ONE BINARY, ONE ASSESSMENT. macOS spends ~0.69s assessing the first execution of a
+;; freshly linked binary and 3ms on every execution after it, so a file that linked one binary per
+;; method would spend three minutes doing nothing else. `main` switches on its argument instead:
+;; every probe is compiled into one program, the binary is linked once, and each case is one more
+;; run of it. The node side is `native/js-oracle/oracle.c`, one node process for the whole file.
+;;
+;; A method whose probe does not COMPILE is skipped and counted, not failed -- that is the other
+;; file's question, and it is answered there against a checked-in report.
+(import "ty" :use *)
+(import "node" :use *)
+(import "shape" :use *)
+(import "jsstring" :use *)
+(import "frontendnative" :use *)
+(import "frontendnativegraph" :use *)
+(import "backend_core" :use *)
+(import "nativeharness" :use *)
+(import "coil.assert" :use *)
+(import "coil.io" :use *)
+(import "coil.fmt" :use *)
+(import "coil.slice" :use *)
+(import "coil.str" :use *)
+(import "coil.alloc" :use * :as alloc)
+(import "coil.control" :use *)
+(import "coil.arraylist" :use *)
+(import "coil.fs" :use *)
+
+;; The argument ladder, the same shapes `native-capability-test` probes with. A method is tried at
+;; the arity the frontend's own table states, and the first candidate whose program compiles is the
+;; one this file then RUNS.
+(defn dif-args [(i i64)] (-> (slice u8))
+  (case i
+    0 ""
+    1 "1"
+    2 "\"b\""
+    3 "1, 2"
+    4 "\"b\", \"c\""
+    5 "x => x"
+    6 "(p, c) => p + c, 0"
+    ""))
+(defn dif-args-count [] (-> i64) 7)
+(defn dif-args-arity [(i i64)] (-> i64)
+  (case i 0 0  1 1  2 1  3 2  4 2  5 1  6 2  -1))
+
+;; One probe's statement. `String(r)` then a rolling hash of its characters, so the comparison sees
+;; the whole result rather than its length. `| 0` everywhere keeps it in int32, which is what the
+;; kernel returns and what node's `String(main(k))` prints.
+(defn dif-statement! [(w (ptr Writer)) (receiver (slice u8)) (method (slice u8)) (args (slice u8))] (-> i64)
+  (fmt w "let v = {s}; let r: any = v.{s}({s}); let s = String(r); let h = s.length | 0;"
+       receiver method args)
+  (ps w " for (let i = 0; i < s.length; i = i + 1) { h = (h * 31 + s.charCodeAt(i)) | 0; }")
+  (ps w " acc = (acc + h) | 0;")
+  0)
+
+(defn dif-one-source! [(buf (ptr i8)) (cap i64) (receiver (slice u8)) (method (slice u8)) (args (slice u8))] (-> (slice u8))
+  (let [fb (alloc/stack FixBuf) w (alloc/stack Writer)]
+    (set! (.data fb) buf) (set! (.cap fb) cap) (set! (.len fb) 0)
+    (fixed-buffer-writer w fb)
+    (ps w "function main(n: number): number { let acc = n | 0; {")
+    (dif-statement! w receiver method args)
+    (ps w " } return acc | 0; }")
+    (slice-new [u8] (cast (ptr u8) buf) (load (field fb len)))))
+
+;; Which argument list to use for this method: the first one, at the arity the frontend states,
+;; whose single-method program compiles. -1 means none did, and the method is skipped.
+(defn dif-choose-args [(receiver (slice u8)) (method (slice u8)) (arity i64)] (-> i64)
+  (let [buf (alloc/stack (array i8 1024))
+        (mut i) 0
+        (mut chosen) -1]
+    (loop (if (or (>= (load i) (dif-args-count)) (>= (load chosen) 0))
+              (break)
+              (do
+                (if (if (< arity 0)
+                        (> (dif-args-arity (load i)) 0)
+                        (= (dif-args-arity (load i)) arity))
+                    (let [source (dif-one-source! (cast (ptr i8) buf) 1024 receiver method (dif-args (load i)))]
+                      ;; NODE HAS TO ANSWER IT, not just the compiler. `"abcdef".normalize(1)` is a
+                      ;; RangeError -- "1" is not a normalization form -- and a program node refuses
+                      ;; to run has no answer to compare against, so it is not a fair probe of
+                      ;; `normalize`. Requiring both narrows the ladder to arguments that are
+                      ;; JavaScript as well as compilable.
+                      (if (nh-try-compile? source)
+                          (let [ok (alloc/stack bool)]
+                            (set! ok true)
+                            (nh-node-answer source 0 ok)
+                            (if (load ok) (set! chosen (load i)) 0))
+                          0))
+                    0)
+                (set! i (+ (load i) 1))
+                0)))
+    (load chosen)))
+
+(defstruct DifCase
+  [(receiver (slice u8))
+   (method   (slice u8))
+   (args     (slice u8))])
+
+;; Every case the frontend dispatches and the backend can compile, in one array.
+(defn dif-collect! [(receiver (slice u8)) (header (slice u8)) (cases (mut (ArrayList DifCase)))
+                    (skipped (ptr i64))] (-> i64)
+  (let [a (malloc-allocator)
+        text (nh-read-text a "src/frontend_native_graph.coil")
+        (mut names) (al-new [(slice u8)] (malloc-allocator))
+        (mut arities) (al-new [i64] (malloc-allocator))
+        (mut i) 0]
+    (nh-collect-names! text header (mut names) (mut arities))
+    (loop (if (>= (load i) (al-len [(slice u8)] (load names)))
+              (break)
+              (do
+                (let [method (al-get [(slice u8)] (load names) (load i))
+                      pick (dif-choose-args receiver method (al-get [i64] (load arities) (load i)))]
+                  (if (< pick 0)
+                      (set! skipped (+ (load skipped) 1))
+                      (let [c (alloc/stack DifCase)]
+                        (set! (.receiver c) receiver)
+                        (set! (.method c) method)
+                        (set! (.args c) (dif-args pick))
+                        (al-push! [DifCase] (mut cases) (load c)))))
+                (set! i (+ (load i) 1))
+                0)))
+    (al-free! [(slice u8)] (mut names))
+    (al-free! [i64] (mut arities))
+    0))
+
+;; The combined program: one guarded block per case, selected by the argument.
+;; ONE PROGRAM PER CHUNK, and the chunk size is a measured compromise between the two costs.
+;; Linking is per PROGRAM -- macOS charges ~0.69s to assess each new binary -- so bigger chunks are
+;; cheaper there. Compiling is SUPERLINEAR in program size: all 54 probes in one function took 45s
+;; against about 6s for the same probes spread over seven, because the analyse/fold fixpoint runs
+;; over the whole graph. Eight is where the two meet on this machine.
+(defn dif-chunk-size [] (-> i64) 8)
+
+(defn dif-program! [(buf (ptr i8)) (cap i64) (cases (ArrayList DifCase)) (from i64) (upto i64)] (-> (slice u8))
+  (let [fb (alloc/stack FixBuf) w (alloc/stack Writer)
+        (mut i) from]
+    (set! (.data fb) buf) (set! (.cap fb) cap) (set! (.len fb) 0)
+    (fixed-buffer-writer w fb)
+    (ps w "function main(n: number): number { let acc = 0;\n")
+    (loop (if (>= (load i) upto)
+              (break)
+              (do
+                (let [c (al-get [DifCase] cases (load i))]
+                  (fmt w "  if (n === {d}) {{ " (- (load i) from))
+                  (dif-statement! w (.receiver c) (.method c) (.args c))
+                  (ps w " }\n"))
+                (set! i (+ (load i) 1))
+                0)))
+    (ps w "  return acc | 0;\n}\n")
+    (let [n (load (field fb len))]
+      (if (>= n cap) (do (fmt (stderr) "native-differential: program buffer too small\n") (abort) 0) 0)
+      (slice-new [u8] (cast (ptr u8) buf) n))))
+
+(defn dif-group-title [(receiver (slice u8))] (-> (slice u8))
+  (if (= receiver "[1, 2, 3]") "Array.prototype" "String.prototype"))
+
+;; The report, derived exactly like `docs/NATIVE-CAPABILITY.md` and checked in for the same reason:
+;; a differential whose failures are printed and forgotten is a differential nobody reads. This one
+;; is a FILE, compared byte for byte on every run, so a method that starts agreeing and a method
+;; that stops both show up as a diff a person has to look at.
+(defn dif-render! [(buf (ptr i8)) (cap i64) (cases (ArrayList DifCase)) (verdicts (ArrayList i64))
+                   (skipped i64)] (-> (slice u8))
+  (let [fb (alloc/stack FixBuf) w (alloc/stack Writer)
+        (mut i) 0
+        (mut agree) 0
+        (mut differ) 0]
+    (set! (.data fb) buf) (set! (.cap fb) cap) (set! (.len fb) 0)
+    (fixed-buffer-writer w fb)
+    (ps w "<!-- GENERATED by tests/native-differential-test.coil. Do not edit. -->\n")
+    (ps w "# Does it agree with node\n\n")
+    (ps w "Every method in `src/frontend_native_graph.coil`'s dispatch tables, compiled to arm64,\n")
+    (ps w "linked against `native/gc/runtime.c`, EXECUTED, and compared against the same source run\n")
+    (ps w "by node. `docs/NATIVE-CAPABILITY.md` says what compiles; this says what is right.\n\n")
+    (ps w "The probe hashes `String(r)` character by character rather than measuring its length,\n")
+    (ps w "because a length is blind to what these definitions decide -- changing `join`'s separator\n")
+    (ps w "from \",\" to \";\" left a length-only test entirely green.\n\n")
+    (ps w "THE CALL IS DERIVED TOO. Each method is tried at the arity the frontend's own table\n")
+    (ps w "states, and the first argument list whose program BOTH compiles and runs under node is\n")
+    (ps w "the one recorded. A method with no such call is listed as `no runnable call`, which is a\n")
+    (ps w "statement about the probe rather than about the method.\n\n")
+    (ps w "| receiver | call | agrees with node |\n|---|---|---|\n")
+    (loop (if (>= (load i) (al-len [DifCase] cases))
+              (break)
+              (do
+                (let [c (al-get [DifCase] cases (load i))
+                      v (al-get [i64] verdicts (load i))]
+                  (if (= v 0) (set! agree (+ (load agree) 1)) (set! differ (+ (load differ) 1)))
+                  (fmt w "| `{s}` | `v.{s}({s})` | {s} |\n"
+                       (.receiver c) (.method c) (.args c)
+                       (if (= v 0) "yes" "**no**")))
+                (set! i (+ (load i) 1))
+                0)))
+    (fmt w "\n## Totals\n\n| status | count |\n|---|---|\n| agrees with node | {d} |\n| **disagrees** | {d} |\n| no runnable call | {d} |\n"
+         (load agree) (load differ) skipped)
+    (slice-new [u8] (cast (ptr u8) buf) (load (field fb len)))))
+
+(deftest every_dispatched_method_is_run_against_node_and_the_report_matches
+  (let [(mut cases) (al-new [DifCase] (malloc-allocator))
+        (mut verdicts) (al-new [i64] (malloc-allocator))
+        skipped (alloc/stack i64)
+        program (alloc/stack (array i8 65536))
+        report (alloc/stack (array i8 16384))]
+    (set! skipped 0)
+    (dif-collect! "\"abcdef\"" "(defn fng-string-builtin-arity?" (mut cases) skipped)
+    (dif-collect! "[1, 2, 3]" "(defn fng-array-builtin?" (mut cases) skipped)
+    (let [count (al-len [DifCase] (load cases))]
+      ;; A floor, so a collector that silently stopped finding methods fails here instead of
+      ;; passing with nothing to check.
+      (assert (> count 40))
+      (let [(mut from) 0]
+        (loop (if (>= (load from) count)
+                  (break)
+                  (let [upto (let [e (+ (load from) (dif-chunk-size))] (if (> e count) count e))
+                        source (dif-program! (cast (ptr i8) program) 65536 (load cases) (load from) upto)]
+                    (nh-compile! source)
+                    (assert (= (nh-link!) 0))
+                    (let [(mut k) (load from)]
+                      (loop (if (>= (load k) upto)
+                                (break)
+                                (do
+                                  (let [ours (nh-exec! (- (load k) (load from)))
+                                        ok (alloc/stack bool)
+                                        theirs (do (set! ok true)
+                                                   (nh-node-answer source (- (load k) (load from)) ok))]
+                                    (al-push! [i64] (mut verdicts)
+                                              (if (and (load ok) (= ours theirs)) 0 1)))
+                                  (set! k (+ (load k) 1))
+                                  0))))
+                    (set! from upto)
+                    0))))
+      (let [a (malloc-allocator)
+            fresh (dif-render! (cast (ptr i8) report) 16384 (load cases) (load verdicts) (load skipped))
+            recorded (nh-read-text a "docs/NATIVE-DIFFERENTIAL.md")]
+        (if (= fresh recorded)
+            0
+            (do
+              (write-file a "/tmp/aotk-differential.md" fresh)
+              (fmt (stderr)
+                   "native-differential: docs/NATIVE-DIFFERENTIAL.md is out of date.\n  The freshly derived report is in /tmp/aotk-differential.md -- diff it, read what changed,\n  and copy it over if the change is one you meant to make.\n")
+              0))
+        (assert (= fresh recorded))))
+    (al-free! [DifCase] (mut cases))
+    (al-free! [i64] (mut verdicts))
+    0))

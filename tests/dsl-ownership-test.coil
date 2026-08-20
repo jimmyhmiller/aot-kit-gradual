@@ -113,28 +113,14 @@
 ;; because anything open-codes it (nothing does -- `If` owns truthiness as an IR contract) but
 ;; because its caller, `Boolean(x)`, is not implemented yet.
 ;;
-;; The rest are capabilities written ahead of a caller. That is not a defect, and it is still
-;; worth a count that cannot grow without someone saying so.
+;; Seventeen more sat here until 2026-08-19 -- ArrayIota, FltAbs, NumLt, BoxedNaN and the rest,
+;; "capabilities written ahead of a caller" that no caller ever arrived for. They were deleted
+;; with the interpreter cleanup: a definition nothing calls is not a capability, it is an
+;; untested opinion about JavaScript that reads like one. Write them again when something needs
+;; them, against a gate that can run them.
 (defn dsl-orphan-allowed [(name (slice u8))] (-> bool)
-  (or (= name "ArrayIota")
-      (or (= name "ArrayMapDouble")
-      (or (= name "ArrayRepeat")
-      (or (= name "BoxedInf")
-      (or (= name "BoxedNaN")
-      (or (= name "BoxedNegInf")
-      (or (= name "FltAbs")
-      (or (= name "FltCeilFrom")
-      (or (= name "FltFloorFrom")
-      (or (= name "FltSign")
-      (or (= name "FltTrunc")
-      (or (= name "IntAbs")
-      (or (= name "IntSign")
-      (or (= name "NegInfinity")
-      (or (= name "NewObject")
-      (or (= name "NumLt")
-      (or (= name "ObjectCoercible")
-      (or (= name "String.prototype.indexOf")
-      (= name "ToBoolean"))))))))))))))))))))
+  (or (= name "String.prototype.indexOf")
+      (= name "ToBoolean")))
 
 (defn read-text [(a (ptr Allocator)) (path (slice u8))] (-> (slice u8))
   (try (let [text (try-or! (read-file a path) (do (fmt (stderr) "dsl-ownership: cannot read {s}\n" path) (abort) ""))]
@@ -231,8 +217,15 @@
     26 "lib/string/starts-with.jsl" 27 "lib/string/substring.jsl"
     28 "lib/string/trim.jsl"        29 "lib/json/stringify.jsl"
     30 "lib/json/parse.jsl"
+    ;; THESE THREE WERE MISSING UNTIL 2026-08-19, and the omission is why this list must be
+    ;; checked rather than appended to. Every call made from an unlisted file is invisible here,
+    ;; so its callees look dead and get parked on the orphan allowlist -- which is exactly what
+    ;; had happened to `ObjectCoercible`, `FltAbs`, `IntAbs`, `IntSign`, `FltSign` and `BoxedNaN`.
+    ;; The allowlist was absorbing a detector bug. If you add a .jsl file, add it here.
+    31 "lib/math/platform.jsl"     32 "lib/math/rounding.jsl"
+    33 "lib/object/enumeration.jsl"
     ""))
-(defn lib-file-count [] (-> i64) 31)
+(defn lib-file-count [] (-> i64) 34)
 
 (defn wrapped-in? [(text (slice u8)) (name (slice u8)) (buf (ptr i8)) (close i64)] (-> bool)
   (let [n (slice-len name)]
@@ -332,7 +325,13 @@
 ;; the compiler's own closed world, documented at the site. `(Lt)` and `(Le)` are ZERO: the last
 ;; three `(Lt)` died with `fng-slice-bound`, a clamp that had no callers since `ArraySlice`'s
 ;; bounds moved into the library. The surviving `(BitOr)` are `fng-int-value` for array lengths
-;; and element keys plus the static evaluator; `++`/`--` moved to ToNumberValue + JsAdd/JsSub
+;; and element keys, the static evaluator, and -- since loops began compiling -- the same
+;; float-to-int32 conversion at `fng-jsl-call`'s `int` PARAMETER seam. That third one is
+;; representation and not meaning: `fng-to-number-operand` answers a raw double, a parameter
+;; declared `int` is a raw integer register, and an integer op reading a small double's bit
+;; pattern gets zero from its low half. `s.charCodeAt(i)` in a loop summed the first character six
+;; times before it was there. It is counted anyway, because the ratchet is textual and a debt that
+;; can be argued away silently was never being watched; `++`/`--` moved to ToNumberValue + JsAdd/JsSub
 ;; with a representation-only write-back; and one of each op is `fng-static-global-value`, the
 ;; constant evaluator for global initialisers, which has no `FngContext` to make a library call
 ;; with, can only ever see literals, and whose qualifier now admits numbers only.
@@ -350,7 +349,7 @@
   (case i
     0 1    1 0    2 0    3 1    4 1
     5 1    6 1    7 1    8 1    9 1
-    10 2   11 1   12 1   13 1
+    10 3   11 1   12 1   13 1
     14 1   15 1   16 1
     -1))
 (defn semantic-op-count [] (-> i64) 17)

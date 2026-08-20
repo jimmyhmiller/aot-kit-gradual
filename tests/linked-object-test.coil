@@ -11,7 +11,6 @@
 (import "shape" :use *)
 (import "shape" :use *)
 (import "corpus" :use *)
-(import "eval" :use *)
 (import "backend_core" :use *) (import "backend_select" :use *)
 (import "backend_schedule" :use *) (import "backend_allocate" :use *)
 (import "backend_aarch64" :use *) (import "backend_macho" :use *)
@@ -52,7 +51,6 @@
       (pclose p)
       (atoll (cast (ptr i8) out)))))
 
-
 (defn build-linked-program! [(ops (slice u8))] (-> i64)
   (let [pool (alloc/stack (array i64 32))
         p (cast (ptr i64) pool)
@@ -72,20 +70,6 @@
       (let [ret (n-new2 (Return) (g-start) (load cur))]
         (n-add-def! (g-stop) ret) (g-analyze!) ret))))
 
-(defn linked-eval [(ops (slice u8)) (arg i64)] (-> i64)
-  (graph-reset! 909)
-  (build-linked-program! ops)
-  (assert (= (g-verify) 0))
-  (ev-reset!)
-  (let [nn (n-count) (mut i) 0 (mut a) NO-NODE]
-    (loop (if (or (>= (load i) nn) (!= (load a) NO-NODE)) (break)
-            (do (if (and (not (n-dead? (load i))) (op-is? (load i) Arg [_]))
-                    (do (set! a (load i)) 0) 0)
-                (set! i (+ (load i) 1)) 0)))
-    (if (!= (load a) NO-NODE) (do (ev-bind! (load a) (RInt arg)) 0) 0))
-  (assert (= (ev-run-nobind 100000) EV-OK))
-  (rt-payload (ev-result)))
-
 (defn linked-native [(ops (slice u8)) (arg i64)] (-> i64)
   (graph-reset! 909)
   (build-linked-program! ops)
@@ -96,21 +80,6 @@
   (assert (be-encode-checked!))
   (assert (be-macho-checked!))
   (emit-and-run arg))
-
-;; A LINKED OBJECT, not an mmapped page: the only test here exercising the Mach-O container and the
-;; relocations resolving against a C caller at a real ABI boundary.
-;;
-;; A DEFTEST OVER A FIXED TABLE, not a property, and the reason is cost: each case writes an object,
-;; runs clang and executes the result, which a 200-case property cannot sustain -- it ran past ten
-;; minutes. Six programs is enough to cover the path; breadth at this layer belongs to the mmap
-;; properties, which run thousands of cases against the same encoder.
-(deftest a_linked_object_agrees_with_the_interpreter
-  (assert (= (linked-eval "a" 41) (linked-native "a" 41)))
-  (assert (= (linked-eval "ab" 7) (linked-native "ab" 7)))
-  (assert (= (linked-eval "abc" -13) (linked-native "abc" -13)))
-  (assert (= (linked-eval "zq" 0) (linked-native "zq" 0)))
-  (assert (= (linked-eval "\x01;\x02;" 99) (linked-native "\x01;\x02;" 99)))
-  (assert (= (linked-eval "abcdef" 1234) (linked-native "abcdef" 1234))))
 
 ;; AN ALLOCATING PROGRAM, LINKED AGAINST THE COLLECTOR AND RUN.
 ;;

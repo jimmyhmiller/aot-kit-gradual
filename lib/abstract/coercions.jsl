@@ -8,7 +8,26 @@
 ;; reference, not that it has an implementation the frontend lacked.
 
 ;; https://tc39.es/ecma262/#sec-tostring
-(macro ToStringValue :params [(v dyn)] :ret dyn (%ToString v))
+;;
+;; ToString of an OBJECT is ToPrimitive with hint string, which calls the object's `toString`, and
+;; an array's is `Array.prototype.toString` -- `String([1, 2, 3])` is "1,2,3" and not
+;; "[object Object]". The primitive cannot make that distinction on its own: it is handed a tagged
+;; word and answers a formatting rule, where the array case is a JavaScript algorithm over the
+;; elements. So the dispatch happens here, and `ArrayToStringValue` in lib/array/read.jsl is the
+;; algorithm.
+;;
+;; `%Box` BEFORE `%IsArray`, because `v` arrives as whatever machine word the caller had: an array
+;; is a RAW object pointer at most call sites and the tag test needs the tagged form. Boxing a value
+;; that is already tagged is the identity, and where the analysis has proven `v` is a number the
+;; whole test folds away and this is `%ToString` again.
+(macro ToStringValue :params [(v dyn)] :ret dyn
+  (if (%IsArray (%Box v)) (ArrayToStringValue (%Box v) (%NewArray)) (%ToString v)))
+
+;; The same conversion CONTINUING an array walk already in progress, so the cycle stack it is
+;; already carrying is the one an inner array is checked against. `ArrayJoinSeen` is the only
+;; caller; `ToStringValue` above is the entry that starts a fresh stack.
+(macro ToStringValueSeen :params [(v dyn) (seen dyn)] :ret dyn
+  (if (%IsArray (%Box v)) (ArrayToStringValue (%Box v) seen) (%ToString v)))
 
 ;; https://tc39.es/ecma262/#sec-tonumber
 ;;

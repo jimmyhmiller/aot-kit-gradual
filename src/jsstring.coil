@@ -1,24 +1,16 @@
 ;; JavaScript strings stored as UTF-16 code units.  Source text arrives as UTF-8, but every
 ;; observable JavaScript index and length is defined over UTF-16 units.
 ;;
-;; A string is IMMUTABLE ONCE BUILT, and building is the one exception: `jss-alloc!` answers a
-;; string whose units are not written yet and `jss-store-unit!` fills them in ascending order.
-;; Nothing may observe one in between — that is what `filled` is for, and both reads below
-;; refuse a partial string exactly as the native runtime does.
+;; THIS IS THE COMPILER'S STRING-CONSTANT TABLE, not a JavaScript string runtime. Source text
+;; interns here, `ms-select-string-id!` reads the units back out to materialize a constant into
+;; machine code, and `jsl_lower` reads names. Every operation ON a JavaScript string belongs to
+;; lib/ over the atoms, and is performed by the emitted code at run time — not here.
 (module jsstring)
 
 (import "coil.alloc" :use * :as alloc)
 (import "coil.arraylist" :use *)
 (import "coil.slice" :use *)
 (import "jsvalue" :use *)
-(import "coil.io" :use *)
-(import "coil.control" :use *)
-(import "coil.fmt" :use *)
-
-(defn jss-panic! [(msg (slice u8))] (-> i64)
-  (let [w (stderr)] (print-str w "string heap: ") (print-str w msg) (print-str w "\n"))
-  (abort)
-  0)
 
 (const JSS-NONE i64 -1)
 (const JSS-REPLACEMENT i64 65533)
@@ -28,7 +20,7 @@
 ;; it in ascending order. The native runtime keeps the same counter and refuses both an
 ;; out-of-order write and a read of a partial string, so the evaluator has to refuse them too
 ;; or a DSL definition that writes out of order would pass here and produce garbage natively.
-(defstruct JsString [(start i64) (length i64) (filled i64)])
+(defstruct JsString [(start i64) (length i64)])
 (defstruct JsStringHeap
   [(strings (ArrayList JsString))
    (units (ArrayList u16))
@@ -51,7 +43,7 @@
   0)
 
 (defn jss-record-make [(start i64) (length i64)] (-> JsString)
-  (JsString :start start :length length :filled length))
+  (JsString :start start :length length))
 
 (defn jss-valid? [(string i64)] (-> bool)
   (and (>= string 0) (< string (al-len [JsString] (.strings (jss-heap))))))
@@ -61,13 +53,7 @@
 
 (defn jss-length [(string i64)] (-> i64)
   (if (jss-valid? string)
-      (let [record (jss-record string)]
-        ;; The read side of the build discipline, and `jss-code-unit` inherits it by asking for the
-        ;; length first: a string with a hole in it is not observable, natively or here.
-        (if (!= (.filled record) (.length record))
-            (jss-panic! "jss-length: a string is read before all its units are written")
-            0)
-        (.length record))
+      (let [record (jss-record string)] (.length record))
       0))
 
 (defn jss-code-unit [(string i64) (index i64)] (-> i64)
@@ -78,48 +64,6 @@
               (al-get [u16]
                       (.units (jss-heap))
                       (+ (.start record) index))))))
-
-;; ATOM: a fresh string of `length` zero units, none of them written yet.
-(defn jss-alloc! [(length i64)] (-> i64)
-  (let [heap (jss-heap)
-        size (if (< length 0) 0 length)
-        first (al-len [u16] (.units heap))
-        id (al-len [JsString] (.strings heap))
-        (mut index) 0]
-    (loop (if (>= (load index) size)
-              (break)
-              (do
-                (al-push! [u16] (field heap units) (cast u16 0))
-                (set! index (+ (load index) 1)))))
-    (al-push! [JsString] (field heap strings) (JsString :start first :length size :filled 0))
-    id))
-
-;; ATOM: write one unit and answer the SAME string. The index must be the next unwritten one --
-;; a DSL definition that discards the returned string, or writes out of order, loses the data
-;; dependence that orders these writes at all, and the failure is reported here rather than
-;; silently producing a string with a hole in it.
-(defn jss-store-unit! [(string i64) (index i64) (unit i64)] (-> i64)
-  (if (not (jss-valid? string))
-      (jss-panic! "jss-store-unit!: not a string")
-      0)
-  (let [record (jss-record string)]
-    (if (or (!= index (.filled record)) (>= index (.length record)))
-        (do (fmt (stderr) "  string={d} index={d} filled={d} length={d}\n"
-                 string index (.filled record) (.length record))
-            (jss-panic! "jss-store-unit!: units must be written in ascending order from 0"))
-        0)
-    ;; The native runtime refuses a unit outside u16 rather than truncating it, so refuse it here
-    ;; too — a masked write would agree with node in the evaluator and disagree in the product.
-    (if (or (< unit 0) (> unit 65535))
-        (do (fmt (stderr) "  unit={d}\n" unit)
-            (jss-panic! "jss-store-unit!: a code unit outside 0..65535"))
-        0)
-    (al-set! [u16] (field (jss-heap) units) (+ (.start record) index) (cast u16 unit))
-    (al-set! [JsString]
-             (field (jss-heap) strings)
-             string
-             (JsString :start (.start record) :length (.length record) :filled (+ index 1)))
-    string))
 
 (defn jss-new-window! [(source (ptr (ArrayList u16))) (start i64) (length i64)] (-> i64)
   (let [heap (jss-heap)
@@ -224,273 +168,3 @@
                               (al-push! [u8] (mut out) (cast u8 (+ 128 (& p 63)))))))
                 (set! i (+ (load i) (load width))))))
     (slice-new [u8] (load (field out data)) (al-len [u8] (load out)))))
-
-(defn jss-equal? [(left i64) (right i64)] (-> bool)
-  (if (!= (jss-length left) (jss-length right))
-      false
-      (let [(mut index) 0
-            (mut same) true]
-        (loop (if (or (>= (load index) (jss-length left)) (not (load same)))
-                  (break)
-                  (do
-                    (if (!= (jss-code-unit left (load index)) (jss-code-unit right (load index)))
-                        (set! same false)
-                        0)
-                    (set! index (+ (load index) 1)))))
-        (load same))))
-
-(defn jss-match-at? [(source i64) (start i64) (needle i64)] (-> bool)
-  (if (or (< start 0) (> (+ start (jss-length needle)) (jss-length source)))
-      false
-      (let [(mut index) 0
-            (mut same) true]
-        (loop (if (or (>= (load index) (jss-length needle)) (not (load same)))
-                  (break)
-                  (do
-                    (if (!= (jss-code-unit source (+ start (load index)))
-                            (jss-code-unit needle (load index)))
-                        (set! same false)
-                        0)
-                    (set! index (+ (load index) 1)))))
-        (load same))))
-
-(defn jss-concat! [(left i64) (right i64)] (-> i64)
-  (let [(mut units) (al-new [u16] (malloc-allocator))
-        (mut index) 0]
-    (loop (if (>= (load index) (jss-length left))
-              (break)
-              (do
-                (al-push! [u16] (mut units) (cast u16 (jss-code-unit left (load index))))
-                (set! index (+ (load index) 1)))))
-    (set! index 0)
-    (loop (if (>= (load index) (jss-length right))
-              (break)
-              (do
-                (al-push! [u16] (mut units) (cast u16 (jss-code-unit right (load index))))
-                (set! index (+ (load index) 1)))))
-    (let [result (jss-new-window! (mut units) 0 (al-len [u16] (load units)))]
-      (al-free! [u16] (mut units))
-      result)))
-
-(defn jss-clamp [(value i64) (length i64)] (-> i64)
-  (if (< value 0) 0 (if (> value length) length value)))
-
-(defn jss-window! [(string i64) (start i64) (end i64)] (-> i64)
-  (let [(mut units) (al-new [u16] (malloc-allocator))
-        (mut index) start]
-    (loop (if (>= (load index) end)
-              (break)
-              (do
-                (al-push! [u16] (mut units) (cast u16 (jss-code-unit string (load index))))
-                (set! index (+ (load index) 1)))))
-    (let [result (jss-new-window! (mut units) 0 (al-len [u16] (load units)))]
-      (al-free! [u16] (mut units))
-      result)))
-
-(defn jss-substring! [(string i64) (start i64) (end i64)] (-> i64)
-  (let [length (jss-length string)
-        a (jss-clamp start length)
-        b (jss-clamp end length)]
-    (jss-window! string (if (< a b) a b) (if (< a b) b a))))
-
-(defn jss-slice! [(string i64) (start i64) (end i64)] (-> i64)
-  (let [length (jss-length string)
-        a (jss-clamp (if (< start 0) (+ length start) start) length)
-        b (jss-clamp (if (< end 0) (+ length end) end) length)]
-    (jss-window! string a (if (> b a) b a))))
-
-(defn jss-substr! [(string i64) (start i64) (count i64)] (-> i64)
-  (let [length (jss-length string)
-        from (jss-clamp (if (< start 0) (+ length start) start) length)
-        size (if (< count 0) 0 count)]
-    (jss-window! string from (jss-clamp (+ from size) length))))
-
-(defn jss-char-at! [(string i64) (index i64)] (-> i64)
-  (if (or (< index 0) (>= index (jss-length string)))
-      (jss-window! string 0 0)
-      (jss-window! string index (+ index 1))))
-
-(defn jss-from-code-unit! [(value i64)] (-> i64)
-  (let [(mut units) (al-new [u16] (malloc-allocator))]
-    (al-push! [u16] (mut units) (cast u16 (& value 65535)))
-    (let [result (jss-new-window! (mut units) 0 1)]
-      (al-free! [u16] (mut units))
-      result)))
-
-(defn jss-normalize! [(string i64) (form i64)] (-> i64)
-  (if (not (jss-valid? string))
-      JSS-NONE
-      ;; The native runtime delegates the complete Unicode tables to CoreFoundation. The ideal
-      ;; evaluator stays host-independent and mirrors the canonical/compatibility cases exercised
-      ;; by its semantic corpus; it is an oracle for IR behavior, not the shipped Unicode engine.
-      (let [(mut units) (al-new [u16] (malloc-allocator))
-            (mut index) 0]
-        (loop (if (>= (load index) (jss-length string))
-                  (break)
-                  (let [unit (jss-code-unit string (load index))
-                        next (if (< (+ (load index) 1) (jss-length string))
-                                 (jss-code-unit string (+ (load index) 1)) -1)]
-                    (cond
-                      (and (or (= form 0) (= form 2)) (and (= unit 101) (= next 769)))
-                        (do (al-push! [u16] (mut units) (cast u16 233))
-                            (store! index (+ (load index) 2)))
-                      (and (or (= form 1) (= form 3)) (= unit 233))
-                        (do (al-push! [u16] (mut units) (cast u16 101))
-                            (al-push! [u16] (mut units) (cast u16 769))
-                            (store! index (+ (load index) 1)))
-                      (and (or (= form 2) (= form 3)) (= unit 64257))
-                        (do (al-push! [u16] (mut units) (cast u16 102))
-                            (al-push! [u16] (mut units) (cast u16 105))
-                            (store! index (+ (load index) 1)))
-                      :else
-                        (do (al-push! [u16] (mut units) (cast u16 unit))
-                            (store! index (+ (load index) 1)))))))
-        (let [result (jss-new-window! (mut units) 0 (al-len [u16] (load units)))]
-          (al-free! [u16] (mut units))
-          result))))
-
-(defn jss-index-of [(string i64) (needle i64) (requested i64)] (-> i64)
-  (let [start (jss-clamp requested (jss-length string))
-        (mut at) (jss-clamp requested (jss-length string))
-        (mut found) -1]
-    (if (= (jss-length needle) 0)
-        start
-        (do
-          (loop (if (or (>= (load found) 0)
-                        (> (+ (load at) (jss-length needle)) (jss-length string)))
-                    (break)
-                    (do
-                      (if (jss-match-at? string (load at) needle) (set! found (load at)) 0)
-                      (set! at (+ (load at) 1)))))
-          (load found)))))
-
-(defn jss-compare [(left i64) (right i64)] (-> i64)
-  (let [left-length (jss-length left)
-        right-length (jss-length right)
-        common (if (< left-length right-length) left-length right-length)
-        (mut index) 0
-        (mut answer) 0]
-    (loop (if (or (>= (load index) common) (!= (load answer) 0))
-              (break)
-              (let [a (jss-code-unit left (load index))
-                    b (jss-code-unit right (load index))]
-                (if (< a b)
-                    (set! answer -1)
-                    (if (> a b) (set! answer 1) (set! index (+ (load index) 1)))))))
-    (if (!= (load answer) 0)
-        (load answer)
-        (if (< left-length right-length) -1 (if (> left-length right-length) 1 0)))))
-
-(defn jss-box [(string i64)] (-> i64)
-  (if (jss-valid? string) (| JSV-STRING (* (+ string 1) 8)) JSV-UNDEFINED))
-
-(defn jss-unbox [(value i64)] (-> i64)
-  (if (= (jsv-tag value) JSV-STRING) (- (/ (jsv-payload value) 8) 1) JSS-NONE))
-
-(defn jss-digit-code [(digit i64)] (-> i64)
-  (if (< digit 10) (+ 48 digit) (+ 87 digit)))
-
-(defn jss-from-int-radix! [(value i64) (radix i64)] (-> i64)
-  (if (or (< radix 2) (> radix 36))
-      (jss-from-utf8! "")
-      (let [(mut reversed) (al-new [u16] (malloc-allocator))
-            negative (< value 0)
-            (mut remaining) (if (< value 0) (- 0 value) value)]
-        (if (= (load remaining) 0)
-            (al-push! [u16] (mut reversed) (cast u16 48))
-            (loop (if (= (load remaining) 0)
-                      (break)
-                      (do
-                        (al-push! [u16]
-                                  (mut reversed)
-                                  (cast u16 (jss-digit-code (% (load remaining) radix))))
-                        (set! remaining (/ (load remaining) radix))))))
-        (let [(mut ordered) (al-new [u16] (malloc-allocator))
-              (mut index) (- (al-len [u16] (load reversed)) 1)]
-          (if negative (al-push! [u16] (mut ordered) (cast u16 45)) 0)
-          (loop (if (< (load index) 0)
-                    (break)
-                    (do
-                      (al-push! [u16] (mut ordered) (al-get [u16] (load reversed) (load index)))
-                      (set! index (- (load index) 1)))))
-          (let [result (jss-new-window! (mut ordered) 0 (al-len [u16] (load ordered)))]
-            (al-free! [u16] (mut reversed))
-            (al-free! [u16] (mut ordered))
-            result)))))
-
-(defn jss-ascii-space? [(unit i64)] (-> bool)
-  (or (= unit 9) (or (= unit 10) (or (= unit 11) (or (= unit 12) (or (= unit 13) (= unit 32)))))))
-
-(defn jss-digit-value [(unit i64)] (-> i64)
-  (cond (and (>= unit 48) (<= unit 57)) (- unit 48)
-        (and (>= unit 65) (<= unit 90)) (+ 10 (- unit 65))
-        (and (>= unit 97) (<= unit 122)) (+ 10 (- unit 97))
-        :else -1))
-
-(defn jss-parse-int [(string i64) (requested-radix i64)] (-> (Option i64))
-  (let [length (jss-length string)
-        (mut index) 0
-        (mut sign) 1
-        (mut radix) requested-radix]
-    (loop (if (or (>= (load index) length)
-                  (not (jss-ascii-space? (jss-code-unit string (load index)))))
-              (break)
-              (set! index (+ (load index) 1))))
-    (if (< (load index) length)
-        (let [unit (jss-code-unit string (load index))]
-          (if (or (= unit 43) (= unit 45))
-              (do (if (= unit 45) (set! sign -1) 0) (set! index (+ (load index) 1)))
-              0))
-        0)
-    (if (= (load radix) 0) (set! radix 10) 0)
-    (if (and (or (= (load radix) 16) (= requested-radix 0))
-             (and (< (+ (load index) 1) length)
-                  (and (= (jss-code-unit string (load index)) 48)
-                       (let [x (jss-code-unit string (+ (load index) 1))]
-                         (or (= x 120) (= x 88))))))
-        (do (set! radix 16) (set! index (+ (load index) 2)))
-        0)
-    (if (or (< (load radix) 2) (> (load radix) 36))
-        (None)
-        (let [(mut value) 0
-              (mut digits) 0
-              (mut done) false]
-          (loop (if (or (>= (load index) length) (load done))
-                    (break)
-                    (let [digit (jss-digit-value (jss-code-unit string (load index)))]
-                      (if (or (< digit 0) (>= digit (load radix)))
-                          (set! done true)
-                          (do
-                            (set! value (+ (* (load value) (load radix)) digit))
-                            (set! digits (+ (load digits) 1))
-                            (set! index (+ (load index) 1)))))))
-          (if (= (load digits) 0) (None) (Some (* (load sign) (load value))))))))
-
-(defn jss-numeric? [(string i64)] (-> bool)
-  (let [length (jss-length string)
-        (mut index) 0
-        (mut digits) 0
-        (mut dot) false]
-    (loop (if (or (>= (load index) length)
-                  (not (jss-ascii-space? (jss-code-unit string (load index)))))
-              (break)
-              (set! index (+ (load index) 1))))
-    (if (< (load index) length)
-        (let [unit (jss-code-unit string (load index))]
-          (if (or (= unit 43) (= unit 45)) (set! index (+ (load index) 1)) 0))
-        0)
-    (loop (if (>= (load index) length)
-              (break)
-              (let [unit (jss-code-unit string (load index))]
-                (if (and (>= unit 48) (<= unit 57))
-                    (do
-                      (set! digits (+ (load digits) 1))
-                      (set! index (+ (load index) 1)))
-                    (if (and (= unit 46) (not (load dot)))
-                        (do (set! dot true) (set! index (+ (load index) 1)))
-                        (break))))))
-    (loop (if (or (>= (load index) length)
-                  (not (jss-ascii-space? (jss-code-unit string (load index)))))
-              (break)
-              (set! index (+ (load index) 1))))
-    (and (= (load index) length) (or (= length 0) (> (load digits) 0)))))

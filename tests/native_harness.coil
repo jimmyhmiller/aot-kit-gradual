@@ -1,0 +1,344 @@
+(module nativeharness)
+;; THE PRODUCT PATH, EXECUTED, AS A REUSABLE PIECE: TypeScript source in, a running arm64 binary
+;; out, and node's answer beside it.
+;;
+;; This began inside `tests/native-execution-test.coil` as nine hand-written cases. It moved here
+;; when `tests/native-differential-test.coil` started asking the same question of every method the
+;; frontend dispatches -- a couple of hundred programs rather than nine -- and at that scale the
+;; two costs the original paid per case stopped being affordable:
+;;
+;;   1. IT RECOMPILED `native/gc/runtime.c` FOR EVERY PROGRAM. 0.25s each, against 0.05s to link an
+;;      object that is already compiled. The runtime, the trampoline and the driver are the same
+;;      bytes for every case; they are built once here and linked thereafter.
+;;   2. IT SPAWNED A NODE PER PROGRAM. `native/js-oracle/oracle.c` keeps ONE node alive and talks to
+;;      it down a pipe -- 0.076ms per case against 63ms of process startup, which is the measurement
+;;      that file was written for. It survived the evaluator's deletion unused; this is its caller.
+;;
+;; THE DRIVER TAKES THE ARGUMENT FROM `argv`, which is what lets it be compiled once. Baking the
+;; argument into its source, as the first version did, made the driver part of the per-case work.
+(import "ty" :use *)
+(import "node" :use *)
+(import "verify" :use *)
+(import "shape" :use *)
+(import "jsstring" :use *)
+(import "frontendnative" :use *)
+(import "frontendnativegraph" :use *)
+(import "backend_core" :use *)
+(import "backend_select" :use *)
+(import "backend_schedule" :use *)
+(import "backend_allocate" :use *)
+(import "backend_aarch64" :use *)
+(import "backend_macho" :use *)
+(import "coil.assert" :use *)
+(import "coil.io" :use *)
+(import "coil.fmt" :use *)
+(import "coil.slice" :use *)
+(import "coil.alloc" :use * :as alloc)
+(import "coil.control" :use *)
+(import "coil.str" :use *)
+(import "coil.arraylist" :use *)
+(import "coil.fs" :use *)
+
+(extern fopen :cc c [(ptr i8) (ptr i8)] (-> (ptr u8)))
+(extern fwrite :cc c [(ptr u8) i64 i64 (ptr u8)] (-> i64))
+(extern fclose :cc c [(ptr u8)] (-> i32))
+(extern popen :cc c [(ptr i8) (ptr i8)] (-> (ptr u8)))
+(extern pclose :cc c [(ptr u8)] (-> i32))
+(extern fgets :cc c [(ptr i8) i32 (ptr u8)] (-> (ptr i8)))
+(extern atoll :cc c [(ptr i8)] (-> i64))
+(extern system :cc c [(ptr i8)] (-> i32))
+;; native/js-oracle/oracle.c, on the link line through Coil.toml's `[cc] sources`.
+(extern js_oracle_run :cc c [(ptr i8) i64 i64 (ptr i8) i64] (-> i32))
+
+;; A NUL-terminated C string in a caller buffer.
+(defn nh-cstr! [(buf (ptr i8)) (cap i64) (s (slice u8))] (-> (ptr i8))
+  (let [fb (alloc/stack FixBuf) w (alloc/stack Writer)]
+    (set! (.data fb) buf) (set! (.cap fb) cap) (set! (.len fb) 0)
+    (fixed-buffer-writer w fb)
+    (fmt w "{s}" s)
+    (set! (index buf (load (field fb len))) (cast i8 0))
+    buf))
+
+;; Run one shell command and read the first line as an integer.
+;;
+;; A CRASH IS NOT THE ANSWER 0, and for a long time this function said it was: a segfaulting
+;; program prints nothing, `fgets` leaves the buffer empty, and `atoll("")` is 0. Every probe
+;; whose expected answer happened to be 0 then PASSED on a program that never ran, and a probe
+;; expecting anything else reported "ours=0" -- which reads as a wrong computation and sent the
+;; search after the arithmetic instead of after the crash. `main(n) { let f = () => n; f();
+;; return 42; }` took SIGSEGV and was reported as answering 0.
+;;
+;; `pclose` returns the child's wait status, and the driver returns 0 on every path it completes.
+;; Anything else -- a signal, a non-zero exit, or no output line at all -- is NOT an answer.
+;;
+;; TWO ENTRY POINTS, because two suites want different things from that fact. The execution suite
+;; wants to die on it, loudly and immediately; `tests/native-frontier-test.coil` wants to RECORD it,
+;; because a program that crashes is one of the ways an open bug is open.
+(defn nh-shell-answer [(cmd (ptr i8)) (ok (ptr bool))] (-> i64)
+  (let [mode (alloc/stack (array i8 8))
+        out (alloc/stack (array i8 256))]
+    (set! (index (cast (ptr i8) out) 0) (cast i8 0))
+    (let [p (popen cmd (nh-cstr! (cast (ptr i8) mode) 8 "r"))]
+      (assert (!= (cast i64 p) 0))
+      (let [line (fgets (cast (ptr i8) out) 256 p)
+            status (pclose p)]
+        (if (or (= (cast i64 line) 0) (!= (cast i64 status) 0))
+            (do (set! ok false) 0)
+            (do (set! ok true) 0))
+        (atoll (cast (ptr i8) out))))))
+
+(defn nh-shell-integer [(cmd (ptr i8))] (-> i64)
+  (let [ok (alloc/stack bool)
+        answer (do (set! ok true) (nh-shell-answer cmd ok))]
+    (if (load ok)
+        answer
+        (do (fmt (stderr) "native-harness: the compiled program did not answer\n")
+            (panic-corrupt "native-harness: the compiled program crashed or printed nothing")
+            0))))
+
+(defn nh-run-shell! [(text (slice u8))] (-> i64)
+  (let [cmd (alloc/stack (array i8 4096))]
+    (cast i64 (system (nh-cstr! (cast (ptr i8) cmd) 4096 text)))))
+
+;; ---------------------------------------------------------------------------
+;; Leg 1: source -> graph -> machine code
+;; ---------------------------------------------------------------------------
+;; Compile WITHOUT asserting, for a caller choosing between candidate programs. Returns true when
+;; machine code came out the other end.
+(defn nh-try-compile? [(source (slice u8))] (-> bool)
+  (block :done
+    (graph-reset! 7001)
+    (shape-reset!)
+    (jss-reset!)
+    (let [(mut fe) (fe-native-new source)]
+      (if (!= (fe-native-index! (mut fe)) FE-OK)
+          (do (fe-native-free! (mut fe)) (return-from :done false))
+          0)
+      (frontend-native-build! (mut fe) 7001 true)
+      (fe-native-free! (mut fe)))
+    (if (!= (g-verify) 0) (return-from :done false) 0)
+    (if (not (be-select-machine-program!)) (return-from :done false) 0)
+    (be-use-runtime-allocation! true)
+    (be-schedule!)
+    (if (< (be-color! 10) 0) (return-from :done false) 0)
+    (if (not (be-encode-checked!)) (return-from :done false) 0)
+    (be-macho-checked!)))
+
+(defn nh-compile! [(source (slice u8))] (-> i64)
+  (graph-reset! 7001)
+  (shape-reset!)
+  (jss-reset!)
+  (let [(mut fe) (fe-native-new source)]
+    (assert (= (fe-native-index! (mut fe)) FE-OK))
+    (frontend-native-build! (mut fe) 7001 true)
+    (fe-native-free! (mut fe)))
+  (assert (= (g-verify) 0))
+  (assert (be-select-machine-program!))
+  ;; An allocation must call the collector rather than bumping thread state nothing initialised;
+  ;; see the note in linked-object-test. Harmless for a program that allocates nothing.
+  (be-use-runtime-allocation! true)
+  (be-schedule!)
+  (assert (>= (be-color! 10) 0))
+  (assert (be-encode-checked!))
+  (assert (be-macho-checked!))
+  0)
+
+;; ---------------------------------------------------------------------------
+;; Leg 2: object -> linked binary -> answer
+;; ---------------------------------------------------------------------------
+;; THE KERNEL IS ENTERED THROUGH `aot_gc_enter`, never called directly, and the collector is
+;; configured first -- the same protocol linked-object-test uses. A program that allocates nothing
+;; pays only the entry, and one that does allocate needs the stack base the entry records.
+;;
+;; `native/gc/runtime.c` is on the link line for every case, because that is where every `%`
+;; primitive lives: a string operation compiles to a `BL` at `_aot_js_string`, and without the
+;; runtime the link fails rather than the program misbehaving.
+(defn nh-prebuilt? [] (-> (ptr bool))
+  (let [done (alloc/static bool)] done))
+
+(defn nh-prepare! [] (-> i64)
+  (if (load (nh-prebuilt?))
+      0
+      (do
+        (set! (nh-prebuilt?) true)
+        (assert (= (nh-run-shell!
+          "printf '#include <stdint.h>\\n#include <stddef.h>\\n#include <stdio.h>\\n#include <stdlib.h>\\nint aot_gc_configure(size_t,int);\\nextern int64_t kernel(int64_t);\\nstatic int64_t arg;\\nstatic int64_t call(void){return kernel(arg);}\\nint64_t aot_gc_enter(int64_t(*)(void));\\nint main(int argc,char**argv){arg=argc>1?atoll(argv[1]):0;if(!aot_gc_configure(1048576,0))return 2;printf(\"%%lld\\\\n\",(long long)aot_gc_enter(call));return 0;}\\n' > /tmp/aotk-driver.c && xcrun clang -arch arm64 -O1 -fno-omit-frame-pointer -Inative/gc -c /tmp/aotk-driver.c -o /tmp/aotk-driver.o && xcrun clang -arch arm64 -O1 -fno-omit-frame-pointer -Inative/gc -c native/gc/runtime.c -o /tmp/aotk-runtime.o && xcrun clang -arch arm64 -c native/gc/trampoline.S -o /tmp/aotk-trampoline.o")
+          0))
+        0)))
+
+;; LINKING AND RUNNING ARE SEPARATE, and the reason is a macOS cost with a sharp edge: the FIRST
+;; execution of a freshly linked binary takes ~0.69s while the system assesses it, and every
+;; execution after that takes 3ms. Measured, repeatedly, on this machine. A suite that links one
+;; binary per case therefore pays 0.7s per case no matter how small the program is -- which is what
+;; made a differential over every method in the frontend look unaffordable at three minutes.
+;;
+;; `tests/native-differential-test.coil` links ONE binary whose `main` selects a case from its
+;; argument, and then runs it once per case. One assessment, N runs.
+(defn nh-link! [] (-> i64)
+  (nh-prepare!)
+  (let [b1 (alloc/stack (array i8 64)) b2 (alloc/stack (array i8 8))]
+    (let [f (fopen (nh-cstr! (cast (ptr i8) b1) 64 "/tmp/aotk-native.o")
+                   (nh-cstr! (cast (ptr i8) b2) 8 "w"))]
+      (assert (!= (cast i64 f) 0))
+      (fwrite (be-object-data) 1 (be-object-len) f)
+      (fclose f))
+    (nh-run-shell!
+      "xcrun clang -arch arm64 /tmp/aotk-driver.o /tmp/aotk-runtime.o /tmp/aotk-trampoline.o /tmp/aotk-native.o -o /tmp/aotk-native 2>/tmp/aotk-native.err")))
+
+(defn nh-exec-command! [(cmd (ptr i8)) (arg i64)] (-> i64)
+  (let [fb (alloc/stack FixBuf) w (alloc/stack Writer)]
+    (set! (.data fb) cmd)
+    (set! (.cap fb) 256) (set! (.len fb) 0)
+    (fixed-buffer-writer w fb)
+    (fmt w "/tmp/aotk-native {d}" arg)
+    (set! (index cmd (load (field fb len))) (cast i8 0))
+    0))
+
+(defn nh-exec! [(arg i64)] (-> i64)
+  (let [cmd (alloc/stack (array i8 256))]
+    (nh-exec-command! (cast (ptr i8) cmd) arg)
+    (nh-shell-integer (cast (ptr i8) cmd))))
+
+;; The same run, with the crash reported rather than fatal. See `nh-shell-answer`.
+(defn nh-exec-checked! [(arg i64) (ok (ptr bool))] (-> i64)
+  (let [cmd (alloc/stack (array i8 256))]
+    (nh-exec-command! (cast (ptr i8) cmd) arg)
+    (nh-shell-answer (cast (ptr i8) cmd) ok)))
+
+(defn nh-run! [(arg i64)] (-> i64)
+  (nh-link!)
+  (nh-exec! arg))
+
+;; ---------------------------------------------------------------------------
+;; Leg 3: the same source, answered by node
+;; ---------------------------------------------------------------------------
+;; THE SAME TEXT GOES TO BOTH. The oracle strips the TypeScript annotations itself, so the frontend
+;; and the engine read one identical source rather than two emitters that could drift apart -- a bug
+;; in a node-only flavour would be invisible to the comparison meant to catch it.
+;;
+;; A JavaScript EXCEPTION comes back as a line beginning "ERR ", which is not an answer and must
+;; never be compared against one: `atoll` would read it as 0 and a program that returns 0 would
+;; agree with a program that threw.
+(defn nh-node-answer [(source (slice u8)) (arg i64) (ok (ptr bool))] (-> i64)
+  (let [buf (alloc/stack (array i8 65536))
+        out (alloc/stack (array i8 4096))
+        src (nh-cstr! (cast (ptr i8) buf) 65536 source)]
+    (set! (index (cast (ptr i8) out) 0) (cast i8 0))
+    (if (!= (cast i64 (js_oracle_run src (slice-len source) arg (cast (ptr i8) out) 4096)) 0)
+        (do (fmt (stderr) "native-harness: the node oracle failed to answer\n")
+            (set! ok false)
+            0)
+        (if (and (= (load (index (cast (ptr i8) out) 0)) (cast i8 69))
+                 (= (load (index (cast (ptr i8) out) 1)) (cast i8 82)))
+            (do (set! ok false) 0)
+            (do (set! ok true) (atoll (cast (ptr i8) out)))))))
+
+;; ---------------------------------------------------------------------------
+;; The whole pipeline, as a STATUS rather than a yes/no
+;; ---------------------------------------------------------------------------
+;; `nh-agrees-with-node?` answers the execution suite's question -- is this right -- and dies on
+;; anything that is not. `tests/native-frontier-test.coil` asks the opposite question of a KNOWN
+;; BUG: is it still broken, and in which of the ways. Both walk the same three legs, so they share
+;; them here rather than growing a second copy of the pipeline.
+;;
+;; `NH-AGREES` is the interesting one: for a frontier repro it is a FAILURE, because it means the
+;; bug is fixed and the repro should be promoted to a real execution case.
+(const NH-AGREES i64 0)
+(const NH-DISAGREES i64 1)
+(const NH-CRASHES i64 2)
+(const NH-REFUSED i64 3)
+(const NH-NODE-THREW i64 4)
+
+(defn nh-status-name [(status i64)] (-> (slice u8))
+  (case status
+    NH-AGREES "agrees with node"
+    NH-DISAGREES "disagrees"
+    NH-CRASHES "crashes"
+    NH-REFUSED "refused"
+    NH-NODE-THREW "node throws"
+    "?"))
+
+(defn nh-status [(source (slice u8)) (arg i64)] (-> i64)
+  (if (not (nh-try-compile? source))
+      NH-REFUSED
+      (if (!= (nh-link!) 0)
+          NH-CRASHES
+          (let [ok (alloc/stack bool)
+                ours (do (set! ok true) (nh-exec-checked! arg ok))]
+            (if (not (load ok))
+                NH-CRASHES
+                (let [node-ok (alloc/stack bool)
+                      theirs (do (set! node-ok true) (nh-node-answer source arg node-ok))]
+                  (if (not (load node-ok))
+                      NH-NODE-THREW
+                      (if (= ours theirs)
+                          NH-AGREES
+                          (do (fmt (stderr) "  ours={d} node={d}\n" ours theirs)
+                              NH-DISAGREES)))))))))
+
+;; The whole claim, in one function: compile it, run it, and ask node.
+(defn nh-agrees-with-node? [(source (slice u8)) (arg i64)] (-> bool)
+  (nh-compile! source)
+  (let [ours (nh-run! arg)
+        ok (alloc/stack bool)
+        theirs (do (set! ok true) (nh-node-answer source arg ok))]
+    (if (not (load ok))
+        (do (fmt (stderr) "native-harness: node threw on\n  source: {s}\n" source) false)
+        (if (= ours theirs)
+            true
+            (do (fmt (stderr)
+                     "native-harness: ours={d} node={d} for arg {d}\n  source: {s}\n"
+                     ours theirs arg source)
+                false)))))
+
+;; ---------------------------------------------------------------------------
+;; The method surface, read out of the frontend's own dispatch tables
+;; ---------------------------------------------------------------------------
+;; Both tables are `cond` chains of `(= name "X")` inside one function, so the function name bounds
+;; the region and every quoted name in it is a method the frontend dispatches. Reading the compiler
+;; rather than a copy of it is the whole point: a copy is a second list to forget to update.
+;;
+;; Shared by `tests/native-capability-test.coil`, which asks whether each method COMPILES, and
+;; `tests/native-differential-test.coil`, which asks whether it computes what node computes. Two
+;; questions, one list, and it is the compiler's list.
+(defn nh-read-text [(a (ptr Allocator)) (path (slice u8))] (-> (slice u8))
+  (try (let [text (try-or! (read-file a path)
+                           (do (fmt (stderr) "native-harness: cannot read {s}\n" path) (abort) ""))]
+         text)))
+
+(defn nh-collect-names! [(text (slice u8)) (fn-header (slice u8)) (out (mut (ArrayList (slice u8))))
+                         (arities (mut (ArrayList i64)))] (-> i64)
+  (match (str-find text fn-header)
+    (None [] (do (fmt (stderr) "native-harness: `{s}` is gone from the frontend; this reads\n  the compiler's dispatch tables by name and one of them moved.\n" fn-header) (abort) 0))
+    (Some [start]
+      (let [after (+ start (slice-len fn-header))
+            stop (match (str-find-from text "\n(defn " after)
+                   (Some [e] e)
+                   (None [] (slice-len text)))
+            (mut at) after]
+        (loop (match (str-find-from text "(= name \"" (load at))
+                (None [] (break))
+                (Some [hit]
+                  (if (>= hit stop)
+                      (break)
+                      (let [from (+ hit 9)]
+                        (match (str-find-from text "\"" from)
+                          (None [] (break))
+                          (Some [end]
+                            (al-push! [(slice u8)] (mut out)
+                                      (slice-new [u8] (index (slice-data text) from) (- end from)))
+                            ;; THE ARITY COMES OUT OF THE SAME LINE, and it is not decoration: a call
+                            ;; the arity table does not accept reaches a lowering that ABORTS, which
+                            ;; without a fork takes the suite down. Probing only accepted arities is
+                            ;; what makes this safe to run. `-1` means the table states none (the
+                            ;; array chain is `(= name "x") true`), and every count is tried.
+                            (al-push! [i64] (mut arities)
+                                      (match (str-find-from text "argc " end)
+                                        (None [] -1)
+                                        (Some [a]
+                                          (if (> a (+ end 24))
+                                              -1
+                                              (- (cast i64 (slice-get text (+ a 5))) 48)))))
+                            (set! at (+ end 1))
+                            0)))))))
+        0))))

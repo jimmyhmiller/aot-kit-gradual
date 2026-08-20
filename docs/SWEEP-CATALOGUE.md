@@ -1,3 +1,6 @@
+> **HISTORICAL, 2026-08-18.** The tools and gates this file describes were deleted with the
+> evaluator. Kept for the findings themselves, which Phase A's harness should re-cover.
+
 # The opcode sweep: what is broken, all of it at once
 
 `docs/FUZZ-FINDINGS.md` is the ledger of defects that have been *diagnosed*. This is the ledger of

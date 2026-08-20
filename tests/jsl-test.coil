@@ -19,7 +19,6 @@
 (import "jsl_lower" :use *)
 (import "node"      :use *)
 (import "ty"        :use *)
-(import "eval"      :use *)
 (import "shape"     :use *)
 (import "jsstring"  :use *)
 (import "jsvalue"   :use *)
@@ -54,63 +53,6 @@
   (assert (= (jsl-load! src) JSL-OK))
   (assert (= (jsl-lower!) JSL-OK))
   0)
-
-;; Call a lowered builtin with one integer argument from the top level and run it. The top-level
-;; Return is a def of Stop (a function body's Return belongs to its Fun instead), which is what
-;; gives the evaluator somewhere to start.
-(defn runN [(name (slice u8)) (args (slice i64))] (-> RtVal)
-  (let [cs (jsl-call! (g-start) name args)
-        ret (n-new2 (Return) (call-end cs) (call-value cs))]
-    (n-add-def! (g-stop) ret)
-    (n-peephole (g-stop))
-    ; `iterate!` IS THE OPTIMISER; `g-analyze!` only computes types and rewrites nothing. Running
-    ; only the latter would leave a folded-predicate If standing, so every claim below about code
-    ; that "disappears" would be a claim about a pass that never ran.
-    (iterate!)
-    (g-analyze!)
-    (assert (= (g-verify) 0))
-    (ev-reset!)
-    (ev-bind-args! 0)
-    (assert (= (ev-run-nobind 100000) EV-OK))
-    (ev-result)))
-
-(defn run1 [(name (slice u8)) (arg i64)] (-> RtVal)
-  (let [buf (alloc/stack (array i64 1))
-        p (cast (ptr i64) buf)]
-    (set! (index p 0) (iconst arg))
-    (runN name (slice-new [i64] p 1))))
-
-(defn run2n [(name (slice u8)) (a i64) (b i64)] (-> RtVal)
-  (let [buf (alloc/stack (array i64 2))
-        p (cast (ptr i64) buf)]
-    (set! (index p 0) a)
-    (set! (index p 1) b)
-    (runN name (slice-new [i64] p 2))))
-
-;; The same three-argument call, but the program must THROW rather than produce a value.
-(defn throws3n [(name (slice u8)) (a i64) (b i64) (c i64)] (-> i64)
-  (let [buf (alloc/stack (array i64 3))
-        p (cast (ptr i64) buf)]
-    (set! (index p 0) a) (set! (index p 1) b) (set! (index p 2) c)
-    (let [cs (jsl-call! (g-start) name (slice-new [i64] p 3))
-          ret (n-new2 (Return) (call-end cs) (call-value cs))]
-      (n-add-def! (g-stop) ret)
-      (n-peephole (g-stop))
-      (iterate!)
-      (g-analyze!)
-      (assert (= (g-verify) 0))
-      (ev-reset!)
-      (ev-bind-args! 0)
-      (assert (= (ev-run-nobind 100000) EV-THROW))
-      0)))
-
-(defn run3n [(name (slice u8)) (a i64) (b i64) (c i64)] (-> RtVal)
-  (let [buf (alloc/stack (array i64 3))
-        p (cast (ptr i64) buf)]
-    (set! (index p 0) a)
-    (set! (index p 1) b)
-    (set! (index p 2) c)
-    (runN name (slice-new [i64] p 3))))
 
 ;; The library as it actually ships, loaded off disk through the index.
 (defn lib! [(seed i64)] (-> i64)
@@ -167,17 +109,6 @@
 (const SRC-SHADOW
   "(builtin shadow :params [(x dyn)] :ret dyn (let [(x (%Mul x 100))] (%Add x 5)))")
 
-; ---------------------------------------------------------------------------
-; Positive: the graph runs
-; ---------------------------------------------------------------------------
-(deftest a_primitive_body_lowers_to_ops_the_evaluator_already_runs
-         (fresh! 90100)
-         (build! SRC-ADD1)
-         (assert (= (jsl-decl-count) 1))
-         (assert (= (jsl-decl-nparams 0) 1))
-         (assert (!= (jsl-decl-fun 0) NO-NODE))
-         (assert (= (rt-payload (run1 "add1" 41)) 42)))
-
 (deftest an_explicit_array_box_retains_its_runtime_tag_contract
          (fresh! 10067)
          (build! "(builtin boxed-array :params [] :ret dyn (%BoxArray (%NewArray)))")
@@ -192,38 +123,6 @@
                      (store! i (+ (load i) 1)))))
            (assert (load found))))
 
-;; The diamond. Both arms are exercised in separate graphs rather than in one, because a Phi whose
-;; predicate is constant folds and the surviving arm would be the only one ever built.
-(deftest an_if_lowers_to_a_diamond_and_both_arms_execute
-         (fresh! 90101)
-         (build! SRC-PICK)
-         (assert (= (rt-payload (run1 "pick" -5)) 5))
-         (fresh! 90102)
-         (build! SRC-PICK)
-         (assert (= (rt-payload (run1 "pick" 7)) 7)))
-
-;; `let` is sequential and emits no node of its own: `e` sees `d`. (x+3)*10-1 at x=1 is 39.
-(deftest let_bindings_are_sequential_ssa_values_and_emit_no_nodes
-         (fresh! 90103)
-         (build! SRC-LET)
-         (assert (= (rt-payload (run1 "scale" 1)) 39)))
-
-;; 2*100 + 5. The inner `x` wins in BOTH passes; if the checker resolved the parameter first while
-;; the lowering resolved the binding first they would still agree that the program is legal, and
-;; the only observable difference would be this number (7 rather than 205).
-(deftest a_let_shadows_a_parameter_and_both_passes_agree_which_one_wins
-         (fresh! 90108)
-         (build! SRC-SHADOW)
-         (assert (= (rt-payload (run1 "shadow" 2)) 205)))
-
-(deftest a_call_between_two_jsl_builtins_lowers_and_runs
-         (fresh! 90104)
-         (build! SRC-CALL)
-         (assert (= (jsl-decl-count) 2))
-         (assert (jsl-decl-transitioning? 0))
-         (assert (not (jsl-decl-transitioning? 1)))
-         (assert (= (rt-payload (run1 "twice" 40)) 42)))
-
 (deftest an_explicit_receiver_is_part_of_the_javascript_call_abi
          (fresh! 90109)
          (build! SRC-CALL-WITH-RECEIVER)
@@ -236,15 +135,6 @@
          (refuses 90110
                   "(builtin bad :params [(fn dyn)] :ret dyn (call-with-receiver fn))"
                   JSL-ERR-ARITY))
-
-;; A type annotation given as a STRING. A bare symbol carries the bracket-free spellings; the rest
-;; of `text.coil`'s grammar arrives as a `KStr`. This asserts the annotation reaches `ty-try-parse`
-;; intact and interns to the type that spelling denotes.
-(deftest a_quoted_annotation_carries_the_full_textual_type_grammar
-         (fresh! 90105)
-         (build! SRC-QUOTED-TYPE)
-         (assert (= (jsl-param-ty 0 0) (t-int-range 0 9)))
-         (assert (= (rt-payload (run1 "narrow" 4)) 5)))
 
 ;; A DECLARED PARAMETER TYPE IS NOT A FACT (D1/D8). The annotation is recorded on the declaration
 ;; and is deliberately NOT injected onto the Parm, because a rewrite may only act on a PROVEN type
@@ -272,7 +162,12 @@
          ; 232: `LooseEqual`, the relational pair, the seven bitwise operations, the arithmetic
          ; group, `NumberRaw`, and the equality/negation trio (`StrictNotEqual`, `LooseNotEqual`,
          ; `LogicalNot`), and `StringReplaceFirst` joined the library.
-         (assert (= (jsl-decl-count) 236))
+         ; 230: `ArrayToStringValue`, which is what `String([1, 2, 3])` reaches, plus the two
+         ; helpers its cycle stack needs (`ArrayJoinSeen`, `ArraySeenHas`) and `ToStringValueSeen`.
+         ; 231: `StringElement`, which is `s[i]` -- neither `charAt` nor `at`.
+         ; 234: `GetIterator`, `IteratorComplete` and `IteratorValue` -- what `for (const x of xs)`
+         ; lowers to, over the array iterator that was already here.
+         (assert (= (jsl-decl-count) 234))
          ; A builtin has a Fun and a macro does not, and every declaration is one or the other.
          (let [(mut i) 0 (mut funs) 0 (mut macros) 0]
            (loop (if (>= (load i) (jsl-decl-count)) (break)
@@ -283,11 +178,11 @@
                                (store! funs (+ (load funs) 1)) 0))
                        (store! i (+ (load i) 1))
                        0)))
-           (assert (= (+ (load funs) (load macros)) 236))
+           (assert (= (+ (load funs) (load macros)) 234))
            ; Most existing heap definitions remain macros for graph visibility and historical
            ; stability; called builtins can now carry an implicit heap effect when recursion or
            ; code sharing requires one.
-           (assert (= (load macros) 181)))
+           (assert (= (load macros) 177)))
          (assert (>= (jsl-find "Clamp") 0))
          (assert (>= (jsl-find "StringIndexOfFrom") 0))
          (assert (>= (jsl-find "StringStartsWith") 0))
@@ -301,60 +196,6 @@
          (assert (>= (jsl-find "StringSplit") 0))
          (assert (>= (jsl-find "StringSplitWhole") 0))
          (assert (jsl-macro? (jsl-find "RequireObjectCoercible"))))
-
-;; INLINING A HELPER REMOVES ITS CALLER'S ANNOTATION. `Clamp` used to be a builtin, which put an
-;; OPTAG-CALL on `StringIndexOfFrom`'s only path and forced `:transitioning true` on it. As a macro it
-;; contributes nodes instead of a call, so the annotation came off — and the transition check,
-;; which reads the lowered graph rather than the source, is what makes that safe to rely on: if the
-;; inlining had not happened, this declaration would no longer lower.
-(deftest making_a_helper_a_macro_removes_the_call_and_the_annotation
-         (lib! 90314)
-         (assert (jsl-macro? (jsl-find "Clamp")))
-         (assert (not (jsl-decl-transitioning? (jsl-find "StringIndexOfFrom"))))
-         ; The callers that still reach a real builtin keep theirs.
-         (assert (jsl-decl-transitioning? (jsl-find "StringStartsWith")))
-         (assert (= (rt-payload (run3n "StringIndexOfFrom" (sconst "abcabc") (sconst "b") (iconst 2))) 4)))
-
-(deftest a_unit_may_call_a_definition_declared_in_another_file
-         ; `StringIndexOfFrom` calls `Clamp`, which lives in a different unit and is read first;
-         ; `StringStartsWith` calls `StringIndexOfFrom`, which is read BEFORE it. Both directions
-         ; resolve because `jsl-check` is a second pass over the finished table.
-         (lib! 90301)
-         (assert (= (rt-payload (run3n "StringIndexOfFrom" (sconst "hello world") (sconst "o") (iconst 5))) 7)))
-
-(deftest the_clamped_start_matches_the_specs_min_max_bounds
-         ; ONE RUN PER GRAPH. `runN` makes its Return a def of Stop, so two runs in one graph give
-         ; the evaluator two entry points and it reports something other than EV-OK. Every case
-         ; below therefore re-loads the library into a fresh graph.
-         (lib! 90302)   ; below zero clamps to zero
-         (assert (= (rt-payload (run3n "StringIndexOfFrom" (sconst "abcabc") (sconst "b") (iconst -99))) 1))
-         (lib! 90311)   ; past the end clamps to the length, so nothing is found
-         (assert (= (rt-payload (run3n "StringIndexOfFrom" (sconst "abcabc") (sconst "b") (iconst 99))) -1)))
-
-(deftest starts_with_and_includes_run_off_the_shared_core
-         (lib! 90303)
-         (assert (= (rt-payload (run2n "StringStartsWith" (sconst "coil") (sconst "co"))) 1))
-         (lib! 90312)
-         (assert (= (rt-payload (run2n "StringStartsWith" (sconst "coil") (sconst "il"))) 0))
-         ; The empty needle occurs at 0, so `startsWith("")` is true, as the spec says.
-         (lib! 90304)
-         (assert (= (rt-payload (run2n "StringStartsWith" (sconst "coil") (sconst ""))) 1))
-         (lib! 90305)
-         (assert (= (rt-payload (run3n "StringIncludesFrom" (sconst "coil") (sconst "il") (iconst 0))) 1))
-         (lib! 90313)
-         (assert (= (rt-payload (run3n "StringIncludesFrom" (sconst "coil") (sconst "zz") (iconst 0))) 0)))
-
-;; THE BUG lib/string/ends-with.jsl'S GUARD EXISTS FOR. A needle one code unit longer than the
-;; receiver puts the expected position at -1, and a needle that does not occur also answers -1, so
-;; without the `(%Lt at 0)` guard these two compare equal and `endsWith` reports true for a needle
-;; that cannot fit. Deleting the guard makes exactly this row fail.
-(deftest ends_with_refuses_a_needle_longer_than_the_receiver
-         (lib! 90306)
-         (assert (= (rt-payload (run2n "StringEndsWith" (sconst "oil") (sconst "coil"))) 0))
-         (lib! 90307)
-         (assert (= (rt-payload (run2n "StringEndsWith" (sconst "coil") (sconst "il"))) 1))
-         (lib! 90308)
-         (assert (= (rt-payload (run2n "StringEndsWith" (sconst "coil") (sconst "co"))) 0)))
 
 (deftest a_missing_index_and_an_empty_index_are_refused_by_name
          (fresh! 90309)
@@ -387,65 +228,6 @@
          (refuses 90205
                   "(builtin f :params [(x dyn)] x) (builtin f :params [(y dyn)] y)"
                   JSL-ERR-DUP-NAME))
-
-;; Called builtins receive an implicit trailing heap parameter and publish their returned heap at
-;; CallEnd. This is the effect convention JSON's recursive parser needs: source parameters remain
-;; ordinary JavaScript values while memory is explicit in IR and invisible in the DSL surface.
-(deftest a_builtin_reads_the_callers_heap_through_its_effect_parameter
-         (fresh! 91200)
-         (assert (= (jsl-load!
-                      "(builtin arrayLength :params [(a dyn)] :ret int (%ArrayLen a))
-                       (macro makeAndRead :params [] :ret int
-                         (let [(a (%NewArray))
-                               (stored (%ArrayStore a 0 (%Box 42)))]
-                           (arrayLength a)))")
-                    JSL-OK))
-         (assert (= (jsl-require-body-only! "makeAndRead") JSL-OK))
-         (let [ctrl (alloc/stack (array i64 1))
-               mem (alloc/stack (array i64 1))
-               cp (cast (ptr i64) ctrl)
-               mp (cast (ptr i64) mem)]
-           (store! (index cp 0) (g-start))
-           (store! (index mp 0)
-                   (n-new1 (Arg (t-mem-alias JS-PROPERTY-ALIAS (t-undef))) (g-start)))
-           (let [value (jsl-inline! cp mp (g-start) "makeAndRead" (slice-new [i64] cp 0))
-                 ret (n-new3 (Return) (load (index cp 0)) value (load (index mp 0)))]
-             (n-add-def! (g-stop) ret)
-             (iterate!)
-             (g-analyze!)
-             (assert (= (g-verify) 0))
-             (ev-reset!)
-             (assert (= (ev-run-nobind 100000) EV-OK))
-             (assert (= (rt-payload (ev-result)) 1)))))
-
-(deftest a_recursive_builtin_threads_the_heap_at_every_call
-         (fresh! 91201)
-         (assert (= (jsl-load!
-                      "(builtin sumArray :transitioning true :params [(a dyn) (i int)] :ret int
-                         (if (%Lt i (%ArrayLen a))
-                             (%Add (%UnboxInt (%ArrayLoad a i)) (sumArray a (%Add i 1)))
-                             0))
-                       (macro makeAndSum :params [] :ret int
-                         (let [(a (%NewArray))
-                               (s0 (%ArrayStore a 0 (%Box 20)))
-                               (s1 (%ArrayStore a 1 (%Box 22)))]
-                           (sumArray a 0)))")
-                    JSL-OK))
-         (assert (= (jsl-require-body-only! "makeAndSum") JSL-OK))
-         (let [ctrl (alloc/stack (array i64 1)) mem (alloc/stack (array i64 1))
-               cp (cast (ptr i64) ctrl) mp (cast (ptr i64) mem)]
-           (store! (index cp 0) (g-start))
-           (store! (index mp 0)
-                   (n-new1 (Arg (t-mem-alias JS-PROPERTY-ALIAS (t-undef))) (g-start)))
-           (let [value (jsl-inline! cp mp (g-start) "makeAndSum" (slice-new [i64] cp 0))
-                 ret (n-new3 (Return) (load (index cp 0)) value (load (index mp 0)))]
-             (n-add-def! (g-stop) ret)
-             (iterate!)
-             (g-analyze!)
-             (assert (= (g-verify) 0))
-             (ev-reset!)
-             (assert (= (ev-run-nobind 100000) EV-OK))
-             (assert (= (rt-payload (ev-result)) 42)))))
 
 ;; The same definition as a `macro` is accepted, because a macro is lowered into its caller's graph
 ;; and so reads its caller's memory.
@@ -494,67 +276,6 @@
              (assert (= (g-verify) 0))
              (assert (op-is? (load (index mp 0)) Phi [_]))
              (assert (ty-mem? (n-ty (load (index mp 0))))))))
-
-(deftest an_ordinary_object_can_be_allocated_and_populated_entirely_in_jsl
-         (fresh! 91205)
-         (assert (= (jsl-load!
-                      "(macro makeObject :params [] :ret dyn
-                         (let [(object (%NewObject))
-                               (ignored (%PropStoreKey object \"answer\" (%Box 42)))]
-                           (%PropLoadKey object \"answer\")))")
-                    JSL-OK))
-         (let [ctrl (alloc/stack (array i64 1))
-               mem (alloc/stack (array i64 1))
-               cp (cast (ptr i64) ctrl)
-               mp (cast (ptr i64) mem)
-               argv (alloc/stack (array i64 1))]
-           (store! (index cp 0) (g-start))
-           (store! (index mp 0)
-                   (n-new1 (Arg (t-mem-alias JS-PROPERTY-ALIAS (t-undef))) (g-start)))
-           (let [value (jsl-inline! cp mp (g-start) "makeObject"
-                                    (slice-new [i64] (cast (ptr i64) argv) 0))
-                 ret (n-new3 (Return) (load (index cp 0)) value (load (index mp 0)))]
-             (n-add-def! (g-stop) ret)
-             (iterate!)
-             (g-analyze!)
-             (assert (= (g-verify) 0))
-             (ev-reset!)
-             (ev-bind-args! 0)
-             (assert (= (ev-run-nobind 10000) EV-OK))
-             (assert (rt-eq? (ev-result) (RInt 42))))))
-
-(deftest own_key_primitives_are_ordered_memory_aware_heap_reads
-         (fresh! 91206)
-         (assert (= (jsl-load!
-                      "(macro firstOwnKey :params [] :ret bool
-                         (let [(object (%NewObject))
-                               (a (%PropStoreKey object \"later\" (%Box 1)))
-                               (b (%PropStoreKey object \"10\" (%Box 2)))
-                               (c (%PropStoreKey object \"2\" (%Box 3)))
-                               (count (%OwnKeyCount object))]
-                           (if (%Eq count 3)
-                               (%StringEq (%OwnKeyAt object 0) \"2\")
-                               false)))")
-                    JSL-OK))
-         (let [ctrl (alloc/stack (array i64 1))
-               mem (alloc/stack (array i64 1))
-               argv (alloc/stack (array i64 1))
-               cp (cast (ptr i64) ctrl)
-               mp (cast (ptr i64) mem)]
-           (store! (index cp 0) (g-start))
-           (store! (index mp 0)
-                   (n-new1 (Arg (t-mem-alias JS-PROPERTY-ALIAS (t-undef))) (g-start)))
-           (let [value (jsl-inline! cp mp (g-start) "firstOwnKey"
-                                    (slice-new [i64] (cast (ptr i64) argv) 0))
-                 ret (n-new3 (Return) (load (index cp 0)) value (load (index mp 0)))]
-             (n-add-def! (g-stop) ret)
-             (iterate!)
-             (g-analyze!)
-             (assert (= (g-verify) 0))
-             (ev-reset!)
-             (ev-bind-args! 0)
-             (assert (= (ev-run-nobind 10000) EV-OK))
-             (assert (rt-eq? (ev-result) (RBool true))))))
 
 (deftest a_designed_but_unbuilt_form_is_refused_as_unsupported
          (refuses 90207 "(class JSArray :params [(x dyn)] x)" JSL-ERR-UNSUPPORTED))
@@ -607,78 +328,6 @@
          (assert (= (jsl-load! SRC-CALL) JSL-OK))
          (assert (= (jsl-lower!) JSL-OK))
          (assert (jsl-ok?)))
-
-; ---------------------------------------------------------------------------
-; String.prototype.indexOf, against Node
-; ---------------------------------------------------------------------------
-;; EVERY EXPECTED VALUE HERE WAS PRODUCED BY NODE, not reasoned out. The table is the output of a
-;; script over `String.prototype.indexOf` covering the coercions the spec's steps 1-4 perform:
-;; fractional positions (truncated TOWARD ZERO), both infinities, NaN, undefined, null, booleans,
-;; numeric strings with and without whitespace, exponent and hex forms, the empty string, and a
-;; non-string search value.
-;;
-;; One run per graph, because `runN` makes its Return a def of Stop.
-;;
-;; THE `Infinity` AND `-Infinity` ROWS ARE THE POINT. `%ToInteger` is ToIntegerOrInfinity, not `|0`:
-;; `|0` answers 0 for both, so `"abc".indexOf("c", Infinity)` would find the `c` at index 2 instead
-;; of returning -1. Those two rows fail against any implementation that reached for ToInt32.
-(deftest string_prototype_indexof_agrees_with_node
-         (lib! 91000) (assert (= (rt-payload (run3n "String.prototype.indexOf" (sconst "hello world") (sconst "o") (iconst 0))) 4))
-         (lib! 91001) (assert (= (rt-payload (run3n "String.prototype.indexOf" (sconst "hello world") (sconst "o") (iconst 5))) 7))
-         (lib! 91002) (assert (= (rt-payload (run3n "String.prototype.indexOf" (sconst "hello world") (sconst "o") (iconst 99))) -1))
-         (lib! 91003) (assert (= (rt-payload (run3n "String.prototype.indexOf" (sconst "hello world") (sconst "o") (iconst -99))) 4))
-         (lib! 91004) (assert (= (rt-payload (run3n "String.prototype.indexOf" (sconst "abcabc") (sconst "b") (iconst 2))) 4))
-         ; 2.9 truncates to 2, not 3: ToIntegerOrInfinity truncates toward zero.
-         (lib! 91005) (assert (= (rt-payload (run3n "String.prototype.indexOf" (sconst "abcabc") (sconst "b") (fconst 2.9))) 4))
-         ; -2.9 truncates to -2, which clamps to 0.
-         (lib! 91006) (assert (= (rt-payload (run3n "String.prototype.indexOf" (sconst "abcabc") (sconst "b") (fconst -2.9))) 1))
-         (lib! 91007) (assert (= (rt-payload (run3n "String.prototype.indexOf" (sconst "abc") (sconst "c") (kconst (t-flt-bits INF-BITS)))) -1))
-         (lib! 91008) (assert (= (rt-payload (run3n "String.prototype.indexOf" (sconst "abc") (sconst "c") (kconst (t-flt-bits NEG-INF-BITS)))) 2))
-         (lib! 91009) (assert (= (rt-payload (run3n "String.prototype.indexOf" (sconst "abc") (sconst "c") (kconst (t-flt-bits JSV-NAN)))) 2))
-         (lib! 91010) (assert (= (rt-payload (run3n "String.prototype.indexOf" (sconst "abc") (sconst "") (iconst 0))) 0))
-         (lib! 91011) (assert (= (rt-payload (run3n "String.prototype.indexOf" (sconst "abc") (sconst "") (iconst 99))) 3))
-         (lib! 91012) (assert (= (rt-payload (run3n "String.prototype.indexOf" (sconst "abc") (sconst "zz") (iconst 0))) -1))
-         (lib! 91013) (assert (= (rt-payload (run3n "String.prototype.indexOf" (sconst "abc") (sconst "b") (kconst (t-undef)))) 1))
-         (lib! 91014) (assert (= (rt-payload (run3n "String.prototype.indexOf" (sconst "abc") (sconst "b") (kconst (t-null)))) 1))
-         (lib! 91015) (assert (= (rt-payload (run3n "String.prototype.indexOf" (sconst "abc") (sconst "b") (bconst true))) 1))
-         (lib! 91016) (assert (= (rt-payload (run3n "String.prototype.indexOf" (sconst "abc") (sconst "b") (sconst "1"))) 1))
-         (lib! 91017) (assert (= (rt-payload (run3n "String.prototype.indexOf" (sconst "abc") (sconst "b") (sconst " 1 "))) 1))
-         (lib! 91018) (assert (= (rt-payload (run3n "String.prototype.indexOf" (sconst "abc") (sconst "b") (sconst "1e0"))) 1))
-         (lib! 91019) (assert (= (rt-payload (run3n "String.prototype.indexOf" (sconst "abc") (sconst "b") (sconst "0x1"))) 1))
-         ; "" is +0 and "nonsense" is NaN; both become position 0.
-         (lib! 91020) (assert (= (rt-payload (run3n "String.prototype.indexOf" (sconst "abc") (sconst "b") (sconst ""))) 1))
-         (lib! 91021) (assert (= (rt-payload (run3n "String.prototype.indexOf" (sconst "abc") (sconst "b") (sconst "nonsense"))) 1))
-         ; Step 3 is ToString on the SEARCH value, so a number and a boolean are stringified.
-         (lib! 91022) (assert (= (rt-payload (run3n "String.prototype.indexOf" (sconst "12345") (iconst 34) (iconst 0))) 2))
-         (lib! 91023) (assert (= (rt-payload (run3n "String.prototype.indexOf" (sconst "truthy") (bconst true) (iconst 0))) -1)))
-
-;; Step 1. RequireObjectCoercible throws on a nullish receiver, and the THROW is what is asserted —
-;; the error CLASS is a documented deviation (there are no error objects until R03), so the payload
-;; is the message string rather than a TypeError.
-(deftest a_nullish_receiver_throws_at_step_one
-         (lib! 91030)
-         (throws3n "String.prototype.indexOf" (kconst (t-null)) (sconst "b") (iconst 0))
-         (lib! 91031)
-         (throws3n "String.prototype.indexOf" (kconst (t-undef)) (sconst "b") (iconst 0)))
-
-;; A JSL string literal with spaces and parens. Under the old `coil.sexp` this needed a pre-pass
-;; that encoded delimiters inside quoted runs as control bytes, because a quoted run was not a
-;; token; `coil.reader`'s `KStr` makes it ordinary.
-(deftest a_string_literal_may_contain_spaces_and_parens
-         (fresh! 91040)
-         (build! "(builtin msg :params [(x dyn)] :ret dyn \"a b (c)\")")
-         (let [r (run1 "msg" 0)]
-           (assert (= (rt-tag r) RT-STR))
-           (assert (jss-equal? (rt-payload r) (jss-from-utf8! "a b (c)")))))
-
-;; Float literals, which the reader only started distinguishing from symbols with `KFloat`. The
-;; lattice holds a float as its BIT PATTERN, so the path under test is `KFloat` -> `t-flt-bits`.
-(deftest a_float_literal_lowers_to_a_float_constant
-         (fresh! 91050)
-         (build! "(builtin half :params [(x dyn)] :ret dyn (%Mul x 0.5))")
-         (let [r (run1 "half" 7)]
-           (assert (= (rt-tag r) RT-FLT))
-           (assert (= (rt-payload r) (f64-bits 3.5)))))
 
 ;; The reader's own refusal, surfaced as a named JSL failure rather than retold. `coil.reader`
 ;; returns a `Diag` carrying the message and the byte range that noticed; `jsl-read!` keeps the
@@ -751,51 +400,6 @@
                   (loop [(j 0) (row total)]
                     (if (%Lt j n) (recur (%Add j 1) (%Add row 1)) row)))
            total)))")
-
-(deftest a_loop_lowers_to_a_loop_phi_and_counts
-         (fresh! 91100) (build! SRC-SUM)
-         (assert (= (rt-payload (run1 "sumto" 5)) 10))    ; 0+1+2+3+4
-         (fresh! 91101) (build! SRC-SUM)
-         (assert (= (rt-payload (run1 "sumto" 1)) 0))
-         ; Zero trips: the condition fails immediately and the loop's value is the initialiser.
-         (fresh! 91102) (build! SRC-SUM)
-         (assert (= (rt-payload (run1 "sumto" 0)) 0)))
-
-(deftest a_loop_carrying_two_bindings_advances_both
-         (fresh! 91103) (build! SRC-REPEAT)
-         (let [r (run2n "srepeat" (sconst "ab") (iconst 3))]
-           (assert (= (rt-tag r) RT-STR))
-           (assert (jss-equal? (rt-payload r) (jss-from-utf8! "ababab"))))
-         (fresh! 91104) (build! SRC-REPEAT)
-         (let [r (run2n "srepeat" (sconst "x") (iconst 0))]
-           (assert (jss-equal? (rt-payload r) (jss-from-utf8! "")))))
-
-(deftest a_loop_binding_may_declare_its_carried_representation
-         (fresh! 91109)
-         (build! "(builtin typedLoop :params [] :ret int
-                    (loop [(i 0 int)]
-                      (if (%Lt i 3) (recur (%Add i 1)) i)))")
-         (assert (= (n-phi-declared-type (first-op OPTAG-PHI)) (t-int)))
-         (assert (= (rt-payload (runN "typedLoop" (slice-new [i64] (cast (ptr i64) 0) 0))) 3))
-         (refuses 91112
-                  "(builtin f :params [] (loop [(i 0 not-a-type)] (recur i)))"
-                  JSL-ERR-BAD-TYPE)
-         (refuses 91113
-                  "(builtin f :params [] (loop [(i 0 int extra)] (recur i)))"
-                  JSL-ERR-BAD-LOOP))
-
-(deftest two_recur_sites_merge_into_one_back_edge
-         (fresh! 91105) (build! SRC-TWO-RECUR)
-         (assert (= (rt-payload (run1 "countodd" 10)) 5))   ; 1,3,5,7,9
-         (fresh! 91106) (build! SRC-TWO-RECUR)
-         (assert (= (rt-payload (run1 "countodd" 7)) 3)))   ; 1,3,5
-
-(deftest a_nested_loop_keeps_its_recurs_separate
-         ; total = n*n: the inner loop adds 1 per column, the outer runs n rows.
-         (fresh! 91107) (build! SRC-NESTED)
-         (assert (= (rt-payload (run1 "grid" 4)) 16))
-         (fresh! 91108) (build! SRC-NESTED)
-         (assert (= (rt-payload (run1 "grid" 0)) 0)))
 
 ;; A `loop` nothing recurs to would leave the Loop's back edge null; a `loop` everything recurs from
 ;; cannot terminate and leaves the enclosing body with no Return. Both are named at lowering rather
@@ -884,21 +488,6 @@
    (builtin slowpath :params [(y dyn)] :ret dyn
      (Positive y :otherwise (%Add y 999)))")
 
-(deftest a_macro_is_inlined_rather_than_called
-         (fresh! 90400)
-         (build! SRC-MACRO)
-         (assert (jsl-macro? (jsl-find "Twice")))
-         (assert (not (jsl-macro? (jsl-find "useTwice"))))
-         ; A macro gets no Fun, because it is never called.
-         (assert (= (jsl-decl-fun (jsl-find "Twice")) NO-NODE))
-         (assert (!= (jsl-decl-fun (jsl-find "useTwice")) NO-NODE))
-         (assert (= (rt-payload (run1 "useTwice" 5)) 11)))
-
-(deftest a_macro_body_cannot_see_its_callers_bindings
-         (fresh! 90401)
-         (build! SRC-MACRO-SHADOW)
-         (assert (= (rt-payload (run1 "caller" 2)) 3)))
-
 ;; A macro that reaches itself has no fixed point, so the expansion would not terminate. It has to
 ;; be a named diagnostic found statically, not a depth cap that reports a legal deep nest.
 (deftest a_recursive_macro_is_refused_before_anything_is_lowered
@@ -906,49 +495,6 @@
          (refuses 90403
                   "(macro A :params [(x dyn)] (A x)) (builtin c :params [(x dyn)] :ret dyn (A x))"
                   JSL-ERR-MACRO-RECURSION))
-
-(deftest a_label_and_its_otherwise_handler_both_execute
-         (fresh! 90404)
-         (build! SRC-LABEL)
-         (assert (= (rt-payload (run1 "classify" 3)) 30))
-         (fresh! 90405)
-         (build! SRC-LABEL)
-         (assert (= (rt-payload (run1 "classify" -3)) -1)))
-
-;; THE CLAIM THE LANGUAGE IS FOR. With the guard decidable, the whole of `fast` becomes the constant
-;; 70: no call, because a macro is inlined into its caller; no branch, because the guard folded; and
-;; no `%Add`, because the entire bail-out path went with it.
-;;
-;; WHICH PASS DOES IT, precisely, because the distinction matters to anyone relying on this. The
-;; LOWERING sees that `%Lt 7 0` constructed a constant bool and lowers only the selected arm. The
-;; `goto`, its handler, and their `%Add y 999` therefore never enter the graph. The assertions before
-;; `run1` distinguish this from a later graph cleanup that merely deletes an already-built arm.
-;;
-;; That is still the thesis. V8 reaches this shape by speculating and keeping deopt metadata to
-;; retreat with; under D1's closed world it falls out of ordinary constant propagation, with no
-;; deoptimisation machinery anywhere.
-(deftest a_decidable_guard_folds_to_straight_line_code
-         (fresh! 90406)
-         (build! SRC-SPECIALISE)
-         ; These are pre-iteration assertions: the dead source arm was never lowered.
-         (assert (= (count-op OPTAG-IF) 0))
-         (assert (= (count-op OPTAG-ADD) 0))
-         (assert (= (rt-payload (run1 "fast" 1)) 70))
-         (assert (= (count-op OPTAG-CALL) 1))   ; only the top-level call the harness makes
-         (assert (= (count-op OPTAG-IF) 0))
-         (assert (= (count-op OPTAG-ADD) 0))
-         (assert (= (count-op OPTAG-MUL) 0))
-         (assert (= (count-op OPTAG-LT) 0)))
-
-(deftest an_opaque_guard_keeps_the_branch_and_the_slow_path
-         (fresh! 90407)
-         (build! SRC-NOT-SPECIALISED)
-         (assert (= (rt-payload (run1 "slowpath" 4)) 40))
-         (assert (>= (count-op OPTAG-IF) 1))
-         (assert (>= (count-op OPTAG-ADD) 1))
-         (fresh! 90408)
-         (build! SRC-NOT-SPECIALISED)
-         (assert (= (rt-payload (run1 "slowpath" -4)) 995)))
 
 (deftest a_label_on_a_builtin_is_refused_because_control_cannot_cross_a_call
          (refuses 90409 "(builtin f :labels [L] :params [(x dyn)] x)" JSL-ERR-BAD-LABELS))

@@ -1,3 +1,8 @@
+> **HISTORICAL, 2026-08-18.** The evaluator described here was deleted. This file is kept as
+> the design record of how graph execution worked — the memory-version heap, the per-control
+> effect chain, the failure codes — because Phase A rebuilds execution against the CPU and the
+> problems it had to solve do not go away. Nothing here describes current code.
+
 # Ideal evaluator execution-model redesign
 
 ## Status and purpose

@@ -1,3 +1,6 @@
+> **HISTORICAL, 2026-08-18.** The tools and gates this file describes were deleted with the
+> evaluator. Kept for the findings themselves, which Phase A's harness should re-cover.
+
 # Deftests owed
 
 The gate is now `coil test`. Nothing else.

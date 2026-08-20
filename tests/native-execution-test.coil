@@ -1,0 +1,718 @@
+(module nativeexecutiontest)
+;; THE PRODUCT PATH, EXECUTED: TypeScript source in, a running arm64 binary out, and node's answer
+;; beside ours.
+;;
+;; This is the only test in the repo that runs the artifact this project ships. Every other suite
+;; checks the compiler's structure -- types, verifier, selection, scheduling, allocation -- or
+;; executes a hand-built graph of arithmetic through `mmap`. Neither can see a defect in the DSL
+;; itself, because a definition in `lib/` only becomes machine code at the end of this pipeline.
+;;
+;; Until 2026-08-18 that gap was covered by the graph interpreter, which ran the same IR and was
+;; compared against node. It was deleted: an interpreter is a second implementation of JavaScript,
+;; and the whole point of `lib/` is that there is only one. What replaces it is this -- the same
+;; differential against node, against the real thing instead of against an opinion of it.
+;;
+;; THE PIECES ALREADY EXISTED, unassembled. `frontend-native-graph-test` turns source into a graph;
+;; `linked-object-test` writes an object, drives `clang` through `popen`, and runs the result;
+;; `js-source-prop` (deleted) asked node for the answer the same way. This file is those three
+;; joined into one claim: OUR COMPILED PROGRAM AGREES WITH NODE.
+(import "nativeharness" :use *)
+(import "coil.assert" :use *)
+(import "coil.io" :use *)
+(import "coil.fmt" :use *)
+(import "coil.slice" :use *)
+(import "coil.alloc" :use * :as alloc)
+
+;; THE THREE LEGS LIVE IN `tests/native_harness.coil` NOW. They moved when
+;; `tests/native-differential-test.coil` began asking the same question of every method the frontend
+;; dispatches: at that scale recompiling the runtime and spawning a node per case stopped being
+;; affordable, and there is no reason for two copies of the pipeline. This file is the hand-written
+;; cases; that one is the derived sweep.
+(defn agrees-with-node? [(source (slice u8)) (arg i64)] (-> bool)
+  (nh-agrees-with-node? source arg))
+
+;; ---------------------------------------------------------------------------
+;; The cases
+;; ---------------------------------------------------------------------------
+;; ARITHMETIC FIRST, and not because arithmetic is interesting: it is the falsification. If the
+;; harness is wired wrong -- the object never written, the link silently failing, `atoll` reading an
+;; empty line -- every case reports 0 and a comparison against node's 0 would pass. This case
+;; returns something that is not 0 and not the argument.
+(deftest a_compiled_program_computes_arithmetic_on_the_cpu
+  (assert (agrees-with-node? "function main(n: number): number { return (n * 3 + 7) | 0; }" 5)))
+
+;; THE CASE THIS FILE WAS BUILT FOR. `toLowerCase` and `toUpperCase` have no implementation in the
+;; compiler and none in C: strike 1 deleted both, and what answers now is `lib/string/case.jsl` --
+;; a DSL loop over `%StringNew`/`%StringSetUnit`, lowered through `jsl_lower`, selected to
+;; JSSOP 0 and 1, emitted as arm64, and resolved by the linker against `_aot_js_string`. Every one
+;; of those steps is unexercised by every other test in this repo.
+;;
+;; THE CHARACTERS ARE THE POINT. `@` and `[` bracket `A`-`Z` and `a` follows `Z`, so an off-by-one
+;; in the loop's comparisons changes the answer here and nowhere else. The empty string exercises a
+;; zero-length allocation, and `String(n)` a receiver that is not a constant.
+(deftest string_case_is_a_dsl_loop_and_it_runs_on_the_cpu
+  (assert (agrees-with-node? "function main(n: number): number {
+  let acc = n | 0;
+  { let s = \"AbZ@[a\"; acc = (acc + s.toLowerCase().charCodeAt(0) + s.toLowerCase().charCodeAt(2)) | 0; }
+  { let s = \"AbZ@[a\"; acc = (acc + s.toUpperCase().charCodeAt(1) + s.toUpperCase().charCodeAt(5)) | 0; }
+  { let e = \"\"; acc = (acc + e.toLowerCase().length + e.toUpperCase().length) | 0; }
+  return acc | 0;
+}
+" 7)))
+
+
+;; THE REST OF THE STRING FAMILY, which is what strikes 2 through 5 rewrite. Every one of these
+;; still reaches a `%` primitive and a C case today; each strike replaces one with a DSL loop over
+;; the atoms, and this case is what says the replacement computes what the primitive did.
+;;
+;; `substring`/`slice` are NOT here: they do not compile. See the frontier ladder below.
+(deftest the_string_family_runs_on_the_cpu
+  (assert (agrees-with-node? "function main(n: number): number {
+  let acc = n | 0;
+  { let s = \"abcdef\"; acc = (acc + s.length + s.charCodeAt(3) + s.indexOf(\"cd\")) | 0; }
+  { let s = \"a\" + \"bc\"; acc = (acc + s.length + (s === \"abc\" ? 5 : 9)) | 0; }
+  { let s = \"x,y,z\"; acc = (acc + s.split(\",\").length) | 0; }
+  { acc = (acc + String(n).length + parseInt(\"42\", 10)) | 0; }
+  return acc | 0;
+}
+" 3)))
+
+
+;; ARRAYS, WHICH MEANS THE COLLECTOR IS IN THE LOOP: a literal is a real allocation through
+;; `_aot_alloc_slow`, so a wrong answer here could come from the GC rather than from the DSL.
+;; `push`, `map` and `reduce` are NOT here -- they do not compile. See the ladder below.
+(deftest arrays_and_the_collector_run_on_the_cpu
+  (assert (agrees-with-node? "function main(n: number): number {
+  let a = [1, 2, 3, 4];
+  return (n + a.length + a[2]) | 0;
+}
+" 4)))
+
+
+;; OBJECTS: a shaped literal and a field mutation, which is the static-slot path.
+;; `Object.keys` in the SAME program does not compile -- see the ladder.
+(deftest objects_run_on_the_cpu
+  (assert (agrees-with-node? "function main(n: number): number {
+  let o = {x: 1, y: 2};
+  o.x = (o.x + 10) | 0;
+  return (n + o.x + o.y) | 0;
+}
+" 4)))
+
+
+;; THE CASES THAT `ToString` AND `Box` SELECTION UNBLOCKED (2026-08-19). Each of these was a
+;; `selection has no rule` cell in docs/NATIVE-CAPABILITY.md an hour before it was written, and
+;; compiling is only half the claim -- the fixes decide which MACHINE WORD a value is, so if either
+;; is wrong the program runs and prints the wrong number. Node is what says otherwise.
+(deftest a_string_result_reaching_arithmetic_runs_on_the_cpu
+  (assert (agrees-with-node? "function main(n: number): number {
+  let acc = n | 0;
+  { let v = \"abcdef\"; let r: any = v.charAt(1); acc = (acc + r.charCodeAt(0)) | 0; }
+  { let v = \"abcdef\"; let r: any = v.substring(1, 4); acc = (acc + r.length) | 0; }
+  { let v = \"abcdef\"; let r: any = v.slice(-2); acc = (acc + r.charCodeAt(0) + r.length) | 0; }
+  { let v = \"abcdef\"; let r: any = v.trim(); acc = (acc + r.length) | 0; }
+  return acc | 0;
+}
+" 5)))
+
+;; A VALUE THAT SPANS REPRESENTATION CLASSES, which is the shape the `Box` fix is about: `at` and
+;; `codePointAt` answer `undefined` out of range and a number in it, so the same variable is
+;; `undefined|number` and can only be a tagged word.
+(deftest a_value_that_may_be_undefined_runs_on_the_cpu
+  (assert (agrees-with-node? "function main(n: number): number {
+  let acc = n | 0;
+  { let v = \"abcdef\"; let r: any = v.codePointAt(1); acc = (acc + String(r).length) | 0; }
+  { let v = \"abcdef\"; let r: any = v.at(1); acc = (acc + String(r).length) | 0; }
+  { let v = \"abcdef\"; let r: any = v.at(99); acc = (acc + String(r).length) | 0; }
+  { let v = [1, 2, 3]; let r: any = v.at(99); acc = (acc + String(r).length) | 0; }
+  return acc | 0;
+}
+" 6)))
+
+;; `String(x)` ON A VALUE THE ANALYSIS PROVED IS A NUMBER but did not pin to int or float. This is
+;; the exact shape that used to fall to `-2`: narrowing `dyn` to `num` lost the conversion.
+(deftest string_of_an_unpinned_number_runs_on_the_cpu
+  (assert (agrees-with-node? "function main(n: number): number {
+  let acc = n | 0;
+  { let x = n + 1; acc = (acc + String(x).length) | 0; }
+  { let a = [1, 2, 3]; let x = a.length + 1; acc = (acc + String(x).length) | 0; }
+  { let s = \"abc\"; let x = s.length + n; acc = (acc + String(x).length) | 0; }
+  return acc | 0;
+}
+" 7)))
+
+;; `String(anArray)` -- the last of the 216 cells, and a DIFFERENT KIND of gap from the ones above.
+;; The others were the compiler deciding a machine word from a type; this one is a JavaScript
+;; algorithm that nothing implemented. `String([1, 2, 3])` is "1,2,3" through
+;; Array.prototype.toString, and the runtime's ToString is a tag dispatch that answers
+;; "[object Object]" for every tagged object -- right for an object, wrong for an array, and not
+;; fixable inside the primitive because the array case reads the ELEMENTS. `ToStringValue` in
+;; lib/abstract/coercions.jsl tests `%IsArray` and hands the array case to `ArrayToStringValue`.
+;;
+;; EVERY CASE READS CHARACTERS, NOT JUST A LENGTH, and the first draft of this test did not: it
+;; compared `String(v).length` only, so changing the separator from "," to ";" left all nine tests
+;; green. A length is blind to exactly the thing this definition decides. `charCodeAt` at the
+;; separator position is what fails when the separator is wrong, and at position 0 when the
+;; elements are converted wrong. The empty array is "" (length 0) and a single element carries no
+;; separator at all.
+;;
+;; THE LAST TWO CASES ARE THE CYCLE STACK. `a.push(a)` makes a self-referential array, and
+;; JavaScript answers "1," for it -- the inner visit sees the array it is already inside and
+;; contributes the empty string. Without the stack that recursion does not terminate; with a stack
+;; that only ever grows, `[b, b]` for one array `b` would answer "1," instead of "1,1". Both are
+;; here because they fail in opposite directions.
+(deftest string_of_an_array_runs_on_the_cpu
+  (assert (agrees-with-node? "function main(n: number): number {
+  let acc = n | 0;
+  { let s = String([1, 2, 3]); acc = (acc + s.length + s.charCodeAt(0) + s.charCodeAt(1) + s.charCodeAt(4)) | 0; }
+  { let s = String([7]); acc = (acc + s.length + s.charCodeAt(0)) | 0; }
+  { let v: any[] = []; let s = String(v); acc = (acc + s.length) | 0; }
+  { let v = [1, 2, 3]; let s = String(v.slice(1)); acc = (acc + s.length + s.charCodeAt(1)) | 0; }
+  { let v = [10, 20]; let s = String(v); acc = (acc + s.length + s.charCodeAt(2)) | 0; }
+  { let v: any[] = [1, [2, 3]]; let s = String(v); acc = (acc + s.length + s.charCodeAt(2)) | 0; }
+  { let v: any[] = [1, undefined, null, 4]; let s = String(v); acc = (acc + s.length + s.charCodeAt(1)) | 0; }
+  { let v: any[] = [1, [2, [3, 4]], 5]; let s = String(v); acc = (acc + s.length) | 0; }
+  { let v: any[] = [[1, 2], [3]]; acc = (acc + v.join(\"-\").length + v.join(\"-\").charCodeAt(3)) | 0; }
+  { let v: any[] = [1]; v.push(v); let s = String(v); acc = (acc + s.length + s.charCodeAt(1)) | 0; }
+  { let b: any[] = [1]; let v: any[] = [b, b]; let s = String(v); acc = (acc + s.length + s.charCodeAt(1)) | 0; }
+  return acc | 0;
+}
+" 5)))
+
+;; LOOPS. UNTIL 2026-08-19 NOT ONE JAVASCRIPT LOOP COMPILED -- `for`, `while` and `do` alike, from
+;; the empty one upward -- and nothing in the repo said so, because every probe in the derived
+;; capability report is straight-line and every case above it was written by hand. The cause was two
+;; computes disagreeing about what ANY means: `n-ty-settled?` treated a value at a fixpoint AT ANY
+;; as "not analysed yet", so a proven-dead region could never be proven dead (dead code is FULL of
+;; ANY values, and they will never be anything else), and the live `Phi` merging one kept an arm
+;; instruction selection has no rule for. Loops are where that shape occurs, because a loop's guards
+;; are momentarily unknown while its back edge is unbuilt.
+;;
+;; THE INDEX CASES ARE THE ONES THAT WERE SILENTLY WRONG once they did compile. A loop's carried phi
+;; has one arm while the body is lowered, so every "is this tagged?" test answered from half a phi:
+;; `i++` wrote a raw DOUBLE back into a phi whose entry arm was a raw INT, and `a[i]` and
+;; `s.charCodeAt(i)` read the double's bit pattern -- whose low half is zero for any small integer
+;; -- so they indexed 0 on EVERY iteration. `[4,5,6]` summed to 12 instead of 15 and "abcdef"
+;; hashed to six copies of "a". Both forms of the update are here for that reason: `i++` and
+;; `i = i + 1` took different paths and were wrong in different ways.
+(deftest loops_run_on_the_cpu
+  (assert (agrees-with-node? "function main(n: number): number {
+  let acc = 0;
+  for (let i = 0; i < n; i = i + 1) { acc = (acc + i) | 0; }
+  let j = 0; while (j < n) { acc = (acc + j * j) | 0; j = j + 1; }
+  let k = 0; do { acc = (acc + 1) | 0; k = k + 1; } while (k < n);
+  for (let a = 0; a < n; a++) { for (let b = 0; b < n; b++) { acc = (acc + a * b) | 0; } }
+  return acc | 0;
+}
+" 6)))
+
+(deftest a_loop_counter_used_as_an_index_runs_on_the_cpu
+  (assert (agrees-with-node? "function main(n: number): number {
+  let acc = n | 0;
+  { let s = \"abcdef\"; let h = 0;
+    for (let i = 0; i < s.length; i = i + 1) { h = (h * 31 + s.charCodeAt(i)) | 0; }
+    acc = (acc + h) | 0; }
+  { let s = \"abcdef\"; let h = 0;
+    for (let i = 0; i < s.length; i++) { h = (h * 31 + s.charCodeAt(i)) | 0; }
+    acc = (acc + h) | 0; }
+  { let a = [4, 5, 6]; let h = 0;
+    for (let i = 0; i < a.length; i = i + 1) { h = (h + a[i]) | 0; }
+    acc = (acc + h) | 0; }
+  { let a = [4, 5, 6]; let h = 0;
+    for (let i = 0; i < a.length; i++) { h = (h + a[i] * 2) | 0; }
+    acc = (acc + h) | 0; }
+  { let a = [1, 2, 3, 4]; let i = 0; let s = 0;
+    while (i < a.length) { s = (s + a[i]) | 0; i = i + 1; }
+    acc = (acc + s) | 0; }
+  return acc | 0;
+}
+" 3)))
+
+;; AN ARRAY RETURNED FROM A FUNCTION IS STILL AN ARRAY. `be-array-value?` decides which tag a `Box`
+;; puts on a pointer, and it could not see through a `Call`: a `Call` has lattice type `dyn` and the
+;; `Cast` the frontend puts on its result carries the declared `obj`, so `(x) => [x, x]` handed back
+;; something every runtime tag test called an ordinary object. `r instanceof Array` was false and
+;; `String(r)` printed "[object Object]" -- fifteen characters where node prints two.
+;;
+;; IT BLOCKED A CORRECT DEFINITION, which is the part worth remembering. `Array.prototype.flatMap`
+;; is FlattenIntoArray with depth 1: SPREAD a mapped element that is an array, APPEND one that is
+;; not. Written that way -- as `ArrayConcatValue`, the step `concat` already has -- it asks
+;; `%IsArray` about the callback's result, so it could not be written at all while the answer was
+;; wrong. The definition it replaced unboxed every mapped value as an object and read its length,
+;; which is right for `x => [x, x]` and produces the EMPTY array for `x => x`.
+;;
+;; BOTH CALLBACK SHAPES ARE HERE because they fail in opposite directions: the old definition passed
+;; the first and failed the second, the new one would have done the reverse without the tag fix, and
+;; either one alone proves nothing.
+(deftest an_array_from_a_function_is_still_an_array_on_the_cpu
+  (assert (agrees-with-node? "function main(n: number): number {
+  let acc = n | 0;
+  { let f = (x: any) => [x, x]; let r: any = f(1); acc = (acc + (r instanceof Array ? 100 : 200)) | 0; }
+  { let f = (x: any) => [x, x]; let r: any = f(1); acc = (acc + String(r).length) | 0; }
+  { let v = [1, 2]; let r: any = v.map(x => [x, x]); acc = (acc + String(r).length) | 0; }
+  { let v = [1, 2, 3]; let r = v.flatMap(x => x); acc = (acc + String(r).length) | 0; }
+  { let v = [1, 2, 3]; let r = v.flatMap(x => [x, x]); acc = (acc + String(r).length) | 0; }
+  { let v: any[] = [1, 2, 3]; let r = v.flatMap(x => x === 2 ? [x, x] : x);
+    acc = (acc + String(r).length + String(r).charCodeAt(2)) | 0; }
+  { let v = [1, 2]; let r = v.concat([3, 4]); acc = (acc + String(r).length) | 0; }
+  return acc | 0;
+}
+" 4)))
+
+;; A DECLARED `:ret` IS A REPRESENTATION CONTRACT, the other half of the parameter rule. A `Call`
+;; computes `dyn` whatever its callee returns, so a `lib/` definition declared `:ret int` -- a RAW
+;; machine integer -- read as a tagged JavaScript value everywhere downstream, and two consumers
+;; disagreed about the same word:
+;;
+;;   "abcdef".lastIndexOf("c")        returned 2, correctly
+;;   "abcdef".lastIndexOf("c") | 0    answered 0
+;;
+;; because `be-box-input-already-tagged?` saw `dyn`, called the `Box` an identity, and the DSL's
+;; ToInt32 ran its tag tests on a raw integer. BOTH SHAPES ARE HERE: the one that was right on its
+;; own is what makes the pair a test rather than a repin.
+;;
+;; AND A STRING-POSITION ARGUMENT IS ToString OF WHAT WAS PASSED. `fng-string-argument` passed the
+;; expression through untouched, so a number reached `%StringCompare` and `join` as a raw machine
+;; word: `"abcdef".localeCompare(1)` answered 0 where node says 1, and `[1,2,3].join(1)` used an
+;; integer as a separator.
+(deftest a_declared_return_type_is_a_representation_on_the_cpu
+  (assert (agrees-with-node? "function main(n: number): number {
+  let acc = n | 0;
+  { let v = \"abcdef\"; acc = (acc + v.lastIndexOf(\"c\")) | 0; }
+  { let v = \"abcdef\"; acc = (acc + (v.lastIndexOf(\"c\") | 0)) | 0; }
+  { let v = \"abcdef\"; acc = (acc + v.lastIndexOf(\"z\")) | 0; }
+  { let v = \"abcdef\"; acc = (acc + String(v.lastIndexOf(\"c\")).length) | 0; }
+  { let v = \"abcdef\"; acc = (acc + v.localeCompare(1)) | 0; }
+  { let v = \"abcdef\"; acc = (acc + v.lastIndexOf(1)) | 0; }
+  { let v = [1, 2, 3]; let s = v.join(1); acc = (acc + s.length + s.charCodeAt(1)) | 0; }
+  { let v = \"a1b\"; acc = (acc + v.indexOf(1)) | 0; }
+  return acc | 0;
+}
+" 5)))
+
+;; THE ORDINARY SHAPES A PERSON WRITES, none of which either derived report probes: both of those
+;; sweep METHODS, and a method table has nothing to say about recursion, closures, objects,
+;; templates, `switch`, or a conditional expression. Each line here was a separate program in a
+;; scratch sweep, and one of them failed.
+;;
+;; `n > 0 ? "yes" : 5` MERGED A RAW STRING POINTER WITH A RAW INTEGER. The ternary did not box its
+;; arms, so one Phi held two machine words that no consumer can read both of. `String(v)` handed the
+;; runtime's tag dispatch an untagged `5` and printed "2.4703282292062327e-323" -- the double whose
+;; bit pattern is 5 -- twenty-three characters where node prints one. `??` boxed its arms already;
+;; the conditional expression did not.
+;;
+;; `String(f(1))` for an `f` returning a number DID NOT COMPILE AT ALL, which is the other half of
+;; the same lesson: `x + 1` on an `any` parameter has type `num|str`, `ml-kind-for-type` called that
+;; a raw SCALAR because it only asked about `VK-OBJ`, so the function had no single return tag and
+;; the `Box` above the call had nothing to tag a value that was already tagged.
+(deftest ordinary_programs_run_on_the_cpu
+  (assert (agrees-with-node? "function fib(k: number): number { if (k < 2) { return k; } return (fib(k-1) + fib(k-2)) | 0; }
+function main(n: number): number {
+  let acc = n | 0;
+  acc = (acc + fib(12)) | 0;
+  { let c = 0; let inc = () => { c = c + 1; return c; }; inc(); inc(); acc = (acc + c) | 0; }
+  { let o = {x: 1, y: 2}; o.x = o.x + o.y; acc = (acc + o.x) | 0; }
+  { let o: any = {}; o[\"k\"] = 5; acc = (acc + o[\"k\"]) | 0; }
+  { let o = {a: 1, b: 2}; acc = (acc + Object.keys(o).length) | 0; }
+  { let s = \"\"; for (let i = 0; i < 4; i++) { s = s + i; } acc = (acc + s.length + s.charCodeAt(2)) | 0; }
+  { let a: number[] = []; for (let i = 0; i < 5; i++) { a.push(i * 2); } acc = (acc + a.length + a[3]) | 0; }
+  { let a = [1, 2, 3, 4]; acc = (acc + a.reduce((p, c) => p + c, 0)) | 0; }
+  { let v: any = n > 0 ? \"yes\" : 5; acc = (acc + String(v).length) | 0; }
+  { let v: any = n > 0 ? 3 : 5; acc = (acc + v) | 0; }
+  { let f = (x: any) => x + 1; let r: any = f(1); acc = (acc + String(r).length + r) | 0; }
+  { let a = 3; let s = `x${a}y`; acc = (acc + s.length + s.charCodeAt(1)) | 0; }
+  { let r = 0; switch (n) { case 0: r = 7; break; case 1: r = 8; break; default: r = 9; } acc = (acc + r) | 0; }
+  { let a = [3, 1, 2]; let r = a.sort((p, q) => p - q); acc = (acc + String(r).charCodeAt(0)) | 0; }
+  return acc | 0;
+}
+" 1)))
+
+;; `s[i]` ON A STRING IS NOT AN ARRAY LOAD, and it answered `undefined` for EVERY index. It took the
+;; ordinary element path, so `GetElement` ran `%ArrayLoad` over a string pointer; `String("abc"[1])`
+;; printed "undefined" where node prints "b", nine characters instead of one, with nothing to say it
+;; had gone wrong. Three things had to change together and each was wrong on its own:
+;;
+;;   - `StringElement` in lib/, which is NEITHER `charAt` NOR `at`: `"abc".charAt(9)` is the empty
+;;     string, `"abc".at(-1)` is "c", and `"abc"[9]` and `"abc"[-1]` are both `undefined`.
+;;   - the verifier accepted only an object, function or undefined RECEIVER, so `s[i].charCodeAt(0)`
+;;     -- a receiver typed `str|undefined` -- was refused outright, while the same call on a `dyn`
+;;     receiver had always been fine. `dyn` includes VK-STR; narrowing must not lose the capability.
+;;   - `fng-infer` called `s[i]` dynamic, so the method dispatched generically and answered 0.
+;;     TypeScript's own type for it is `string`, and saying so puts it on the static path.
+;;
+;; Out of range the value is `undefined` and calling a method on it is a TypeError this compiler
+;; cannot raise. That gap is real and it is not this test's subject.
+(deftest indexing_a_string_runs_on_the_cpu
+  (assert (agrees-with-node? "function main(n: number): number {
+  let acc = n | 0;
+  { let s = \"abc\"; acc = (acc + String(s[1]).length + String(s[1]).charCodeAt(0)) | 0; }
+  { let s = \"abc\"; acc = (acc + String(s[9]).length) | 0; }
+  { let s = \"abcdef\"; let t = 0;
+    for (let i = 0; i < s.length; i++) { t = (t + s[i].charCodeAt(0)) | 0; }
+    acc = (acc + t) | 0; }
+  { let s = \"abcdef\"; let o = \"\";
+    for (let i = 0; i < s.length; i++) { o = o + s[i]; }
+    acc = (acc + o.length + o.charCodeAt(3)) | 0; }
+  { let s: any = \"abc\"; acc = (acc + String(s[1]).length) | 0; }
+  return acc | 0;
+}
+" 2)))
+
+;; A FUNCTION THAT ROUND-TRIPS THROUGH THE HEAP CAN BE CALLED. Until this landed, EVERY object
+;; method in the language returned nothing -- `{get: () => 7}` then `o.get()` answered 0, and so did
+;; `[function () { return 42; }][0]()`. Neither derived report could see it: both sweep methods on
+;; built-in receivers and never put a function in the heap.
+;;
+;; TWO INDEPENDENT BUGS, and the first hid the second completely.
+;;
+;; ONE: a polymorphic call is encoded in `MInst.imm` as the COMPLEMENT of its target set, and
+;; `be-poly-call?` recovers which kind of call it is from the SIGN -- negative is a dispatch,
+;; non-negative names an owner to call directly. That is injective for every 63-bit set and it
+;; collides for exactly one input. An unconstrained `fun` type carries `fidxs` of -1; its complement
+;; is 0; and 0 reads as "direct call to owner 0", which is always the entry function. A callable
+;; loaded from the heap has precisely that type, because inference does not follow a function
+;; through a store -- so every such call was compiled as `bl _kernel` and branched into `main`.
+;; The disassembly is what said so; no amount of reading the selector would have, because the
+;; selector was marking these calls polymorphic correctly and the ENCODER disagreed.
+;;
+;; TWO: with the dispatch reaching the right function, arguments arrived as 0. A generic call's ABI
+;; is all tagged -- the callee is unknown and every JavaScript function's parameters are `dyn` --
+;; and the unknown-callee path passed the raw expression. `o.add(4)` emitted `mov x2, #4` and the
+;; callee tag-tested x2, found no tag, and answered nothing. THE RECEIVER SURVIVED, because it is
+;; boxed on its own path, which is exactly why `this.v` worked while `k` did not and why fixing
+;; only the dispatch looked like most of a fix.
+(deftest a_function_from_the_heap_can_be_called_on_the_cpu
+  (assert (agrees-with-node? "function apply(g: any): number { return g() | 0; }
+function main(n: number): number {
+  let acc = n | 0;
+  { let a: any[] = [function() { return 42; }]; acc = (acc + a[0]()) | 0; }
+  { let o = {get: () => 7}; acc = (acc + o.get()) | 0; }
+  { let o = {v: 3, get: function() { return this.v; }}; acc = (acc + o.get()) | 0; }
+  { let o = {v: 3, add: function(k: number) { return this.v + k; }}; acc = (acc + o.add(4)) | 0; }
+  { let o = {add: function(a: number, b: number) { return (a * 10 + b) | 0; }}; acc = (acc + o.add(4, 5)) | 0; }
+  { let o = {a: function() { return 3; }, b: function() { return 5; }}; acc = (acc + o.a() * 10 + o.b()) | 0; }
+  { let o: any = {}; o.cb = function(x: number) { return (x * 3) | 0; }; acc = (acc + o.cb(5)) | 0; }
+  { let o = {s: \"abc\", len: function() { return this.s.length; }}; acc = (acc + o.len()) | 0; }
+  { let o = {mk: function() { return {v: 9}; }}; acc = (acc + o.mk().v) | 0; }
+  { let o = {inner: {get: function() { return 6; }}}; acc = (acc + o.inner.get()) | 0; }
+  { let a: any[] = [function() { return 1; }, function() { return 2; }]; let s = 0;
+    for (let i = 0; i < a.length; i++) { s = (s + a[i]()) | 0; } acc = (acc + s) | 0; }
+  { let f = function() { return 7; }; acc = (acc + f()) | 0; }
+  acc = (acc + apply(function() { return 7; })) | 0;
+  return acc | 0;
+}
+" 3)))
+
+;; ---------------------------------------------------------------------------
+;; What does NOT compile is not listed here
+;; ---------------------------------------------------------------------------
+;; An earlier version of this file carried a hand-typed ladder of five features that fail to
+;; compile. It was accurate for about an hour. `tests/native-capability-test.coil` derives the same
+;; information from the compiler's own dispatch tables and writes `docs/NATIVE-CAPABILITY.md`, which
+;; is checked in and compared on every run -- 216 cells, none of them typed by hand.
+;;
+;; This file answers the stronger question for a handful of cases: not "does it compile" but "does
+;; the compiled program agree with node". Add a case here when a strike lands, and let the derived
+;; report track the frontier.
+
+;; ---------------------------------------------------------------------------
+;; `for (const x of xs)`
+;; ---------------------------------------------------------------------------
+;; ECMAScript's own desugaring, not an index loop written in the frontend: `GetIterator` builds an
+;; array iterator once, and each trip is `ArrayIteratorNext` plus `IteratorComplete`/`IteratorValue`
+;; over the result object -- all four in `lib/array/iterator.jsl`, over the `ArrayValues` that
+;; `xs.values()` already used. The iterator keeps its index in an internal slot, which is why this
+;; needs no synthetic loop counter: a loop-carried value here is a phi over a SYMBOL, and there is
+;; no symbol for a counter the source never wrote.
+;;
+;; The `for await` form and every initializer that is not a single `const`/`let` binding -- an
+;; assignment target, a destructuring pattern -- are refused by name rather than lowered.
+(deftest for_of_runs_on_the_cpu
+  (assert (agrees-with-node? "function main(n: number): number {
+  let acc = n | 0;
+  { let xs = [4, 5, 6]; for (const x of xs) { acc = (acc + x) | 0; } }
+  { let xs: any[] = []; for (const x of xs) { acc = (acc + 100) | 0; } }
+  { let out = \"\"; for (const s of [\"ab\", \"cd\"]) { out = out + s; }
+    acc = (acc + out.length + out.charCodeAt(2)) | 0; }
+  { for (let x of [1, 2, 3]) { x = x * 2; acc = (acc + x) | 0; } }
+  { for (const x of [1, 2, 3].map(v => v * 3)) { acc = (acc + x) | 0; } }
+  return acc | 0;
+}
+" 3)))
+
+;; ABRUPT CONTROL, AND TWO OF THEM. One `break` or one `continue` compiled before the global code
+;; motion pass was made to iterate; two of anything in one for-of body did not, because the deferred
+;; phi boxes the frontend distributes are NEW instructions consumed by OLD ones, so a single
+;; backward placement pass reads a use's block before that use has moved. `ms-gcm-placement-valid?`
+;; then refused the program with MSEL-PLACEMENT.
+(deftest for_of_break_and_continue_run_on_the_cpu
+  (assert (agrees-with-node? "function main(n: number): number {
+  let acc = n | 0;
+  for (const x of [1, 2, 3, 4, 5]) { if (x === 2) { continue; } if (x === 4) { break; } acc = (acc + x) | 0; }
+  for (const x of [1, 2, 3, 4, 5]) { if (x === 2) { continue; } if (x === 4) { continue; } acc = (acc + x) | 0; }
+  outer: for (const a of [1, 2, 3]) { for (const b of [1, 2, 3]) { if (b === 2) { continue outer; } acc = (acc + a * b) | 0; } }
+  return acc | 0;
+}
+" 3)))
+
+;; A FOR-OF INSIDE ANOTHER LOOP, which is the case that found the throw hoist. `GetIterator` refuses
+;; a non-array with `%Throw`, and the throw's only consumer is the Phi joining its arm with the
+;; iterator -- so nothing kept it inside its guard and `ms-gcm-place!` moved it to the shallowest
+;; block between its inputs and that Phi, OUTSIDE both loops. Every one of these aborted with
+;; "uncaught JavaScript throw" before the first iteration; the version whose outer loop ran ZERO
+;; times aborted too, which is what said the throw was unguarded rather than mis-answered.
+(deftest for_of_inside_another_loop_runs_on_the_cpu
+  (assert (agrees-with-node? "function main(n: number): number {
+  let acc = n | 0; let ys = [10, 20];
+  for (const a of [1, 2]) { for (const b of [10, 20]) { acc = (acc + a * b) | 0; } }
+  for (let i = 0; i < 2; i = i + 1) { for (const b of ys) { acc = (acc + b) | 0; } }
+  { let i = 0; while (i < 2) { for (const b of ys) { acc = (acc + b) | 0; } i = i + 1; } }
+  return acc | 0;
+}
+" 3)))
+
+;; THE ITERABLE IS AN EXPRESSION, and the binding is scoped to the loop. `for (const x of ...)`
+;; shadows an outer `x` for the body only -- the default child walk in `fe-resolve-node!` bound the
+;; name before descending into the ITERABLE and never popped it, so the binding leaked past the
+;; loop.
+(deftest for_of_over_an_expression_runs_on_the_cpu
+  (assert (agrees-with-node? "function build(): any { return [3, 4, 5]; }
+function total(xs: any): number { let s = 0; for (const x of xs) { s = (s + x) | 0; } return s | 0; }
+function main(n: number): number {
+  let x = 99; let acc = n | 0;
+  for (const v of build()) { acc = (acc + v) | 0; }
+  acc = (acc + total([1, 2, 3])) | 0;
+  for (const x of [1, 2]) { acc = (acc + x) | 0; }
+  { let xs = [1, 2]; for (const v of xs) { if (xs.length < 4) { xs.push(v + 10); } acc = (acc + v) | 0; } acc = (acc + xs.length) | 0; }
+  return (acc + x) | 0;
+}
+" 3)))
+
+;; ---------------------------------------------------------------------------
+;; Three compiler defects for-of found, none of which needs for-of to reproduce
+;; ---------------------------------------------------------------------------
+;; A DYNAMIC KEY READ IS A JAVASCRIPT VALUE. `be-js-dynamic-boundary?` kept a second, shorter list
+;; of "which ops produce a tagged word" beside `n-rep-of`, and `PropLoadKey` was in one and not the
+;; other -- so an `If` on `o[k]` tested the RAW word, and a tagged `false` is a non-zero bit
+;; pattern. `o[k] ? 100 : 200` answered 100 while `String(o[k])` printed "false" and `o.a` was
+;; right. Both halves are here: `true` passes either way, which is why it stayed hidden.
+(deftest a_dynamic_key_read_is_a_javascript_value_on_the_cpu
+  (assert (agrees-with-node? "function main(n: number): number {
+  let acc = n | 0; let k = \"a\";
+  { let o: any = {}; o[k] = false; acc = (acc + (o[k] ? 100 : 200) + String(o[k]).length) | 0; }
+  { let o: any = {}; o[k] = true;  acc = (acc + (o[k] ? 100 : 200)) | 0; }
+  { let o: any = {}; o.a = false;  acc = (acc + (o.a ? 100 : 200)) | 0; }
+  return acc | 0;
+}
+" 3)))
+
+;; AN ALLOCATION AND A FIELD STORE MUST NOT ERASE THE RUNTIME PROPERTY HEAP. Both `fng-object` and
+;; `fng-lvalue-write` rebuilt the memory merge from the declared FIELD aliases alone, so the
+;; dynamic aliases fell out of it -- and `fng-current-memory` answers a missing alias by
+;; manufacturing a fresh `Arg`, which starts that alias's store chain over from nothing. An array
+;; literal therefore kept only its LAST element store whenever an element expression touched
+;; another alias: `[{v: 1}, {v: 2}]` had a hole at index 0, and so did
+;; `[(o.v = 1, 5), (o.v = 2, 6)]`, which has no objects in the array at all.
+(deftest an_element_expression_that_writes_memory_keeps_the_array_on_the_cpu
+  (assert (agrees-with-node? "function main(n: number): number {
+  let acc = n | 0;
+  { let xs = [{v: 1}, {v: 2}]; let a: any = xs.pop(); let b: any = xs.pop(); acc = (acc + a.v + b.v) | 0; }
+  { for (const o of [{v: 3}, {v: 4}]) { acc = (acc + o.v) | 0; } }
+  { let o = {v: 0}; let xs = [(o.v = 1, 5), (o.v = 2, 6)];
+    let a: any = xs.pop(); let b: any = xs.pop(); acc = (acc + a + b + o.v) | 0; }
+  return acc | 0;
+}
+" 3)))
+
+;; ---------------------------------------------------------------------------
+;; A LOOP WHOSE BODY ALWAYS RETURNS
+;; ---------------------------------------------------------------------------
+;; `while (i < 2) { return x; }` is a shape JavaScript writes deliberately -- the loop is a guarded
+;; early exit -- and it did not compile at all. `fng-loop` writes the Loop's back edge from the
+;; control the body fell out with, and a body that never falls out left `NO-NODE` there. A merge
+;; with a null last input is `n-in-progress?`, which is exactly what `g-verify` reports as
+;; `VERR-IN-PROGRESS`, so the whole program was rejected.
+;;
+;; The back edge is not MISSING, it is UNREACHABLE, and the graph has a node that says so: `XCtrl`.
+;; `loop-compute` reads slot 1 alone, so the loop stays as reachable as its entry, and the carried
+;; phis meet a proven-dead path and collapse onto their entry arm.
+;;
+;; NOT a `for ... of` defect -- `while`, `for`, `do`/`while` and the for-of form all failed
+;; identically, and all four are here along with the nested and both-arms-return shapes.
+(deftest a_loop_whose_body_always_returns_runs_on_the_cpu
+  (assert (agrees-with-node? "function whileform(n: number): number { let i = 0; while (i < 2) { return (n + 1) | 0; } return -1; }
+function forform(n: number): number { for (let i = 0; i < 2; i++) { return (n + 2) | 0; } return -1; }
+function forofform(n: number): number { for (const x of [7, 8]) { return (n + x) | 0; } return -1; }
+function doform(n: number): number { let i = 0; do { return (n + 4) | 0; } while (i < 2); }
+function nevertaken(n: number): number { let i = 10; while (i < 2) { return 99; } return (n + 5) | 0; }
+function nested(n: number): number { let i = 0; while (i < 3) { let j = 0; while (j < 3) { return (n + i + j) | 0; } i = (i + 1) | 0; } return -1; }
+function botharms(n: number): number { let i = 0; while (i < 4) { if (n > 0) { return (n + 7) | 0; } else { return (n - 7) | 0; } } return -1; }
+function withstore(n: number): number { let o = {v: 1}; for (let i = 0; i < 3; i++) { o.v = (n + i) | 0; return o.v | 0; } return -1; }
+function main(n: number): number {
+  return (whileform(n) + forform(n) + forofform(n) + doform(n) + nevertaken(n)
+          + nested(n) + botharms(n) + withstore(n)) | 0;
+}
+" 3)))
+
+;; DROPPING A REGION PATH DROPS THE MATCHING ARM FROM EVERY PHI ON IT -- OR THE GRAPH IS MALFORMED.
+;; `region-remove-path!` walked the region's out list once, forward, and `n-del-use!` is a SWAP
+;; remove: an entry vacated during the walk is refilled from the END of the list, so an unvisited
+;; phi lands at an index already passed. Dropping a loop's back-edge arm routinely vacates one,
+;; because a memory phi's back edge is a store chain whose own memory input is that phi -- release
+;; the arm, the chain dies, the chain releases the phi, and the phi releases the region.
+;;
+;; What survived was a THREE-input Phi on a TWO-input Region, and it surfaced as `phi-compute`
+;; reading the region past its end: "n-in: input index out of range", from a `for` loop whose body
+;; returns. Both scans now restart after every removal. Unreachable until a back edge could be
+;; PROVEN dead, which is what the case above made possible.
+
+;; ---------------------------------------------------------------------------
+;; A CLOSURE THAT CAPTURES THE ENTRY FUNCTION'S PARAMETER
+;; ---------------------------------------------------------------------------
+;; A captured variable lives in a heap CELL, and `fng-compile-function!` materializes one for every
+;; parameter a nested closure captures -- except that the whole loop sat behind `(if top-level 0
+;; ...)`, and the entry function IS compiled top-level. Its parameters therefore stayed bare `Arg`
+;; nodes, `fng-closure-expression` stored the RAW ARGUMENT into an environment slot typed as a cell
+;; pointer, and the callee read that slot with a `Cast` plus a `Load`. `() => n` dereferenced the
+;; integer 5.
+;;
+;; IT WAS A SEGFAULT REPORTED AS THE ANSWER 0. A crashed program prints nothing, `fgets` leaves the
+;; buffer empty and `atoll("")` is 0 -- so this read as a wrong computation for as long as anyone
+;; looked at it, and every probe whose expected answer was 0 would have PASSED on it.
+;; `nh-shell-integer` now refuses a non-zero wait status by name.
+(deftest a_closure_that_captures_the_entry_parameter_runs_on_the_cpu
+  (assert (agrees-with-node? "function main(n: number): number {
+  let acc = 0;
+  { let f = () => n; acc = (acc + f()) | 0; }
+  { let g = (v: number) => (v + n) | 0; acc = (acc + g(3) + g(4)) | 0; }
+  { let h = () => { n = (n + 1) | 0; return n; }; acc = (acc + h() + h() + n) | 0; }
+  return acc | 0;
+}
+" 5)))
+
+
+;; ---------------------------------------------------------------------------
+;; A CALLBACK RUNS USER CODE, AND USER CODE WRITES STATE `lib/` CANNOT NAME
+;; ---------------------------------------------------------------------------
+;; `jl-mem` is the JavaScript PROPERTY heap -- the one state a `.jsl` definition can name -- and it
+;; was the only memory edge a callback `Call` carried. A callback also reaches a captured
+;; variable's CELL and a closure ENVIRONMENT's fields, each on its own alias, and nothing tied
+;; those to the call at all, so the caller's stores into them had no consumer and were deleted as
+;; dead. One hole, two ends:
+;;
+;;   let b = 2; [3, 4].map(v => (v + b) | 0)      the environment slot was never written and the
+;;                                                callee dereferenced it -- SIGSEGV, reported for
+;;                                                as long as anyone looked as the answer 0
+;;   let acc = 0; [3, 4].forEach(v => { acc += v; })   the cell store died the same way, and the
+;;                                                read after the loop saw the initial value
+;;
+;; `jsl-decl-calls-back?` is a fixpoint over the call graph in the shape of `jsl-decl-uses-memory?`
+;; -- a definition calls back if its body contains a `call` form or calls a definition that does --
+;; and `fng-callback-outer-memory` builds the merge such a definition is handed.
+;;
+;; THE PROPERTY HEAP IS EXCLUDED FROM THAT MERGE, because `jl-call-mem` merges it with the
+;; definition's own `jl-mem`: including it twice puts two states on one alias, which is ambiguous,
+;; and selection refused `[1, 2, 3].flatMap(x => x)` outright. On the way back the property heap is
+;; the exception in the OTHER direction -- it is taken from the body, because `ArrayMap` builds its
+;; result array through that chain -- while every other alias re-anchors at the CallEnd, exactly as
+;; an ordinary JavaScript call does.
+;;
+;; EVERY METHOD HERE IS PINNED WITH A CAPTURE, which is the shape that was broken, and all seven
+;; are in ONE function on purpose -- see the note below on who owns a memory state.
+(deftest a_callback_reaches_the_callers_cells_and_environments_on_the_cpu
+  (assert (agrees-with-node? "function main(n: number): number {
+  let acc = n | 0;
+  { let t = 0; [3, 4].forEach(v => { t = (t + v) | 0; }); acc = (acc + t) | 0; }
+  { let b = 2; let a = [3, 4].map(v => (v + b) | 0); acc = (acc + a[0] + a[1] + a.length) | 0; }
+  { let a = [3, 4].map(v => (v + n) | 0); acc = (acc + a[0] + a[1]) | 0; }
+  { let s = [1, 2, 3].reduce((a, b) => (a + b) | 0, n); acc = (acc + s) | 0; }
+  { let lo = 2; let a = [1, 2, 3, 4].filter(v => v > lo); acc = (acc + a.length + a[0]) | 0; }
+  { let t = 0; let o = {v: n}; [1, 2].forEach(k => { o.v = (o.v + k) | 0; t = (t + o.v) | 0; });
+    acc = (acc + t + o.v) | 0; }
+  { let hi = 3; let a = [1, 2, 3, 4].map(v => (v > hi ? v : 0) | 0); acc = (acc + a[3]) | 0; }
+  { let v = [1, 2, 3]; let r = v.flatMap(x => x); acc = (acc + String(r).length) | 0; }
+  return acc | 0;
+}
+" 5)))
+
+;; ---------------------------------------------------------------------------
+;; A MEMORY STATE BELONGS TO ONE FUNCTION, AND THE BLOCK QUERY IS NOT WHAT SAYS SO
+;; ---------------------------------------------------------------------------
+;; `ms-node-block` answers "this owner's entry block" for any node with NO control input, and a
+;; memory node usually has none -- slot 0 of `Store`/`Load`/`MemMerge` is a control anchor that is
+;; null in practice. That is a sensible PLACEMENT default and a useless OWNERSHIP test, and
+;; `ms-preselect-function!`'s dynamic-effect sweep was using it as one: it walks EVERY node in the
+;; graph, so a store belonging to `main` answered "entry block of owner 1" and a JSL builtin
+;; adopted it. Selecting it there walked into a memory `Phi` on one of `main`'s loops, which
+;; `ms-preallocate-phis!` marks seen for `main` and not for that owner, and the program was refused
+;; with MSEL-UNSUPPORTED.
+;;
+;; `forEach` and `flatMap` in one function was the witness, and only once the callback memory edge
+;; above existed to reach that phi. `ms-memory-chain-owner` asks the chain instead: a `Phi`'s
+;; region, an `Arg`'s anchor and any pinned effect's control all map to a block, and a block names
+;; its function. Nothing else changed -- a chain that names no function still falls back to the
+;; block query, exactly as before.
+
+;; ---------------------------------------------------------------------------
+;; `xs: number[]` IS AN ARRAY
+;; ---------------------------------------------------------------------------
+;; The TypeScript bridge had no kind number for `KindArrayType` at all, so an array TYPE annotation
+;; arrived as kind 0 and `fng-type-tag` answered `FNG-DYNAMIC`. Everything that decides "is this an
+;; array" asks `fng-infer`, which asks that -- so `xs.push(9)` on an array-typed PARAMETER was not
+;; an array method. It took the generic path, loaded `push` out of the runtime property table,
+;; found nothing, and dispatched `undefined`: `brk` on the callee tag test. Every method, and a
+;; function declared to RETURN `number[]` the same way.
+;;
+;; It looked like "a callback inside a nested function traps", because a callback is only ever
+;; written on a method and the array in `main` is usually a literal. `fng-number-array-symbol?` has
+;; been reading the type node's TEXT for a trailing `"[]"` since before this kind existed; that is
+;; what it was working around.
+;;
+;; TWO PLACES HAD TO NAME `FNG-ARRAY` where they had been reading `FNG-DYNAMIC` by accident: an
+;; array-typed FIELD must keep a tagged slot (a raw one is a pointer the GC scan skips), and an
+;; array ARGUMENT must still be boxed (a `Parm` is a tagged JavaScript value).
+(deftest an_array_typed_parameter_is_an_array_on_the_cpu
+  (assert (agrees-with-node? "type T = { xs: number[] };
+function grow(xs: number[]): number { xs.push(9); return xs.length | 0; }
+function total(xs: number[]): number { let t = 0; xs.forEach(v => { t = (t + v) | 0; }); return t | 0; }
+function doubled(xs: number[]): number { let a = xs.map(v => (v * 2) | 0); return (a[0] + a[1]) | 0; }
+function where(xs: number[]): number { return xs.indexOf(2) | 0; }
+function text(xs: string[]): number { return (xs.length + xs.join(\"-\").length) | 0; }
+function build(k: number): number[] { return [k, k + 1]; }
+function main(n: number): number {
+  let acc = n | 0;
+  acc = (acc + grow([1, 2, 3]) + total([1, 2, 3]) + doubled([1, 2]) + where([1, 2, 3])) | 0;
+  acc = (acc + text([\"ab\", \"cd\"])) | 0;
+  { let a = build(n); acc = (acc + a[0] + a[1] + a.length) | 0; }
+  { let t: T = {xs: [1, 2, 3]}; t.xs.push(4); acc = (acc + t.xs.length + t.xs[3]) | 0; }
+  return acc | 0;
+}
+" 5)))
+
+;; ---------------------------------------------------------------------------
+;; THREE BUGS THAT WERE FILED AS OPEN AND WERE NOT
+;; ---------------------------------------------------------------------------
+;; These come out of `repros/open/`, where they had been sitting as fixed-but-still-filed. Nothing
+;; ran that directory: the tool that did, `tools/js-repro`, was deleted with the interpreter, and
+;; the paragraphs stayed. `tests/native-frontier-test.coil` runs it now and would have said so.
+;;
+;; `String(1e21)` switches to exponential notation, which
+;; `repros/open/large-double-tostring-not-exponential.js` said it did not. The half that IS still
+;; owed is the shortest-round-trip digit generator -- `String(1/3)` is 19 characters against node's
+;; 18 -- and that half is `repros/open/shortest-round-trip-digits.js` now.
+;;
+;; Unary `+` on a string, `JSON.stringify`, and a `forEach` callback mutating an enclosing local
+;; were `repros/open/undefined-for-these-values.js`, three constructs filed together because the
+;; deleted sweep grouped them by the status they produced. The grouping was a hypothesis, the file
+;; said so, and all three answer correctly now -- the last of them since the callback memory edge
+;; landed hours earlier the same day.
+(deftest three_repros_filed_as_open_were_already_fixed
+  (assert (agrees-with-node? "function main(n: number): number {
+  let acc = n | 0;
+  { let s = String(1e21); acc = (acc + (s === \"1e+21\" ? 1 : 10) + s.length) | 0; }
+  { acc = (+String(acc) + 2) | 0; }
+  { let s = JSON.stringify({x: acc}); acc = (acc + s.length) | 0; }
+  { let s = 0; [1, 2, 3].forEach((x) => { s = (s + x) | 0; }); acc = (acc + s) | 0; }
+  return acc | 0;
+}
+" 7)))

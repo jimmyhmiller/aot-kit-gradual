@@ -179,58 +179,6 @@
     (set! (.error-role frontend) 0)
     (load frontend)))
 
-(defn fe-native-new-file [(source (slice u8)) (filename (slice u8)) (script-kind i64)] (-> NativeFrontend)
-  (let [a (malloc-allocator)
-        (mut frontend) (zeroed NativeFrontend)]
-    (set! (.ast frontend) (ts-open-file source filename script-kind))
-    (set! (.functions frontend) (al-new [FeFunction] a))
-    (set! (.symbols frontend) (al-new [FeSymbol] a))
-    (set! (.resolutions frontend) (al-new [FeResolution] a))
-    (set! (.captures frontend) (al-new [FeCapture] a))
-    (set! (.types frontend) (al-new [FeTypeDecl] a))
-    (set! (.fields frontend) (al-new [FeField] a))
-    (set! (.prototype-methods frontend) (al-new [FePrototypeMethod] a))
-    (set! (.prototype-parents frontend) (al-new [FePrototypeParent] a))
-    (set! (.status frontend) FE-OK)
-    (set! (.error-node frontend) -1)
-    (set! (.error-code frontend) 0)
-    (set! (.error-role frontend) 0)
-    (load frontend)))
-
-;; A REFUSAL'S REASON, BY NAME. `error-code` is one of the `FE-CODE-*` constants, and a bare 1007
-;; in a report is a number the reader has to come here to decode -- which is the same failure of
-;; diagnostics as not reporting it at all, one step further along.
-(defn fe-code-name [(code i64)] (-> (slice u8))
-  (cond (= code FE-CODE-UNSUPPORTED-SYNTAX) "unsupported-syntax"
-        (= code FE-CODE-UNSUPPORTED-OPERATOR) "unsupported-operator"
-        (= code FE-CODE-UNBOUND-NAME) "unbound-name"
-        (= code FE-CODE-INVALID-TARGET) "invalid-target"
-        (= code FE-CODE-CONSTRUCTOR-LAYOUT) "constructor-layout"
-        (= code FE-CODE-MISSING-RECEIVER) "missing-receiver"
-        (= code FE-CODE-UNKNOWN-BUILTIN) "unknown-builtin"
-        (= code 0) "none"
-        :else "unnamed-code"))
-
-(defn fe-status-name [(status i64)] (-> (slice u8))
-  (cond (= status FE-OK) "ok"
-        (= status FE-PARSE) "parse"
-        (= status FE-UNBOUND) "unbound"
-        (= status FE-UNSUPPORTED) "unsupported"
-        (= status FE-TARGET) "target"
-        :else "unnamed-status"))
-
-;; THE SOURCE A REFUSAL IS ABOUT. `status` and `error-code` say what kind of thing was refused;
-;; `error-node` says which one, but only as an AST index, so every consumer that wanted to report
-;; a refusal usefully had to reach into the struct and know about `ast` to resolve it. None did:
-;; `tools/js-sweep.coil` reported 5508 refusals as the bare word INDEX, and `tools/js-repro.coil`
-;; said "the source did not index" and stopped. A refusal that cannot name its cause tells you to
-;; look and nothing about where.
-;;
-;; Empty when the refusal named no node -- a parse failure has no offending construct to point at.
-(defn fe-error-text [(frontend (mut NativeFrontend))] (-> (slice u8))
-  (let [n (.error-node frontend)]
-    (if (< n 0) "" (ts-text (field frontend ast) n))))
-
 (defn fe-fail! [(frontend (mut NativeFrontend)) (code i64) (node i64) (role i64)] (-> i64)
   (if (= (.status frontend) FE-OK)
       (do
@@ -338,6 +286,23 @@
                 (set! index (+ (load index) 1)))))
     (load found)))
 
+;; `for (const x of xs)` only, and the refusals here are the whole reason this is a separate check.
+;; An assignment target (`for (x of xs)`) writes a binding that already exists, and a binding
+;; pattern (`for (const [a, b] of xs)`) is destructuring; neither is lowered, and both would
+;; otherwise reach the graph builder as a declaration list it would silently read the wrong child
+;; of. `for (let a = 1, b of xs)` is not valid TypeScript, but the single-declarator check costs
+;; nothing and says so.
+(defn fe-for-of-binding-valid? [(ast TsAst) (node i64)] (-> bool)
+  (let [initializer (ts-role ast node TS-ROLE-INITIALIZER 0)]
+    (and (!= initializer -1)
+         (and (= (ts-kind ast initializer) TSK-VARIABLE-DECLARATION-LIST)
+              (and (= (ts-child-count ast initializer) 1)
+                   (let [declaration (ts-child ast initializer 0)]
+                     (and (= (ts-kind ast declaration) TSK-VARIABLE-DECLARATION)
+                          (and (= (ts-child-count ast declaration) 1)
+                               (= (ts-kind ast (ts-child ast declaration 0))
+                                  TSK-IDENTIFIER)))))))))
+
 (defn fe-validate-node! [(frontend (mut NativeFrontend))
                          (node i64)
                          (targets (mut (ArrayList FeTarget)))] (-> i64)
@@ -406,10 +371,21 @@
                               (fe-target-make label
                                               true
                                               (or (= statement-kind TSK-DO)
-                                                  (or (= statement-kind TSK-WHILE) (= statement-kind TSK-FOR)))))
+                                                  (or (= statement-kind TSK-WHILE)
+                                                      (or (= statement-kind TSK-FOR)
+                                                          (= statement-kind TSK-FOR-OF))))))
                     (fe-validate-node! (mut frontend) statement (mut targets))
                     (store! (field targets len) (- (al-len [FeTarget] (load targets)) 1)))))
-          (or (= kind TSK-DO) (or (= kind TSK-WHILE) (= kind TSK-FOR)))
+          (and (= kind TSK-FOR-OF) (not (fe-for-of-binding-valid? ast node)))
+            (fe-fail! (mut frontend) FE-CODE-UNSUPPORTED-SYNTAX node TS-ROLE-INITIALIZER)
+          ;; `for (k in o)` and `for await (x of xs)` are refused HERE rather than by the graph
+          ;; builder's kind-0 abort. Same answer, three differences that matter: the message names
+          ;; the construct, the refusal is recoverable, and a test can therefore observe it --
+          ;; `tests/native-frontier-test.coil` asserts both on every gate.
+          (or (= kind TSK-FOR-IN) (= kind TSK-FOR-AWAIT))
+            (fe-fail! (mut frontend) FE-CODE-UNSUPPORTED-SYNTAX node TS-ROLE-EXPRESSION)
+          (or (= kind TSK-DO)
+              (or (= kind TSK-WHILE) (or (= kind TSK-FOR) (= kind TSK-FOR-OF))))
             (let [(mut index) 0]
               (al-push! [FeTarget] (mut targets) (fe-target-make -1 true true))
               (loop (if (or (>= (load index) (ts-child-count ast node))
@@ -1082,10 +1058,6 @@
                           (set! index (+ (load index) 1)))))
               (load found))))))
 
-(defn fe-symbol-name [(frontend (ptr NativeFrontend)) (index i64)] (-> (slice u8))
-  (let [symbol (al-get [FeSymbol] (.symbols frontend) index)]
-    (ts-text (field frontend ast) (.name-node symbol))))
-
 ;; A REST PARAMETER, DETECTED FROM ITS OWN SOURCE TEXT. Nothing in this frontend implements one,
 ;; and until this check existed nothing noticed: `...xs` was indexed as an ordinary parameter named
 ;; `xs`, the call site passed it nothing, and every read came back undefined. `xs.length` was
@@ -1413,6 +1385,29 @@
                   (fe-resolve-node! (mut frontend) (mut bindings) value owner depth)
                   0)
               (al-push! [FeBinding] (mut bindings) (fe-binding-make name symbol depth))
+              0)
+          ;; The ITERABLE is evaluated in the enclosing scope and the binding is visible only
+          ;; inside the loop. The default child walk got both wrong: it walks children in order,
+          ;; so it bound the name before descending into the expression, and it never popped the
+          ;; binding, leaving it in scope for every statement after the loop.
+          (= kind TSK-FOR-OF)
+            (let [saved (al-len [FeBinding] (load bindings))]
+              (fe-resolve-node! (mut frontend)
+                                (mut bindings)
+                                (ts-role ast node TS-ROLE-EXPRESSION 0)
+                                owner
+                                depth)
+              (fe-resolve-node! (mut frontend)
+                                (mut bindings)
+                                (ts-role ast node TS-ROLE-INITIALIZER 0)
+                                owner
+                                (+ depth 1))
+              (fe-resolve-node! (mut frontend)
+                                (mut bindings)
+                                (ts-role ast node TS-ROLE-STATEMENT 0)
+                                owner
+                                (+ depth 1))
+              (store! (field bindings len) saved)
               0)
           (= kind TSK-BLOCK)
             (let [saved (al-len [FeBinding] (load bindings))

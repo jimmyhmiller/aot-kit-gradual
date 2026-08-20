@@ -6,7 +6,7 @@
 ;; graph, so it reads the caller's memory. `JSL-ERR-HEAP-IN-BUILTIN` refuses the other shape.
 ;;
 ;; These ARE verified against Node, now that `build.jsl` can allocate: a probe definition builds the
-;; array with `ArrayIota` and reads it back, all inside one function, so nothing crosses a call.
+;; array and reads it back, all inside one function, so nothing crosses a call.
 ;;
 ;; MEMORY IS IMPLICIT. `%ArrayLen` and `%ArrayLoad` take the ambient heap from the lowering rather
 ;; than from an operand here, so a definition reads like the spec rather than like memory SSA.
@@ -50,6 +50,9 @@
 ;; `undefined` and `null` become the EMPTY string rather than "undefined" and "null", which is the
 ;; one place `join` disagrees with `String(x)` and the reason this cannot just call `%ToString`.
 (macro ArrayJoin :params [(a dyn) (sep dyn)] :ret dyn
+  (ArrayJoinSeen a sep (%NewArray)))
+
+(macro ArrayJoinSeen :params [(a dyn) (sep dyn) (seen dyn)] :ret dyn
   (let [(len (%ArrayLen a))]
     (loop [(i 0) (out "")]
       (if (%Le len i) out
@@ -58,7 +61,41 @@
               ;; a bare `undefined` is the machine word 0, so the unboxed spelling compared a tag
               ;; against a payload and never matched. `[1, undefined, null, 4].join(",")` came out
               ;; as "1,undefined,null,4" — the exact case this definition exists to get right.
+              ;; `ToStringValue`, NOT `%ToString`, and that is what makes `join` RECURSIVE:
+              ;; `[1, [2, 3]].join("-")` is "1-2,3", because converting an element that is itself
+              ;; an array joins it with a comma. `%ToString` bottoms out in the runtime's tag
+              ;; dispatch and answers "[object Object]" there. The recursion runs through
+              ;; `ArrayToStringValue`, which is a `builtin` -- a CALL, which terminates; a macro
+              ;; reaching itself is an inline expansion that does not, and
+              ;; `jsl-check-macro-cycles` refuses it by name.
               (piece (if (%Eq v (%Box undefined)) ""
-                       (if (%Eq v (%Box null)) "" (%ToString v))))
+                       (if (%Eq v (%Box null)) "" (ToStringValueSeen v seen))))
               (joined (if (%Eq i 0) piece (%StringConcat out (%StringConcat sep piece))))]
           (recur (%Add i 1) joined))))))
+
+;; https://tc39.es/ecma262/#sec-array.prototype.tostring -- `join` with no separator, which is a
+;; comma. THIS IS WHAT `String([1, 2, 3])` REACHES. `%ToString` bottoms out in the runtime's tag
+;; dispatch, which answers "[object Object]" for every tagged object; that is right for an object
+;; and wrong for an array, and no amount of work inside the primitive can tell them apart usefully
+;; because the ARRAY case is a JavaScript algorithm rather than a formatting rule. So it is decided
+;; above the primitive, here.
+;; `seen` IS A STACK, PUSHED AND POPPED, and it is what makes a self-referential array terminate:
+;; `let a = [1]; a.push(a); String(a)` is "1," in JavaScript, not an infinite recursion and not a
+;; RangeError. Pushed and popped rather than accumulated, because the question is "am I inside this
+;; array right now" and not "have I ever seen it": `String([b, b])` for one array `b` is "1,1", and
+;; an append-only visited list would answer "1," for it.
+(builtin ArrayToStringValue :transitioning true :params [(value dyn) (seen dyn)] :ret dyn
+  (if (ArraySeenHas seen value)
+      ""
+      (let [(pushed (%ArrayStore seen (%ArrayLen seen) value))
+            (out (ArrayJoinSeen (%UnboxArray value) "," seen))
+            (dropped (%ArrayResize seen (%Sub (%ArrayLen seen) 1) seen))]
+        out)))
+
+;; The cycle stack, searched by IDENTITY. `%Eq` on two tagged array words compares the pointers,
+;; which is the question being asked -- two arrays with equal contents are different entries.
+(macro ArraySeenHas :params [(seen dyn) (value dyn)] :ret bool
+  (let [(len (%ArrayLen seen))]
+    (loop [(i 0)]
+      (if (%Le len i) false
+        (if (%Eq (%ArrayLoad seen i) value) true (recur (%Add i 1)))))))

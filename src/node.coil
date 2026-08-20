@@ -150,7 +150,6 @@
        (~variant [payload] payload)
        (_ (do (panic-corrupt ~label) 0)))))
 
-
 (const OPTAG-START i64 0)  ; the root of control
 (const OPTAG-STOP i64 1)  ; collects every Return
 (const OPTAG-RETURN i64 2)  ; (ctrl, value)
@@ -574,7 +573,6 @@
     (InternalStore [operation] operation)
     (StringNormalize [] 0)))
 
-
 (const INTERNAL-TARGET i64 0)
 (const INTERNAL-INDEX i64 1)
 (const INTERNAL-KIND i64 2)
@@ -796,7 +794,6 @@
 (defn op-has-class? [(op Op) (class i64)] (-> bool)
   (!= (& (op-class op) class) 0))
 
-
 ;; ---------------------------------------------------------------------------
 ;; Op classification. The numbering above exists so these are range tests: control ops come
 ;; first, then value ops, and within the value ops the ones that may fold to a constant come
@@ -901,6 +898,15 @@
    (nfwd i64)  ; load-after-store forwardings performed (4c-1)
    (nselim i64)  ; store-after-store eliminations performed (4c-2)
    (ndalloc i64)  ; allocations removed after their object did not escape (4c-3)
+   ;; HAS `g-analyze!` FINISHED ON THIS GRAPH. Not "are the types current" -- a fold changes edges
+   ;; without re-running the analysis and this stays true across that, exactly as the rest of
+   ;; `g-fold-proven!` already relies on types computed before the folds beside it. What it
+   ;; separates is a graph the analysis has RUN over from one still under construction, which is
+   ;; the distinction `n-ty-settled?` needs and could not make. See its note.
+   (analysed bool)
+   ;; A CONTROL arm is being proven dead, as opposed to a VALUE being proven constant. The two ask
+   ;; `n-ty-proven?` the same question and need different answers about ANY; see `n-ty-settled?`.
+   (provingctrl bool)
    (inited bool)])
 
 (defn graph [] (-> (ptr Graph))
@@ -958,6 +964,8 @@
     (al-clear! [i64] (field p pmark))
     (al-clear! [i64] (field p pstack))
     (set! (.pbusy p) false)
+    (set! (.analysed p) false)
+    (set! (.provingctrl p) false)
     (set! (.nchg p) 0)
     ; per-GRAPH, not per-process: every fixture starts from `graph-reset!`, so a gate that builds
     ; the corpus in a loop reads the count for the fixture it just built and not a running total.
@@ -1072,8 +1080,6 @@
 (defn n-set-op! [(n i64) (op Op)] (-> i64)
   (set! (.op (nd n)) op)
   0)
-(defn n-cold? [(n i64)] (-> bool)
-  (.cold (nd n)))
 (defn n-mark-cold! [(n i64)] (-> i64)
   (set! (.cold (nd n)) true)
   0)
@@ -1377,9 +1383,6 @@
           (al-set! [bool] (field p onwl) n false)
           n))))
 
-(defn wl-empty? [] (-> bool)
-  (= (al-len [i64] (.wl (graph))) 0))
-
 ;; Is this node pending? Exported for the tests that check the revisit machinery directly: "a type
 ;; change re-queues the nodes that read it" is otherwise only observable as a fixpoint several steps
 ;; later, which is a much weaker thing to assert. NOT what `n-ty-proven?` asks, deliberately:
@@ -1606,7 +1609,11 @@
     (Box [mode] (box-compute n))
     (Unbox [target] (unbox-compute n))
     (TypeTest [target] (typetest-compute n))
-    (CallEnd [] (if (ty-high? (n-in-ty n 0)) (t-top) (n-in-ty n 0)))
+    ;; `ty-unanalysed?` AND NOT `ty-high?`, for the reason `if-compute` documents at length: on the
+    ;; control axis "unanalysed" and "proven unreachable" are both high, and they are not the same
+    ;; claim. A CallEnd in dead code is `~ctrl` -- it forwards what its control says -- and
+    ;; answering ANY for it makes every merge below the call ANY, live arms included.
+    (CallEnd [] (if (ty-unanalysed? (n-in-ty n 0)) (t-top) (n-in-ty n 0)))
     (Fun [index]
         ;; Only JavaScript-visible function identities fit in Val.fidxs. Internal JSL functions
         ;; may use the disjoint high namespace; their exact identity remains on this OPTAG-FUN node.
@@ -1666,7 +1673,7 @@
         ;; the REPRESENTATION, not just the value set.
         (t-dyn))
     (ToNumber [] (t-dyn))
-    (ArrayTest [] (t-bool))
+    (ArrayTest [] (arraytest-compute n))
     (ArrayUnbox [] (t-obj))
     (ParseFloat [] (t-dyn))
     (StringNormalize [] (t-str))))
@@ -2219,21 +2226,21 @@
   (n-check-alias alias "n-load!: not an allocated alias number")
   (n-peephole (n-new3 (Load alias) NO-NODE mem ptr)))
 
+;; The `-at!` variant, for the reason `jl-prim-mem` gives about its own: a read with a null control
+;; anchor floats, and global code motion then hoists it to the shallowest block between its inputs
+;; and its uses. That is right for a straight-line body and wrong when the POINTER is loop-local:
+;; `for (const o of xs) o.v` put the shape-slot load outside the loop and left the `Unbox` that
+;; produced its pointer inside, which is a dependency `ms-gcm-place!` refuses (MSEL-DEPENDENCY).
+(defn n-load-at! [(ctrl i64) (mem i64) (ptr i64) (alias i64)] (-> i64)
+  (n-check-alias alias "n-load-at!: not an allocated alias number")
+  (n-peephole (n-new3 (Load alias) ctrl mem ptr)))
+
 (defn n-store! [(mem i64) (ptr i64) (val i64) (alias i64)] (-> i64)
   (n-check-alias alias "n-store!: not an allocated alias number")
   (n-peephole (n-new4 (Store alias) NO-NODE mem ptr val)))
 
-(defn n-prop-load! [(mem i64) (ptr i64) (name (slice u8))] (-> i64)
-  (n-peephole (n-new3 (PropLoad (shape-name-intern! name)) NO-NODE mem ptr)))
-
 (defn n-prop-load-at! [(ctrl i64) (mem i64) (ptr i64) (name (slice u8))] (-> i64)
   (n-peephole (n-new3 (PropLoad (shape-name-intern! name)) ctrl mem ptr)))
-
-(defn n-prop-has-at! [(ctrl i64) (mem i64) (ptr i64) (name (slice u8))] (-> i64)
-  (n-peephole (n-new3 (PropHas (shape-name-intern! name)) ctrl mem ptr)))
-
-(defn n-prop-delete-at! [(ctrl i64) (mem i64) (ptr i64) (name (slice u8))] (-> i64)
-  (n-peephole (n-new3 (PropDelete (shape-name-intern! name)) ctrl mem ptr)))
 
 (defn n-prototype-has-at! [(ctrl i64) (mem i64) (ptr i64) (prototype i64)] (-> i64)
   (n-peephole (n-new4 (ProtoHas) ctrl mem ptr prototype)))
@@ -2266,14 +2273,8 @@
 (defn n-internal-set-index-at! [(ctrl i64) (mem i64) (ptr i64) (index i64)] (-> i64)
   (n-peephole (n-new4 (InternalStore INTERNAL-SET-INDEX) ctrl mem ptr index)))
 
-(defn n-prop-store! [(mem i64) (ptr i64) (val i64) (name (slice u8))] (-> i64)
-  (n-peephole (n-new4 (PropStore (shape-name-intern! name)) NO-NODE mem ptr val)))
-
 (defn n-prop-store-at! [(ctrl i64) (mem i64) (ptr i64) (val i64) (name (slice u8))] (-> i64)
   (n-peephole (n-new4 (PropStore (shape-name-intern! name)) ctrl mem ptr val)))
-
-(defn n-set-prototype! [(mem i64) (ptr i64) (prototype i64)] (-> i64)
-  (n-peephole (n-new4 (SetProto) NO-NODE mem ptr prototype)))
 
 (defn n-set-prototype-at! [(ctrl i64) (mem i64) (ptr i64) (prototype i64)] (-> i64)
   (n-peephole (n-new4 (SetProto) ctrl mem ptr prototype)))
@@ -2283,9 +2284,6 @@
 ;; consumer. Anchor it to the control point of its allocation.
 (defn n-array-mark! [(ctrl i64) (ptr i64)] (-> i64)
   (n-peephole (n-new2 (ArrayMark) ctrl ptr)))
-
-(defn n-array-load! [(mem i64) (ptr i64) (index i64)] (-> i64)
-  (n-peephole (n-new4 (ArrayLoad 0) NO-NODE mem ptr index)))
 
 (defn n-array-load-at! [(ctrl i64) (mem i64) (ptr i64) (index i64)] (-> i64)
   (n-peephole (n-new4 (ArrayLoad 0) ctrl mem ptr index)))
@@ -2302,15 +2300,6 @@
 (defn n-array-length-at! [(ctrl i64) (mem i64) (ptr i64)] (-> i64)
   (n-peephole (n-new3 (ArrayLen) ctrl mem ptr)))
 
-(defn n-array-resize! [(mem i64) (ptr i64) (length i64)] (-> i64)
-  (n-peephole (n-new5 (ArrayResize) NO-NODE mem ptr length ptr)))
-
-(defn n-array-resize-at! [(ctrl i64) (mem i64) (ptr i64) (length i64)] (-> i64)
-  (n-peephole (n-new5 (ArrayResize) ctrl mem ptr length ptr)))
-
-(defn n-array-resize-after! [(mem i64) (ptr i64) (length i64) (value i64)] (-> i64)
-  (n-peephole (n-new5 (ArrayResize) NO-NODE mem ptr length value)))
-
 (defn n-array-resize-after-at! [(ctrl i64)
                                  (mem i64)
                                  (ptr i64)
@@ -2318,70 +2307,10 @@
                                  (value i64)] (-> i64)
   (n-peephole (n-new5 (ArrayResize) ctrl mem ptr length value)))
 
-(defn n-array-copy! [(mem i64) (source i64) (result i64) (start i64)] (-> i64)
-  (n-peephole (n-new5 (ArrayCopy) NO-NODE mem source result start)))
-
-(defn n-array-copy-at! [(ctrl i64)
-                         (mem i64)
-                         (source i64)
-                         (result i64)
-                         (start i64)] (-> i64)
-  (n-peephole (n-new5 (ArrayCopy) ctrl mem source result start)))
-
 (defn n-string-const! [(string i64)] (-> i64)
   (n-peephole (n-new1 (StringConst string) (g-start))))
-(defn n-string-length! [(string i64)] (-> i64)
-  (n-peephole (n-new2 (StringLen) NO-NODE string)))
-(defn n-string-equal! [(left i64) (right i64)] (-> i64)
-  (n-peephole (n-new3 (StringEq) NO-NODE left right)))
-(defn n-string-concat! [(left i64) (right i64)] (-> i64)
-  (n-peephole (n-new3 (StringConcat) NO-NODE left right)))
-(defn n-string-char-code! [(string i64) (index i64)] (-> i64)
-  (n-peephole (n-new3 (StringCharCode) NO-NODE string index)))
-(defn n-string-substring! [(string i64) (start i64) (end i64) (mode i64)] (-> i64)
-  (n-peephole (n-new4 (StringSubstring mode) NO-NODE string start end)))
-(defn n-to-string! [(value i64)] (-> i64)
-  (n-peephole (n-new2 (ToString) NO-NODE value)))
-(defn n-parse-int! [(value i64) (radix i64)] (-> i64)
-  (n-peephole (n-new3 (ParseInt) NO-NODE value radix)))
-(defn n-is-nan! [(value i64)] (-> i64)
-  (n-peephole (n-new2 (IsNaN) NO-NODE value)))
-(defn n-string-split! [(mem i64) (string i64) (delimiter i64) (result i64)] (-> i64)
-  (n-peephole (n-new5 (StringSplit) NO-NODE mem string delimiter result)))
-(defn n-string-from-code-unit! [(value i64)] (-> i64)
-  (n-peephole (n-new2 (StringFromCodeUnit) NO-NODE value)))
-(defn n-number-to-string! [(value i64) (radix i64)] (-> i64)
-  (n-peephole (n-new3 (NumberToString) NO-NODE value radix)))
-(defn n-to-fixed! [(value i64) (digits i64)] (-> i64)
-  (n-peephole (n-new3 (ToFixed) NO-NODE value digits)))
-;; BOTH TAKE A CONTROL. An allocation and a mutation may not float — see `jl-prim`'s string-atom
-;; arm for what a floating one does to the evaluator — so the builder asks for the block rather
-;; than letting a caller forget it.
-(defn n-string-alloc! [(ctrl i64) (length i64)] (-> i64)
-  (n-peephole (n-new2 (StringAlloc) ctrl length)))
-(defn n-string-set-unit! [(ctrl i64) (string i64) (index i64) (unit i64)] (-> i64)
-  (n-peephole (n-new4 (StringSetUnit) ctrl string index unit)))
-(defn n-string-index-of! [(value i64) (needle i64) (start i64)] (-> i64)
-  (n-peephole (n-new4 (StringIndexOf) NO-NODE value needle start)))
-(defn n-string-compare! [(left i64) (right i64)] (-> i64)
-  (n-peephole (n-new3 (StringCompare) NO-NODE left right)))
-(defn n-string-normalize! [(string i64) (form i64)] (-> i64)
-  (n-peephole (n-new3 (StringNormalize) NO-NODE string form)))
-(defn n-js-builtin! [(descriptor i64) (arg0 i64) (arg1 i64)] (-> i64)
-  (n-peephole (n-new3 (JsBuiltin descriptor) NO-NODE arg0 arg1)))
-(defn n-js-throw! [(value i64)] (-> i64)
-  (n-peephole (n-new2 (JsThrow) NO-NODE value)))
-(defn n-to-integer! [(value i64)] (-> i64)
-  (n-peephole (n-new2 (ToInteger) NO-NODE value)))
 (defn n-to-number! [(value i64)] (-> i64)
   (n-peephole (n-new2 (ToNumber) NO-NODE value)))
-(defn n-array-test! [(value i64)] (-> i64)
-  (n-peephole (n-new2 (ArrayTest) NO-NODE value)))
-(defn n-array-unbox! [(value i64)] (-> i64)
-  (n-peephole (n-new2 (ArrayUnbox) NO-NODE value)))
-(defn n-parse-float! [(value i64)] (-> i64)
-  (n-peephole (n-new2 (ParseFloat) NO-NODE value)))
-
 (defn n-memmerge2! [(a i64) (b i64)] (-> i64)
   (n-peephole (n-new3 (MemMerge) NO-NODE a b)))
 
@@ -2971,6 +2900,22 @@
         (ProtoHas [] REP-RAW-NUM)
         (_ REP-UNKNOWN))))
 
+;; `%IsArray`, and it folds in exactly ONE direction. A value whose kinds do not include VK-OBJ
+;; cannot be an array, so the test is a constant false -- which is what lets `ToStringValue`'s array
+;; dispatch cost nothing at the overwhelming majority of its call sites, where the operand is a
+;; proven number or string. The other direction is NOT available here: the lattice has no bit that
+;; separates an array from a plain object (both are VK-OBJ with a shape), so "is an array" is a
+;; structural question and `arraytest-idealize` is where it is asked.
+;;
+;; `ty-high?` FIRST, for the reason every compute has it: an unanalysed input has NO kinds, and
+;; answering false for it would make the type RISE to `bool` the moment the input fell to `dyn`.
+;; `g-analyze!` aborts on a rising type, so this guard is what makes the fold monotone.
+(defn arraytest-compute [(n i64)] (-> i64)
+  (let [t (n-in-ty n 1)]
+    (if (ty-high? t)
+        (t-top)
+        (if (= (& (ty-kinds t) VK-OBJ) 0) (t-bool-con false) (t-bool)))))
+
 (defn typetest-compute [(n i64)] (-> i64)
   (let [t (n-in-ty n 1)
         target (n-typetest-target-type n)]
@@ -3211,15 +3156,24 @@
 ;; Subsuming a phi removes it from this node's out list, so the index only advances when nothing
 ;; was removed.
 (defn region-reduce-phis! [(n i64)] (-> i64)
-  (let [(mut i) 0]
-    (loop (if (>= (load i) (n-nouts n))
-              (break)
-              (let [u (n-out n (load i))]
-                (if (and (not (n-dead? u)) (op-phi? (n-op u)))
-                    (do (n-subsume! u (n-in u 1)) 0)
-                    (set! i (+ (load i) 1)))
-                0)))
-    0))
+  ;; RESCAN FROM THE START, for the reason `region-remove-path!` states: a subsume can cascade and
+  ;; vacate an out slot this scan has already passed, and `n-del-use!` fills that slot from the
+  ;; END of the list. Holding the index still when the CURRENT entry disappears is not enough --
+  ;; the entry that moves is not always the one being replaced.
+  (loop
+    (let [(mut found) NO-NODE
+          (mut i) 0]
+      (loop (if (or (>= (load i) (n-nouts n)) (!= (load found) NO-NODE))
+                (break)
+                (do
+                  (let [u (n-out n (load i))]
+                    (if (and (not (n-dead? u)) (op-phi? (n-op u))) (set! found u) 0))
+                  (set! i (+ (load i) 1))
+                  0)))
+      (if (= (load found) NO-NODE)
+          (break)
+          (do (n-subsume! (load found) (n-in (load found) 1)) 0))))
+  0)
 
 ;; The index of a path that cannot be reached, or 0 for none. A Loop never gives up its entry:
 ;; a loop whose entry died is handled by the loop dying, not by rewriting it into a region.
@@ -3246,16 +3200,34 @@
 ;; matching value from every Phi on that region leaves each Phi reading the wrong path, which
 ;; is a miscompile that typechecks. They are removed together, here, or not at all.
 (defn region-remove-path! [(n i64) (path i64)] (-> i64)
-  (let [(mut i) 0]
-    (loop (if (>= (load i) (n-nouts n))
-              (break)
-              (do
-                (let [u (n-out n (load i))]
-                  (if (and (op-phi? (n-op u)) (= (n-nins u) (n-nins n)))
-                      (do (n-del-def! u path) 0)
-                      0))
-                (set! i (+ (load i) 1))
-                0))))
+  ;; RESCAN FROM THE START AFTER EVERY REMOVAL, because a removal can move an unvisited phi into
+  ;; an index this scan has already passed. `n-del-use!` is a SWAP-remove, and dropping a phi's
+  ;; backedge arm routinely kills a whole cycle: a memory phi's backedge is a store chain whose
+  ;; own memory input is that phi, so releasing the arm kills the chain, the chain releases the
+  ;; phi, and the phi -- now unused -- releases this region and vacates its slot in the out list.
+  ;; The last entry lands there, and a single forward pass never looks at it again.
+  ;;
+  ;; That left a THREE-input Phi on a TWO-input Region, which is the exact malformation this
+  ;; function exists to prevent, and it surfaced as `phi-compute` reading the region past its
+  ;; end. Unreachable until a loop back edge could be proven dead; see `fng-loop`.
+  ;;
+  ;; The scan is quadratic in the out list, which is a handful of nodes.
+  (loop
+    (let [(mut found) NO-NODE
+          (mut i) 0]
+      (loop (if (or (>= (load i) (n-nouts n)) (!= (load found) NO-NODE))
+                (break)
+                (do
+                  (let [u (n-out n (load i))]
+                    (if (and (and (not (n-dead? u)) (op-phi? (n-op u)))
+                             (= (n-nins u) (n-nins n)))
+                        (set! found u)
+                        0))
+                  (set! i (+ (load i) 1))
+                  0)))
+      (if (= (load found) NO-NODE)
+          (break)
+          (do (n-del-def! (load found) path) 0))))
   (n-del-def! n path)
   n)
 
@@ -4193,18 +4165,6 @@
                     (g-changed!)
                     true)))))))
 
-(defn g-inline-small! [] (-> i64)
-  (let [lim (n-count)
-        (mut i) 0
-        (mut count) 0]
-    (loop (if (>= (load i) lim)
-              (break)
-              (do
-                (if (inline-one-call! (load i)) (set! count (+ (load count) 1)) 0)
-                (set! i (+ (load i) 1))
-                0)))
-    (load count)))
-
 ;; Remove a local dense array after every observing load has forwarded away and the owner has not
 ;; escaped. Its stores and resize nodes then carry only sequencing tokens; bypassing them exposes
 ;; the allocation to ordinary dead-node cleanup.
@@ -4261,80 +4221,10 @@
                 0)))
     (load count)))
 
-;; Clone one small straight-line function. The temporary Call is only a substitution map consumed
-;; by the already-gated inliner; it is killed before this function returns and never reaches IR.
-(defn n-specialize-fun! [(fun i64) (new-fidx i64)] (-> i64)
-  (if (or (not (op-is? fun Fun [_])) (!= (n-nins fun) 2))
-      NO-NODE
-      (let [ret (n-in fun 1)]
-        (if (or (not (op-is? ret Return [])) (!= (n-in ret 0) (n-fun-entry fun)))
-            NO-NODE
-            (let [clone (n-fun-open! new-fidx)
-                  fake (n-new (Call 0))
-                  argc (fun-parm-count fun)
-                  (mut i) 0]
-              (n-add-def! fake (n-fun-entry clone))
-              (n-add-def! fake fun)
-              (loop (if (>= (load i) argc)
-                        (break)
-                        (do
-                          (n-add-def! fake (n-parm! clone (load i)))
-                          (set! i (+ (load i) 1))
-                          0)))
-              (if (not (inline-clonable? (n-in ret 1) fun fake 32))
-                  (do (n-kill! fake) NO-NODE)
-                  (let [value (inline-clone! (n-in ret 1) fun fake)]
-                    (n-keep! value)
-                    (n-kill! fake)
-                    (n-unkeep! value)
-                    (n-fun-close! clone (n-new2 (Return) (n-fun-entry clone) value))
-                    clone)))))))
-
 (defstruct SpecSite [(value i64) (end i64) (fast i64) (fallback i64) (clone i64)])
-(defn spec-value [(s SpecSite)] (-> i64)
-  (.value s))
-(defn spec-end [(s SpecSite)] (-> i64)
-  (.end s))
-(defn spec-fast [(s SpecSite)] (-> i64)
-  (.fast s))
-(defn spec-fallback [(s SpecSite)] (-> i64)
-  (.fallback s))
-(defn spec-clone [(s SpecSite)] (-> i64)
-  (.clone s))
-
 ;; Profile input to M9's specialization cost model.
 (defn n-profile-specialize? [(samples i64) (target-hits i64) (clone-cost i64)] (-> bool)
   (and (and (>= samples 32) (>= (* target-hits 100) (* samples 80))) (<= clone-cost 32)))
-
-(defn n-specialize-call1! [(ctrl i64) (generic i64) (arg i64) (target i64) (new-fidx i64)] (-> SpecSite)
-  (let [clone (n-specialize-fun! generic new-fidx)
-        (mut out) (zeroed SpecSite)]
-    (if (= clone NO-NODE) (do (panic-corrupt "n-specialize-call1!: function exceeds the cost model") 0) 0)
-    (n-keep! arg)
-    (let [test (n-typetest! arg target)
-          iff (n-peephole (n-new2 (If) ctrl test))
-          arms (n-if-arms! iff)
-          narrowed (n-peephole (n-new2 (Cast target) (arms-t arms) arg))
-          fast (n-call1! (arms-t arms) clone narrowed)
-          slow (n-call1! (arms-f arms) generic arg)
-          region (n-new (Region))]
-      (n-mark-cold! (arms-f arms))
-      (n-unkeep! arg)
-      (n-add-def! region NO-NODE)
-      (n-add-def! region (call-end fast))
-      (n-add-def! region (call-end slow))
-      (let [phi (n-new (Phi (t-dyn)))]
-        (n-add-def! phi region)
-        (n-add-def! phi (call-value fast))
-        (n-add-def! phi (call-value slow))
-        ; Return the raw merge pair. The caller has not attached its consumer yet, so eager
-        ; simplification here can collect a proven arm before that consumer exists.
-        (set! (.value out) phi)
-        (set! (.end out) region)
-        (set! (.fast out) (call-value fast))
-        (set! (.fallback out) (call-value slow))
-        (set! (.clone out) clone)
-        (load out)))))
 
 ;; "This operand IS the integer k", which every identity rule below asks about the operand it is
 ;; about to discard. IT IS A CLAIM ABOUT A TYPE, so it needs the proven answer too: a Phi
@@ -4514,8 +4404,24 @@
               (do (al-push! [i64] (field p pmark) 0) 0)))
     0))
 
+;; SETTLED MEANS AT A FIXPOINT, and ANY is a fixpoint like any other -- but only once the analysis
+;; has actually run. Those are two different states that both spell ANY, and conflating them is what
+;; made dead code IMMORTAL: a value inside a proven-dead region computes ANY forever (no path
+;; reaches it, so it has no value), so every cone containing one was "unsettled", so
+;; `n-in-proven-xctrl?` never proved anything, so the dead region was never dropped -- and the live
+;; `Phi` merging it kept an ANY arm that instruction selection has no rule for.
+;;
+;; NO JAVASCRIPT LOOP COMPILED for this reason, together with `if-compute`'s ordering. A loop puts
+;; the DSL's guards under a predicate that is unknown on the first pass, so a loop body always
+;; contains proven-dead arms with ANY values in them; straight-line code rarely does.
+;;
+;; The `analysed` flag is what makes ANY safe to accept: DURING CONSTRUCTION every half-built node
+;; is ANY and folding on that is the mistake `n-peephole` documents, so the flag is false until
+;; `g-analyze!` has completed once.
 (defn n-ty-settled? [(n i64)] (-> bool)
-  (and (not (ty-unanalysed? (n-ty n))) (= (n-ty n) (n-compute n))))
+  (and (or (not (ty-unanalysed? (n-ty n)))
+           (and (.analysed (graph)) (.provingctrl (graph))))
+       (= (n-ty n) (n-compute n))))
 
 (defn n-ty-proven? [(n i64)] (-> bool)
   (let [p (graph)
@@ -4569,8 +4475,19 @@
 ;; element of the control axis, so meet(~ctrl, anything reachable) is `ctrl` and a node reporting
 ;; `~ctrl` may still fall to `ctrl` later. It is proof only once nothing its type depends on is
 ;; unanalysed. Every rewrite that deletes a control path goes through here.
+;; PROVING A CONTROL ARM DEAD IS NOT PROVING A VALUE CONSTANT, and the flag is what tells
+;; `n-ty-settled?` which one it is answering. Accepting a fixpoint at ANY is necessary here --
+;; without it no dead region is ever removable, because dead regions are full of ANY values that
+;; will never be anything else -- and WRONG for the constant fold, where it let a loop's carried
+;; phi be replaced by its entry value while the loop was still being built.
 (defn n-in-proven-xctrl? [(n i64) (i i64)] (-> bool)
-  (and (= (n-in-ty n i) (t-xctrl)) (n-ty-proven? (n-in n i))))
+  (and (= (n-in-ty n i) (t-xctrl))
+       (let [p (graph)
+             was (.provingctrl p)]
+         (set! (.provingctrl p) true)
+         (let [answer (n-ty-proven? (n-in n i))]
+           (set! (.provingctrl p) was)
+           answer))))
 
 (defn n-const [(t i64)] (-> i64)
   (n-peephole (n-new1 (Const t) (g-start))))
@@ -4599,8 +4516,18 @@
           ;; A singleton function SET is constant as an analysis fact (one possible target), not
           ;; as a runtime JavaScript value. A Cast refining a heap-loaded callable must therefore
           ;; retain that value; replacing it with `Const fun#N` discards function/closure identity.
+          ;; A `Box` IS NOT FOLDABLE TO A CONSTANT, for the same reason a function set is not: its
+          ;; result is a TAGGED WORD and a `Const` is a raw immediate, so replacing one with the
+          ;; other deletes the very operation it exists to perform. `undefined` is where this shows:
+          ;; `Box(Const undefined)` has a constant type -- there is only one undefined -- so it
+          ;; folded, and a `Phi` merging it with a boxed string then held a raw immediate on one arm
+          ;; and a tagged word on the other. `String(v.at(99))` printed one character where node
+          ;; prints "undefined", and nothing in the compiler objected, because both arms were
+          ;; individually well-typed. DSL-OWNERSHIP records the same trap for `box-compute`'s type;
+          ;; this is the transformation half of it.
           (if (and (and (and (op-foldable? (n-op n)) (ty-const? t))
-                        (= (& (ty-kinds t) VK-FUN) 0))
+                        (and (= (& (ty-kinds t) VK-FUN) 0)
+                             (not (op-value-is? (n-op n) Box [_]))))
                    (n-ty-proven? n))
               (let [c (n-new1 (Const t) (g-start))]
                 (n-set-ty! c t)
@@ -4640,8 +4567,6 @@
   (.nfwd (graph)))
 (defn g-store-elims [] (-> i64)
   (.nselim (graph)))
-(defn g-dead-allocations [] (-> i64)
-  (.ndalloc (graph)))
 (defn g-forwarded! [] (-> i64)
   (set! (.nfwd (graph)) (+ (.nfwd (graph)) 1))
   0)
@@ -4837,6 +4762,7 @@
                       (do (panic-corrupt "g-analyze!: types did not reach a fixpoint") 0)
                       0)
                   0))))
+    (set! (.analysed (graph)) true)
     (load steps)))
 
 ;; Whole-world optimistic inference. Resetting every live node to lattice TOP is intentional: the
@@ -4902,6 +4828,237 @@
 
 ;; Every node that is neither reachable from Stop nor from Start must be dead. A live node
 ;; nobody can reach is a leak, and the arena would grow forever across a real compile.
+;; A DEAD LOOP IS NOT DEAD CODE UNTIL SOMETHING SAYS SO. `n-kill!` refuses a node that still has
+;; users, and every node in a loop's Phi cycle has one -- the next node in the cycle. So a loop
+;; whose result nobody reads stays live, unreachable from every root, and `v-pass-leaks` reports it
+;; as a leak: `"abcdef".toLowerCase()` compared only against `undefined` folds the comparison away
+;; and leaves `lib/string/case.jsl`'s whole loop with no consumer, and the program does not compile.
+;;
+;; The sweep breaks the cycles first -- detach every input of every unreachable node, which drops
+;; the uses that were only holding each other up -- and then kills them.
+;;
+;; IT REFUSES TO RUN ON ANYTHING WITH AN EFFECT. A memory-typed node, a `Call`, a `New` or a throw
+;; that is unreachable means something is wrong with the graph rather than merely unused, and
+;; deleting it would delete an observable effect. In that case the sweep does nothing and the leak
+;; check reports exactly what it reports today. Ordinary memory effects never reach here anyway:
+;; they are reachable through the memory chain that ends at the `Return`.
+;; A FUNCTION NOTHING CALLS IS NOT PART OF THIS PROGRAM, and until this pass it stayed in the graph
+;; anyway. `mu-build-program!` builds EVERY live `Fun` -- deliberately, because a callable whose
+;; identity escapes only as a value has no direct call edge and the universal dispatcher can still
+;; land on it -- so an uncalled function is selected, scheduled, register-allocated and emitted.
+;;
+;; IT BECAME REACHABLE THE DAY A `lib/` MACRO STARTED NAMING A `builtin`. `ToStringValue` tests
+;; `%IsArray` and hands the array case to `ArrayToStringValue`, and `ToStringValue` is inlined into
+;; `JsAdd` -- so `n + 1` pulled the join builtin's `Fun` into its graph, the `ArrayTest` folded to
+;; false, the `Call` died with the arm, and the FUNCTION remained: an extra machine function in the
+;; object, extra register pressure, and a graph that no longer rendered the same.
+;;
+;; WHAT COUNTS AS REFERENCED IS REACHABILITY FROM THE PROGRAM'S ROOTS, not the absence of a `Call`.
+;; A function whose identity is stored in a field, captured by a closure or merged in a `Phi` is
+;; reachable from `Stop` through that value, and dropping it would delete a target the dynamic
+;; dispatcher can still land on. Following inputs from `Start` and `Stop` answers both questions at
+;; once: a `Call` names its `Fun` as an input, and so does every other consumer of a function value.
+;;
+;; It refuses to run rather than kill a node something outside the doomed functions still uses --
+;; the same conservatism `g-sweep-unreachable!` applies, for the same reason.
+(defn g-kill-uncalled-functions! [] (-> i64)
+  (let [n (n-count)
+        (mut reached) (al-new [bool] (malloc-allocator))
+        (mut doomed) (al-new [bool] (malloc-allocator))
+        (mut i) 0
+        (mut killed) 0]
+    (loop (if (>= (load i) n)
+              (break)
+              (do (al-push! [bool] (mut reached) false)
+                  (al-push! [bool] (mut doomed) false)
+                  (set! i (+ (load i) 1))
+                  0)))
+    (n-reachable-mark (g-stop) (mut reached))
+    (n-reachable-mark (g-start) (mut reached))
+    ;; Everything a function nobody reached can see. A `Fun` that only another doomed function names
+    ;; is doomed too, and this loop finds it without a fixpoint: neither is reachable from the roots,
+    ;; so each is its own starting point.
+    (set! i 0)
+    (loop (if (>= (load i) n)
+              (break)
+              (do
+                (if (and (not (n-dead? (load i)))
+                         (and (op-is? (load i) Fun [_]) (not (al-get (load reached) (load i)))))
+                    (n-reachable-mark (load i) (mut doomed))
+                    0)
+                (set! i (+ (load i) 1))
+                0)))
+    ;; A `Parm` points AT its function rather than being an input of it, so it is never found by
+    ;; the walk above and has to be added by name.
+    (set! i 0)
+    (loop (if (>= (load i) n)
+              (break)
+              (do
+                (if (and (not (n-dead? (load i)))
+                         (and (op-is? (load i) Parm [_])
+                              (and (> (n-nins (load i)) 0)
+                                   (and (!= (n-in (load i) 0) NO-NODE)
+                                        (al-get (load doomed) (n-in (load i) 0))))))
+                    (al-set! [bool] (mut doomed) (load i) true)
+                    0)
+                (set! i (+ (load i) 1))
+                0)))
+    (let [(mut safe) true]
+      (set! i 0)
+      (loop (if (>= (load i) n)
+                (break)
+                (do
+                  (if (and (not (n-dead? (load i)))
+                           (and (al-get (load doomed) (load i))
+                                (al-get (load reached) (load i))))
+                      ;; Shared with the program: a string constant or a type the entry also names.
+                      ;; Not doomed at all, and not a reason to refuse -- just not ours to kill.
+                      (al-set! [bool] (mut doomed) (load i) false)
+                      0)
+                  (set! i (+ (load i) 1))
+                  0)))
+      ;; Nothing outside the doomed set may still be reading from inside it.
+      (set! i 0)
+      (loop (if (or (>= (load i) n) (not (load safe)))
+                (break)
+                (do
+                  (if (and (not (n-dead? (load i))) (al-get (load doomed) (load i)))
+                      (let [(mut k) 0]
+                        (loop (if (or (>= (load k) (n-nouts (load i))) (not (load safe)))
+                                  (break)
+                                  (do
+                                    (let [u (n-out (load i) (load k))]
+                                      (if (or (n-dead? u) (al-get (load doomed) u))
+                                          0
+                                          (set! safe false)))
+                                    (set! k (+ (load k) 1))
+                                    0))))
+                      0)
+                  (set! i (+ (load i) 1))
+                  0)))
+      (if (not (load safe))
+          0
+          (do
+            ;; UNPIN FIRST. A `Parm` is pinned for its whole life -- `jl-bind!` keeps it, and the
+            ;; pin is deliberate: a function's arity is read off its `Parm` nodes, so a parameter
+            ;; the body never mentions must survive every fold. That reason expires with the
+            ;; function. Lowering is finished by the time this runs, so nothing else is holding it.
+            (set! i 0)
+            (loop (if (>= (load i) n)
+                      (break)
+                      (do
+                        (if (and (not (n-dead? (load i))) (al-get (load doomed) (load i)))
+                            (loop (if (<= (n-keeps (load i)) 0) (break) (n-unkeep! (load i))))
+                            0)
+                        (set! i (+ (load i) 1))
+                        0)))
+            ;; Break every edge first, then collect. `n-kill!` refuses a node that still has users,
+            ;; and a function body is full of cycles -- the loop Phis, and the `Fun`/`Return` pair
+            ;; itself.
+            (set! i 0)
+            (loop (if (>= (load i) n)
+                      (break)
+                      (do
+                        (if (and (not (n-dead? (load i))) (al-get (load doomed) (load i)))
+                            (let [(mut k) 0]
+                              (loop (if (>= (load k) (n-nins (load i)))
+                                        (break)
+                                        (do (if (!= (n-in (load i) (load k)) NO-NODE)
+                                                (do (n-set-def! (load i) (load k) NO-NODE) 0)
+                                                0)
+                                            (set! k (+ (load k) 1))
+                                            0))))
+                            0)
+                        (set! i (+ (load i) 1))
+                        0)))
+            (set! i 0)
+            (loop (if (>= (load i) n)
+                      (break)
+                      (do
+                        (if (and (not (n-dead? (load i)))
+                                 (and (al-get (load doomed) (load i))
+                                      (= (n-nouts (load i)) 0)))
+                            (do (n-kill! (load i)) (set! killed (+ (load killed) 1)) 0)
+                            0)
+                        (set! i (+ (load i) 1))
+                        0)))
+            0)))
+    (al-free! [bool] (mut reached))
+    (al-free! [bool] (mut doomed))
+    (load killed)))
+
+(defn g-sweep-unreachable! [] (-> i64)
+  (let [n (n-count)
+        (mut seen) (al-new [bool] (malloc-allocator))
+        (mut i) 0]
+    (loop (if (>= (load i) n)
+              (break)
+              (do (al-push! [bool] (mut seen) false) (set! i (+ (load i) 1)) 0)))
+    (n-reachable-mark (g-stop) (mut seen))
+    (n-reachable-mark (g-start) (mut seen))
+    (set! i 0)
+    (loop (if (>= (load i) n)
+              (break)
+              (do
+                (if (and (not (n-dead? (load i)))
+                         (or (op-is? (load i) Fun [_])
+                             (op-is? (load i) Parm [_])))
+                    (n-reachable-mark (load i) (mut seen))
+                    0)
+                (set! i (+ (load i) 1))
+                0)))
+    ;; Is every unreachable node safe to delete?
+    (let [(mut safe) true]
+      (set! i 0)
+      (loop (if (>= (load i) n)
+                (break)
+                (do
+                  (if (and (not (n-dead? (load i)))
+                           (and (not (al-get (load seen) (load i)))
+                                (or (ty-mem? (n-ty (load i)))
+                                    (or (op-is? (load i) Call [_])
+                                        (or (op-is? (load i) New [_])
+                                            (or (op-is? (load i) JsThrow [])
+                                                (> (n-keeps (load i)) 0)))))))
+                      (set! safe false)
+                      0)
+                  (set! i (+ (load i) 1))
+                  0)))
+      (if (not (load safe))
+          (do (al-free! [bool] (mut seen)) 0)
+          (do
+            ;; break the cycles, then collect the corpses
+            (set! i 0)
+            (loop (if (>= (load i) n)
+                      (break)
+                      (do
+                        (if (and (not (n-dead? (load i))) (not (al-get (load seen) (load i))))
+                            (let [(mut k) 0]
+                              (loop (if (>= (load k) (n-nins (load i)))
+                                        (break)
+                                        (do (if (!= (n-in (load i) (load k)) NO-NODE)
+                                                (do (n-set-def! (load i) (load k) NO-NODE) 0)
+                                                0)
+                                            (set! k (+ (load k) 1))
+                                            0))))
+                            0)
+                        (set! i (+ (load i) 1))
+                        0)))
+            (set! i 0)
+            (loop (if (>= (load i) n)
+                      (break)
+                      (do
+                        (if (and (not (n-dead? (load i)))
+                                 (and (not (al-get (load seen) (load i)))
+                                      (= (n-nouts (load i)) 0)))
+                            (do (n-kill! (load i)) 0)
+                            0)
+                        (set! i (+ (load i) 1))
+                        0)))
+            (al-free! [bool] (mut seen))
+            0)))
+    0))
+
 (defn g-leaked-count [] (-> i64)
   (let [n (n-count)
         (mut seen) (al-new [bool] (malloc-allocator))
@@ -5130,14 +5287,6 @@
                       (set! k (+ (load k) 1)))))
         (ps w "\n")
         0))))
-
-(defn g-print-flat-range [(w (ptr Writer)) (first i64) (last i64)] (-> i64)
-  (let [(mut i) (if (< first 0) 0 first)
-        end (if (> last (n-count)) (n-count) last)]
-    (loop (if (>= (load i) end)
-              (break)
-              (do (n-print-flat w (load i)) (set! i (+ (load i) 1)))))
-    0))
 
 (defn g-print-flat [(w (ptr Writer))] (-> i64)
   (let [n (n-count)

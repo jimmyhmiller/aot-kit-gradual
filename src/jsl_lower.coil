@@ -62,6 +62,7 @@
    (callback-calls (ArrayList i64)) ; dynamic JS calls emitted by callback macros
    (ctrl   i64)               ; the control the next effectful form hangs off, or JL-DIVERGED
    (mem    i64)               ; the current JS property memory, or NO-NODE before it is needed
+   (outer  i64)               ; the CALLER's other memory (cells, closure environments), or NO-NODE
    (anchor i64)               ; Start/FunStart of the CFG owner receiving newly rooted constants
    (frame  i64)               ; lookup floor: a macro body cannot see its caller's bindings
    (decl   i64)               ; which declaration is being lowered, for diagnostics
@@ -81,6 +82,7 @@
           (set! (.callback-calls p) (al-new [i64] (malloc-allocator)))
           (set! (.ctrl p) NO-NODE)
           (set! (.mem p) NO-NODE)
+          (set! (.outer p) NO-NODE)
           (set! (.anchor p) NO-NODE)
           (set! (.frame p) 0)
           (set! (.decl p) -1)
@@ -127,6 +129,7 @@
     (al-clear! [i64] (field p callback-calls))
     (set! (.ctrl p) NO-NODE)
     (set! (.mem p) NO-NODE)
+    (set! (.outer p) NO-NODE)
     (set! (.anchor p) NO-NODE)
     (set! (.frame p) 0)
     (set! (.decl p) -1)
@@ -146,6 +149,28 @@
 ;; `jl-lower-decl!` binds this for any declaration the checker found reads the heap; a macro
 ;; inlined into such a declaration inherits it, which is why the fixpoint propagates memory use
 ;; through calls rather than reading each body in isolation.
+;; THE CALLER'S OTHER MEMORY, and the whole reason it has to be here. `jl-mem` is the JavaScript
+;; PROPERTY heap, which is every state a `.jsl` definition can name -- and a callback is USER code,
+;; which writes states this library cannot name: a captured variable's cell, a closure
+;; environment's fields. Those live on their own aliases, and the callback `Call` carried no edge
+;; to any of them, so the caller's stores into them had no consumer and were deleted as dead.
+;;
+;;   let b = 2; [3, 4].map(v => (v + b) | 0)          the environment slot was never written, and
+;;                                                    the callee dereferenced it -- SIGSEGV
+;;   let acc = 0; [3, 4].forEach(v => { acc += v; })  the cell store died the same way, and the
+;;                                                    read after the loop saw the initial value
+;;
+;; `fng-jsl-call` sets this around any definition `jsl-decl-calls-back?` is true for, and clears it
+;; afterwards; NO-NODE everywhere else, which is every definition that takes no callback.
+(defn jl-outer-mem [] (-> i64) (.outer (jl)))
+(defn jl-set-outer-mem! [(m i64)] (-> i64) (set! (.outer (jl)) m) 0)
+
+;; The memory a callback call publishes: the property heap this definition threads, merged with the
+;; caller's other state when there is any. ONE trailing argument, because `v-need-call-args` permits
+;; exactly one memory producer and it must be last.
+(defn jl-call-mem [] (-> i64)
+  (let [m (jl-mem) o (jl-outer-mem)]
+    (if (= o NO-NODE) m (n-memmerge2! m o))))
 (defn jl-set-mem! [(m i64)] (-> i64) (set! (.mem (jl)) m) 0)
 (defn jl-mem-raw [] (-> i64) (.mem (jl)))
 
@@ -344,7 +369,7 @@
       (n-peephole (n-new2 (Unbox (jsp-aux id)) NO-NODE a))
   (if (or (= id JSP-UNBOXINT)
           (or (= id JSP-UNBOXFLT)
-              (or (= id JSP-UNBOXBOOL) (or (= id JSP-UNBOXOBJ) (= id JSP-UNBOXSTRING)))))
+              (or (= id JSP-UNBOXOBJ) (= id JSP-UNBOXSTRING))))
       (jl-unbox (jsp-aux id) a)
    ;; `OPTAG-JSBUILTIN` always carries two operands. Unary descriptors ignore the duplicate second
    ;; operand; the zero-argument random descriptor ignores both explicit zero placeholders.
@@ -485,7 +510,7 @@
                   (store! i (+ (load i) 1))
                   0)))
       (if (jl-diverged?) (return-from :done NO-NODE) 0)
-      (store! (index p n) (jl-mem))
+      (store! (index p n) (jl-call-mem))
       ;; The callee value doubles as the hidden environment, and a bare `f(...)` call runs with an
       ;; undefined receiver — the uniform closure-call ABI, same layout `inline-clone!` maps
       ;; parameters against.
@@ -609,7 +634,7 @@
           ;; for an arm which target discovery has proved uninhabited.
           raw-callee
           (do
-            (store! (index p call-n) (jl-mem))
+            (store! (index p call-n) (jl-call-mem))
             ;; The callee value doubles as the hidden environment: a closure is its own
             ;; environment object, and a bare function ignores the slot entirely.
             (let [cs (n-call-receiver! (jl-ctrl) callee callee receiver
@@ -1107,7 +1132,22 @@
       (if uses-mem
           (jl-set-mem! (n-new1 (Arg (t-mem-alias JS-PROPERTY-ALIAS (t-undef))) end))
           0)
-        (call-value cs)))))
+      ;; A DECLARED `:ret` IS A REPRESENTATION CONTRACT ON THE WAY OUT, exactly as a declared
+      ;; parameter type is one on the way in, and nothing carried it. A `Call` computes `dyn`
+      ;; whatever its callee returns, so the result of a definition declared `:ret int` -- a RAW
+      ;; machine integer -- reads as a tagged JavaScript value everywhere downstream. Two consumers
+      ;; then disagree about the same word: `"abcdef".lastIndexOf("c")` RETURNED 2 CORRECTLY, and
+      ;; `lastIndexOf("c") | 0` answered 0, because `be-box-input-already-tagged?` saw `dyn` on the
+      ;; loop phi holding it, called the `Box` an identity, and the DSL's `ToInt32` ran its tag
+      ;; tests on a raw integer.
+      ;;
+      ;; The `Cast` is an assertion of the type the declaration already states, so it adds no claim
+      ;; the callee was not making. It is pinned to the `CallEnd`, which is where the value exists.
+      (let [ret (jsl-decl-ret callee)
+            v (call-value cs)]
+        (if (or (= ret TY-NO-ID) (= ret (t-dyn)))
+            v
+            (n-peephole (n-new2 (Cast ret) end v))))))))
 
 ;; Inline only calls introduced by JSL's JavaScript-callback form. This deliberately excludes
 ;; ordinary source calls: callback macros expose hot per-element calls, while global inlining can

@@ -166,10 +166,6 @@
 (defn fng-numeric-string-add-ptr [] (-> (ptr bool))
   (let [enabled (alloc/static bool)] enabled))
 
-(defn fng-falsify-numeric-string-add! [(enabled bool)] (-> i64)
-  (set! (fng-numeric-string-add-ptr) enabled)
-  0)
-
 (defn fng-capture-by-value-ptr [] (-> (ptr bool))
   (let [enabled (alloc/static bool)] enabled))
 
@@ -291,11 +287,6 @@
                   (= bits (f64-bits (cast f64 (cast i64 number))))))
         (fng-const (cast i64 number))
         (n-new1 (Const (t-flt-bits bits)) (g-start)))))
-
-(defn fng-string-coerce [(context FngContext) (source i64) (value i64)] (-> i64)
-  (if (= (fng-infer context source FNG-DYNAMIC) FNG-STRING)
-      value
-      (fng-jsl-call1 context "ToStringValue" value)))
 
 (defn fng-direct-call-object-type [(value i64)] (-> i64)
   (if (and (>= value 0) (op-is? value Call [_]))
@@ -592,8 +583,12 @@
         ;; It never showed up because the corpus passes objects that are ALREADY tagged — an array
         ;; element in `integrated-heap-program.ts`, which `fng-tagged-dynamic-value?` recognises and
         ;; leaves alone. A freshly allocated one is the case nothing covered.
+        ;; FNG-ARRAY is in this set for the same reason FNG-DYNAMIC is, and it was FNG-DYNAMIC
+        ;; until `fng-type-tag` learned about `KindArrayType`: an array parameter is a `Parm`, a
+        ;; `Parm` is a tagged JavaScript value, and the caller must hand over a tagged one.
         (if (or (>= parameter-type 0)
-                (or (= parameter-type FNG-DYNAMIC) (= parameter-type FNG-NUMBER)))
+                (or (= parameter-type FNG-DYNAMIC)
+                    (or (= parameter-type FNG-NUMBER) (= parameter-type FNG-ARRAY))))
             (if (fng-tagged-dynamic-value? value) value (fng-box-dynamic-argument! value))
             value))))
 
@@ -656,6 +651,15 @@
 (defn fng-machine-number-value? [(v i64) (fuel i64)] (-> bool)
   (if (or (= v NO-NODE) (<= fuel 0))
       false
+    ;; AN OPEN LOOP PHI IS NOT A MACHINE NUMBER YET, whatever its one visible arm says. `i++` asked
+    ;; this to decide the write-back representation and got "raw" from the entry `0`, so it wrote a
+    ;; raw FLOAT into a phi whose other arm is a raw INT -- one phi, two register classes, and every
+    ;; integer consumer read the double's bit pattern. `a[i]` and `s.charCodeAt(i)` inside an `i++`
+    ;; loop then indexed 0 on every iteration. Answering false here writes the tagged value back, so
+    ;; the phi is tagged on both arms and the use sites unbox it; where the counter really is an
+    ;; integer the guards fold and the loop is the same two instructions it was.
+    (if (fng-open-loop-phi? v)
+        false
       ;; The boxed walk, not just the shallow producer test: `ty-isa ANY num` below is true for
       ;; an unanalysed Phi, so a Phi joining Box arms would otherwise read as a machine number.
       (if (fng-boxed-dynamic-value? v)
@@ -682,7 +686,7 @@
                            (or (op-is? (n-in v 1) Fun [_])
                                (op-is? (n-in v 1) Closure [_])))
                       (fng-call-returns-machine-number-fuel? v (- fuel 1))
-                      false))))))
+                      false)))))))
 
 ;; Is this a DIRECT call whose callee returns a MACHINE NUMBER on every return arm? The
 ;; number-conversion exemption for direct calls assumed "direct => raw numeric return", but a
@@ -762,6 +766,29 @@
         0)
     0))
 
+;; A LOOP'S CARRIED PHI IS NOT FINISHED WHILE THE BODY IS BEING LOWERED. `fng-loop` allocates each
+;; phi with its back edge as NO-NODE, lowers the body, and only then writes slot 2 -- so every use
+;; of an induction variable INSIDE the loop asks about a phi with one arm. Both structural tests
+;; below answer from the arms, so a counter whose entry value is a raw `0` reads as certainly-raw,
+;; and the coercion is skipped. Then the body's `i = i + 1` comes back from the DSL BOXED, slot 2 is
+;; written, and the phi that was judged raw is tagged.
+;;
+;; NOTHING NOTICES. `a[i]` fails `g-verify` with "ArrayLoad slot 3 is tagged, needs raw-num", which
+;; at least says so; `s.charCodeAt(i)` compiles and reads the NaN box as an index, and the program
+;; returns a number that is merely wrong. Both are in `tests/native-execution-test.coil` now.
+;;
+;; So an open loop phi is conservatively "may be tagged". The cost is a coercion on a counter that
+;; turns out raw, and it FOLDS: `ToNumberValue`'s guard proves against a phi typed `int` and
+;; `BitOr(x, 0)` on an int is the identity, so the finished graph is the one the old test was
+;; hoping for -- only now it is the analysis proving it rather than the frontend guessing.
+(defn fng-open-loop-phi? [(v i64)] (-> bool)
+  (and (>= v 0)
+       (and (op-is? v Phi [_])
+            (and (> (n-nins v) 0)
+                 (and (!= (n-in v 0) NO-NODE)
+                      (and (op-is? (n-in v 0) Loop [])
+                           (or (< (n-nins v) 3) (= (n-in v 2) NO-NODE))))))))
+
 (defn fng-needs-to-number? [(value i64) (captured-cell bool)] (-> bool)
   ;; STRUCTURAL, not just the seed type: a fresh Load's type is not computed until inference
   ;; runs, so `n-ty == dyn` misses a tagged field load written moments earlier — Mul then took
@@ -769,8 +796,18 @@
   ;; tagged 3 read as NaN, NaN*5|0 == 0). The boxed walk extends the same structural test
   ;; through Phi joins of Box arms (inlined JSL macros like StringCodePointAt).
   (or captured-cell
-      (or (fng-value-tagged? value)
-          (fng-boxed-dynamic-value? value))))
+      ;; A VALUE THAT CERTAINLY CARRIES A RAW MACHINE NUMBER NEEDS NOTHING, whatever its type reads,
+      ;; and this gate is what stops the last resort in `fng-value-tagged?` -- `n-ty == dyn` -- from
+      ;; claiming one that does. A `Call` computes `dyn` regardless of its native ABI, so the result
+      ;; of a `lib/` definition declared `:ret int` reads as tagged: `"abcdef".lastIndexOf("c")`
+      ;; RETURNED 2 CORRECTLY and `lastIndexOf("c") | 0` answered 0, because the coercion put the
+      ;; raw index through `ToNumber` into a double and the bitwise op read the low half of a small
+      ;; double's bit pattern. `fng-machine-number-value?` is the structural question and it already
+      ;; defers to the boxed walk, so this only ever narrows the coercion.
+      (and (not (fng-machine-number-value? value 8))
+           (or (fng-value-tagged? value)
+               (or (fng-boxed-dynamic-value? value)
+                   (fng-open-loop-phi? value))))))
 
 (defn fng-int-value [(context FngContext) (source i64) (value i64)] (-> i64)
   (let [frontend (load (field context frontend))
@@ -909,6 +946,16 @@
               (= kind TSK-STRING) FNG-STRING
               (= kind TSK-STRING-LITERAL) FNG-STRING
               (= kind TSK-ARRAY-LITERAL) FNG-ARRAY
+              ;; `xs: number[]` IS AN ARRAY, and until the bridge reported `KindArrayType` at all
+              ;; this fell through to `FNG-DYNAMIC`. Everything that decides "is this an array"
+              ;; asks `fng-infer`, which asks this, so `xs.push(9)` on an array-typed PARAMETER was
+              ;; not an array method: it took the generic path, loaded `push` out of the runtime
+              ;; property table, found nothing, and dispatched `undefined` -- `brk` on the callee
+              ;; tag test. The same for every method, and for `forEach` it looked like "a callback
+              ;; inside a nested function traps", because a callback is only ever written on a
+              ;; method. `fng-number-array-symbol?` had been reading the type node's TEXT for
+              ;; `"[]"` since before this kind existed; that is what it was working around.
+              (= kind TSK-ARRAY-TYPE) FNG-ARRAY
               (= kind TSK-VOID) FNG-VOID
               :else FNG-DYNAMIC))))
 
@@ -948,7 +995,12 @@
             ;; reaching the fallback declared a slot the GC scan skips while the program stored
             ;; raw object pointers into it — a dangling pointer on the first collection. The
             ;; representation verifier (g-rep-report) is what caught it.
-            (if (and (= tag FNG-DYNAMIC) (!= kind TSK-TYPE-LITERAL))
+            ;; FNG-ARRAY lands here with FNG-DYNAMIC and for the same reason: an array is a
+            ;; managed pointer, so its slot must be TAGGED. It read `FNG-DYNAMIC` until
+            ;; `fng-type-tag` learned about `KindArrayType`, and without naming it here the fall
+            ;; through would reach `fng-coil-type`'s `t-int` default -- a raw slot the GC scan
+            ;; skips, holding an object pointer.
+            (if (and (or (= tag FNG-DYNAMIC) (= tag FNG-ARRAY)) (!= kind TSK-TYPE-LITERAL))
                 (t-dyn)
                 (fng-coil-type frontend shapes type-node))))))
 
@@ -1116,14 +1168,6 @@
                 (fng-alias-leaf memory alias 16)
                 (fng-memory (load (load (field context ctrl))) alias))))))
 
-(defn fng-control [(context FngContext)] (-> i64)
-  (load (load (field context ctrl))))
-
-(defn fng-effect? [(context FngContext) (owner i64)] (-> bool)
-  (let [function-id (.owner context)
-        type-count (.type-count context)]
-    (al-get [bool] (load (load (field context effects))) (+ (* function-id type-count) owner))))
-
 (defn fng-active-memory! [(context FngContext) (out (mut (ArrayList i64)))] (-> i64)
   (let [frontend (load (field context frontend))
         (mut index) 0]
@@ -1224,17 +1268,6 @@
                 (set! index (+ (load index) 1)))))
     (load answer)))
 
-(defn fng-function-source-index [(frontend (ptr NativeFrontend)) (source-id i64)] (-> i64)
-  (let [(mut index) 0 (mut answer) -1]
-    (loop (if (or (>= (load index) (al-len [FeFunction] (.functions frontend)))
-                  (!= (load answer) -1))
-              (break)
-              (let [fn (al-get [FeFunction] (.functions frontend) (load index))]
-                (if (= (.source-id fn) source-id)
-                    (set! answer (load index)) 0)
-                (set! index (+ (load index) 1)))))
-    (load answer)))
-
 (defn fng-function-node-index [(frontend (ptr NativeFrontend)) (node i64)] (-> i64)
   (let [(mut index) 0
         (mut answer) -1]
@@ -1289,9 +1322,6 @@
                 (and (fng-static-global-expression-mode? frontend (ts-child ast node 0) (- fuel 1) true)
                      (fng-static-global-expression-mode? frontend (ts-child ast node 2) (- fuel 1) true))
               :else false))))
-
-(defn fng-static-global-expression? [(frontend (ptr NativeFrontend)) (node i64) (fuel i64)] (-> bool)
-  (fng-static-global-expression-mode? frontend node fuel false))
 
 ;; An immutable primitive constant expression has no runtime environment identity. Publish it as a
 ;; compilation-unit value so every function can reference it without manufacturing closure cells.
@@ -1781,7 +1811,17 @@
                            (fng-number-array-symbol? frontend
                                                      (fe-resolution-symbol frontend base)))
                       FNG-NUMBER
-                      FNG-DYNAMIC))
+                      ;; `s[i]` ON A STRING IS A STRING, which is what TypeScript's own type for it
+                      ;; says, and saying so here is what puts `s[i].charCodeAt(0)` on the static
+                      ;; string path. It is not merely faster: the dynamic dispatch answers 0 for a
+                      ;; receiver typed `str|undefined`, so a loop over `s[i].charCodeAt(0)` summed
+                      ;; to nothing. Out of range the value is `undefined` and calling a method on it
+                      ;; is a TypeError this compiler cannot raise -- the same gap every other
+                      ;; unguarded access has, and the reason `docs/NATIVE-DIFFERENTIAL.md` is a
+                      ;; floor rather than a conformance claim.
+                      (if (= (fng-infer context base FNG-DYNAMIC) FNG-STRING)
+                          FNG-STRING
+                          FNG-DYNAMIC)))
               (= kind TSK-OBJECT-LITERAL) (fe-type-index-for-decl-node frontend node)
               (or (= kind TSK-CALL) (= kind TSK-NEW-EXPRESSION))
                 (if (and (= kind TSK-NEW-EXPRESSION)
@@ -2326,41 +2366,6 @@
              (= (fng-infer context (ts-child ast callee 0) FNG-DYNAMIC) FNG-ARRAY))
         (ts-text ast (ts-child ast callee 1))
         "")))
-
-;; `Array.prototype`'s recognised names, the counterpart of `fng-string-builtin-arity?`. `at` and
-;; `join` were written in lib/array/read.jsl and unreachable for the same reason the twelve string
-;; methods were: absent from this list, the call never reaches a lowering.
-(defn fng-array-builtin-legacy? [(context FngContext) (node i64)] (-> bool)
-  (let [name (fng-array-builtin-name context node)]
-    (or (= name "concat")
-    (or (= name "flat")
-    (or (= name "splice")
-    (or (= name "fill")
-        (or (= name "reverse")
-            (or (= name "unshift")))))))
-    (or (= name "push")
-        (or (= name "pop")
-            (or (= name "shift")
-                (or (= name "slice")
-                    (or (= name "indexOf")
-                        (or (= name "includes")
-                            (or (= name "lastIndexOf")
-                                (or (= name "at")
-                                    (or (= name "join")
-                                        (or (= name "map")
-                                            (or (= name "filter")
-                                                (or (= name "forEach")
-                                                    (or (= name "reduce")
-                                                        (or (= name "reduceRight")
-                                                            (or (= name "find")
-                                                                (or (= name "findIndex")
-                                                                    (or (= name "some")
-                                                                        (or (= name "every")
-                                                                            (or (= name "sort")
-                                                                                (or (= name "flatMap")
-                                                                                    (or (= name "keys")
-                                                                                        (or (= name "values")
-                                                                                            (= name "entries")))))))))))))))))))))))))
 
 (defn fng-array-builtin? [(context FngContext) (node i64)] (-> bool)
   (let [name (fng-array-builtin-name context node)]
@@ -3009,6 +3014,55 @@
 ;;
 ;; The control cell is passed through because a body containing an `if` ends on its merge, and
 ;; everything the frontend sequences afterwards belongs there.
+;; THE CALLER'S STATE THAT A CALLBACK CAN REACH BUT `.jsl` CANNOT NAME: every declared field
+;; alias, every dynamic alias, and the captured-cell alias -- minus the JavaScript property heap,
+;; which the definition threads itself.
+;;
+;; THE EXCLUSION IS THE WHOLE POINT. `jl-call-mem` merges this with the definition's own
+;; `jl-mem`, so including the property heap here as well would put TWO states on ONE alias inside
+;; a single `MemMerge` -- ambiguous by construction: `fng-alias-leaf` takes whichever it finds
+;; first, and selection refused `[1, 2, 3].flatMap(x => x)` outright with MSEL-UNSUPPORTED on the
+;; result array's `ArrayMark`. Aliases are deduplicated for the same reason -- a field alias and a
+;; dynamic alias can be the same alias.
+(defn fng-callback-outer-memory [(context FngContext)] (-> i64)
+  (let [(mut active) (al-new [i64] (malloc-allocator))
+        (mut aliases) (al-new [i64] (malloc-allocator))
+        (mut memories) (al-new [i64] (malloc-allocator))
+        (mut i) 0]
+    (fng-active-memory! context (mut active))
+    (loop (if (>= (load i) (al-len [i64] (load active)))
+              (break)
+              (let [field-index (al-get [i64] (load active) (load i))
+                    alias (al-get [i64] (load (load (field context aliases))) field-index)]
+                (if (and (!= alias JS-PROPERTY-ALIAS) (not (fng-list-has (mut aliases) alias)))
+                    (al-push! [i64] (mut aliases) alias)
+                    0)
+                (set! i (+ (load i) 1)))))
+    (set! i 0)
+    (loop (if (>= (load i) (al-len [i64] (load (field context dynamic-aliases))))
+              (break)
+              (let [alias (al-get [i64] (load (field context dynamic-aliases)) (load i))]
+                (if (and (!= alias JS-PROPERTY-ALIAS) (not (fng-list-has (mut aliases) alias)))
+                    (al-push! [i64] (mut aliases) alias)
+                    0)
+                (set! i (+ (load i) 1)))))
+    (if (and (!= (.cell-shape context) SHAPE-ROOT)
+             (and (!= (.cell-alias context) JS-PROPERTY-ALIAS)
+                  (not (fng-list-has (mut aliases) (.cell-alias context)))))
+        (al-push! [i64] (mut aliases) (.cell-alias context))
+        0)
+    (set! i 0)
+    (loop (if (>= (load i) (al-len [i64] (load aliases)))
+              (break)
+              (do (al-push! [i64] (mut memories)
+                            (fng-current-memory context (al-get [i64] (load aliases) (load i))))
+                  (set! i (+ (load i) 1)))))
+    (let [answer (if (> (al-len [i64] (load memories)) 0) (fng-merge memories) NO-NODE)]
+      (al-free! [i64] (mut active))
+      (al-free! [i64] (mut aliases))
+      (al-free! [i64] (mut memories))
+      answer)))
+
 (defn fng-jsl-call [(context FngContext) (name (slice u8)) (args (slice i64))] (-> i64)
   (if (!= (jsl-require-body-only! name) JSL-OK)
       (do (panic-corrupt "frontend: a JSL definition the frontend emits did not resolve") 0)
@@ -3027,6 +3081,48 @@
                       0)
                     0)
                 (set! probe (+ (load probe) 1))))))
+  ;; THE DECLARED PARAMETER TYPE IS A REPRESENTATION CONTRACT, and this is the one place that can
+  ;; honour it. A definition writing `(start int)` means a RAW machine integer: its body does plain
+  ;; integer arithmetic on it, and `%Add` with a tagged operand is a verifier error, not a coercion.
+  ;; Call sites pass whatever the expression produced, and for `"abcdef".slice(-2)` that is a BOXED
+  ;; -2, because unary minus reaches the DSL and comes back tagged. The graph then failed
+  ;; `g-verify` with "Add slot 1 is tagged, needs raw-num" and the program did not compile at all.
+  ;;
+  ;; Unboxing here is representation, which is the frontend's job -- the DSL owns what the operation
+  ;; MEANS and the frontend owns which machine word carries it. Fixing it at each call site instead
+  ;; would be the same edit repeated per method, and the next definition with an `int` parameter
+  ;; would arrive broken again.
+  ;;
+  ;; It fires only on a value that is actually tagged, so a raw argument -- which is nearly all of
+  ;; them -- is untouched and nothing is added to fold away.
+  (let [callee (jsl-find name)
+        (mut k) 0]
+    (loop (if (or (>= (load k) (slice-len args)) (< callee 0))
+              (break)
+              (do
+                (if (and (< (load k) (jsl-decl-nparams callee))
+                         (and (ty-int-only? (jsl-param-ty callee (load k)))
+                              ;; `fng-open-loop-phi?` for the reason it documents: inside a loop the
+                              ;; argument may be a counter whose back edge is not wired yet, and
+                              ;; every other test here answers from the arms it can see.
+                              (or (fng-value-tagged? (slice-get args (load k)))
+                                  (fng-open-loop-phi? (slice-get args (load k))))))
+                    ;; `BitOr(x, 0)` ON TOP, because `fng-to-number-operand` answers a raw FLOAT and
+                    ;; the parameter says `int`. Both are "raw-num" to the verifier and a different
+                    ;; register class to selection, so an `int` parameter handed the float read the
+                    ;; double's bit pattern -- whose low 32 bits are zero for every small integer.
+                    ;; `s.charCodeAt(i)` in a loop therefore read index 0 on every iteration and
+                    ;; summed the first character six times. The same conversion `fng-int-value`
+                    ;; puts on an index, for the same reason it puts it there.
+                    (do (slice-set! args (load k)
+                                    (fng-peep
+                                      (n-new3 (BitOr) NO-NODE
+                                              (fng-to-number-operand context (slice-get args (load k)))
+                                              (fng-const 0))))
+                        0)
+                    0)
+                (set! k (+ (load k) 1))
+                0))))
   ;; The heap goes in and comes back out. A definition that does not touch it leaves the cell alone,
   ;; so this is the same code for both kinds and there is nothing to decide here.
   (let [cell (alloc/stack (array i64 1))
@@ -3038,17 +3134,46 @@
     ;; definition that turns out not to write is harmless — the memory cell is compared below and
     ;; an unchanged one publishes nothing.
     (if (jsl-name-uses-memory? name) (fng-record-dynamic-alias! context JS-PROPERTY-ALIAS) 0)
-    (set! (index mp 0) (fng-current-memory context JS-PROPERTY-ALIAS))
-    (let [owner-entry (if (.top-level context)
-                          (g-start)
-                          (n-fun-entry (.fun context)))
-          v (jsl-inline! (load (field context ctrl)) mp owner-entry name args)]
-      (if (!= (load (index mp 0)) (fng-current-memory context JS-PROPERTY-ALIAS))
-          (do (fng-record-dynamic-alias! context JS-PROPERTY-ALIAS)
-              (set! (load (field context memory)) (fng-preserve-active-memory context (load (index mp 0))))
-              0)
-          0)
-      v)))
+    ;; A DEFINITION THAT CALLS A CALLBACK RUNS USER CODE, so it needs everything an ordinary
+    ;; JavaScript call site publishes, not just the property heap. `fng-callback-outer-memory`
+    ;; builds the rest -- every other active alias plus the captured-cell alias -- and
+    ;; `jl-call-mem` names it on the callback `Call` itself. Without it the caller's cell and
+    ;; closure-environment stores had no consumer at all, so they were deleted as dead:
+    ;; `[3, 4].map(v => v + b)` then dereferenced an environment slot nothing had written.
+    ;;
+    ;; AT THE CALL, NOT AT THIS SEAM. Merging it into the memory handed IN looks tidier and is
+    ;; worse: it becomes the entry arm of the definition's loop memory phi, and `ArrayFilter`'s
+    ;; resize-before-and-after-the-loop shape then fails placement outright --
+    ;; `[1, 2, 3, 4].filter(v => v > lo)`, which compiles and answers correctly today, stopped
+    ;; compiling at all. Naming it on the `Call` leaves every other memory edge the shape it had.
+    (let [calls-back (jsl-name-calls-back? name)]
+      (set! (index mp 0) (fng-current-memory context JS-PROPERTY-ALIAS))
+      (if calls-back (jl-set-outer-mem! (fng-callback-outer-memory context)) 0)
+      (let [owner-entry (if (.top-level context)
+                            (g-start)
+                            (n-fun-entry (.fun context)))
+            v (jsl-inline! (load (field context ctrl)) mp owner-entry name args)]
+        (jl-set-outer-mem! NO-NODE)
+        (if calls-back
+            ;; The callback may have written any alias the caller can reach, so nothing recorded
+            ;; before the call still describes them. Clearing the cell first is what re-anchors
+            ;; them: `fng-current-memory` answers a missing alias with a fresh `Arg` at the current
+            ;; control, which is the control the body ended on -- the CallEnd. THE PROPERTY HEAP IS
+            ;; THE EXCEPTION and is taken from the body: `ArrayMap` builds its result array through
+            ;; that chain, and re-anchoring it too would leave those stores with no consumer, which
+            ;; deleted every element the map had written.
+            (do (fng-record-dynamic-alias! context JS-PROPERTY-ALIAS)
+                (set! (load (field context memory)) NO-NODE)
+                (set! (load (field context memory))
+                      (fng-preserve-active-memory context (load (index mp 0))))
+                0)
+            (if (!= (load (index mp 0)) (fng-current-memory context JS-PROPERTY-ALIAS))
+                (do (fng-record-dynamic-alias! context JS-PROPERTY-ALIAS)
+                    (set! (load (field context memory))
+                          (fng-preserve-active-memory context (load (index mp 0))))
+                    0)
+                0))
+        v))))
 
 (defn fng-jsl-call0 [(context FngContext) (name (slice u8))] (-> i64)
   (fng-jsl-call context name (slice-new [i64] (cast (ptr i64) 0) 0)))
@@ -3083,13 +3208,6 @@
     (set! (index p 3) d)
     (fng-jsl-call context name (slice-new [i64] p 4))))
 
-(defn fng-jsl-call5 [(context FngContext) (name (slice u8))
-                      (a i64) (b i64) (c i64) (d i64) (e i64)] (-> i64)
-  (let [buf (alloc/stack (array i64 5)) p (cast (ptr i64) buf)]
-    (set! (index p 0) a) (set! (index p 1) b) (set! (index p 2) c)
-    (set! (index p 3) d) (set! (index p 4) e)
-    (fng-jsl-call context name (slice-new [i64] p 5))))
-
 (defn fng-jsl-call9 [(context FngContext) (name (slice u8))
                       (a i64) (b i64) (c i64) (d i64) (e i64)
                       (f i64) (g i64) (h i64) (i i64)] (-> i64)
@@ -3105,11 +3223,20 @@
 ;; search method here takes its needle through ToString. `"abc".indexOf()` is therefore
 ;; `"abc".indexOf("undefined")` and answers -1 rather than trapping on a tag. The padding methods
 ;; pass " " instead, which is their spec default rather than a coercion.
+;; A STRING-POSITION ARGUMENT IS ToString OF WHATEVER WAS PASSED, which is what every one of these
+;; methods says in the spec and what this used to skip: the expression went through untouched, so
+;; `"abcdef".localeCompare(1)` handed a raw machine integer to `%StringCompare` and `[1,2,3].join(1)`
+;; used one as a separator. Both answered nonsense that compiled.
+;;
+;; The coercion is `ToStringValue`, so the meaning stays in `lib/` -- and it costs nothing where the
+;; argument is already a string, because `%IsArray` folds to false on a `str` type, the guard goes
+;; with it, and selection answers `ToString` of a string with the string itself.
 (defn fng-string-argument [(context FngContext) (node i64) (child i64) (fallback (slice u8))] (-> i64)
   (let [frontend (load (field context frontend))
         ast (field frontend ast)]
     (if (> (ts-child-count ast node) child)
-        (fng-expression context (ts-child ast node child))
+        (fng-jsl-call1 context "ToStringValue"
+                       (fng-expression context (ts-child ast node child)))
         (n-string-const! (jss-from-utf8! fallback)))))
 
 (defn fng-string-call [(context FngContext) (node i64)] (-> i64)
@@ -3564,17 +3691,6 @@
                                    (load index))]
                 (if (= (.target method) owner)
                     (set! answer (.constructor method))
-                    0)
-                (set! index (+ (load index) 1)))))
-    (load answer)))
-
-(defn fng-first-function-target [(targets i64)] (-> i64)
-  (let [(mut index) 0 (mut answer) -1]
-    (loop (if (or (>= (load index) 63) (>= (load answer) 0))
-              (break)
-              (do
-                (if (!= (& targets (<< 1 (load index))) 0)
-                    (set! answer (- (load index) 1))
                     0)
                 (set! index (+ (load index) 1)))))
     (load answer)))
@@ -4105,10 +4221,19 @@
                   (do
                     (fng-record-dynamic-alias! context JS-PROPERTY-ALIAS)
                     (let [loaded
-                            (fng-jsl-call2 context "GetNamedProperty" receiver
-                                           (fng-const
-                                             (shape-name-intern!
-                                               (ts-text ast (ts-child ast callee-node 1)))))
+                            ;; THE SAME LOAD AN ORDINARY READ WOULD DO. This went straight to
+                            ;; `GetNamedProperty` -- the runtime property table -- while an object
+                            ;; LITERAL stores its properties into static shape slots, so the load
+                            ;; never saw the store: `{get: () => 7}` then `o.get()` dispatched on
+                            ;; `undefined` and the program returned 0. `o.get` read as a value was
+                            ;; already right, because that path is `fng-field-load-value`, which
+                            ;; picks the shape slot when the field is statically known and the
+                            ;; property table when it is not. A callee is a property read like any
+                            ;; other and has no business choosing differently.
+                            (fng-field-load-value context callee-node
+                                                  (ts-child ast callee-node 0)
+                                                  (ts-child ast callee-node 1)
+                                                  raw-receiver)
                           targets method-targets]
                       (if (> targets 0)
                           (n-new2 (Cast (t-fun-set targets))
@@ -4220,7 +4345,24 @@
                             (mut args)
                             (if (>= argument-function-index 0)
                                 (fng-call-argument frontend argument-fn ordinal value)
-                                value)))
+                                ;; A GENERIC CALL'S ABI IS ALL TAGGED, because the callee is not
+                                ;; known and every JavaScript function's parameters are `dyn`. With
+                                ;; a known callee `fng-call-argument` puts each argument in the
+                                ;; representation that callee declares; with an unknown one there is
+                                ;; nothing to ask, and this passed the raw expression instead.
+                                ;;
+                                ;; `o.add(4)` therefore did `mov x2, #4` and the callee tag-tested
+                                ;; x2, found no tag, and answered 0 -- EVERY argument to a method
+                                ;; loaded from the heap arrived as nothing. The receiver survived
+                                ;; only because it is boxed on its own path, which is why `this.v`
+                                ;; worked while `k` did not.
+                                ;;
+                                ;; A direct callee recovered from the graph is excluded: it is
+                                ;; called exactly, with its own parameter classification, and boxing
+                                ;; would break the raw representation it expects.
+                                (if direct-value-callee
+                                    value
+                                    (fng-box-dynamic-argument! value)))))
                 (set! index (+ (load index) 1)))))
     ; JavaScript fills omitted formal parameters with undefined. Native calls use a fixed register
     ; ABI, so materialize those values explicitly for statically known targets.
@@ -4521,6 +4663,29 @@
                     (mut stores)
                     (fng-current-memory context (.cell-alias context)))
           0)
+      ;; THE DYNAMIC ALIASES SURVIVE THIS ALLOCATION TOO, and until now they did not. `stores` is
+      ;; the field aliases this shape supplies plus the ones it does not, plus the capture cell --
+      ;; and never the runtime property heap. So an object literal ERASED it: the next
+      ;; `fng-current-memory` for JS-PROPERTY-ALIAS finds no leaf in the merge and manufactures a
+      ;; fresh `Arg`, which starts the store chain over from nothing.
+      ;;
+      ;; `[{v: 1}, {v: 2}]` therefore kept only the LAST element store -- the first became
+      ;; unreachable and was collected -- so element 0 was a hole and `String(xs[0])` was
+      ;; "undefined". It needs no objects in the array to reproduce: any element expression that
+      ;; writes another alias does it, and `[(o.v = 1, 5), (o.v = 2, 6)]` answers 6 twice.
+      (let [(mut dynamic-at) 0]
+        (loop (if (>= (load dynamic-at) (al-len [i64] (load (field context dynamic-aliases))))
+                  (break)
+                  (do
+                    (al-push! [i64]
+                              (mut stores)
+                              (fng-current-memory
+                                context
+                                (al-get [i64]
+                                        (load (field context dynamic-aliases))
+                                        (load dynamic-at))))
+                    (set! dynamic-at (+ (load dynamic-at) 1))
+                    0))))
       (set! (load (field context memory)) (fng-merge stores))
       (al-free! [i64] (mut field-values))
       (al-free! [i64] (mut incoming))
@@ -4702,10 +4867,11 @@
                       cast-node (n-new2 (Cast (if (< owner 0) (t-obj) (t-obj-shape shape)))
                                         (load (load (field context ctrl)))
                                         object)]
-                  (n-load! (if (< owner 0)
-                               (fng-compatible-field-memory context name-node field-index)
-                               (fng-current-memory context alias))
-                           cast-node alias)))))))
+                  (n-load-at! (load (load (field context ctrl)))
+                              (if (< owner 0)
+                                  (fng-compatible-field-memory context name-node field-index)
+                                  (fng-current-memory context alias))
+                              cast-node alias)))))))
 
 (defn fng-field-load [(context FngContext) (node i64)] (-> i64)
   (let [frontend (load (field context frontend))
@@ -4774,6 +4940,22 @@
     (if (= (ts-kind ast node) TSK-STRING-LITERAL)
         (substr text 1 (- (slice-len text) 1))
         text)))
+
+;; A string receiver with a numeric key. Both halves have to be known: `o[i]` on a dynamic receiver
+;; stays on the property path, because a string is only one of the things it might be.
+(defn fng-string-element? [(context FngContext) (node i64)] (-> bool)
+  (let [frontend (load (field context frontend))
+        ast (field frontend ast)]
+    (and (= (fng-infer context (ts-child ast node 0) FNG-DYNAMIC) FNG-STRING)
+         (= (fng-infer context (ts-child ast node 1) FNG-DYNAMIC) FNG-NUMBER))))
+
+(defn fng-string-element [(context FngContext) (node i64)] (-> i64)
+  (let [frontend (load (field context frontend))
+        ast (field frontend ast)
+        key-node (ts-child ast node 1)
+        string (fng-expression context (ts-child ast node 0))
+        key (fng-expression context key-node)]
+    (fng-jsl-call2 context "StringElement" string (fng-int-value context key-node key))))
 
 (defn fng-lvalue [(context FngContext) (node i64)] (-> FngLValue)
   (let [frontend (load (field context frontend))
@@ -4985,20 +5167,16 @@
                     ;; now read the same function. See repros/field-copy-stays-boxed.js.
                     stored-value (fng-coerce-to-alias alias new-value)
                     stored
-                      (n-store! (fng-current-memory context alias) cast-node stored-value alias)
-                    (mut memories) (al-new [i64] (malloc-allocator))
-                    (mut index) 0]
-                (loop (if (>= (load index) (al-len [i64] (load (field context aliases))))
-                          (break)
-                          (let [candidate (al-get [i64] (load (load (field context aliases))) (load index))]
-                            (al-push! [i64]
-                                      (mut memories)
-                                      (if (= candidate alias)
-                                          stored
-                                          (fng-current-memory context candidate)))
-                            (set! index (+ (load index) 1)))))
-                (set! (load (field context memory)) (fng-merge memories))
-                (al-free! [i64] (mut memories))
+                      (n-store! (fng-current-memory context alias) cast-node stored-value alias)]
+                ;; `fng-preserve-active-memory` RATHER THAN A THIRD HAND-ROLLED MERGE. This walked
+                ;; the declared field aliases and nothing else, so a store to `o.v` dropped the
+                ;; runtime property heap out of the merge -- and `fng-current-memory` answers a
+                ;; missing alias by manufacturing a fresh `Arg`, which restarts that alias's store
+                ;; chain from nothing. `let xs = [(o.v = 1, 5), (o.v = 2, 6)]` kept only the last
+                ;; element store and read a hole at index 0. The shared helper preserves the
+                ;; dynamic aliases and the closure cell as well, which this also owed.
+                (set! (load (field context memory))
+                      (fng-preserve-active-memory context stored))
                 new-value))
           (if (= (.kind target) FNG-LVALUE-ELEMENT)
               (fng-jsl-call3 context "SetElement"
@@ -5245,7 +5423,17 @@
                   then-node (ts-role ast node TS-ROLE-WHEN-TRUE 0)
                   else-node (ts-role ast node TS-ROLE-WHEN-FALSE 0)
                   condition (fng-condition-representation context condition-node)]
-              (fng-branch-expression context condition then-node NO-NODE else-node NO-NODE false))
+              ;; THE ARMS ARE BOXED, and they have to be: `n > 0 ? "yes" : 5` merges a raw string
+              ;; pointer with a raw integer into one Phi, and nothing downstream can read both. The
+              ;; consumer that noticed was `String(v)`, which took the runtime's tag dispatch on an
+              ;; untagged `5` and printed "2.4703282292062327e-323" -- the double whose bit pattern
+              ;; is 5, twenty-three characters where node prints one.
+              ;;
+              ;; Boxing unconditionally rather than deciding per pair is the same bargain the rest
+              ;; of this file takes: `box-idealize` peels the box off an arm that was already
+              ;; tagged, and `Unbox(Box(v))` cancels for a numeric consumer, so `n > 0 ? 3 : 5`
+              ;; reaching arithmetic still compiles to the raw phi it did before.
+              (fng-branch-expression context condition then-node NO-NODE else-node NO-NODE true))
           (= kind TSK-BINARY)
             (let [left-node (ts-child ast node 0)
                   operator (ts-text ast (ts-child ast node 1))
@@ -5512,7 +5700,14 @@
           (= kind TSK-ELEMENT-ACCESS)
             (if (!= (ts-role ast node TS-ROLE-OPERATOR 0) -1)
                 (fng-optional-element-load context node)
-                (fng-lvalue-read context (fng-lvalue context node)))
+                ;; `s[i]` ON A STRING IS NOT AN ARRAY LOAD. It took the ordinary element path, so
+                ;; `GetElement` ran `%ArrayLoad` over a string pointer and every index answered
+                ;; `undefined` -- `String("abc"[1])` printed "undefined" where node prints "b", nine
+                ;; characters instead of one, with nothing to say it had gone wrong. A string's
+                ;; indexed property is its own algorithm and it lives in `lib/`.
+                (if (fng-string-element? context node)
+                    (fng-string-element context node)
+                    (fng-lvalue-read context (fng-lvalue context node))))
           ;; AN UNRECOGNISED EXPRESSION KIND MUST NOT RETURN `NO-NODE`. The bridge maps every
           ;; syntax it does not enumerate to kind 0 (native/typescript-go-bridge/main.go, the
           ;; `default` of the kind switch), so this arm is where unsupported syntax arrives.
@@ -5847,19 +6042,6 @@
                 (do
                   (fng-assigned! frontend (ts-child ast node (load index)) (mut assigned))
                   (set! index (+ (load index) 1))))))
-    0))
-
-(defn fng-restore-values! [(context FngContext)
-                           (symbols (ptr (ArrayList i64)))
-                           (saved (ptr (ArrayList i64)))] (-> i64)
-  (let [(mut index) 0]
-    (loop (if (>= (load index) (al-len [i64] (load symbols)))
-              (break)
-              (do
-                (fng-set-symbol! context
-                                 (al-get [i64] (load symbols) (load index))
-                                 (al-get [i64] (load saved) (load index)))
-                (set! index (+ (load index) 1)))))
     0))
 
 (defn fng-target-make [(label-node i64)
@@ -6242,97 +6424,6 @@
     (al-free! [i64] (mut memories))
     0))
 
-(defn fng-switch-path-copy-unused [(context FngContext) (node i64) (label-node i64)] (-> bool)
-  (let [frontend (load (field context frontend))
-        ast (field frontend ast)
-        clauses (ts-role ast node TS-ROLE-CLAUSE 0)
-        (mut assigned) (al-new [i64] (malloc-allocator))
-        (mut entry-clauses) (al-new [i64] (malloc-allocator))
-        (mut entry-ctrls) (al-new [i64] (malloc-allocator))
-        (mut entry-starts) (al-new [i64] (malloc-allocator))
-        (mut entry-values) (al-new [i64] (malloc-allocator))
-        discriminant (fng-expression context (ts-role ast node TS-ROLE-EXPRESSION 0))
-        (mut default-index) -1
-        (mut index) 0]
-    (fng-assigned! frontend clauses (mut assigned))
-    (let [target-index (fng-push-target! context label-node true false (mut assigned))]
-      ;; Case expressions execute left-to-right only while no earlier case matched.
-      (loop (let [clause (ts-role ast clauses TS-ROLE-CLAUSE (load index))]
-              (if (= clause -1)
-                  (break)
-                  (do
-                    (if (= (ts-kind ast clause) TSK-DEFAULT-CLAUSE)
-                        (set! default-index (load index))
-                        ;; `switch` matches with `===`, so the test is the DSL's StrictEqual. The
-                        ;; call is lowered BEFORE the If reads the current control: inlining it
-                        ;; builds guard diamonds that ADVANCE the control, and an If anchored at
-                        ;; the pre-call control gave one Region two non-projection control
-                        ;; successors -- the evaluator reports that as stuck control.
-                        (let [test (fng-expression context (ts-role ast clause TS-ROLE-EXPRESSION 0))
-                              matches
-                                (fng-jsl-call2 context "StrictEqual"
-                                               (fng-box-dynamic-argument! discriminant)
-                                               (fng-box-dynamic-argument! test))
-                              arms
-                                (n-if-arms! (fng-peep (n-new2 (If)
-                                                              (load (load (field context ctrl)))
-                                                              matches)))]
-                          (al-push! [i64] (mut entry-clauses) (load index))
-                          (al-push! [i64] (mut entry-ctrls) (arms-t arms))
-                          (al-push! [i64]
-                                    (mut entry-starts)
-                                    (fng-snapshot-target! context target-index (mut entry-values)))
-                          (set! (load (field context ctrl)) (arms-f arms))))
-                    (set! index (+ (load index) 1))))))
-      ;; The final false arm selects default, or exits directly when no default exists.
-      (al-push! [i64] (mut entry-clauses) (load default-index))
-      (al-push! [i64] (mut entry-ctrls) (load (load (field context ctrl))))
-      (al-push! [i64]
-                (mut entry-starts)
-                (fng-snapshot-target! context target-index (mut entry-values)))
-      ;; Compile every selected fallthrough suffix independently, then merge its exits.
-      (set! index 0)
-      (loop (if (>= (load index) (al-len [i64] (load entry-clauses)))
-                (break false)
-                (let [entry (al-get [i64] (load entry-clauses) (load index))
-                      (mut clause-index) entry
-                      (mut continues) true]
-                  (set! (load (field context ctrl)) (al-get [i64] (load entry-ctrls) (load index)))
-                  (fng-restore-target! context
-                                       target-index
-                                       entry-values
-                                       (al-get [i64] (load entry-starts) (load index)))
-                  (cond (= entry -1) (fng-capture-target! context target-index FNG-JUMP-BREAK)
-                        :else
-                          (loop (if (not (load continues))
-                                    (break)
-                                    (let [clause (ts-role ast clauses TS-ROLE-CLAUSE (load clause-index))]
-                                      (if (= clause -1)
-                                          (break)
-                                          (let [expression (ts-role ast clause TS-ROLE-EXPRESSION 0)
-                                                (mut child-index) 0]
-                                            (loop (if (or (>= (load child-index) (ts-child-count ast clause))
-                                                          (not (load continues)))
-                                                      (break)
-                                                      (let [child (ts-child ast clause (load child-index))]
-                                                        (if (!= child expression)
-                                                            (store! continues (fng-statement context child))
-                                                            0)
-                                                        (store! child-index (+ (load child-index) 1)))))
-                                            (store! clause-index (+ (load clause-index) 1)))))))
-                        (if (load continues)
-                            (fng-capture-target! context target-index FNG-JUMP-BREAK)
-                            0)
-                          (store! index (+ (load index) 1)))))
-        (let [answer (fng-merge-target! context target-index FNG-JUMP-BREAK false)]
-          (fng-pop-target! context target-index)
-          (al-free! [i64] (mut assigned))
-          (al-free! [i64] (mut entry-clauses))
-          (al-free! [i64] (mut entry-ctrls))
-          (al-free! [i64] (mut entry-starts))
-          (al-free! [i64] (mut entry-values))
-          answer)))))
-
 (defn fng-snapshot! [(context FngContext)
                      (symbols (ptr (ArrayList i64)))
                      (active (ptr (ArrayList i64)))
@@ -6588,7 +6679,14 @@
                 (condition-node i64)
                 (body-node i64)
                 (increment-node i64)
-                (label-node i64)] (-> bool)
+                (label-node i64)
+                ;; `for ... of` only, and NO-NODE/-1 for every other loop: the iterator object
+                ;; built once BEFORE the Loop, and the symbol its per-iteration value binds to.
+                ;; Everything that makes for-of a loop rather than a syntax -- the phi set, the
+                ;; memory phis, the break/continue target, the label -- is this function's job
+                ;; already, so the two differences are passed in rather than copied out.
+                (iterator i64)
+                (binding-symbol i64)] (-> bool)
   (let [frontend (load (field context frontend))
         ast (field frontend ast)
         (mut carried) (al-new [i64] (malloc-allocator))
@@ -6599,7 +6697,7 @@
         (mut index) 0]
     (fng-assigned! frontend body-node (mut carried))
     (if (!= increment-node -1) (fng-assigned! frontend increment-node (mut carried)) 0)
-    (fng-assigned! frontend condition-node (mut carried))
+    (if (!= condition-node -1) (fng-assigned! frontend condition-node (mut carried)) 0)
     (let [target-index (fng-push-target! context label-node true true (mut carried))]
       (n-add-def! loop-node NO-NODE)
       (n-add-def! loop-node (load (load (field context ctrl))))
@@ -6661,14 +6759,32 @@
                   (fng-set-symbol! context symbol phi)
                   (set! index (+ (load index) 1)))))
       (set! (load (field context ctrl)) loop-node)
-      (let [condition (fng-condition-representation context condition-node)
+      ;; `for ... of` has NO condition expression. Its test is the iterator's own answer, so the
+      ;; step runs in the loop header and the If asks whether the iterator is DONE -- which puts
+      ;; the body on the FALSE arm and the exit on the true one, the mirror of every other loop.
+      (let [step (if (= iterator NO-NODE)
+                     NO-NODE
+                     (fng-jsl-call1 context "ArrayIteratorNext" iterator))
+            condition (if (= iterator NO-NODE)
+                          (fng-condition-representation context condition-node)
+                          (fng-jsl-call1 context "IteratorComplete" step))
             ; The condition may itself emit control (a ToNumber diamond, a short-circuit merge, an
             ; inlined JSL call). The loop test must anchor at whatever control the condition left
             ; behind; pinning it to the Loop node put two Ifs on one control and broke the CFG.
             arms (n-if-arms! (fng-peep (n-new2 (If)
                                                (load (load (field context ctrl)))
-                                               condition)))]
-        (set! (load (field context ctrl)) (arms-t arms))
+                                               condition)))
+            body-arm (if (= iterator NO-NODE) (arms-t arms) (arms-f arms))
+            exit-arm (if (= iterator NO-NODE) (arms-f arms) (arms-t arms))]
+        (set! (load (field context ctrl)) body-arm)
+        ;; The binding is written INSIDE the body arm, after the done test: on the exhausted trip
+        ;; there is no value, and IteratorValue would be reading `undefined` out of the result
+        ;; object for nothing.
+        (if (= iterator NO-NODE)
+            0
+            (fng-set-symbol! context
+                             binding-symbol
+                             (fng-jsl-call1 context "IteratorValue" step)))
         (let [body-continues (fng-statement context body-node)
               reaches-increment (fng-merge-target! context target-index FNG-JUMP-CONTINUE body-continues)]
           (if (and reaches-increment (!= increment-node -1)) (fng-expression context increment-node) 0)
@@ -6700,7 +6816,15 @@
                             0)
                           (do (n-set-def! phi 2 back) 0))
                       (set! index (+ (load index) 1)))))
-          (n-set-def! loop-node 2 (if reaches-increment (load (load (field context ctrl))) NO-NODE))
+          ;; A BODY THAT NEVER FALLS OUT STILL NEEDS A BACK EDGE. `while (c) { return x; }` reaches
+          ;; the increment on no path, so this slot had nothing to write and kept `NO-NODE` --
+          ;; which is `n-in-progress?`, which is `VERR-IN-PROGRESS`, and the whole program was
+          ;; rejected for a shape JavaScript writes deliberately. The back edge is not missing, it
+          ;; is UNREACHABLE, and the graph has a node that says exactly that: `XCtrl`. `loop-compute`
+          ;; reads slot 1 alone, so the loop stays as reachable as its entry, and the carried phis
+          ;; -- whose slot 2 was written unconditionally just above -- meet a proven-dead path and
+          ;; collapse onto their entry arm.
+          (n-set-def! loop-node 2 (if reaches-increment (load (load (field context ctrl))) (n-xctrl)))
           (if (not (load (fng-optimize-ptr)))
               (let [(mut reset-index) 0]
                 (n-set-ty! loop-node (t-top))
@@ -6718,7 +6842,7 @@
                                        (al-get [i64] (load carried) (load index))
                                        (al-get [i64] (load phis) (load index)))
                       (set! index (+ (load index) 1)))))
-          (set! (load (field context ctrl)) (arms-f arms))
+          (set! (load (field context ctrl)) exit-arm)
           ;; On exit the observable memory is the loop HEADER's state — the phis — not the
           ;; body's final store chain (which does not dominate the exit arm). The phis also
           ;; keep the body's stores reachable through their backedge inputs.
@@ -7033,6 +7157,41 @@
                 (set! index (+ (load index) 1)))))
     0))
 
+;; `for (const x of xs)` -- ForIn/OfBodyEvaluation over an array iterator, ECMAScript's own
+;; desugaring rather than an index loop written here.
+;;
+;; THE ITERATOR IS WHY THIS NEEDS NO SYNTHETIC COUNTER. An index loop wants a loop-carried integer,
+;; and a loop-carried value in this builder is a phi over a SYMBOL -- there is no symbol for a
+;; counter the source never wrote, and `fng-assigned!` derives the carried set from the source. The
+;; iterator keeps its index in an internal slot, so the state crosses the back edge through the
+;; loop's memory phis, which `fng-loop` builds for every loop already.
+;;
+;; `GetIterator` is called ONCE, before the Loop, so a non-array throws before the first trip
+;; rather than on each one.
+(defn fng-for-of [(context FngContext) (node i64) (label-node i64)] (-> bool)
+  (let [frontend (load (field context frontend))
+        ast (field frontend ast)
+        ;; `fe-for-of-binding-valid?` has already refused every other initializer shape.
+        declaration (ts-child ast (ts-role ast node TS-ROLE-INITIALIZER 0) 0)
+        symbol (fe-symbol-for-declaration frontend declaration (.owner context))
+        ;; UNBOXED, exactly as `xs.values()` passes it. `%InternalTarget` hands whatever went in
+        ;; straight to `%ArrayLen`, so a tagged word here makes the iterator answer "done" on its
+        ;; first step and the loop body never runs. `GetIterator` tags for its `%IsArray` test and
+        ;; nowhere else.
+        iterable (fng-expression context (ts-role ast node TS-ROLE-EXPRESSION 0))
+        iterator (fng-jsl-call1 context "GetIterator" iterable)]
+    ;; The element type is whatever the iterable holds, which nothing here claims to know. The
+    ;; symbol was initialized to `undefined`/FNG-VOID by `fng-initialize-locals!`, and leaving it
+    ;; there would tell inference the binding is undefined on every read.
+    (fng-set-symbol-type! context symbol FNG-DYNAMIC)
+    (fng-loop context
+              -1
+              (ts-role ast node TS-ROLE-STATEMENT 0)
+              -1
+              label-node
+              iterator
+              symbol)))
+
 (defn fng-statement [(context FngContext) (node i64)] (-> bool)
   (let [frontend (load (field context frontend))
         ast (field frontend ast)
@@ -7063,7 +7222,8 @@
                          (ts-role ast node TS-ROLE-STATEMENT 0)
                          (ts-role ast node TS-ROLE-CONDITION 0)
                          -1)
-          (= kind TSK-WHILE) (fng-loop context (ts-child ast node 0) (ts-child ast node 1) -1 -1)
+          (= kind TSK-WHILE)
+            (fng-loop context (ts-child ast node 0) (ts-child ast node 1) -1 -1 NO-NODE -1)
           (= kind TSK-FOR)
             (let [count (ts-child-count ast node)
                   initialize (ts-child ast node 0)
@@ -7071,7 +7231,8 @@
                   increment (ts-child ast node 2)
                   body (ts-child ast node (- count 1))]
               (fng-statement context initialize)
-              (fng-loop context condition body increment -1))
+              (fng-loop context condition body increment -1 NO-NODE -1))
+          (= kind TSK-FOR-OF) (fng-for-of context node -1)
           (= kind TSK-SWITCH) (fng-switch context node -1)
           (= kind TSK-VARIABLE-DECLARATION-LIST) (do (fng-statement context (ts-child ast node 0)) true)
           (= kind TSK-BREAK) (do (fng-capture-jump! context node FNG-JUMP-BREAK) false)
@@ -7089,7 +7250,9 @@
                                 (ts-child ast statement 0)
                                 (ts-child ast statement 1)
                                 -1
-                                label)
+                                label
+                                NO-NODE
+                                -1)
                     (= (ts-kind ast statement) TSK-FOR)
                       (let [count (ts-child-count ast statement)
                             initialize (ts-child ast statement 0)
@@ -7097,8 +7260,8 @@
                             increment (ts-child ast statement 2)
                             body (ts-child ast statement (- count 1))]
                         (fng-statement context initialize)
-                        (fng-loop context condition body increment label))
-                    (= (ts-kind ast statement) TSK-SWITCH) (fng-switch context statement label)
+                        (fng-loop context condition body increment label NO-NODE -1))
+                    (= (ts-kind ast statement) TSK-FOR-OF) (fng-for-of context statement label)
                     (= (ts-kind ast statement) TSK-SWITCH) (fng-switch context statement label)
                     :else (fng-labeled-block context statement label)))
           (= kind TSK-VARIABLE-DECLARATION)
@@ -7484,7 +7647,41 @@
                          fun
                          top-level)]
       (if top-level
-          0
+          ;; MAIN'S PARAMETERS NEED THE SAME CELLS. The loop below materializes a cell for every
+          ;; parameter a nested closure captures, and it was skipped entirely for the top level --
+          ;; so `main`'s parameters stayed bare `Arg` nodes in `values[]`. `fng-closure-expression`
+          ;; then stored the RAW ARGUMENT into an environment slot typed as a cell pointer, while
+          ;; the callee's body read that slot with `fng-symbol-node`, which for a captured symbol
+          ;; is a `Cast` plus a `Load`. `function main(n) { let f = () => n; return f()|0; }`
+          ;; therefore dereferenced the integer 5 and took SIGSEGV -- which the harness reported as
+          ;; the answer 0, because a crashed program prints nothing and `atoll("")` is 0.
+          ;;
+          ;; Only the cell materialization is shared. `fng-default-parameter!` is not: a top-level
+          ;; entry's arguments are `Arg` nodes that always exist, and it has its own `.top-level`
+          ;; guard for exactly that reason.
+          (do
+            (set! index 0)
+            (loop (if (>= (load index) (.parameter-count fn))
+                      (break)
+                      (do
+                        (let [parameter-symbol
+                                (al-get [FeSymbol]
+                                        (.symbols frontend)
+                                        (+ (.parameter-start fn) (load index)))
+                              symbol-id (.id parameter-symbol)]
+                          (if (fng-symbol-cell? context symbol-id)
+                              ;; Clear the binding first, for the reason the non-top-level copy
+                              ;; states: a raw node sitting in `values[]` is indistinguishable
+                              ;; from an existing cell, and the parameter would be stored into
+                              ;; itself.
+                              (let [incoming (al-get [i64] (load (load (field context values)))
+                                                     symbol-id)]
+                                (al-set! [i64] (mut (load (field context values))) symbol-id NO-NODE)
+                                (fng-set-symbol! context symbol-id incoming)
+                                0)
+                              0))
+                        (set! index (+ (load index) 1)))))
+            0)
           (do
             (set! index 0)
             (loop (if (>= (load index) (.parameter-count fn))
@@ -7725,6 +7922,20 @@
                       (fng-analyze-fresh!) 0)) 0))
         0)
     (fng-discard-unused!)
+    ;; A LOOP NOBODY READS SURVIVES EVERY FOLD. `n-kill!` refuses a node that still has users, and
+    ;; each node in a loop's Phi cycle has one -- the next node round the cycle -- so a definition
+    ;; from `lib/` whose result goes unread stays live, reachable from no root, and `v-pass-leaks`
+    ;; refuses the graph. `"abcdef".toLowerCase()` compared only against `undefined` is the witness:
+    ;; the comparison folds away, the loop does not, and the program does not compile.
+    ;;
+    ;; It runs HERE, after every rewrite and after the memory scaffolding is settled, because
+    ;; reachability is a whole-graph question and the answer is only meaningful once the graph is
+    ;; the one that will be verified -- inside the analyse/fold fixpoint the function's own memory
+    ;; `Arg`s are not wired to the `Return` yet and every one of them looks unreachable.
+    ;; The uncalled functions go FIRST: their bodies are full of memory nodes and calls, and the
+    ;; sweep below refuses to run at all when an unreachable node has an effect. Pruning them here
+    ;; leaves the sweep the question it was written for -- a dead loop with no consumer.
+    (if analyze (do (g-kill-uncalled-functions!) (g-sweep-unreachable!)) 0)
     ; The first-parameter symbol may not exist: a zero-parameter main leaves the symbol list
     ; empty and parameter-start at 0, so the lookup must sit INSIDE the count guard. Binding
     ; it unconditionally was an out-of-bounds al-get that only ever ran because the previous

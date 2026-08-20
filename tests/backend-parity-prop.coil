@@ -31,7 +31,6 @@
 (import "shape" :use *)
 (import "jsstring" :use *)
 (import "corpus" :use *)
-(import "eval" :use *)
 (import "gtext" :use *)
 (import "coil.assert" :use *)
 (import "oparbitrary" :use *)
@@ -72,27 +71,6 @@
 (const MAX-OPS i64 24)
 ;; The generous register count, and the ceiling of the floor search.
 (const WIDE-REGS i64 8)
-;; ADD, SUB and the three bitwise ops. The omissions are deliberate.
-;;
-;; The bitwise operators are here because they are TOTAL AND EXACT on integers: no trap, and no
-;; path where the evaluator has to leave the integer domain. That makes them free coverage of
-;; instruction selection, which is why they came before loops or calls.
-;;
-;; No DIV or MOD: they trap on zero, and a disagreement about a fault is not a disagreement about
-;; arithmetic. No MUL: the graph's `int` is a JAVASCRIPT integer, so the evaluator promotes an
-;; overflowing result to a double exactly as the language specifies, while the emitted AArch64 code
-;; wraps at 64 bits. Chained multiplication leaves the exact range within a handful of operations,
-;; so a MUL property would spend its cases comparing an `RT-FLT` against a wrapped integer and
-;; calling the difference a bug. Covering MUL needs the comparison to model that promotion; it is
-;; listed in docs/DEFTESTS-OWED.md rather than faked here.
-(defn prop-op [(k i64)] (-> Op)
-  (if (= k 0) (Add)
-    (if (= k 1) (Sub)
-      (if (= k 2) (BitAnd)
-        (if (= k 3) (BitOr)
-          (if (= k 4) (BitXor)
-            (if (= k 5) (Shl)
-              (if (= k 6) (Shr) (UShr)))))))))
 ;; The three shifts join the set for the same reason the bitwise operators did: total on integers,
 ;; no trap, no path out of the integer domain. A shift count is masked identically by both sides --
 ;; the evaluator and AArch64 implement the same OP -- so a disagreement about masking would be a
@@ -129,56 +107,6 @@
       (n-add-def! phi (n-new3 (Sub) NO-NODE a b))
       phi)))
 
-;; Build an integer program over `arg` and return its Return node.
-;;
-;; EVERY NODE MUST BE REACHABLE FROM THE RETURN. The graph verifier reports an unreferenced node as
-;; a LEAK and rejects the graph, so a generator that builds a pool and returns only its last entry
-;; produces nothing but verifier failures. The chain below is what makes reachability structural:
-;; each step consumes the RUNNING VALUE, so walking back from the final node visits everything.
-;;
-;; The second operand is any earlier value. That is where the register pressure comes from -- a
-;; value picked by a much later step stays live across everything in between, which is the shape
-;; that makes the allocator spill. Branches add the other axis: values live ACROSS a merge, which
-;; is where a spill and a Phi have to agree about the same location.
-(defn build-program! [(ops (slice u8))] (-> i64)
-  (let [pool (alloc/stack (array i64 32))
-        p (cast (ptr i64) pool)
-        a0 (n-new1 (Arg (t-int)) (g-start))
-        k0 (n-new1 (Const (t-int-con 3)) (g-start))
-        seed (n-new3 (Add) NO-NODE a0 k0)]
-    ;; `seed` uses both roots, so the argument and the constant are reachable too.
-    (set! (index p 0) a0)
-    (set! (index p 1) k0)
-    (set! (index p 2) seed)
-    (let [(mut n) 3
-          (mut cur) seed
-          (mut ctrl) (g-start)
-          (mut i) 0
-          limit (if (> (slice-len ops) MAX-OPS) MAX-OPS (slice-len ops))]
-      (loop (if (>= (load i) limit) (break)
-              (let [b (cast i64 (slice-get ops (load i)))
-                    other (load (index p (% (/ b 8) (load n))))]
-                ;; LOW BITS, NOT HIGH BITS. The `(slice u8)` generator produces printable bytes --
-                ;; every counterexample this property has ever reported was ASCII -- so a step
-                ;; chosen from the top two bits is a step that never happens: the branch arm sat
-                ;; dead through 31,000 cases while the coverage number stayed flat and looked like
-                ;; saturation. Three of four steps are arithmetic and one is a branch, so programs
-                ;; keep a straight-line spine with diamonds through it.
-                (if (< (% b 4) 3)
-                    (set! cur (n-new3 (prop-op (% (/ b 4) PROP-OPS)) NO-NODE (load cur) other))
-                    (let [phi (emit-branch! (load ctrl) (load cur) other)]
-                      (set! ctrl (n-in phi 0))
-                      (set! cur phi)
-                      0))
-                (set! (index p (load n)) (load cur))
-                (set! n (+ (load n) 1))
-                (set! i (+ (load i) 1))
-                0)))
-      (let [ret (n-new2 (Return) (load ctrl) (load cur))]
-        (n-add-def! (g-stop) ret)
-        (g-analyze!)
-        ret))))
-
 ;; Copy the encoded bytes onto an executable page and call them with one argument.
 (defn native1 [(arg i64)] (-> i64)
   (let [mem (mmap (cast (ptr u8) 0) 4096 3 4098 -1 0)]
@@ -196,19 +124,6 @@
         (assert (= (munmap mem 4096) 0))
         result))))
 
-;; Compile the same program at a given register count and run it on the CPU.
-;; The graph is rebuilt from scratch per register count rather than re-coloured, so nothing carries
-;; over from the previous compilation.
-(defn native-at [(ops (slice u8)) (arg i64) (regs i64)] (-> i64)
-  (graph-reset! 909)
-  (build-program! ops)
-  (assert (= (g-verify) 0))
-  (assert (be-select-machine-program!))
-  (be-schedule!)
-  (assert (= (be-color! regs) 0))
-  (be-encode!)
-  (native1 arg))
-
 ;; The graph's single OPTAG-ARG node.
 (defn find-arg [] (-> i64)
   (let [n (n-count)
@@ -221,121 +136,6 @@
                 (set! i (+ (load i) 1))
                 0)))
     (load found)))
-
-;; Evaluate the program, optionally running the optimizer first.
-;;
-;; `iterate!` self-seeds with `wl-push-live!` and runs peephole, GVN, type narrowing and dead-node
-;; elimination to a fixpoint, so this needs no worklist priming -- but it does need `g-analyze!`
-;; again afterwards, since the graph it analysed is not the graph that comes out.
-;;
-;; THE ARGUMENT CAN BE OPTIMIZED AWAY. `BITXOR(x, x)` folds to zero, and the generator can pick the
-;; running value as its own second operand, so a program that read `arg` before folding may not
-;; afterwards. That is the optimizer working, not a failure: bind only if the node survived.
-(defn eval-program [(ops (slice u8)) (arg i64) (optimize bool)] (-> i64)
-  (graph-reset! 909)
-  (build-program! ops)
-  (if optimize (do (iterate!) (g-analyze!) 0) 0)
-  (assert (= (g-verify) 0))
-  (ev-reset!)
-  (let [a (find-arg)]
-    (if (!= a NO-NODE) (do (ev-bind! a (RInt arg)) 0) 0))
-  (assert (= (ev-run-nobind PROP-BUDGET) EV-OK))
-  (assert (= (rt-tag (ev-result)) RT-INT))
-  (rt-payload (ev-result)))
-
-;; NOT `ev-run-bound`. That takes a SEED and binds each argument to a value derived from it
-;; (`seed*31 + k*7919`), which is the right thing for a fixture asserting a pinned number and the
-;; wrong thing here: the native side is called with `arg` itself, so seeding would compare two
-;; different inputs and report a disagreement on every case.
-(defn interpreted [(ops (slice u8)) (arg i64)] (-> i64)
-  (graph-reset! 909)
-  (build-program! ops)
-  (assert (= (g-verify) 0))
-  (ev-reset!)
-  (ev-bind! (find-arg) (RInt arg))
-  (assert (= (ev-run-nobind PROP-BUDGET) EV-OK))
-  (assert (= (rt-tag (ev-result)) RT-INT))
-  (rt-payload (ev-result)))
-
-; ============================================================================
-; Generated graph boundaries
-; ============================================================================
-;; `build-program!` is more useful than a generator of disconnected Nodes: its running-value spine
-;; makes every generated node reachable, and its diamonds keep Region/Phi arities in lockstep.  The
-;; same arbitrary byte slice can therefore fuzz the boundaries that consume WHOLE valid graphs.
-;;
-;; Verification is required to be observationally read-only.  Rendering on both sides checks every
-;; serialized op payload, type and input edge.  The subsequent round trip replaces the graph with a
-;; parse, so the final verifier call checks the rebuilt topology rather than the original arena.
-(defprop generated_valid_graphs_verify_read_only_and_round_trip
-  [(ops (slice u8))]
-  (assume (> (slice-len ops) 0))
-  (let [before (alloc/stack (array u8 32768))
-        after  (alloc/stack (array u8 32768))]
-    (graph-reset! 909)
-    (build-program! ops)
-    (let [live (g-live-count)
-          a (g-render (cast (ptr i8) before) 32768)
-          clean (= (g-verify) 0)
-          b (g-render (cast (ptr i8) after) 32768)]
-      (and clean
-           (and (gbytes-eq? a b)
-                (and (= (g-live-count) live)
-                     (and (= (g-round-trip-check) GRT-OK)
-                          (and (= (g-live-count) live)
-                               (= (g-verify) 0)))))))))
-
-;; One mutation after a valid generated prefix.  Unlike a generic "nonzero is fine" corruption
-;; property, each arm names the check that must win, so reordered or accidentally weakened verifier
-;; passes become a counterexample.  The selector is separate from the graph bytes: shrinking the
-;; program cannot silently change which corruption is under test.
-(defprop generated_single_faults_are_rejected_by_their_exact_name
-  [(ops (slice u8)) (selector i64)]
-  (assume (> (slice-len ops) 0))
-  (graph-reset! 909)
-  (let [ret (build-program! ops)
-        kind (& selector 3)
-        expected (if (= kind 0) VERR-STOP-INPUT
-                   (if (= kind 1) VERR-CTRL-SLOT
-                     (if (= kind 2) VERR-LEAK VERR-ARITY)))]
-    (if (= kind 0)
-        ;; The value is already reachable, so adding it to Stop introduces only a bad exit kind.
-        (n-add-def! (g-stop) (n-in ret 1))
-      (if (= kind 1)
-          ;; Return slot zero must be control, never its result value.
-          (n-set-def! ret 0 (n-in ret 1))
-        (if (= kind 2)
-            ;; Peepholing gives the orphan its correct type; reachability is its sole defect.
-            (do (n-peephole (n-new1 (Const (t-int-con 99)) (g-start))) 0)
-          ;; Return permits two or three inputs.  Four is unambiguously an arity fault.
-          (do (n-add-def! ret (n-in ret 1)) (n-add-def! ret (n-in ret 1)) 0))))
-    (let [violations (g-verify)]
-      (and (> violations 0) (= (g-verify-code) expected)))))
-
-
-;; Does the allocator claim to have solved this program at `regs` registers?
-;; `be-color!` returns 0 on success and a nonzero failure code otherwise (7 at one register for a
-;; typical generated tree, 1 at three -- a binary op needs somewhere to put both operands).
-(defn colors-at? [(ops (slice u8)) (regs i64)] (-> bool)
-  (graph-reset! 909)
-  (build-program! ops)
-  (if (!= (g-verify) 0) false
-    (if (not (be-select-machine-program!)) false
-      (do (be-schedule!) (= (be-color! regs) 0)))))
-
-;; The TIGHTEST allocation this program admits, or 0 if it needs more than WIDE-REGS.
-;;
-;; The floor is a property of the program, not a constant -- which is why the deleted fixed
-;; matrices ("colour it at 8 and at 1") could not have covered generated input. Compiling at the
-;; floor puts the allocator exactly at its limit, which is where a spill bug lives.
-(defn min-regs [(ops (slice u8))] (-> i64)
-  (let [(mut r) 1
-        (mut found) 0]
-    (loop (if (or (> (load r) WIDE-REGS) (!= (load found) 0)) (break)
-            (if (colors-at? ops (load r))
-                (do (set! found 1) 0)
-                (do (set! r (+ (load r) 1)) 0))))
-    (if (= (load found) 0) 0 (load r))))
 
 ;; How many branch steps this byte string will actually produce. Reported by `classify` below,
 ;; because inferring which arms fire from a coverage number is exactly the mistake that let the
@@ -351,41 +151,6 @@
                 (set! i (+ (load i) 1))
                 0)))
     (load c)))
-
-(defprop native-agrees-with-interpreter-at-the-allocator-floor
-  [(ops (slice u8)) (arg i64)]
-  (assume (> (slice-len ops) 0))
-  ;; Bounded so ADD/SUB stay exact: 24 operations against constants of 3 and 7 cannot carry a
-  ;; magnitude of 2^40 anywhere near the 2^53 where the evaluator would start returning a double.
-  ;; Reducing beats `assume` here -- a precondition this narrow would discard almost every case.
-  (let [arg (% arg 1099511627776)
-        tight (min-regs ops)]
-    ;; A program needing more than WIDE-REGS is discarded rather than silently passed. `classify`
-    ;; reports the split, so this property cannot quietly become vacuous.
-    (classify "needs more than WIDE-REGS" (= tight 0))
-    (assume (> tight 0))
-    (classify "floor is WIDE-REGS" (= tight WIDE-REGS))
-    (classify "straight-line (no branch)" (= (branch-count ops) 0))
-    (classify "one branch" (= (branch-count ops) 1))
-    (classify "two or more branches" (> (branch-count ops) 1))
-    (let [want (interpreted ops arg)
-          wide (native-at ops arg WIDE-REGS)
-          got (native-at ops arg tight)]
-      (and (= want wide) (= want got)))))
-
-;; The optimizer must not change what a program means.
-;;
-;; A DIFFERENT SUBSYSTEM from the property above, and a cheaper one: no backend, no register
-;; allocation, no execution. `iterate!` folds constants, merges equal nodes with GVN, narrows types
-;; and deletes what it proves dead -- every one of which is a rewrite that can be wrong in a way the
-;; graph verifier still accepts. Interpreting before and after is what makes a wrong rewrite visible.
-(defprop optimization-preserves-meaning
-  [(ops (slice u8)) (arg i64)]
-  (assume (> (slice-len ops) 0))
-  (let [arg (% arg 1099511627776)
-        raw (eval-program ops arg false)
-        opt (eval-program ops arg true)]
-    (= raw opt)))
 
 ; ============================================================================
 ; Floats
@@ -483,25 +248,6 @@
         (g-analyze!)
         ret))))
 
-(defn eval-flt [(ops (slice u8)) (bits i64) (optimize bool)] (-> i64)
-  (graph-reset! 909)
-  (build-flt-program! ops)
-  (if optimize (do (iterate!) (g-analyze!) 0) 0)
-  (assert (= (g-verify) 0))
-  (ev-reset!)
-  (let [a (find-arg)]
-    (if (!= a NO-NODE) (do (ev-bind! a (RFlt bits)) 0) 0))
-  (assert (= (ev-run-nobind PROP-BUDGET) EV-OK))
-  (assert (= (rt-tag (ev-result)) RT-FLT))
-  (rt-payload (ev-result)))
-
-;; The argument is a generated BIT PATTERN, not a generated number, so the search covers NaNs,
-;; infinities, denormals and both zeros without anyone enumerating them.
-(defprop float-optimization-preserves-meaning
-  [(ops (slice u8)) (bits i64)]
-  (assume (> (slice-len ops) 0))
-  (flt-same? (eval-flt ops bits false) (eval-flt ops bits true)))
-
 ;; The comparator the float property rests on, pinned explicitly.
 ;;
 ;; Both halves matter and they pull in opposite directions: a NaN payload is invisible to a
@@ -567,173 +313,6 @@
   (be-encode!)
   (native1-flt bits))
 
-;; A SECOND REGISTER CLASS. Integer pressure and float pressure are allocated from different banks,
-;; and the rule the deleted B05 gate policed as a negative test -- a value must not be coloured into
-;; the wrong class -- is exactly what a generated float program at its allocation floor exercises.
-(defprop float-native-agrees-with-interpreter-at-the-allocator-floor
-  [(ops (slice u8)) (bits i64)]
-  (assume (> (slice-len ops) 0))
-  (let [tight (flt-min-regs ops)]
-    (assume (> tight 0))
-    (let [want (eval-flt ops bits false)
-          wide (flt-native-at ops bits WIDE-REGS)
-          got (flt-native-at ops bits tight)]
-      (and (flt-same? want wide) (flt-same? want got)))))
-
-; ============================================================================
-; The legacy selector must refuse what it cannot compile
-; ============================================================================
-
-;; The general half: an encoder that returns a sentinel must not have it published as an
-;; instruction. This is the guard that matters beyond floats -- it catches the NEXT encoder to
-;; return a negative, not just the one that did.
-(deftest encoder-refuses-to-publish-a-word-that-is-not-a-word
-  (graph-reset! 909)
-  (build-program! "a")
-  (assert (be-select-machine-program!))
-  (be-schedule!)
-  (assert (= (be-color! 8) 0))
-  (assert (be-encode-checked!))
-  (let [good (be-code-len)]
-    (assert (> good 0))
-    ;; -31 is exactly what the float path produced. Its low four bytes are 0xFFFFFFE1.
-    (be-u32! -31)
-    (assert (= (be-result) BER-ENCODING))
-    ;; Publication is atomic: a failed encode invalidates the bytes rather than shipping a
-    ;; buffer that is mostly right.
-    (assert (= (be-code-len) 0)))
-  ;; A legitimate word with its high bit set is NOT a sentinel and must still encode.
-  (graph-reset! 909)
-  (build-program! "a")
-  (assert (be-select-machine-program!))
-  (be-schedule!)
-  (assert (= (be-color! 8) 0))
-  (assert (be-encode-checked!))
-  (assert (> (be-code-len) 0)))
-
-;; A counted loop: `for (i = 0; i < n; i++) acc = acc OP i`, two loop-carried Phis.
-;; The trip count is a small CONSTANT, never the argument: a generated bound could ask for 2^40
-;; iterations, which exhausts the evaluator's step budget and hangs the native side.
-;; A chain of operations over the two loop-carried values and fresh constants, driven by the
-;; generated bytes. Returns the value that becomes the accumulator's next iteration.
-(defn build-loop-body! [(body (slice u8)) (acc i64) (i i64)] (-> i64)
-  (let [pool (alloc/stack (array i64 32))
-        p (cast (ptr i64) pool)
-        (mut n) 2
-        (mut cur) acc
-        (mut k) 0
-        limit (if (> (slice-len body) 8) 8 (slice-len body))]
-    (set! (index p 0) acc)
-    (set! (index p 1) i)
-    (loop (if (>= (load k) limit) (break)
-            (let [b (cast i64 (slice-get body (load k)))
-                  other (if (= (% (/ b 4) 2) 0)
-                            (n-new1 (Const (t-int-con (+ 1 (% (/ b 8) 7)))) (g-start))
-                          (load (index p (% (/ b 8) (load n)))))]
-              (set! cur (n-new3 (prop-op (% b PROP-OPS)) NO-NODE (load cur) other))
-              (set! (index p (load n)) (load cur))
-              (set! n (+ (load n) 1))
-              (set! k (+ (load k) 1))
-              0)))
-    ;; Always fold `i` in, so the loop counter is a real input to the carried value rather than
-    ;; something the optimiser can prove irrelevant and delete along with the loop.
-    (n-new3 (Add) NO-NODE (load cur) i)))
-
-(defn build-loop-program! [(trips i64) (opk i64) (body (slice u8))] (-> i64)
-  (let [lp (n-new (Loop))]
-    (n-add-def! lp NO-NODE)
-    (n-add-def! lp (g-start))
-    (n-add-def! lp NO-NODE)
-    (n-peephole lp)
-    (let [i (n-new (Phi (t-int)))
-          acc (n-new (Phi (t-int)))
-          a0 (n-new1 (Arg (t-int)) (g-start))]
-      (n-add-def! i lp)
-      (n-add-def! i (n-new1 (Const (t-int-con 0)) (g-start)))
-      (n-add-def! i NO-NODE)
-      (n-add-def! acc lp)
-      (n-add-def! acc a0)
-      (n-add-def! acc NO-NODE)
-      (let [limit (n-new1 (Const (t-int-con trips)) (g-start))
-            test (n-new3 (Lt) NO-NODE i limit)
-            arms (n-if-arms! (n-peephole (n-new2 (If) lp test)))
-            inext (n-new3 (Add) NO-NODE i (n-new1 (Const (t-int-con 1)) (g-start)))
-            ;; THE BODY IS GENERATED, not a single operation. A one-op body made the whole input
-            ;; space 8 trip counts by 5 operators, which is why the corpus stopped growing at six
-            ;; entries: there was nothing left to find. The chain below runs the same
-            ;; generator shape as the straight-line property, but every value it builds is now
-            ;; live across a back edge.
-            anext (build-loop-body! body acc i)]
-        (n-set-def! i 2 inext)
-        (n-set-def! acc 2 anext)
-        (n-set-def! lp 2 (arms-t arms))
-        (let [ret (n-new2 (Return) (arms-f arms) acc)]
-          (n-add-def! (g-stop) ret)
-          (wl-push! lp) (wl-push! i) (wl-push! acc)
-          (iterate!)
-          (g-analyze!)
-          ret)))))
-
-(defn loop-colors-at? [(trips i64) (opk i64) (body (slice u8)) (regs i64)] (-> bool)
-  (graph-reset! 909)
-  (build-loop-program! trips opk body)
-  (if (!= (g-verify) 0) false
-    (if (not (be-select-machine-program!)) false
-      (do (be-schedule!) (= (be-color! regs) 0)))))
-
-(defn loop-min-regs [(trips i64) (opk i64) (body (slice u8))] (-> i64)
-  (let [(mut r) 1
-        (mut found) 0]
-    (loop (if (or (> (load r) WIDE-REGS) (!= (load found) 0)) (break)
-            (if (loop-colors-at? trips opk body (load r))
-                (do (set! found 1) 0)
-                (do (set! r (+ (load r) 1)) 0))))
-    (if (= (load found) 0) 0 (load r))))
-
-(defn loop-native-at [(trips i64) (opk i64) (body (slice u8)) (arg i64) (regs i64)] (-> i64)
-  (graph-reset! 909)
-  (build-loop-program! trips opk body)
-  (assert (= (g-verify) 0))
-  (assert (be-select-machine-program!))
-  (be-schedule!)
-  (assert (= (be-color! regs) 0))
-  (be-encode!)
-  (native1 arg))
-
-(defn loop-eval [(trips i64) (opk i64) (body (slice u8)) (arg i64)] (-> i64)
-  (graph-reset! 909)
-  (build-loop-program! trips opk body)
-  (assert (= (g-verify) 0))
-  (ev-reset!)
-  (let [a (find-arg)]
-    (if (!= a NO-NODE) (do (ev-bind! a (RInt arg)) 0) 0))
-  (assert (= (ev-run-nobind PROP-BUDGET) EV-OK))
-  (assert (= (rt-tag (ev-result)) RT-INT))
-  (rt-payload (ev-result)))
-
-;; A LOOP-CARRIED value has to survive the back edge, which is the one place a register allocator
-;; and a Phi must agree about a location across a jump BACKWARDS. The straight-line and diamond
-;; properties never exercise it: nothing there is live across a control edge that returns to its
-;; own definition.
-;;
-;; The prototype selector rejected this shape outright ("loop with two carried values is rejected
-;; as phi"); the selector that replaced it compiles it, so the frontier those deleted tests
-;; recorded is now testable behaviour instead.
-(defprop loop-native-agrees-with-interpreter-at-the-allocator-floor
-  [(spec (slice u8)) (arg i64)]
-  (assume (> (slice-len spec) 0))
-  (let [b (cast i64 (slice-get spec 0))
-        trips (+ 1 (% b 8))
-        opk (% (/ b 8) PROP-OPS)
-        arg (% arg 1099511627776)
-        body (subslice spec 1 (slice-len spec))
-        tight (loop-min-regs trips opk body)]
-    (assume (> tight 0))
-    (let [want (loop-eval trips opk body arg)
-          wide (loop-native-at trips opk body arg WIDE-REGS)
-          got (loop-native-at trips opk body arg tight)]
-      (and (= want wide) (= want got)))))
-
 ;; EVERY GENERATOR ARM MUST ACTUALLY FIRE.
 ;;
 ;; This exists because one did not. The branch step was originally chosen from a byte's TOP two
@@ -753,138 +332,12 @@
                 0)))
     (load found)))
 
-(deftest every-generator-arm-fires
-  ;; byte 3: (% 3 4) = 3 -> the branch arm in both generators.
-  (graph-reset! 909)
-  (build-program! "\x03;")
-  (assert (graph-has-op? OPTAG-PHI))
-  (assert (graph-has-op? OPTAG-REGION))
-  (assert (graph-has-op? OPTAG-IF))
-  (graph-reset! 909)
-  (build-flt-program! "\x03;")
-  (assert (graph-has-op? OPTAG-PHI))
-  (assert (graph-has-op? OPTAG-REGION))
-  (assert (graph-has-op? OPTAG-IF))
-  ;; byte 0: (% 0 4) = 0 -> the arithmetic arm, and NO control flow.
-  (graph-reset! 909)
-  (build-program! "\x00;")
-  (assert (not (graph-has-op? OPTAG-IF)))
-  (graph-reset! 909)
-  (build-flt-program! "\x00;")
-  (assert (not (graph-has-op? OPTAG-IF)))
-  ;; the loop generator always builds its loop
-  (graph-reset! 909)
-  (build-loop-program! 3 0 "ab")
-  (assert (graph-has-op? OPTAG-LOOP))
-  (assert (graph-has-op? OPTAG-PHI)))
-
-; ============================================================================
-; Calls
-; ============================================================================
-;; A call is the one boundary where the allocator has to give a value back UNCHANGED across code it
-;; does not control. Straight-line chains, diamonds and loops all keep every value inside one
-;; function, so none of them can reach caller-saved preservation: the register a value sits in is
-;; only ever clobbered by instructions the allocator itself placed.
-;;
-;; So the shape here is deliberate. Several values are computed BEFORE the call, the call happens,
-;; and every one of them is used AFTER it. They are live across the boundary by construction, which
-;; is what forces the allocator to preserve or spill each one.
-(defn build-call-program! [(ops (slice u8))] (-> i64)
-  ;; callee: f(x) = x * 3 + 1, small enough that the interesting part stays the caller.
-  (let [callee (n-fun-open! 0)
-        px (n-parm! callee 0)
-        body (n-new3 (Add) NO-NODE
-                     (n-new3 (Mul) NO-NODE px (n-new1 (Const (t-int-con 3)) (g-start)))
-                     (n-new1 (Const (t-int-con 1)) (g-start)))
-        cret (n-new2 (Return) (n-fun-entry callee) body)]
-    (n-fun-close! callee cret)
-    (let [pool (alloc/stack (array i64 32))
-          p (cast (ptr i64) pool)
-          a0 (n-new1 (Arg (t-int)) (g-start))
-          v0 (n-new3 (Add) NO-NODE a0 (n-new1 (Const (t-int-con 3)) (g-start)))]
-      (set! (index p 0) v0)
-      ;; Build a handful of values first; each becomes live across the call below.
-      (let [(mut n) 1
-            (mut cur) v0
-            (mut k) 0
-            limit (if (> (slice-len ops) 6) 6 (slice-len ops))]
-        (loop (if (>= (load k) limit) (break)
-                (let [b (cast i64 (slice-get ops (load k)))]
-                  (set! cur
-                        (n-new3 (prop-op (% b PROP-OPS)) NO-NODE (load cur)
-                                (n-new1 (Const (t-int-con (+ 1 (% (/ b 8) 7)))) (g-start))))
-                  (set! (index p (load n)) (load cur))
-                  (set! n (+ (load n) 1))
-                  (set! k (+ (load k) 1))
-                  0)))
-        (let [site (n-call1! (g-start) callee (load cur))
-              (mut acc) (call-value site)
-              (mut j) 0]
-          ;; EVERY pre-call value folded in AFTER the call. This is the whole point: each one had
-          ;; to survive a boundary the allocator does not own.
-          (loop (if (>= (load j) (load n)) (break)
-                  (do (set! acc (n-new3 (Add) NO-NODE (load acc) (load (index p (load j)))))
-                      (set! j (+ (load j) 1))
-                      0)))
-          (let [ret (n-new2 (Return) (call-end site) (load acc))]
-            (n-add-def! (g-stop) ret)
-            (g-analyze!)
-            ret))))))
-
-(defn call-colors-at? [(ops (slice u8)) (regs i64)] (-> bool)
-  (graph-reset! 909)
-  (build-call-program! ops)
-  (if (!= (g-verify) 0) false
-    (if (not (be-select-machine-program!)) false
-      (do (be-schedule!) (= (be-color! regs) 0)))))
-
 ;; A CALL NEEDS MORE REGISTERS THAN WIDE-REGS. Measured: the smallest count that colours this
 ;; shape is 11, because a call pins argument and return registers by ABI on top of everything the
 ;; caller keeps live across it. Searching to 8 made the precondition unsatisfiable and the property
 ;; vacuous -- 200 of 200 cases rejected, which the runner reported as a warning rather than letting
 ;; it pass silently.
 (const CALL-WIDE-REGS i64 16)
-(defn call-min-regs [(ops (slice u8))] (-> i64)
-  (let [(mut r) 1
-        (mut found) 0]
-    (loop (if (or (> (load r) CALL-WIDE-REGS) (!= (load found) 0)) (break)
-            (if (call-colors-at? ops (load r))
-                (do (set! found 1) 0)
-                (do (set! r (+ (load r) 1)) 0))))
-    (if (= (load found) 0) 0 (load r))))
-
-(defn call-eval [(ops (slice u8)) (arg i64)] (-> i64)
-  (graph-reset! 909)
-  (build-call-program! ops)
-  (assert (= (g-verify) 0))
-  (ev-reset!)
-  (let [a (find-arg)]
-    (if (!= a NO-NODE) (do (ev-bind! a (RInt arg)) 0) 0))
-  (assert (= (ev-run-nobind PROP-BUDGET) EV-OK))
-  (assert (= (rt-tag (ev-result)) RT-INT))
-  (rt-payload (ev-result)))
-
-(defn call-native-at [(ops (slice u8)) (arg i64) (regs i64)] (-> i64)
-  (graph-reset! 909)
-  (build-call-program! ops)
-  (assert (= (g-verify) 0))
-  (assert (be-select-machine-program!))
-  (be-schedule!)
-  (assert (= (be-color! regs) 0))
-  (be-encode!)
-  (native1 arg))
-
-(defprop call-native-agrees-with-interpreter-at-the-allocator-floor
-  [(ops (slice u8)) (arg i64)]
-  (assume (> (slice-len ops) 0))
-  (let [arg (% arg 1048576)
-        tight (call-min-regs ops)]
-    (assume (> tight 0))
-    (let [want (call-eval ops arg)
-          wide (call-native-at ops arg CALL-WIDE-REGS)
-          got (call-native-at ops arg tight)]
-      (and (= want wide) (= want got)))))
-
 ; ============================================================================
 ; The heap
 ; ============================================================================
@@ -904,42 +357,6 @@
 (defn heap-load [(alias i64) (mem i64) (ptr i64)] (-> i64)
   (n-new3 (Load alias) NO-NODE mem ptr))
 
-(defn build-heap-program! [(ops (slice u8))] (-> i64)
-  (shape-reset!)
-  (let [sx (shape-transition SHAPE-ROOT "x" (t-int))
-        ax (shape-field-alias sx 0)
-        a0 (n-new1 (Arg (t-int)) (g-start))
-        o1 (n-new-obj1! (g-start) sx (mk-mem-in ax))
-        p1 (n-obj-ptr o1)
-        o2 (n-new-obj1! (g-start) sx (n-obj-mem o1 0))
-        p2 (n-obj-ptr o2)]
-    ;; Both fields initialised before the generated sequence: a load from an untouched field is a
-    ;; question about uninitialised memory, not about aliasing.
-    (let [(mut mem) (heap-store ax (n-obj-mem o2 0) p1 a0)
-          (mut cur) a0
-          (mut k) 0
-          limit (if (> (slice-len ops) 10) 10 (slice-len ops))]
-      (set! mem
-            (heap-store ax (load mem) p2
-                        (n-new3 (Add) NO-NODE a0 (n-new1 (Const (t-int-con 1)) (g-start)))))
-      (loop (if (>= (load k) limit) (break)
-              (let [b (cast i64 (slice-get ops (load k)))
-                    ptr (if (= (% b 2) 0) p1 p2)]
-                (if (= (% (/ b 2) 2) 0)
-                    ;; store the running value
-                    (do (set! mem (heap-store ax (load mem) ptr (load cur))) 0)
-                  ;; or read a field back and fold it in
-                  (do (set! cur
-                            (n-new3 (prop-op (% (/ b 4) PROP-OPS)) NO-NODE
-                                    (load cur) (heap-load ax (load mem) ptr)))
-                      0))
-                (set! k (+ (load k) 1))
-                0)))
-      (let [ret (n-new3 (Return) (g-start) (load cur) (load mem))]
-        (n-add-def! (g-stop) ret)
-        (g-analyze!)
-        ret))))
-
 ;; NOT `find-arg`. A heap program has TWO arguments -- the integer and the memory that
 ;; `mk-mem-in` threads in -- and `find-arg` returns whichever OPTAG-ARG it meets first. Binding an
 ;; integer into the memory argument leaves the evaluator with no heap and it stops, which is what
@@ -956,52 +373,6 @@
                 (set! i (+ (load i) 1))
                 0)))
     (load found)))
-
-(defn heap-eval [(ops (slice u8)) (arg i64) (optimize bool)] (-> i64)
-  (graph-reset! 909)
-  (build-heap-program! ops)
-  (if optimize (do (iterate!) (g-analyze!) 0) 0)
-  (assert (= (g-verify) 0))
-  (ev-reset!)
-  (let [a (find-int-arg)]
-    (if (!= a NO-NODE) (do (ev-bind! a (RInt arg)) 0) 0))
-  (assert (= (ev-run-nobind PROP-BUDGET) EV-OK))
-  (assert (= (rt-tag (ev-result)) RT-INT))
-  (rt-payload (ev-result)))
-
-(defprop heap-optimization-preserves-meaning
-  [(ops (slice u8)) (arg i64)]
-  (assume (> (slice-len ops) 0))
-  (let [arg (% arg 1048576)]
-    (= (heap-eval ops arg false) (heap-eval ops arg true))))
-
-; ============================================================================
-; One corpus over every shape
-; ============================================================================
-;; SIX GENERATORS, ONE CORPUS. Each property above explores its own island: the coverage-guided
-;; search builds a corpus for arithmetic, a separate one for loops, a separate one for calls, and
-;; nothing ever combines them. A mutation that would be interesting in a loop is never tried in a
-;; call, because the two searches share nothing.
-;;
-;; Here the FIRST BYTE picks the shape and the rest drives it, so one corpus spans all of them and
-;; the search can splice a productive tail from one shape onto another. That is the whole reason
-;; Fuzzilli-style corpora hold choices rather than bytes -- a spliced program is still a program.
-(defn any-eval [(kind i64) (ops (slice u8)) (arg i64)] (-> i64)
-  (if (= kind 0) (interpreted ops arg)
-    (if (= kind 1) (eval-program ops arg true)
-      (if (= kind 2) (loop-eval (+ 1 (% arg 7)) (% arg PROP-OPS) ops arg)
-        (if (= kind 3) (call-eval ops arg)
-          (heap-eval ops arg false))))))
-
-(defn any-native [(kind i64) (ops (slice u8)) (arg i64) (regs i64)] (-> i64)
-  (if (= kind 2) (loop-native-at (+ 1 (% arg 7)) (% arg PROP-OPS) ops arg regs)
-    (if (= kind 3) (call-native-at ops arg regs)
-      (native-at ops arg regs))))
-
-(defn any-min-regs [(kind i64) (ops (slice u8)) (arg i64)] (-> i64)
-  (if (= kind 2) (loop-min-regs (+ 1 (% arg 7)) (% arg PROP-OPS) ops)
-    (if (= kind 3) (call-min-regs ops)
-      (min-regs ops))))
 
 ;; Kinds 0 and 4 are interpreter-only comparisons (the optimiser and the heap), so this asserts what
 ;; each shape can actually support rather than forcing every shape through the backend.
@@ -1041,85 +412,6 @@
         (n-add-def! (g-stop) ret)
         (g-analyze!)
         ret))))
-
-(defn array-eval [(ops (slice u8)) (arg i64) (optimize bool)] (-> i64)
-  (graph-reset! 909)
-  (build-array-program! ops)
-  (if optimize (do (iterate!) (g-analyze!) 0) 0)
-  (assert (= (g-verify) 0))
-  (ev-reset!)
-  (let [a (find-int-arg)]
-    (if (!= a NO-NODE) (do (ev-bind! a (RInt arg)) 0) 0))
-  (assert (= (ev-run-nobind PROP-BUDGET) EV-OK))
-  (rt-payload (ev-result)))
-
-(defprop array-optimization-preserves-meaning
-  [(ops (slice u8)) (arg i64)]
-  (assume (> (slice-len ops) 0))
-  (= (array-eval ops arg false) (array-eval ops arg true)))
-
-(defprop every-shape-agrees-under-one-corpus
-  [(ops (slice u8)) (arg i64)]
-  (assume (> (slice-len ops) 1))
-  (let [kind (% (cast i64 (slice-get ops 0)) 9)
-        body (subslice ops 1 (slice-len ops))
-        arg (% arg 1048576)]
-    (if (= kind 7)
-        ;; a malformed graph: the verifier reaches a verdict and names any rejection
-        (do (graph-reset! 909)
-            (let [a0 (n-new1 (Arg (t-int)) (g-start))
-                  c3 (n-new1 (Const (t-int-con 3)) (g-start))
-                  v (n-new3 (Add) NO-NODE a0 c3)]
-              (if (= (% (cast i64 (slice-get ops 0)) 3) 0)
-                  (do (n-new1 (Const (t-int-con 99)) (g-start))
-                      (n-add-def! (g-stop) (n-new2 (Return) (g-start) v)) 0)
-                (if (= (% (cast i64 (slice-get ops 0)) 3) 1)
-                    (do (n-add-def! (g-stop) (n-new2 (Return) v v)) 0)
-                  0))
-              (g-analyze!)
-              (if (= (g-verify) 0) true (!= (g-verify-code) 0))))
-    (if (= kind 8)
-        ;; ALLOCATION REFUSAL: a call shape needs 11 registers, so colouring it at one must fail
-        ;; cleanly and name itself rather than produce a program.
-        (do (graph-reset! 909)
-            (build-call-program! body)
-            (if (!= (g-verify) 0) true
-              (if (not (be-select-machine-program!)) (!= (be-result) BER-OK)
-                (do (be-schedule!)
-                    (if (< (be-color! 1) 0) (!= (be-result) BER-OK)
-                      (if (= (be-color! 1) 0) true (= (be-code-len) 0)))))))
-    (if (= kind 6)
-        ;; a program the backend cannot compile: refused by name, nothing published
-        (do (graph-reset! 909)
-            (let [a0 (n-new1 (Arg (t-int)) (g-start))
-                  v (n-new3 (Add) NO-NODE a0 (n-new1 (Const (t-int-con 3)) (g-start)))
-                  bad (n-new3 (unsupported-op (% (cast i64 (slice-get ops 0)) UNSUPPORTED-OPS)) NO-NODE v v)
-                  ret (n-new2 (Return) (g-start) bad)]
-              (n-add-def! (g-stop) ret)
-              (g-analyze!)
-              (if (be-select-machine-program!)
-                  (do (be-schedule!)
-                      (if (< (be-color! CALL-WIDE-REGS) 0) true (be-encode-checked!)))
-                (and (!= (be-result) BER-OK) (= (be-code-len) 0)))))
-    (if (or (= kind 1) (or (= kind 4) (= kind 5)))
-        ;; interpreter versus optimiser: the arithmetic, heap and array shapes
-        (= (if (= kind 1) (eval-program body arg false)
-             (if (= kind 4) (heap-eval body arg false) (array-eval body arg false)))
-           (if (= kind 1) (eval-program body arg true)
-             (if (= kind 4) (heap-eval body arg true) (array-eval body arg true))))
-      ;; interpreter versus the CPU, at the tightest allocation the allocator claims to solve
-      (let [tight (any-min-regs kind body arg)]
-        (if (= tight 0) true
-          (let [want (any-eval kind body arg)
-                wide (any-native kind body arg CALL-WIDE-REGS)
-                got (any-native kind body arg tight)]
-            ;; AND THE OBJECT FILE. The properties above stop at `be-encode!` because that is what
-            ;; the mmap-and-call path needs, which leaves backend_macho -- the container, the symbol
-            ;; table, the relocations, the stackmaps -- untouched by every one of them. A program
-            ;; that encodes must also publish, and `mobj-verify-model!` is the backend's own check
-            ;; that what it published describes what it emitted.
-            (and (and (= want wide) (= want got))
-                 (and (be-macho-checked!) (mobj-verify-model!))))))))))))
 
 ; ============================================================================
 ; Rejection is behaviour too
@@ -1243,17 +535,3 @@
       (n-add-def! (g-stop) ret)
       (g-analyze!)
       ret)))
-
-(defn string-eval [(ops (slice u8)) (optimize bool)] (-> i64)
-  (graph-reset! 909)
-  (build-string-program! ops)
-  (if optimize (do (iterate!) (g-analyze!) 0) 0)
-  (assert (= (g-verify) 0))
-  (ev-reset!)
-  (assert (= (ev-run-nobind PROP-BUDGET) EV-OK))
-  (rt-payload (ev-result)))
-
-(defprop string_optimization_preserves_meaning
-  [(ops (slice u8))]
-  (assume (> (slice-len ops) 0))
-  (= (string-eval ops false) (string-eval ops true)))

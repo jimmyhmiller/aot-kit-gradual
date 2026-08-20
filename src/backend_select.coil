@@ -33,12 +33,51 @@
 ;; property, not a new source-language nominal type.  Boxing must therefore preserve ArrayMark
 ;; provenance instead of deriving the tag from the lattice alone.  Casts and homogeneous value
 ;; Phis retain that provenance; a mixed or unresolved Phi conservatively remains an Object.
+;; A CALL'S TARGET SET, AS THE 63 BITS IT ACTUALLY OCCUPIES.
+;;
+;; A polymorphic call is encoded in `MInst.imm` as the COMPLEMENT of its target set, and
+;; `be-poly-call?` recovers which kind of call it is from the SIGN: a negative `imm` is a dispatch,
+;; a non-negative one names the owner to call directly. That is injective for every 63-bit set --
+;; the complement always has bit 63 set -- and it COLLIDES for exactly one input. An unconstrained
+;; `fun` type carries `fidxs` of -1, its complement is 0, and 0 reads as "direct call to owner 0",
+;; which is always the entry function.
+;;
+;; A callable LOADED FROM THE HEAP has precisely that type: nothing narrows it, because closed-world
+;; inference does not follow a function through a store. So every such call branched into `main`
+;; instead of dispatching -- `{get: () => 7}` then `o.get()` answered 0, and so did every object
+;; method in the language, and `[function () { return 42; }][0]()` with it. It was invisible to both
+;; derived reports, which sweep methods on built-in receivers and never put a function in the heap.
+;;
+;; AN UNCONSTRAINED SET IS NOT A SUMMARY, and the encoder already has a value that says so: a
+;; recovered `targets` of 0 means "no summary, dispatch over every function in the unit", which is
+;; what `be-poly-call-targets` documents and what this case needs. Mapping -1 to 0 makes the
+;; complement -1 -- negative, so still a dispatch -- and leaves `ms-call-target-valid?`'s loop over
+;; set bits vacuous instead of demanding a function for all 63 indices.
+;;
+;; Emission and `ms-call-target-valid?` MUST agree on this, which is why it is one function and not
+;; two expressions that can drift.
+(defn be-call-target-summary [(t i64)] (-> i64)
+  (let [fidxs (ty-fun-targets t)]
+    (if (< fidxs 0) 0 fidxs)))
+
 (defn be-array-value? [(node i64) (fuel i64)] (-> bool)
   (if (or (= node NO-NODE) (or (<= fuel 0) (n-dead? node)))
       false
       (match (n-op node)
         (ArrayMark [] true)
         (Cast [target] (be-array-value? (n-in node 1) (- fuel 1)))
+        ;; AN ARRAY RETURNED FROM A FUNCTION IS STILL AN ARRAY, and nothing here could see that. A
+        ;; `Call` has lattice type `dyn`, and the `Cast` the frontend puts on its result carries the
+        ;; declared `obj` -- so `(x) => [x, x]` handed back a value this function called an ordinary
+        ;; object, the `Box` above it chose `JSV-OBJECT`, and every runtime tag test then disagreed
+        ;; with JavaScript: `r instanceof Array` was false and `String(r)` printed "[object Object]"
+        ;; where node prints "1,1". `Array.prototype.flatMap` could not be written correctly at all,
+        ;; because its append-or-spread step asks exactly this question about a callback's result.
+        ;;
+        ;; Follow the bounded call graph instead, the way `be-function-return-kind-fuel` does for the
+        ;; return ABI and for the same reason. Every reachable target must return an array; a call
+        ;; that might land on something else is an ordinary object, which is the conservative answer.
+        (Call [_] (be-call-returns-array? node (- fuel 1)))
         (Phi [declared]
             (let [(mut input) 1
                   (mut evidence) false
@@ -54,6 +93,40 @@
                           (set! input (+ (load input) 1)))))
               (and (load evidence) (load valid))))
         (_ false))))
+
+(defn be-function-returns-array? [(owner i64) (fuel i64)] (-> bool)
+  (let [count (mu-function-return-count owner)
+        (mut i) 0
+        ;; A function with no `Return` block promises nothing, so it cannot promise an array.
+        (mut all) (> count 0)]
+    (loop (if (or (>= (load i) count) (not (load all)))
+              (break)
+              (let [term (mu-block-terminator (mu-function-return-block owner (load i)))]
+                (if (and (!= term NO-NODE) (op-is? term Return []))
+                    (if (be-array-value? (n-in term 1) fuel) 0 (set! all false))
+                    (set! all false))
+                (set! i (+ (load i) 1)))))
+    (load all)))
+
+(defn be-call-returns-array? [(call i64) (fuel i64)] (-> bool)
+  (if (<= fuel 0)
+      false
+      (let [funcs (mu-function-count)
+            (mut owner) 0
+            (mut saw) false
+            (mut all) true]
+        (loop (if (or (>= (load owner) funcs) (not (load all)))
+                  (break)
+                  (let [fun (mu-function-ideal (load owner))]
+                    (if (and (!= fun NO-NODE)
+                             (and (op-is? fun Fun [_]) (infer-call-reaches-fun? call fun)))
+                        (do (set! saw true)
+                            (if (be-function-returns-array? (load owner) (- fuel 1))
+                                0
+                                (set! all false)))
+                        0)
+                    (set! owner (+ (load owner) 1)))))
+        (and (load saw) (load all)))))
 
 (defn be-function-return-kind-fuel [(owner i64) (fuel i64)] (-> i64)
   (let [count (mu-function-return-count owner)
@@ -245,6 +318,31 @@
 (defn be-call-return-tag [(call i64)] (-> i64)
   (be-call-return-tag-fuel call 32))
 
+;; A VALUE THAT SPANS REPRESENTATION CLASSES CANNOT BE RAW, and that is a fact about machines
+;; rather than a heuristic. There are three raw forms -- a number in a register, a string pointer,
+;; an object pointer -- and `undefined`, `null` and `true` have no raw form at all. So a kind set
+;; touching two of these classes, or touching the class that has no raw form, describes a value that
+;; can only be a TAGGED word, whatever the type lattice says beyond that.
+;;
+;; This is what lets `String(x)` compile for `undefined|number`, the shape every `codePointAt` and
+;; `at` produces: the frontend is right that the value is not a plain number, and the runtime's
+;; tag dispatch is exactly the thing that can print it.
+(defn be-kinds-must-be-tagged? [(t i64)] (-> bool)
+  (let [k (ty-kinds t)
+        numeric (if (!= (& k VK-NUM) 0) 1 0)
+        string (if (!= (& k VK-STR) 0) 1 0)
+        pointer (if (!= (& k (| VK-OBJ VK-FUN)) 0) 1 0)
+        ;; `undefined`, `null` and `true` are their own class: each has an immediate form that a
+        ;; `Box` turns into the tagged word, so ALONE they are not already tagged.
+        tagonly (if (!= (& k (| (| VK-UNDEF VK-NULL) (| VK-BOOL (| VK-SYM VK-BIG)))) 0) 1 0)]
+    ;; STRICTLY MORE THAN ONE CLASS. The first version of this said `tagonly` alone was enough and
+    ;; was wrong in the way that matters: `Box(Const undefined)` became a no-op, the immediate
+    ;; flowed on untagged, and `String(v.at(99))` printed one character where node prints
+    ;; "undefined". It compiled, ran, and answered 7 instead of 15 --
+    ;; `tests/native-execution-test.coil` is what said so. One class means a raw form exists and
+    ;; the box is doing real work; two or more means no raw form covers the value at all.
+    (> (+ numeric (+ string (+ pointer tagonly))) 1)))
+
 (defn be-js-tag-for-value [(node i64)] (-> i64)
   ;; A materialized closure's VALUE is its environment object pointer; boxing it must produce
   ;; an OBJECT-tagged word. The generic dispatcher recognizes that tag and reads the callable
@@ -278,8 +376,13 @@
       true
   (if (op-is? node Call [_])
       (= (be-call-return-kind node) MLK-BOXED)
-      (= (ml-kind-for-node node) MLK-BOXED))))
-
+      ;; A value spanning representation classes -- `int|flt|str` out of a Phi, say -- has no raw
+      ;; form to have been produced in, so whatever produced it produced a tagged word and boxing
+      ;; it again is the identity. Without this the box has no tag to emit, `be-js-tag-for-value`
+      ;; answers -1, and a program that merely joins a number with a string in one variable does
+      ;; not compile.
+      (or (be-kinds-must-be-tagged? (n-ty node))
+          (= (ml-kind-for-node node) MLK-BOXED)))))
 
 (defn be-float-only? [(t i64)] (-> bool)
   (= (ty-kinds t) VK-FLT))
@@ -426,11 +529,23 @@
 ; Frontend dynamic values cross the JavaScript-value ABI at these nodes. Hand-written
 ; backend fixtures also use t-dyn for unconstrained machine integers, so type alone is
 ; not enough to justify a runtime JavaScript equality or truthiness call.
+;
+; THE FIRST QUESTION IS `n-rep-of`, and the hand-written list below is only what it cannot answer.
+; A value that is certainly TAGGED is a JavaScript value by construction, so keeping a second,
+; shorter list of "which ops produce one" was a copy that drifted -- and it did: `PropLoadKey` sat
+; beside `PropLoad` in `n-rep-of` as REP-TAGGED and was missing here, so `o[k]` read back a stored
+; `false`, took the RAW word as an If predicate, and a tagged false is a non-zero bit pattern.
+; `o[k] ? 100 : 200` answered 100 while `String(o[k])` printed "false" and `o.a` was right.
+;
+; The list survives for the ops `n-rep-of` leaves UNKNOWN because their representation is not
+; structural: a `Call`'s result is whatever the callee returns, and a `Phi` with an absent or mixed
+; arm has no single answer yet.
 (defn be-js-dynamic-boundary? [(node i64)] (-> bool)
-  (match (n-op node)
-    (Call [_] true) (PropLoad [_] true) (ArrayLoad [_] true) (Box [_] true) (Phi [_] true)
-    (_ false)))
-
+  (if (= (n-rep-of node 8) REP-TAGGED)
+      true
+      (match (n-op node)
+        (Call [_] true) (PropLoad [_] true) (ArrayLoad [_] true) (Box [_] true) (Phi [_] true)
+        (_ false))))
 
 (defn graph-arg-index [(n i64)] (-> i64)
   (let [(mut i) 0
@@ -524,7 +639,6 @@
 
 (defn be-field-off [(alias i64)] (-> i64)
   (if (shape-alias-defined? alias) (shape-alias-offset alias) (* (% alias 16) 8)))
-
 
 (defn be-inst-count [] (-> i64)
   (al-len [MInst] (.ins (backend))))
@@ -755,6 +869,51 @@
                     (set! i (+ (load i) 1))
                     0)))
         (load best))))
+
+;; WHICH FUNCTION A MEMORY STATE BELONGS TO, or -1 when nothing in its chain says.
+;;
+;; `ms-node-block` answers "this owner's entry block" for any node with NO control input, and a
+;; memory node usually has none -- slot 0 of `Store`/`Load`/`MemMerge` is a control anchor that is
+;; null in practice. That is a sensible PLACEMENT default and a useless OWNERSHIP test, and
+;; `ms-preselect-function!`'s dynamic-effect sweep was using it as one: it walks every node in the
+;; graph, so a store belonging to `main` answered "entry block of owner 1" and was adopted by a
+;; JSL builtin. Selecting it there then walked a chain into a memory `Phi` on one of `main`'s
+;; loops, which `ms-preallocate-phis!` had marked seen for `main` and not for that owner, and the
+;; whole program was refused with MSEL-UNSUPPORTED. `forEach` and `flatMap` in one function was
+;; the witness.
+;;
+;; The chain DOES say, one step further along: a `Phi`'s region, an `Arg`'s anchor and any pinned
+;; effect's control all map to a block, and a block names its function. `MemMerge` has no control
+;; of its own, so ask its inputs.
+(defn ms-memory-chain-owner-fuel [(node i64) (fuel i64)] (-> i64)
+  (if (or (< node 0) (<= fuel 0))
+      -1
+      (let [ctrl (if (> (n-nins node) 0) (n-in node 0) NO-NODE)
+            direct
+              (if (= ctrl NO-NODE)
+                  -1
+                  (let [mapped (al-get (.ctrl-block (machine-unit)) ctrl)]
+                    (if (>= mapped 0) (mu-block-owner mapped) -1)))]
+        (if (>= direct 0)
+            direct
+            (match (n-op node)
+              (MemMerge []
+                (let [(mut i) 1
+                      (mut answer) -1]
+                  (loop (if (or (>= (load i) (n-nins node)) (>= (load answer) 0))
+                            (break)
+                            (do
+                              (set! answer
+                                    (ms-memory-chain-owner-fuel (n-in node (load i)) (- fuel 1)))
+                              (set! i (+ (load i) 1))
+                              0)))
+                  (load answer)))
+              (_ (if (and (ms-linear-memory-effect? node) (> (n-nins node) 1))
+                     (ms-memory-chain-owner-fuel (n-in node 1) (- fuel 1))
+                     -1)))))))
+
+(defn ms-memory-chain-owner [(node i64)] (-> i64)
+  (ms-memory-chain-owner-fuel node 64))
 
 (defn ms-memory-block [(owner i64) (node i64)] (-> i64)
   ;; Memory operations put their memory dependency, not control, in input 0. Placing one from
@@ -1264,15 +1423,6 @@
 (defn ms-select-memory! [(owner i64) (node i64)] (-> bool)
   (ms-select-memory-at! owner node (ms-memory-block owner node)))
 
-(defn ms-select-binary! [(owner i64) (node i64) (mop i64) (bid i64)] (-> i64)
-  (let [a (ms-select-value-at! owner (n-in node 1) bid)
-        b (ms-select-value-at! owner (n-in node 2) bid)]
-    (if (or (< a 0) (< b 0))
-        -1
-        (let [vr (ms-new-vreg!)]
-          (ms-emit! owner bid (mi-new mop vr a b 0 node))
-          vr))))
-
 (defn ms-select-int32-binary! [(owner i64) (node i64) (mop i64) (bid i64)] (-> i64)
   (let [an (n-in node 1)
         bn (n-in node 2)
@@ -1553,16 +1703,67 @@
                                           end
                                           (+ JSSOP-SUBSTRING mode))))))
             (ToString [] (let [value-node (n-in node 1)
-                      value (ms-select-value-at! owner value-node bid)
+                      selected (ms-select-value-at! owner value-node bid)
+                      ;; A RAW OBJECT POINTER HAS NO TAG, and the runtime's ToString is a dispatch
+                      ;; on one. An object reaches here as a bare pointer -- `ArrayMark`, or the
+                      ;; `Proj` of a `New` -- so it is tagged HERE, with the same tag
+                      ;; `be-js-tag-for-value` derives for an explicit `Box`, and the runtime then
+                      ;; answers "[object Object]" for it. The array case never gets this far:
+                      ;; `ToStringValue` in lib/ tests `%IsArray` first and joins.
+                      value
+                        (if (and (>= selected 0) (= (n-rep-of value-node 32) REP-RAW-PTR))
+                            (let [tag (be-js-tag-for-value value-node)]
+                              ;; `-1` IS THE FAILURE, and a tag is not a small number: `JSV-ARRAY`
+                              ;; is a negative 64-bit pattern, so testing `< 0` rejects every
+                              ;; object tag there is.
+                              (if (= tag -1)
+                                  -1
+                                  (let [fresh (ms-new-vreg!)]
+                                    ;; NO-NODE: the ToString node itself is claimed by the
+                                    ;; `ms-jsstring!` below, and two instructions naming one node
+                                    ;; is MSEL-DUPLICATE.
+                                    (ms-emit! owner bid (mi-new MI-JSBOX fresh selected -1 tag NO-NODE))
+                                    fresh)))
+                            selected)
                       operation
-                        (let [kinds (ty-kinds (n-ty value-node))]
-                          (cond (= kinds VK-STR) -1
+                        (let [kinds (ty-kinds (n-ty value-node))
+                              rep (n-rep-of value-node 32)]
+                          (cond
+                                (= rep REP-RAW-PTR) JSSOP-FROM-VALUE
+                                ;; REPRESENTATION IS THE FIRST QUESTION, not the last. Every arm
+                                ;; below reads the TYPE to pick a machine word, and a tagged value
+                                ;; with a narrow type walks straight into the wrong one: a NaN out
+                                ;; of `charCodeAt` is typed float-only and IS a tagged word, so it
+                                ;; reached `FROM-DOUBLE-BITS`, which reinterpreted the NaN box as an
+                                ;; IEEE double and printed nineteen characters where node prints
+                                ;; "NaN". The runtime's tag dispatch is exactly the thing that reads
+                                ;; a tagged word correctly, whatever its type says.
+                                (= rep REP-TAGGED) JSSOP-FROM-VALUE
+                                (= kinds VK-STR) -1
                                 (ty-int-only? (n-ty value-node)) JSSOP-FROM-INT
                                 (= kinds VK-BOOL) JSSOP-FROM-BOOL
                                 (= kinds VK-NULL) JSSOP-FROM-NULL
                                 (= kinds VK-UNDEF) JSSOP-FROM-UNDEFINED
                                 (be-float-only? (n-ty value-node)) JSSOP-FROM-DOUBLE-BITS
                                 (= (n-ty value-node) (t-dyn)) JSSOP-FROM-VALUE
+                                ;; NARROWING A TYPE MUST NOT LOSE A CAPABILITY, and it did: every
+                                ;; arm above asks the TYPE which machine word this is, so a value
+                                ;; the analysis proved is `num` -- strictly more than `dyn` knows --
+                                ;; fell to `-2` and the whole program failed to compile. `String(x)`
+                                ;; on anything the frontend could not pin to int-only or float-only
+                                ;; was unreachable, which is most of `docs/NATIVE-CAPABILITY.md`.
+                                ;;
+                                ;; A TYPE IS NOT A REPRESENTATION. `n-rep-of` is the one answer to
+                                ;; which machine word this is: a tagged word goes to the runtime's
+                                ;; tag dispatch exactly as `dyn` does, and a raw number is an
+                                ;; integer or a double according to the register class selection
+                                ;; already chose for it -- the same derivation
+                                ;; `be-js-tag-for-value` makes three hundred lines up.
+                                (ty-numeric? (n-ty value-node))
+                                  (if (be-node-fp-value? value-node)
+                                      JSSOP-FROM-DOUBLE-BITS
+                                      JSSOP-FROM-INT)
+                                (be-kinds-must-be-tagged? (n-ty value-node)) JSSOP-FROM-VALUE
                                 :else -2))]
                   (if (= operation -1)
                       (set! vr value)
@@ -2274,7 +2475,9 @@
                                                 (ms-emit! owner
                                                           call-bid
                                                           (mi-new MI-CALL fresh a b
-                                                                  (if polymorphic (^ targets -1) target)
+                                                                  (if polymorphic
+                                                                      (^ (be-call-target-summary (n-ty callee-node)) -1)
+                                                                      target)
                                                                   node))]
                                           (ms-add-call-args! at (if (= argc 0) -1 first) argc)
                                           (if has-memory
@@ -2286,9 +2489,6 @@
           (if (< (load vr) 0)
               -1
               (do (ms-vset! owner node (load vr)) (load vr)))))))
-
-(defn ms-select-value! [(owner i64) (node i64)] (-> i64)
-  (ms-select-value-at! owner node (ms-entry-block owner)))
 
 (defn ms-phi-block [(owner i64) (phi i64)] (-> i64)
   (if (or (not (op-is? phi Phi [_])) (= (n-in phi 0) NO-NODE))
@@ -2635,8 +2835,15 @@
                               (do (ms-select-value-at! owner (load node) bid) 0)
                               0))
                         (if (ms-linear-memory-effect? (load node))
-                            (let [bid (ms-memory-block owner (load node))]
-                              (if (and (>= bid 0) (= (mu-block-owner bid) owner))
+                            ;; THIS SWEEP WALKS THE WHOLE GRAPH, so the block query alone is not an
+                            ;; ownership test -- see `ms-memory-chain-owner`. When the chain names a
+                            ;; function, only that function adopts the effect; when it names none,
+                            ;; the block fallback still decides, exactly as before.
+                            (let [bid (ms-memory-block owner (load node))
+                                  chain-owner (ms-memory-chain-owner (load node))]
+                              (if (and (>= bid 0)
+                                       (and (= (mu-block-owner bid) owner)
+                                            (or (< chain-owner 0) (= chain-owner owner))))
                                   (do (ms-select-memory-at! owner (load node) bid) 0)
                                   0))
                             0))
@@ -2866,12 +3073,24 @@
 ;; `-at!`-less builders exist for the reads that genuinely may float, they pass NO-NODE, and the
 ;; loop-invariant motion this pass is for is over pure ops like `%StringIndexOf`, which have no
 ;; control input at all.
+;; WHICH OPERATIONS BELONG TO THE BLOCK THEIR CONTROL NAMES, rather than to wherever global code
+;; motion would rather have them. Every heap read and write is one, because a read hoisted above its
+;; guard reads a value the guard exists to prevent.
+;;
+;; `JsThrow` IS ONE TOO, AND IT IS NOT A HEAP OPERATION. It lowers to a runtime call that never
+;; returns -- `exit(70)` -- and its only consumer is the Phi that joins its arm with the other one,
+;; so nothing keeps it inside its guard: `ms-gcm-place!` moved it to the shallowest block between
+;; its inputs and that Phi, which for `for (const x of xs)` inside another loop is OUTSIDE both
+;; loops. Every such program aborted with "uncaught JavaScript throw" before the first iteration,
+;; including one whose outer loop ran ZERO times, while the guard that should have skipped it sat
+;; correctly in the loop body two thousand instructions later reading the already-thrown result.
+;; A value may be computed early; an operation that ENDS THE PROCESS may not.
 (defn ms-anchored-memory-op? [(node i64)] (-> bool)
   (or (ms-linear-memory-effect? node)
       (match (n-op node)
         (Load [_] true) (PropLoad [_] true) (PropHas [_] true) (ProtoHas [] true)
         (PropLoadKey [] true) (PropHasKey [] true) (InternalLoad [_] true)
-        (ArrayLoad [_] true) (ArrayLen [] true) (_ false))))
+        (ArrayLoad [_] true) (ArrayLen [] true) (JsThrow [] true) (_ false))))
 
 ;; The block a control-anchored heap operation belongs to, or -1 when it has none.
 (defn ms-inst-anchor-block [(owner i64) (at i64)] (-> i64)
@@ -3137,55 +3356,31 @@
                 0)))
     (load latest)))
 
-(defn ms-gcm-latest-use-block-scan [(owner i64) (vreg i64)] (-> i64)
-  (let [(mut latest) -1
-        (mut rpo) 0
-        (mut edge) 0]
-    ;; Instructions are already packed into per-function block ranges. Walking the entire program
-    ;; for every definition made GCM quadratic in unrelated functions (DeltaBlue has 76 of them).
-    ;; Restrict the use scan to the owning function; cross-function vreg uses are invalid anyway.
-    (loop (if (>= (load rpo) (mu-function-block-count owner))
-              (break)
-              (let [bid (mu-function-block owner (load rpo))
-                    first (mu-block-inst-first bid)
-                    count (mu-block-inst-count bid)
-                    (mut at) first]
-                (loop (if (>= (load at) (+ first count))
-                          (break)
-                          (do
-                            (if (ms-inst-uses-vreg? (load at) vreg)
-                                (set! latest
-                                      (ms-gcm-lca (load latest)
-                                                  (ms-inst-block (load at))))
-                                0)
-                            (set! at (+ (load at) 1)))))
-                (set! rpo (+ (load rpo) 1)))))
-    ; A Phi source is used on its incoming edge, hence in the predecessor block.
-    (loop (if (>= (load edge) (mu-edge-count))
-              (break)
-              (do
-                (if (= (mu-block-owner (mu-edge-source (load edge))) owner)
-                    (let [(mut i) 0]
-                      (loop (if (>= (load i) (mu-edge-copy-count (load edge)))
-                                (break)
-                                (do
-                                  (if (and (= (mu-copy-kind (load edge) (load i)) MCOPY-VALUE)
-                                           (= (mu-copy-src (load edge) (load i)) vreg))
-                                      (set! latest (ms-gcm-lca (load latest) (mu-edge-source (load edge))))
-                                      0)
-                                  (set! i (+ (load i) 1))
-                                  0))))
-                    0)
-                (set! edge (+ (load edge) 1))
-                0)))
-    (load latest)))
-
 (defn ms-gcm-place! [] (-> bool)
   (ms-gcm-build-use-lists!)
   (if (not (ms-gcm-compute-earliest!))
       false
-      (let [(mut at) (be-inst-count)
+      (let [(mut round) 0
+            (mut moved) true
+            (mut at) 0
             (mut ok) true]
+      ;; ONE BACKWARD PASS IS NOT A FIXPOINT. Placement walks instructions from last to first, so a
+      ;; value's uses are normally settled before the value itself -- but not always: the deferred
+      ;; phi boxes `fng-distribute-deferred-phi-boxes!` creates are NEW instructions consumed by
+      ;; OLD ones, so a use sits at a lower index and moves after the def has already read its
+      ;; block. `for (const x of xs)` with two `continue`s produced exactly that, and
+      ;; `ms-gcm-placement-valid?` -- which recomputes the latest use -- then refused the program
+      ;; with MSEL-PLACEMENT: latest 6 at placement, 4 at verification.
+      ;;
+      ;; Repeating until nothing moves is what makes the two agree. The bound is a backstop, not an
+      ;; expectation: each round can only move an instruction toward a shallower loop depth or a
+      ;; block its inputs still dominate, and in practice the second round is already quiet.
+      (loop (if (or (not (load moved)) (or (not (load ok)) (>= (load round) 8)))
+                (break)
+                (do
+                  (set! moved false)
+                  (set! round (+ (load round) 1))
+                  (set! at (be-inst-count))
         (loop (if (or (<= (load at) 0) (not (load ok)))
                   (break)
                   (do
@@ -3226,8 +3421,10 @@
                                                      (mu-block-loop-depth (load choice)))
                                                   (set! choice (load cursor))
                                                   0))))
+                                  (if (!= (.block-id m) (load choice)) (set! moved true) 0)
                                   (set! (.block-id m) (load choice))))))))
                     0)))
+                  0)))
         (if (load ok) (do (ms-pack-instructions!) true) false))))
 
 (defn ms-cache-new-defs! [] (-> i64)
@@ -3454,9 +3651,6 @@
   (if (mu-build!) (ms-select-built!) false))
 (defn ms-select-program! [] (-> bool)
   (if (mu-build-program!) (ms-select-built!) false))
-(defn ms-select-entry! [(entry-fun i64)] (-> bool)
-  (if (mu-build-entry! entry-fun) (ms-select-built!) false))
-
 ; Convert verified block terminators to the legacy encodable label/branch vocabulary.  This is a
 ; separate publication step so the block verifier continues to reason about explicit successors.
 (defn ms-lowered-inst [(owner i64)
@@ -3939,7 +4133,7 @@
         (and (< target (mu-function-count))
              (= (mu-function-ideal target) (mu-direct-callee node)))
         (let [targets (^ target -1)
-              expected (ty-fun-targets (n-ty (n-in node 1)))
+              expected (be-call-target-summary (n-ty (n-in node 1)))
               (mut fidx) 0
               (mut valid) (= targets expected)]
           (loop (if (or (>= (load fidx) 63) (not (load valid)))
@@ -3987,24 +4181,6 @@
                 (set! i (+ (load i) 1))
                 0)))
     (load used)))
-
-(defn ms-call-live-valid? [(at i64)] (-> bool)
-  (let [call (be-inst at)
-        owner (.owner call)
-        (mut i) 0
-        (mut ok) true]
-    (loop (if (or (>= (load i) at) (not (load ok)))
-              (break)
-              (do
-                (let [m (be-inst (load i))
-                      dst (.dst m)]
-                  (if (and (= (.owner m) owner)
-                           (and (>= dst 0) (ms-vreg-used-after? owner dst at)))
-                      (set! ok false)
-                      0))
-                (set! i (+ (load i) 1))
-                0)))
-    (load ok)))
 
 (defn ms-block-range-valid? [(bid i64)] (-> bool)
   (let [first (mu-block-inst-first bid)
@@ -4511,48 +4687,6 @@
                 0)))
     0))
 
-;; One instruction per line with vregs, so a machine-level bug can be read against the
-;; disassembly instead of guessed at. ms-dump's terse one-line-per-block format is a GOLDEN
-;; contract (ms-render feeds test fixtures) and must not change.
-(defn ms-dump-verbose [(w (ptr Writer))] (-> i64)
-  (let [funcs (mu-function-count)
-        (mut owner) 0]
-    (loop (if (>= (load owner) funcs)
-              (break)
-              (do
-                (fmt w "function {d}\n" (load owner))
-                (let [nblocks (mu-function-block-count (load owner))
-                      (mut rpo) 0]
-                  (loop (if (>= (load rpo) nblocks)
-                            (break)
-                            (do
-                              (let [bid (mu-function-block (load owner) (load rpo))
-                                    first (mu-block-inst-first bid)
-                                    n (mu-block-inst-count bid)
-                                    (mut i) 0]
-                                (fmt w "  b{d}:\n" (load rpo))
-                                (loop (if (>= (load i) n)
-                                          (break)
-                                          (do
-                                            (let [at (+ first (load i))
-                                                  m (be-inst at)]
-                                              (fmt w "    {d}: {s} d={d} a={d} b={d} imm={d} n={d}\n"
-                                                   at
-                                                   (mi-op-name (ms-inst-op at))
-                                                   (load (field m dst))
-                                                   (load (field m a))
-                                                   (load (field m b))
-                                                   (load (field m imm))
-                                                   (load (field m node))))
-                                            (set! i (+ (load i) 1))
-                                            0)))
-                                0)
-                              (set! rpo (+ (load rpo) 1))
-                              0))))
-                (set! owner (+ (load owner) 1))
-                0)))
-    0))
-
 (defn ms-render [(buf (ptr i8)) (cap i64)] (-> (slice u8))
   (let [fb (alloc/stack FixBuf)
         w (alloc/stack Writer)]
@@ -4565,82 +4699,26 @@
       (if (>= n cap) (do (panic-corrupt "ms-render: buffer too small") 0) 0)
       (slice-new [u8] (cast (ptr u8) buf) n))))
 
-(defn be-stackmap-count [] (-> i64)
-  (let [n (be-inst-count)
-        (mut i) 0
-        (mut count) 0]
-    (loop (if (>= (load i) n)
-              (break)
-              (do
-                (if (= (.op (be-inst (load i))) MI-NEW)
-                    (set! count (+ (load count) 1))
-                    0)
-                (set! i (+ (load i) 1))
-                0)))
-    (load count)))
-
-(defn be-stackmap-pc [(which i64)] (-> i64)
-  (let [n (be-inst-count)
-        (mut i) 0
-        (mut seen) 0
-        (mut pc) -1]
-    (loop (if (or (>= (load i) n) (>= (load pc) 0))
-              (break)
-              (do
-                (if (= (.op (be-inst (load i))) MI-NEW)
-                    (if (= (load seen) which)
-                        (set! pc (.first (be-inst (load i))))
-                        (set! seen (+ (load seen) 1)))
-                    0)
-                (set! i (+ (load i) 1))
-                0)))
-    (load pc)))
-
-(defn be-stackmap-live-count [(which i64)] (-> i64)
-  (let [n (be-inst-count)
-        (mut i) 0
-        (mut seen) 0
-        (mut safepoint) -1
-        (mut count) 0]
-    ; `MInst.first` becomes an encoded byte offset after be-encode!, while `last` remains a
-    ; scheduled instruction index. Find the allocation in that latter domain instead of comparing
-    ; byte PCs with liveness indices.
-    (loop (if (or (>= (load i) n) (>= (load safepoint) 0))
-              (break)
-              (do
-                (if (= (.op (be-inst (load i))) MI-NEW)
-                    (if (= (load seen) which)
-                        (set! safepoint (load i))
-                        (set! seen (+ (load seen) 1)))
-                    0)
-                (set! i (+ (load i) 1))
-                0)))
-    (set! i 0)
-    (loop (if (>= (load i) n)
-              (break)
-              (do
-                (let [m (be-inst (load i))]
-                  (if (and (>= (load safepoint) 0)
-                           (and (>= (.dst m) 0)
-                                (and (<= (load i) (load safepoint))
-                                     (>= (.last m) (load safepoint)))))
-                      (set! count (+ (load count) 1))
-                      0))
-                (set! i (+ (load i) 1))
-                0)))
-    (load count)))
-
-
 ;; Machine representation classification is selection policy. Liveness consumes the result;
 ;; keeping it here prevents a selection/liveness dependency cycle.
+;; A VALUE SPANNING REPRESENTATION CLASSES IS TAGGED, and this asked about `VK-OBJ` alone -- so
+;; `num|str`, which is what `x + 1` on an `any` parameter produces, was classified a raw SCALAR. A
+;; function returning one then had no single return tag, `be-call-return-tag` answered -1, and
+;; `String(f(1))` failed instruction selection outright: the `Box` above the call had nothing to tag
+;; a value that was already tagged. `undefined|number` -- every `at` and `codePointAt` -- was
+;; classified the same wrong way.
+;;
+;; `be-kinds-must-be-tagged?` is the one place that rule is stated; this is the second reader of it.
 (defn ml-kind-for-type [(t i64)] (-> i64)
   (let [kinds (ty-kinds t)
         nonmoving (| VK-STR (| VK-SYM (| VK-BIG VK-FUN)))]
-    (if (ty-only-obj? t)
-        MLK-RAW-MANAGED
-        (if (and (!= kinds 0) (= (& kinds (bits-dual nonmoving VK-MASK)) 0))
-            MLK-NONMOVING
-            (if (!= (& kinds VK-OBJ) 0) MLK-BOXED MLK-SCALAR)))))
+    (if (be-kinds-must-be-tagged? t)
+        MLK-BOXED
+        (if (ty-only-obj? t)
+            MLK-RAW-MANAGED
+            (if (and (!= kinds 0) (= (& kinds (bits-dual nonmoving VK-MASK)) 0))
+                MLK-NONMOVING
+                (if (!= (& kinds VK-OBJ) 0) MLK-BOXED MLK-SCALAR))))))
 
 ;; Parm lattice types describe JavaScript values, not necessarily their machine representation.
 ;; In particular, receiver-aware calls intentionally pass typed object receivers as raw pointers;
@@ -4830,9 +4908,6 @@
   (.schedule-result (machine-unit)))
 (defn ms-schedule-item [] (-> i64)
   (.schedule-item (machine-unit)))
-(defn ms-schedule-seed [] (-> i64)
-  (.schedule-seed (machine-unit)))
-
 (defn ms-schedule-memory-node-dep? [(consumer i64) (node i64)] (-> bool)
   (let [m (be-inst consumer)
         first (.mem-first m)
@@ -4951,9 +5026,6 @@
                     3
                     0))))))
 
-(defn ms-schedule-latency [(op i64)] (-> i64)
-  (case op MI-SDIV 8 MI-MUL 4 MI-LOAD 4 MI-CALL 8 MI-NEW 6 1))
-
 (defn ms-schedule-priority [(at i64)] (-> i64)
   (let [m (be-inst at)]
     ; Correctness edges decide readiness. Latency remains separately queryable target metadata;
@@ -4968,21 +5040,6 @@
           (& (+ (* (+ seed 1) 1103515245)
                 (* (+ (.schedule-order (be-inst at)) 1) 2654435761))
              2147483647))))
-
-(defn ms-schedule-ready? [(first i64) (count i64) (candidate i64)] (-> bool)
-  (let [u (machine-unit)
-        (mut i) 0
-        (mut ready) true]
-    (loop (if (or (>= (load i) count) (not (load ready)))
-              (break)
-              (do
-                (if (and (= (al-get (.schedule-done u) (load i)) 0)
-                         (> (ms-schedule-dependency-kind (+ first (load i)) candidate) 0))
-                    (set! ready false)
-                    0)
-                (set! i (+ (load i) 1))
-                0)))
-    (load ready)))
 
 ;; Schedule one block, and if the edge set has no topological order, drop the two order-preserving
 ;; call/effect edges and schedule it again.

@@ -1,0 +1,263 @@
+(module nativefrontiertest)
+;; THE OPEN-BUG CORPUS, WATCHED BY THE EVERYDAY GATE.
+;;
+;; The bugs themselves are `tests/frontier/open-bugs-frontier.coil` -- one genuinely failing test
+;; each, red until fixed, run with `coil test --suite frontier`. They are out of the everyday gate
+;; because a permanently red `coil test` stops answering the question the gate exists for.
+;;
+;; So this file is what keeps them from rotting anyway. It does not assert that anything is broken;
+;; it derives the STATUS of each repro through the real pipeline, writes `docs/NATIVE-FRONTIER.md`,
+;; and compares that byte for byte with what is checked in. A bug that gets FIXED, one that
+;; REGRESSES, and one that merely changes how it is broken -- refused becoming a wrong answer, say
+;; -- all turn the gate red with a diff naming the file.
+;;
+;; THE REASON THIS EXISTS AT ALL. `repros/open/` held four hand-written bug files and a paragraph
+;; each, and nothing ran them: the tool that did, `tools/js-repro`, was deleted with the interpreter
+;; and the paragraphs stayed. By 2026-08-19 two of the four were FIXED and still filed as open, one
+;; of them by a change made hours earlier the same day. A bug record nothing executes is worse than
+;; no record, because it reads as current.
+;;
+;; DERIVED, NOT LISTED, for the reason `tests/native-capability-test.coil` states at length: a
+;; hand-typed list of open bugs is a second thing to forget to update. The corpus is the DIRECTORY.
+;;
+;; EVERY REPRO IS `main(7)`, and each file states node's answer for it in its own header.
+(import "nativeharness" :use *)
+(import "coil.assert" :use *)
+(import "coil.alloc" :use * :as alloc)
+(import "coil.arraylist" :use *)
+(import "coil.fmt" :use *)
+(import "coil.fs" :use *)
+(import "coil.io" :use *)
+(import "coil.slice" :use *)
+(import "coil.str" :use *)
+(import "ty" :use *)
+
+(defn frontier-arg [] (-> i64) 7)
+
+;; THE CORPUS IS THE DIRECTORY. `coil.fs` has no listing call, so the shell provides one; the
+;; alternative is a checked-in manifest, which is exactly the second list this file exists to avoid.
+;; Sorted, because `ls` is and the report has to be stable.
+(defn frontier-paths! [(a (ptr Allocator)) (out (mut (ArrayList (slice u8))))] (-> i64)
+  (assert (= (nh-run-shell! "ls repros/open/*.js > /tmp/aotk-frontier-list.txt") 0))
+  (let [text (nh-read-text a "/tmp/aotk-frontier-list.txt")
+        (mut at) 0]
+    (loop (if (>= (load at) (slice-len text))
+              (break)
+              (match (str-find-from text "\n" (load at))
+                (None [] (break))
+                (Some [end]
+                  (do
+                    (if (> end (load at))
+                        (al-push! [(slice u8)] (mut out)
+                                  (slice-new [u8] (index (slice-data text) (load at))
+                                             (- end (load at))))
+                        0)
+                    (set! at (+ end 1))
+                    0)))))
+    (assert (> (al-len [(slice u8)] (load out)) 0))
+    0))
+
+;; The file name without its directory, for the report.
+(defn frontier-name [(path (slice u8))] (-> (slice u8))
+  (let [(mut at) 0 (mut last) -1]
+    (loop (if (>= (load at) (slice-len path))
+              (break)
+              (do (if (= (load (index (slice-data path) (load at))) (cast u8 47))
+                      (set! last (load at))
+                      0)
+                  (set! at (+ (load at) 1)))))
+    (if (< (load last) 0)
+        path
+        (slice-new [u8] (index (slice-data path) (+ (load last) 1))
+                   (- (slice-len path) (+ (load last) 1))))))
+
+;; ---------------------------------------------------------------------------
+;; A repro without a test, or a test without a repro
+;; ---------------------------------------------------------------------------
+;; The failing suite names its cases at COMPILE time -- a `deftest` cannot be generated from a
+;; directory read at run time -- so it carries the one hand-written list in this design. This is
+;; what stops it drifting: every repro must appear in that file, and the file must mention no
+;; repro that does not exist. Adding a bug is two edits and forgetting either one fails here.
+(deftest every_open_repro_has_a_failing_test_and_the_reverse
+  (let [a (malloc-allocator)
+        suite (nh-read-text a "tests/frontier/open-bugs-frontier.coil")
+        (mut paths) (al-new [(slice u8)] (malloc-allocator))
+        (mut i) 0
+        (mut missing) 0
+        (mut mentions) 0
+        (mut at) 0]
+    (frontier-paths! a (mut paths))
+    (loop (if (>= (load i) (al-len [(slice u8)] (load paths)))
+              (break)
+              (let [path (al-get [(slice u8)] (load paths) (load i))]
+                (match (str-find suite path)
+                  (None [] (do (fmt (stderr)
+                                    "native-frontier: {s} has no case in tests/frontier/open-bugs-frontier.coil.\n  A bug with no failing test is how repros/open/ rotted the last time.\n"
+                                    path)
+                               (set! missing (+ (load missing) 1))
+                               0))
+                  (Some [_] 0))
+                (set! i (+ (load i) 1))
+                0)))
+    ;; And the other direction: a case naming a repro that no longer exists. The needle carries the
+    ;; opening QUOTE, because that file's own header prose says `repros/open/` too and a bare
+    ;; substring count reads the sentence as a ninth case.
+    (loop (match (str-find-from suite "\"repros/open/" (load at))
+            (None [] (break))
+            (Some [hit] (do (set! mentions (+ (load mentions) 1))
+                            (set! at (+ hit 13))
+                            0))))
+    (if (!= (load mentions) (al-len [(slice u8)] (load paths)))
+        (do (fmt (stderr)
+                 "native-frontier: the failing suite names {d} repros and repros/open/ holds {d}.\n  A case whose repro was deleted passes for the wrong reason.\n"
+                 (load mentions) (al-len [(slice u8)] (load paths)))
+            0)
+        0)
+    (assert (= (load missing) 0))
+    (assert (= (load mentions) (al-len [(slice u8)] (load paths))))
+    ;; SAID OUT LOUD ON EVERY GATE. The frontier suite is opt-in, which is the one thing about this
+    ;; design that can hide it: a green `coil test` with eight open bugs is exactly the shape of
+    ;; the problem this whole corpus exists to prevent. So the everyday gate prints the count and
+    ;; the command, and AGENTS.md makes running it a standing order rather than a good intention.
+    (let [w (stdout)]
+      (fmt w "\n=== THE FRONTIER: {d} OPEN BUGS ===\n" (al-len [(slice u8)] (load paths)))
+      (ps w "  coil test --suite frontier   -- eight failing tests, and they are the work queue.\n")
+      (ps w "  They are red because the bugs are real. Fixing one turns its test GREEN; it then\n")
+      (ps w "  stays as the regression test it already was. Never make one green any other way.\n"))
+    (al-free! [(slice u8)] (mut paths))
+    0))
+
+;; ---------------------------------------------------------------------------
+;; The report
+;; ---------------------------------------------------------------------------
+(defn render-frontier! [(buf (ptr i8)) (cap i64)] (-> (slice u8))
+  (let [a (malloc-allocator)
+        fb (alloc/stack FixBuf) w (alloc/stack Writer)
+        (mut paths) (al-new [(slice u8)] (malloc-allocator))
+        (mut i) 0]
+    (set! (.data fb) buf) (set! (.cap fb) cap) (set! (.len fb) 0)
+    (fixed-buffer-writer w fb)
+    (frontier-paths! a (mut paths))
+    (ps w "<!-- GENERATED by tests/native-frontier-test.coil. Do not edit. -->\n")
+    (ps w "# The open frontier\n\n")
+    (ps w "Every file in `repros/open/` is a bug this compiler still has, run through the real\n")
+    (ps w "pipeline at `main(7)`. Each has a GENUINELY FAILING test in\n")
+    (ps w "`tests/frontier/open-bugs-frontier.coil` -- run them with `coil test --suite frontier`,\n")
+    (ps w "which is red today and is supposed to be.\n\n")
+    (ps w "This table is regenerated and compared byte for byte on every everyday gate, so a bug\n")
+    (ps w "that is fixed, that regresses, or that merely changes how it is broken shows up as a\n")
+    (ps w "diff here rather than as a paragraph nobody rechecked.\n\n")
+    (ps w "| repro | status |\n|---|---|\n")
+    (loop (if (>= (load i) (al-len [(slice u8)] (load paths)))
+              (break)
+              (let [path (al-get [(slice u8)] (load paths) (load i))
+                    source (nh-read-text a path)
+                    status (nh-status source (frontier-arg))]
+                (fmt w "| `{s}` | {s} |\n" (frontier-name path) (nh-status-name status))
+                (set! i (+ (load i) 1))
+                0)))
+    (ps w "\n`refused` means the frontend declines the program by name. `crashes` means it compiled\n")
+    (ps w "and the binary did not answer. `disagrees` means it compiled, ran, and computed something\n")
+    (ps w "other than what node computes -- the worst of the three, because only a differential\n")
+    (ps w "finds it. `agrees with node` must never appear: that is a fixed bug still filed as open,\n")
+    (ps w "and its test in the frontier suite has gone green.\n")
+    (al-free! [(slice u8)] (mut paths))
+    (slice-new [u8] (cast (ptr u8) buf) (load (field fb len)))))
+
+;; ---------------------------------------------------------------------------
+;; The index: what works, what does not, and where each answer comes from
+;; ---------------------------------------------------------------------------
+;; A hand-written "what works" page is the exact thing this directory's history argues against, so
+;; every number here is COUNTED at generation time: the execution suite's cases out of its own
+;; source, the open bugs out of `repros/open/`, and the method sweep's agreement out of the
+;; differential report's own table. Change the compiler and this file changes, or the gate is red.
+(defn count-occurrences [(text (slice u8)) (needle (slice u8))] (-> i64)
+  (let [(mut at) 0 (mut n) 0]
+    (loop (match (str-find-from text needle (load at))
+            (None [] (break))
+            (Some [hit] (do (set! n (+ (load n) 1))
+                            (set! at (+ hit (slice-len needle)))
+                            0))))
+    (load n)))
+
+(defn render-what-works! [(buf (ptr i8)) (cap i64)] (-> (slice u8))
+  (let [a (malloc-allocator)
+        fb (alloc/stack FixBuf) w (alloc/stack Writer)
+        execution (nh-read-text a "tests/native-execution-test.coil")
+        differential (nh-read-text a "docs/NATIVE-DIFFERENTIAL.md")
+        (mut paths) (al-new [(slice u8)] (malloc-allocator))
+        (mut i) 0]
+    (set! (.data fb) buf) (set! (.cap fb) cap) (set! (.len fb) 0)
+    (fixed-buffer-writer w fb)
+    (frontier-paths! a (mut paths))
+    (ps w "<!-- GENERATED by tests/native-frontier-test.coil. Do not edit. -->\n")
+    (ps w "# What works, and what does not\n\n")
+    (ps w "Source in, an arm64 Mach-O object out, linked against `native/gc/runtime.c` and executed.\n")
+    (ps w "JavaScript semantics live in `lib/**/*.jsl`; the compiler lowers syntax into calls on them\n")
+    (ps w "and owns no meaning of its own.\n\n")
+    (ps w "Every number below is COUNTED when this file is generated, and the file is compared byte\n")
+    (ps w "for byte on every gate. Nothing here is maintained by hand -- a hand-maintained status\n")
+    (ps w "page is what rotted last time: `repros/open/` held four bug files whose runner had been\n")
+    (ps w "deleted, and two of the four were fixed and still filed as open.\n\n")
+    (fmt w "| | count |\n|---|---|\n")
+    (fmt w "| whole programs compiled, run on the CPU and compared against node | {d} |\n"
+         (count-occurrences execution "\n(deftest "))
+    (fmt w "| methods agreeing with node, of those the sweep can call | {d} of {d} |\n"
+         (count-occurrences differential "| yes |")
+         (count-occurrences differential "\n| `"))
+    (fmt w "| **open bugs, each a failing test** | {d} |\n\n"
+         (al-len [(slice u8)] (load paths)))
+    (ps w "## The two commands\n\n")
+    (ps w "```\ncoil test                    # the gate. MUST be green.\n")
+    (ps w "coil test --suite frontier   # the open bugs. RED, and that is the point.\n```\n\n")
+    (ps w "The frontier suite's failures are the work queue -- see `AGENTS.md`. Each asserts the\n")
+    (ps w "answer node gives, so fixing a bug turns its test green and it then stays as the\n")
+    (ps w "regression test it already was.\n\n")
+    (ps w "## Still broken\n\n")
+    (loop (if (>= (load i) (al-len [(slice u8)] (load paths)))
+              (break)
+              (let [path (al-get [(slice u8)] (load paths) (load i))
+                    source (nh-read-text a path)
+                    status (nh-status source (frontier-arg))]
+                (fmt w "- `{s}` -- {s}\n" (frontier-name path) (nh-status-name status))
+                (set! i (+ (load i) 1))
+                0)))
+    (ps w "\n## Where each answer comes from\n\n")
+    (ps w "| file | question it answers |\n|---|---|\n")
+    (ps w "| `docs/NATIVE-CAPABILITY.md` | what COMPILES, read out of the frontend's own dispatch tables |\n")
+    (ps w "| `docs/NATIVE-DIFFERENTIAL.md` | what AGREES WITH NODE -- every dispatched method, executed |\n")
+    (ps w "| `docs/NATIVE-FRONTIER.md` | what is still BROKEN, and in which way |\n")
+    (ps w "| `tests/native-execution-test.coil` | the hand-written correctness cases, each a real program |\n")
+    (ps w "| `HANDOFF.md` | the running narrative: what landed, what it cost, and the witness for each claim |\n")
+    (al-free! [(slice u8)] (mut paths))
+    (slice-new [u8] (cast (ptr u8) buf) (load (field fb len)))))
+
+(deftest what_works_is_derived_and_the_checked_in_index_matches
+  (let [a (malloc-allocator)
+        buf (alloc/stack (array i8 8192))
+        fresh (render-what-works! (cast (ptr i8) buf) 8192)
+        recorded (nh-read-text a "docs/WHAT-WORKS.md")]
+    (if (= fresh recorded)
+        0
+        (do
+          (write-file a "/tmp/aotk-what-works.md" fresh)
+          (fmt (stderr)
+               "native-frontier: docs/WHAT-WORKS.md is out of date.\n  The freshly derived index is in /tmp/aotk-what-works.md -- diff it and copy it over.\n")
+          0))
+    (assert (= fresh recorded)))
+  0)
+
+(deftest the_frontier_report_matches_what_is_checked_in
+  (let [a (malloc-allocator)
+        buf (alloc/stack (array i8 8192))
+        fresh (render-frontier! (cast (ptr i8) buf) 8192)
+        recorded (nh-read-text a "docs/NATIVE-FRONTIER.md")]
+    (if (= fresh recorded)
+        0
+        (do
+          (write-file a "/tmp/aotk-frontier.md" fresh)
+          (fmt (stderr)
+               "native-frontier: docs/NATIVE-FRONTIER.md is out of date.\n  The freshly derived report is in /tmp/aotk-frontier.md -- diff it, read what changed,\n  and copy it over if the change is one you meant to make.\n")
+          0))
+    (assert (= fresh recorded)))
+  0)

@@ -1,25 +1,83 @@
 # The demolition manual: one implementation of JavaScript, in the DSL
 
-**THE DECISION (E0, made by the owner 2026-08-16): push the primitive line down.** Every fat
-primitive — an operation whose meaning is a loop over smaller operations — becomes a DSL
-definition in `lib/`, and BOTH hand-written copies of it (`src/eval.coil` and
-`native/gc/runtime.c`) are DELETED IN THE SAME COMMIT. The owner has explicitly accepted
-breakage and lost functionality in exchange for deleted lines. When an operation resists, refuse
-it loudly (the rest-parameters pattern) rather than keeping a hand-written copy.
+**THE EVALUATOR IS GONE (owner, 2026-08-18).** `src/eval.coil`, `src/jsarray.coil`,
+`src/jsobject.coil`, the evaluator's string runtime, `tools/js-repro`, `tools/js-sweep` and every
+test that ran a program through the interpreter were deleted in one commit — 8,700 lines. The
+reasoning: an AOT compiler ships machine code, the interpreter shipped nothing, and it was one of
+the two hand-written copies of every primitive that this manual exists to delete. Deleting it
+halves the duplication in a single move and makes the remaining strikes smaller.
+
+**READ THIS BEFORE YOU DELETE ANYTHING ELSE. THERE IS NO JAVASCRIPT-SEMANTICS GATE RIGHT NOW.**
+`coil test` is 390 tests about the compiler's STRUCTURE — types, verifier, graph text, selection,
+scheduling, register allocation — plus about 70 assertions that execute machine code for
+arithmetic, control flow, calls and object memory. Nothing checks that a JavaScript program
+computes the right answer. Green does not mean correct. Every gate that could answer that
+question ran through the interpreter and went with it: the node differential, the fuzz property,
+the 48-repro sweep.
+
+**So the next work is not a strike. It is the native oracle** — see `## Phase A` below. Until it
+lands, a strike can be written but cannot be verified, and landing one on a green tree is
+landing it blind.
+
+**THE DECISION (E0, owner 2026-08-16): push the primitive line down.** Every fat primitive — an
+operation whose meaning is a loop over smaller operations — becomes a DSL definition in `lib/`,
+and the hand-written copy in `native/gc/runtime.c` is DELETED IN THE SAME COMMIT. (This used to
+say BOTH copies, eval.coil and runtime.c. There is only one now.) The owner has explicitly
+accepted breakage and lost functionality in exchange for deleted lines. When an operation
+resists, refuse it loudly (the rest-parameters pattern) rather than keeping a hand-written copy.
 
 What survives permanently:
-- **The atom set** (small ops the CPU/heap gives us; each needs one evaluator arm and one
-  instruction selection, and that is the ONLY duplication allowed in the repo).
+- **The atom set** — small ops the CPU/heap gives us. Each needs ONE implementation, the C case
+  in `runtime.c`, and one instruction selection. There is no second copy to keep in sync any
+  more; that is the whole benefit of deleting the interpreter.
 - **The GC**: `native/gc/runtime.c`'s allocation/collection/safepoints and `trampoline.S` are
   machine plumbing, not JavaScript. Never delete them. The string-constant materializer's use of
   `JSSOP-NEW`/`JSSOP-SET-UNIT` in `ms-select-string-id!` also stays.
-- **The evaluator as an atom interpreter.** Do NOT delete `eval.coil` wholesale — it is the
-  diagnostic engine for every test. It shrinks automatically as fat ops die.
+- **`src/jsstring.coil`, at 170 lines** — NOT a string runtime any more. It is the compiler's
+  string-CONSTANT table: source text interns here and `ms-select-string-id!` reads the units back
+  to materialize a constant into machine code. Do not grow it back.
 - **`lib/` — the single implementation of everything else.**
 
-Success is measured in deleted lines. Starting point: eval.coil 4,330 · runtime.c 2,274 ·
-jsstring.coil 451 · jsarray.coil 173 · jsobject.coil 351. Record the new totals in each strike's
-commit message.
+Success is measured in deleted lines. `runtime.c` 2,261 is the number that matters now.
+`repros/*.js` (49 files) and `tests/native-conformance/*.ts` are kept deliberately: they are the
+input corpus Phase A's harness will run.
+
+---
+
+## Phase A — the native oracle: DONE (2026-08-19)
+
+`tests/native-execution-test.coil` compiles TypeScript source to an object file, links it with
+`xcrun clang` against `native/gc/runtime.c` and `trampoline.S`, runs the binary, and compares the
+integer it prints with node's answer for the same source. **This is the only test in the repo that
+runs the artifact this project ships.**
+
+It needed no new machinery, and the earlier sketch in this file (mmap the code, hand-patch the `BL`
+relocations through thunks) was the wrong shape — the real linker does that job. The three legs
+already existed unassembled: `fe-native-new`/`frontend-native-build!` for source to graph,
+`linked-object-test`'s `fopen`+`popen`+`clang` for graph to running binary, and a `popen` of
+`node -e` for the other opinion.
+
+Falsified before it was trusted: changing one comparison in `lib/string/case.jsl` (65 to 66) makes
+`string_case_is_a_dsl_loop_and_it_runs_on_the_cpu` fail while the arithmetic case still passes.
+
+What it proves that nothing else did: `"AbZ@[a".toLowerCase()` has no implementation in the
+compiler and none in C — strike 1 deleted both — so the answer comes from `lib/string/case.jsl`
+lowered through `jsl_lower`, selected to JSSOP 0 and 1, emitted as arm64, and resolved by the
+linker against `_aot_js_string`. The emitted object's only undefined symbol IS `_aot_js_string`.
+
+**The frontier it exposed is DERIVED, not listed.** `tests/native-capability-test.coil` reads the
+method names out of the frontend's own dispatch tables, compiles each under four usage shapes, and
+writes `docs/NATIVE-CAPABILITY.md` -- checked in, compared on every run, 216 cells.
+
+**205 of 216 compile today, up from 113, and verifier rejections are 0.** Six fixes got there;
+HANDOFF.md has each with its witness. The theme is one sentence: A TYPE IS NOT A REPRESENTATION,
+and four separate places were deciding which machine word a value is by asking its type.
+
+The 11 that remain are one missing feature: `String(anArray)`. JavaScript says `String([1,2,3])`
+is `"1,2,3"` through `Array.prototype.toString`, and nothing implements that conversion --
+`ArrayJoin` exists in `lib/` and wants reaching from `ToStringValue`, not a case in the frontend.
+
+Read that report before scoping a strike.
 
 ---
 
@@ -65,9 +123,6 @@ is the third argument slot (use `(ms-immediate! owner bid 0)` for unused positio
 THIS IS ALREADY DONE: `AOT_JS_STRING_NEW = 0` and `AOT_JS_STRING_SET_UNIT = 1` exist and work
 (the constant materializer uses them). No C is needed for Strike 0.
 
-**src/eval.coil**: dispatch arm in the big value match (near `(ToFixed [] (ev-to-fixed n))`)
-plus the `ev-x` implementation.
-
 ## Part 2 — The op-DELETION drill (the point of everything)
 
 To DELETE a fat op `X`, in one commit:
@@ -79,9 +134,8 @@ To DELETE a fat op `X`, in one commit:
    `src/op_arbitrary.coil` (the fuzz generator), `src/js_templates.coil` (`js-op-family` and
    the emit arms — the TEMPLATE program can move to a surviving op's arm; do not lose the
    fuzz coverage of the JS feature, only the dead op).
-3. Delete the now-orphaned implementations: the `ev-x` function, any `jss-*`/`jsarray`/`jsobject`
-   helper only it used, the `n-x!` builder in node.coil, the `JSSOP-X` const, the runtime.c
-   case and the js-value.h enum member (leave a `/* retired: X */` comment at the enum so the
+3. Delete the now-orphaned implementations: the `n-x!` builder in node.coil, the `JSSOP-X`
+   const, the runtime.c case and the js-value.h enum member (leave a `/* retired: X */` comment at the enum so the
    numbering history is readable; never reuse the number).
 4. Update pins the compiler cannot see: `tests/jsl-test.coil` decl counts if lib
    definitions were added (`jsl-decl-count`, funs+macros totals, macro count),
@@ -115,9 +169,8 @@ Rewrite `lib/string/case.jsl`:
                 (recur (%Add i 1) (%StringSetUnit out i m)))))))
 
 Upper is the mirror (97–122 → subtract 32). This matches today's ASCII-only semantics exactly.
-Then DELETE ops `StringLower`, `StringUpper` (Part 2 drill: eval `ev-string-case` +
-`jss-ascii-case!`, runtime `TO_LOWER_ASCII`/`TO_UPPER_ASCII` cases, JSSOP 21/22, JSP 24/25,
-`n-string-lower!`/`n-string-upper!`, fuzz-table arms). Pin with node:
+DONE 2026-08-18. Ops `StringLower`/`StringUpper`, runtime `TO_LOWER_ASCII`/`TO_UPPER_ASCII`,
+JSSOP 21/22, JSP 24/25 and `n-string-lower!`/`n-string-upper!` are gone. Pinned against node:
 `"AbZ@[a".toLowerCase()` → `"abz@[a"`, upper mirror, plus a dynamic `String(acc)` receiver.
 
 ### Strike 2 — build/compare: `StringFromCodeUnit`, `StringConcat`, `StringEq`
@@ -147,9 +200,9 @@ copies (the runtime case is large — big deletion).
 
 ### Strike 6 — `ParseInt`; `ToFixed` and `NumberToString(radix)` in the DSL
 - `ParseInt`: char loop over units (sign, radix prefix, digit values). Delete the op.
-- `ToFixed`: the exact bignum ALGORITHM IS ALREADY WRITTEN TWICE in this repo
-  (`ev-to-fixed` in eval.coil and `aot_js_to_fixed_format` in runtime.c — both commented).
-  Port it ONCE to the DSL: the 32-bit-half bignum is expressible with `%NewArray`/
+- `ToFixed`: the exact bignum ALGORITHM is written in `aot_js_to_fixed_format` (runtime.c,
+  commented; the evaluator's twin `ev-to-fixed` was deleted with the interpreter — recover it from
+  git history if the commentary helps). Port it to the DSL: the 32-bit-half bignum is expressible with `%NewArray`/
   `%ArrayStore`/`%ArrayLoad` over an array of raw ints, or over a `%StringNew` unit buffer.
   Then delete BOTH copies and the `ToFixed` op — the poster child of this whole effort.
 - `NumberToString` radix formatting: digit loop. Delete `FROM_INT_RADIX`.
@@ -181,16 +234,18 @@ uses it, JSSOP 31, the templates that emit them.
 
 ## Part 4 — The gate protocol (run after every strike, no exceptions)
 
-    coil test                                     # full suite; read the exit, do not pipe-mask
-    coil build tools/js-repro.coil -o out/js-repro
-    for f in repros/*.js; do case "$f" in *ns.js) continue;; esac; \
-      ./out/js-repro "$f" 10 >/dev/null || echo "FAIL $f"; done
-    coil test tests/js-source-prop.coil --filter opcode_generated --cases 600
-    time ./out/js-repro repros/ns.js 10           # budget ~2 minutes; 5+ means investigate
+    coil check                                    # silent = clean
+    coil test                                     # read the exit; do not pipe-mask it
 
-Every strike also adds a deftest to `tests/js-source-prop.coil` whose expected values were
-computed BY RUNNING NODE (`node -e '...'`), never by hand — a hand-computed expectation shipped
-wrong once already.
+`coil test` now includes `tests/native-execution-test.coil`, which is the only suite that runs
+compiled code against node. **A strike is not done until its DSL definition has a case there.**
+Add one in the same commit, and let node supply the expected value rather than computing it by
+hand — a hand-computed expectation shipped wrong once already.
+
+The repro sweep, the fuzz property and the `ns.js` budget are still gone; they ran through the
+interpreter. Rebuilding the fuzz property on this harness is the next gate work after the `Box`
+selection fix — `src/js_templates.coil` in git holds 400 lines of node-verified program templates
+for it.
 
 ## Part 5 — Known traps (each of these cost real time; do not rediscover them)
 
@@ -211,16 +266,14 @@ wrong once already.
   cannot recur). String operations in this manual are all `builtin`s.
 - **GVN and allocation**: any op that creates identity or mutates gets op-class 2, never 98.
 - **Do not delete** `JSSOP-NEW`/`SET-UNIT` runtime cases, `ms-select-string-id!`, the GC, or
-  the trampoline. `jss-from-utf8!`/`jss-utf8!` stay (the evaluator's own I/O needs them).
-- **AN ALLOCATION OR A MUTATION MUST BE CONTROL-PINNED, and op-class 2 is not enough** (S0 cost an
-  hour here). The evaluator is demand-driven and recomputes an ordinary value node at EVERY
-  demand, so a floating `%StringNew` allocates a second string and a floating `%StringSetUnit`
-  writes the same unit twice — `jss-store-unit!` reports exactly that, by design. Two things fix
-  it together: lower the primitive with `(jl-ctrl)` as slot 0 (see `jl-prim`'s string-atom arm),
-  and put the op on the evaluator's per-control chain so each arrival clears its cache
-  (`ev-cached-value-op?` + `ev-string-atom`). Do NOT reach for `ev-effect-op?` — that list means
-  "runs on block entry AND its result is a memory state to publish", and an atom answering a
-  string fails the second half with `EV-MEM`.
+  the trampoline. `jss-from-utf8!`/`jss-utf8!` stay: the frontend interns source text with one
+  and `jsl_lower` reads names back with the other.
+- **AN ALLOCATION OR A MUTATION MUST BE CONTROL-PINNED, and op-class 2 is not enough.** Lower the
+  primitive with `(jl-ctrl)` as slot 0 — see `jl-prim`'s string-atom arm. A floating allocation is
+  free to be duplicated or sunk by anything that walks the graph. This was found the hard way when
+  the interpreter, which was demand-driven, ran a floating `%StringSetUnit` twice and wrote the
+  same unit twice; the interpreter is gone but the graph property it exposed is real, and the
+  scheduler is the next thing that will exercise it.
 - **A DELETED OP LEAVES A HOLE IN A DENSE, SCANNED ID SPACE.** `gparse-op` walks every OPTAG and
   `jsp-find` walks every JSP id, so a retired number must be declared — `op-tag-retired?`
   (node.coil) and `jsp-retired?` (jsl.coil) — or the parser aborts on its own table. Add the
@@ -228,15 +281,16 @@ wrong once already.
 
 ## Part 6 — Progress ledger (update per strike, with commit hashes)
 
-| strike | status | eval.coil | runtime.c | notes |
-|---|---|---|---|---|
-| baseline | — | 4330 | 2274 | 2026-08-16 |
-| S0 atoms | **done** | 4373 | 2274 | 2026-08-18. `StringAlloc`/`StringSetUnit`, OPTAGs 91/92, JSP 94/95. Registration ADDS lines; the deletions start at S1. |
-| S1 case | **done** | 4373 | 2261 | 2026-08-18. lib/string/case.jsl is a loop over the atoms; `StringLower`/`StringUpper`, `ev-string-case`, `jss-ascii-case!`, JSSOP 21/22 and the C case are gone. |
-| S2 build/compare | open | | | |
-| S3 substring | open | | | |
-| S4 search | open | | | |
-| S5 split | open | | | |
-| S6 parseint/tofixed/radix | open | | | |
-| S7 double ToString | open | | | |
-| S8 delete normalize | open | | | |
+| strike | status | runtime.c | notes |
+|---|---|---|---|
+| baseline | — | 2274 | 2026-08-16. eval.coil was 4330 then; it is 0 now. |
+| S0 atoms | **done** | 2274 | 2026-08-18. `StringAlloc`/`StringSetUnit`, OPTAGs 91/92, JSP 94/95. Registration adds; deletion starts at S1. The evaluator half of this strike was deleted the same day. |
+| S1 case | **done** | 2261 | 2026-08-18. lib/string/case.jsl is a loop over the atoms; the ops, JSSOP 21/22 and the C case are gone. **Its native half has never executed — Phase A validates it.** |
+| **Phase A** | **NEXT** | — | The native oracle. No strike below can be verified until it lands. |
+| S2 build/compare | open | | |
+| S3 substring | open | | |
+| S4 search | open | | |
+| S5 split | open | | |
+| S6 parseint/tofixed/radix | open | | |
+| S7 double ToString | open | | |
+| S8 delete normalize | open | | |

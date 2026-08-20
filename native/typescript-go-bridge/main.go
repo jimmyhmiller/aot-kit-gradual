@@ -176,6 +176,18 @@ func aot_ts_node_kind(raw C.uintptr_t, id C.int32_t) C.int32_t {
 	if n == nil {
 		return -1
 	}
+	// `for await (const x of xs)` is a DIFFERENT iteration protocol, not a decoration on this
+	// one, so it gets its own code rather than sharing KindForOfStatement's.
+	//
+	// IT USED TO RETURN 0, the bridge's "no code for this", and that was worse in two ways. Kind 0
+	// is also what every syntax nobody has taught this function returns, so the diagnostic said
+	// "bridge kind 0" instead of naming the construct; and the frontend's catch-all for kind 0 is
+	// an ABORT, which no test can observe without forking -- and forking here deadlocks on the Go
+	// runtime (see tests/native-capability-test.coil). With a real code the refusal happens at
+	// INDEXING, recoverably, and `tests/native-frontier-test.coil` can assert it on every gate.
+	if n.Kind == ast.KindForOfStatement && n.AsForInOrOfStatement().AwaitModifier != nil {
+		return 260
+	}
 	return C.int32_t(stableKindCode(n.Kind))
 }
 
@@ -207,6 +219,7 @@ func stableKindCode(kind ast.Kind) int32 {
 	case ast.KindPropertySignature: return 172
 	case ast.KindTypeReference: return 184
 	case ast.KindTypeLiteral: return 188
+	case ast.KindArrayType: return 189
 	case ast.KindUnionType: return 193
 	case ast.KindLiteralType: return 202
 	case ast.KindArrayLiteralExpression: return 210
@@ -234,6 +247,8 @@ func stableKindCode(kind ast.Kind) int32 {
 	case ast.KindDoStatement: return 247
 	case ast.KindWhileStatement: return 248
 	case ast.KindForStatement: return 249
+	case ast.KindForOfStatement: return 250
+	case ast.KindForInStatement: return 259
 	case ast.KindLabeledStatement: return 251
 	case ast.KindContinueStatement: return 252
 	case ast.KindBreakStatement: return 253
@@ -450,6 +465,7 @@ func roleNode(n *ast.Node, role int32, index int32) *ast.Node {
 		case ast.KindParameter: return n.AsParameterDeclaration().Initializer
 		case ast.KindPropertyAssignment: return n.AsPropertyAssignment().Initializer
 		case ast.KindForStatement: return n.AsForStatement().Initializer
+		case ast.KindForInStatement, ast.KindForOfStatement: return n.AsForInOrOfStatement().Initializer
 		}
 	case 5: // expression / operand
 		if index != 0 { return nil }
@@ -466,6 +482,7 @@ func roleNode(n *ast.Node, role int32, index int32) *ast.Node {
 		case ast.KindPostfixUnaryExpression: return n.AsPostfixUnaryExpression().Operand
 		case ast.KindSwitchStatement: return n.AsSwitchStatement().Expression
 		case ast.KindCaseClause: return n.AsCaseOrDefaultClause().Expression
+		case ast.KindForInStatement, ast.KindForOfStatement: return n.AsForInOrOfStatement().Expression
 		}
 	case 6: // left
 		if n.Kind == ast.KindBinaryExpression && index == 0 { return n.AsBinaryExpression().Left }

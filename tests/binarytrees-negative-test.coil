@@ -3,7 +3,6 @@
 (import "binarytrees" :use *)
 (import "node" :use *)
 (import "shape" :use *)
-(import "eval" :use *)
 (import "ty" :use *)
 (import "backend_core" :use *)
 (import "backend_select" :use *)
@@ -21,32 +20,6 @@
         (do (set! value (* (load value) 2)) (set! i (+ (load i) 1)) 0)))
     (load value)))
 (defn neg-tree-check [(depth i64)] (-> i64) (- (neg-pow2 (+ depth 1)) 1))
-
-(defn neg-result-field [(slot i64)] (-> i64)
-  (let [obj (rt-payload (ev-result)) alias (shape-field-alias (ev-obj-shape obj) slot)
-        ver (hv-find (ev-result-mem) obj alias)]
-    (if (< ver 0) -9223372036854775807 (rt-payload (hve-val (hv-ent ver))))))
-
-(defn neg-result-valid? [(depth i64)] (-> bool)
-  (if (or (!= (ev-status) EV-OK) (!= (rt-tag (ev-result)) RT-OBJ)) false
-    (if (or (!= (neg-result-field 0) (+ depth 1))
-            (!= (neg-result-field 1) (neg-tree-check (+ depth 1)))) false
-      (let [(mut slot) 0 (mut valid) true]
-        (loop
-          (if (or (>= (load slot) BT-WORK-SLOTS) (not (load valid))) (break)
-            (do (let [work-depth (+ BT-MIN-DEPTH (* (load slot) 2))
-                      base (+ 2 (* (load slot) 3))
-                      iterations (if (<= work-depth depth)
-                                     (neg-pow2 (+ (- depth work-depth) BT-MIN-DEPTH)) 0)]
-                  (if (or (!= (neg-result-field base) work-depth)
-                          (or (!= (neg-result-field (+ base 1)) iterations)
-                              (!= (neg-result-field (+ base 2))
-                                  (* iterations (neg-tree-check work-depth)))))
-                      (set! valid false) 0))
-                (set! slot (+ (load slot) 1)) 0)))
-        (and (load valid)
-             (and (= (neg-result-field 29) depth)
-                  (= (neg-result-field 30) (neg-tree-check depth))))))))
 
 (defn neg-find-op [(op i64)] (-> i64)
   (let [(mut i) 0 (mut found) NO-NODE]
@@ -110,24 +83,6 @@
             (set! i (+ (load i) 1)) 0)))
     (load found)))
 
-(defn neg-run-caught! [(kind i64)] (-> bool)
-  (let [arg (binarytrees-build! (+ 2400 kind))]
-    (case kind
-      0 (let [load-node (neg-find-op OPTAG-LOAD)]
-          (n-set-op! load-node (Load (+ (n-load-alias load-node) 2))))
-      1 (let [eq (neg-find-op OPTAG-EQ)] (store! (field (nd eq) op) (Lt)))
-      2 (let [add (neg-find-recursive-add)] (n-set-def! add 2 (bt-const 0)))
-      3 (let [phi (neg-find-loop-phi) entry (n-in phi 1) back (n-in phi 2)]
-          (n-set-def! phi 1 back) (n-set-def! phi 2 entry))
-      4 (let [constant (neg-find-pow-base-constant)]
-          (n-set-op! constant (Const (t-int-con 2)))
-          (n-set-ty! constant (t-int-con 2)))
-      5 (let [call (neg-find-final-check-call)] (n-set-def! call 2 (bt-null)))
-      0)
-    (ev-reset!) (ev-bind! arg (RInt 4))
-    (ev-run-nobind 10000000)
-    (not (neg-result-valid? 4))))
-
 (defn build-asymmetric-field-check! [(swap bool)] (-> i64)
   (graph-reset! (if swap 2502 2501)) (shape-reset!)
   (let [left-shape (shape-transition SHAPE-ROOT "left" (t-obj))
@@ -165,23 +120,6 @@
                 (set! found (load i)) 0)
             (set! i (+ (load i) 1)) 0)))
     (load found)))
-
-(deftest focused_binarytrees_mutations_are_observable
-  (let [(mut kind) 0]
-    (loop
-      (if (> (load kind) 5) (break)
-        (do (let [caught (neg-run-caught! (load kind))]
-              (if caught 0 (do (fmt (stderr) "uncaught binarytrees mutation {d}\n" (load kind)) 0))
-              (assert caught))
-            (store! kind (+ (load kind) 1)) 0)))))
-
-(deftest exchanging_left_and_right_offsets_is_observable_on_distinct_children
-  (build-asymmetric-field-check! false)
-  (assert (= (ev-run-bound 1 100000) EV-OK))
-  (assert (= (rt-payload (ev-result)) 1))
-  (build-asymmetric-field-check! true)
-  (assert (= (ev-run-bound 1 100000) EV-OK))
-  (assert (= (rt-payload (ev-result)) 0)))
 
 (deftest assigning_the_long_lived_root_to_a_caller_saved_register_is_rejected
   (binarytrees-build! 2510)

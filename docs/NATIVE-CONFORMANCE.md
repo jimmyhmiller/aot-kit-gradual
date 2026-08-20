@@ -1,3 +1,6 @@
+> **HISTORICAL, 2026-08-18.** The tools and gates this file describes were deleted with the
+> evaluator. Kept for the findings themselves, which Phase A's harness should re-cover.
+
 # Native source conformance
 
 `tools/native-source-conformance.sh` is the product-path correctness gate. Each case is an ordinary

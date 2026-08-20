@@ -20,10 +20,9 @@
 //
 // This file stays here because it still does not RUN -- implementing rest parameters means
 // materialising an array from the extra arguments at a call site whose ABI is fixed-arity, which
-// is feature work rather than a defect. Pinned meanwhile by
-// `a_rest_parameter_is_refused_rather_than_bound_to_nothing` in tests/js-source-prop.coil, whose
-// second case checks that an ordinary parameter list still indexes -- otherwise the test would
-// pass by refusing everything.
+// is feature work rather than a defect. It is asserted still-refused on every gate by
+// `tests/native-frontier-test.coil`; the pointer this paragraph used to carry was to
+// `tests/js-source-prop.coil`, which was deleted with the interpreter, and nothing noticed.
 //
 // node says 10 for main(7).
 function main(n) {

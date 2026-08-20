@@ -180,7 +180,6 @@
 (const JSP-FLOORNUM         i64 44)
 (const JSP-CEILNUM          i64 45)
 (const JSP-ROUNDNUM         i64 46)
-(const JSP-UNBOXBOOL        i64 47)
 ;; `%ArrayResize a n v` — set the array's length to `n`, and ORDER the resize after `v`. The third
 ;; operand is not data the resize consumes; it is the value whose read must happen first. `pop`
 ;; loads the last element and then shortens the array, and nothing in the memory chain says the
@@ -201,7 +200,6 @@
 (const JSP-ISOBJECT         i64 59)
 (const JSP-ISFUNCTION       i64 60)
 (const JSP-PROPHASNAMED     i64 61)
-(const JSP-PROPDELETENAMED  i64 62)
 (const JSP-PROTOTYPEHAS     i64 63)
 (const JSP-EXPNUM           i64 64)
 (const JSP-LOGNUM           i64 65)
@@ -258,7 +256,9 @@
 ;; Retired primitive ids, for the reason `op-tag-retired?` exists: this space is dense and
 ;; scanned, and `jsp-op` panics on an id with no row. Never reused.
 (defn jsp-retired? [(id i64)] (-> bool)
-  (or (= id 24) (= id 25)))  ; %StringLower, %StringUpper -- lib/string/case.jsl
+  (or (= id 24) (= id 25)     ; %StringLower, %StringUpper -- lib/string/case.jsl
+      (or (= id 47)           ; %UnboxBool -- declared, never used by lib/
+          (= id 62))))        ; %PropDeleteNamed -- same
 
 (defn jsp-name [(id i64)] (-> (slice u8))
   (case id
@@ -309,7 +309,6 @@
         JSP-FLOORNUM       "%FloorNum"
         JSP-CEILNUM        "%CeilNum"
         JSP-ROUNDNUM       "%RoundNum"
-        JSP-UNBOXBOOL      "%UnboxBool"
         JSP-ARRAYRESIZE    "%ArrayResize"
         JSP-UNBOXOBJ       "%UnboxObj"
         JSP-PROPLOADNAMED  "%PropLoadNamed"
@@ -324,7 +323,6 @@
         JSP-ISOBJECT       "%IsObject"
         JSP-ISFUNCTION     "%IsFunction"
         JSP-PROPHASNAMED   "%PropHasNamed"
-        JSP-PROPDELETENAMED "%PropDeleteNamed"
         JSP-PROTOTYPEHAS   "%PrototypeHas"
         JSP-EXPNUM         "%ExpNum"
         JSP-LOGNUM         "%LogNum"
@@ -407,7 +405,6 @@
         JSP-FLOORNUM       (JsBuiltin (jsp-aux id))
         JSP-CEILNUM        (JsBuiltin (jsp-aux id))
         JSP-ROUNDNUM       (JsBuiltin (jsp-aux id))
-        JSP-UNBOXBOOL      (Unbox (jsp-aux id))
         JSP-ARRAYRESIZE    (ArrayResize)
         JSP-UNBOXOBJ       (Unbox (jsp-aux id))
         JSP-PROPLOADNAMED  (PropLoad (jsp-aux id))
@@ -422,7 +419,6 @@
         JSP-ISOBJECT       (TypeTest (jsp-aux id))
         JSP-ISFUNCTION     (TypeTest (jsp-aux id))
         JSP-PROPHASNAMED   (PropHas (jsp-aux id))
-        JSP-PROPDELETENAMED (PropDelete (jsp-aux id))
         JSP-PROTOTYPEHAS   (ProtoHas)
         JSP-EXPNUM         (JsBuiltin (jsp-aux id))
         JSP-LOGNUM         (JsBuiltin (jsp-aux id))
@@ -507,7 +503,6 @@
         JSP-FLOORNUM       1
         JSP-CEILNUM        1
         JSP-ROUNDNUM       1
-        JSP-UNBOXBOOL      1
         JSP-ARRAYRESIZE    3
         JSP-UNBOXOBJ       1
         JSP-PROPLOADNAMED  2
@@ -522,7 +517,6 @@
         JSP-ISOBJECT       1
         JSP-ISFUNCTION     1
         JSP-PROPHASNAMED   2
-        JSP-PROPDELETENAMED 2
         JSP-PROTOTYPEHAS   2
         JSP-EXPNUM         1
         JSP-LOGNUM         1
@@ -587,7 +581,6 @@
         JSP-PROPLOADNAMED JSP-MEM-READ
         JSP-PROPSTORENAMED JSP-MEM-WRITE
         JSP-PROPHASNAMED JSP-MEM-READ
-        JSP-PROPDELETENAMED JSP-MEM-WRITE
         JSP-PROTOTYPEHAS JSP-MEM-READ
         JSP-SETPROTOTYPE JSP-MEM-WRITE
         JSP-PROPLOADKEY JSP-MEM-READ
@@ -621,7 +614,6 @@
         JSP-UNBOXNUMBER (t-flt)
         JSP-UNBOXINT (t-int)
         JSP-UNBOXFLT (t-flt)
-        JSP-UNBOXBOOL (t-bool)
         JSP-UNBOXOBJ  (t-obj)
         JSP-UNBOXSTRING (t-str)
         ;; The descriptor id the `OPTAG-JSBUILTIN` runtime dispatches on. Rounding a double needs a
@@ -702,6 +694,7 @@
    (nparams       i64)
    (ret           i64)          ; a TyId; TY-NO-ID when `:ret` was omitted
    (usesmem       bool)         ; reads the heap, so it takes memory as a trailing parameter
+   (callsback     bool)         ; invokes a JavaScript callback value, directly or through a callee
    (heapparams    i64)          ; bitset: parameters whose value reaches a heap-array operand
    (body          (ptr rd/Sexp))
    (fun           i64)])        ; the OPTAG-FUN node once lowered; NO-NODE until then
@@ -869,9 +862,9 @@
     (load n)))
 
 (defn jsl-decl-nparams [(i i64)] (-> i64) (.nparams (jsl-decl-p i)))
+(defn jsl-decl-ret [(i i64)] (-> i64) (.ret (jsl-decl-p i)))
 (defn jsl-decl-transitioning? [(i i64)] (-> bool) (.transitioning (jsl-decl-p i)))
 (defn jsl-decl-cold? [(i i64)] (-> bool) (.cold (jsl-decl-p i)))
-(defn jsl-decl-ret [(i i64)] (-> i64) (.ret (jsl-decl-p i)))
 (defn jsl-decl-body [(i i64)] (-> (ptr rd/Sexp)) (.body (jsl-decl-p i)))
 (defn jsl-decl-fun [(i i64)] (-> i64) (.fun (jsl-decl-p i)))
 (defn jsl-decl-uses-memory? [(i i64)] (-> bool) (.usesmem (jsl-decl-p i)))
@@ -881,12 +874,14 @@
 (defn jsl-decl-set-uses-memory! [(i i64) (v bool)] (-> i64)
   (set! (.usesmem (jsl-decl-p i)) v) 0)
 
-;; How many arguments a caller supplies: the declared parameters, plus the heap when the callee
-;; reads it. The IR already has this convention — `v-need-call-args` permits the LAST argument of a
-;; call to be a memory producer — so passing the heap positionally is what the verifier expects
-;; rather than something invented here.
-(defn jsl-decl-call-arity [(i i64)] (-> i64)
-  (+ (jsl-decl-nparams i) (if (jsl-decl-uses-memory? i) 1 0)))
+;; Does this definition invoke a JAVASCRIPT CALLBACK? Distinct from `usesmem`, which asks about the
+;; heap this library owns. A callback runs USER code, which can write anything the caller's scope
+;; reaches -- a captured cell, a closure environment field -- none of which is JS-PROPERTY-ALIAS,
+;; and none of which the JSL memory convention carries. The frontend asks so it can hand such a
+;; definition the same full memory merge an ordinary JavaScript call gets.
+(defn jsl-decl-calls-back? [(i i64)] (-> bool) (.callsback (jsl-decl-p i)))
+(defn jsl-decl-set-calls-back! [(i i64) (v bool)] (-> i64)
+  (set! (.callsback (jsl-decl-p i)) v) 0)
 
 ;; A store straight into the live element.
 (defn jsl-decl-set-fun! [(i i64) (fun i64)] (-> i64)
@@ -949,7 +944,6 @@
 (defn jsl-keyword? [(x (ptr rd/Sexp))] (-> bool) (rd/sexp-kw? x))
 
 (defn jsl-prim-name? [(s (slice u8))] (-> bool) (jsl-starts-with? s JSL-CH-PERCENT))
-
 
 ;; A type annotation, or TY-NO-ID. A bare symbol carries the spellings with no bracket or space (`dyn`, `int=0`);
 ;; a string carries the rest of `text.coil`'s grammar verbatim (`"int=[0..9]"`). Both go to the one
@@ -1380,6 +1374,55 @@
 (defn jsl-check-heap-shape [] (-> i64)
   (jsl-resolve-heap-params!))
 
+;; The same walk as `jsl-body-reads-memory?`, asking a narrower question: does this body contain a
+;; JavaScript CALL form, or call a definition that does. `call`, `call-with-receiver` and
+;; `call-dynamic-with-receiver` are the three surface spellings; every other head is either a
+;; primitive or another definition, and a definition propagates the answer to its callers.
+(defn jsl-body-calls-back? [(x (ptr rd/Sexp))] (-> bool)
+  (if (and (not (rd/sexp-list? x)) (not (rd/sexp-vec? x))) false
+    (let [n (rd/sexp-count x) (mut i) 0 (mut found) false]
+      (if (and (rd/sexp-list? x) (and (> n 0) (rd/sexp-sym? (rd/sexp-nth x 0))))
+          (let [name (rd/sexp-sym (rd/sexp-nth x 0))]
+            (if (or (= name "call")
+                    (or (= name "call-with-receiver") (= name "call-dynamic-with-receiver")))
+                (set! found true)
+              (if (jsl-prim-name? name)
+                  0
+                  (let [c (jsl-find name)]
+                    (if (and (>= c 0) (jsl-decl-calls-back? c)) (set! found true) 0)))))
+          0)
+      (loop (if (or (>= (load i) n) (load found)) (break)
+              (do (if (jsl-body-calls-back? (rd/sexp-nth x (load i))) (set! found true) 0)
+                  (set! i (+ (load i) 1))
+                  0)))
+      (load found))))
+
+(defn jsl-resolve-callback-use! [] (-> i64)
+  (let [n (jsl-decl-count) (mut changed) true (mut rounds) 0]
+    (loop (if (not (load changed)) (break)
+            (do
+              (set! changed false)
+              (let [(mut i) 0]
+                (loop (if (>= (load i) n) (break)
+                        (do
+                          (if (jsl-decl-calls-back? (load i)) 0
+                            (if (jsl-body-calls-back? (jsl-decl-body (load i)))
+                                (do (jsl-decl-set-calls-back! (load i) true)
+                                    (set! changed true) 0)
+                                0))
+                          (set! i (+ (load i) 1))
+                          0))))
+              (set! rounds (+ (load rounds) 1))
+              (if (> (load rounds) (+ n 1))
+                  (do (jsl-fail! JSL-ERR-MACRO-RECURSION "callback-use fixpoint") 0)
+                  0)
+              0)))
+    JSL-OK))
+
+(defn jsl-name-calls-back? [(name (slice u8))] (-> bool)
+  (let [d (jsl-find name)]
+    (and (>= d 0) (jsl-decl-calls-back? d))))
+
 (defn jsl-resolve-memory-use! [] (-> i64)
   (let [n (jsl-decl-count) (mut changed) true (mut rounds) 0]
     (loop (if (not (load changed)) (break)
@@ -1436,7 +1479,9 @@
       (let [cycles (jsl-check-macro-cycles)]
         (if (!= cycles JSL-OK) cycles
           (let [mem (jsl-resolve-memory-use!)]
-            (if (!= mem JSL-OK) mem (jsl-check-heap-shape))))))))
+            (if (!= mem JSL-OK) mem
+              (let [cb (jsl-resolve-callback-use!)]
+                (if (!= cb JSL-OK) cb (jsl-check-heap-shape))))))))))
 
 ; ============================================================================
 ; The reader
@@ -1668,21 +1713,3 @@
           (if (!= (load err) JSL-OK) (load err)
             (if (= (load loaded) 0) (jsl-fail! JSL-ERR-EMPTY-INDEX path)
               (jsl-check))))))))
-
-;; The diagnostic. Printed by the tools and by a failing test, so the message names the code and
-;; the definition rather than reporting that something, somewhere, was wrong.
-;; `path:lo-hi: CODE at "name"`. The range comes from whichever form the walk was inspecting, which
-;; is the innermost one under the failing check.
-(defn jsl-report [(w (ptr Writer))] (-> i64)
-  (if (jsl-ok?) 0
-    (do (print-str w (jsl-source-path (jsl-err-src)))
-        (ps w ":")
-        (dec-print w (jsl-err-lo))
-        (ps w "-")
-        (dec-print w (jsl-err-hi))
-        (ps w ": ")
-        (ps w (jsl-err-name (jsl-err)))
-        (ps w " at \"")
-        (print-str w (jsl-where))
-        (ps w "\"\n")
-        0)))

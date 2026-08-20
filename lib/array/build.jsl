@@ -292,33 +292,6 @@
         (let [(ignored (%ArrayStore out (%Sub i lo) (%ArrayLoad a i)))]
           (recur (%Add i 1)))))))
 
-;; A dense array of `n` copies of `v`. `Array.prototype.fill` over a fresh array.
-(macro ArrayRepeat :params [(n dyn) (v dyn)] :ret dyn
-  (let [(a (%NewArray))]
-    (loop [(i 0)]
-      (if (%Le n i) a
-        (let [(ignored (%ArrayStore a i v))]
-          (recur (%Add i 1)))))))
-
-;; The ascending integers [0, n), which gives the conformance table an array whose every element is
-;; distinguishable — a fill of one repeated value cannot tell an off-by-one index from a correct one.
-(macro ArrayIota :params [(n dyn)] :ret dyn
-  (let [(a (%NewArray))]
-    (loop [(i 0)]
-      (if (%Le n i) a
-        (let [(ignored (%ArrayStore a i i))]
-          (recur (%Add i 1)))))))
-
-;; The original pre-callback conformance fixture. Kept as a small closed mapping probe; `ArrayMap`
-;; below is the actual JavaScript callback definition reached by source programs.
-(macro ArrayMapDouble :params [(src dyn)] :ret dyn
-  (let [(len (%ArrayLen src))
-        (out (%NewArray))]
-    (loop [(i 0)]
-      (if (%Le len i) out
-        (let [(ignored (%ArrayStore out i (%Mul (%ArrayLoad src i) 2)))]
-          (recur (%Add i 1)))))))
-
 ;; https://tc39.es/ecma262/#sec-array.prototype.map. Array elements already carry the tagged
 ;; JavaScript representation expected by a callback. The index and receiver array are boxed at the
 ;; semantic boundary, and the callback result is stored without changing its representation.
@@ -492,16 +465,23 @@
                           (recur (%Add i 1)))))))]
           (recur (%Sub end 1)))))))
 
+;; https://tc39.es/ecma262/#sec-array.prototype.flatmap -- FlattenIntoArray with depth 1, and the
+;; depth is the whole subtlety: a mapped element is SPREAD when it is an array and APPENDED when it
+;; is not. This used to do neither. It unboxed EVERY mapped value as an object and read its length,
+;; so `[1, 2, 3].flatMap(x => x)` -- whose callback answers a number -- read the length of a number
+;; and produced the EMPTY array where node says "1,2,3".
+;;
+;; `ArrayConcatValue` IS that append-or-spread step, already written for `concat`, so this is the
+;; loop and nothing else. It could not be written this way until `be-array-value?` learned to follow
+;; a `Call` to its callee's returns: `ArrayConcatValue` asks `%IsArray`, and an array returned from a
+;; function was not array-tagged, so `flatMap(x => [x, x])` appended three arrays instead of
+;; spreading six numbers. Both callbacks are in `tests/native-execution-test.coil` now, because the
+;; two shapes fail in opposite directions and one of them passing proves nothing about the other.
 (macro ArrayFlatMap :transitioning true :params [(src dyn) (callback dyn)] :ret dyn
   (let [(len (%ArrayLen src))
         (out (%NewArray))]
-    (loop [(i 0) (to 0)]
+    (loop [(i 0)]
       (if (%Le len i) out
-        (let [(mapped (%UnboxObj (call callback (%ArrayLoad src i) (%Box i) src)))
-              (mlen (%ArrayLen mapped))
-              (next
-                (loop [(j 0) (at to)]
-                  (if (%Le mlen j) at
-                    (let [(stored (%ArrayStore out at (%ArrayLoad mapped j)))]
-                      (recur (%Add j 1) (%Add at 1))))))]
-          (recur (%Add i 1) next))))))
+        (let [(mapped (call callback (%ArrayLoad src i) (%Box i) src))
+              (appended (ArrayConcatValue out mapped))]
+          (recur (%Add i 1)))))))

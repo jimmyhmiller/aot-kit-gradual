@@ -20,6 +20,13 @@ coil test              # THE gate. 45 suites, 550 tests, one compile of the shar
 Green means every suite still holds. **Nothing is marked done and nothing is committed while it is
 red**, which is the contract the whole project runs on.
 
+**AND GREEN DOES NOT MEAN CORRECT RIGHT NOW.** The graph interpreter was deleted on 2026-08-18
+(see HANDOFF.md), and with it every check that a JavaScript program computes the right answer: the
+node differential, the fuzz property, the repro sweep. What remains is 390 tests about the
+compiler's STRUCTURE plus ~70 that execute machine code for arithmetic, control flow, calls and
+object memory. Strings, properties, arrays and the collector are compiled and never run. The next
+work is the native execution suite that closes that hole — `docs/DEMOLITION.md`, Phase A.
+
 The gate used to be `tools/gate.sh`: shell gates, 19 Node oracles, a second frontend in JavaScript,
 35 emit drivers and 40 C harnesses. All of it is gone. That deletion dropped real coverage —
 differential testing against a JavaScript engine, proof that emitted machine code executes, and the
@@ -94,9 +101,30 @@ and application compatibility. The V8-v7 workloads remain regression evidence ra
 product destination. Graphs can still be built directly through the node API for focused compiler
 tests.
 
-Source-level native claims are tracked by the [Node differential conformance gate](docs/NATIVE-CONFORMANCE.md).
-It distinguishes product-path support from phase-local capability tests and correctness-qualifies
-every native benchmark before timing.
+Two derived reports answer the two different questions, both regenerated and compared byte for byte
+on every run, both read out of the compiler's own dispatch tables so that adding a method adds a row:
+
+- **[docs/NATIVE-CAPABILITY.md](docs/NATIVE-CAPABILITY.md)** -- what COMPILES. 216 of 216 cells
+  today, from `tests/native-capability-test.coil`. This is a ceiling, not a floor.
+
+Both sweep METHODS on built-in receivers, so neither says anything about a loop, a closure, an
+object method or a conditional expression. Those are hand-written in `tests/native-execution-test.coil`,
+and HANDOFF.md records what is still known to be wrong. The largest remaining gap is `for...of`,
+which is refused by name rather than silently wrong.
+- **[docs/NATIVE-DIFFERENTIAL.md](docs/NATIVE-DIFFERENTIAL.md)** -- what is RIGHT. Every method
+  compiled to arm64, linked, EXECUTED, and compared against the same source run by node, from
+  `tests/native-differential-test.coil`. 49 of 53 agree; the 4 that do not are listed by name.
+
+`docs/STATUS.md` answers a third question -- whether a definition exists in `lib/` and the frontend
+calls it -- and says everything is done.
+
+Hand-written execution cases live in `tests/native-execution-test.coil`, and both suites share the
+pipeline in `tests/native_harness.coil`: source in, a linked arm64 binary out, node's answer beside
+it. Source-level native claims WERE tracked by the Node differential conformance gate; its runner was
+deleted with the shell gates on 2026-08-13, and
+[docs/NATIVE-CONFORMANCE.md](docs/NATIVE-CONFORMANCE.md) now describes what that gate did rather
+than something you can run. Its corpus (`tests/native-conformance/*.ts` plus the manifest) is kept as
+the input for the replacement.
 
 ## The two things that will cost you a day
 

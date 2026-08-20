@@ -1,3 +1,6 @@
+> **HISTORICAL, 2026-08-18.** The tools and gates this file describes were deleted with the
+> evaluator. Kept for the findings themselves, which Phase A's harness should re-cover.
+
 # What the JavaScript source fuzzer has found
 
 `tests/js-source-prop.coil` generates `Op` values, lifts them to TypeScript, and runs the same text
@@ -30,7 +33,7 @@ nothing rejected kind 0. Three different symptoms, one cause:
 |---|---|---|
 | `x as number` | **segfault** — the expression dispatch returned `NO-NODE` and the caller used it as a node id | reported |
 | `[...a, 3]` | **wrong answer, no diagnostic** — length 2 where node says 3 | reported |
-| `for (const v of xs)` | graph built with control stuck at the Start node | reported |
+| `for (const v of xs)` | graph built with control stuck at the Start node | reported, and since 2026-08-19 **lowered** -- see HANDOFF |
 
 Fixed by making both dispatch fallthroughs loud (`fng-unsupported-syntax!`), and by splitting the
 array-literal element skip: an **elision** is kind 0 with an empty extent and is still skipped, so

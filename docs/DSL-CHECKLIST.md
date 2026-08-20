@@ -83,14 +83,23 @@ guards, re-record any golden graphs, gate with `--cases 600` fuzz.
       correct (enumeration learned shapes — see E6). **Done when:** such a test exists and
       passes.
 
-## E. The primitive layer: one meaning per primitive, not two hand-written copies
+## E. The primitive layer: one meaning per primitive
 
-Today every `%` primitive is implemented twice: `eval.coil` (the oracle, ~163 `ev-*` functions)
-and `native/gc/runtime.c` + `js-value.h` (~2,300 lines C).
+**RESOLVED BY DELETION, 2026-08-18.** This section used to open "every `%` primitive is
+implemented twice: `eval.coil` (the oracle, ~163 `ev-*` functions) and `native/gc/runtime.c`
+(~2,300 lines C)." The evaluator is gone, so there is exactly one implementation of every
+primitive. The items below are no longer about reconciling twins — each is now "is this operation
+a loop that belongs in `lib/`, or an atom the machine provides?", and a strike deletes C without
+having to delete anything else in step.
+
+**E-GATE: satisfied 2026-08-19.** `tests/native-execution-test.coil` compiles a program, links it
+against the runtime, runs it, and compares with node. A strike in this section is verified by adding
+a case there. Note the frontier it exposed: `substring`/`slice` do not compile at all today, so
+strike 3 cannot be verified until `Box` selection is fixed.
 
 - [x] E0. **DECIDED (owner, 2026-08-16): push the primitive line down.** Fat primitives become
-      DSL definitions over a small atom set; BOTH hand-written copies are deleted in the same
-      commit; what remains duplicated is only the atom interpreter + atom selection, plus the
+      DSL definitions over a small atom set; the hand-written C copy is deleted in the same
+      commit (it said BOTH copies until the interpreter was deleted outright on 2026-08-18); what remains duplicated is only the atom interpreter + atom selection, plus the
       GC as permanent native substrate. Breakage and lost functionality are acceptable in
       exchange for deleted lines. **The execution plan, written for a less capable model to run
       step-by-step, is `docs/DEMOLITION.md`** — the items below map onto its strikes.
@@ -150,10 +159,11 @@ and `native/gc/runtime.c` + `js-value.h` (~2,300 lines C).
       hand-written semantic requires adding a door back in a commit that says so.
 - [ ] G3. Layer-D guard: the dispatch-data facts (D1–D4) are covered by tests or derived from
       the DSL, so they cannot drift silently.
-- [ ] G4. The primitive layer (E) has a conformance harness: one table of cases runs against
-      the evaluator, the native runtime, and node, so the two implementations cannot disagree
-      silently. (The fuzz property covers composite programs; this is the per-primitive
-      version.)
+- [x] G4. The primitive layer (E) has a conformance harness — `tests/native-execution-test.coil`
+      (2026-08-19). It was to run cases "against the evaluator, the native runtime, and node"; the
+      evaluator no longer exists, so it is two implementations, ours and node's, which is the
+      comparison that was ever worth anything. What is still owed is BREADTH: six cases today, and
+      the fuzz property that generated composite programs has not been rebuilt on it.
 
 ---
 
