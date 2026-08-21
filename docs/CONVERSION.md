@@ -36,10 +36,10 @@ The last twelve rows were written, spec-annotated and Node-verified for months w
 `fng-string-builtin?` listed nine method names and none of these were among them, so no program
 could call any of them. They are covered by `string-methods.ts` and `string-transforms.ts`.
 
-`fng-string-builtin-arity?` carries each name's supported argument counts and REFUSES the rest:
-`lastIndexOf(needle, from)` is a frontend diagnostic rather than a compile with the `fromIndex`
-dropped, because `StringLastIndexOf` has no way to honour it and a silently ignored argument is a
-wrong answer.
+`fng-string-builtin-arity?` carries each name's supported argument counts and REFUSES the rest.
+String search positions are boxed and passed to their DSL definitions, which own
+ToIntegerOrInfinity, defaulting, bounds, and `lastIndexOf`'s special NaN-as-+Infinity rule; the
+frontend does not drop or interpret them.
 
 `split` was the largest open item and the last hand-written IR node in the frontend with JavaScript
 semantics in it. What made it look blocked was the allocation — the hand-written path built its own

@@ -1,5 +1,45 @@
 # Handoff: move JavaScript semantics into the DSL
 
+## STRING SEARCH POSITIONS LIVE IN THE DSL (2026-08-21, latest)
+
+`String.prototype.indexOf`, `includes`, `startsWith`, `endsWith`, and `lastIndexOf` now pass boxed
+optional positions into `lib/string/*.jsl`. The DSL owns ToIntegerOrInfinity, clamping, negative and
+infinite positions, the `endsWith` undefined-to-length default, and `lastIndexOf`'s distinct
+NaN-to-+Infinity rule. `lastIndexOf`'s forward scan stops at the converted position, including for
+an empty needle. The frontend now accepts the real optional arities, but only reports absence and
+boxes representation; it does not interpret the values.
+
+Complete reruns of all five upstream Test262 method directories produced **88 passed, 40 failed,
+80 refused, and 43 skipped**, versus 48 passed, 34 failed, 126 refused, and 43 skipped before this
+change. Forty refusals became native passes. Six refusals became honest failures: four
+object-valued `lastIndexOf` positions expose the existing missing ToPrimitive/`valueOf` support,
+and the large multi-assertion `indexOf/position-tointeger.js` now reaches graph construction but
+exhausts the compiler's bounded allocator instead of stopping at its former encoder refusal.
+
+The merged full-corpus artifact at `.amp/in/artifacts/test262-current.jsonl` now contains **2,591
+passed, 8,596 failed, 48,074 refused, and 23,017 skipped** across the same 82,278 unique records.
+This is an honest incremental rerun: unsupported object coercion and compiler scaling were not
+special-cased into passes.
+
+Verification on Linux x86-64:
+
+* Coil main `bbac459` produced byte-identical stage-2/stage-3 x64 compilers. `.agents/setup` could
+  not install it because Coil's own upstream x64 behavioral gate currently reports 53 passed and
+  three build failures (`closure-lib.coil`, `defclosure.coil`, and `sums-deep.coil`). This
+  repository's suites were run with that freshly built stage-2 compiler; the upstream Coil gate
+  failure is not hidden or attributed to this repository.
+* Complete upstream String `indexOf`, `includes`, `startsWith`, `endsWith`, and `lastIndexOf`
+  directories — **88 passed, 40 failed, 80 refused, 43 skipped**.
+* `COIL_META_CACHE=0 coil test tests/jsl-test.coil --no-fork` — **38 passed, 0 failed**.
+* `COIL_META_CACHE=0 coil test tests/dsl-ownership-test.coil --no-fork` — **4 passed, 0 failed**,
+  with no frontend-owned JavaScript operation.
+* `COIL_META_CACHE=0 coil test tests/native-differential-test.coil --no-fork` — **1 passed, 0
+  failed**, including the new optional-position probes against Node.
+* `COIL_META_CACHE=0 coil test` — **428 passed, 0 failed**.
+* `COIL_META_CACHE=0 coil test --suite frontier` — intentionally **0 passed, 8 failed**: the same
+  seven named frontend refusals and 26-vs-25 semantic disagreement, with no infrastructure
+  failures.
+
 ## ARRAY SEARCH `fromIndex` AND `substr` COUNT LIVE IN THE DSL (2026-08-21, latest)
 
 `Array.prototype.indexOf`, `includes`, and `lastIndexOf` now pass the boxed `fromIndex` value into

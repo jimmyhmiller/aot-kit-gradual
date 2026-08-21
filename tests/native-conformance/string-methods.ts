@@ -23,12 +23,18 @@ export function main(): number {
   total = total + (s.includes("zzz") ? 32 : 0);
   total = total + (s.includes("Hello", 3) ? 64 : 0);
   total = total + (s.startsWith("") ? 128 : 0);
+  total = total + (s.startsWith("World", 6) ? 256 : 0);
+  total = total + (s.endsWith("Hello", 5) ? 512 : 0);
+  total = total + (s.endsWith("World", 5) ? 1024 : 0);
+  total = total + (s.includes("World", -5) ? 2048 : 0);
 
   // "o" is at 4 and at 7. A miss is -1, offset by 2 here so it stays inside its own column.
   total = total + s.lastIndexOf("o") * 1000;
-  total = total + (s.lastIndexOf("zzz") + 2) * 100000;
+  total = total + s.lastIndexOf("o", 6) * 10000;
+  total = total + s.lastIndexOf("o", undefined) * 100000;
+  total = total + (s.lastIndexOf("zzz") + 2) * 1000000;
   // The empty needle is the row that made StringLastIndexOf terminate: it matches at every index
-  // including len, and the definition's `from > len` guard is the only thing that stops the loop.
+  // through the converted limit, and the definition's `from > limit` guard stops the loop.
   total = total + s.lastIndexOf("") * 10000000;
 
   // Each trim reads a length, so removing the wrong end is a different answer than removing both.

@@ -675,8 +675,8 @@ for byte against the JavaScript codegen.
 parameter holds whatever representation the value already has: a string literal in a `.jsl` file
 lowers to `n-string-const!`, a raw pointer, and `%StringIndexOf` reads it as one. So the frontend
 passes its string straight through — boxing it would hand the library a tagged word where it expects
-a pointer. `StringIndexOfFrom` takes `(s dyn) (needle dyn) (start int)` and returns `int`, which is
-exactly what the IR node it replaces took and returned, so nothing at the boundary converts.
+a pointer. `StringIndexOfFrom` takes the position as `dyn` so the DSL owns ToIntegerOrInfinity and
+saturation, then returns the raw `int` index expected by its consumers.
 
 ### The scheduling bug this exposed
 

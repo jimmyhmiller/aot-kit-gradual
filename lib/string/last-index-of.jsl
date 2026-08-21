@@ -1,5 +1,4 @@
-;; https://tc39.es/ecma262/#sec-string.prototype.lastindexof, over already-coerced arguments and
-;; searching the whole receiver.
+;; https://tc39.es/ecma262/#sec-string.prototype.lastindexof, over already-coerced arguments.
 ;;
 ;; Returns an UNBOXED index, like `StringIndexOfFrom`. The library's rule is that internal helpers
 ;; hand back machine values and only entry points box: the backend treats a `dyn`-typed Phi as
@@ -9,19 +8,21 @@
 ;; forward `%StringIndexOf`. Each step resumes one past the previous hit, so the loop runs once per
 ;; occurrence rather than once per code unit.
 ;;
-;; THE `from > len` GUARD IS WHAT MAKES IT TERMINATE, and the empty needle is why. `StringIndexOfFrom`
-;; CLAMPS its start to [0, len], so once `from` runs past the end an empty needle keeps matching at
-;; `len` for ever: hit = len, recur from len+1, clamp back to len, hit = len again. Without this
-;; test `"abc".lastIndexOf("")` does not return. Every other needle terminates on the `hit < 0` arm,
-;; which is exactly why the empty-needle row had to be in the conformance table.
+;; NaN is deliberately detected after ToNumber and before ToIntegerOrInfinity: lastIndexOf gives
+;; NaN (including an omitted or undefined position) the value +Infinity, whereas ordinary index
+;; conversion would turn it into zero. The forward search stops when its next hit lies beyond the
+;; clamped limit. The `from > limit` guard is also what makes an empty needle terminate.
 (builtin StringLastIndexOf
   :transitioning true
-  :params [(s dyn) (needle dyn)]
+  :params [(s dyn) (needle dyn) (position dyn)]
   :ret int
-  (loop [(from 0) (best -1)]
-    (if (%Lt (%StringLen s) from)
-        best
-        (let [(hit (StringIndexOfFrom s needle from))]
-          (if (%Lt hit 0)
-              best
-              (recur (%Add hit 1) hit))))))
+  (let [(len (%StringLen s))
+        (number (ToNumberValue position))
+        (limit (if (IsNaNValue number) len (ClampedIndex number len)))]
+    (loop [(from 0) (best -1)]
+      (if (%Lt limit from)
+          best
+          (let [(hit (%StringIndexOf s needle from))]
+            (if (%Lt hit 0)
+                best
+                (if (%Lt limit hit) best (recur (%Add hit 1) hit))))))))

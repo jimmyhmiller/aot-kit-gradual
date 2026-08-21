@@ -26,10 +26,10 @@ statement about the probe rather than about the method.
 | `"abcdef"` | `v.indexOf(1, 2)` | yes |
 | `"abcdef"` | `v.toLowerCase()` | yes |
 | `"abcdef"` | `v.toUpperCase()` | yes |
-| `"abcdef"` | `v.startsWith(1)` | yes |
-| `"abcdef"` | `v.endsWith(1)` | yes |
+| `"abcdef"` | `v.startsWith(1, 2)` | yes |
+| `"abcdef"` | `v.endsWith(1, 2)` | yes |
 | `"abcdef"` | `v.includes(1, 2)` | yes |
-| `"abcdef"` | `v.lastIndexOf(1)` | yes |
+| `"abcdef"` | `v.lastIndexOf(1, 2)` | yes |
 | `"abcdef"` | `v.padStart(1, 2)` | yes |
 | `"abcdef"` | `v.padEnd(1, 2)` | yes |
 | `"abcdef"` | `v.repeat(1)` | yes |

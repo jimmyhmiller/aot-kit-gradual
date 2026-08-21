@@ -2939,11 +2939,10 @@
 ;; and the compile stops. Passing the JSL gates says nothing about that; only
 ;; `tools/native-source-conformance.sh` does.
 ;;
-;; THE ARITY IS PART OF THE ENTRY, not a detail. `lastIndexOf` takes a `fromIndex` in the language
-;; and `StringLastIndexOf` does not implement one, so the two-argument form is REFUSED here rather
-;; than compiled with the argument dropped: a silently ignored argument is a wrong answer, and a
-;; name this function rejects is a clear frontend diagnostic. Same for the three-argument `replaceAll`
-;; and for `at` with more than one.
+;; THE ARITY IS PART OF THE ENTRY, not a detail. A silently ignored argument is a wrong answer, and
+;; a name this function rejects is a clear frontend diagnostic. The search methods accept their
+;; optional position because the boxed value now reaches the DSL rather than being dropped. The
+;; three-argument `replaceAll` and `at` with more than one remain refused.
 (defn fng-string-builtin-arity? [(name (slice u8)) (argc i64)] (-> bool)
   (cond (= name "charAt")      (<= argc 1)
         (= name "charCodeAt")  (<= argc 1)
@@ -2956,10 +2955,10 @@
         (= name "toLowerCase") (= argc 0)
         (= name "toUpperCase") (= argc 0)
         ;; Added with the reachability pass. Everything below already had a definition.
-        (= name "startsWith")  (= argc 1)
-        (= name "endsWith")    (= argc 1)
+        (= name "startsWith")  (<= argc 2)
+        (= name "endsWith")    (<= argc 2)
         (= name "includes")    (<= argc 2)
-        (= name "lastIndexOf") (= argc 1)
+        (= name "lastIndexOf") (<= argc 2)
         (= name "padStart")    (<= argc 2)
         (= name "padEnd")      (<= argc 2)
         (= name "repeat")      (= argc 1)
@@ -3299,28 +3298,40 @@
         ;; existing `"undefined"` string, which is what ToString of an absent argument produces.
         (fng-jsl-call3 context "StringIndexOfFrom" string
                        (fng-string-argument context node 1 "undefined")
-                       (if (> argc 1) (fng-expression context (ts-child ast node 2)) (fng-const 0)))
-      ;; The three search predicates. Each is `StringIndexOfFrom` plus a comparison in the library,
-      ;; which is why none of them needed a primitive: `startsWith` is "first occurrence is 0",
-      ;; `endsWith` is "occurrence at len-len is exactly there" with the guard that makes an
-      ;; over-long needle answer false, and `includes` is "not -1". All three return a BOXED
-      ;; boolean, so the result is `FNG-DYNAMIC` and reaches truthiness the ordinary way.
+                       (n-box! (if (> argc 1)
+                                   (fng-expression context (ts-child ast node 2))
+                                   (fng-const 0))))
+      ;; The three search predicates are string search plus comparisons in the library, which is
+      ;; why none needs a new primitive. Their boxed positions are converted and bounded there;
+      ;; `endsWith` also computes the candidate start from its end position. All three return a
+      ;; BOXED boolean, so the result is `FNG-DYNAMIC` and reaches truthiness the ordinary way.
       (= name "startsWith")
-        (fng-jsl-call2 context "StringStartsWith" string
-                       (fng-string-argument context node 1 "undefined"))
+        (fng-jsl-call3 context "StringStartsWith" string
+                       (fng-string-argument context node 1 "undefined")
+                       (n-box! (if (> argc 1)
+                                   (fng-expression context (ts-child ast node 2))
+                                   (fng-undefined))))
       (= name "endsWith")
-        (fng-jsl-call2 context "StringEndsWith" string
-                       (fng-string-argument context node 1 "undefined"))
+        (fng-jsl-call3 context "StringEndsWith" string
+                       (fng-string-argument context node 1 "undefined")
+                       (n-box! (if (> argc 1)
+                                   (fng-expression context (ts-child ast node 2))
+                                   (fng-undefined))))
       (= name "includes")
         (fng-jsl-call3 context "StringIncludesFrom" string
                        (fng-string-argument context node 1 "undefined")
-                       (if (> argc 1) (fng-expression context (ts-child ast node 2)) (fng-const 0)))
-      ;; `StringLastIndexOf` scans FORWARD keeping the last hit, because the primitive only searches
-      ;; forward. `fng-string-builtin-arity?` refuses the two-argument form rather than dropping the
-      ;; `fromIndex` the definition has no way to honour.
+                       (n-box! (if (> argc 1)
+                                   (fng-expression context (ts-child ast node 2))
+                                   (fng-const 0))))
+      ;; `StringLastIndexOf` scans forward keeping the last hit up to the DSL's converted position,
+      ;; because the primitive only searches forward. Omitted and explicit values follow the same
+      ;; boxed-value boundary as the other search methods.
       (= name "lastIndexOf")
-        (fng-jsl-call2 context "StringLastIndexOf" string
-                       (fng-string-argument context node 1 "undefined"))
+        (fng-jsl-call3 context "StringLastIndexOf" string
+                       (fng-string-argument context node 1 "undefined")
+                       (n-box! (if (> argc 1)
+                                   (fng-expression context (ts-child ast node 2))
+                                   (fng-undefined))))
       ;; The padding pair. The filler defaults to a single space, which is the spec's default and
       ;; the reason the second argument is optional at all.
       (= name "padStart")
