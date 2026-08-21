@@ -22,6 +22,9 @@ import (
 	"github.com/microsoft/typescript-go/internal/tspath"
 )
 
+//export aot_ts_force_link
+func aot_ts_force_link() {}
+
 type parseResult struct {
 	file     *ast.SourceFile
 	source   string

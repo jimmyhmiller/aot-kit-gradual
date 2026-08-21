@@ -15,6 +15,7 @@
 (import "backend_core" :use *) (import "backend_select" :use *)
 (import "backend_schedule" :use *) (import "backend_allocate" :use *)
 (import "backend_aarch64" :use *) (import "backend_macho" :use *)
+(import "native_code_test_support" :use *)
 (import "coil.assert" :use *) (import "coil.io" :use *) (import "coil.fmt" :use *)
 (import "coil.slice" :use *) (import "coil.alloc" :use * :as alloc) (import "coil.control" :use *)
 (extern fopen :cc c [(ptr i8) (ptr i8)] (-> (ptr u8)))
@@ -44,7 +45,9 @@
       (set! (.data fb) (cast (ptr i8) b4))
       (set! (.cap fb) 2048) (set! (.len fb) 0)
       (fixed-buffer-writer w fb)
-      (fmt w "printf '#include <stdint.h>\\n#include <stdio.h>\\nextern int64_t kernel(int64_t);\\nint main(void){{printf(\"%%lld\\\\n\",(long long)kernel({d}));}}\\n' > /tmp/aotk-prop.c && xcrun clang -arch arm64 /tmp/aotk-prop.c /tmp/aotk-prop.o -o /tmp/aotk-prop 2>/dev/null && /tmp/aotk-prop" arg)
+      (if (host-native-x64?)
+          (fmt w "printf '#include <stdint.h>\\n#include <stdio.h>\\nextern int64_t kernel(int64_t);\\nint main(void){{printf(\"%%lld\\\\n\",(long long)kernel({d}));}}\\n' > /tmp/aotk-prop.c && clang /tmp/aotk-prop.c /tmp/aotk-prop.o -o /tmp/aotk-prop 2>/dev/null && /tmp/aotk-prop" arg)
+          (fmt w "printf '#include <stdint.h>\\n#include <stdio.h>\\nextern int64_t kernel(int64_t);\\nint main(void){{printf(\"%%lld\\\\n\",(long long)kernel({d}));}}\\n' > /tmp/aotk-prop.c && xcrun clang -arch arm64 /tmp/aotk-prop.c /tmp/aotk-prop.o -o /tmp/aotk-prop 2>/dev/null && /tmp/aotk-prop" arg))
       (set! (index (cast (ptr i8) b4) (load (field fb len))) (cast i8 0)))
     (let [p (popen (cast (ptr i8) b4) (cstr! (cast (ptr i8) b3) 8 "r"))]
       (assert (!= (cast i64 p) 0))
@@ -78,8 +81,8 @@
   (assert (be-select-machine-program!))
   (be-schedule!)
   (assert (= (be-color! 8) 0))
-  (assert (be-encode-checked!))
-  (assert (be-macho-checked!))
+  (assert (host-native-encode-checked!))
+  (assert (host-native-object-checked!))
   (emit-and-run arg))
 
 ;; AN ALLOCATING PROGRAM, LINKED AGAINST THE COLLECTOR AND RUN.
@@ -104,7 +107,9 @@
       (fwrite (be-object-data) 1 (be-object-len) f)
       (fclose f))
     (let [p (popen (cstr! (cast (ptr i8) b4) 2048
-                          "printf '#include <stdint.h>\\n#include <stddef.h>\\n#include <stdio.h>\\nint aot_gc_configure(size_t,int);\\nextern int64_t kernel(void);\\nint64_t aot_gc_enter(int64_t(*)(void));\\nint main(void){if(!aot_gc_configure(4096,0))return 2;printf(\"%%lld\\\\n\",(long long)aot_gc_enter(kernel));}\\n' > /tmp/aotk-gc.c && xcrun clang -arch arm64 -O1 -fno-omit-frame-pointer -Inative/gc /tmp/aotk-gc.c native/gc/runtime.c native/gc/trampoline.S /tmp/aotk-gc.o -o /tmp/aotk-gc 2>/dev/null && /tmp/aotk-gc")
+                          (if (host-native-x64?)
+                              "printf '#include <stdint.h>\\n#include <stddef.h>\\n#include <stdio.h>\\nint aot_gc_configure(size_t,int);\\nextern int64_t kernel(void);\\nint64_t aot_gc_enter(int64_t(*)(void));\\nint main(void){if(!aot_gc_configure(4096,0))return 2;printf(\"%%lld\\\\n\",(long long)aot_gc_enter(kernel));}\\n' > /tmp/aotk-gc.c && clang -O1 -fno-omit-frame-pointer -Inative/gc /tmp/aotk-gc.c native/gc/runtime.c native/gc/trampoline.S /tmp/aotk-gc.o -lm -o /tmp/aotk-gc 2>/dev/null && /tmp/aotk-gc"
+                              "printf '#include <stdint.h>\\n#include <stddef.h>\\n#include <stdio.h>\\nint aot_gc_configure(size_t,int);\\nextern int64_t kernel(void);\\nint64_t aot_gc_enter(int64_t(*)(void));\\nint main(void){if(!aot_gc_configure(4096,0))return 2;printf(\"%%lld\\\\n\",(long long)aot_gc_enter(kernel));}\\n' > /tmp/aotk-gc.c && xcrun clang -arch arm64 -O1 -fno-omit-frame-pointer -Inative/gc /tmp/aotk-gc.c native/gc/runtime.c native/gc/trampoline.S /tmp/aotk-gc.o -o /tmp/aotk-gc 2>/dev/null && /tmp/aotk-gc"))
                    (cstr! (cast (ptr i8) b3) 8 "r"))]
       (assert (!= (cast i64 p) 0))
       (fgets (cast (ptr i8) out) 128 p)
@@ -128,8 +133,8 @@
     (be-use-runtime-allocation! true)
     (be-schedule!)
     (assert (>= (be-color! 1) 0))
-    (assert (be-encode-checked!))
-    (assert (be-macho-checked!))
+    (assert (host-native-encode-checked!))
+    (assert (host-native-object-checked!))
     ;; two allocations, so two calls into the collector -- and the field written to the FIRST
     ;; object is the one read back, across a second allocation that could have moved it.
     (assert (= (gc-run) 41))))

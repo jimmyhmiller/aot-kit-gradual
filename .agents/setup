@@ -1,0 +1,111 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+readonly repo_root
+
+step() {
+  local label=$1
+  shift
+  local started=$SECONDS
+  printf '\n==> %s\n' "$label"
+  "$@"
+  printf '<== %s (%ss)\n' "$label" "$((SECONDS - started))"
+}
+
+install_system_dependencies() {
+  local -a packages=()
+  command -v cc >/dev/null 2>&1 || packages+=(build-essential)
+  command -v clang >/dev/null 2>&1 || packages+=(clang)
+  command -v curl >/dev/null 2>&1 || packages+=(curl ca-certificates)
+  command -v git >/dev/null 2>&1 || packages+=(git)
+  command -v python3 >/dev/null 2>&1 || packages+=(python3)
+
+  if ((${#packages[@]} == 0)); then
+    printf 'System dependencies are already installed.\n'
+    return
+  fi
+
+  if ((EUID == 0)); then
+    apt-get update
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${packages[@]}"
+  else
+    sudo apt-get update
+    sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${packages[@]}"
+  fi
+}
+
+install_go() {
+  local version=1.25.14
+  local archive="go${version}.linux-amd64.tar.gz"
+  local checksum=a21ae5633a269bcd7e90cf767e48225633795e99d831742cbf3397064fee7712
+  local go_root="$HOME/.local/go"
+  local download="$HOME/.cache/amp/downloads/$archive"
+
+  if [[ -x "$go_root/bin/go" ]] && [[ $("$go_root/bin/go" version) == "go version go${version} linux/amd64" ]]; then
+    printf 'Go %s is already installed.\n' "$version"
+  else
+    mkdir -p "$(dirname "$download")" "$HOME/.local"
+    if [[ ! -f "$download" ]] || ! printf '%s  %s\n' "$checksum" "$download" | sha256sum --check --status; then
+      curl --fail --location --retry 3 --output "$download" "https://go.dev/dl/$archive"
+    fi
+    printf '%s  %s\n' "$checksum" "$download" | sha256sum --check --status
+    rm -rf "$go_root"
+    tar -C "$HOME/.local" -xzf "$download"
+  fi
+
+  mkdir -p "$HOME/.local/bin"
+  ln -sfn "$go_root/bin/go" "$HOME/.local/bin/go"
+  ln -sfn "$go_root/bin/gofmt" "$HOME/.local/bin/gofmt"
+}
+
+install_coil_main() {
+  local checkout="$HOME/.cache/amp/coil-main"
+  local build="$HOME/.cache/amp/coil-build/coil"
+  local marker="$HOME/.cache/amp/coil-build/main-commit"
+  local installed_library="$HOME/.local/lib/coil/prelude.coil"
+
+  mkdir -p "$(dirname "$checkout")" "$(dirname "$build")" "$HOME/.local/bin"
+  if [[ ! -e "$checkout" ]]; then
+    git clone --filter=blob:none --branch main --single-branch \
+      https://github.com/jimmyhmiller/coil.git "$checkout"
+  elif [[ ! -d "$checkout/.git" ]]; then
+    printf 'error: %s exists but is not a Coil checkout\n' "$checkout" >&2
+    return 1
+  fi
+
+  git -C "$checkout" fetch --depth 1 origin main
+  git -C "$checkout" checkout --detach --force FETCH_HEAD
+
+  local commit
+  commit=$(git -C "$checkout" rev-parse HEAD)
+  if [[ ! -x "$build" ]] || [[ ! -f "$marker" ]] || [[ $(<"$marker") != "$commit" ]]; then
+    python3 "$checkout/scripts/dev.py" build nollvm --output "$build"
+    python3 "$checkout/scripts/dev.py" install --source "$build" --dest "$HOME/.local/bin/coil"
+    printf '%s\n' "$commit" > "$marker"
+  elif [[ ! -x "$HOME/.local/bin/coil" ]] || [[ ! -f "$installed_library" ]]; then
+    python3 "$checkout/scripts/dev.py" install --source "$build" --dest "$HOME/.local/bin/coil"
+  else
+    printf 'Coil main at %s is already installed.\n' "${commit:0:12}"
+  fi
+
+  "$HOME/.local/bin/coil" --version
+}
+
+install_node_dependencies() {
+  cd "$repo_root"
+  npm ci
+}
+
+build_typescript_go_bridge() {
+  cd "$repo_root"
+  PATH="$HOME/.local/bin:$PATH" tools/build-typescript-go-bridge.sh
+}
+
+step "System dependencies" install_system_dependencies
+step "Go 1.25 toolchain" install_go
+step "Coil from main" install_coil_main
+step "Node dependencies" install_node_dependencies
+step "Pinned TypeScript-Go bridge" build_typescript_go_bridge
+
+printf '\nOrb setup complete.\n'

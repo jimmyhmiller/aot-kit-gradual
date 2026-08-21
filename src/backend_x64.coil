@@ -1,0 +1,1109 @@
+;; Linux x86-64 encoder for the machine IR.  The selector and scheduler are target-neutral; this
+;; module translates their allocated integer operations to the SysV AMD64 instruction stream.
+(module backend_x64)
+
+(import "coil.primitive" :as primitive)
+(import "backend_core" :use *)
+(import "backend_select" :use *)
+(import "backend_liveness" :use *)
+(import "backend_allocate" :use *)
+(import "shape" :use *)
+(import "jsvalue" :use *)
+(import "coil.alloc" :use * :as alloc)
+(import "coil.arraylist" :use *)
+(import "coil.io" :use *)
+(import "coil.fmt" :use *)
+
+;; The allocator currently numbers its first eight GPR colors like AAPCS64 x0-x7.  Keep that
+;; internal color space stable while mapping it to the six SysV argument registers followed by
+;; two caller-saved temporaries.  This lets target parameterisation happen at the ABI boundary
+;; instead of teaching target-neutral selection about hardware register numbers.
+(defn x64-reg [(reg i64)] (-> i64)
+  (case reg 0
+        7  ; rdi
+          1
+        6  ; rsi
+          2
+        2  ; rdx
+          3
+        1  ; rcx
+          4
+        8  ; r8
+          5
+        9  ; r9
+          6
+        10  ; r10
+          7
+        11  ; r11
+          19
+        3   ; rbx (SysV callee-saved)
+          20
+        13  ; r13 (SysV callee-saved; r12 holds GC thread state)
+          -1))
+
+(defn x64-u8! [(v i64)] (-> i64)
+  (al-push! [u8] (field (backend) code) (cast u8 (& v 255)))
+  0)
+
+(defn x64-u64! [(v i64)] (-> i64)
+  (let [(mut shift) 0]
+    (loop (if (>= (load shift) 64)
+              (break)
+              (do
+                (x64-u8! (>> v (load shift)))
+                (set! shift (+ (load shift) 8))
+                0))))
+  0)
+
+(defn x64-u32! [(v i64)] (-> i64)
+  (let [(mut shift) 0]
+    (loop (if (>= (load shift) 32) (break)
+              (do (x64-u8! (>> v (load shift)))
+                  (set! shift (+ (load shift) 8))))))
+  0)
+
+(defn x64-patch32! [(at i64) (v i64)] (-> i64)
+  (let [(mut i) 0]
+    (loop (if (>= (load i) 4) (break)
+              (do (al-set! [u8] (field (backend) code) (+ at (load i))
+                           (cast u8 (& (>> v (* (load i) 8)) 255)))
+                  (set! i (+ (load i) 1))))))
+  0)
+
+(defn x64-rex! [(r i64) (b i64)] (-> i64)
+  (x64-u8! (| 72 (| (if (>= r 8) 4 0) (if (>= b 8) 1 0)))))
+
+(defn x64-modrm! [(reg i64) (rm i64)] (-> i64)
+  (x64-u8! (| 192 (| (<< (& reg 7) 3) (& rm 7)))))
+
+(defn x64-mem! [(reg i64) (base i64) (disp i64)] (-> i64)
+  (let [lo (& base 7)
+        sib (= lo 4)
+        md (if (and (= disp 0) (!= lo 5)) 0 (if (and (>= disp -128) (<= disp 127)) 1 2))]
+    (x64-u8! (| (<< md 6) (| (<< (& reg 7) 3) lo)))
+    (if sib (x64-u8! (| (<< 4 3) lo)) 0)
+    (if (= md 1) (x64-u8! disp) (if (= md 2) (x64-u32! disp) 0))))
+
+(defn x64-load! [(dst i64) (base i64) (disp i64)] (-> i64)
+  (x64-rex! dst base) (x64-u8! 139) (x64-mem! dst base disp))
+(defn x64-store! [(base i64) (disp i64) (src i64)] (-> i64)
+  (x64-rex! src base) (x64-u8! 137) (x64-mem! src base disp))
+(defn x64-alu! [(opcode i64) (dst i64) (src i64)] (-> i64)
+  (x64-rex! src dst) (x64-u8! opcode) (x64-modrm! src dst))
+(defn x64-cmp! [(a i64) (b i64)] (-> i64) (x64-alu! 57 a b))
+(defn x64-cmp-imm32! [(reg i64) (imm i64)] (-> i64)
+  (x64-rex! 0 reg) (x64-u8! 129) (x64-modrm! 7 reg) (x64-u32! imm))
+(defn x64-setcc! [(dst i64) (cc i64)] (-> i64)
+  ;; A REX prefix selects sil/dil rather than the legacy high-byte registers.
+  (if (or (>= dst 4) (>= dst 8)) (x64-u8! (| 64 (if (>= dst 8) 1 0))) 0)
+  (x64-u8! 15) (x64-u8! (+ 144 cc)) (x64-modrm! 0 dst)
+  (x64-rex! dst dst) (x64-u8! 15) (x64-u8! 182) (x64-modrm! dst dst))
+
+(defn x64-sp-adjust! [(sub bool) (bytes i64)] (-> i64)
+  (if (> bytes 0)
+      (do (x64-u8! 72) (x64-u8! 129) (x64-u8! (if sub 236 196)) (x64-u32! bytes)) 0))
+
+(defn x64-mov-rr! [(dst i64) (src i64)] (-> i64)
+  (if (= dst src)
+      0
+      (do
+        (x64-rex! src dst)
+        (x64-u8! 137)
+        (x64-modrm! src dst))))
+
+(defn x64-mov-imm! [(dst i64) (imm i64)] (-> i64)
+  (x64-rex! 0 dst)
+  (x64-u8! (+ 184 (& dst 7)))
+  (x64-u64! imm))
+
+(defn x64-add-rr! [(dst i64) (src i64)] (-> i64)
+  (x64-rex! src dst)
+  (x64-u8! 1)
+  (x64-modrm! src dst))
+
+(defn x64-sub-rr! [(dst i64) (src i64)] (-> i64)
+  (x64-rex! src dst)
+  (x64-u8! 41)
+  (x64-modrm! src dst))
+
+(defn x64-imul-rr! [(dst i64) (src i64)] (-> i64)
+  (x64-rex! dst src)
+  (x64-u8! 15)
+  (x64-u8! 175)
+  (x64-modrm! dst src))
+
+(defn x64-neg! [(dst i64)] (-> i64)
+  (x64-rex! 0 dst)
+  (x64-u8! 247)
+  (x64-modrm! 3 dst))
+
+(defn x64-shift-imm! [(dst i64) (kind i64) (amount i64)] (-> i64)
+  (x64-rex! 0 dst)
+  (x64-u8! 193)
+  (x64-modrm! kind dst)
+  (x64-u8! amount))
+
+(defn x64-signext32! [(reg i64)] (-> i64)
+  (x64-rex! reg reg) (x64-u8! 99) (x64-modrm! reg reg))
+
+(defn x64-shift32! [(reg i64) (kind i64)] (-> i64)
+  (if (>= reg 8) (x64-u8! 65) 0)
+  (x64-u8! 211) (x64-modrm! kind reg))
+
+(defn x64-ret! [] (-> i64)
+  (x64-u8! 195))
+
+(defn x64-location [(vreg i64)] (-> i64)
+  (let [reg (mra-reg vreg)]
+    (if (or (< reg 0) (>= reg 32)) -1 (x64-reg reg))))
+
+(defn x64-fpr-location [(vreg i64)] (-> i64)
+  (let [reg (mra-reg vreg)]
+    (if (and (>= reg 32) (< reg 64)) (- reg 32) -1)))
+
+(defn x64-spill-off [(vreg i64)] (-> i64)
+  (let [owner (mra-owner vreg) slot (mra-spill vreg)]
+    (if (or (< owner 0) (< slot 0))
+        -1
+        (+ 16 (* (+ (mu-function-callee-count owner) slot) 8)))))
+
+(defn x64-callee-save-off [(owner i64) (reg i64)] (-> i64)
+  (let [mask (mu-function-callee-mask owner)
+        (mut r) 19
+        (mut rank) 0]
+    (loop (if (>= (load r) reg)
+              (break)
+              (do
+                (if (!= (& mask (<< 1 (load r))) 0)
+                    (set! rank (+ (load rank) 1))
+                    0)
+                (set! r (+ (load r) 1)))))
+    (+ 16 (* (load rank) 8))))
+
+(defn x64-fload! [(dst i64) (base i64) (disp i64)] (-> i64)
+  (x64-u8! 242) (x64-rex! dst base) (x64-u8! 15) (x64-u8! 16)
+  (x64-mem! dst base disp))
+
+(defn x64-fstore! [(base i64) (disp i64) (src i64)] (-> i64)
+  (x64-u8! 242) (x64-rex! src base) (x64-u8! 15) (x64-u8! 17)
+  (x64-mem! src base disp))
+
+(defn x64-save-callees! [(owner i64)] (-> i64)
+  (let [mask (mu-function-callee-mask owner)
+        (mut reg) 19]
+    (loop (if (> (load reg) 20)
+              (break)
+              (do
+                (if (!= (& mask (<< 1 (load reg))) 0)
+                    (x64-store! 4 (x64-callee-save-off owner (load reg))
+                                (x64-reg (load reg)))
+                    0)
+                (set! reg (+ (load reg) 1)))))
+    (set! reg 40)
+    (loop (if (> (load reg) 47)
+              (break)
+              (do
+                (if (!= (& mask (<< 1 (load reg))) 0)
+                    (x64-fstore! 4 (x64-callee-save-off owner (load reg))
+                                 (- (load reg) 32))
+                    0)
+                (set! reg (+ (load reg) 1))))))
+  0)
+
+(defn x64-restore-callees! [(owner i64)] (-> i64)
+  (let [mask (mu-function-callee-mask owner)
+        (mut reg) 19]
+    (loop (if (> (load reg) 20)
+              (break)
+              (do
+                (if (!= (& mask (<< 1 (load reg))) 0)
+                    (x64-load! (x64-reg (load reg)) 4
+                               (x64-callee-save-off owner (load reg)))
+                    0)
+                (set! reg (+ (load reg) 1)))))
+    (set! reg 40)
+    (loop (if (> (load reg) 47)
+              (break)
+              (do
+                (if (!= (& mask (<< 1 (load reg))) 0)
+                    (x64-fload! (- (load reg) 32) 4
+                                (x64-callee-save-off owner (load reg)))
+                    0)
+                (set! reg (+ (load reg) 1))))))
+  0)
+
+(defn x64-read-gpr! [(vreg i64) (scratch i64)] (-> i64)
+  (let [reg (x64-location vreg)]
+    (if (>= reg 0)
+        reg
+        (let [off (x64-spill-off vreg)]
+          (if (< off 0) -1 (do (x64-load! scratch 4 off) scratch))))))
+
+(defn x64-read-gpr-delta! [(vreg i64) (scratch i64) (delta i64)] (-> i64)
+  (let [reg (x64-location vreg)]
+    (if (>= reg 0)
+        reg
+        (let [off (x64-spill-off vreg)]
+          (if (< off 0) -1 (do (x64-load! scratch 4 (+ off delta)) scratch))))))
+
+(defn x64-write-gpr [(vreg i64) (scratch i64)] (-> i64)
+  (let [reg (x64-location vreg)]
+    (if (>= reg 0) reg (if (>= (x64-spill-off vreg) 0) scratch -1))))
+
+(defn x64-store-gpr! [(vreg i64) (reg i64)] (-> i64)
+  (let [off (x64-spill-off vreg)]
+    (if (>= off 0) (x64-store! 4 off reg) 0)))
+
+(defn x64-read-fpr! [(vreg i64) (scratch i64)] (-> i64)
+  (let [reg (x64-fpr-location vreg)]
+    (if (>= reg 0)
+        reg
+        (let [off (x64-spill-off vreg)]
+          (if (< off 0) -1 (do (x64-fload! scratch 4 off) scratch))))))
+
+(defn x64-read-fpr-delta! [(vreg i64) (scratch i64) (delta i64)] (-> i64)
+  (let [reg (x64-fpr-location vreg)]
+    (if (>= reg 0)
+        reg
+        (let [off (x64-spill-off vreg)]
+          (if (< off 0) -1 (do (x64-fload! scratch 4 (+ off delta)) scratch))))))
+
+(defn x64-write-fpr [(vreg i64) (scratch i64)] (-> i64)
+  (let [reg (x64-fpr-location vreg)]
+    (if (>= reg 0) reg (if (>= (x64-spill-off vreg) 0) scratch -1))))
+
+(defn x64-store-fpr! [(vreg i64) (reg i64)] (-> i64)
+  (let [off (x64-spill-off vreg)]
+    (if (>= off 0) (x64-fstore! 4 off reg) 0)))
+
+(defn x64-movq-xr! [(xd i64) (rs i64)] (-> i64)
+  (x64-u8! 102) (x64-rex! xd rs) (x64-u8! 15) (x64-u8! 110) (x64-modrm! xd rs))
+(defn x64-movq-rx! [(rd i64) (xs i64)] (-> i64)
+  (x64-u8! 102) (x64-rex! xs rd) (x64-u8! 15) (x64-u8! 126) (x64-modrm! xs rd))
+(defn x64-cvtsi2sd! [(xd i64) (rs i64)] (-> i64)
+  (x64-u8! 242) (x64-rex! xd rs) (x64-u8! 15) (x64-u8! 42) (x64-modrm! xd rs))
+(defn x64-cvttsd2si! [(rd i64) (xs i64)] (-> i64)
+  (x64-u8! 242) (x64-rex! rd xs) (x64-u8! 15) (x64-u8! 44) (x64-modrm! rd xs))
+(defn x64-fop! [(opcode i64) (dst i64) (src i64)] (-> i64)
+  (x64-u8! 242) (x64-rex! dst src) (x64-u8! 15) (x64-u8! opcode) (x64-modrm! dst src))
+(defn x64-fmov! [(dst i64) (src i64)] (-> i64)
+  (if (= dst src) 0 (x64-fop! 16 dst src)))
+
+(defn x64-fcmp! [(left i64) (right i64)] (-> i64)
+  (x64-u8! 102) (x64-rex! left right) (x64-u8! 15) (x64-u8! 46)
+  (x64-modrm! left right))
+
+(defn x64-fset-ordered! [(dst i64) (cc i64)] (-> i64)
+  (x64-setcc! dst cc)
+  (x64-setcc! 0 11) ; setnp: ordered operands
+  (x64-alu! 33 dst 0))
+
+(defn x64-label-off [(label i64)] (-> i64)
+  (let [(mut i) 0 (mut answer) -1]
+    (loop (if (or (>= (load i) (be-inst-count)) (>= (load answer) 0)) (break)
+              (do (let [m (be-inst (load i))]
+                    (if (and (= (.op m) MI-LABEL) (= (.imm m) label))
+                        (set! answer (.first m)) 0))
+                  (set! i (+ (load i) 1)))))
+    (load answer)))
+
+(defn x64-entry-owner [(bid i64)] (-> i64)
+  (let [(mut owner) 0 (mut answer) -1]
+    (loop (if (or (>= (load owner) (mu-function-count)) (>= (load answer) 0)) (break)
+              (do (if (= (mu-function-block (load owner) 0) bid)
+                      (set! answer (load owner)) 0)
+                  (set! owner (+ (load owner) 1)))))
+    (load answer)))
+
+(defn x64-call-class-index [(m (ptr MInst)) (which i64)] (-> i64)
+  (let [class (ml-register-class (ms-inst-arg (load (x64-current-inst)) which))
+        (mut i) 0
+        (mut index) 0]
+    (loop (if (>= (load i) which)
+              (break)
+              (do (if (= (ml-register-class (ms-inst-arg (load (x64-current-inst)) (load i))) class)
+                      (set! index (+ (load index) 1)) 0)
+                  (set! i (+ (load i) 1)))))
+    (load index)))
+
+(defn x64-call-stack-index [(m (ptr MInst)) (which i64)] (-> i64)
+  (let [(mut i) 0
+        (mut index) 0]
+    (loop (if (>= (load i) which)
+              (break)
+              (do (if (>= (x64-call-class-index m (load i)) 8)
+                      (set! index (+ (load index) 1)) 0)
+                  (set! i (+ (load i) 1)))))
+    (load index)))
+
+(defn x64-copy! [(dst i64) (src i64)] (-> bool)
+  (let [rd (x64-location dst)
+        rs (x64-location src)]
+    (if (or (< rd 0) (< rs 0))
+        false
+        (do (x64-mov-rr! rd rs) true))))
+
+(defn x64-variable-shift! [(m (ptr MInst)) (kind i64) (signed bool)] (-> i64)
+  (let [left (x64-read-gpr! (.a m) 14)
+        right (x64-read-gpr! (.b m) 15)
+        to (x64-write-gpr (.dst m) 14)]
+    (if (or (< left 0) (< right 0) (< to 0))
+        (x64-fail! (.node m))
+        (do
+          ;; CL is implicit. Save any unrelated allocated rcx value, then publish the result only
+          ;; after restoring it (the destination itself may legitimately be rcx).
+          (x64-mov-rr! 0 1)
+          (x64-mov-rr! 14 left)
+          (x64-mov-rr! 1 right)
+          (x64-shift32! 14 kind)
+          (if signed (x64-signext32! 14) 0)
+          (x64-mov-rr! 1 0)
+          (x64-mov-rr! to 14)
+          (x64-store-gpr! (.dst m) to))))
+  0)
+
+(defn x64-runtime-call! [(m (ptr MInst)) (at i64)] (-> i64)
+  (let [value (ms-inst-arg at 0)
+        rd (x64-write-gpr (.dst m) 14)]
+    ;; Machine allocation inherits AArch64's eight callee-saved FP colors. SysV has no
+    ;; callee-saved XMM registers, so protect those colors explicitly across C runtime calls.
+    (x64-sp-adjust! true 96)
+    (let [(mut fp) 8]
+      (loop (if (> (load fp) 15)
+                (break)
+                (do (x64-fstore! 4 (+ 32 (* (- (load fp) 8) 8)) (load fp))
+                    (set! fp (+ (load fp) 1))))))
+    (if (and (= (.op m) MI-JSSTRING) (= (.imm m) JSSOP-FROM-DOUBLE-BITS))
+        (let [fa (x64-read-fpr-delta! (.a m) 15 96)]
+          (if (< fa 0) (x64-fail! (.node m))
+              (do (x64-movq-rx! 14 fa) (x64-store! 4 0 14))))
+        (let [ra (x64-read-gpr-delta! (.a m) 14 96)]
+          (if (< ra 0) (x64-fail! (.node m)) (x64-store! 4 0 ra))))
+    (let [rb (x64-read-gpr-delta! (.b m) 14 96)]
+      (if (< rb 0) (x64-fail! (.node m)) (x64-store! 4 8 rb)))
+    (let [rv (x64-read-gpr-delta! value 14 96)]
+      (if (< rv 0) (x64-fail! (.node m)) (x64-store! 4 16 rv)))
+    (x64-load! 7 4 0)
+    (if (= (.op m) MI-JSPROP)
+        (do (x64-load! 6 4 16) (x64-load! 2 4 8))
+        (do (x64-load! 6 4 8) (x64-load! 2 4 16)))
+    (x64-mov-imm! 1 (.imm m))
+    (x64-u8! 232)
+    (set! (.last m) (al-len [u8] (.code (backend))))
+    (x64-u32! 0)
+    (set! (.earliest m) (al-len [u8] (.code (backend))))
+    (let [(mut fp) 8]
+      (loop (if (> (load fp) 15)
+                (break)
+                (do (x64-fload! (load fp) 4 (+ 32 (* (- (load fp) 8) 8)))
+                    (set! fp (+ (load fp) 1))))))
+    (x64-sp-adjust! false 96)
+    (if (< rd 0)
+        (x64-fail! (.node m))
+        (do (x64-mov-rr! rd 0) (x64-store-gpr! (.dst m) rd)))
+    0))
+
+(defn x64-current-op [] (-> (ptr i64)) (let [v (primitive/alloc-static i64)] v))
+(defn x64-current-owner [] (-> (ptr i64)) (let [v (primitive/alloc-static i64)] v))
+(defn x64-current-inst [] (-> (ptr i64)) (let [v (primitive/alloc-static i64)] v))
+
+(defn x64-fail! [(node i64)] (-> i64)
+  (let [m (be-inst (load (x64-current-inst)))]
+    (fmt (stderr) "x64-encoding: unsupported op={d} node={d} owner={d} inst={d} dst={d}/{d}/{d} a={d}/{d}/{d} b={d}/{d}/{d}\n"
+         (load (x64-current-op)) node (load (x64-current-owner)) (load (x64-current-inst))
+         (.dst m) (if (< (.dst m) 0) -1 (mra-reg (.dst m)))
+         (if (< (.dst m) 0) -1 (mra-spill (.dst m)))
+         (.a m) (if (< (.a m) 0) -1 (mra-reg (.a m)))
+         (if (< (.a m) 0) -1 (mra-spill (.a m)))
+         (.b m) (if (< (.b m) 0) -1 (mra-reg (.b m)))
+         (if (< (.b m) 0) -1 (mra-spill (.b m)))))
+  (be-fail! BER-ENCODING node)
+  0)
+
+;; Encode allocated Machine IR. Unsupported operations fail atomically; they must never be
+;; mistaken for successfully emitted code.
+(defn be-x64-encode-checked! [] (-> bool)
+  (if (!= (be-result) BER-OK)
+      false
+      (let [n (be-inst-count)
+            (mut at) 0]
+        (al-clear! [u8] (field (backend) code))
+        (loop (if (or (>= (load at) n) (!= (be-result) BER-OK))
+                  (break)
+                  (do
+                    (let [m (be-inst (load at))
+                          op (.op m)
+                          dst (x64-location (.dst m))
+                          a (x64-location (.a m))
+                          b (x64-location (.b m))
+                          fdst (x64-fpr-location (.dst m))
+                          fa (x64-fpr-location (.a m))
+                          fb (x64-fpr-location (.b m))]
+                      (set! (x64-current-op) op)
+                      (set! (x64-current-owner) (.owner m))
+                      (set! (x64-current-inst) (load at))
+                      (set! (.first m) (al-len [u8] (.code (backend))))
+                      (case op MI-LABEL
+                            (let [owner (x64-entry-owner (.imm m))]
+                              (if (< owner 0) 0
+                                  (do (x64-u8! 85) (x64-u8! 72) (x64-u8! 137) (x64-u8! 229)
+                                      (x64-sp-adjust! true (mu-function-frame-size owner))
+                                      (x64-save-callees! owner)))) MI-ARG
+                            0 MI-ABI-COPY
+                            (let [from (x64-read-gpr! (.a m) 0)
+                                  to (x64-write-gpr (.dst m) 14)]
+                              (if (or (< from 0) (< to 0))
+                                  (x64-fail! (.node m))
+                                  (do (x64-mov-rr! to from) (x64-store-gpr! (.dst m) to))))
+                              MI-COPY
+                            (let [from (x64-read-gpr! (.a m) 0)
+                                  to (x64-write-gpr (.dst m) 14)]
+                              (if (or (< from 0) (< to 0))
+                                  (x64-fail! (.node m))
+                                  (do (x64-mov-rr! to from) (x64-store-gpr! (.dst m) to))))
+                              MI-MOV
+                            (let [from (x64-read-gpr! (.a m) 0)
+                                  to (x64-write-gpr (.imm m) 14)]
+                              (if (or (< from 0) (< to 0))
+                                  (x64-fail! (.node m))
+                                  (do (x64-mov-rr! to from) (x64-store-gpr! (.imm m) to))))
+                              MI-MOVI
+                            (let [to (x64-write-gpr (.dst m) 0)]
+                              (if (< to 0)
+                                  (x64-fail! (.node m))
+                                  (do (x64-mov-imm! to (.imm m))
+                                      (x64-store-gpr! (.dst m) to))))
+                              MI-FMOVI
+                            (let [to (x64-write-fpr (.dst m) 14)]
+                              (if (< to 0)
+                                (x64-fail! (.node m))
+                                  (do (x64-mov-imm! 0 (.imm m)) (x64-movq-xr! to 0)
+                                      (x64-store-fpr! (.dst m) to))))
+                              MI-SCVTF
+                            (let [to (x64-write-fpr (.dst m) 14)
+                                  from (x64-read-gpr! (.a m) 14)]
+                              (if (or (< to 0) (< from 0))
+                                  (x64-fail! (.node m))
+                                  (do (x64-cvtsi2sd! to from)
+                                      (x64-store-fpr! (.dst m) to))))
+                              MI-I32FROMFP
+                            (let [to (x64-write-gpr (.dst m) 14)
+                                  from (x64-read-fpr! (.a m) 14)]
+                              (if (or (< to 0) (< from 0))
+                                  (x64-fail! (.node m))
+                                  (do
+                                    (x64-cvttsd2si! to from)
+                                    (x64-rex! to to) (x64-u8! 99) (x64-modrm! to to)
+                                    (x64-store-gpr! (.dst m) to))))
+                              MI-FADD
+                            (let [to (x64-write-fpr (.dst m) 14)
+                                  left (x64-read-fpr! (.a m) 14)
+                                  right (x64-read-fpr! (.b m) 15)]
+                              (if (or (< to 0) (< left 0) (< right 0))
+                                  (x64-fail! (.node m))
+                                  (do (if (= to right)
+                                          (x64-fop! 88 to left)
+                                          (do (x64-fmov! to left) (x64-fop! 88 to right)))
+                                      (x64-store-fpr! (.dst m) to))))
+                              MI-FSUB
+                            (let [to (x64-write-fpr (.dst m) 14)
+                                  left (x64-read-fpr! (.a m) 14)
+                                  right (x64-read-fpr! (.b m) 15)]
+                              (if (or (< to 0) (< left 0) (< right 0))
+                                  (x64-fail! (.node m))
+                                  (do (if (and (= to right) (!= to left))
+                                          (do (x64-fmov! 13 left) (x64-fop! 92 13 right)
+                                              (x64-fmov! to 13))
+                                          (do (x64-fmov! to left) (x64-fop! 92 to right)))
+                                      (x64-store-fpr! (.dst m) to))))
+                              MI-FMUL
+                            (let [to (x64-write-fpr (.dst m) 14)
+                                  left (x64-read-fpr! (.a m) 14)
+                                  right (x64-read-fpr! (.b m) 15)]
+                              (if (or (< to 0) (< left 0) (< right 0))
+                                  (x64-fail! (.node m))
+                                  (do (if (= to right)
+                                          (x64-fop! 89 to left)
+                                          (do (x64-fmov! to left) (x64-fop! 89 to right)))
+                                      (x64-store-fpr! (.dst m) to))))
+                              MI-FDIV
+                            (let [to (x64-write-fpr (.dst m) 14)
+                                  left (x64-read-fpr! (.a m) 14)
+                                  right (x64-read-fpr! (.b m) 15)]
+                              (if (or (< to 0) (< left 0) (< right 0))
+                                  (x64-fail! (.node m))
+                                  (do (if (and (= to right) (!= to left))
+                                          (do (x64-fmov! 13 left) (x64-fop! 94 13 right)
+                                              (x64-fmov! to 13))
+                                          (do (x64-fmov! to left) (x64-fop! 94 to right)))
+                                      (x64-store-fpr! (.dst m) to))))
+                              MI-FNEG
+                            (let [from (x64-read-fpr! (.a m) 14)
+                                  to (x64-write-fpr (.dst m) 14)]
+                              (if (or (< from 0) (< to 0))
+                                  (x64-fail! (.node m))
+                                  (do (x64-movq-rx! 0 from)
+                                      (x64-mov-imm! 14 -9223372036854775808)
+                                      (x64-alu! 49 0 14)
+                                      (x64-movq-xr! to 0)
+                                      (x64-store-fpr! (.dst m) to))))
+                              MI-FEQ
+                            (let [left (x64-read-fpr! (.a m) 14)
+                                  right (x64-read-fpr! (.b m) 15)
+                                  to (x64-write-gpr (.dst m) 14)]
+                              (if (or (< left 0) (< right 0) (< to 0))
+                                  (x64-fail! (.node m))
+                                  (do (x64-fcmp! left right) (x64-fset-ordered! to 4)
+                                      (x64-store-gpr! (.dst m) to))))
+                              MI-FLT
+                            (let [left (x64-read-fpr! (.a m) 14)
+                                  right (x64-read-fpr! (.b m) 15)
+                                  to (x64-write-gpr (.dst m) 14)]
+                              (if (or (< left 0) (< right 0) (< to 0))
+                                  (x64-fail! (.node m))
+                                  (do (x64-fcmp! left right) (x64-fset-ordered! to 2)
+                                      (x64-store-gpr! (.dst m) to))))
+                              MI-FLE
+                            (let [left (x64-read-fpr! (.a m) 14)
+                                  right (x64-read-fpr! (.b m) 15)
+                                  to (x64-write-gpr (.dst m) 14)]
+                              (if (or (< left 0) (< right 0) (< to 0))
+                                  (x64-fail! (.node m))
+                                  (do (x64-fcmp! left right) (x64-fset-ordered! to 6)
+                                      (x64-store-gpr! (.dst m) to))))
+                              MI-FTRUTH
+                            (let [value (x64-read-fpr! (.a m) 14)
+                                  to (x64-write-gpr (.dst m) 14)]
+                              (if (or (< value 0) (< to 0))
+                                  (x64-fail! (.node m))
+                                  (do (x64-mov-imm! 0 0) (x64-movq-xr! 13 0)
+                                      (x64-fcmp! value 13) (x64-setcc! to 5)
+                                      (x64-store-gpr! (.dst m) to))))
+                              MI-ADD
+                            (let [ra (x64-read-gpr! (.a m) 14)
+                                  rb (x64-read-gpr! (.b m) 15)
+                                  rd (x64-write-gpr (.dst m) 14)]
+                              (if (or (< rd 0) (< ra 0) (< rb 0))
+                                  (x64-fail! (.node m))
+                                  (do
+                                    (if (= rd rb) (x64-add-rr! rd ra)
+                                        (do (x64-mov-rr! rd ra) (x64-add-rr! rd rb)))
+                                    (x64-store-gpr! (.dst m) rd))))
+                              MI-SUB
+                            (let [ra (x64-read-gpr! (.a m) 14)
+                                  rb (x64-read-gpr! (.b m) 15)
+                                  rd (x64-write-gpr (.dst m) 14)]
+                              (if (or (< rd 0) (< ra 0) (< rb 0))
+                                  (x64-fail! (.node m))
+                                  (do
+                                    (if (and (= rd rb) (!= rd ra))
+                                        (do (x64-mov-rr! 0 ra) (x64-sub-rr! 0 rb) (x64-mov-rr! rd 0))
+                                        (do (x64-mov-rr! rd ra) (x64-sub-rr! rd rb)))
+                                    (x64-store-gpr! (.dst m) rd))))
+                              MI-MUL
+                            (let [ra (x64-read-gpr! (.a m) 14)
+                                  rb (x64-read-gpr! (.b m) 15)
+                                  rd (x64-write-gpr (.dst m) 14)]
+                              (if (or (< rd 0) (< ra 0) (< rb 0))
+                                  (x64-fail! (.node m))
+                                  (do
+                                    (if (= rd rb) (x64-imul-rr! rd ra)
+                                        (do (x64-mov-rr! rd ra) (x64-imul-rr! rd rb)))
+                                    (x64-store-gpr! (.dst m) rd))))
+                              MI-SDIV
+                            (let [left (x64-read-gpr! (.a m) 14)
+                                  right (x64-read-gpr! (.b m) 15)
+                                  to (x64-write-gpr (.dst m) 14)]
+                              (if (or (< left 0) (< right 0) (< to 0))
+                                  (x64-fail! (.node m))
+                                  (do (x64-mov-rr! 15 right)
+                                      (x64-mov-rr! 0 left)
+                                      (x64-u8! 72) (x64-u8! 153)
+                                      (x64-rex! 0 15) (x64-u8! 247) (x64-modrm! 7 15)
+                                      (x64-mov-rr! to 0)
+                                      (x64-store-gpr! (.dst m) to))))
+                              MI-NEG
+                            (let [ra (x64-read-gpr! (.a m) 14) rd (x64-write-gpr (.dst m) 14)]
+                              (if (or (< rd 0) (< ra 0)) (x64-fail! (.node m))
+                                  (do (x64-mov-rr! rd ra) (x64-neg! rd)
+                                      (x64-store-gpr! (.dst m) rd))))
+                              MI-BITAND
+                            (let [ra (x64-read-gpr! (.a m) 14) rb (x64-read-gpr! (.b m) 15)
+                                  rd (x64-write-gpr (.dst m) 14)]
+                              (if (or (< rd 0) (< ra 0) (< rb 0)) (x64-fail! (.node m))
+                                  (do (if (= rd rb) (x64-alu! 33 rd ra)
+                                          (do (x64-mov-rr! rd ra) (x64-alu! 33 rd rb)))
+                                      (x64-signext32! rd)
+                                      (x64-store-gpr! (.dst m) rd)))) MI-BITOR
+                            (let [ra (x64-read-gpr! (.a m) 14) rb (x64-read-gpr! (.b m) 15)
+                                  rd (x64-write-gpr (.dst m) 14)]
+                              (if (or (< rd 0) (< ra 0) (< rb 0)) (x64-fail! (.node m))
+                                  (do (if (= rd rb) (x64-alu! 9 rd ra)
+                                          (do (x64-mov-rr! rd ra) (x64-alu! 9 rd rb)))
+                                      (x64-signext32! rd)
+                                      (x64-store-gpr! (.dst m) rd)))) MI-BITXOR
+                            (let [ra (x64-read-gpr! (.a m) 14) rb (x64-read-gpr! (.b m) 15)
+                                  rd (x64-write-gpr (.dst m) 14)]
+                              (if (or (< rd 0) (< ra 0) (< rb 0)) (x64-fail! (.node m))
+                                  (do (if (= rd rb) (x64-alu! 49 rd ra)
+                                          (do (x64-mov-rr! rd ra) (x64-alu! 49 rd rb)))
+                                      (x64-signext32! rd)
+                                      (x64-store-gpr! (.dst m) rd)))) MI-BITNOT
+                            (let [ra (x64-read-gpr! (.a m) 14) rd (x64-write-gpr (.dst m) 14)]
+                              (if (or (< rd 0) (< ra 0)) (x64-fail! (.node m))
+                                  (do (x64-mov-rr! rd ra) (x64-rex! 0 rd) (x64-u8! 247)
+                                      (x64-modrm! 2 rd) (x64-signext32! rd)
+                                      (x64-store-gpr! (.dst m) rd))))
+                              MI-MOD
+                            (let [left (x64-read-gpr! (.a m) 14)
+                                  right (x64-read-gpr! (.b m) 15)
+                                  to (x64-write-gpr (.dst m) 14)]
+                              (if (or (< left 0) (< right 0) (< to 0))
+                                  (x64-fail! (.node m))
+                                  (do (x64-mov-rr! 15 right) (x64-signext32! 15)
+                                      (x64-mov-rr! 0 left) (x64-signext32! 0)
+                                      (x64-u8! 72) (x64-u8! 153)
+                                      (x64-rex! 0 15) (x64-u8! 247) (x64-modrm! 7 15)
+                                      (x64-mov-rr! to 2) (x64-signext32! to)
+                                      (x64-store-gpr! (.dst m) to))))
+                              MI-SHL
+                            (x64-variable-shift! m 4 true)
+                              MI-SHR
+                            (x64-variable-shift! m 7 true)
+                              MI-USHR
+                            (x64-variable-shift! m 5 false)
+                              MI-EQ
+                            (let [ra (x64-read-gpr! (.a m) 14) rb (x64-read-gpr! (.b m) 15)
+                                  rd (x64-write-gpr (.dst m) 14)]
+                              (if (or (< rd 0) (< ra 0) (< rb 0)) (x64-fail! (.node m))
+                                  (do (x64-cmp! ra rb) (x64-setcc! rd 4)
+                                      (x64-store-gpr! (.dst m) rd)))) MI-LT
+                            (let [ra (x64-read-gpr! (.a m) 14) rb (x64-read-gpr! (.b m) 15)
+                                  rd (x64-write-gpr (.dst m) 14)]
+                              (if (or (< rd 0) (< ra 0) (< rb 0)) (x64-fail! (.node m))
+                                  (do (x64-cmp! ra rb) (x64-setcc! rd 12)
+                                      (x64-store-gpr! (.dst m) rd)))) MI-LE
+                            (let [ra (x64-read-gpr! (.a m) 14) rb (x64-read-gpr! (.b m) 15)
+                                  rd (x64-write-gpr (.dst m) 14)]
+                              (if (or (< rd 0) (< ra 0) (< rb 0)) (x64-fail! (.node m))
+                                  (do (x64-cmp! ra rb) (x64-setcc! rd 14)
+                                      (x64-store-gpr! (.dst m) rd))))
+                              MI-JSBOX
+                            (let [rd (x64-write-gpr (.dst m) 14)]
+                              (if (< rd 0)
+                                  (x64-fail! (.node m))
+                                  (if (= (.imm m) 0)
+                                      (let [from (x64-read-fpr! (.a m) 15)]
+                                        (if (< from 0) (x64-fail! (.node m))
+                                            (do (x64-movq-rx! rd from)
+                                                (x64-store-gpr! (.dst m) rd))))
+                                      (let [ra (x64-read-gpr! (.a m) 15)]
+                                        (if (< ra 0)
+                                            (x64-fail! (.node m))
+                                            (do
+                                          (x64-mov-rr! rd ra)
+                                          (x64-mov-imm! 0 JSV-PAYLOAD-MASK)
+                                          (x64-alu! 33 rd 0)
+                                          (x64-mov-imm! 0 (.imm m))
+                                          (x64-alu! 9 rd 0)
+                                          (x64-store-gpr! (.dst m) rd)))))))
+                              MI-JSTEST
+                            (let [ra (x64-read-gpr! (.a m) 15) rd (x64-write-gpr (.dst m) 14)]
+                              (if (or (< rd 0) (< ra 0))
+                                  (x64-fail! (.node m))
+                                  (if (= (.imm m) 0)
+                                      (let [(mut low-branch) 0
+                                            (mut middle-branch) 0
+                                            (mut negative-branch) 0
+                                            (mut end-jump) 0
+                                            (mut true-at) 0
+                                            (mut end-at) 0]
+                                        (x64-mov-rr! 14 ra)
+                                        (x64-mov-rr! 15 ra)
+                                        (x64-shift-imm! 15 5 48)
+                                        (x64-mov-imm! 0 JSV-NAN)
+                                        (x64-cmp! 14 0)
+                                        (x64-setcc! rd 4)
+                                        (x64-mov-imm! 0 32760)
+                                        (x64-cmp! 15 0)
+                                        (x64-u8! 15) (x64-u8! 130)
+                                        (set! low-branch (al-len [u8] (.code (backend)))) (x64-u32! 0)
+                                        (x64-mov-imm! 0 32767)
+                                        (x64-cmp! 15 0)
+                                        (x64-u8! 15) (x64-u8! 134)
+                                        (set! middle-branch (al-len [u8] (.code (backend)))) (x64-u32! 0)
+                                        (x64-mov-imm! 0 65528)
+                                        (x64-cmp! 15 0)
+                                        (x64-u8! 15) (x64-u8! 130)
+                                        (set! negative-branch (al-len [u8] (.code (backend)))) (x64-u32! 0)
+                                        (x64-u8! 233)
+                                        (set! end-jump (al-len [u8] (.code (backend)))) (x64-u32! 0)
+                                        (set! true-at (al-len [u8] (.code (backend))))
+                                        (x64-mov-imm! rd 1)
+                                        (set! end-at (al-len [u8] (.code (backend))))
+                                        (x64-patch32! (load low-branch) (- (load true-at) (+ (load low-branch) 4)))
+                                        (x64-patch32! (load middle-branch) (- (load end-at) (+ (load middle-branch) 4)))
+                                        (x64-patch32! (load negative-branch) (- (load true-at) (+ (load negative-branch) 4)))
+                                        (x64-patch32! (load end-jump) (- (load end-at) (+ (load end-jump) 4)))
+                                        (x64-store-gpr! (.dst m) rd))
+                                      (do
+                                    (x64-mov-imm! 0 JSV-TAG-MASK)
+                                    (x64-alu! 33 0 ra)
+                                    (x64-mov-imm! rd (.imm m))
+                                    (x64-cmp! 0 rd)
+                                    (x64-setcc! rd 4)
+                                    (x64-store-gpr! (.dst m) rd)))))
+                              MI-JSUNBOX
+                            (let [ra (x64-read-gpr! (.a m) 15)
+                                  rd (x64-write-gpr (.dst m) 14)]
+                            (if (< ra 0)
+                                (x64-fail! (.node m))
+                                (if (= (.imm m) 0)
+                                    (let [outfp (x64-write-fpr (.dst m) 14)]
+                                      (if (< outfp 0)
+                                        (x64-fail! (.node m))
+                                        (do
+                                          (x64-mov-rr! 0 ra)
+                                          (x64-mov-rr! 14 ra)
+                                          (x64-mov-imm! 15 JSV-TAG-MASK)
+                                          (x64-alu! 33 14 15)
+                                          (x64-mov-imm! 15 JSV-INTEGER)
+                                          (x64-cmp! 14 15)
+                                          (x64-u8! 15) (x64-u8! 133) (x64-u32! 31)
+                                          (x64-mov-imm! 15 JSV-PAYLOAD-MASK)
+                                          (x64-alu! 33 0 15)
+                                          (x64-shift-imm! 0 4 16)
+                                          (x64-shift-imm! 0 7 16)
+                                          (x64-cvtsi2sd! outfp 0)
+                                          (x64-u8! 233) (x64-u32! 5)
+                                          (x64-movq-xr! outfp 0)
+                                          (x64-store-fpr! (.dst m) outfp))))
+                                    (if (< rd 0)
+                                        (x64-fail! (.node m))
+                                        (do
+                                  (x64-mov-rr! 14 ra)
+                                  (x64-mov-imm! 0 JSV-TAG-MASK)
+                                  (x64-alu! 33 0 14)
+                                  (x64-mov-imm! 15 (.imm m))
+                                  (x64-cmp! 0 15)
+                                  (x64-u8! 15) (x64-u8! 132) (x64-u32! 2)
+                                  (x64-u8! 15) (x64-u8! 11)
+                                  (x64-mov-rr! rd 14)
+                                  (x64-mov-imm! 0 JSV-PAYLOAD-MASK)
+                                  (x64-alu! 33 rd 0)
+                                  (if (= (.imm m) JSV-INTEGER)
+                                      (do (x64-shift-imm! rd 4 16)
+                                          (x64-shift-imm! rd 7 16))
+                                      0)
+                                  (x64-store-gpr! (.dst m) rd))))))
+                              MI-LOAD
+                            (let [address (x64-read-gpr! (.a m) 15)
+                                  is-fp (= (ml-register-class (.dst m)) MRC-FPR)
+                                  to (if is-fp (x64-write-fpr (.dst m) 14)
+                                         (x64-write-gpr (.dst m) 14))]
+                              (if (or (< address 0) (< to 0))
+                                  (x64-fail! (.node m))
+                                  (if is-fp
+                                      (do (x64-fload! to address (.imm m))
+                                          (x64-store-fpr! (.dst m) to))
+                                      (do (x64-load! to address (.imm m))
+                                          (x64-store-gpr! (.dst m) to))))) MI-STORE
+                            (let [address (x64-read-gpr! (.a m) 14)
+                                  is-fp (= (ml-register-class (.b m)) MRC-FPR)
+                                  value (if is-fp (x64-read-fpr! (.b m) 15)
+                                            (x64-read-gpr! (.b m) 15))]
+                              (if (or (< address 0) (< value 0))
+                                  (x64-fail! (.node m))
+                                  (if is-fp (x64-fstore! address (.imm m) value)
+                                      (x64-store! address (.imm m) value))))
+                              MI-NEW
+                            (let [to (x64-write-gpr (.dst m) 14)
+                                  (mut fp) 8]
+                              (if (< to 0)
+                                  (x64-fail! (.node m))
+                                  (if (not (be-runtime-allocation?))
+                                      (do
+                                        ;; Legacy raw-byte backend tests provide a scratch heap as
+                                        ;; their fourth C argument, matching AArch64's non-runtime
+                                        ;; allocation mode. Production native execution enables
+                                        ;; runtime allocation and takes the collector path below.
+                                        (x64-mov-rr! to 1)
+                                        (x64-mov-imm! 15 (* (graph-new-index (.node m)) 128))
+                                        (x64-add-rr! to 15)
+                                        (x64-store-gpr! (.dst m) to))
+                                  (do
+                                    ;; The allocator treats xmm8-xmm15 as callee-save colors, while
+                                    ;; the SysV runtime is allowed to clobber every XMM register.
+                                    (x64-sp-adjust! true 64)
+                                    (loop (if (> (load fp) 15)
+                                              (break)
+                                              (do (x64-fstore! 4 (* (- (load fp) 8) 8) (load fp))
+                                                  (set! fp (+ (load fp) 1)))))
+                                    (x64-mov-imm! 7 (shape-size (.imm m)))
+                                    (x64-mov-imm! 6 (.imm m))
+                                    (x64-u8! 232)
+                                    (set! (.last m) (al-len [u8] (.code (backend))))
+                                    (x64-u32! 0)
+                                    (set! (.earliest m) (al-len [u8] (.code (backend))))
+                                    (set! fp 8)
+                                    (loop (if (> (load fp) 15)
+                                              (break)
+                                              (do (x64-fload! (load fp) 4 (* (- (load fp) 8) 8))
+                                                  (set! fp (+ (load fp) 1)))))
+                                    (x64-sp-adjust! false 64)
+                                    (x64-mov-rr! to 0)
+                                    (x64-store-gpr! (.dst m) to)))))
+                              MI-B
+                            (do (x64-u8! 233) (set! (.last m) (al-len [u8] (.code (backend))))
+                                (x64-u32! 0) (set! (.earliest m) (al-len [u8] (.code (backend))))) MI-JMP
+                            (do (x64-u8! 233) (set! (.last m) (al-len [u8] (.code (backend))))
+                                (x64-u32! 0) (set! (.earliest m) (al-len [u8] (.code (backend))))) MI-CBZ
+                            (let [ra (x64-read-gpr! (.a m) 14)]
+                              (if (< ra 0) (x64-fail! (.node m))
+                                  (do (x64-rex! ra ra) (x64-u8! 133) (x64-modrm! ra ra)
+                                      (x64-u8! 15) (x64-u8! 132)
+                                      (set! (.last m) (al-len [u8] (.code (backend))))
+                                      (x64-u32! 0)
+                                      (set! (.earliest m) (al-len [u8] (.code (backend))))))) MI-CBR
+                            (let [ra (x64-read-gpr! (.a m) 14)]
+                              (if (< ra 0) (x64-fail! (.node m))
+                                  (do (x64-rex! ra ra) (x64-u8! 133) (x64-modrm! ra ra)
+                                      (x64-u8! 15) (x64-u8! 133)
+                                      (set! (.last m) (al-len [u8] (.code (backend))))
+                                      (x64-u32! 0)
+                                      (set! (.earliest m) (al-len [u8] (.code (backend))))
+                                      (x64-u8! 233)
+                                      (set! (.latest m) (al-len [u8] (.code (backend))))
+                                      (x64-u32! 0)
+                                      (set! (.schedule-order m) (al-len [u8] (.code (backend)))))))
+                              MI-CALL
+                            (let [polymorphic (< (.imm m) 0)
+                                  argc (.arg-count m)
+                                  area (& (+ (* (+ argc (if polymorphic 1 0)) 8) 15) -16)
+                                      (mut arg) 0]
+                                  (x64-sp-adjust! true area)
+                                  (if polymorphic
+                                      (let [callee (x64-read-gpr-delta! (.a m) 15 area)]
+                                        (if (< callee 0) (x64-fail! (.node m))
+                                            (x64-store! 4 (* argc 8) callee))) 0)
+                                  ;; Snapshot every source before assigning ABI registers.
+                                  (loop (if (>= (load arg) argc)
+                                            (break)
+                                            (let [vr (ms-inst-arg (load at) (load arg))]
+                                              (if (= (ml-register-class vr) MRC-FPR)
+                                                  (let [r (x64-read-fpr-delta! vr 15 area)]
+                                                    (if (< r 0) (x64-fail! (.node m))
+                                                        (x64-fstore! 4 (* (load arg) 8) r)))
+                                                  (let [r (x64-read-gpr-delta! vr 15 area)]
+                                                    (if (< r 0) (x64-fail! (.node m))
+                                                        (x64-store! 4 (* (load arg) 8) r))))
+                                              (set! arg (+ (load arg) 1)))))
+                                  (set! arg 0)
+                                  (loop (if (>= (load arg) argc)
+                                            (break)
+                                            (let [vr (ms-inst-arg (load at) (load arg))
+                                                  abi (x64-call-class-index m (load arg))]
+                                              (if (< abi 8)
+                                                  (if (= (ml-register-class vr) MRC-FPR)
+                                                      (x64-fload! abi 4 (* (load arg) 8))
+                                                      (x64-load! (x64-reg abi) 4 (* (load arg) 8)))
+                                                  0)
+                                              (set! arg (+ (load arg) 1)))))
+                                  ;; Compact class-overflow arguments at the incoming stack base.
+                                  (set! arg 0)
+                                  (loop (if (>= (load arg) argc)
+                                            (break)
+                                            (let [vr (ms-inst-arg (load at) (load arg))
+                                                  abi (x64-call-class-index m (load arg))]
+                                              (if (>= abi 8)
+                                                  (let [slot (x64-call-stack-index m (load arg))]
+                                                    (if (= (ml-register-class vr) MRC-FPR)
+                                                        (do (x64-fload! 15 4 (* (load arg) 8))
+                                                            (x64-fstore! 4 (* slot 8) 15))
+                                                        (do (x64-load! 15 4 (* (load arg) 8))
+                                                            (x64-store! 4 (* slot 8) 15))))
+                                                  0)
+                                              (set! arg (+ (load arg) 1)))))
+                                  (if polymorphic
+                                      (let [(mut function-branch) 0
+                                            (mut closure-branch) 0
+                                            (mut decoded-jump) 0
+                                            (mut function-at) 0
+                                            (mut closure-at) 0
+                                            (mut decoded-at) 0
+                                            (mut owner) 0
+                                            first-end (al-len [i64] (.x64-poly-end-offs (backend)))]
+                                        ;; Decode a bare function id or a closure environment's
+                                        ;; target field into rax without disturbing call arguments.
+                                        (x64-load! 0 4 (* argc 8))
+                                        (x64-mov-rr! 14 0)
+                                        (x64-mov-imm! 15 JSV-TAG-MASK)
+                                        (x64-alu! 33 14 15)
+                                        (x64-mov-imm! 15 JSV-FUNCTION)
+                                        (x64-cmp! 14 15)
+                                        (x64-u8! 15) (x64-u8! 132)
+                                        (set! function-branch (al-len [u8] (.code (backend)))) (x64-u32! 0)
+                                        (x64-mov-imm! 15 JSV-OBJECT)
+                                        (x64-cmp! 14 15)
+                                        (x64-u8! 15) (x64-u8! 132)
+                                        (set! closure-branch (al-len [u8] (.code (backend)))) (x64-u32! 0)
+                                        (x64-u8! 15) (x64-u8! 11)
+                                        (set! closure-at (al-len [u8] (.code (backend))))
+                                        (x64-mov-imm! 15 JSV-PAYLOAD-MASK)
+                                        (x64-alu! 33 0 15)
+                                        (x64-load! 0 0 8)
+                                        (x64-u8! 233)
+                                        (set! decoded-jump (al-len [u8] (.code (backend)))) (x64-u32! 0)
+                                        (set! function-at (al-len [u8] (.code (backend))))
+                                        (x64-mov-imm! 15 JSV-PAYLOAD-MASK)
+                                        (x64-alu! 33 0 15)
+                                        (set! decoded-at (al-len [u8] (.code (backend))))
+                                        (x64-patch32! (load function-branch)
+                                                      (- (load function-at) (+ (load function-branch) 4)))
+                                        (x64-patch32! (load closure-branch)
+                                                      (- (load closure-at) (+ (load closure-branch) 4)))
+                                        (x64-patch32! (load decoded-jump)
+                                                      (- (load decoded-at) (+ (load decoded-jump) 4)))
+                                        (loop (if (>= (load owner) (mu-function-count))
+                                                  (break)
+                                                  (let [symbol (al-get (.symbols (machine-unit)) (load owner))]
+                                                    (if (>= symbol 1)
+                                                        (let [(mut skip) 0]
+                                                          (x64-cmp-imm32! 0 symbol)
+                                                          (x64-u8! 15) (x64-u8! 133)
+                                                          (set! skip (al-len [u8] (.code (backend)))) (x64-u32! 0)
+                                                          (x64-u8! 232)
+                                                          (let [call-off (al-len [u8] (.code (backend)))]
+                                                            (x64-u32! 0)
+                                                            (al-push! [i64] (field (backend) x64-poly-call-offs) call-off)
+                                                            (al-push! [i64] (field (backend) x64-poly-call-targets) (load owner)))
+                                                          (let [kind (be-function-return-kind (load owner))]
+                                                            (if (= kind MLK-BOXED) 0
+                                                                (if (and (= kind MLK-SCALAR)
+                                                                         (be-function-fp-return? (load owner)))
+                                                                    (x64-movq-rx! 0 0)
+                                                                    (do (x64-mov-imm! 14 JSV-PAYLOAD-MASK)
+                                                                        (x64-alu! 33 0 14)
+                                                                        (x64-mov-imm! 14 (be-function-return-tag (load owner)))
+                                                                        (x64-alu! 9 0 14)))))
+                                                          (x64-u8! 233)
+                                                          (al-push! [i64] (field (backend) x64-poly-end-offs)
+                                                                    (al-len [u8] (.code (backend))))
+                                                          (x64-u32! 0)
+                                                          (x64-patch32! (load skip)
+                                                                        (- (al-len [u8] (.code (backend)))
+                                                                           (+ (load skip) 4)))) 0)
+                                                    (set! owner (+ (load owner) 1)))))
+                                        (x64-u8! 15) (x64-u8! 11)
+                                        (let [end (al-len [u8] (.code (backend)))
+                                              (mut e) first-end]
+                                          (loop (if (>= (load e) (al-len [i64] (.x64-poly-end-offs (backend))))
+                                                    (break)
+                                                    (do (let [off (al-get (.x64-poly-end-offs (backend)) (load e))]
+                                                          (x64-patch32! off (- end (+ off 4))))
+                                                        (set! e (+ (load e) 1))))))
+                                        (set! (.earliest m) (al-len [u8] (.code (backend)))))
+                                      (do (x64-u8! 232)
+                                          (set! (.last m) (al-len [u8] (.code (backend))))
+                                          (x64-u32! 0)
+                                          (set! (.earliest m) (al-len [u8] (.code (backend))))))
+                                  (if (= (ml-register-class (.dst m)) MRC-FPR)
+                                      (let [to (x64-write-fpr (.dst m) 14)]
+                                        (if (< to 0) (x64-fail! (.node m))
+                                            (do (x64-fmov! 14 0)
+                                                (x64-sp-adjust! false area)
+                                                (x64-fmov! to 14)
+                                                (x64-store-fpr! (.dst m) to))))
+                                      (let [to (x64-write-gpr (.dst m) 14)]
+                                        (if (< to 0) (x64-fail! (.node m))
+                                            (do (x64-mov-rr! 14 0)
+                                                (x64-sp-adjust! false area)
+                                                (x64-mov-rr! to 14)
+                                                (x64-store-gpr! (.dst m) to))))))
+                              MI-STACKARG
+                            (let [is-fp (= (ml-register-class (.dst m)) MRC-FPR)
+                                  to (if is-fp (x64-write-fpr (.dst m) 14)
+                                         (x64-write-gpr (.dst m) 14))
+                                  ;; At entry the return address is at rsp+0. The prologue then
+                                  ;; pushes rbp before subtracting the aligned frame, so incoming
+                                  ;; stack arguments begin at frame+16 from the post-prologue rsp.
+                                  off (+ (+ (mu-function-frame-size (.owner m)) 16) (* (.imm m) 8))]
+                              (if (< to 0) (x64-fail! (.node m))
+                                  (if is-fp
+                                      (do (x64-fload! to 4 off) (x64-store-fpr! (.dst m) to))
+                                      (do (x64-load! to 4 off) (x64-store-gpr! (.dst m) to)))))
+                              MI-JSPROP
+                            (x64-runtime-call! m (load at)) MI-JSARRAY
+                            (x64-runtime-call! m (load at)) MI-JSSTRING
+                            (x64-runtime-call! m (load at))
+                              MI-RET
+                            (let [is-fp (= (ml-register-class (.a m)) MRC-FPR)
+                                  result (if is-fp (x64-read-fpr! (.a m) 14)
+                                             (x64-read-gpr! (.a m) 14))]
+                              (if (< result 0)
+                                  (x64-fail! (.node m))
+                                  (do (if is-fp (x64-fmov! 0 result) (x64-mov-rr! 0 result))
+                                    (if (< (.owner m) 0) 0
+                                        (do (x64-restore-callees! (.owner m))
+                                            (x64-sp-adjust! false (mu-function-frame-size (.owner m)))
+                                            (x64-u8! 93)))
+                                      (x64-ret!))))
+                              (x64-fail! (.node m))))
+                    (set! at (+ (load at) 1))
+                    0)))
+        ;; Resolve block-relative branches after all variable-length instructions have exact PCs.
+        (if (= (be-result) BER-OK)
+            (let [(mut j) 0]
+              (loop (if (>= (load j) n) (break)
+                        (do (let [m (be-inst (load j)) op (.op m)]
+                              (case op MI-B (x64-patch32! (.last m)
+                                                         (- (x64-label-off (.imm m)) (.earliest m)))
+                                    MI-JMP (x64-patch32! (.last m)
+                                                        (- (x64-label-off (.imm m)) (.earliest m)))
+                                    MI-CBZ (x64-patch32! (.last m)
+                                                        (- (x64-label-off (.imm m)) (.earliest m)))
+                                    MI-CBR (do (x64-patch32! (.last m)
+                                                            (- (x64-label-off (.b m)) (.earliest m)))
+                                               (x64-patch32! (.latest m)
+                                                             (- (x64-label-off (.imm m)) (.schedule-order m))))
+                                    0))
+                            (set! j (+ (load j) 1)))))) 0)
+        (if (= (be-result) BER-OK)
+            (let [(mut fixup) 0]
+              (loop (if (>= (load fixup) (al-len [i64] (.x64-poly-call-offs (backend))))
+                        (break)
+                        (do (let [off (al-get (.x64-poly-call-offs (backend)) (load fixup))
+                                  owner (al-get (.x64-poly-call-targets (backend)) (load fixup))
+                                  target (x64-label-off (mu-function-block owner 0))]
+                              (if (< target 0) (x64-fail! -1)
+                                  (x64-patch32! off (- target (+ off 4)))))
+                            (set! fixup (+ (load fixup) 1)))))) 0)
+        ;; Internal direct calls are also made executable in the raw byte stream used by focused
+        ;; backend tests. ELF RELA relocations overwrite these addends when an object is linked.
+        (if (= (be-result) BER-OK)
+            (let [(mut call) 0]
+              (loop (if (>= (load call) n)
+                        (break)
+                        (do (let [m (be-inst (load call))]
+                              (if (and (= (.op m) MI-CALL) (>= (.imm m) 0))
+                                  (let [target (x64-label-off (mu-function-block (.imm m) 0))]
+                                    (if (< target 0) (x64-fail! (.node m))
+                                        (x64-patch32! (.last m) (- target (.earliest m)))))
+                                  0))
+                            (set! call (+ (load call) 1)))))) 0)
+        ;; Exact function ranges are consumed by both ELF symbols and stack maps.
+        (let [(mut owner) 0]
+          (loop (if (>= (load owner) (mu-function-count)) (break)
+                    (do (let [f (mu-function (load owner)) start (x64-label-off (mu-function-block (load owner) 0))
+                              end (if (= (+ (load owner) 1) (mu-function-count))
+                                      (al-len [u8] (.code (backend)))
+                                      (x64-label-off (mu-function-block (+ (load owner) 1) 0)))]
+                          (set! (.code-start f) start) (set! (.code-size f) (- end start)))
+                        (set! owner (+ (load owner) 1)))))
+        (and (= (be-result) BER-OK) (> (al-len [u8] (.code (backend))) 0))))))
+
+(defn be-x64-code-len [] (-> i64)
+  (if (= (be-result) BER-OK) (al-len [u8] (.code (backend))) 0))
+
+(defn be-x64-code-byte [(at i64)] (-> i64)
+  (cast i64 (al-get (.code (backend)) at)))

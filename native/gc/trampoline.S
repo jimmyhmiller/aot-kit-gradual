@@ -1,3 +1,60 @@
+#if defined(__x86_64__) && !defined(__APPLE__)
+.text
+.globl aot_gc_enter
+.type aot_gc_enter,@function
+aot_gc_enter:
+  pushq %r12
+  movq %rdi, %rax
+  leaq aot_gc_thread_state(%rip), %r12
+  call *%rax
+  popq %r12
+  ret
+.size aot_gc_enter, .-aot_gc_enter
+
+.globl aot_gc_enter1
+.type aot_gc_enter1,@function
+aot_gc_enter1:
+  pushq %r12
+  movq %rdi, %rax
+  movq %rsi, %rdi
+  leaq aot_gc_thread_state(%rip), %r12
+  call *%rax
+  popq %r12
+  ret
+.size aot_gc_enter1, .-aot_gc_enter1
+
+.globl aot_alloc_slow
+.type aot_alloc_slow,@function
+aot_alloc_slow:
+  pushq %rbp
+  movq %rsp, %rbp
+  pushq %rbx
+  pushq %r12
+  pushq %r13
+  pushq %r14
+  pushq %r15
+  subq $8, %rsp
+  movq %rsp, %rdx
+  leaq 48(%rsp), %rcx
+  movq 8(%rbp), %r8
+  call aot_gc_alloc
+  testq %rax, %rax
+  jne 1f
+  call aot_gc_oom_trap
+  ud2
+1:
+  addq $8, %rsp
+  popq %r15
+  popq %r14
+  popq %r13
+  popq %r12
+  popq %rbx
+  popq %rbp
+  ret
+.size aot_alloc_slow, .-aot_alloc_slow
+
+.section .note.GNU-stack,"",@progbits
+#else
 .text
 .p2align 2
 .globl _aot_gc_enter
@@ -52,3 +109,4 @@ _aot_alloc_slow:
   ldp x29, x30, [sp, #80]
   add sp, sp, #96
   ret
+#endif

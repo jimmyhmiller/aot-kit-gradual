@@ -1,0 +1,189 @@
+;; Linux ELF64 publication for the x86-64 Machine IR backend.  Metadata construction and model
+;; validation intentionally remain owned by backend_macho: that module is the platform-neutral
+;; contract consumed by native/gc/runtime.c; this file only changes the object container.
+(module backend_elf)
+
+(import "backend_core" :use *)
+(import "backend_select" :use *)
+(import "backend_macho" :use *)
+(import "backend_x64" :use *)
+(import "node" :use *)
+(import "coil.alloc" :use * :as alloc)
+(import "coil.arraylist" :use *)
+(import "coil.slice" :use *)
+
+(defn elf-u8! [(b (mut (ArrayList u8))) (v i64)] (-> i64)
+  (al-push! [u8] (mut b) (cast u8 (& v 255))) 0)
+(defn elf-u16! [(b (mut (ArrayList u8))) (v i64)] (-> i64)
+  (elf-u8! (mut b) v) (elf-u8! (mut b) (>> v 8)) 0)
+(defn elf-u32! [(b (mut (ArrayList u8))) (v i64)] (-> i64)
+  (elf-u16! (mut b) v) (elf-u16! (mut b) (>> v 16)) 0)
+(defn elf-u64! [(b (mut (ArrayList u8))) (v i64)] (-> i64)
+  (elf-u32! (mut b) v) (elf-u32! (mut b) (>> v 32)) 0)
+(defn elf-bytes! [(b (mut (ArrayList u8))) (s (slice u8))] (-> i64)
+  (let [(mut i) 0]
+    (loop (if (>= (load i) (slice-len s)) (break)
+              (do (elf-u8! (mut b) (cast i64 (slice-get s (load i))))
+                  (set! i (+ (load i) 1)))))) 0)
+(defn elf-copy! [(to (mut (ArrayList u8))) (from (ArrayList u8))] (-> i64)
+  (let [(mut i) 0]
+    (loop (if (>= (load i) (al-len [u8] from)) (break)
+              (do (elf-u8! (mut to) (cast i64 (al-get [u8] from (load i))))
+                  (set! i (+ (load i) 1)))))) 0)
+(defn elf-pad! [(b (mut (ArrayList u8))) (at i64)] (-> i64)
+  (loop (if (>= (al-len [u8] (load b)) at) (break) (elf-u8! (mut b) 0))) 0)
+(defn elf-align [(v i64) (a i64)] (-> i64) (& (+ v (- a 1)) (- 0 a)))
+
+(defn elf-hex-name! [(b (mut (ArrayList u8))) (owner i64)] (-> i64)
+  (elf-bytes! (mut b) "aot_")
+  (let [(mut shift) 60]
+    (loop (if (< (load shift) 0) (break)
+              (let [d (& (>> owner (load shift)) 15)]
+                (elf-u8! (mut b) (if (< d 10) (+ 48 d) (+ 87 d)))
+                (set! shift (- (load shift) 4))))))
+  (elf-u8! (mut b) 0))
+
+(defn elf-undef-sym! [(sym (mut (ArrayList u8))) (str (mut (ArrayList u8)))
+                      (name (slice u8))] (-> i64)
+  (let [nameoff (al-len [u8] (load str))]
+    (elf-bytes! (mut str) name) (elf-u8! (mut str) 0)
+    (elf-u32! (mut sym) nameoff) (elf-u8! (mut sym) 18) (elf-u8! (mut sym) 0)
+    (elf-u16! (mut sym) 0) (elf-u64! (mut sym) 0) (elf-u64! (mut sym) 0)))
+
+;; ELF64 section header.
+(defn elf-sh! [(b (mut (ArrayList u8))) (name i64) (kind i64) (flags i64)
+               (off i64) (size i64) (link i64) (info i64) (align i64) (entsize i64)] (-> i64)
+  (elf-u32! (mut b) name) (elf-u32! (mut b) kind)
+  (elf-u64! (mut b) flags) (elf-u64! (mut b) 0)
+  (elf-u64! (mut b) off) (elf-u64! (mut b) size)
+  (elf-u32! (mut b) link) (elf-u32! (mut b) info)
+  (elf-u64! (mut b) align) (elf-u64! (mut b) entsize) 0)
+
+(defn elf-read-u32 [(at i64)] (-> i64)
+  (let [o (.obj (backend))]
+    (| (cast i64 (al-get [u8] o at))
+       (| (<< (cast i64 (al-get [u8] o (+ at 1))) 8)
+          (| (<< (cast i64 (al-get [u8] o (+ at 2))) 16)
+             (<< (cast i64 (al-get [u8] o (+ at 3))) 24))))))
+
+;; Publish ET_REL.  Calls use the x86 `call rel32` relocation contract: the four-byte field is at
+;; instruction+1 and RELA's -4 addend accounts for x86 PC-relative addressing from its end.
+(defn be-elf! [] (-> i64)
+  (mobj-build-roots!)
+  (let [a (malloc-allocator)
+        p (backend)
+        funcs (mu-function-count)
+        textlen (be-x64-code-len)
+        stacklen (mobj-stackmap-size)
+        layoutlen (mobj-layout-size)
+        (mut text) (al-new [u8] a)
+        (mut stack) (al-new [u8] a)
+        (mut layout) (al-new [u8] a)
+        (mut rela) (al-new [u8] a)
+        (mut sym) (al-new [u8] a)
+        (mut str) (al-new [u8] a)]
+    (let [(mut i) 0]
+      (loop (if (>= (load i) textlen) (break)
+                (do (elf-u8! (mut text) (be-x64-code-byte (load i)))
+                    (set! i (+ (load i) 1))))))
+    ;; Reuse the authoritative byte producers, then retain each result independently.
+    (al-clear! [u8] (field p obj)) (mobj-write-stackmaps!)
+    (elf-copy! (mut stack) (.obj p))
+    (al-clear! [u8] (field p obj)) (mobj-write-layouts!)
+    (elf-copy! (mut layout) (.obj p))
+    ;; Null symbol, local function definitions, then the sole global definition `kernel`.
+    (let [(mut z) 0]
+      (loop (if (>= (load z) 24) (break)
+                (do (elf-u8! (mut sym) 0) (set! z (+ (load z) 1))))))
+    (elf-u8! (mut str) 0)
+    (let [(mut owner) 1]
+      (loop (if (>= (load owner) funcs) (break)
+                (let [name (al-len [u8] (load str))]
+                  (elf-hex-name! (mut str) (load owner))
+                  (elf-u32! (mut sym) name) (elf-u8! (mut sym) 2) (elf-u8! (mut sym) 0)
+                  (elf-u16! (mut sym) 1) (elf-u64! (mut sym) (mu-function-code-start (load owner)))
+                  (elf-u64! (mut sym) (mu-function-code-size (load owner)))
+                  (set! owner (+ (load owner) 1))))))
+    (let [kernel-name (al-len [u8] (load str))]
+      (elf-bytes! (mut str) "kernel") (elf-u8! (mut str) 0)
+      (elf-u32! (mut sym) kernel-name) (elf-u8! (mut sym) 18) (elf-u8! (mut sym) 0)
+      (elf-u16! (mut sym) 1)
+      (elf-u64! (mut sym) (if (> funcs 0) (mu-function-code-start 0) 0))
+      (elf-u64! (mut sym) (if (> funcs 0) (mu-function-code-size 0) textlen)))
+    (let [text-name (al-len [u8] (load str))]
+      (elf-bytes! (mut str) "aot_text_start") (elf-u8! (mut str) 0)
+      (elf-u32! (mut sym) text-name) (elf-u8! (mut sym) 16) (elf-u8! (mut sym) 0)
+      (elf-u16! (mut sym) 1) (elf-u64! (mut sym) 0) (elf-u64! (mut sym) 0))
+    (elf-undef-sym! (mut sym) (mut str) "aot_alloc_slow")
+    (elf-undef-sym! (mut sym) (mut str) "aot_js_property")
+    (elf-undef-sym! (mut sym) (mut str) "aot_js_array")
+    (elf-undef-sym! (mut sym) (mut str) "aot_js_string")
+    (let [(mut at) 0]
+      (loop (if (>= (load at) (be-inst-count)) (break)
+                (do
+                  (let [m (be-inst (load at)) op (ms-inst-op (load at))]
+                  (if (or (and (= op MI-CALL) (>= (.imm m) 0))
+                          (or (= op MI-NEW)
+                              (or (= op MI-JSPROP) (or (= op MI-JSARRAY) (= op MI-JSSTRING)))))
+                      (let [target (.imm m)
+                            symbol (case op MI-CALL (if (= target 0) funcs target)
+                                         MI-NEW (+ funcs 2)
+                                         MI-JSPROP (+ funcs 3)
+                                         MI-JSARRAY (+ funcs 4)
+                                         MI-JSSTRING (+ funcs 5) 0)]
+                        (elf-u64! (mut rela) (.last m))
+                        (elf-u32! (mut rela) 2) ; R_X86_64_PC32
+                        (elf-u32! (mut rela) symbol)
+                        (elf-u64! (mut rela) -4)) 0)
+                  )
+                  (set! at (+ (load at) 1))))))
+    (let [textoff 64
+          stackoff (elf-align (+ textoff textlen) 8)
+          layoutoff (elf-align (+ stackoff stacklen) 8)
+          relaoff (elf-align (+ layoutoff layoutlen) 8)
+          symoff (elf-align (+ relaoff (al-len [u8] (load rela))) 8)
+          stroff (+ symoff (al-len [u8] (load sym)))
+          shstr "\0.text\0aot_stackmap\0aot_layout\0.rela.text\0.symtab\0.strtab\0.shstrtab\0.note.GNU-stack\0"
+          shstroff (+ stroff (al-len [u8] (load str)))
+          shoff (elf-align (+ shstroff (slice-len shstr)) 8)
+          out (field p obj)]
+      (al-clear! [u8] out)
+      (elf-u8! (mut out) 127) (elf-bytes! (mut out) "ELF")
+      (elf-u8! (mut out) 2) (elf-u8! (mut out) 1) (elf-u8! (mut out) 1) (elf-u8! (mut out) 0)
+      (elf-pad! (mut out) 16)
+      (elf-u16! (mut out) 1) (elf-u16! (mut out) 62) (elf-u32! (mut out) 1)
+      (elf-u64! (mut out) 0) (elf-u64! (mut out) 0) (elf-u64! (mut out) shoff)
+      (elf-u32! (mut out) 0) (elf-u16! (mut out) 64) (elf-u16! (mut out) 0)
+      (elf-u16! (mut out) 0) (elf-u16! (mut out) 64) (elf-u16! (mut out) 9) (elf-u16! (mut out) 7)
+      (elf-copy! (mut out) text) (elf-pad! (mut out) stackoff) (elf-copy! (mut out) stack)
+      (elf-pad! (mut out) layoutoff) (elf-copy! (mut out) layout)
+      (elf-pad! (mut out) relaoff) (elf-copy! (mut out) rela)
+      (elf-pad! (mut out) symoff) (elf-copy! (mut out) sym) (elf-copy! (mut out) str)
+      (elf-bytes! (mut out) shstr) (elf-pad! (mut out) shoff)
+      (let [(mut z) 0] (loop (if (>= (load z) 64) (break) (do (elf-u8! (mut out) 0) (set! z (+ (load z) 1))))))
+      (elf-sh! (mut out) 1 1 6 textoff textlen 0 0 16 0)
+      (elf-sh! (mut out) 7 1 2 stackoff stacklen 0 0 8 0)
+      (elf-sh! (mut out) 20 1 2 layoutoff layoutlen 0 0 8 0)
+      (elf-sh! (mut out) 31 4 0 relaoff (al-len [u8] (load rela)) 5 1 8 24)
+      (elf-sh! (mut out) 42 2 0 symoff (al-len [u8] (load sym)) 6 funcs 8 24)
+      (elf-sh! (mut out) 50 3 0 stroff (al-len [u8] (load str)) 0 0 1 0)
+      (elf-sh! (mut out) 58 3 0 shstroff (slice-len shstr) 0 0 1 0)
+      (elf-sh! (mut out) 68 1 0 shstroff 0 0 0 1 0)
+      (al-len [u8] (.obj p)))))
+
+(defn be-elf-checked! [] (-> bool)
+  (let [p (backend)]
+    (al-clear! [u8] (field p obj))
+    (if (or (!= (be-result) BER-OK) (= (be-x64-code-len) 0))
+        (be-fail! BER-OBJECT NO-NODE)
+        (if (not (mobj-verify-model!))
+            (be-fail! BER-OBJECT (mobj-item))
+            (if (and (> (be-elf!) (be-x64-code-len))
+                     (= (elf-read-u32 0) 1179403647)
+                     (= (elf-read-u32 16) 4063233))
+                true
+                (be-fail! BER-OBJECT NO-NODE))))))
+
+(defn be-elf-object-len [] (-> i64)
+  (if (= (be-result) BER-OK) (al-len [u8] (.obj (backend))) 0))
+(defn be-elf-object-data [] (-> (ptr u8)) (.data (.obj (backend))))

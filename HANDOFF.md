@@ -1,5 +1,199 @@
 # Handoff: move JavaScript semantics into the DSL
 
+## COMPLETE TEST262 CORPUS NOW HAS AN HONEST NATIVE BASELINE (2026-08-21, latest)
+
+The runner can now attempt every actual test file in an upstream Test262 checkout with bounded
+parallel native compilation, incremental JSONL results, and resume. It excludes `_FIXTURE.js`
+module support files (which are inputs to tests, not tests themselves), accepts CR/CRLF metadata,
+uses PID-specific object/executable paths, caches immutable C bridge objects by tracked-source
+freshness, and cleans up after crashes and timeouts. On Linux each worker has a 30-second timeout
+and a 2048 MiB address-space limit, so malformed generated programs are recorded instead of
+exhausting the machine. None of these outcomes is turned into a pass.
+
+The complete attempt used Test262 revision `3655e7464de3d52643ecddd4b5f9f4f3e7f62398` and selected
+53,578 tests. Default/strict expansion plus one policy record for unsupported protocol tests
+produced 82,278 unique results:
+
+* **2,475 passed** through frontend, Machine IR, native x86-64 encoding, ELF linking, runtime, and
+  execution.
+* **8,656 failed**, led by 6,164 `jsl argument 0 is NO-NODE` graph corruptions, 1,724 runtime
+  failures, 492 compiler `SIGSEGV`s, 104 declaration-initializer graph corruptions, 79 compiler
+  `SIGABRT`s, and 65 timeouts.
+* **48,130 refused** rather than approximated. The largest indexed reasons are frontend codes 1001
+  (23,354) and 1003 (20,462), followed by unsupported bridge kinds and 1,615 pipeline refusals.
+* **23,017 skipped** for explicit unimplemented Test262 protocol: 11,876 catchable-exception
+  assertions, 5,523 async tests, 4,453 negative parse tests, 843 modules, 290 `$262` host-object
+  tests, and 32 negative runtime tests.
+
+The durable evidence is `.amp/in/artifacts/test262-full.jsonl` with aggregate totals in
+`.amp/in/artifacts/test262-full.jsonl.summary.json`. All 82,278 `(path, variant)` keys are unique;
+there are no fixture-file or metadata-parser failures. `docs/TEST262.md` documents range,
+parallelism, timeout, memory-limit, result, and resume options. This is a full-corpus **attempt and
+baseline**, not a conformance claim: exact top-level Script semantics, modules, async completion,
+negative phases, fresh realms, `$262`, and catchable exceptions remain real implementation work.
+
+No JavaScript operation was added to the runner, native harness, or frontend. These changes are
+process isolation, object preparation, metadata, and reporting only; `lib/**/*.jsl` remains the
+sole owner of JavaScript semantics.
+
+Final Linux x86-64 verification:
+
+* `npm run test262 -- --jobs 4 --test262 /tmp/test262 tests/test262/cases` from an empty native C
+  object cache — **8 passed, 0 failed, 0 refused, 0 skipped**, with no leaked per-process files.
+* The full incremental command — expected nonzero because unsupported and broken tests are not
+  hidden — **2,475 passed, 8,656 failed, 48,130 refused, 23,017 skipped**.
+* `COIL_META_CACHE=0 coil test tests/test262-harness-test.coil --no-fork` — **5 passed, 0 failed**.
+* `COIL_META_CACHE=0 coil test tests/dsl-ownership-test.coil --no-fork` — **4 passed, 0 failed**.
+* `COIL_META_CACHE=0 coil test` — **428 passed, 0 failed**.
+* `COIL_META_CACHE=0 coil test --suite frontier` — intentionally **0 passed, 8 failed**: seven
+  listed frontend refusals and the listed 26-vs-25 disagreement, with no platform, encoding,
+  linking, or runtime infrastructure failure.
+
+## ACTUAL TEST262 FILES RUN THROUGH THE NATIVE RUNNER (2026-08-21, latest)
+
+The prior section's single Test262-shaped fixture was not an answer to “can this run Test262
+tests?” A real command now reads upstream YAML frontmatter, expands requested includes, selects
+default/strict variants, assembles the native entry, and reports PASS/FAIL/REFUSED/SKIP:
+
+```
+npm run test262 -- --test262 /path/to/test262 TEST_OR_DIRECTORY...
+```
+
+Four byte-for-byte upstream files from Test262 revision
+`3655e7464de3d52643ecddd4b5f9f4f3e7f62398` are pinned under `tests/test262/cases/`: division,
+modulus, and multiplication line-terminator tests plus the compare-array harness include test. Each
+passes in both default and strict mode, so the focused command performs eight actual Test262
+executions through native frontend, Machine IR,
+x86-64 encoding, ELF publication/linking, runtime, and GC trampoline. The Coil gate independently
+runs all four source files against Node.
+
+The runner does not turn missing support into green. A frontend refusal makes the command fail;
+module/async/negative variants are visibly skipped; a runtime throw/crash fails. It prints the
+current function-body entry limitation before every run because exact top-level Script semantics
+are not implemented yet. `docs/TEST262.md` records that boundary and the exact source provenance.
+Try/catch now has a stable bridge kind and is rejected during indexing instead of aborting in graph
+construction.
+
+No JavaScript semantics were added to runner/frontend code. Metadata, include expansion, variant
+selection, and process status are harness policy. Arithmetic and assertion value operations still
+reach `lib/**/*.jsl`; the four DSL ownership invariants remain green and the exact open-coded
+semantic debt remains empty.
+
+Focused verification on Linux x86-64:
+
+* `npm run test262 -- --test262 /tmp/test262 tests/test262/cases` — **8 passed, 0 failed, 0
+  refused, 0 skipped**.
+* `COIL_META_CACHE=0 coil test tests/test262-harness-test.coil --no-fork` — **5 passed, 0 failed**.
+* `COIL_META_CACHE=0 coil test tests/dsl-ownership-test.coil --no-fork` — **4 passed, 0 failed**.
+* `COIL_META_CACHE=0 coil test tests/frontend-native-graph-test.coil --no-fork` — **4 passed, 0
+  failed**.
+* `COIL_META_CACHE=0 coil test` — **428 passed, 0 failed**.
+* `COIL_META_CACHE=0 coil test --suite frontier` — intentionally **0 passed, 8 failed**, with the
+  same seven named frontend refusals and one 26-vs-25 semantic disagreement; no harness, platform,
+  encoding, linking, or runtime infrastructure failure.
+
+## TEST262 CORE HARNESS REACHES NATIVE X86-64 EXECUTION (2026-08-21, latest)
+
+The first Test262 runner slice now assembles the exact upstream `sta.js`, a deliberately bounded
+`assert.js`, and a fixture into the repository's `main(n)` entry ABI, then sends that source through
+the real frontend, x86-64 encoder, ELF linker, GC trampoline, and process execution. The assertion
+slice runs ordinary `assert`, exact SameValue behavior (including NaN and signed zero),
+`assert.sameValue`, `assert.notSameValue`, global `compareArray`, and `assert.compareArray`.
+Vendored harness files retain their Ecma copyright notices and the Test262 BSD license.
+
+This exposed a real frontend collision: `object.name()` was rejected whenever an unrelated
+top-level function declaration was also named `name`. Test262 defines both global `compareArray`
+and `assert.compareArray`. Receiver validation no longer guesses a target from that spelling; the
+graph builder continues to resolve indexed methods and otherwise performs the JavaScript property
+load and dynamic call.
+
+This is an honest synchronous-script foundation, not a claim that arbitrary Test262 tests run yet.
+Frontmatter policy, requested includes, strict/module variants, negative parse/runtime phases,
+async completion, fresh realms, and `$262` remain runner work. The upstream `assert.js` also uses
+`try`/`catch` for diagnostic formatting and `assert.throws`; the bridge can identify TryStatement,
+but the native frontend and runtime do not yet implement catchable exception transport. The local
+assertion subset therefore omits `assert.throws` rather than reporting false conformance.
+
+Verification on Linux x86-64:
+
+* `COIL_META_CACHE=0 coil test tests/test262-harness-test.coil --no-fork` — **1 passed, 0 failed**.
+* `COIL_META_CACHE=0 coil test` — **423 passed, 0 failed**.
+* `COIL_META_CACHE=0 coil test --suite frontier` — intentionally **0 passed, 8 failed**, with the
+  same seven listed frontend refusals and one 26-vs-25 semantic disagreement; no infrastructure
+  failures.
+
+## LINUX X86-64 RUNS THE COMPLETE NATIVE JAVASCRIPT HARNESS (2026-08-21, latest)
+
+Linux x86-64 now owns a complete host-native path from the target-neutral Machine IR through
+`src/backend_x64.coil`, ELF64 `ET_REL` publication in `src/backend_elf.coil`, the SysV runtime/GC
+entry trampoline, native linking, and execution. It uses neither QEMU nor cross-AArch64 artifacts.
+The earlier “first arithmetic slice” note below is retained as history and is superseded by this
+section.
+
+The x64 encoder now covers the machine operations exercised by the full JavaScript native harness:
+integer and floating arithmetic/comparisons/conversions, NaN-box tests and box/unbox, loads/stores,
+branches and edge copies, SysV frames/spills/callee saves, direct and polymorphic calls, runtime
+string/array/property calls, and allocation. Direct calls are resolved in raw executable bytes and
+also carry ELF RELA relocations. Runtime calls are undefined ELF symbols; polymorphic dispatch calls
+are internal fixups and receive no external relocation. Unsupported instructions fail atomically
+with an exact op/node/owner/instruction/location diagnostic.
+
+Two ABI boundaries found by actual execution are worth preserving. Internal generated-code calls
+have independent eight-GPR/eight-FPR argument lanes plus compact stack overflow, while C runtime
+calls use SysV registers and preserve allocator-visible XMM callee colors. After `push rbp`, the
+first incoming stack argument is at `frame + 16`, not the AArch64-derived `frame + 8`; the wrong
+offset read the return address as JSON.stringify's ninth argument. Focused raw-byte tests now select
+host-native bytes and portable mmap flags, while structural AArch64 encoder tests remain AArch64.
+
+Verification on Linux x86-64:
+
+* `COIL_META_CACHE=0 coil test tests/native-execution-test.coil` — **27 passed, 0 failed**.
+* `COIL_META_CACHE=0 coil test` — **422 passed, 0 failed**.
+* `COIL_META_CACHE=0 coil test --suite frontier` — intentionally **0 passed, 8 failed**. Seven are
+  the listed frontend refusals and `shortest-round-trip-digits.js` is the listed 26-vs-25 semantic
+  disagreement; there are no xcrun, Mach-O, ELF, encoding, linking, runtime, or platform failures.
+
+## LINUX X86-64 NOW HAS AN ELF64 RELOCATABLE-OBJECT PUBLISHER (2026-08-21, latest)
+
+`src/backend_elf.coil` publishes the existing x86-64 Machine IR code as ELF64 `ET_REL`: `.text`,
+local function and global `kernel`/`aot_text_start` symbols, `R_X86_64_PC32` RELA call fixups, the
+unchanged `aot_stackmap` and `aot_layout` payloads, and a non-executable-stack note. It deliberately
+reuses `backend_macho`'s metadata producers and pre-publication model verifier, so Linux does not
+fork the GC/runtime contract. `native/gc/runtime.c` now selects ELF section-start symbols off Apple.
+
+## LINUX NOW EXECUTES ITS FIRST REAL X86-64 JAVASCRIPT ARTIFACT (2026-08-21, latest)
+
+The Linux path is native x86-64, with no QEMU and no cross-architecture execution. The new
+`src/backend_x64.coil` maps the allocator's first integer colors onto the SysV AMD64 argument and
+caller-saved registers and encodes moves, 64-bit immediates, add/subtract/multiply/negate, and
+return. Unsupported machine operations fail with `BER-ENCODING`; they are not silently omitted.
+`tests/frontend-native-graph-test.coil` now compiles
+`function main(n) { return n * 3 + 7; }`, maps the emitted x86-64 bytes executable, calls them in
+process with the host C ABI, and observes 22 for 5 and 4 for -1. The same test retains the existing
+AArch64 encoder on non-x86-64 hosts. The focused suite is 3/3 green on this Linux orb.
+
+This is the first host-native encoder slice, not yet the full Test262 harness. The linked harness
+still needs the remaining machine operations, SysV spill/callee-save/call lowering, an ELF64
+relocatable-object writer, and an x86-64 GC entry/stack-map contract. Those are the next platform
+milestones; claiming the Mach-O/AArch64 harness works on Linux before they exist would be false.
+
+## FRESH AMP ORBS INSTALL THE COMPLETE TOOLCHAIN (2026-08-21, latest)
+
+`.agents/setup` now installs the Debian prerequisites, Go 1.25.14, the current Coil `main`
+compiler and standard library, npm dependencies, and the pinned `typescript-go` C archive. The
+Coil install is accepted only after its upstream no-LLVM bootstrap reaches a byte-identical
+stage-2/stage-3 fixpoint and passes the x64 behavioral gate. A commit marker skips that
+three-stage bootstrap on a warm snapshot while still fetching `main`; the measured cold setup was
+5m12s and the second run was 2.73s. `.agents/resume` performs only the fast tool availability check
+and completed in under 0.01s. A clean non-interactive login shell resolved `coil` and `go` from
+`~/.local/bin` and Node from the orb toolchain.
+
+The TypeScript-Go bridge now force-links portably from its ordinary static archive. Apple embeds
+its framework linker options in the archive member that needs them; Linux receives no Darwin
+flags. `native/platform_compat.c` supplies the non-Apple instruction-cache symbol and host mmap
+flags. This removes the old pre-test Linux linker boundary; product execution now reaches the
+host-native backend boundary described above.
+
 ## SIX MORE DEFECTS, A HARNESS THAT STOPPED CALLING A SEGFAULT "0", AND A FRONTIER THAT RUNS (2026-08-19, latest)
 
 `coil test` is **417 passing, 0 failing**. Each fix falsifies on its own; each is pinned by a case

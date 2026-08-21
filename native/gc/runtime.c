@@ -8,10 +8,17 @@
 #include <stdio.h>
 #include "js-value.h"
 
+#ifdef __APPLE__
 extern const uint8_t aot_text_start[] __asm("section$start$__TEXT$__text");
 extern const uint8_t aot_kernel[] __asm("_kernel");
 extern const uint8_t aot_stackmaps[] __asm("section$start$__DATA$__aot_stackmap");
 extern const uint8_t aot_layouts[] __asm("section$start$__DATA$__aot_layout");
+#else
+extern const uint8_t aot_text_start[];
+extern const uint8_t aot_kernel[] __asm("kernel");
+extern const uint8_t aot_stackmaps[] __asm("__start_aot_stackmap");
+extern const uint8_t aot_layouts[] __asm("__start_aot_layout");
+#endif
 
 typedef struct {
   uint32_t owner, code_start, code_size, frame_size;
