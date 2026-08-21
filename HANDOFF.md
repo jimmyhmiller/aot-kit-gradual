@@ -1,5 +1,35 @@
 # Handoff: move JavaScript semantics into the DSL
 
+## TEST262 CORE HARNESS REACHES NATIVE X86-64 EXECUTION (2026-08-21, latest)
+
+The first Test262 runner slice now assembles the exact upstream `sta.js`, a deliberately bounded
+`assert.js`, and a fixture into the repository's `main(n)` entry ABI, then sends that source through
+the real frontend, x86-64 encoder, ELF linker, GC trampoline, and process execution. The assertion
+slice runs ordinary `assert`, exact SameValue behavior (including NaN and signed zero),
+`assert.sameValue`, `assert.notSameValue`, global `compareArray`, and `assert.compareArray`.
+Vendored harness files retain their Ecma copyright notices and the Test262 BSD license.
+
+This exposed a real frontend collision: `object.name()` was rejected whenever an unrelated
+top-level function declaration was also named `name`. Test262 defines both global `compareArray`
+and `assert.compareArray`. Receiver validation no longer guesses a target from that spelling; the
+graph builder continues to resolve indexed methods and otherwise performs the JavaScript property
+load and dynamic call.
+
+This is an honest synchronous-script foundation, not a claim that arbitrary Test262 tests run yet.
+Frontmatter policy, requested includes, strict/module variants, negative parse/runtime phases,
+async completion, fresh realms, and `$262` remain runner work. The upstream `assert.js` also uses
+`try`/`catch` for diagnostic formatting and `assert.throws`; the bridge can identify TryStatement,
+but the native frontend and runtime do not yet implement catchable exception transport. The local
+assertion subset therefore omits `assert.throws` rather than reporting false conformance.
+
+Verification on Linux x86-64:
+
+* `COIL_META_CACHE=0 coil test tests/test262-harness-test.coil --no-fork` — **1 passed, 0 failed**.
+* `COIL_META_CACHE=0 coil test` — **423 passed, 0 failed**.
+* `COIL_META_CACHE=0 coil test --suite frontier` — intentionally **0 passed, 8 failed**, with the
+  same seven listed frontend refusals and one 26-vs-25 semantic disagreement; no infrastructure
+  failures.
+
 ## LINUX X86-64 RUNS THE COMPLETE NATIVE JAVASCRIPT HARNESS (2026-08-21, latest)
 
 Linux x86-64 now owns a complete host-native path from the target-neutral Machine IR through
