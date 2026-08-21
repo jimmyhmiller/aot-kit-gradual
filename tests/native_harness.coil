@@ -1,4 +1,5 @@
 (module nativeharness)
+(import "coil.primitive" :as primitive)
 ;; THE PRODUCT PATH, EXECUTED, AS A REUSABLE PIECE: TypeScript source in, a running arm64 binary
 ;; out, and node's answer beside it.
 ;;
@@ -52,7 +53,7 @@
 
 ;; A NUL-terminated C string in a caller buffer.
 (defn nh-cstr! [(buf (ptr i8)) (cap i64) (s (slice u8))] (-> (ptr i8))
-  (let [fb (alloc/stack FixBuf) w (alloc/stack Writer)]
+  (let [fb (primitive/alloc-stack FixBuf) w (primitive/alloc-stack Writer)]
     (set! (.data fb) buf) (set! (.cap fb) cap) (set! (.len fb) 0)
     (fixed-buffer-writer w fb)
     (fmt w "{s}" s)
@@ -75,8 +76,8 @@
 ;; wants to die on it, loudly and immediately; `tests/native-frontier-test.coil` wants to RECORD it,
 ;; because a program that crashes is one of the ways an open bug is open.
 (defn nh-shell-answer [(cmd (ptr i8)) (ok (ptr bool))] (-> i64)
-  (let [mode (alloc/stack (array i8 8))
-        out (alloc/stack (array i8 256))]
+  (let [mode (primitive/alloc-stack (array i8 8))
+        out (primitive/alloc-stack (array i8 256))]
     (set! (index (cast (ptr i8) out) 0) (cast i8 0))
     (let [p (popen cmd (nh-cstr! (cast (ptr i8) mode) 8 "r"))]
       (assert (!= (cast i64 p) 0))
@@ -88,7 +89,7 @@
         (atoll (cast (ptr i8) out))))))
 
 (defn nh-shell-integer [(cmd (ptr i8))] (-> i64)
-  (let [ok (alloc/stack bool)
+  (let [ok (primitive/alloc-stack bool)
         answer (do (set! ok true) (nh-shell-answer cmd ok))]
     (if (load ok)
         answer
@@ -97,7 +98,7 @@
             0))))
 
 (defn nh-run-shell! [(text (slice u8))] (-> i64)
-  (let [cmd (alloc/stack (array i8 4096))]
+  (let [cmd (primitive/alloc-stack (array i8 4096))]
     (cast i64 (system (nh-cstr! (cast (ptr i8) cmd) 4096 text)))))
 
 ;; ---------------------------------------------------------------------------
@@ -154,7 +155,7 @@
 ;; primitive lives: a string operation compiles to a `BL` at `_aot_js_string`, and without the
 ;; runtime the link fails rather than the program misbehaving.
 (defn nh-prebuilt? [] (-> (ptr bool))
-  (let [done (alloc/static bool)] done))
+  (let [done (primitive/alloc-static bool)] done))
 
 (defn nh-prepare! [] (-> i64)
   (if (load (nh-prebuilt?))
@@ -176,7 +177,7 @@
 ;; argument, and then runs it once per case. One assessment, N runs.
 (defn nh-link! [] (-> i64)
   (nh-prepare!)
-  (let [b1 (alloc/stack (array i8 64)) b2 (alloc/stack (array i8 8))]
+  (let [b1 (primitive/alloc-stack (array i8 64)) b2 (primitive/alloc-stack (array i8 8))]
     (let [f (fopen (nh-cstr! (cast (ptr i8) b1) 64 "/tmp/aotk-native.o")
                    (nh-cstr! (cast (ptr i8) b2) 8 "w"))]
       (assert (!= (cast i64 f) 0))
@@ -186,7 +187,7 @@
       "xcrun clang -arch arm64 /tmp/aotk-driver.o /tmp/aotk-runtime.o /tmp/aotk-trampoline.o /tmp/aotk-native.o -o /tmp/aotk-native 2>/tmp/aotk-native.err")))
 
 (defn nh-exec-command! [(cmd (ptr i8)) (arg i64)] (-> i64)
-  (let [fb (alloc/stack FixBuf) w (alloc/stack Writer)]
+  (let [fb (primitive/alloc-stack FixBuf) w (primitive/alloc-stack Writer)]
     (set! (.data fb) cmd)
     (set! (.cap fb) 256) (set! (.len fb) 0)
     (fixed-buffer-writer w fb)
@@ -195,13 +196,13 @@
     0))
 
 (defn nh-exec! [(arg i64)] (-> i64)
-  (let [cmd (alloc/stack (array i8 256))]
+  (let [cmd (primitive/alloc-stack (array i8 256))]
     (nh-exec-command! (cast (ptr i8) cmd) arg)
     (nh-shell-integer (cast (ptr i8) cmd))))
 
 ;; The same run, with the crash reported rather than fatal. See `nh-shell-answer`.
 (defn nh-exec-checked! [(arg i64) (ok (ptr bool))] (-> i64)
-  (let [cmd (alloc/stack (array i8 256))]
+  (let [cmd (primitive/alloc-stack (array i8 256))]
     (nh-exec-command! (cast (ptr i8) cmd) arg)
     (nh-shell-answer (cast (ptr i8) cmd) ok)))
 
@@ -220,8 +221,8 @@
 ;; never be compared against one: `atoll` would read it as 0 and a program that returns 0 would
 ;; agree with a program that threw.
 (defn nh-node-answer [(source (slice u8)) (arg i64) (ok (ptr bool))] (-> i64)
-  (let [buf (alloc/stack (array i8 65536))
-        out (alloc/stack (array i8 4096))
+  (let [buf (primitive/alloc-stack (array i8 65536))
+        out (primitive/alloc-stack (array i8 4096))
         src (nh-cstr! (cast (ptr i8) buf) 65536 source)]
     (set! (index (cast (ptr i8) out) 0) (cast i8 0))
     (if (!= (cast i64 (js_oracle_run src (slice-len source) arg (cast (ptr i8) out) 4096)) 0)
@@ -263,11 +264,11 @@
       NH-REFUSED
       (if (!= (nh-link!) 0)
           NH-CRASHES
-          (let [ok (alloc/stack bool)
+          (let [ok (primitive/alloc-stack bool)
                 ours (do (set! ok true) (nh-exec-checked! arg ok))]
             (if (not (load ok))
                 NH-CRASHES
-                (let [node-ok (alloc/stack bool)
+                (let [node-ok (primitive/alloc-stack bool)
                       theirs (do (set! node-ok true) (nh-node-answer source arg node-ok))]
                   (if (not (load node-ok))
                       NH-NODE-THREW
@@ -280,7 +281,7 @@
 (defn nh-agrees-with-node? [(source (slice u8)) (arg i64)] (-> bool)
   (nh-compile! source)
   (let [ours (nh-run! arg)
-        ok (alloc/stack bool)
+        ok (primitive/alloc-stack bool)
         theirs (do (set! ok true) (nh-node-answer source arg ok))]
     (if (not (load ok))
         (do (fmt (stderr) "native-harness: node threw on\n  source: {s}\n" source) false)
@@ -301,7 +302,7 @@
 ;; Shared by `tests/native-capability-test.coil`, which asks whether each method COMPILES, and
 ;; `tests/native-differential-test.coil`, which asks whether it computes what node computes. Two
 ;; questions, one list, and it is the compiler's list.
-(defn nh-read-text [(a (ptr Allocator)) (path (slice u8))] (-> (slice u8))
+(defn nh-read-text [(a (dyn Allocator)) (path (slice u8))] (-> (slice u8))
   (try (let [text (try-or! (read-file a path)
                            (do (fmt (stderr) "native-harness: cannot read {s}\n" path) (abort) ""))]
          text)))
