@@ -17,6 +17,9 @@ export function main(): number {
     + t.substr(2, 0).length + t.substr(2, 99).length
     + t.substr(2, -1).length + t.substr(0, -5).length + t.substr(-2, -1).length
     + t.substr(0, 1).charCodeAt(0)
+    + t.substr(5).length + t.substr(5).charCodeAt(0)
+    + t.substr(6, undefined).length + t.substr(6, undefined).charCodeAt(0)
+    + t.substr(5, null).length
     + m.toLowerCase().charCodeAt(0) + m.toLowerCase().charCodeAt(1)
     + m.toUpperCase().charCodeAt(1) + m.toUpperCase().charCodeAt(3)
     + m.toLowerCase().length + m.toUpperCase().length) | 0;

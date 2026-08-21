@@ -1,5 +1,42 @@
 # Handoff: move JavaScript semantics into the DSL
 
+## ARRAY SEARCH `fromIndex` AND `substr` COUNT LIVE IN THE DSL (2026-08-21, latest)
+
+`Array.prototype.indexOf`, `includes`, and `lastIndexOf` now pass the boxed `fromIndex` value into
+`lib/array/read.jsl`, where ToIntegerOrInfinity, negative-relative indexing, infinities, bounds,
+empty-array coercion ordering, string value comparison, and SameValueZero are implemented. An
+explicit `undefined` remains distinguishable from an omitted `lastIndexOf` argument. The frontend
+only reports argument presence and builds the graph; it does not decide JavaScript meaning.
+
+`String.prototype.substr` likewise passes its boxed count to `lib/string/substring.jsl`. Omitted
+and explicitly `undefined` counts return the remainder, while other values use the existing DSL
+conversion and clamp operations. The remaining surrogate-pair cases need proper UTF-16 code-unit
+string representation and were not approximated in the frontend.
+
+Complete upstream reruns of the three affected array-search directories plus the `substr`
+directory improved the full-corpus baseline from 2,475 to **2,551 passed**. The merged incremental
+artifact is `.amp/in/artifacts/test262-current.jsonl`, with **2,551 passed, 8,590 failed, 48,120
+refused, and 23,017 skipped** across the same 82,278 unique path/variant records. This includes 72
+array-search failures and four refusals becoming passes. Four formerly passing object-valued
+`fromIndex` cases now fail honestly because evaluating the argument exposes the existing missing
+ToPrimitive/`valueOf` support; their old passes resulted from ignoring `fromIndex` entirely.
+
+Verification on Linux x86-64:
+
+* Focused upstream empty-array coercion-ordering and `substr(..., undefined)` cases — **8 passed**.
+* Complete affected array-search directories — **190 passed, 516 failed, 94 refused, 28 skipped**.
+* Complete upstream `substr` directory — **10 passed, 2 failed, 8 refused, 5 skipped**; both
+  failures are the known UTF-16 surrogate-pair boundary.
+* `COIL_META_CACHE=0 coil test tests/jsl-test.coil --no-fork` — **38 passed, 0 failed**.
+* `COIL_META_CACHE=0 coil test tests/dsl-ownership-test.coil --no-fork` — **4 passed, 0 failed**,
+  with no frontend-owned JavaScript operation.
+* `COIL_META_CACHE=0 coil test tests/native-differential-test.coil --no-fork` — **1 passed, 0
+  failed**.
+* `COIL_META_CACHE=0 coil test` — **428 passed, 0 failed**.
+* `COIL_META_CACHE=0 coil test --suite frontier` — intentionally **0 passed, 8 failed**: the same
+  seven named frontend refusals and 26-vs-25 semantic disagreement, with no infrastructure
+  failures.
+
 ## COMPLETE TEST262 CORPUS NOW HAS AN HONEST NATIVE BASELINE (2026-08-21, latest)
 
 The runner can now attempt every actual test file in an upstream Test262 checkout with bounded

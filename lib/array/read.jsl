@@ -11,27 +11,63 @@
 ;; MEMORY IS IMPLICIT. `%ArrayLen` and `%ArrayLoad` take the ambient heap from the lowering rather
 ;; than from an operand here, so a definition reads like the spec rather than like memory SSA.
 
-;; https://tc39.es/ecma262/#sec-array.prototype.indexof, steps 6-10, from an already-clamped start.
-(macro ArrayIndexOfFrom :params [(a dyn) (target dyn) (from int)] :ret int
+;; https://tc39.es/ecma262/#sec-array.prototype.indexof, steps 6-10. ToIntegerOrInfinity of the
+;; start is normalized into [0, len]: negative values count from the end, then clamp at zero.
+(macro ArrayIndexOf :params [(a dyn) (target dyn) (from dyn)] :ret int
   (let [(len (%ArrayLen a))]
-    (loop [(i from)]
-      (if (%Le len i) -1
-        (if (%Eq (%ArrayLoad a i) target) i (recur (%Add i 1)))))))
+    (if (%Le len 0)
+        -1
+        (let [(n (%ToInteger from))
+              (start (if (%IsInt n)
+                         (let [(i (%UnboxInt n))]
+                           (if (%Lt i 0) (Clamp (%Add len i) 0 len) (Clamp i 0 len)))
+                         (if (%Lt (%UnboxFlt n) 0.0) 0 len)))]
+          (loop [(i start)]
+            (if (%Le len i) -1
+              (let [(value (%ArrayLoad a i))
+                    (same (if (%IsString value)
+                              (if (%IsString target) (StringEquals value target) false)
+                              (if (%IsString target) false (%Eq value target))))]
+                (if same i (recur (%Add i 1))))))))))
 
 ;; https://tc39.es/ecma262/#sec-array.prototype.includes. It differs from `indexOf` in EXACTLY one
 ;; way and it is the reason both exist: `includes` compares with SameValueZero, so it finds a NaN
 ;; that `indexOf` — using strict equality — never can.
-(macro ArrayIncludes :params [(a dyn) (target dyn)] :ret bool
+(macro ArrayIncludes :params [(a dyn) (target dyn) (from dyn)] :ret bool
   (let [(len (%ArrayLen a))]
-    (loop [(i 0)]
-      (if (%Le len i) false
-        (if (SameValueZero (%ArrayLoad a i) target) true (recur (%Add i 1)))))))
+    (if (%Le len 0)
+        false
+        (let [(n (%ToInteger from))
+              (start (if (%IsInt n)
+                         (let [(i (%UnboxInt n))]
+                           (if (%Lt i 0) (Clamp (%Add len i) 0 len) (Clamp i 0 len)))
+                         (if (%Lt (%UnboxFlt n) 0.0) 0 len)))]
+          (loop [(i start)]
+            (if (%Le len i) false
+              (if (SameValueZero (%ArrayLoad a i) target) true (recur (%Add i 1)))))))))
 
 ;; https://tc39.es/ecma262/#sec-array.prototype.lastindexof, searching the whole array.
-(macro ArrayLastIndexOf :params [(a dyn) (target dyn)] :ret int
-  (loop [(i (%Sub (%ArrayLen a) 1))]
-    (if (%Lt i 0) -1
-      (if (%Eq (%ArrayLoad a i) target) i (recur (%Sub i 1))))))
+(macro ArrayLastIndexOf :params [(a dyn) (target dyn) (from dyn) (has-from bool)] :ret int
+  (let [(len (%ArrayLen a))]
+    (if (%Le len 0)
+        -1
+        (let [(n (%ToInteger from))
+              (start (if has-from
+                         (if (%IsInt n)
+                             (let [(i (%UnboxInt n))]
+                               (if (%Lt i 0)
+                                   (let [(relative (%Add len i))]
+                                     (if (%Lt relative 0) -1 relative))
+                                   (if (%Le len i) (%Sub len 1) i)))
+                             (if (%Lt (%UnboxFlt n) 0.0) -1 (%Sub len 1)))
+                         (%Sub len 1)))]
+          (loop [(i start)]
+            (if (%Lt i 0) -1
+              (let [(value (%ArrayLoad a i))
+                    (same (if (%IsString value)
+                              (if (%IsString target) (StringEquals value target) false)
+                              (if (%IsString target) false (%Eq value target))))]
+                (if same i (recur (%Sub i 1))))))))))
 
 ;; https://tc39.es/ecma262/#sec-array.prototype.at — a negative index counts from the end.
 ;;
