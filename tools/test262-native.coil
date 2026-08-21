@@ -1,0 +1,51 @@
+(module test262native)
+
+(import "nativeharness" :use *)
+(import "frontendnative" :use *)
+(import "typescriptnative" :use *)
+(import "coil.alloc" :use * :as alloc)
+(import "coil.args" :use *)
+(import "coil.fmt" :use *)
+(import "coil.fs" :use *)
+(import "coil.io" :use *)
+(import "coil.result" :use *)
+(import "coil.slice" :use *)
+
+(defn t262-native-read [(a (ptr Allocator)) (path (slice u8))] (-> (slice u8))
+  (try (try-or! (read-file a path) "")))
+
+(defn main [(argc i32) (argv (ptr (ptr i8)))] (-> i64)
+  (block :done
+    (args-set! argc argv)
+    (if (!= (args-count) 2)
+        (return-from :done
+                     (do (fmt (stderr) "usage: test262-native <assembled-source.js>\n") 64))
+        0)
+    (let [a (malloc-allocator)
+          source (t262-native-read a (args-nth 1))]
+      (if (= (slice-len source) 0)
+          (return-from :done
+                       (do (fmt (stderr) "test262-native: cannot read empty source\n") 66))
+          0)
+      (let [(mut frontend) (fe-native-new source)
+            status (fe-native-index! (mut frontend))]
+        (if (!= status FE-OK)
+            (do (fmt (stderr)
+                     "test262-native: frontend status={d} code={d} node={d}: {s}\n"
+                     status (.error-code frontend) (.error-node frontend)
+                     (ts-text (.ast frontend) (.error-node frontend)))
+                0)
+            0)
+        (fe-native-free! (mut frontend))
+        (if (!= status FE-OK)
+            (return-from :done (do (fmt (stdout) "REFUSED\n") 2))
+            0))
+      (if (not (nh-try-compile? source))
+          (do (fmt (stdout) "REFUSED\n") 2)
+          (if (!= (nh-link!) 0)
+              (do (fmt (stdout) "LINK-FAILED\n") 3)
+              (let [ok (alloc/stack bool)
+                    _ (do (set! ok true) (nh-exec-checked! 0 ok))]
+                (if (load ok)
+                    (do (fmt (stdout) "PASS\n") 0)
+                    (do (fmt (stdout) "RUNTIME-FAILED\n") 1))))))))

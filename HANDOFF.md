@@ -1,5 +1,48 @@
 # Handoff: move JavaScript semantics into the DSL
 
+## ACTUAL TEST262 FILES RUN THROUGH THE NATIVE RUNNER (2026-08-21, latest)
+
+The prior section's single Test262-shaped fixture was not an answer to “can this run Test262
+tests?” A real command now reads upstream YAML frontmatter, expands requested includes, selects
+default/strict variants, assembles the native entry, and reports PASS/FAIL/REFUSED/SKIP:
+
+```
+npm run test262 -- --test262 /path/to/test262 TEST_OR_DIRECTORY...
+```
+
+Four byte-for-byte upstream files from Test262 revision
+`3655e7464de3d52643ecddd4b5f9f4f3e7f62398` are pinned under `tests/test262/cases/`: division,
+modulus, and multiplication line-terminator tests plus the compare-array harness include test. Each
+passes in both default and strict mode, so the focused command performs eight actual Test262
+executions through native frontend, Machine IR,
+x86-64 encoding, ELF publication/linking, runtime, and GC trampoline. The Coil gate independently
+runs all four source files against Node.
+
+The runner does not turn missing support into green. A frontend refusal makes the command fail;
+module/async/negative variants are visibly skipped; a runtime throw/crash fails. It prints the
+current function-body entry limitation before every run because exact top-level Script semantics
+are not implemented yet. `docs/TEST262.md` records that boundary and the exact source provenance.
+Try/catch now has a stable bridge kind and is rejected during indexing instead of aborting in graph
+construction.
+
+No JavaScript semantics were added to runner/frontend code. Metadata, include expansion, variant
+selection, and process status are harness policy. Arithmetic and assertion value operations still
+reach `lib/**/*.jsl`; the four DSL ownership invariants remain green and the exact open-coded
+semantic debt remains empty.
+
+Focused verification on Linux x86-64:
+
+* `npm run test262 -- --test262 /tmp/test262 tests/test262/cases` — **8 passed, 0 failed, 0
+  refused, 0 skipped**.
+* `COIL_META_CACHE=0 coil test tests/test262-harness-test.coil --no-fork` — **5 passed, 0 failed**.
+* `COIL_META_CACHE=0 coil test tests/dsl-ownership-test.coil --no-fork` — **4 passed, 0 failed**.
+* `COIL_META_CACHE=0 coil test tests/frontend-native-graph-test.coil --no-fork` — **4 passed, 0
+  failed**.
+* `COIL_META_CACHE=0 coil test` — **428 passed, 0 failed**.
+* `COIL_META_CACHE=0 coil test --suite frontier` — intentionally **0 passed, 8 failed**, with the
+  same seven named frontend refusals and one 26-vs-25 semantic disagreement; no harness, platform,
+  encoding, linking, or runtime infrastructure failure.
+
 ## TEST262 CORE HARNESS REACHES NATIVE X86-64 EXECUTION (2026-08-21, latest)
 
 The first Test262 runner slice now assembles the exact upstream `sta.js`, a deliberately bounded
