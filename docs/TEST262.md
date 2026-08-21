@@ -12,6 +12,21 @@ strict variants from `flags`, and reports each variant as `PASS`, `FAIL`, `REFUS
 `REFUSED` is not counted as a pass and makes the command fail. The native executable, not Node,
 decides pass/fail; a successful test must compile, link, execute, and return normally.
 
+The same runner can make an incremental, parallel attempt over the complete checkout:
+
+```sh
+node tools/run-test262.mjs --no-build --jobs 8 --results test262-full.jsonl \
+  --test262 /path/to/test262 /path/to/test262/test
+node tools/run-test262.mjs --no-build --jobs 8 --resume --results test262-full.jsonl \
+  --test262 /path/to/test262 /path/to/test262/test
+```
+
+Each completed variant is appended to the JSONL file before the next one starts, and the final
+category totals are written to `test262-full.jsonl.summary.json`. `--start` and `--limit` select a
+file range. `--timeout-ms` defaults to 30 seconds per variant. On Linux, `--memory-mb` defaults to
+2048 MiB and is enforced with `prlimit`, so a broken generated program is recorded as a failure
+instead of exhausting the host. Neither limit turns a test green.
+
 ## Current boundary
 
 This is not yet the full Test262 protocol. Tests execute inside the compiler's current

@@ -1,5 +1,54 @@
 # Handoff: move JavaScript semantics into the DSL
 
+## COMPLETE TEST262 CORPUS NOW HAS AN HONEST NATIVE BASELINE (2026-08-21, latest)
+
+The runner can now attempt every actual test file in an upstream Test262 checkout with bounded
+parallel native compilation, incremental JSONL results, and resume. It excludes `_FIXTURE.js`
+module support files (which are inputs to tests, not tests themselves), accepts CR/CRLF metadata,
+uses PID-specific object/executable paths, caches immutable C bridge objects by tracked-source
+freshness, and cleans up after crashes and timeouts. On Linux each worker has a 30-second timeout
+and a 2048 MiB address-space limit, so malformed generated programs are recorded instead of
+exhausting the machine. None of these outcomes is turned into a pass.
+
+The complete attempt used Test262 revision `3655e7464de3d52643ecddd4b5f9f4f3e7f62398` and selected
+53,578 tests. Default/strict expansion plus one policy record for unsupported protocol tests
+produced 82,278 unique results:
+
+* **2,475 passed** through frontend, Machine IR, native x86-64 encoding, ELF linking, runtime, and
+  execution.
+* **8,656 failed**, led by 6,164 `jsl argument 0 is NO-NODE` graph corruptions, 1,724 runtime
+  failures, 492 compiler `SIGSEGV`s, 104 declaration-initializer graph corruptions, 79 compiler
+  `SIGABRT`s, and 65 timeouts.
+* **48,130 refused** rather than approximated. The largest indexed reasons are frontend codes 1001
+  (23,354) and 1003 (20,462), followed by unsupported bridge kinds and 1,615 pipeline refusals.
+* **23,017 skipped** for explicit unimplemented Test262 protocol: 11,876 catchable-exception
+  assertions, 5,523 async tests, 4,453 negative parse tests, 843 modules, 290 `$262` host-object
+  tests, and 32 negative runtime tests.
+
+The durable evidence is `.amp/in/artifacts/test262-full.jsonl` with aggregate totals in
+`.amp/in/artifacts/test262-full.jsonl.summary.json`. All 82,278 `(path, variant)` keys are unique;
+there are no fixture-file or metadata-parser failures. `docs/TEST262.md` documents range,
+parallelism, timeout, memory-limit, result, and resume options. This is a full-corpus **attempt and
+baseline**, not a conformance claim: exact top-level Script semantics, modules, async completion,
+negative phases, fresh realms, `$262`, and catchable exceptions remain real implementation work.
+
+No JavaScript operation was added to the runner, native harness, or frontend. These changes are
+process isolation, object preparation, metadata, and reporting only; `lib/**/*.jsl` remains the
+sole owner of JavaScript semantics.
+
+Final Linux x86-64 verification:
+
+* `npm run test262 -- --jobs 4 --test262 /tmp/test262 tests/test262/cases` from an empty native C
+  object cache — **8 passed, 0 failed, 0 refused, 0 skipped**, with no leaked per-process files.
+* The full incremental command — expected nonzero because unsupported and broken tests are not
+  hidden — **2,475 passed, 8,656 failed, 48,130 refused, 23,017 skipped**.
+* `COIL_META_CACHE=0 coil test tests/test262-harness-test.coil --no-fork` — **5 passed, 0 failed**.
+* `COIL_META_CACHE=0 coil test tests/dsl-ownership-test.coil --no-fork` — **4 passed, 0 failed**.
+* `COIL_META_CACHE=0 coil test` — **428 passed, 0 failed**.
+* `COIL_META_CACHE=0 coil test --suite frontier` — intentionally **0 passed, 8 failed**: seven
+  listed frontend refusals and the listed 26-vs-25 disagreement, with no platform, encoding,
+  linking, or runtime infrastructure failure.
+
 ## ACTUAL TEST262 FILES RUN THROUGH THE NATIVE RUNNER (2026-08-21, latest)
 
 The prior section's single Test262-shaped fixture was not an answer to “can this run Test262

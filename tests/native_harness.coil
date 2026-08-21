@@ -49,6 +49,8 @@
 (extern fgets :cc c [(ptr i8) i32 (ptr u8)] (-> (ptr i8)))
 (extern atoll :cc c [(ptr i8)] (-> i64))
 (extern system :cc c [(ptr i8)] (-> i32))
+(extern getpid :cc c [] (-> i32))
+(extern unlink :cc c [(ptr i8)] (-> i32))
 (extern aot_host_is_x86_64 :cc c [] (-> i32))
 ;; native/js-oracle/oracle.c, on the link line through Coil.toml's `[cc] sources`.
 (extern js_oracle_run :cc c [(ptr i8) i64 i64 (ptr i8) i64] (-> i32))
@@ -61,6 +63,15 @@
     (fmt w "{s}" s)
     (set! (index buf (load (field fb len))) (cast i8 0))
     buf))
+
+(defn nh-process-path! [(buf (ptr i8)) (cap i64) (suffix (slice u8))] (-> (slice u8))
+  (let [fb (alloc/stack FixBuf) w (alloc/stack Writer)]
+    (set! (.data fb) buf) (set! (.cap fb) cap) (set! (.len fb) 0)
+    (fixed-buffer-writer w fb)
+    (fmt w "/tmp/aotk-native-{d}{s}" (cast i64 (getpid)) suffix)
+    (let [len (load (field fb len))]
+      (set! (index buf len) (cast i8 0))
+      (slice-new [u8] (cast (ptr u8) buf) len))))
 
 ;; Run one shell command and read the first line as an integer.
 ;;
@@ -169,17 +180,24 @@
 (defn nh-prebuilt? [] (-> (ptr bool))
   (let [done (alloc/static bool)] done))
 
+(defn nh-prebuilt-current? [] (-> bool)
+  (= (nh-run-shell!
+       "test -f /tmp/aotk-driver.o && test /tmp/aotk-driver.o -nt native/gc/driver.c && test -f /tmp/aotk-runtime.o && test /tmp/aotk-runtime.o -nt native/gc/runtime.c && test -f /tmp/aotk-trampoline.o && test /tmp/aotk-trampoline.o -nt native/gc/trampoline.S")
+     0))
+
 (defn nh-prepare! [] (-> i64)
   (if (load (nh-prebuilt?))
       0
-      (do
+      (if (nh-prebuilt-current?)
+          (do (set! (nh-prebuilt?) true) 0)
+          (do
         (set! (nh-prebuilt?) true)
         (assert (= (nh-run-shell!
           (if (!= (aot_host_is_x86_64) (cast i32 0))
-              "printf '#include <stdint.h>\\n#include <stddef.h>\\n#include <stdio.h>\\n#include <stdlib.h>\\nint aot_gc_configure(size_t,int);\\nextern int64_t kernel(int64_t);\\nstatic int64_t arg;\\nstatic int64_t call(void){return kernel(arg);}\\nint64_t aot_gc_enter(int64_t(*)(void));\\nint main(int argc,char**argv){arg=argc>1?atoll(argv[1]):0;if(!aot_gc_configure(1048576,0))return 2;printf(\"%%lld\\\\n\",(long long)aot_gc_enter(call));return 0;}\\n' > /tmp/aotk-driver.c && clang -O1 -fno-omit-frame-pointer -Inative/gc -c /tmp/aotk-driver.c -o /tmp/aotk-driver.o && clang -O1 -fno-omit-frame-pointer -Inative/gc -c native/gc/runtime.c -o /tmp/aotk-runtime.o && clang -c native/gc/trampoline.S -o /tmp/aotk-trampoline.o"
-              "printf '#include <stdint.h>\\n#include <stddef.h>\\n#include <stdio.h>\\n#include <stdlib.h>\\nint aot_gc_configure(size_t,int);\\nextern int64_t kernel(int64_t);\\nstatic int64_t arg;\\nstatic int64_t call(void){return kernel(arg);}\\nint64_t aot_gc_enter(int64_t(*)(void));\\nint main(int argc,char**argv){arg=argc>1?atoll(argv[1]):0;if(!aot_gc_configure(1048576,0))return 2;printf(\"%%lld\\\\n\",(long long)aot_gc_enter(call));return 0;}\\n' > /tmp/aotk-driver.c && xcrun clang -arch arm64 -O1 -fno-omit-frame-pointer -Inative/gc -c /tmp/aotk-driver.c -o /tmp/aotk-driver.o && xcrun clang -arch arm64 -O1 -fno-omit-frame-pointer -Inative/gc -c native/gc/runtime.c -o /tmp/aotk-runtime.o && xcrun clang -arch arm64 -c native/gc/trampoline.S -o /tmp/aotk-trampoline.o"))
+              "clang -O1 -fno-omit-frame-pointer -Inative/gc -c native/gc/driver.c -o /tmp/aotk-driver.$$.o && clang -O1 -fno-omit-frame-pointer -Inative/gc -c native/gc/runtime.c -o /tmp/aotk-runtime.$$.o && clang -c native/gc/trampoline.S -o /tmp/aotk-trampoline.$$.o && mv /tmp/aotk-driver.$$.o /tmp/aotk-driver.o && mv /tmp/aotk-runtime.$$.o /tmp/aotk-runtime.o && mv /tmp/aotk-trampoline.$$.o /tmp/aotk-trampoline.o"
+              "xcrun clang -arch arm64 -O1 -fno-omit-frame-pointer -Inative/gc -c native/gc/driver.c -o /tmp/aotk-driver.$$.o && xcrun clang -arch arm64 -O1 -fno-omit-frame-pointer -Inative/gc -c native/gc/runtime.c -o /tmp/aotk-runtime.$$.o && xcrun clang -arch arm64 -c native/gc/trampoline.S -o /tmp/aotk-trampoline.$$.o && mv /tmp/aotk-driver.$$.o /tmp/aotk-driver.o && mv /tmp/aotk-runtime.$$.o /tmp/aotk-runtime.o && mv /tmp/aotk-trampoline.$$.o /tmp/aotk-trampoline.o"))
           0))
-        0)))
+        0))))
 
 ;; LINKING AND RUNNING ARE SEPARATE, and the reason is a macOS cost with a sharp edge: the FIRST
 ;; execution of a freshly linked binary takes ~0.69s while the system assesses it, and every
@@ -191,24 +209,48 @@
 ;; argument, and then runs it once per case. One assessment, N runs.
 (defn nh-link! [] (-> i64)
   (nh-prepare!)
-  (let [b1 (alloc/stack (array i8 64)) b2 (alloc/stack (array i8 8))]
-    (let [f (fopen (nh-cstr! (cast (ptr i8) b1) 64 "/tmp/aotk-native.o")
-                   (nh-cstr! (cast (ptr i8) b2) 8 "w"))]
+  (let [object-buf (alloc/stack (array i8 128))
+        binary-buf (alloc/stack (array i8 128))
+        error-buf (alloc/stack (array i8 128))
+        mode-buf (alloc/stack (array i8 8))
+        command-buf (alloc/stack (array i8 1024))
+        object (nh-process-path! (cast (ptr i8) object-buf) 128 ".o")
+        binary (nh-process-path! (cast (ptr i8) binary-buf) 128 "")
+        error (nh-process-path! (cast (ptr i8) error-buf) 128 ".err")]
+    (let [f (fopen (cast (ptr i8) (slice-data object))
+                   (nh-cstr! (cast (ptr i8) mode-buf) 8 "w"))]
       (assert (!= (cast i64 f) 0))
       (fwrite (be-object-data) 1 (be-object-len) f)
       (fclose f))
-    (nh-run-shell!
+    (let [fb (alloc/stack FixBuf) w (alloc/stack Writer)]
+      (set! (.data fb) (cast (ptr i8) command-buf))
+      (set! (.cap fb) 1024) (set! (.len fb) 0)
+      (fixed-buffer-writer w fb)
       (if (!= (aot_host_is_x86_64) (cast i32 0))
-          "clang /tmp/aotk-driver.o /tmp/aotk-runtime.o /tmp/aotk-trampoline.o /tmp/aotk-native.o -lm -o /tmp/aotk-native 2>/tmp/aotk-native.err"
-          "xcrun clang -arch arm64 /tmp/aotk-driver.o /tmp/aotk-runtime.o /tmp/aotk-trampoline.o /tmp/aotk-native.o -o /tmp/aotk-native 2>/tmp/aotk-native.err"))))
+          (fmt w "clang /tmp/aotk-driver.o /tmp/aotk-runtime.o /tmp/aotk-trampoline.o {s} -lm -o {s} 2>{s}"
+               object binary error)
+          (fmt w "xcrun clang -arch arm64 /tmp/aotk-driver.o /tmp/aotk-runtime.o /tmp/aotk-trampoline.o {s} -o {s} 2>{s}"
+               object binary error))
+      (nh-run-shell! (slice-new [u8]
+                                (cast (ptr u8) command-buf)
+                                (load (field fb len)))))))
 
 (defn nh-exec-command! [(cmd (ptr i8)) (arg i64)] (-> i64)
-  (let [fb (alloc/stack FixBuf) w (alloc/stack Writer)]
+  (let [binary-buf (alloc/stack (array i8 128))
+        binary (nh-process-path! (cast (ptr i8) binary-buf) 128 "")
+        fb (alloc/stack FixBuf) w (alloc/stack Writer)]
     (set! (.data fb) cmd)
     (set! (.cap fb) 256) (set! (.len fb) 0)
     (fixed-buffer-writer w fb)
-    (fmt w "/tmp/aotk-native {d}" arg)
+    (fmt w "{s} {d}" binary arg)
     (set! (index cmd (load (field fb len))) (cast i8 0))
+    0))
+
+(defn nh-cleanup! [] (-> i64)
+  (let [buf (alloc/stack (array i8 128))]
+    (unlink (cast (ptr i8) (slice-data (nh-process-path! (cast (ptr i8) buf) 128 ".o"))))
+    (unlink (cast (ptr i8) (slice-data (nh-process-path! (cast (ptr i8) buf) 128 ".err"))))
+    (unlink (cast (ptr i8) (slice-data (nh-process-path! (cast (ptr i8) buf) 128 ""))))
     0))
 
 (defn nh-exec! [(arg i64)] (-> i64)
