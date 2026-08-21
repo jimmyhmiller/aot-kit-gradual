@@ -1,5 +1,77 @@
 # Handoff: move JavaScript semantics into the DSL
 
+## LINUX X86-64 RUNS THE COMPLETE NATIVE JAVASCRIPT HARNESS (2026-08-21, latest)
+
+Linux x86-64 now owns a complete host-native path from the target-neutral Machine IR through
+`src/backend_x64.coil`, ELF64 `ET_REL` publication in `src/backend_elf.coil`, the SysV runtime/GC
+entry trampoline, native linking, and execution. It uses neither QEMU nor cross-AArch64 artifacts.
+The earlier “first arithmetic slice” note below is retained as history and is superseded by this
+section.
+
+The x64 encoder now covers the machine operations exercised by the full JavaScript native harness:
+integer and floating arithmetic/comparisons/conversions, NaN-box tests and box/unbox, loads/stores,
+branches and edge copies, SysV frames/spills/callee saves, direct and polymorphic calls, runtime
+string/array/property calls, and allocation. Direct calls are resolved in raw executable bytes and
+also carry ELF RELA relocations. Runtime calls are undefined ELF symbols; polymorphic dispatch calls
+are internal fixups and receive no external relocation. Unsupported instructions fail atomically
+with an exact op/node/owner/instruction/location diagnostic.
+
+Two ABI boundaries found by actual execution are worth preserving. Internal generated-code calls
+have independent eight-GPR/eight-FPR argument lanes plus compact stack overflow, while C runtime
+calls use SysV registers and preserve allocator-visible XMM callee colors. After `push rbp`, the
+first incoming stack argument is at `frame + 16`, not the AArch64-derived `frame + 8`; the wrong
+offset read the return address as JSON.stringify's ninth argument. Focused raw-byte tests now select
+host-native bytes and portable mmap flags, while structural AArch64 encoder tests remain AArch64.
+
+Verification on Linux x86-64:
+
+* `COIL_META_CACHE=0 coil test tests/native-execution-test.coil` — **27 passed, 0 failed**.
+* `COIL_META_CACHE=0 coil test` — **422 passed, 0 failed**.
+* `COIL_META_CACHE=0 coil test --suite frontier` — intentionally **0 passed, 8 failed**. Seven are
+  the listed frontend refusals and `shortest-round-trip-digits.js` is the listed 26-vs-25 semantic
+  disagreement; there are no xcrun, Mach-O, ELF, encoding, linking, runtime, or platform failures.
+
+## LINUX X86-64 NOW HAS AN ELF64 RELOCATABLE-OBJECT PUBLISHER (2026-08-21, latest)
+
+`src/backend_elf.coil` publishes the existing x86-64 Machine IR code as ELF64 `ET_REL`: `.text`,
+local function and global `kernel`/`aot_text_start` symbols, `R_X86_64_PC32` RELA call fixups, the
+unchanged `aot_stackmap` and `aot_layout` payloads, and a non-executable-stack note. It deliberately
+reuses `backend_macho`'s metadata producers and pre-publication model verifier, so Linux does not
+fork the GC/runtime contract. `native/gc/runtime.c` now selects ELF section-start symbols off Apple.
+
+## LINUX NOW EXECUTES ITS FIRST REAL X86-64 JAVASCRIPT ARTIFACT (2026-08-21, latest)
+
+The Linux path is native x86-64, with no QEMU and no cross-architecture execution. The new
+`src/backend_x64.coil` maps the allocator's first integer colors onto the SysV AMD64 argument and
+caller-saved registers and encodes moves, 64-bit immediates, add/subtract/multiply/negate, and
+return. Unsupported machine operations fail with `BER-ENCODING`; they are not silently omitted.
+`tests/frontend-native-graph-test.coil` now compiles
+`function main(n) { return n * 3 + 7; }`, maps the emitted x86-64 bytes executable, calls them in
+process with the host C ABI, and observes 22 for 5 and 4 for -1. The same test retains the existing
+AArch64 encoder on non-x86-64 hosts. The focused suite is 3/3 green on this Linux orb.
+
+This is the first host-native encoder slice, not yet the full Test262 harness. The linked harness
+still needs the remaining machine operations, SysV spill/callee-save/call lowering, an ELF64
+relocatable-object writer, and an x86-64 GC entry/stack-map contract. Those are the next platform
+milestones; claiming the Mach-O/AArch64 harness works on Linux before they exist would be false.
+
+## FRESH AMP ORBS INSTALL THE COMPLETE TOOLCHAIN (2026-08-21, latest)
+
+`.agents/setup` now installs the Debian prerequisites, Go 1.25.14, the current Coil `main`
+compiler and standard library, npm dependencies, and the pinned `typescript-go` C archive. The
+Coil install is accepted only after its upstream no-LLVM bootstrap reaches a byte-identical
+stage-2/stage-3 fixpoint and passes the x64 behavioral gate. A commit marker skips that
+three-stage bootstrap on a warm snapshot while still fetching `main`; the measured cold setup was
+5m12s and the second run was 2.73s. `.agents/resume` performs only the fast tool availability check
+and completed in under 0.01s. A clean non-interactive login shell resolved `coil` and `go` from
+`~/.local/bin` and Node from the orb toolchain.
+
+The TypeScript-Go bridge now force-links portably from its ordinary static archive. Apple embeds
+its framework linker options in the archive member that needs them; Linux receives no Darwin
+flags. `native/platform_compat.c` supplies the non-Apple instruction-cache symbol and host mmap
+flags. This removes the old pre-test Linux linker boundary; product execution now reaches the
+host-native backend boundary described above.
+
 ## SIX MORE DEFECTS, A HARNESS THAT STOPPED CALLING A SEGFAULT "0", AND A FRONTIER THAT RUNS (2026-08-19, latest)
 
 `coil test` is **417 passing, 0 failing**. Each fix falsifies on its own; each is pinned by a case

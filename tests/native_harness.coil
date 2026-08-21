@@ -29,6 +29,8 @@
 (import "backend_allocate" :use *)
 (import "backend_aarch64" :use *)
 (import "backend_macho" :use *)
+(import "backend_x64" :use *)
+(import "backend_elf" :use *)
 (import "coil.assert" :use *)
 (import "coil.io" :use *)
 (import "coil.fmt" :use *)
@@ -47,6 +49,7 @@
 (extern fgets :cc c [(ptr i8) i32 (ptr u8)] (-> (ptr i8)))
 (extern atoll :cc c [(ptr i8)] (-> i64))
 (extern system :cc c [(ptr i8)] (-> i32))
+(extern aot_host_is_x86_64 :cc c [] (-> i32))
 ;; native/js-oracle/oracle.c, on the link line through Coil.toml's `[cc] sources`.
 (extern js_oracle_run :cc c [(ptr i8) i64 i64 (ptr i8) i64] (-> i32))
 
@@ -121,8 +124,9 @@
     (be-use-runtime-allocation! true)
     (be-schedule!)
     (if (< (be-color! 10) 0) (return-from :done false) 0)
-    (if (not (be-encode-checked!)) (return-from :done false) 0)
-    (be-macho-checked!)))
+    (if (!= (aot_host_is_x86_64) (cast i32 0))
+        (if (not (be-x64-encode-checked!)) (return-from :done false) (be-elf-checked!))
+        (if (not (be-encode-checked!)) (return-from :done false) (be-macho-checked!)))))
 
 (defn nh-compile! [(source (slice u8))] (-> i64)
   (graph-reset! 7001)
@@ -139,8 +143,17 @@
   (be-use-runtime-allocation! true)
   (be-schedule!)
   (assert (>= (be-color! 10) 0))
-  (assert (be-encode-checked!))
-  (assert (be-macho-checked!))
+  (if (!= (aot_host_is_x86_64) (cast i32 0))
+      (do
+        (if (not (be-x64-encode-checked!))
+            (do
+              (fmt (stderr) "native-harness: x64 encode failed result={d} node={d}\n"
+                   (be-result) (be-result-node))
+              0)
+            0)
+        (assert (= (be-result) BER-OK))
+        (assert (be-elf-checked!)))
+      (do (assert (be-encode-checked!)) (assert (be-macho-checked!))))
   0)
 
 ;; ---------------------------------------------------------------------------
@@ -162,7 +175,9 @@
       (do
         (set! (nh-prebuilt?) true)
         (assert (= (nh-run-shell!
-          "printf '#include <stdint.h>\\n#include <stddef.h>\\n#include <stdio.h>\\n#include <stdlib.h>\\nint aot_gc_configure(size_t,int);\\nextern int64_t kernel(int64_t);\\nstatic int64_t arg;\\nstatic int64_t call(void){return kernel(arg);}\\nint64_t aot_gc_enter(int64_t(*)(void));\\nint main(int argc,char**argv){arg=argc>1?atoll(argv[1]):0;if(!aot_gc_configure(1048576,0))return 2;printf(\"%%lld\\\\n\",(long long)aot_gc_enter(call));return 0;}\\n' > /tmp/aotk-driver.c && xcrun clang -arch arm64 -O1 -fno-omit-frame-pointer -Inative/gc -c /tmp/aotk-driver.c -o /tmp/aotk-driver.o && xcrun clang -arch arm64 -O1 -fno-omit-frame-pointer -Inative/gc -c native/gc/runtime.c -o /tmp/aotk-runtime.o && xcrun clang -arch arm64 -c native/gc/trampoline.S -o /tmp/aotk-trampoline.o")
+          (if (!= (aot_host_is_x86_64) (cast i32 0))
+              "printf '#include <stdint.h>\\n#include <stddef.h>\\n#include <stdio.h>\\n#include <stdlib.h>\\nint aot_gc_configure(size_t,int);\\nextern int64_t kernel(int64_t);\\nstatic int64_t arg;\\nstatic int64_t call(void){return kernel(arg);}\\nint64_t aot_gc_enter(int64_t(*)(void));\\nint main(int argc,char**argv){arg=argc>1?atoll(argv[1]):0;if(!aot_gc_configure(1048576,0))return 2;printf(\"%%lld\\\\n\",(long long)aot_gc_enter(call));return 0;}\\n' > /tmp/aotk-driver.c && clang -O1 -fno-omit-frame-pointer -Inative/gc -c /tmp/aotk-driver.c -o /tmp/aotk-driver.o && clang -O1 -fno-omit-frame-pointer -Inative/gc -c native/gc/runtime.c -o /tmp/aotk-runtime.o && clang -c native/gc/trampoline.S -o /tmp/aotk-trampoline.o"
+              "printf '#include <stdint.h>\\n#include <stddef.h>\\n#include <stdio.h>\\n#include <stdlib.h>\\nint aot_gc_configure(size_t,int);\\nextern int64_t kernel(int64_t);\\nstatic int64_t arg;\\nstatic int64_t call(void){return kernel(arg);}\\nint64_t aot_gc_enter(int64_t(*)(void));\\nint main(int argc,char**argv){arg=argc>1?atoll(argv[1]):0;if(!aot_gc_configure(1048576,0))return 2;printf(\"%%lld\\\\n\",(long long)aot_gc_enter(call));return 0;}\\n' > /tmp/aotk-driver.c && xcrun clang -arch arm64 -O1 -fno-omit-frame-pointer -Inative/gc -c /tmp/aotk-driver.c -o /tmp/aotk-driver.o && xcrun clang -arch arm64 -O1 -fno-omit-frame-pointer -Inative/gc -c native/gc/runtime.c -o /tmp/aotk-runtime.o && xcrun clang -arch arm64 -c native/gc/trampoline.S -o /tmp/aotk-trampoline.o"))
           0))
         0)))
 
@@ -183,7 +198,9 @@
       (fwrite (be-object-data) 1 (be-object-len) f)
       (fclose f))
     (nh-run-shell!
-      "xcrun clang -arch arm64 /tmp/aotk-driver.o /tmp/aotk-runtime.o /tmp/aotk-trampoline.o /tmp/aotk-native.o -o /tmp/aotk-native 2>/tmp/aotk-native.err")))
+      (if (!= (aot_host_is_x86_64) (cast i32 0))
+          "clang /tmp/aotk-driver.o /tmp/aotk-runtime.o /tmp/aotk-trampoline.o /tmp/aotk-native.o -lm -o /tmp/aotk-native 2>/tmp/aotk-native.err"
+          "xcrun clang -arch arm64 /tmp/aotk-driver.o /tmp/aotk-runtime.o /tmp/aotk-trampoline.o /tmp/aotk-native.o -o /tmp/aotk-native 2>/tmp/aotk-native.err"))))
 
 (defn nh-exec-command! [(cmd (ptr i8)) (arg i64)] (-> i64)
   (let [fb (alloc/stack FixBuf) w (alloc/stack Writer)]
@@ -306,23 +323,37 @@
                            (do (fmt (stderr) "native-harness: cannot read {s}\n" path) (abort) ""))]
          text)))
 
+;; Coil's stdlib spells this as tail recursion, but the Linux no-LLVM compiler currently leaves
+;; that recursion in the binary. Scanning the 200KB frontend then exhausts Linux's 8MB stack before
+;; capability or differential collection reaches a case. Keep this source-sized walk explicit.
+(defn nh-find-from [(hay (slice u8)) (needle (slice u8)) (start i64)] (-> (Option i64))
+  (let [last (- (slice-len hay) (slice-len needle))
+        (mut at) start
+        (mut found) -1]
+    (loop (if (> (load at) last)
+              (break)
+              (if (= (subslice hay (load at) (+ (load at) (slice-len needle))) needle)
+                  (do (set! found (load at)) (break))
+                  (set! at (+ (load at) 1)))))
+    (if (< (load found) 0) (None) (Some (load found)))))
+
 (defn nh-collect-names! [(text (slice u8)) (fn-header (slice u8)) (out (mut (ArrayList (slice u8))))
                          (arities (mut (ArrayList i64)))] (-> i64)
-  (match (str-find text fn-header)
+  (match (nh-find-from text fn-header 0)
     (None [] (do (fmt (stderr) "native-harness: `{s}` is gone from the frontend; this reads\n  the compiler's dispatch tables by name and one of them moved.\n" fn-header) (abort) 0))
     (Some [start]
       (let [after (+ start (slice-len fn-header))
-            stop (match (str-find-from text "\n(defn " after)
+            stop (match (nh-find-from text "\n(defn " after)
                    (Some [e] e)
                    (None [] (slice-len text)))
             (mut at) after]
-        (loop (match (str-find-from text "(= name \"" (load at))
+        (loop (match (nh-find-from text "(= name \"" (load at))
                 (None [] (break))
                 (Some [hit]
                   (if (>= hit stop)
                       (break)
                       (let [from (+ hit 9)]
-                        (match (str-find-from text "\"" from)
+                        (match (nh-find-from text "\"" from)
                           (None [] (break))
                           (Some [end]
                             (al-push! [(slice u8)] (mut out)
@@ -333,7 +364,7 @@
                             ;; what makes this safe to run. `-1` means the table states none (the
                             ;; array chain is `(= name "x") true`), and every count is tried.
                             (al-push! [i64] (mut arities)
-                                      (match (str-find-from text "argc " end)
+                                      (match (nh-find-from text "argc " end)
                                         (None [] -1)
                                         (Some [a]
                                           (if (> a (+ end 24))

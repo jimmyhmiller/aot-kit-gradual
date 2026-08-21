@@ -126,6 +126,27 @@
   (try (let [text (try-or! (read-file a path) (do (fmt (stderr) "dsl-ownership: cannot read {s}\n" path) (abort) ""))]
             text)))
 
+;; Coil's standard `str-find-from` is tail-recursive. Keep this source-ownership scan iterative so
+;; it also runs under host backends which do not yet lower that recursion to a loop.
+(defn dsl-find-from [(text (slice u8)) (needle (slice u8)) (start i64)] (-> (Option i64))
+  (let [limit (- (slice-len text) (slice-len needle))
+        (mut at) start
+        (mut found) -1]
+    (loop (if (or (> (load at) limit) (>= (load found) 0))
+              (break)
+              (let [(mut i) 0 (mut same) true]
+                (loop (if (or (>= (load i) (slice-len needle)) (not (load same)))
+                          (break)
+                          (do (if (!= (slice-get text (+ (load at) (load i)))
+                                      (slice-get needle (load i)))
+                                  (set! same false) 0)
+                              (set! i (+ (load i) 1)))))
+                (if (load same) (set! found (load at)) (set! at (+ (load at) 1))))))
+    (if (>= (load found) 0) (Some (load found)) (None))))
+
+(defn dsl-find [(text (slice u8)) (needle (slice u8))] (-> (Option i64))
+  (dsl-find-from text needle 0))
+
 ;; `"Name"` with the quotes: the frontend names a DSL routine only as a string literal argument to
 ;; `fng-jsl-call*`, so quoting the needle is what separates a real call from a coincidental mention
 ;; in a comment.
@@ -138,7 +159,7 @@
                   (set! i (+ (load i) 1))
                   0))))
     (set! (index buf (+ n 1)) (cast i8 34))
-    (match (str-find text (slice-new [u8] (cast (ptr u8) buf) (+ n 2)))
+    (match (dsl-find text (slice-new [u8] (cast (ptr u8) buf) (+ n 2)))
       (Some [_] true)
       (None [] false))))
 
@@ -236,7 +257,7 @@
                   (set! i (+ (load i) 1))
                   0))))
     (set! (index buf (+ n 1)) (cast i8 close))
-    (match (str-find text (slice-new [u8] (cast (ptr u8) buf) (+ n 2)))
+    (match (dsl-find text (slice-new [u8] (cast (ptr u8) buf) (+ n 2)))
       (Some [_] true)
       (None [] false))))
 
@@ -358,7 +379,7 @@
   (let [(mut from) 0 (mut seen) 0 (mut going) true]
     (loop (if (not (load going))
               (break)
-              (match (str-find-from text needle (load from))
+              (match (dsl-find-from text needle (load from))
                 (Some [at] (do (set! seen (+ (load seen) 1))
                                (set! from (+ at 1))
                                0))

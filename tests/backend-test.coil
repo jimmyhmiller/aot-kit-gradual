@@ -11,6 +11,7 @@
 (import "backend_allocate" :use *)
 (import "backend_aarch64" :use *)
 (import "backend_macho" :use *)
+(import "native_code_test_support" :use *)
 (import "corpus" :use *)
 (import "jsvalue" :use *)
 (import "coil.assert" :use *)
@@ -32,14 +33,14 @@
 
 
 (defn native-call3 [(a i64) (b i64) (c i64)] (-> i64)
-  (let [mem (mmap (cast (ptr u8) 0) 4096 3 4098 -1 0)
-        heap (mmap (cast (ptr u8) 0) 4096 3 4098 -1 0)]
+  (let [mem (mmap (cast (ptr u8) 0) 4096 3 (host-native-mmap-flags) -1 0)
+        heap (mmap (cast (ptr u8) 0) 4096 3 (host-native-mmap-flags) -1 0)]
     (assert (!= (cast i64 mem) -1))
     (assert (!= (cast i64 heap) -1))
-    (let [n (be-code-len) (mut i) 0]
+    (let [n (host-native-code-len) (mut i) 0]
       (loop
         (if (>= (load i) n) (break)
-          (do (set! (index mem (load i)) (cast u8 (be-code-byte (load i))))
+          (do (set! (index mem (load i)) (cast u8 (host-native-code-byte (load i))))
               (set! i (+ (load i) 1)) 0)))
       (assert (= (mprotect mem 4096 5) 0)) (sys_icache_invalidate mem n)
       (let [fp (cast (fnptr c [i64 i64 i64 i64] i64) mem)
@@ -48,12 +49,12 @@
         (assert (= (munmap mem 4096) 0)) got))))
 
 (defn native-call3-double-bits [(a i64) (b i64) (c i64)] (-> i64)
-  (let [mem (mmap (cast (ptr u8) 0) 4096 3 4098 -1 0)]
+  (let [mem (mmap (cast (ptr u8) 0) 4096 3 (host-native-mmap-flags) -1 0)]
     (assert (!= (cast i64 mem) -1))
-    (let [n (be-code-len) (mut i) 0]
+    (let [n (host-native-code-len) (mut i) 0]
       (loop
         (if (>= (load i) n) (break)
-          (do (set! (index mem (load i)) (cast u8 (be-code-byte (load i))))
+          (do (set! (index mem (load i)) (cast u8 (host-native-code-byte (load i))))
               (set! i (+ (load i) 1)) 0)))
       (assert (= (mprotect mem 4096 5) 0)) (sys_icache_invalidate mem n)
       (let [fp (cast (fnptr c [i64 i64 i64] f64) mem)
@@ -99,7 +100,7 @@
           ret (n-new2 (Return) (call-end site) unboxed)]
       (n-add-def! (g-stop) ret) (g-analyze!)
       (assert (select-program-or-report))
-      (be-schedule!) (assert (= (be-color! 8) 0)) (be-encode!)
+      (be-schedule!) (assert (= (be-color! 8) 0)) (assert (host-native-encode-checked!))
       (assert (= (native-call3 0 0 0) -23)))))
 
 (deftest every_tag_survives_the_dynamic_direct_call_abi
@@ -111,7 +112,7 @@
           ret (n-new2 (Return) (call-end site) (call-value site))]
       (n-add-def! (g-stop) ret) (g-analyze!)
       (assert (select-program-or-report))
-      (be-schedule!) (assert (= (be-color! 8) 0)) (be-encode!)
+      (be-schedule!) (assert (= (be-color! 8) 0)) (assert (host-native-encode-checked!))
       (let [(mut i) 0]
         (loop
           (if (>= (load i) (native-js-word-count)) (break)
@@ -134,7 +135,7 @@
             ret (n-new2 (Return) region value)]
         (n-add-def! (g-stop) ret) (g-analyze!)
         (assert (select-program-or-report))
-        (be-schedule!) (assert (= (be-color! 8) 0)) (be-encode!)
+        (be-schedule!) (assert (= (be-color! 8) 0)) (assert (host-native-encode-checked!))
         (assert (= (native-call3 1 0 0) 11))
         (assert (= (native-call3 0 0 0) 22))))))
 
@@ -151,7 +152,7 @@
       (let [ret (n-new2 (Return) region phi)]
         (n-add-def! (g-stop) ret) (g-analyze!)
         (assert (select-program-or-report))
-        (be-schedule!) (assert (= (be-color! 8) 0)) (be-encode!)
+        (be-schedule!) (assert (= (be-color! 8) 0)) (assert (host-native-encode-checked!))
         (let [(mut i) 0]
           (loop
             (if (>= (load i) (native-js-word-count)) (break)
@@ -188,7 +189,7 @@
                   (store! boxed-spills (+ (load boxed-spills) 1)) 0)
               (store! vr (+ (load vr) 1)) 0)))
       (assert (> (load boxed-spills) 0)))
-    (be-encode!) (assert (= (native-call3 0 0 0) 60))))
+    (assert (host-native-encode-checked!)) (assert (= (native-call3 0 0 0) 60))))
 
 (deftest tagged_words_survive_dynamic_object_fields
   (graph-reset! 106) (shape-reset!)
@@ -203,7 +204,7 @@
         ret (n-new3 (Return) (g-start) value mem1)]
     (n-add-def! (g-stop) ret) (g-analyze!)
     (assert (select-program-or-report))
-    (be-schedule!) (assert (= (be-color! 8) 0)) (be-encode!)
+    (be-schedule!) (assert (= (be-color! 8) 0)) (assert (host-native-encode-checked!))
     (assert (= (native-call3 0 0 0) -91))))
 
 (deftest every_tag_survives_dynamic_object_field_storage
@@ -218,7 +219,7 @@
         ret (n-new3 (Return) (g-start) loaded mem1)]
     (n-add-def! (g-stop) ret) (g-analyze!)
     (assert (select-program-or-report))
-    (be-schedule!) (assert (>= (be-color! 8) 0)) (be-encode!)
+    (be-schedule!) (assert (>= (be-color! 8) 0)) (assert (host-native-encode-checked!))
     (let [(mut i) 0]
       (loop
         (if (>= (load i) (native-js-word-count)) (break)
@@ -233,7 +234,7 @@
         ret (n-new2 (Return) (g-start) tested)]
     (n-add-def! (g-stop) ret) (g-analyze!)
     (assert (select-program-or-report))
-    (be-schedule!) (assert (= (be-color! 8) 0)) (be-encode!)
+    (be-schedule!) (assert (= (be-color! 8) 0)) (assert (host-native-encode-checked!))
     (assert (= (native-call3 (jsv-box-int 7) 0 0) 1))
     (assert (= (native-call3 (+ JSV-BOOLEAN 1) 0 0) 0))
     (assert (= (native-call3 4607182418800017408 0 0) 0))))
@@ -245,7 +246,7 @@
         ret (n-new2 (Return) (g-start) tested)]
     (n-add-def! (g-stop) ret) (g-analyze!)
     (assert (select-program-or-report))
-    (be-schedule!) (assert (= (be-color! 8) 0)) (be-encode!)
+    (be-schedule!) (assert (= (be-color! 8) 0)) (assert (host-native-encode-checked!))
     (assert (= (native-call3 4607182418800017408 0 0) 1))
     (assert (= (native-call3 JSV-NEGATIVE-ZERO 0 0) 1))
     (assert (= (native-call3 JSV-NAN 0 0) 1))
@@ -261,13 +262,10 @@
         ret (n-new2 (Return) (g-start) value)]
     (n-add-def! (g-stop) ret) (g-analyze!)
     (assert (select-program-or-report))
-    (be-schedule!) (assert (= (be-color! 8) 0)) (be-encode!)
+    (be-schedule!) (assert (= (be-color! 8) 0)) (assert (host-native-encode-checked!))
     (assert (= (native-call3-double-bits 4607182418800017408 0 0) 4607182418800017408))
     (assert (= (native-call3-double-bits JSV-NEGATIVE-ZERO 0 0) JSV-NEGATIVE-ZERO))
     (assert (= (native-call3-double-bits JSV-NAN 0 0) JSV-NAN))))
-
-
-
 
 
 
