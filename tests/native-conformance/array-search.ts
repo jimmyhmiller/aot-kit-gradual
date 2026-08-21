@@ -12,9 +12,16 @@ export function main(): number {
   xs.push(20);
   xs.push(30);
   xs.push(20);
+  const numericText: any = "2";
+  const words = ["first", "second", "first"];
   return (xs.indexOf(20) + xs.indexOf(99) + xs.indexOf(10) + xs.indexOf(30)
     + xs.indexOf(20, 2) + xs.indexOf(10, 1)
+    + xs.indexOf(20, numericText) + xs.indexOf(20, -2)
     + xs.lastIndexOf(20) + xs.lastIndexOf(10) + xs.lastIndexOf(99)
+    + xs.lastIndexOf(20, 0) + xs.lastIndexOf(20, -2)
     + (xs.includes(30) ? 1000 : 0) + (xs.includes(99) ? 2000 : 0)
-    + (xs.includes(10) ? 4000 : 0)) | 0;
+    + (xs.includes(10) ? 4000 : 0)
+    + (xs.includes(10, 1) ? 8000 : 0) + (xs.includes(20, -1) ? 16000 : 0)
+    + words.indexOf("first") * 32000 + words.lastIndexOf("first") * 64000
+    + (words.includes("second") ? 256000 : 0)) | 0;
 }

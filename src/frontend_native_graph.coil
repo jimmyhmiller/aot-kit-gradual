@@ -2434,8 +2434,8 @@
 ;; builtins; their calls carry the same heap as an implicit trailing effect argument.
 ;;
 ;; The receiver stays a RAW array pointer, which is what `%ArrayLen` and `%ArrayLoad` expect. The
-;; search target is BOXED, because array elements are stored boxed and `%Eq` compares the stored
-;; words.
+;; search target and fromIndex are BOXED because the DSL owns StrictEqual/SameValueZero and
+;; ToIntegerOrInfinity rather than receiving pre-decided machine values from the frontend.
 (defn fng-array-search [(context FngContext) (node i64) (name (slice u8))] (-> i64)
   (let [frontend (load (field context frontend))
         ast (field frontend ast)
@@ -2446,13 +2446,20 @@
                            (fng-expression context (ts-child ast node 1))
                            (fng-undefined)))]
     (if (= name "includes")
-        (fng-jsl-call2 context "ArrayIncludes" array target)
+        (fng-jsl-call3 context "ArrayIncludes" array target
+                       (n-box! (if (> argc 1)
+                                   (fng-expression context (ts-child ast node 2))
+                                   (fng-const 0))))
         (if (= name "lastIndexOf")
-            (fng-jsl-call2 context "ArrayLastIndexOf" array target)
-            (fng-jsl-call3 context "ArrayIndexOfFrom" array target
-                           (if (> argc 1)
-                               (fng-expression context (ts-child ast node 2))
-                               (fng-const 0)))))))
+            (fng-jsl-call4 context "ArrayLastIndexOf" array target
+                           (n-box! (if (> argc 1)
+                                       (fng-expression context (ts-child ast node 2))
+                                       (fng-undefined)))
+                           (fng-const (if (> argc 1) 1 0)))
+            (fng-jsl-call3 context "ArrayIndexOf" array target
+                           (n-box! (if (> argc 1)
+                                       (fng-expression context (ts-child ast node 2))
+                                       (fng-const 0))))))))
 
 (defn fng-math-member-id [(context FngContext) (node i64)] (-> i64)
   (let [frontend (load (field context frontend))
@@ -3356,12 +3363,19 @@
       ;; differ: substr's second argument is a COUNT, and substring SWAPS out-of-order arguments
       ;; where slice yields the empty string.
       :else
-        (let [end (if (> argc 1)
-                      (fng-expression context (ts-child ast node 2))
-                      (fng-jsl-call1 context "StringLength" string))
-              jsl-name (cond (= name "substring") "StringSubstring"
+        (let [jsl-name (cond (= name "substring") "StringSubstring"
                              (= name "substr") "StringSubstr"
-                             :else "StringSlice")]
+                             :else "StringSlice")
+              ;; The distinction between an absent/undefined substr count and every value that
+              ;; ToInteger turns into zero is JavaScript meaning owned by StringSubstr. The
+              ;; frontend supplies the actual value and only boxes it to match that DSL boundary.
+              end (if (= name "substr")
+                      (n-box! (if (> argc 1)
+                                  (fng-expression context (ts-child ast node 2))
+                                  (fng-undefined)))
+                      (if (> argc 1)
+                          (fng-expression context (ts-child ast node 2))
+                          (fng-jsl-call1 context "StringLength" string)))]
           (fng-jsl-call3 context jsl-name string start end)))))
 
 ;; `Array.prototype.push`, out of `ArrayPush1` in lib/array/build.jsl.
