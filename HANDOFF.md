@@ -1,5 +1,26 @@
 # Handoff: move JavaScript semantics into the DSL
 
+## ORDINARY CONSTRUCTOR IDENTITY MAKES ASSERTION FAILURES CATCHABLE (2026-08-22, latest)
+
+Synthesized ordinary function prototypes now receive their standard `constructor` property through
+`InitializeFunctionPrototype` in `lib/abstract/errors.jsl`. A statically known `new F()` whose
+constructor never reads `this` now also gets its prototype link; the old receiver-type guard left
+such objects disconnected. Custom Error-like constructors therefore retain exact function identity,
+and Test262 assertion failures thrown as ordinary `Test262Error` objects can themselves be checked.
+
+Two more byte-for-byte upstream harness cases are pinned: `assert-throws-custom.js` and
+`assert-throws-incorrect-ctor.js`. The focused runner now executes **14 passed, 0 failed, 0 refused,
+0 skipped** over seven files in default and strict modes. The full synchronous upstream
+`assert-throws-*` sample improved from 2/20 to **16 passed, 4 failed, 1 skipped**. The four failures
+are two files in both modes: aliased/polymorphic Error construction and three sequential invalid
+callback assertions currently exhaust graph memory; the `$262` same-realm case is policy-skipped.
+Those gaps remain visible rather than weakening `assert.throws`.
+
+Final verification with current Coil: `coil test` is **439 passed, 0 failed**; focused native is
+**35 passed, 0 failed**; focused Test262 harness is **8 passed, 0 failed**; DSL ownership remains
+**4 passed, 0 failed**. The frontier remains the intentional **0 passed, 8 failed**, with the same
+seven named refusals and shortest-round-trip disagreement and no infrastructure failure.
+
 ## BUILT-IN ERROR IDENTITY UNBLOCKS `assert.throws` ATTEMPTS (2026-08-22, latest)
 
 The seven built-in Error names now resolve to distinct function-tagged constructor identities.

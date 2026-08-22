@@ -2320,6 +2320,12 @@
         (let [frontend (load (field context frontend))
               ast (field frontend ast)
               object (fng-empty-dynamic-object context)
+              initialized
+                (fng-jsl-call2 context "InitializeFunctionPrototype"
+                               object
+                               (al-get [i64]
+                                       (load (load (field context functions)))
+                                       constructor))
               parent (fng-prototype-parent frontend constructor)
               (mut index) 0]
           (if (>= parent 0)
@@ -3190,6 +3196,8 @@
               (do
                 (if (= (slice-get args (load probe)) NO-NODE)
                     (do
+                      (fmt (stderr) "frontend: JSL {s} argument {d} is NO-NODE owner={d}\n"
+                           name (load probe) (.owner context))
                       (if (= (load probe) 0) (panic-corrupt "jsl argument 0 is NO-NODE") 0)
                       (if (= (load probe) 1) (panic-corrupt "jsl argument 1 is NO-NODE") 0)
                       (panic-corrupt "jsl argument 2+ is NO-NODE")
@@ -4463,7 +4471,12 @@
                                    saved-start)
             (set! (load (field context ctrl)) (arms-f arms))))
         0)
-    (if (and construct (and (= receiver-type FE-RECEIVER-DYNAMIC) (>= callee 0)))
+    ;; Every dynamically represented construction with a static target gets the constructor's
+    ;; prototype, including a constructor that never reads `this` (receiver-type -1). The latter
+    ;; still allocates a real ordinary object above; omitting its link made `new F().constructor`
+    ;; undefined and `new F() instanceof F` false. Statically shaped receivers use the closed-world
+    ;; shape path; truly polymorphic construction still requires runtime constructor dispatch.
+    (if (and construct (and (< receiver-owner 0) (>= function-index 0)))
         (let [prototype (fng-constructor-prototype! context callee)
               linked
                 (fng-jsl-call2 context "SetObjectPrototype" receiver prototype)]
