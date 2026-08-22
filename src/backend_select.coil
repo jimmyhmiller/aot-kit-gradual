@@ -397,6 +397,12 @@
                 tag))))))))
 
 (defn be-box-input-already-tagged? [(node i64)] (-> bool)
+  ;; A raw managed pointer remains raw regardless of the liveness class assigned to values that
+  ;; eventually cross a dynamic boundary. Treating MLK-BOXED as proof here let Box(object) become
+  ;; the identity; its low canonical address then looked like an untagged IEEE double to every
+  ;; TypeTest, so ordinary objects took the numeric ToPrimitive fast path.
+  (if (= (n-rep-of node 32) REP-RAW-PTR)
+      false
   (if (op-is? node Box [_])
       true
   (if (op-is? node Call [_])
@@ -407,7 +413,7 @@
       ;; answers -1, and a program that merely joins a number with a string in one variable does
       ;; not compile.
       (or (be-kinds-must-be-tagged? (n-ty node))
-          (= (ml-kind-for-node node) MLK-BOXED)))))
+          (= (ml-kind-for-node node) MLK-BOXED))))))
 
 (defn be-float-only? [(t i64)] (-> bool)
   (= (ty-kinds t) VK-FLT))
@@ -1389,7 +1395,14 @@
                     (if (or (< object 0) (< prototype 0))
                         (set! ok false)
                         (let [fresh (ms-new-vreg!)
-                              effect-bid bid
+                              effect-bid
+                                (ms-selection-value-block
+                                  owner
+                                  (ms-selection-value-block
+                                    owner
+                                    (ms-array-effect-block owner (n-in node 1) (n-in node 2) bid)
+                                    object)
+                                  prototype)
                               key (ms-immediate! owner effect-bid 0)
                               at
                                 (ms-emit! owner
@@ -1495,7 +1508,10 @@
   (or (op-is? node ArrayLoad [_])
       (or (op-is? node PropLoad [_])
           (or (op-is? node Box [_])
-              (ms-call-returns-tagged? node)))))
+          (or (and (op-is? node Phi [_]) (be-box-input-already-tagged? node))
+          (or (op-is? node ToNumber [])
+          (or (op-is? node ToInteger [])
+              (ms-call-returns-tagged? node))))))))
 
 (defn ms-fp-input! [(owner i64) (node i64) (vreg i64) (bid i64)] (-> i64)
   (if (be-node-fp-value? node)
@@ -1871,7 +1887,29 @@
                                   (set! vr (ms-immediate! owner bid 0))
                                   (if (= kinds VK-UNDEF)
                                       (set! vr (ms-immediate! owner bid 1))
-                                      0)))))))
+                                      (if (ms-value-is-tagged? value-node)
+                                          (let [zero (ms-immediate! owner bid 0)]
+                                            ;; The DSL's arithmetic operations return tagged
+                                            ;; JavaScript Numbers. Preserve that boundary and ask
+                                            ;; the runtime about the encoded value rather than
+                                            ;; mistaking its bits for a raw f64 register.
+                                            (set! vr
+                                                  (ms-jsstring! owner bid node value zero zero
+                                                                JSSOP-IS-NAN-VALUE)))
+                                      (if (be-node-fp-value? value-node)
+                                          (let [fp (ms-fp-input! owner value-node value bid)
+                                                ordered (ms-new-vreg!)
+                                                zero (ms-immediate! owner bid 0)
+                                                result (ms-new-vreg!)]
+                                            ;; A Number is NaN exactly when it is not equal to
+                                            ;; itself. MI-FEQ performs an ordered comparison, so
+                                            ;; invert that boolean with the ordinary integer EQ.
+                                            (ms-emit! owner bid
+                                                      (mi-new MI-FEQ ordered fp fp 0 NO-NODE))
+                                            (ms-emit! owner bid
+                                                      (mi-new MI-EQ result ordered zero 0 node))
+                                            (set! vr result))
+                                          0)))))))))
             (StringFromCodeUnit [] (let [value (ms-select-value-at! owner (n-in node 1) bid)]
                   (if (>= value 0)
                       (set! vr
@@ -4163,28 +4201,13 @@
         (and (< target (mu-function-count))
              (= (mu-function-ideal target) (mu-direct-callee node)))
         (let [targets (^ target -1)
-              expected (be-call-target-summary (n-ty (n-in node 1)))
-              (mut fidx) 0
-              (mut valid) (= targets expected)]
-          (loop (if (or (>= (load fidx) 63) (not (load valid)))
-                    (break)
-                    (do
-                      (if (!= (& targets (<< 1 (load fidx))) 0)
-                          (let [(mut owner-index) 0
-                                (mut found) false]
-                            (loop (if (or (>= (load owner-index) (mu-function-count)) (load found))
-                                      (break)
-                                      (do
-                                        (if (= (al-get (.symbols (machine-unit))
-                                                       (load owner-index))
-                                               (load fidx))
-                                            (set! found true)
-                                            0)
-                                        (set! owner-index (+ (load owner-index) 1)))))
-                            (if (not (load found)) (set! valid false) 0))
-                          0)
-                      (set! fidx (+ (load fidx) 1)))))
-          (load valid)))))
+              expected (be-call-target-summary (n-ty (n-in node 1)))]
+          ;; Polymorphic emission deliberately dispatches over every function in the machine unit:
+          ;; the type summary can retain dead function ids after reachability, and requiring those
+          ;; ids to have machine owners rejects sound calls even though no runtime value can name a
+          ;; dead function. Validate that selection faithfully recorded the summary; unit coverage
+          ;; is defined by mu-build-program! and checked by the emitted all-owner dispatch itself.
+          (= targets expected)))))
 
 (defn ms-call-args-valid? [(at i64)] (-> bool)
   (let [m (be-inst at)
@@ -4685,6 +4708,46 @@
         "JSPROP" MI-JSARRAY
         "JSARRAY" MI-JSSTRING
         "JSSTRING" "?"))
+
+(defn ms-print-inst [(w (ptr Writer)) (at i64)] (-> i64)
+  (if (or (< at 0) (>= at (be-inst-count)))
+      (do (fmt w "m{d}: out of range\n" at) 0)
+      (let [m (be-inst at)]
+        (fmt w "m{d}: {s} owner={d} block={d} node={d} dst={d} a={d} b={d} imm={d}\n"
+             at (mi-op-name (.op m)) (.owner m) (.block-id m) (.node m)
+             (.dst m) (.a m) (.b m) (.imm m))
+        (let [a-def (ms-owner-def-inst (.owner m) (.a m))
+              b-def (ms-owner-def-inst (.owner m) (.b m))]
+          (if (>= a-def 0)
+              (let [d (be-inst a-def)]
+                (fmt w "  a <- m{d}:{s} block={d} node={d}\n"
+                     a-def (mi-op-name (.op d)) (.block-id d) (.node d))
+                0)
+              0)
+          (if (>= b-def 0)
+              (let [d (be-inst b-def)]
+                (fmt w "  b <- m{d}:{s} block={d} node={d}\n"
+                     b-def (mi-op-name (.op d)) (.block-id d) (.node d))
+                0)
+              0)
+          (if (and (= (.op m) MI-CALL)
+                   (and (>= (.node m) 0) (< (.node m) (n-count))))
+              (let [target (.imm m)
+                    expected (be-call-target-summary (n-ty (n-in (.node m) 1)))
+                    (mut owner) 0]
+                (fmt w "  call target={d} decoded={d} expected={d} args={d}@{d} symbols="
+                     target (if (< target 0) (^ target -1) target) expected
+                     (.arg-count m) (.arg-first m))
+                (loop (if (>= (load owner) (mu-function-count))
+                          (break)
+                          (do
+                            (fmt w "{d}," (al-get (.symbols (machine-unit)) (load owner)))
+                            (set! owner (+ (load owner) 1))
+                            0)))
+                (ps w "\n")
+                0)
+              0))))
+  0)
 
 (defn ms-dump [(w (ptr Writer))] (-> i64)
   (let [funcs (mu-function-count)

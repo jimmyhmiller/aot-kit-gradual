@@ -1,5 +1,37 @@
 # Handoff: move JavaScript semantics into the DSL
 
+## TEST262 ITERATION IS SUB-MINUTE AND COERCION/ERROR FOUNDATIONS ARE NATIVE (2026-08-22, latest)
+
+The mandatory edit loop remains below one minute: `coil test` is **46 passed, 0 failed in 45.56 s**
+in this orb. Test262 runs now report per-variant duration and exact pipeline phase, and machine
+selection failures print the instruction op, owner, block, graph node, arguments, definitions, and
+polymorphic target summary. The runner loads only the referenced assertion methods from the local
+bootstrap harness. This is closed-world dependency elimination, not altered assertions: an Array
+case that previously exceeded a 10 s timeout now reaches its real runtime failure in **8.99 s for
+both variants**. A four-case batching experiment was discarded after measurement showed the
+backend's larger-graph costs outweighed harness reuse.
+
+JavaScript Number constants, Boolean conversion, Number/Boolean wrapper internal slots, and
+Number-hint `valueOf`/`toString` coercion are implemented in `lib/**/*.jsl`. Raw managed pointers
+are boxed at the representation boundary instead of being mistaken for tagged values. Default
+object/function numeric coercion and basic wrappers execute natively; an 18-variant Number-constant
+shard and focused wrapper/coercion witnesses pass. Polymorphic call verification now agrees with
+the encoder's deliberate all-live-owner dispatch instead of rejecting stale dead function ids in
+the conservative type summary.
+
+Unbound identifier reads now raise catchable `ReferenceError` objects at runtime rather than being
+indexing refusals, and built-in Error `instanceof` is delegated to DSL-owned constructor identity.
+The exact four default/strict unbound-reference variants that were previously frontend code 1003
+now pass. Pure proven-number arithmetic no longer retains impossible pending-exception branches:
+the frontend records only the numeric representation refinement while `JsAdd` and all coercion
+meaning remain in the DSL. Test262's large all-checks-in-one coercion files still expose quadratic
+graph/allocation growth and user-callback throws through a non-inlined coercion builtin remain an
+open boundary; no 4,000-pass claim has been made yet.
+
+Final standing verification: `coil test` is **46 passed, 0 failed in 45.56 s**. Frontier reaches
+all seven current intentional JavaScript bugs as **0 passed, 7 failed**, with no xcrun, Mach-O,
+encoding, link, or Linux infrastructure failure.
+
 ## THE MANDATORY GATE IS BOUNDED BELOW ONE MINUTE (2026-08-22, latest)
 
 The former default compiled all 46 test modules into one 3.1 GiB runner before executing 442 tests.

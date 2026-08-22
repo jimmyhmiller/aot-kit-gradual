@@ -769,10 +769,15 @@ AotJsValue aot_js_string(uintptr_t a, int64_t b,
     int ok = 0;
     double d = aot_js_to_number_double((AotJsValue)a, &ok);
     if (!ok) {
-      fprintf(stderr, "aot_js_string: ToNumber on a value requiring ToPrimitive\n");
+      fprintf(stderr,
+              "aot_js_string: ToNumber on a value requiring ToPrimitive value=0x%016" PRIxPTR
+              " tag=0x%016" PRIx64 "\n",
+              a, aot_js_tag((AotJsValue)a));
       abort();
     }
-    if (operation == AOT_JS_VALUE_TO_NUMBER) return aot_js_number_result(d);
+    if (operation == AOT_JS_VALUE_TO_NUMBER) {
+      return aot_js_number_result(d);
+    }
     if (d != d) return aot_js_box_int(0);
     if (d == INFINITY || d == -INFINITY) return aot_js_number_result(d);
     double t = d < 0 ? ceil(d) : floor(d);
@@ -1425,6 +1430,10 @@ AotJsValue aot_js_property(uintptr_t owner, uint64_t name,
   }
   if (operation >= 10 && operation <= 13) {
     JsObjectRec *object = js_object(owner, 0);
+    /* InternalKind is the representation query used to distinguish iterator and primitive-wrapper
+       slots from an ordinary object. Ordinary objects answer -1; the value-bearing accesses still
+       throw when no internal slots were initialized. */
+    if (operation == 12 && (!object || object->internal_kind < 0)) return (AotJsValue)-1;
     if (!object || object->internal_kind < 0) {
       fputs("uncaught JavaScript throw\n", stderr);
       exit(70);

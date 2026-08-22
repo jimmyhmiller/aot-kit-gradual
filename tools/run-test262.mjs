@@ -33,7 +33,7 @@ const optionNames = new Set([
   "--timeout-ms",
   "--memory-mb",
 ]);
-const flagNames = new Set(["--quiet", "--no-build", "--resume"]);
+const flagNames = new Set(["--quiet", "--no-build", "--resume", "--es5-only"]);
 const hasFlag = (name) => argv.includes(name);
 const paths = [];
 for (let i = 0; i < argv.length; i++) {
@@ -57,11 +57,12 @@ const memoryMb = Math.max(1, Number(option("--memory-mb", "2048")));
 const results = option("--results");
 const quiet = hasFlag("--quiet");
 const resume = hasFlag("--resume");
+const es5Only = hasFlag("--es5-only");
 if (paths.length === 0) {
   console.error(
     "usage: node tools/run-test262.mjs --test262 DIR [--start N] [--limit N] " +
       "[--jobs N] [--timeout-ms N] [--memory-mb N] [--results FILE] [--resume] [--quiet] " +
-      "TEST_OR_DIRECTORY...",
+      "[--es5-only] TEST_OR_DIRECTORY...",
   );
   process.exit(64);
 }
@@ -86,6 +87,19 @@ if (!hasFlag("--no-build")) {
 const localHarness = resolve("tests/test262/harness");
 const sta = readFileSync(join(localHarness, "sta.js"), "utf8");
 const assertion = readFileSync(join(localHarness, "assert.js"), "utf8");
+const assertionMarker = (text) => {
+  const at = assertion.indexOf(text);
+  if (at < 0) throw new Error(`local assert.js is missing marker: ${text}`);
+  return at;
+};
+const assertionParts = {
+  base: assertion.slice(assertionMarker("function assert("), assertionMarker("assert._isSameValue")),
+  sameHelper: assertion.slice(assertionMarker("assert._isSameValue"), assertionMarker("assert.sameValue")),
+  sameValue: assertion.slice(assertionMarker("assert.sameValue"), assertionMarker("assert.notSameValue")),
+  notSameValue: assertion.slice(assertionMarker("assert.notSameValue"), assertionMarker("assert.throws")),
+  throws: assertion.slice(assertionMarker("assert.throws"), assertionMarker("function compareArray")),
+  compareArray: assertion.slice(assertionMarker("function compareArray")),
+};
 const temporary = mkdtempSync(join(tmpdir(), "aotk-test262-"));
 const cleanupTemporary = () => rmSync(temporary, { recursive: true, force: true });
 process.on("exit", cleanupTemporary);
@@ -129,18 +143,39 @@ function variants(metadata) {
 
 function assemble(source, metadata, strict) {
   const flags = new Set(metadata.flags || []);
-  const pieces = ["function main(n) {\n"];
-  if (strict) pieces.push('"use strict";\n');
-  if (!flags.has("raw")) pieces.push(sta, "\n", assertion, "\n");
-  for (const include of metadata.includes || []) {
-    pieces.push(readFileSync(join(root, "harness", include), "utf8"), "\n");
+  const pieces = [];
+  const includes = (metadata.includes || []).map((include) =>
+    readFileSync(join(root, "harness", include), "utf8")
+  );
+  if (!flags.has("raw")) {
+    pieces.push(sta, "\n");
+    // The native frontend is closed-world. Do not compile the comparatively large assertion
+    // library for old-style tests that use only direct Test262Error checks; load it whenever the
+    // test or one of its requested includes can reference `assert`.
+    const assertionUsers = [source, ...includes].join("\n");
+    if (/\bassert\b/.test(assertionUsers)) {
+      pieces.push(assertionParts.base);
+      const same = /\bassert\.(?:sameValue|notSameValue|compareArray)\b/.test(assertionUsers);
+      if (same) pieces.push(assertionParts.sameHelper);
+      if (/\bassert\.sameValue\b/.test(assertionUsers)) pieces.push(assertionParts.sameValue);
+      if (/\bassert\.notSameValue\b/.test(assertionUsers)) pieces.push(assertionParts.notSameValue);
+      if (/\bassert\.throws\b/.test(assertionUsers)) pieces.push(assertionParts.throws);
+      if (/\bassert\.compareArray\b/.test(assertionUsers)) pieces.push(assertionParts.compareArray);
+      pieces.push("\n");
+    }
   }
+  for (const include of includes) pieces.push(include, "\n");
+  pieces.push("function main(n) {\n");
+  if (strict) pieces.push('"use strict";\n');
   pieces.push(source, "\nreturn 0;\n}\n");
   return pieces.join("");
 }
 
-const files = [];
+let files = [];
 for (const path of paths) collect(path, files);
+if (es5Only) {
+  files = files.filter((path) => /(?:^|\n)es5id:/.test(readFileSync(path, "utf8")));
+}
 if (start > 0) files.splice(0, start);
 if (limit > 0) files.length = Math.min(files.length, limit);
 
@@ -155,6 +190,8 @@ const resultKey = (result) => `${result.path}\0${result.variant}`;
 function categoryFor(status, detail = "") {
   const code = detail.match(/frontend status=\d+ code=(\d+)/);
   if (code) return `frontend-code-${code[1]}`;
+  const phase = detail.match(/^native-harness: ([a-z0-9-]+)/i);
+  if (phase) return `pipeline-${phase[1].toLowerCase()}`;
   const bridgeKind = detail.match(/bridge kind (-?\d+)/);
   if (bridgeKind) return `frontend-bridge-kind-${bridgeKind[1]}`;
   if (status === "skipped") return detail.split(" is not implemented", 1)[0].replaceAll(" ", "-");
@@ -202,6 +239,7 @@ for (let index = 0; index < files.length; index++) {
     report({ path, variant: "metadata", status: "failed", detail: error.message });
     continue;
   }
+  if (es5Only && !metadata.es5id) continue;
   const reason = unsupportedReason(metadata, source);
   if (reason) {
     report({ path, variant: "policy", status: "skipped", detail: `${reason} is not implemented` });
@@ -252,27 +290,37 @@ async function runOne(task) {
   const { index, path, source, metadata, variant } = task;
   const assembled = join(temporary, `${index}-${variant.name}-${basename(path)}`);
   writeFileSync(assembled, assemble(source, metadata, variant.strict));
+  const started = performance.now();
   const run = await runNative(assembled);
+  const durationMs = Math.round(performance.now() - started);
   rmSync(assembled, { force: true });
   for (const suffix of [".o", ".err", ""]) {
     rmSync(`/tmp/aotk-native-${run.pid}${suffix}`, { force: true });
   }
   if (run.status === 0 && run.stdout.trim().endsWith("PASS")) {
-    report({ path, variant: variant.name, status: "passed" });
+    report({ path, variant: variant.name, status: "passed", durationMs });
   } else if (
     (run.status === 2 && run.stdout.trim().endsWith("REFUSED")) ||
     run.stderr.includes("frontend: unsupported")
   ) {
     const lines = run.stderr.trim().split("\n");
-    const detail = lines.find((line) => line.startsWith("test262-native: frontend")) ||
+    const phaseIndex = lines.findIndex((line) => line.startsWith("native-harness:"));
+    const phaseDetail = phaseIndex >= 0
+      ? [lines[phaseIndex], ...lines.slice(phaseIndex + 1).filter((line) =>
+          /^[mn]\d+:/.test(line) || /^  (?:[ab] <-|call )/.test(line),
+        )].join("; ")
+      : "";
+    const detail = phaseDetail ||
+      lines.find((line) => line.startsWith("test262-native: frontend")) ||
       lines.find((line) => line.startsWith("frontend: unsupported")) || lines.at(-1);
-    report({ path, variant: variant.name, status: "refused", detail });
+    report({ path, variant: variant.name, status: "refused", detail, durationMs });
+    if (run.stderr && !quiet) process.stderr.write(run.stderr);
   } else {
     const stderrLines = run.stderr.trim().split("\n");
     const detail = stderrLines.find((line) => line.startsWith("graph corruption:")) ||
       stderrLines.find((line) => line.startsWith("native-harness:")) || run.signal ||
       run.stdout.trim() || `exit ${run.status}`;
-    report({ path, variant: variant.name, status: "failed", detail });
+    report({ path, variant: variant.name, status: "failed", detail, durationMs });
     if (run.stderr && !quiet) process.stderr.write(run.stderr);
   }
 }

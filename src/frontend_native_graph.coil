@@ -42,6 +42,7 @@
 (const FNG-INTRINSIC-NUMBER i64 -14)
 (const FNG-INTRINSIC-PARSEFLOAT i64 -15)
 (const FNG-ITERATOR i64 -16)
+(const FNG-INTRINSIC-BOOLEAN i64 -17)
 (const FNG-JUMP-BREAK i64 0)
 (const FNG-JUMP-CONTINUE i64 1)
 (const FNG-JUMP-THROW i64 2)
@@ -935,8 +936,27 @@
 ;; The precision is not lost by moving it: `:ret` is recorded and never read, so a call's type is
 ;; whatever the graph computes, and the guards fold when the operands are known. `1 + 2` keeps its
 ;; integer range; only a genuinely dynamic operand produces a dynamic result.
+(defn fng-graph-proven-numeric? [(node i64) (fuel i64)] (-> bool)
+  (if (or (= node NO-NODE) (or (<= fuel 0) (n-dead? node)))
+      false
+      (match (n-op node)
+        (Const [ty] (ty-numeric? ty))
+        (Arg [ty] (ty-numeric? ty))
+        (Cast [target] (ty-numeric? target))
+        (Box [_] (if (> (n-nins node) 1)
+                     (fng-graph-proven-numeric? (n-in node 1) (- fuel 1))
+                     false))
+        (Add [] true) (Sub [] true) (Mul [] true) (Div [] true) (Minus [] true)
+        (_ false))))
+
 (defn fng-arith2 [(context FngContext) (name (slice u8)) (a i64) (b i64)] (-> i64)
-  (fng-jsl-call2 context name (n-box! a) (n-box! b)))
+  (let [value (fng-jsl-call2 context name (n-box! a) (n-box! b))]
+    ;; A representation refinement, not arithmetic semantics: when both source values are proven
+    ;; machine numbers, the DSL's guarded dynamic result is also a Number. Recording that fact lets
+    ;; the typed consumer cancel Box/Unbox without retaining impossible object-exception arms.
+    (if (and (fng-graph-proven-numeric? a 16) (fng-graph-proven-numeric? b 16))
+        (fng-peep (n-new2 (Cast (t-num)) (load (load (field context ctrl))) value))
+        value)))
 
 (defn fng-arith1 [(context FngContext) (name (slice u8)) (a i64)] (-> i64)
   (fng-jsl-call1 context name (n-box! a)))
@@ -1700,6 +1720,7 @@
         (= symbol FE-INTRINSIC-OBJECT) FNG-INTRINSIC-OBJECT
         (= symbol FE-INTRINSIC-NUMBER) FNG-INTRINSIC-NUMBER
         (= symbol FE-INTRINSIC-PARSEFLOAT) FNG-INTRINSIC-PARSEFLOAT
+        (= symbol FE-INTRINSIC-BOOLEAN) FNG-INTRINSIC-BOOLEAN
         :else FNG-DYNAMIC))
 
 (defn fng-declared-symbol-type [(frontend (ptr NativeFrontend)) (symbol-id i64)] (-> i64)
@@ -1855,10 +1876,14 @@
                             FNG-DYNAMIC)]
                   (if (or (= callee-type FNG-INTRINSIC-STRING)
                           (or (= callee-type FNG-INTRINSIC-PARSEINT)
-                              (= callee-type FNG-INTRINSIC-ISNAN)))
+                              (or (= callee-type FNG-INTRINSIC-ISNAN)
+                                  (= callee-type FNG-INTRINSIC-BOOLEAN))))
                       (if (= callee-type FNG-INTRINSIC-STRING)
                           FNG-STRING
-                          (if (= callee-type FNG-INTRINSIC-ISNAN) FNG-BOOLEAN FNG-NUMBER))
+                          (if (or (= callee-type FNG-INTRINSIC-ISNAN)
+                                  (= callee-type FNG-INTRINSIC-BOOLEAN))
+                              FNG-BOOLEAN
+                              FNG-NUMBER))
                       ;; Both of these are unboxed at their emitter — see `fng-number-static` for
                       ;; why the predicates must be — so they are a machine bool and a machine
                       ;; number, exactly like the global `isNaN` and `parseInt` above.
@@ -1917,7 +1942,7 @@
                                       (fng-call-result-type
                                         frontend callee (= kind TSK-NEW-EXPRESSION)))))))))))))))))))))))
               (= kind TSK-PROPERTY-ACCESS)
-                (if (fng-number-max-safe? context node)
+                (if (fng-number-constant? context node)
                     FNG-NUMBER
                 (let [owner (fng-infer context (ts-role ast node TS-ROLE-OBJECT 0) FNG-DYNAMIC)
                       name-node (ts-role ast node TS-ROLE-PROPERTY 0)
@@ -2620,6 +2645,21 @@
     (fng-record-dynamic-alias! context JS-PROPERTY-ALIAS)
     object))
 
+(defn fng-unbound-reference [(context FngContext) (node i64)] (-> i64)
+  (let [frontend (load (field context frontend))
+        ast (field frontend ast)
+        object
+          (fng-jsl-call3 context "NewErrorObject"
+                         (n-string-const! (jss-from-utf8! (ts-text ast node)))
+                         (n-string-const! (jss-from-utf8! "ReferenceError"))
+                         (fng-jsl-call1 context "ErrorConstructorValue" (fng-const 3)))
+        raised (fng-jsl-call1 context "ThrowValue" (n-box! object))]
+    (fng-record-dynamic-alias! context JS-PROPERTY-ALIAS)
+    ;; An identifier read is an expression, so leave a structurally ordinary (runtime-impossible)
+    ;; false arm for its parent expression while routing the pending true arm to the active catch.
+    (fng-check-pending-exception! context raised)
+    (fng-undefined)))
+
 (defn fng-string-builtin-name [(context FngContext) (node i64)] (-> (slice u8))
   (let [frontend (load (field context frontend))
         ast (field frontend ast)
@@ -2663,11 +2703,24 @@
 (defn fng-number-static? [(context FngContext) (node i64)] (-> bool)
   (> (str-len (fng-number-static-name context node)) 0))
 
-(defn fng-number-max-safe? [(context FngContext) (node i64)] (-> bool)
+(defn fng-number-constant-name [(context FngContext) (node i64)] (-> (slice u8))
   (let [frontend (load (field context frontend)) ast (field frontend ast)]
-    (and (= (ts-kind ast node) TSK-PROPERTY-ACCESS)
-         (and (= (fe-resolution-symbol frontend (ts-child ast node 0)) FE-INTRINSIC-NUMBER)
-              (= (ts-text ast (ts-child ast node 1)) "MAX_SAFE_INTEGER")))))
+    (if (and (= (ts-kind ast node) TSK-PROPERTY-ACCESS)
+             (= (fe-resolution-symbol frontend (ts-child ast node 0)) FE-INTRINSIC-NUMBER))
+        (let [member (ts-text ast (ts-child ast node 1))]
+          (cond (= member "NaN")               "NumberNaN"
+                (= member "POSITIVE_INFINITY") "NumberPositiveInfinity"
+                (= member "NEGATIVE_INFINITY") "NumberNegativeInfinity"
+                (= member "EPSILON")           "NumberEpsilon"
+                (= member "MAX_VALUE")         "NumberMaxValue"
+                (= member "MIN_VALUE")         "NumberMinValue"
+                (= member "MAX_SAFE_INTEGER")  "NumberMaxSafeInteger"
+                (= member "MIN_SAFE_INTEGER")  "NumberMinSafeInteger"
+                :else ""))
+        "")))
+
+(defn fng-number-constant? [(context FngContext) (node i64)] (-> bool)
+  (> (str-len (fng-number-constant-name context node)) 0))
 
 (defn fng-number-static [(context FngContext) (node i64)] (-> i64)
   (let [frontend (load (field context frontend))
@@ -2700,6 +2753,38 @@
                                  (n-box! (fng-expression context (ts-child ast node 1))))
                   (t-flt))
         (fng-const 0))))
+
+;; `Boolean(value)` is the DSL's ToBoolean operation. Argument evaluation belongs to the frontend;
+;; truthiness does not. An omitted argument is `undefined`, hence false through the same path.
+(defn fng-boolean-convert? [(context FngContext) (node i64)] (-> bool)
+  (let [frontend (load (field context frontend))
+        ast (field frontend ast)]
+    (and (> (ts-child-count ast node) 0)
+         (= (fe-resolution-symbol frontend (ts-child ast node 0)) FE-INTRINSIC-BOOLEAN))))
+
+(defn fng-boolean-convert [(context FngContext) (node i64)] (-> i64)
+  (let [frontend (load (field context frontend))
+        ast (field frontend ast)
+        argument (if (> (ts-child-count ast node) 1)
+                     (n-box! (fng-expression context (ts-child ast node 1)))
+                     (n-box! (fng-undefined)))]
+    (fng-jsl-call1 context "ToBoolean" argument)))
+
+(defn fng-primitive-wrapper? [(context FngContext) (node i64) (symbol i64)] (-> bool)
+  (let [frontend (load (field context frontend))
+        ast (field frontend ast)]
+    (and (= (ts-kind ast node) TSK-NEW-EXPRESSION)
+         (= (fe-resolution-symbol frontend (ts-child ast node 0)) symbol))))
+
+(defn fng-primitive-wrapper [(context FngContext) (node i64) (number bool)] (-> i64)
+  (let [frontend (load (field context frontend))
+        ast (field frontend ast)
+        argument (if (> (ts-child-count ast node) 1)
+                     (n-box! (fng-expression context (ts-child ast node 1)))
+                     (n-box! (if number (fng-const 0) (fng-undefined))))]
+    (fng-jsl-call1 context
+                   (if number "NewNumberObject" "NewBooleanObject")
+                   argument)))
 
 (defn fng-parse-float? [(context FngContext) (node i64)] (-> bool)
   (let [frontend (load (field context frontend)) ast (field frontend ast)
@@ -3184,6 +3269,46 @@
     (set! (load (field context ctrl)) (arms-f arms))
     0))
 
+(defn fng-lowered-window-can-throw? [(start i64)] (-> bool)
+  ;; Declaration-level can-throw is necessarily conservative. Macro guards often fold while they
+  ;; lower (`number + number` removes ToPrimitive's object arm), and retaining a pending-exception
+  ;; branch after the only Call/JsThrow disappeared both bloats pure arithmetic and invents runtime
+  ;; externs in otherwise standalone code. Ask the lowered window instead: these are the two graph
+  ;; operations that can set the pending exception transport.
+  (let [(mut node) start (mut found) false]
+    (loop (if (or (>= (load node) (n-count)) (load found))
+              (break)
+              (do
+                (if (and (not (n-dead? (load node)))
+                         (or (op-is? (load node) Call [_]) (op-is? (load node) JsThrow [])))
+                    (set! found true)
+                    0)
+                (set! node (+ (load node) 1)))))
+    (load found)))
+
+(defn fng-proven-numeric-nonthrowing-call? [(name (slice u8)) (args (slice i64))] (-> bool)
+  (let [arithmetic
+          (or (= name "JsAdd")
+              (or (= name "JsSub")
+                  (or (= name "JsMul")
+                      (or (= name "JsDiv")
+                          (or (= name "JsMod")
+                              (or (= name "JsNegate")
+                                  (or (= name "ToNumberValue")
+                                      (= name "ToPrimitiveNumber"))))))))
+        (mut index) 0
+        (mut numeric) arithmetic]
+    (loop (if (or (>= (load index) (slice-len args)) (not (load numeric)))
+              (break)
+              (do
+                (let [argument (slice-get args (load index))]
+                (if (or (ty-numeric? (n-ty argument))
+                        (fng-graph-proven-numeric? argument 16))
+                    0
+                    (set! numeric false)))
+                (set! index (+ (load index) 1)))))
+    (load numeric)))
+
 (defn fng-jsl-call [(context FngContext) (name (slice u8)) (args (slice i64))] (-> i64)
   (if (!= (jsl-require-body-only! name) JSL-OK)
       (do (panic-corrupt "frontend: a JSL definition the frontend emits did not resolve") 0)
@@ -3272,7 +3397,8 @@
     (let [calls-back (jsl-name-calls-back? name)]
       (set! (index mp 0) (fng-current-memory context JS-PROPERTY-ALIAS))
       (if calls-back (jl-set-outer-mem! (fng-callback-outer-memory context)) 0)
-      (let [owner-entry (if (.top-level context)
+      (let [lowered-start (n-count)
+            owner-entry (if (.top-level context)
                             (g-start)
                             (n-fun-entry (.fun context)))
             v (jsl-inline! (load (field context ctrl)) mp owner-entry name args)]
@@ -3298,7 +3424,9 @@
                 0))
         ;; ThrowValue is used by source `throw`, whose statement lowering already knows the edge is
         ;; abrupt. Definitions that call it transitively still get the ordinary pending check.
-        (if (and (!= name "ThrowValue") (jsl-name-can-throw? name))
+        (if (and (!= name "ThrowValue")
+                 (and (not (fng-proven-numeric-nonthrowing-call? name args))
+                      (fng-lowered-window-can-throw? lowered-start)))
             (fng-check-pending-exception! context v)
             0)
         v))))
@@ -5499,6 +5627,7 @@
                     (= symbol FE-INTRINSIC-NAN) (n-new1 (Const (t-flt-bits JSV-NAN)) (g-start))
                     (= symbol FE-INTRINSIC-INFINITY) (fng-jsl-call0 context "Infinity")
                     (= symbol FE-INTRINSIC-ERROR) (fng-error-constructor-value context node)
+                    (= symbol FE-INTRINSIC-UNBOUND) (fng-unbound-reference context node)
                     (< symbol 0) NO-NODE
                     :else
                       (let [stored (fng-symbol-node context symbol)
@@ -5773,6 +5902,10 @@
                                                      (fng-static-property-name ast left-node)))
                                     (fng-jsl-call2 context "HasProperty" right left))
                               (= operator "instanceof")
+                                (if (and (= (ts-kind ast right-node) TSK-IDENTIFIER)
+                                         (= (fe-resolution-symbol frontend right-node)
+                                            FE-INTRINSIC-ERROR))
+                                    (fng-jsl-call2 context "InstanceOfErrorValue" left right)
                                 (let [constructor (fe-find-function-name frontend right-node)]
                                   (if (>= constructor 0)
                                       (let [prototype
@@ -5809,7 +5942,7 @@
                                                       "instanceof right-operand"
                                                       (ts-kind ast right-node)
                                                       (ts-text ast right-node))))
-                                          (fng-jsl-call2 context "OrdinaryInstanceOf" left right))))
+                                          (fng-jsl-call2 context "OrdinaryInstanceOf" left right)))))
                               (= operator ",") right
                               :else NO-NODE)))))
           (= kind TSK-CALL)
@@ -5825,6 +5958,8 @@
                 (fng-parse-float context node)
             (if (fng-number-convert? context node)
                 (fng-number-convert context node)
+            (if (fng-boolean-convert? context node)
+                (fng-boolean-convert context node)
             (if (fng-number-to-string? context node)
                 (fng-number-to-string context node)
             (if (fng-number-to-fixed? context node)
@@ -5851,9 +5986,15 @@
                         (fng-string-call context node)
                         (if (fng-array-builtin? context node)
                             (fng-array-call context node)
-                            (fng-call context node))))))))))))))))))))
+                            (fng-call context node)))))))))))))))))))))
           (= kind TSK-NEW-EXPRESSION)
-            (if (fng-error-constructor? context node) (fng-error-constructor context node) (fng-call context node))
+            (if (fng-primitive-wrapper? context node FE-INTRINSIC-NUMBER)
+                (fng-primitive-wrapper context node true)
+            (if (fng-primitive-wrapper? context node FE-INTRINSIC-BOOLEAN)
+                (fng-primitive-wrapper context node false)
+            (if (fng-error-constructor? context node)
+                (fng-error-constructor context node)
+                (fng-call context node))))
           (= kind TSK-OBJECT-LITERAL)
             (let [inferred (fe-type-index-for-decl-node frontend node)
                   dynamic (and (= expected FNG-DYNAMIC) (< inferred 0))
@@ -5867,8 +6008,8 @@
             (if (!= (ts-role ast node TS-ROLE-OPERATOR 0) -1)
                 (fng-optional-field-load context node)
             (let [math-member (fng-math-member-id context node)]
-              (if (fng-number-max-safe? context node)
-                  (fng-jsl-call0 context "MaxSafeInteger")
+              (if (fng-number-constant? context node)
+                  (fng-jsl-call0 context (fng-number-constant-name context node))
               (if (>= math-member 0)
                   NO-NODE
                   (if (= (ts-text ast node) "Math.LN2")

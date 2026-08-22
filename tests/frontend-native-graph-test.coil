@@ -89,12 +89,23 @@ n7: Return <- n0 n5 n6 : [ctrl,num,mem#-9223372036854775808 undefined]
 ;; It also settles the calling convention question: a `number` parameter lowers to an int-typed
 ;; `Arg`, not a NaN-boxed `dyn`, so an ordinary `(fnptr c [i64] i64)` reaches it.
 (deftest javascript_source_compiles_and_executes
-  (let [source "function main(n: number): number { return n * 3 + 7; }"
+  ;; This mmap-only fixture cannot resolve runtime externs. Arithmetic now correctly reaches the
+  ;; DSL's throwable ToNumber path, so linked execution tests own it; this one isolates source,
+  ;; selection, allocation, encoding, mapping, and the scalar entry ABI without an object linker.
+  (let [source "function main(n: number): number { return n; }"
         (mut frontend) (fe-native-new source)]
     (assert (= (fe-native-index! (mut frontend)) FE-OK))
     (frontend-native-build! (mut frontend) 6201 true)
     (assert (= (g-verify) 0))
-    (assert (be-select-machine-program!))
+    (if (be-select-machine-program!)
+        0
+        (do (fmt (stderr) "selection failed code={d} node={d} machine={d}/{d}\n"
+                 (be-result) (be-result-node) (ms-result) (ms-result-item))
+            (ms-print-inst (stderr) (ms-result-item))
+            (if (and (>= (be-result-node) 0) (< (be-result-node) (n-count)))
+                (n-print-flat (stderr) (be-result-node))
+                0)
+            (assert false)))
     (be-schedule!)
     (assert (= (be-color! 8) 0))
     (let [x64 (!= (aot_host_is_x86_64) (cast i32 0))]
@@ -113,8 +124,8 @@ n7: Return <- n0 n5 n6 : [ctrl,num,mem#-9223372036854775808 undefined]
         (assert (= (mprotect mem 4096 5) 0))
         (sys_icache_invalidate mem n)
         (let [fp (cast (fnptr c [i64] i64) mem)]
-          (assert (= (primitive/call-ptr fp 5) 22))
-          (assert (= (primitive/call-ptr fp -1) 4))
+          (assert (= (primitive/call-ptr fp 5) 5))
+          (assert (= (primitive/call-ptr fp -1) -1))
           (assert (= (munmap mem 4096) 0))
           0))
       0)
