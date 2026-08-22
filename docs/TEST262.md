@@ -33,18 +33,20 @@ This is not yet the full Test262 protocol. Tests execute inside the compiler's c
 `function main(n)` entry ABI, so tests requiring exact top-level Script semantics are outside the
 claim. Module and async variants, negative parse/runtime phases, fresh realms, and `$262` are
 reported as unsupported rather than approximated. The local assertion bootstrap implements
-ordinary assertion, SameValue, and array comparison; native catchable exception transport is
-still required before upstream `assert.throws` can be implemented honestly.
+ordinary assertion, SameValue, array comparison, and constructor-checked `assert.throws` over the
+supported built-in Error constructors. Diagnostic formatting remains deliberately smaller than
+upstream's harness.
 
-The three cases under `tests/test262/cases/` are byte-for-byte copies of these upstream files at
+The five cases under `tests/test262/cases/` are byte-for-byte copies of these upstream files at
 Test262 revision `3655e7464de3d52643ecddd4b5f9f4f3e7f62398`:
 
 * `test/language/expressions/division/line-terminator.js`
 * `test/language/expressions/modulus/line-terminator.js`
 * `test/language/expressions/multiplication/line-terminator.js`
 * `test/harness/compare-array-empty.js`
+* `test/harness/assert-throws-native.js`
 
-They run in both default and strict variants, giving eight actual Test262 executions in the focused
+They run in both default and strict variants, giving ten actual Test262 executions in the focused
 runner check.
 
 ## Semantic ownership

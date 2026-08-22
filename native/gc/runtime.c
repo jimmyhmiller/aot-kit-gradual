@@ -498,6 +498,8 @@ static AotJsValue js_builtin_bits(double number) {
 }
 
 AotJsValue aot_js_builtin(AotJsValue a, AotJsValue b, uint64_t operation) {
+  if (operation == 20)
+    return AOT_JS_FUNCTION | (UINT64_C(0x10000) + (a & UINT64_C(0xff)));
   double x = js_builtin_number(a), y = js_builtin_number(b), result = NAN;
   switch (operation) {
     case AOT_JS_BUILTIN_ABS: result = fabs(x); break;
@@ -834,7 +836,7 @@ AotJsValue aot_js_string(uintptr_t a, int64_t b,
   }
   if (operation == 204)
     return AOT_JS_UNDEFINED;
-  if (operation >= 100 && operation < 117)
+  if ((operation >= 100 && operation < 117) || operation == 120)
     return aot_js_builtin((AotJsValue)a, (AotJsValue)b, operation - 100);
   if (operation == AOT_JS_STRING_NEW) {
     JsStringRec *result = js_string_new(b < 0 ? 0 : (size_t)b);

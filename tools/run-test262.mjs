@@ -113,7 +113,6 @@ function unsupportedReason(metadata, source) {
   if (flags.has("module")) return "module variant";
   if (flags.has("async")) return "async completion";
   if (metadata.negative) return `negative ${metadata.negative.phase || "unknown"} phase`;
-  if (/\bassert\.throws\s*\(/.test(source)) return "catchable exception assertions";
   if (/\$262\b/.test(source)) return "$262 host object";
   return "";
 }

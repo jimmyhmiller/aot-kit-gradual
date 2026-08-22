@@ -2,8 +2,7 @@
 // This code is governed by the BSD license found in the LICENSE file.
 //
 // Bootstrap slice of Test262's assertion harness. The callable `assert`, SameValue relation, and
-// sameValue/notSameValue behavior are preserved. Diagnostic formatting is deliberately minimal;
-// the upstream formatter and assert.throws depend on unsupported try/catch exception transport.
+// sameValue/notSameValue behavior are preserved. Diagnostic formatting is deliberately minimal.
 
 function assert(mustBeTrue, message) {
   if (mustBeTrue === true) return;
@@ -24,6 +23,24 @@ assert.sameValue = function (actual, expected, message) {
 assert.notSameValue = function (actual, unexpected, message) {
   if (!assert._isSameValue(actual, unexpected)) return;
   throw new Test262Error(message === undefined ? "Expected different values" : message);
+};
+
+assert.throws = function (expectedErrorConstructor, func, message) {
+  if (typeof func !== "function") {
+    throw new Test262Error("assert.throws requires an error constructor and a function");
+  }
+  try {
+    func();
+  } catch (thrown) {
+    if (typeof thrown !== "object" || thrown === null) {
+      throw new Test262Error(message === undefined ? "Thrown value was not an object" : message);
+    }
+    if (thrown.constructor !== expectedErrorConstructor) {
+      throw new Test262Error(message === undefined ? "Wrong error constructor" : message);
+    }
+    return;
+  }
+  throw new Test262Error(message === undefined ? "Expected an exception" : message);
 };
 
 function compareArray(actual, expected) {

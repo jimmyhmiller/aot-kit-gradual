@@ -1,5 +1,30 @@
 # Handoff: move JavaScript semantics into the DSL
 
+## BUILT-IN ERROR IDENTITY UNBLOCKS `assert.throws` ATTEMPTS (2026-08-22, latest)
+
+The seven built-in Error names now resolve to distinct function-tagged constructor identities.
+`new Error`/`EvalError`/`RangeError`/`ReferenceError`/`SyntaxError`/`TypeError`/`URIError` allocates
+and initializes `message`, `name`, and `constructor` through `NewErrorObject` in
+`lib/abstract/errors.jsl`; the frontend only identifies syntax and passes the constructor kind.
+The Test262 bootstrap now performs the upstream assertion's essential checks: the callback must
+throw an object whose constructor is exactly the expected constructor. The runner no longer skips
+every `assert.throws` file by policy.
+
+The byte-for-byte upstream `test/harness/assert-throws-native.js` case is pinned and passes in both
+default and strict modes through native x86-64. An exploratory run over the synchronous upstream
+assert-throws harness directory produced **2 passed, 18 failed, and 1 skipped**. The remaining
+failures are visible work (especially custom constructor identity and assertion-failure paths), not
+manufactured passes; one `$262` case remains policy-skipped. String `repeat` RangeError cases now
+attempt compilation rather than skipping, but expose an existing JSL loop graph failure in a
+callback (SIGSEGV/timeout), which was not hidden.
+
+Final verification with current Coil: `coil test` is **436 passed, 0 failed**. The opt-in frontier
+is the intentional **0 passed, 8 failed**: seven named syntax/bridge refusals and the existing
+shortest-round-trip disagreement (`ours=26`, `node=25`), with no platform, encoding, link, or
+runtime infrastructure failure. The focused native suite is **34 passed, 0 failed**, the focused
+Test262 harness suite is **6 passed, 0 failed**, and the runner executes **10 passed, 0 failed,
+0 refused, 0 skipped** across the five pinned upstream files in default and strict modes.
+
 ## CATCHABLE EXCEPTIONS CROSS NATIVE FRAMES (2026-08-22, latest)
 
 Catch-only `try` statements now lower to explicit exceptional graph edges on Linux x86-64. A
@@ -17,9 +42,8 @@ scope, state snapshots and exceptional control transport. The DSL ownership gate
 empty list of frontend-open-coded JavaScript operations.
 
 This is a substantial Test262 foundation, not complete exception conformance. `finally` is still
-refused because it requires completion records for return/throw/break/continue. The runner still
-skips `assert.throws`; built-in Error constructor identities/prototypes are not implemented, so
-enabling it now would either create honest failures or require weakening its constructor check.
+refused because it requires completion records for return/throw/break/continue. At this milestone
+the runner still skipped `assert.throws`; the newer section above records its subsequent enablement.
 A 40-file exploratory catch sample produced 5 native passes, 16 honest failures and 32 refusals;
 the failures/refusals expose unrelated Annex B binding semantics, empty statements, `eval`,
 `for-in`, and built-in Error names rather than platform or exception-transport failures.

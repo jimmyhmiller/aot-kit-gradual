@@ -2583,17 +2583,34 @@
   (let [frontend (load (field context frontend)) ast (field frontend ast)]
     (= (fe-resolution-symbol frontend (ts-child ast node 0)) FE-INTRINSIC-ERROR)))
 
+(defn fng-error-kind [(name (slice u8))] (-> i64)
+  (cond (= name "Error") 0
+        (= name "EvalError") 1
+        (= name "RangeError") 2
+        (= name "ReferenceError") 3
+        (= name "SyntaxError") 4
+        (= name "TypeError") 5
+        (= name "URIError") 6
+        :else -1))
+
+(defn fng-error-constructor-value [(context FngContext) (node i64)] (-> i64)
+  (fng-jsl-call1 context "ErrorConstructorValue"
+                 (fng-const (fng-error-kind (ts-text (field (load (field context frontend)) ast) node)))))
+
 (defn fng-error-constructor [(context FngContext) (node i64)] (-> i64)
   (let [frontend (load (field context frontend))
         ast (field frontend ast)
-        object (fng-empty-dynamic-object context)
+        callee (ts-child ast node 0)
+        name (ts-text ast callee)
         message
           (if (> (ts-child-count ast node) 1)
               (fng-expression context (ts-child ast node 1))
               (n-string-const! (jss-from-utf8! "")))
-        stored
-          (fng-jsl-call3 context "SetNamedProperty" object
-                         (fng-const (shape-name-intern! "message")) message)]
+        object
+          (fng-jsl-call3 context "NewErrorObject"
+                         message
+                         (n-string-const! (jss-from-utf8! name))
+                         (fng-error-constructor-value context callee))]
     (fng-record-dynamic-alias! context JS-PROPERTY-ALIAS)
     object))
 
@@ -5447,6 +5464,7 @@
               (cond (= symbol FE-INTRINSIC-UNDEFINED) (fng-undefined)
                     (= symbol FE-INTRINSIC-NAN) (n-new1 (Const (t-flt-bits JSV-NAN)) (g-start))
                     (= symbol FE-INTRINSIC-INFINITY) (fng-jsl-call0 context "Infinity")
+                    (= symbol FE-INTRINSIC-ERROR) (fng-error-constructor-value context node)
                     (< symbol 0) NO-NODE
                     :else
                       (let [stored (fng-symbol-node context symbol)
