@@ -1,5 +1,27 @@
 # Handoff: move JavaScript semantics into the DSL
 
+## DATA DESCRIPTORS AND QUOTED PROPERTY KEYS RUN THROUGH THE DSL (2026-08-22, latest)
+
+The native property representation now records writable, enumerable, and configurable bits for
+ordinary and indexed array properties. `Object.defineProperty`, `defineProperties`,
+`getOwnPropertyDescriptor`, `getOwnPropertyNames`, `create`, `hasOwnProperty`, and
+`propertyIsEnumerable` are composed in `lib/**/*.jsl`; the runtime exposes only property storage
+and attribute operations. Writes honor non-writable properties, deletes honor configurable, array
+length/string-index attributes are represented, and Object enumeration filters enumerable keys.
+Accessor descriptors and the complete built-in prototype/property inventory remain open.
+
+Quoted object-literal keys are now published to the DSL property heap without their source quote
+characters. This repaired computed access and descriptors for numeric-looking names such as `"0"`.
+The first 20 `Object.getOwnPropertyDescriptor` Test262 files improved from **12/40** passing to
+**26/40**; the complete directory currently reports **118 passed, 502 failed, 0 refused**. The
+remaining directory failures are predominantly accessor descriptors, absent built-in own-property
+inventory, primitive coercion/throw cases, and existing verifier/graph failures. This is not yet a
+4,000-pass improvement, and no such claim should be made without a completed broad run.
+
+The mandatory loop remains below one minute: `coil test` is **46 passed, 0 failed in 46.57 s**.
+Frontier reaches all seven current intentional JavaScript bugs as **0 passed, 7 failed in 41.78 s**,
+with no xcrun, Mach-O, encoder, link, or Linux infrastructure failure.
+
 ## TEST262 ITERATION IS SUB-MINUTE AND COERCION/ERROR FOUNDATIONS ARE NATIVE (2026-08-22, latest)
 
 The mandatory edit loop remains below one minute: `coil test` is **46 passed, 0 failed in 45.56 s**

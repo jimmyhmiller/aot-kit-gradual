@@ -800,7 +800,7 @@
                 (Store [alias] (ms-push-memory-dep-tree! first (n-in node 1) (- fuel 1)))
                 (PropStore [name] (ms-push-memory-dep-tree! first (n-in node 1) (- fuel 1)))
                 (PropDelete [name] (ms-push-memory-dep-tree! first (n-in node 1) (- fuel 1)))
-                (PropStoreKey [] (ms-push-memory-dep-tree! first (n-in node 1) (- fuel 1)))
+                (PropStoreKey [_] (ms-push-memory-dep-tree! first (n-in node 1) (- fuel 1)))
                 (PropDeleteKey [] (ms-push-memory-dep-tree! first (n-in node 1) (- fuel 1)))
                 (SetProto [] (ms-push-memory-dep-tree! first (n-in node 1) (- fuel 1)))
                 (ObjectFreeze [] (ms-push-memory-dep-tree! first (n-in node 1) (- fuel 1)))
@@ -972,11 +972,11 @@
                 (PropLoad [name] (set! current (n-in (load current) 1)))
                 (PropHas [name] (set! current (n-in (load current) 1)))
                 (ProtoHas [] (set! current (n-in (load current) 1)))
-                (PropLoadKey [] (set! current (n-in (load current) 1)))
+                (PropLoadKey [_] (set! current (n-in (load current) 1)))
                 (PropHasKey [] (set! current (n-in (load current) 1)))
                 (OwnKeyCount [] (set! current (n-in (load current) 1)))
                 (OwnKeyAt [] (set! current (n-in (load current) 1)))
-                (PropStoreKey [] (set! current (n-in (load current) 1)))
+                (PropStoreKey [_] (set! current (n-in (load current) 1)))
                 (PropDeleteKey [] (set! current (n-in (load current) 1)))
                 (ObjectFreeze [] (set! current (n-in (load current) 1)))
                 (InternalLoad [slot] (set! current (n-in (load current) 1)))
@@ -1028,7 +1028,7 @@
         (Store [alias] (ms-memory-chain-phi? (n-in node 1)))
         (PropStore [name] (ms-memory-chain-phi? (n-in node 1)))
         (PropDelete [name] (ms-memory-chain-phi? (n-in node 1)))
-        (PropStoreKey [] (ms-memory-chain-phi? (n-in node 1)))
+        (PropStoreKey [_] (ms-memory-chain-phi? (n-in node 1)))
         (PropDeleteKey [] (ms-memory-chain-phi? (n-in node 1)))
         (SetProto [] (ms-memory-chain-phi? (n-in node 1)))
         (ObjectFreeze [] (ms-memory-chain-phi? (n-in node 1)))
@@ -1073,7 +1073,7 @@
     (PropDelete [name] (let [object-block (ms-node-block owner (n-in node 2))]
           (if (and (>= object-block 0) (!= object-block (ms-entry-block owner)))
               object-block fallback)))
-    (PropStoreKey [] (let [value-block (ms-node-block owner (n-in node 4))
+    (PropStoreKey [_] (let [value-block (ms-node-block owner (n-in node 4))
               key-block (ms-node-block owner (n-in node 3))]
           (if (and (>= value-block 0) (!= value-block (ms-entry-block owner)))
               value-block
@@ -1168,7 +1168,7 @@
     (Store [alias] true)
     (PropStore [name] true)
     (PropDelete [name] true)
-    (PropStoreKey [] true)
+    (PropStoreKey [_] true)
     (PropDeleteKey [] true)
     (SetProto [] true)
     (ObjectFreeze [] true)
@@ -1271,7 +1271,7 @@
                                            (mi-new MI-JSPROP fresh object object 4 node))]
                           (ms-add-single-arg! at key)
                           (ms-add-memory-deps! at node 1 1))))))
-            (PropStoreKey [] (if (not (ms-select-memory-at! owner (n-in node 1) bid))
+            (PropStoreKey [operation] (if (not (ms-select-memory-at! owner (n-in node 1) bid))
                   (set! ok false)
                   (let [object (ms-select-value-at! owner (n-in node 2) bid)
                         key (ms-select-value-at! owner (n-in node 3) bid)
@@ -1280,7 +1280,7 @@
                         (set! ok false)
                         (let [fresh (ms-new-vreg!)
                               at (ms-emit! owner bid
-                                           (mi-new MI-JSPROP fresh object value 1 node))]
+                                           (mi-new MI-JSPROP fresh object value operation node))]
                           (ms-add-single-arg! at key)
                           (ms-add-memory-deps! at node 1 1))))))
             (PropDeleteKey [] (if (not (ms-select-memory-at! owner (n-in node 1) bid))
@@ -1691,10 +1691,9 @@
                                         fresh
                                         -1
                                         -1
-                                        (if (or (= (ty-kinds (n-ty node)) VK-NULL)
-                                                (= (ty-kinds (n-ty node)) VK-UNDEF))
-                                            0
-                                            (ty-int-lo (n-ty node)))
+                                        (cond (= (ty-kinds (n-ty node)) VK-NULL) JSV-NULL
+                                              (= (ty-kinds (n-ty node)) VK-UNDEF) JSV-UNDEFINED
+                                              :else (ty-int-lo (n-ty node)))
                                         node))
                       (set! vr fresh))
                     (if (and (be-float-only? (n-ty node)) (ty-const? (n-ty node)))
@@ -2150,7 +2149,11 @@
                   (if (< a 0)
                       0
                       (let [operand
-                              (if (or (ty-int-only? (n-ty an)) (= (ty-kinds (n-ty an)) VK-BOOL))
+                              ;; Ideal type does not decide representation: `%Box false` is still
+                              ;; typed Boolean but carries the tagged JavaScript word. Only a raw
+                              ;; numeric representation may be compared directly with zero;
+                              ;; tagged booleans and references need the runtime truthiness seam.
+                              (if (= (n-rep-of an 32) REP-RAW-NUM)
                                   a
                                   (ms-jsstring! owner bid NO-NODE a zero zero JSSOP-VALUE-TRUTHY))
                             fresh (ms-new-vreg!)]
@@ -2215,7 +2218,7 @@
                               (ms-add-single-arg! at key)
                               (ms-add-memory-deps! at node 1 1)
                               (set! vr fresh)))))))
-            (PropLoadKey [] (let [pinned-bid (ms-pinned-read-block owner node bid)]
+            (PropLoadKey [operation] (let [pinned-bid (ms-pinned-read-block owner node bid)]
                   (if (or (not (ms-select-control-effects! owner (n-in node 0) pinned-bid))
                           (not (ms-select-memory-at! owner (n-in node 1) pinned-bid)))
                       (ms-fail! MSEL-UNSUPPORTED node)
@@ -2225,7 +2228,7 @@
                             (ms-fail! MSEL-UNSUPPORTED node)
                             (let [fresh (ms-new-vreg!)
                                   at (ms-emit! owner pinned-bid
-                                               (mi-new MI-JSPROP fresh object object 0 node))]
+                                               (mi-new MI-JSPROP fresh object object operation node))]
                               (ms-add-single-arg! at key)
                               (ms-add-memory-deps! at node 1 1)
                               (set! vr fresh)))))))
@@ -3153,7 +3156,7 @@
   (or (ms-linear-memory-effect? node)
       (match (n-op node)
         (Load [_] true) (PropLoad [_] true) (PropHas [_] true) (ProtoHas [] true)
-        (PropLoadKey [] true) (PropHasKey [] true) (InternalLoad [_] true)
+        (PropLoadKey [_] true) (PropHasKey [] true) (InternalLoad [_] true)
         (ArrayLoad [_] true) (ArrayLen [] true) (JsThrow [] true)
         ;; Exception transport descriptors are process state reads/writes and must remain after
         ;; the call or throw whose status they inspect. Ordinary numeric JsBuiltins remain pure.
@@ -3943,7 +3946,7 @@
     (Store [alias] (>= (ms-node-inst-before owner node at) 0))
     (PropStore [name] (>= (ms-node-inst-before owner node at) 0))
     (PropDelete [name] (>= (ms-node-inst-before owner node at) 0))
-    (PropStoreKey [] (>= (ms-node-inst-before owner node at) 0))
+    (PropStoreKey [_] (>= (ms-node-inst-before owner node at) 0))
     (PropDeleteKey [] (>= (ms-node-inst-before owner node at) 0))
     (SetProto [] (>= (ms-node-inst-before owner node at) 0))
     (ObjectFreeze [] (>= (ms-node-inst-before owner node at) 0))

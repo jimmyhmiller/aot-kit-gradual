@@ -41,6 +41,16 @@
 (deftest a_compiled_program_computes_arithmetic_on_the_cpu
   (assert (agrees-with-node? "function main(n: number): number { return (n * 3 + 7) | 0; }" 5)))
 
+(deftest tagged_constants_and_boolean_results_keep_their_javascript_representation
+  (assert (agrees-with-node? "function main(n: number): number {
+  var value = undefined + null;
+  return Number.isNaN(value) ? 1 : 0;
+}" 0))
+  (assert (agrees-with-node? "function main(n: number): number {
+  var value = n ? {} : new Number(0);
+  return !!value ? 1 : 0;
+}" 0)))
+
 (deftest a_thrown_value_crosses_a_call_and_is_caught
   (assert (agrees-with-node? "function fail(v) { throw v; }
 function main(n) {
@@ -416,8 +426,8 @@ function main(n: number): number {
 ;; printed "undefined" where node prints "b", nine characters instead of one, with nothing to say it
 ;; had gone wrong. Three things had to change together and each was wrong on its own:
 ;;
-;;   - `StringElement` in lib/, which is NEITHER `charAt` NOR `at`: `"abc".charAt(9)` is the empty
-;;     string, `"abc".at(-1)` is "c", and `"abc"[9]` and `"abc"[-1]` are both `undefined`.
+;;   - generic `GetProperty` in lib/ now owns string exotic indexed access as well as ordinary
+;;     object access: `"abc".charAt(9)` is empty, while `"abc"[9]` is `undefined`.
 ;;   - the verifier accepted only an object, function or undefined RECEIVER, so `s[i].charCodeAt(0)`
 ;;     -- a receiver typed `str|undefined` -- was refused outright, while the same call on a `dyn`
 ;;     receiver had always been fine. `dyn` includes VK-STR; narrowing must not lose the capability.
@@ -811,5 +821,23 @@ function main(n: number): number {
   { let s = JSON.stringify({x: acc}); acc = (acc + s.length) | 0; }
   { let s = 0; [1, 2, 3].forEach((x) => { s = (s + x) | 0; }); acc = (acc + s) | 0; }
   return acc | 0;
+}
+" 7)))
+
+;; A Call's lattice type is not its native return representation. A helper returning a raw Boolean
+;; can still have `dyn` graph type; tagged VALUE-TRUTHY then interpreted raw 0/1 as a boxed value.
+(deftest a_raw_direct_call_result_drives_the_following_if
+  (assert (agrees-with-node? "function helper(a: any, b: any): boolean {
+  if (a === b) return a !== 0 || 1 / a === 1 / b;
+  return a !== a && b !== b;
+}
+function same(actual: any, expected: any): void {
+  if (helper(actual, expected)) return;
+  throw 2;
+}
+function main(n: number): number {
+  let object: any = {value: 1};
+  same(object.value, 1);
+  return n | 0;
 }
 " 7)))

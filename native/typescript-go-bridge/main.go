@@ -244,6 +244,7 @@ func stableKindCode(kind ast.Kind) int32 {
 	case ast.KindDeleteExpression: return 229
 	case ast.KindVoidExpression: return 230
 	case ast.KindBlock: return 242
+	case ast.KindEmptyStatement: return 243
 	case ast.KindVariableStatement: return 244
 	case ast.KindExpressionStatement: return 245
 	case ast.KindIfStatement: return 246

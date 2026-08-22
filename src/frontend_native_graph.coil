@@ -2628,6 +2628,14 @@
   (fng-jsl-call1 context "ErrorConstructorValue"
                  (fng-const (fng-error-kind (ts-text (field (load (field context frontend)) ast) node)))))
 
+(defn fng-builtin-constructor-value [(context FngContext) (symbol i64)] (-> i64)
+  (fng-jsl-call1 context "BuiltinConstructorValue"
+                 (fng-const (cond (= symbol FE-INTRINSIC-OBJECT) 16
+                                  (= symbol FE-INTRINSIC-ARRAY) 17
+                                  (= symbol FE-INTRINSIC-STRING) 18
+                                  (= symbol FE-INTRINSIC-NUMBER) 19
+                                  :else 20))))
+
 (defn fng-error-constructor [(context FngContext) (node i64)] (-> i64)
   (let [frontend (load (field context frontend))
         ast (field frontend ast)
@@ -2769,6 +2777,60 @@
                      (n-box! (fng-expression context (ts-child ast node 1)))
                      (n-box! (fng-undefined)))]
     (fng-jsl-call1 context "ToBoolean" argument)))
+
+(defn fng-object-convert? [(context FngContext) (node i64)] (-> bool)
+  (let [frontend (load (field context frontend))
+        ast (field frontend ast)]
+    (and (> (ts-child-count ast node) 0)
+         (= (fe-resolution-symbol frontend (ts-child ast node 0)) FE-INTRINSIC-OBJECT))))
+
+(defn fng-object-convert [(context FngContext) (node i64)] (-> i64)
+  (let [frontend (load (field context frontend))
+        ast (field frontend ast)
+        argument (if (> (ts-child-count ast node) 1)
+                     (n-box! (fng-expression context (ts-child ast node 1)))
+                     (n-box! (fng-undefined)))]
+    (fng-jsl-call1 context "ObjectFromValue" argument)))
+
+(defn fng-string-convert? [(context FngContext) (node i64)] (-> bool)
+  (let [frontend (load (field context frontend))
+        ast (field frontend ast)]
+    (and (> (ts-child-count ast node) 0)
+         (= (fe-resolution-symbol frontend (ts-child ast node 0)) FE-INTRINSIC-STRING))))
+
+(defn fng-string-convert [(context FngContext) (node i64) (wrapper bool)] (-> i64)
+  (let [frontend (load (field context frontend))
+        ast (field frontend ast)
+        argument (if (> (ts-child-count ast node) 1)
+                     (n-box! (fng-expression context (ts-child ast node 1)))
+                     (n-string-const! (jss-from-utf8! "")))]
+    (fng-jsl-call1 context (if wrapper "NewStringObject" "ToStringValue") argument)))
+
+(defn fng-array-convert? [(context FngContext) (node i64)] (-> bool)
+  (let [frontend (load (field context frontend))
+        ast (field frontend ast)]
+    (and (> (ts-child-count ast node) 0)
+         (= (fe-resolution-symbol frontend (ts-child ast node 0)) FE-INTRINSIC-ARRAY))))
+
+(defn fng-array-convert [(context FngContext) (node i64)] (-> i64)
+  (let [frontend (load (field context frontend))
+        ast (field frontend ast)
+        argc (- (ts-child-count ast node) 1)]
+    (if (= argc 0)
+        (fng-jsl-call0 context "NewArray")
+        (if (= argc 1)
+            (fng-jsl-call1 context "ArrayFromOne"
+                           (n-box! (fng-expression context (ts-child ast node 1))))
+            (let [(mut array) (fng-jsl-call0 context "NewArray")
+                  (mut index) 0]
+              (loop (if (>= (load index) argc)
+                        (break)
+                        (do (fng-jsl-call3 context "SetElement" (load array)
+                                          (fng-const (load index))
+                                          (fng-expression context
+                                            (ts-child ast node (+ (load index) 1))))
+                            (set! index (+ (load index) 1)))))
+              (load array))))))
 
 (defn fng-primitive-wrapper? [(context FngContext) (node i64) (symbol i64)] (-> bool)
   (let [frontend (load (field context frontend))
@@ -2978,6 +3040,124 @@
                                                           (ts-child ast node (load index)))))
                   (set! index (+ (load index) 1)))))
     target))
+
+(defn fng-object-static-direct-name [(context FngContext) (callee i64)] (-> (slice u8))
+  (let [frontend (load (field context frontend)) ast (field frontend ast)]
+    (if (and (= (ts-kind ast callee) TSK-PROPERTY-ACCESS)
+             (= (fe-resolution-symbol frontend (ts-child ast callee 0)) FE-INTRINSIC-OBJECT))
+        (ts-text ast (ts-child ast callee 1))
+        "")))
+
+(defn fng-object-static-name [(context FngContext) (node i64)] (-> (slice u8))
+  (let [frontend (load (field context frontend)) ast (field frontend ast)
+        callee (ts-child ast node 0)
+        direct (fng-object-static-direct-name context callee)]
+    (if (> (str-len direct) 0)
+        direct
+        (if (= (ts-kind ast callee) TSK-IDENTIFIER)
+            (let [symbol (fe-resolution-symbol frontend callee)
+                  declaration (if (>= symbol 0)
+                                  (fng-symbol-declaration-node context symbol) -1)]
+              (if (and (>= declaration 0)
+                       (= (ts-kind ast declaration) TSK-VARIABLE-DECLARATION))
+                  (let [count (ts-child-count ast declaration)
+                        initializer (if (> count 1)
+                                        (ts-child ast declaration (- count 1)) -1)]
+                    (if (>= initializer 0)
+                        (fng-object-static-direct-name context initializer) ""))
+                  ""))
+            ""))))
+
+(defn fng-object-descriptor-call? [(context FngContext) (node i64)] (-> bool)
+  (let [name (fng-object-static-name context node)]
+    (or (= name "defineProperty")
+        (or (= name "defineProperties")
+            (or (= name "getOwnPropertyDescriptor")
+                (or (= name "getOwnPropertyNames") (= name "create")))))))
+
+(defn fng-object-descriptor-call [(context FngContext) (node i64)] (-> i64)
+  (let [frontend (load (field context frontend)) ast (field frontend ast)
+        name (fng-object-static-name context node)
+        argc (- (ts-child-count ast node) 1)]
+    (cond (= name "defineProperty")
+            (fng-jsl-call3 context "DefineProperty"
+              (n-box! (if (> argc 0) (fng-expression-expected context (ts-child ast node 1)
+                                                              FNG-DYNAMIC)
+                                      (fng-undefined)))
+              (n-box! (if (> argc 1) (fng-expression context (ts-child ast node 2))
+                                      (fng-undefined)))
+              (n-box! (if (> argc 2) (fng-expression-expected context (ts-child ast node 3)
+                                                              FNG-DYNAMIC)
+                                      (fng-undefined))))
+          (= name "defineProperties")
+            (fng-jsl-call2 context "DefineProperties"
+              (n-box! (if (> argc 0) (fng-expression-expected context (ts-child ast node 1)
+                                                              FNG-DYNAMIC)
+                                      (fng-undefined)))
+              (n-box! (if (> argc 1) (fng-expression-expected context (ts-child ast node 2)
+                                                              FNG-DYNAMIC)
+                                      (fng-undefined))))
+          (= name "getOwnPropertyDescriptor")
+            (fng-jsl-call2 context "GetOwnPropertyDescriptor"
+              (n-box! (if (> argc 0) (fng-expression-expected context (ts-child ast node 1)
+                                                              FNG-DYNAMIC)
+                                      (fng-undefined)))
+              (n-box! (if (> argc 1) (fng-expression context (ts-child ast node 2))
+                                      (fng-undefined))))
+          (= name "getOwnPropertyNames")
+            (fng-jsl-call1 context "ObjectOwnPropertyNames"
+              (n-box! (if (> argc 0) (fng-expression context (ts-child ast node 1))
+                                      (fng-undefined))))
+          :else
+            (let [object (fng-jsl-call1 context "ObjectCreate"
+                           (n-box! (if (> argc 0)
+                                      (fng-expression context (ts-child ast node 1))
+                                      (fng-undefined))))]
+              (if (> argc 1)
+                  (fng-jsl-call2 context "DefineProperties" object
+                    (n-box! (fng-expression-expected context (ts-child ast node 2) FNG-DYNAMIC)))
+                  object)))))
+
+(defn fng-object-prototype-call-name [(context FngContext) (node i64)] (-> (slice u8))
+  (let [frontend (load (field context frontend)) ast (field frontend ast)
+        callee (ts-child ast node 0)]
+    (if (= (ts-kind ast callee) TSK-PROPERTY-ACCESS)
+        (let [name (ts-text ast (ts-child ast callee 1))]
+          (if (or (= name "hasOwnProperty") (= name "propertyIsEnumerable")) name ""))
+        "")))
+
+(defn fng-object-prototype-call? [(context FngContext) (node i64)] (-> bool)
+  (> (str-len (fng-object-prototype-call-name context node)) 0))
+
+(defn fng-object-prototype-call [(context FngContext) (node i64)] (-> i64)
+  (let [frontend (load (field context frontend)) ast (field frontend ast)
+        callee (ts-child ast node 0)
+        receiver (n-box! (fng-expression context (ts-child ast callee 0)))
+        key (n-box! (if (> (ts-child-count ast node) 1)
+                       (fng-expression context (ts-child ast node 1))
+                       (fng-undefined)))]
+    (fng-jsl-call2 context
+      (if (= (fng-object-prototype-call-name context node) "hasOwnProperty")
+          "HasOwnProperty" "PropertyIsEnumerable")
+      receiver key)))
+
+(defn fng-object-method-value? [(context FngContext) (node i64)] (-> bool)
+  (> (str-len (fng-object-static-direct-name context node)) 0))
+
+(defn fng-object-method-value [(context FngContext) (node i64)] (-> i64)
+  (let [name (fng-object-static-direct-name context node)
+        kind (cond (= name "defineProperty") 32
+                   (= name "defineProperties") 33
+                   (= name "getOwnPropertyDescriptor") 34
+                   (= name "getOwnPropertyNames") 35
+                   (= name "create") 36
+                   :else 37)
+        length (cond (= name "defineProperty") 3
+                     (= name "defineProperties") 2
+                     (= name "getOwnPropertyDescriptor") 2
+                     (= name "create") 2
+                     :else 1)]
+    (fng-jsl-call2 context "BuiltinMethodValue" (fng-const kind) (fng-const length))))
 
 (defn fng-object-freeze? [(context FngContext) (node i64)] (-> bool)
   (let [frontend (load (field context frontend)) ast (field frontend ast)
@@ -4981,7 +5161,8 @@
                       name-node (ts-child ast property 0)]
                   (fng-jsl-call3 context "SetNamedProperty"
                                  object
-                                 (fng-const (shape-name-intern! (ts-text ast name-node)))
+                                 (fng-const
+                                   (shape-name-intern! (fng-nonindex-key-text ast name-node)))
                                  (al-get [i64] (load field-values) (load index)))
                   (set! index (+ (load index) 1)))))
       (al-free! [i64] (mut field-values))
@@ -5024,7 +5205,8 @@
                                   (fng-jsl-call3 context "SetProperty" object key value)
                                   (fng-jsl-call3 context "SetNamedProperty" object
                                                  (fng-const
-                                                   (shape-name-intern! (ts-text ast name-node)))
+                                                   (shape-name-intern!
+                                                     (fng-nonindex-key-text ast name-node)))
                                                  value))]
                         0)))
                 (set! index (+ (load index) 1)))))
@@ -5238,8 +5420,8 @@
         (substr text 1 (- (slice-len text) 1))
         text)))
 
-;; A string receiver with a numeric key. Both halves have to be known: `o[i]` on a dynamic receiver
-;; stays on the property path, because a string is only one of the things it might be.
+;; A string receiver with a numeric-looking key. Both halves have to be known: `o[i]` on a dynamic
+;; receiver stays on the property path, because a string is only one of the things it might be.
 (defn fng-string-element? [(context FngContext) (node i64)] (-> bool)
   (let [frontend (load (field context frontend))
         ast (field frontend ast)]
@@ -5252,7 +5434,10 @@
         key-node (ts-child ast node 1)
         string (fng-expression context (ts-child ast node 0))
         key (fng-expression context key-node)]
-    (fng-jsl-call2 context "StringElement" string (fng-int-value context key-node key))))
+    ;; Do not truncate a Number key in the frontend. ToPropertyKey and the string exotic object's
+    ;; canonical-index recognition are JavaScript semantics: GetProperty owns both in lib/, and
+    ;; the runtime PropertyKey primitive then performs only representation-level lookup.
+    (fng-jsl-call2 context "GetProperty" string key)))
 
 (defn fng-lvalue [(context FngContext) (node i64)] (-> FngLValue)
   (let [frontend (load (field context frontend))
@@ -5627,6 +5812,12 @@
                     (= symbol FE-INTRINSIC-NAN) (n-new1 (Const (t-flt-bits JSV-NAN)) (g-start))
                     (= symbol FE-INTRINSIC-INFINITY) (fng-jsl-call0 context "Infinity")
                     (= symbol FE-INTRINSIC-ERROR) (fng-error-constructor-value context node)
+                    (or (= symbol FE-INTRINSIC-OBJECT)
+                        (or (= symbol FE-INTRINSIC-ARRAY)
+                            (or (= symbol FE-INTRINSIC-STRING)
+                                (or (= symbol FE-INTRINSIC-NUMBER)
+                                    (= symbol FE-INTRINSIC-BOOLEAN)))))
+                      (fng-builtin-constructor-value context symbol)
                     (= symbol FE-INTRINSIC-UNBOUND) (fng-unbound-reference context node)
                     (< symbol 0) NO-NODE
                     :else
@@ -5960,6 +6151,12 @@
                 (fng-number-convert context node)
             (if (fng-boolean-convert? context node)
                 (fng-boolean-convert context node)
+            (if (fng-object-convert? context node)
+                (fng-object-convert context node)
+            (if (fng-string-convert? context node)
+                (fng-string-convert context node false)
+            (if (fng-array-convert? context node)
+                (fng-array-convert context node)
             (if (fng-number-to-string? context node)
                 (fng-number-to-string context node)
             (if (fng-number-to-fixed? context node)
@@ -5976,6 +6173,10 @@
                     (fng-object-enumeration context node)
                 (if (fng-object-assign? context node)
                     (fng-object-assign context node)
+            (if (fng-object-descriptor-call? context node)
+                (fng-object-descriptor-call context node)
+            (if (fng-object-prototype-call? context node)
+                (fng-object-prototype-call context node)
                 (if (fng-object-freeze? context node)
                     (fng-object-freeze context node)
                 (if (fng-string-raw? context node)
@@ -5986,15 +6187,21 @@
                         (fng-string-call context node)
                         (if (fng-array-builtin? context node)
                             (fng-array-call context node)
-                            (fng-call context node)))))))))))))))))))))
+                            (fng-call context node))))))))))))))))))))))))))
           (= kind TSK-NEW-EXPRESSION)
+            (if (fng-object-convert? context node)
+                (fng-object-convert context node)
+            (if (fng-string-convert? context node)
+                (fng-string-convert context node true)
+            (if (fng-array-convert? context node)
+                (fng-array-convert context node)
             (if (fng-primitive-wrapper? context node FE-INTRINSIC-NUMBER)
                 (fng-primitive-wrapper context node true)
             (if (fng-primitive-wrapper? context node FE-INTRINSIC-BOOLEAN)
                 (fng-primitive-wrapper context node false)
             (if (fng-error-constructor? context node)
                 (fng-error-constructor context node)
-                (fng-call context node))))
+                (fng-call context node)))))))
           (= kind TSK-OBJECT-LITERAL)
             (let [inferred (fe-type-index-for-decl-node frontend node)
                   dynamic (and (= expected FNG-DYNAMIC) (< inferred 0))
@@ -6010,19 +6217,19 @@
             (let [math-member (fng-math-member-id context node)]
               (if (fng-number-constant? context node)
                   (fng-jsl-call0 context (fng-number-constant-name context node))
+              (if (fng-object-method-value? context node)
+                  (fng-object-method-value context node)
               (if (>= math-member 0)
                   NO-NODE
                   (if (= (ts-text ast node) "Math.LN2")
                       (n-new1 (Const (t-flt-con 0.6931471805599453)) (g-start))
-                      (fng-field-load context node))))))
+                      (fng-field-load context node)))))))
           (= kind TSK-ELEMENT-ACCESS)
             (if (!= (ts-role ast node TS-ROLE-OPERATOR 0) -1)
                 (fng-optional-element-load context node)
-                ;; `s[i]` ON A STRING IS NOT AN ARRAY LOAD. It took the ordinary element path, so
-                ;; `GetElement` ran `%ArrayLoad` over a string pointer and every index answered
-                ;; `undefined` -- `String("abc"[1])` printed "undefined" where node prints "b", nine
-                ;; characters instead of one, with nothing to say it had gone wrong. A string's
-                ;; indexed property is its own algorithm and it lives in `lib/`.
+                ;; `s[i]` ON A STRING IS NOT AN ARRAY LOAD. It enters the DSL's generic property
+                ;; path, which applies ToPropertyKey before the runtime recognizes canonical string
+                ;; indices. This distinction matters for Number keys such as NaN and -0.
                 (if (fng-string-element? context node)
                     (fng-string-element context node)
                     (fng-lvalue-read context (fng-lvalue context node))))
@@ -7611,6 +7818,7 @@
                           (store! continues (fng-statement context (ts-child ast node (load index))))
                           (store! index (+ (load index) 1)))))
               (load continues))
+          (= kind TSK-EMPTY-STATEMENT) true
           (= kind TSK-VARIABLE-STATEMENT)
             (let [list (ts-child ast node 0)
                   (mut declaration-index) 0]

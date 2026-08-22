@@ -63,3 +63,82 @@
             (%Throw "TypeError: Cannot delete property 'length' of Array")
             (let [(ignored (%PropDeleteKey object propertyKey))] true))
         (let [(ignored (%PropDeleteKey object propertyKey))] true))))
+
+(macro WritableAttribute :params [(descriptor dyn) (fallback int)] :ret int
+  (if (%PropHasNamed descriptor "writable")
+      (if (ToBoolean (%PropLoadNamed descriptor "writable")) 1 0) fallback))
+(macro EnumerableAttribute :params [(descriptor dyn) (fallback int)] :ret int
+  (if (%PropHasNamed descriptor "enumerable")
+      (if (ToBoolean (%PropLoadNamed descriptor "enumerable")) 2 0) fallback))
+(macro ConfigurableAttribute :params [(descriptor dyn) (fallback int)] :ret int
+  (if (%PropHasNamed descriptor "configurable")
+      (if (ToBoolean (%PropLoadNamed descriptor "configurable")) 4 0) fallback))
+
+(macro RequireObjectValue :params [(value dyn) (message str)] :ret dyn
+  (if (%IsObject value) value
+      (if (%IsArray value) value (%Throw message))))
+
+(macro DefineProperty
+  :params [(object dyn) (key dyn) (descriptor dyn)] :ret dyn
+  (let [(target (RequireObjectValue object "TypeError: Object.defineProperty called on non-object"))
+        (desc (RequireObjectValue descriptor "TypeError: Property description must be an object"))
+        (propertyKey (ToPropertyKey key))
+        (oldAttributes (%OwnPropertyAttributes target propertyKey))
+        (exists (%Le 0 oldAttributes))
+        (oldValue (if exists (%PropLoadKey target propertyKey) (%Box undefined)))
+        (newValue (if (HasProperty desc "value") (GetProperty desc "value") oldValue))
+        (writable (WritableAttribute desc (if exists (%BitAnd oldAttributes 1) 0)))
+        (enumerable (EnumerableAttribute desc (if exists (%BitAnd oldAttributes 2) 0)))
+        (configurable (ConfigurableAttribute desc (if exists (%BitAnd oldAttributes 4) 0)))
+        (attributes (%BitOr writable (%BitOr enumerable configurable)))
+        (stored (%PropStoreKey target propertyKey newValue))
+        (marked (%SetPropertyAttributes target propertyKey attributes))]
+    target))
+
+(macro GetOwnPropertyDescriptor
+  :params [(object dyn) (key dyn)] :ret dyn
+  (let [(target (RequireObjectValue object "TypeError: Object.getOwnPropertyDescriptor called on non-object"))
+        (propertyKey (ToPropertyKey key))
+        (attributes (%OwnPropertyAttributes target propertyKey))]
+    (if (%Lt attributes 0)
+        (%Box undefined)
+        (let [(descriptor (%Box (%NewObject)))
+              (value (SetProperty descriptor "value" (%PropLoadKey target propertyKey)))
+              (writable (SetProperty descriptor "writable"
+                                      (%Not (%Eq (%BitAnd attributes 1) 0))))
+              (enumerable (SetProperty descriptor "enumerable"
+                                        (%Not (%Eq (%BitAnd attributes 2) 0))))
+              (configurable (SetProperty descriptor "configurable"
+                                          (%Not (%Eq (%BitAnd attributes 4) 0))))]
+          descriptor))))
+
+(macro HasOwnProperty :params [(object dyn) (key dyn)] :ret bool
+  (%Le 0 (%OwnPropertyAttributes object (ToPropertyKey key))))
+
+(macro PropertyIsEnumerable :params [(object dyn) (key dyn)] :ret bool
+  (let [(attributes (%OwnPropertyAttributes object (ToPropertyKey key)))]
+    (if (%Lt attributes 0) false (%Not (%Eq (%BitAnd attributes 2) 0)))))
+
+(macro DefineProperties
+  :params [(object dyn) (descriptors dyn)] :ret dyn
+  (let [(count (%OwnKeyCount descriptors))]
+    (loop [(index 0)]
+      (if (%Le count index)
+          object
+          (let [(key (%OwnKeyAt descriptors index))
+                (attributes (%OwnPropertyAttributes descriptors key))
+                (ignored (if (%Eq (%BitAnd attributes 2) 0)
+                             object
+                             (DefineProperty object key (%PropLoadKey descriptors key))))]
+            (recur (%Add index 1)))))))
+
+(macro ObjectCreate :params [(prototype dyn)] :ret dyn
+  (if (%IsNull prototype)
+      (let [(object (%Box (%NewObject)))
+            (linked (SetObjectPrototype object prototype))]
+        object)
+      (if (%IsObject prototype)
+          (let [(object (%Box (%NewObject)))
+                (linked (SetObjectPrototype object prototype))]
+            object)
+          (%Throw "TypeError: Object prototype may only be an Object or null"))))
