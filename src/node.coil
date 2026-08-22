@@ -1640,7 +1640,7 @@
     (PropDelete [name] (t-mem-alias JS-PROPERTY-ALIAS (t-dyn)))
     (ProtoHas [] (t-bool))
     (PropLoadKey [operation]
-      (if (= operation 14) (t-int-range -1 7) (t-dyn)))
+      (if (or (= operation 14) (= operation 21)) (t-int-range -1 15) (t-dyn)))
     (PropStoreKey [_] (t-mem-alias JS-PROPERTY-ALIAS (t-dyn)))
     (PropHasKey [] (t-bool))
     (PropDeleteKey [] (t-mem-alias JS-PROPERTY-ALIAS (t-dyn)))
@@ -2254,11 +2254,18 @@
 (defn n-own-property-attributes-at! [(ctrl i64) (mem i64) (ptr i64) (key i64)] (-> i64)
   (n-peephole (n-new4 (PropLoadKey 14) ctrl mem ptr key)))
 
+(defn n-property-component-at! [(ctrl i64) (mem i64) (ptr i64) (key i64) (operation i64)] (-> i64)
+  (n-peephole (n-new4 (PropLoadKey operation) ctrl mem ptr key)))
+
 (defn n-prop-store-key-at! [(ctrl i64) (mem i64) (ptr i64) (key i64) (value i64)] (-> i64)
   (n-peephole (n-new5 (PropStoreKey 1) ctrl mem ptr key value)))
 
 (defn n-set-property-attributes-at! [(ctrl i64) (mem i64) (ptr i64) (key i64) (attributes i64)] (-> i64)
   (n-peephole (n-new5 (PropStoreKey 15) ctrl mem ptr key attributes)))
+
+(defn n-define-property-component-at! [(ctrl i64) (mem i64) (ptr i64) (key i64)
+                                        (value i64) (operation i64)] (-> i64)
+  (n-peephole (n-new5 (PropStoreKey operation) ctrl mem ptr key value)))
 
 (defn n-prop-has-key-at! [(ctrl i64) (mem i64) (ptr i64) (key i64)] (-> i64)
   (n-peephole (n-new4 (PropHasKey) ctrl mem ptr key)))
@@ -2800,9 +2807,16 @@
         ;; number, object against number -- and refuses the one it cannot. That is the line between
         ;; a type and a representation, and it is the same line `v-rep-of` draws.
         (let [k (ty-kinds t)]
-          (t-kinds (if (!= (& k (| VK-INT VK-FLT)) 0)
-                       (| k (| VK-INT VK-FLT))
-                       k))))))
+          ;; Boxing changes representation, not callable identity. Retaining a closure's finite
+          ;; target set lets a callee parameter infer the one function its callers pass and turns
+          ;; `assert.throws(..., function () {...})` back into one exact native call instead of a
+          ;; per-site all-functions dispatch ladder. Function ids outside the compact summary
+          ;; already arrive as generic `t-fun` and remain generic here.
+          (if (= k VK-FUN)
+              (t-fun-set (ty-fun-targets t))
+              (t-kinds (if (!= (& k (| VK-INT VK-FLT)) 0)
+                           (| k (| VK-INT VK-FLT))
+                           k)))))))
 
 (defn unbox-compute [(n i64)] (-> i64)
   (if (ty-high? (n-in-ty n 1)) (t-top) (n-unbox-target-type n)))
@@ -2838,7 +2852,8 @@
         (Box [mode] REP-TAGGED)
         (ToNumber [] REP-TAGGED)
         (PropLoad [name] REP-TAGGED)
-        (PropLoadKey [operation] (if (= operation 14) REP-RAW-NUM REP-TAGGED))
+        (PropLoadKey [operation]
+          (if (or (= operation 14) (= operation 21)) REP-RAW-NUM REP-TAGGED))
         (ArrayLoad [alias] REP-TAGGED)
         (JsBuiltin [descriptor] REP-TAGGED)
         (JsThrow [] REP-TAGGED)

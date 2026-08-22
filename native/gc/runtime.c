@@ -74,7 +74,9 @@ typedef struct {
   uintptr_t owner;
   uint64_t name;
   AotJsValue value;
-  /* Data-property attributes: bit 0 writable, bit 1 enumerable, bit 2 configurable. */
+  AotJsValue getter;
+  AotJsValue setter;
+  /* Bits 0 writable, 1 enumerable, 2 configurable, 3 accessor descriptor. */
   uint8_t attributes;
 } JsPropertyRec;
 typedef struct {
@@ -824,8 +826,17 @@ AotJsValue aot_js_string(uintptr_t a, int64_t b,
   }
   if (operation == 203) {
     AotJsValue thrown = exception_pending ? pending_exception : (AotJsValue)a;
-#ifdef AOT_DEBUG_THROW
-    fprintf(stderr, "uncaught JavaScript throw value=0x%016" PRIx64 "\n", thrown);
+    if (getenv("AOT_TRACE_THROW")) {
+      fprintf(stderr, "uncaught JavaScript throw value=0x%016" PRIx64 "\n", thrown);
+    if (aot_js_tag(thrown) == AOT_JS_STRING) {
+      JsStringRec *string = js_string_lookup(aot_js_payload(thrown));
+      if (string) {
+        fputs(" thrown text=", stderr);
+        for (size_t i = 0; i < string->length; ++i)
+          fputc(string->units[i] < 128 ? (char)string->units[i] : '?', stderr);
+        fputc('\n', stderr);
+      }
+    }
     uintptr_t thrown_owner = aot_js_payload(thrown);
     for (size_t i = 0; i < js_properties_len; ++i) {
       if (js_properties[i].owner != thrown_owner) continue;
@@ -842,10 +853,10 @@ AotJsValue aot_js_string(uintptr_t a, int64_t b,
       }
       fputc('\n', stderr);
     }
-#else
-    (void)thrown;
-    fputs("uncaught JavaScript throw\n", stderr);
-#endif
+    } else {
+      (void)thrown;
+      fputs("uncaught JavaScript throw\n", stderr);
+    }
     (void)b; (void)value;
     fflush(stderr);
     exit(70);
@@ -1469,7 +1480,7 @@ AotJsValue aot_js_property(uintptr_t owner, uint64_t name,
     object->frozen = 1;
     js_any_frozen = 1;
     for (size_t i = 0; i < js_properties_len; ++i)
-      if (js_properties[i].owner == owner) js_properties[i].attributes &= 2;
+      if (js_properties[i].owner == owner) js_properties[i].attributes &= 10;
     JsArrayRec *array = js_array(owner, 0);
     if (array)
       for (size_t i = 0; i < array->length; ++i)
@@ -1525,8 +1536,9 @@ AotJsValue aot_js_property(uintptr_t owner, uint64_t name,
       return value & 7;
     }
     if (operation == 0) return aot_js_array(owner, array_index, value, 1);
-    if (operation == 1) {
+    if (operation == 1 || operation == 16) {
       if ((size_t)array_index < indexed_array->length && indexed_array->present[array_index] &&
+          operation != 16 &&
           indexed_array->attributes[array_index] &&
           !((indexed_array->attributes[array_index] - 1) & 1))
         return indexed_array->elements[array_index];
@@ -1622,8 +1634,22 @@ AotJsValue aot_js_property(uintptr_t owner, uint64_t name,
   if (operation == 15) {
     JsPropertyRec *property = js_own_property(owner, name);
     if (!property) return AOT_JS_UNDEFINED;
-    property->attributes = (uint8_t)(value & 7);
+    property->attributes = (uint8_t)(value & 15);
     return property->attributes;
+  }
+  if (operation == 19 || operation == 20 || operation == 21) {
+    uintptr_t cursor = owner;
+    for (size_t depth = 0; cursor && depth <= js_objects_len; ++depth) {
+      JsPropertyRec *property = js_own_property(cursor, name);
+      if (property) {
+        if (operation == 19) return property->getter;
+        if (operation == 20) return property->setter;
+        return property->attributes;
+      }
+      JsObjectRec *object = js_object(cursor, 0);
+      cursor = object ? object->prototype : 0;
+    }
+    return operation == 21 ? (AotJsValue)-1 : AOT_JS_UNDEFINED;
   }
   if (operation == 5) {
     uintptr_t target = (uintptr_t)value;
@@ -1637,20 +1663,41 @@ AotJsValue aot_js_property(uintptr_t owner, uint64_t name,
     }
     return 0;
   }
-  if (operation == 1) {
+  if (operation == 1 || operation == 16) {
     value = js_canonical_stored_value(value);
     if (!aot_js_well_formed(value) || !js_object(owner, 1)) return AOT_JS_UNDEFINED;
     JsPropertyRec *property = js_own_property(owner, name);
-    if (property && !(property->attributes & 1)) return property->value;
+    if (property && operation != 16 && !(property->attributes & 1)) return property->value;
     if (!property) {
       if (!reserve_records((void **)&js_properties, &js_properties_cap,
                            js_properties_len + 1, sizeof(*js_properties)))
         return AOT_JS_UNDEFINED;
       property = &js_properties[js_properties_len++];
-      *property = (JsPropertyRec){owner, name, AOT_JS_UNDEFINED, 7};
+      *property = (JsPropertyRec){owner, name, AOT_JS_UNDEFINED,
+                                  AOT_JS_UNDEFINED, AOT_JS_UNDEFINED, 7};
       js_property_cache_insert(js_properties_len - 1);
     }
+    property->attributes &= 7;
     property->value = value;
+    if (aot_js_managed(value)) js_write_barrier(owner, aot_js_payload(value));
+    return value;
+  }
+  if (operation == 17 || operation == 18) {
+    value = js_canonical_stored_value(value);
+    if (!aot_js_well_formed(value) || !js_object(owner, 1)) return AOT_JS_UNDEFINED;
+    JsPropertyRec *property = js_own_property(owner, name);
+    if (!property) {
+      if (!reserve_records((void **)&js_properties, &js_properties_cap,
+                           js_properties_len + 1, sizeof(*js_properties)))
+        return AOT_JS_UNDEFINED;
+      property = &js_properties[js_properties_len++];
+      *property = (JsPropertyRec){owner, name, AOT_JS_UNDEFINED,
+                                  AOT_JS_UNDEFINED, AOT_JS_UNDEFINED, 8};
+      js_property_cache_insert(js_properties_len - 1);
+    }
+    property->attributes |= 8;
+    property->value = AOT_JS_UNDEFINED;
+    if (operation == 17) property->getter = value; else property->setter = value;
     if (aot_js_managed(value)) js_write_barrier(owner, aot_js_payload(value));
     return value;
   }
@@ -1935,13 +1982,16 @@ static int relocate_side_edges(int scan_old_side, int *next_remembered_dirty) {
     if (!side_owner_live(&property->owner)) continue;
     if (!scan_old_side && property->owner >= (uintptr_t)old_space &&
         property->owner < (uintptr_t)(old_space + collection_old_boundary)) continue;
-    if (!relocate_boxed((uintptr_t *)&property->value)) return 0;
-    if (aot_js_managed(property->value)) {
-      uintptr_t target = aot_js_payload(property->value);
-      if (property->owner >= (uintptr_t)old_space &&
-          property->owner < (uintptr_t)(old_space + old_used) &&
-          target >= (uintptr_t)to_start && target < (uintptr_t)(to_start + capacity))
-        *next_remembered_dirty = 1;
+    AotJsValue *edges[3] = {&property->value, &property->getter, &property->setter};
+    for (size_t edge = 0; edge < 3; ++edge) {
+      if (!relocate_boxed((uintptr_t *)edges[edge])) return 0;
+      if (aot_js_managed(*edges[edge])) {
+        uintptr_t target = aot_js_payload(*edges[edge]);
+        if (property->owner >= (uintptr_t)old_space &&
+            property->owner < (uintptr_t)(old_space + old_used) &&
+            target >= (uintptr_t)to_start && target < (uintptr_t)(to_start + capacity))
+          *next_remembered_dirty = 1;
+      }
     }
   }
   for (size_t i = 0; i < js_arrays_len; ++i) {
@@ -2081,20 +2131,28 @@ static int verify_heap(void) {
     int owner_young = owner >= (uintptr_t)spaces[active_space] &&
                       owner < (uintptr_t)(spaces[active_space] + used);
     int owner_old = owner >= (uintptr_t)old_space && owner < (uintptr_t)(old_space + old_used);
-    if ((!owner_young && !owner_old) || !aot_js_well_formed(js_properties[i].value)) {
-      fprintf(stderr, "property verify failed i=%zu owner=%p value=%llx\n", i, (void *)owner,
-              (unsigned long long)js_properties[i].value);
+    if (!owner_young && !owner_old) {
+      fprintf(stderr, "property verify owner failed i=%zu owner=%p\n", i, (void *)owner);
       return 0;
     }
-    if (aot_js_managed(js_properties[i].value)) {
-      uintptr_t ref = aot_js_payload(js_properties[i].value);
-      int young = ref >= (uintptr_t)spaces[active_space] &&
-                  ref < (uintptr_t)(spaces[active_space] + used);
-      int old = ref >= (uintptr_t)old_space && ref < (uintptr_t)(old_space + old_used);
-      if (!young && !old) {
-        fprintf(stderr, "property verify stale value i=%zu value=%llx ref=%p\n", i,
-                (unsigned long long)js_properties[i].value, (void *)ref);
+    AotJsValue edges[3] = {js_properties[i].value, js_properties[i].getter,
+                           js_properties[i].setter};
+    for (size_t edge = 0; edge < 3; ++edge) {
+      if (!aot_js_well_formed(edges[edge])) {
+        fprintf(stderr, "property verify malformed edge i=%zu edge=%zu value=%llx\n", i, edge,
+                (unsigned long long)edges[edge]);
         return 0;
+      }
+      if (aot_js_managed(edges[edge])) {
+        uintptr_t ref = aot_js_payload(edges[edge]);
+        int young = ref >= (uintptr_t)spaces[active_space] &&
+                    ref < (uintptr_t)(spaces[active_space] + used);
+        int old = ref >= (uintptr_t)old_space && ref < (uintptr_t)(old_space + old_used);
+        if (!young && !old) {
+          fprintf(stderr, "property verify stale edge i=%zu edge=%zu value=%llx ref=%p\n",
+                  i, edge, (unsigned long long)edges[edge], (void *)ref);
+          return 0;
+        }
       }
     }
   }

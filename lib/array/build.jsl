@@ -310,14 +310,27 @@
 ;; https://tc39.es/ecma262/#sec-array.prototype.map. Array elements already carry the tagged
 ;; JavaScript representation expected by a callback. The index and receiver array are boxed at the
 ;; semantic boundary, and the callback result is stored without changing its representation.
+(macro ArrayLikeLength :transitioning true :params [(src dyn)] :ret int
+  (ToLength (GetProperty src "length") 2147483647))
+
+(macro ArrayLikeHasIndex :transitioning true :params [(src dyn) (index int)] :ret bool
+  (HasProperty src index))
+
+(macro ArrayLikeGet :transitioning true :params [(src dyn) (index int)] :ret dyn
+  (GetProperty src index))
+
 (macro ArrayMap :transitioning true :params [(src dyn) (callback dyn)] :ret dyn
-  (let [(len (%ArrayLen src))
-        (out (%NewArray))]
+  (let [(len (ArrayLikeLength src))
+        (out (NewArray))
+        (prepared (%ArrayResize out len out))]
     (loop [(i 0)]
       (if (%Le len i) out
-        (let [(mapped (call callback (%ArrayLoad src i) (%Box i) src))
-              (ignored (%ArrayStore out i mapped))]
-          (recur (%Add i 1)))))))
+        (if (ArrayLikeHasIndex src i)
+            (let [(mapped (call-dynamic-with-receiver (%Box callback) (%Box undefined)
+                                                       (ArrayLikeGet src i) (%Box i) src))
+                  (ignored (%ArrayStore out i mapped))]
+              (recur (%Add i 1)))
+            (recur (%Add i 1)))))))
 
 ;; Compile-time-unrolled literal callbacks use these policies. The frontend supplies literal
 ;; values/counts; callback invocation and array semantics remain DSL-owned.
@@ -356,57 +369,70 @@
     out))
 
 (macro ArrayFilter :transitioning true :params [(src dyn) (callback dyn)] :ret dyn
-  (let [(len (%ArrayLen src))
-        (out (%NewArray))
+  (let [(len (ArrayLikeLength src))
+        (out (NewArray))
         ;; Reserve the maximum dense result once, then publish the selected count at exit.
         (prepared (%ArrayResize out len out))]
     (loop [(i 0) (j 0)]
       (if (%Le len i)
           (let [(resized (%ArrayResize out j out))] out)
-        (let [(value (%ArrayLoad src i))
-              (selected (call callback value (%Box i) src))]
-          (if selected
-              (let [(ignored (%ArrayStore out j value))]
-                (recur (%Add i 1) (%Add j 1)))
-              (recur (%Add i 1) j)))))))
+        (if (ArrayLikeHasIndex src i)
+            (let [(value (ArrayLikeGet src i))
+                  (selected (call-dynamic-with-receiver (%Box callback) (%Box undefined)
+                                                        value (%Box i) src))]
+              (if selected
+                  (let [(ignored (%ArrayStore out j value))]
+                    (recur (%Add i 1) (%Add j 1)))
+                  (recur (%Add i 1) j)))
+            (recur (%Add i 1) j))))))
 
 (macro ArrayForEach :transitioning true :params [(src dyn) (callback dyn)] :ret dyn
-  (let [(len (%ArrayLen src))]
+  (let [(len (ArrayLikeLength src))]
     (loop [(i 0)]
       (if (%Le len i) (%Box undefined)
-        (let [(ignored (call callback (%ArrayLoad src i) (%Box i) src))]
-          (recur (%Add i 1)))))))
+        (if (ArrayLikeHasIndex src i)
+            (let [(ignored (call-dynamic-with-receiver (%Box callback) (%Box undefined)
+                                                        (ArrayLikeGet src i) (%Box i) src))]
+              (recur (%Add i 1)))
+            (recur (%Add i 1)))))))
 
 (macro ArraySome :transitioning true :params [(src dyn) (callback dyn)] :ret bool
-  (let [(len (%ArrayLen src))]
+  (let [(len (ArrayLikeLength src))]
     (loop [(i 0)]
       (if (%Le len i) false
-        (if (call callback (%ArrayLoad src i) (%Box i) src)
-            true
+        (if (ArrayLikeHasIndex src i)
+            (if (call-dynamic-with-receiver (%Box callback) (%Box undefined)
+                                             (ArrayLikeGet src i) (%Box i) src)
+                true
+                (recur (%Add i 1)))
             (recur (%Add i 1)))))))
 
 (macro ArrayEvery :transitioning true :params [(src dyn) (callback dyn)] :ret bool
-  (let [(len (%ArrayLen src))]
+  (let [(len (ArrayLikeLength src))]
     (loop [(i 0)]
       (if (%Le len i) true
-        (if (call callback (%ArrayLoad src i) (%Box i) src)
-            (recur (%Add i 1))
-            false)))))
+        (if (ArrayLikeHasIndex src i)
+            (if (call-dynamic-with-receiver (%Box callback) (%Box undefined)
+                                             (ArrayLikeGet src i) (%Box i) src)
+                (recur (%Add i 1))
+                false)
+            (recur (%Add i 1)))))))
 
 (macro ArrayFind :transitioning true :params [(src dyn) (callback dyn)] :ret dyn
-  (let [(len (%ArrayLen src))]
+  (let [(len (ArrayLikeLength src))]
     (loop [(i 0)]
       (if (%Le len i) (%Box undefined)
-        (let [(value (%ArrayLoad src i))]
-          (if (call callback value (%Box i) src)
+        (let [(value (ArrayLikeGet src i))]
+          (if (call-dynamic-with-receiver (%Box callback) (%Box undefined) value (%Box i) src)
               value
               (recur (%Add i 1))))))))
 
 (macro ArrayFindIndex :transitioning true :params [(src dyn) (callback dyn)] :ret int
-  (let [(len (%ArrayLen src))]
+  (let [(len (ArrayLikeLength src))]
     (loop [(i 0)]
       (if (%Le len i) -1
-        (if (call callback (%ArrayLoad src i) (%Box i) src)
+        (if (call-dynamic-with-receiver (%Box callback) (%Box undefined)
+                                         (ArrayLikeGet src i) (%Box i) src)
             i
             (recur (%Add i 1)))))))
 

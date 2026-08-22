@@ -1,5 +1,31 @@
 # Handoff: move JavaScript semantics into the DSL
 
+## ACCESSORS AND BORROWED ARRAYLIKE CALLBACKS RUN THROUGH THE DSL (2026-08-22, latest)
+
+Ordinary property records now carry accessor getter/setter edges and an accessor attribute bit.
+`DefineProperty`, `GetProperty`, `SetProperty`, descriptor validation, non-configurable redefinition,
+`GetOwnPropertyDescriptor`, and the two-phase `DefineProperties` algorithm remain composed in
+`lib/**/*.jsl`; the runtime additions only store/query descriptor representation. Dynamic getter,
+setter, and captured-callback invocation crosses the x86-64 boxed JavaScript call ABI. A missing
+property's `-1` attribute sentinel is no longer mistaken for an accessor, and frozen accessors keep
+their descriptor-kind bit.
+
+Array `map`, `filter`, `forEach`, `some`, `every`, `find`, and `findIndex` now derive length,
+presence, and values through shared ArrayLike operations in the DSL. This makes borrowed calls such
+as `Array.prototype.forEach.call({1: 11, length: "2"}, callback)` operate on the explicit receiver
+rather than accidentally passing the built-in function identity as the source. Length coercion now
+passes through DSL `ToNumberValue` before the runtime truncation capability, including user
+`valueOf`/`toString` methods. In the 25-file forEach shard that previously reached graph corruption,
+the current runner passes **28 variants**, with 20 honest runtime failures and 2 refusals. This is a
+focused measurement, not a claim of 4,000 newly passing variants; a comparable broad run is still
+required before making that claim.
+
+The default gate remains below one minute: `coil test` is **46 passed, 0 failed in 47.75 s**. The
+frontier reaches all seven current intentional JavaScript bugs as **0 passed, 7 failed in 43.10 s**,
+with no xcrun, Mach-O, encoder, ELF-link, or Linux runtime infrastructure failure. Focused accessor,
+setter, descriptor-identity, borrowed ArrayLike iteration, and captured-callback native execution
+agrees with Node.
+
 ## DATA DESCRIPTORS AND QUOTED PROPERTY KEYS RUN THROUGH THE DSL (2026-08-22, latest)
 
 The native property representation now records writable, enumerable, and configurable bits for

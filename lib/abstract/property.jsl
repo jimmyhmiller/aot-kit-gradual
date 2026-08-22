@@ -54,11 +54,28 @@
 ;; ToString and enter one content-based runtime key space.
 (macro ToPropertyKey :params [(key dyn)] :ret dyn (ToStringValue (%Box key)))
 
-(macro GetProperty :params [(object dyn) (key dyn)] :ret dyn
-  (%PropLoadKey object (ToPropertyKey key)))
+(macro GetProperty :transitioning true :params [(object dyn) (key dyn)] :ret dyn
+  (let [(propertyKey (ToPropertyKey key))
+        (attributes (%PropertyAttributes object propertyKey))]
+    ;; `-1` means no property was found. Its low bits are all set, so testing the accessor bit
+    ;; alone mistakes every missing property for an accessor. Reads still happen to answer
+    ;; undefined, but writes become silent no-ops because the nonexistent setter is undefined.
+    (if (if (%Lt attributes 0) true (%Eq (%BitAnd attributes 8) 0))
+        (%PropLoadKey object propertyKey)
+        (let [(getter (%PropertyGetter object propertyKey))]
+          (if (%IsFunction getter)
+              (call-dynamic-with-receiver getter object)
+              (%Box undefined))))))
 
-(macro SetProperty :params [(object dyn) (key dyn) (value dyn)] :ret dyn
-  (let [(ignored (%PropStoreKey object (ToPropertyKey key) (%Box value)))] value))
+(macro SetProperty :transitioning true :params [(object dyn) (key dyn) (value dyn)] :ret dyn
+  (let [(propertyKey (ToPropertyKey key))
+        (attributes (%PropertyAttributes object propertyKey))]
+    (if (if (%Lt attributes 0) true (%Eq (%BitAnd attributes 8) 0))
+        (let [(ignored (%PropStoreKey object propertyKey (%Box value)))] value)
+        (let [(setter (%PropertySetter object propertyKey))]
+          (if (%IsFunction setter)
+              (let [(ignored (call-dynamic-with-receiver setter object (%Box value)))] value)
+              value)))))
 
 (macro HasProperty :params [(object dyn) (key dyn)] :ret bool
   (%PropHasKey object (ToPropertyKey key)))
@@ -67,7 +84,7 @@
   (let [(propertyKey (ToPropertyKey key))]
     (if (%IsArray (%Box object))
         (if (StringEquals propertyKey "length")
-            (%Throw "TypeError: Cannot delete property 'length' of Array")
+            (ThrowTypeError "Cannot delete property 'length' of Array")
             (let [(ignored (%PropDeleteKey object propertyKey))] true))
         (let [(ignored (%PropDeleteKey object propertyKey))] true))))
 
@@ -81,43 +98,142 @@
   (if (%PropHasNamed descriptor "configurable")
       (if (ToBoolean (%PropLoadNamed descriptor "configurable")) 4 0) fallback))
 
+(macro ValidPropertyDescriptor :params [(descriptor dyn)] :ret bool
+  (if (if (%IsObject descriptor) true
+          (if (%IsArray descriptor) true (%IsFunction descriptor)))
+      (let [(accessor (if (HasProperty descriptor "get") true
+                          (HasProperty descriptor "set")))
+            (data (if (HasProperty descriptor "value") true
+                      (HasProperty descriptor "writable")))
+            (getterValid (if (HasProperty descriptor "get")
+                             (let [(getter (GetProperty descriptor "get"))]
+                               (if (%IsUndefined getter) true (%IsFunction getter)))
+                             true))
+            (setterValid (if (HasProperty descriptor "set")
+                             (let [(setter (GetProperty descriptor "set"))]
+                               (if (%IsUndefined setter) true (%IsFunction setter)))
+                             true))]
+        (if (if accessor data false) false
+            (if getterValid setterValid false)))
+      false))
+
+(macro ValidPropertyRedefinition
+  :transitioning true
+  :params [(descriptor dyn) (oldAttributes int) (oldValue dyn)
+           (oldGetter dyn) (oldSetter dyn)] :ret bool
+  (if (%Lt oldAttributes 0) true
+      (if (%Not (%Eq (%BitAnd oldAttributes 4) 0)) true
+          (let [(accessorDescriptor (if (HasProperty descriptor "get") true
+                                        (HasProperty descriptor "set")))
+                (dataDescriptor (if (HasProperty descriptor "value") true
+                                    (HasProperty descriptor "writable")))
+                (oldAccessor (%Not (%Eq (%BitAnd oldAttributes 8) 0)))]
+            (if (if (HasProperty descriptor "configurable")
+                    (ToBoolean (GetProperty descriptor "configurable")) false)
+                false
+                (if (if (HasProperty descriptor "enumerable")
+                        (%Not (%Eq (if (ToBoolean (GetProperty descriptor "enumerable")) 2 0)
+                                   (%BitAnd oldAttributes 2))) false)
+                    false
+                    ;; A non-configurable property cannot change descriptor kind. A generic
+                    ;; descriptor containing neither data nor accessor fields leaves the kind
+                    ;; unchanged.
+                    (if (if accessorDescriptor (%Not oldAccessor)
+                            (if dataDescriptor oldAccessor false))
+                        false
+                        (if oldAccessor
+                            (if (if (HasProperty descriptor "get")
+                                    (StrictNotEqual (GetProperty descriptor "get") oldGetter) false)
+                                false
+                                (if (if (HasProperty descriptor "set")
+                                        (StrictNotEqual (GetProperty descriptor "set") oldSetter) false)
+                                    false
+                                    true))
+                            (if (if (%Eq (%BitAnd oldAttributes 1) 0)
+                                    (if (HasProperty descriptor "writable")
+                                        (ToBoolean (GetProperty descriptor "writable")) false) false)
+                                false
+                                (if (if (%Eq (%BitAnd oldAttributes 1) 0)
+                                        (if (HasProperty descriptor "value")
+                                            (StrictNotEqual (GetProperty descriptor "value") oldValue) false)
+                                        false)
+                                    false
+                                    true))))))))))
+
 (macro RequireObjectValue :params [(value dyn) (message str)] :ret dyn
   (if (%IsObject value) value
-      (if (%IsArray value) value (%Throw message))))
+      (if (%IsArray value) value
+          (if (%IsFunction value) value (ThrowTypeError message)))))
 
-(macro DefineProperty
-  :params [(object dyn) (key dyn) (descriptor dyn)] :ret dyn
-  (let [(target (RequireObjectValue object "TypeError: Object.defineProperty called on non-object"))
-        (desc (RequireObjectValue descriptor "TypeError: Property description must be an object"))
-        (propertyKey (ToPropertyKey key))
-        (oldAttributes (%OwnPropertyAttributes target propertyKey))
-        (exists (%Le 0 oldAttributes))
-        (oldValue (if exists (%PropLoadKey target propertyKey) (%Box undefined)))
-        (newValue (if (HasProperty desc "value") (GetProperty desc "value") oldValue))
-        (writable (WritableAttribute desc (if exists (%BitAnd oldAttributes 1) 0)))
-        (enumerable (EnumerableAttribute desc (if exists (%BitAnd oldAttributes 2) 0)))
-        (configurable (ConfigurableAttribute desc (if exists (%BitAnd oldAttributes 4) 0)))
-        (attributes (%BitOr writable (%BitOr enumerable configurable)))
-        (stored (%PropStoreKey target propertyKey newValue))
-        (marked (%SetPropertyAttributes target propertyKey attributes))]
-    target))
+(builtin DefineProperty
+  :transitioning true :params [(object dyn) (key dyn) (descriptor dyn)] :ret dyn
+  (if (if (%IsObject object) false
+          (if (%IsArray object) false (%Not (%IsFunction object))))
+      (ThrowTypeError "Object.defineProperty called on non-object")
+      (if (if (%IsObject descriptor) false
+              (if (%IsArray descriptor) false (%Not (%IsFunction descriptor))))
+          (ThrowTypeError "Property description must be an object")
+          (if (%Not (ValidPropertyDescriptor descriptor))
+              (ThrowTypeError "Invalid property descriptor. Cannot both specify accessors and a value or writable attribute")
+              (let [(propertyKey (ToPropertyKey key))
+                    (oldAttributes (%OwnPropertyAttributes object propertyKey))
+                    (exists (%Le 0 oldAttributes))
+                    (oldValue (if exists (%PropLoadKey object propertyKey) (%Box undefined)))]
+                (if (%Not (ValidPropertyRedefinition descriptor oldAttributes oldValue
+                                                     (%PropertyGetter object propertyKey)
+                                                     (%PropertySetter object propertyKey)))
+                    (ThrowTypeError "Cannot redefine non-configurable property")
+                    (let [(accessor (if (HasProperty descriptor "get") true
+                                        (HasProperty descriptor "set")))
+                          (enumerable (EnumerableAttribute descriptor
+                                                           (if exists (%BitAnd oldAttributes 2) 0)))
+                          (configurable (ConfigurableAttribute descriptor
+                                                               (if exists (%BitAnd oldAttributes 4) 0)))]
+                      (if accessor
+                          (let [(getter (if (HasProperty descriptor "get")
+                                           (GetProperty descriptor "get")
+                                           (if (%Eq (%BitAnd oldAttributes 8) 0)
+                                               (%Box undefined)
+                                               (%PropertyGetter object propertyKey))))
+                                (setter (if (HasProperty descriptor "set")
+                                           (GetProperty descriptor "set")
+                                           (if (%Eq (%BitAnd oldAttributes 8) 0)
+                                               (%Box undefined)
+                                               (%PropertySetter object propertyKey))))
+                                (getterStored (%DefinePropertyGetter object propertyKey getter))
+                                (setterStored (%DefinePropertySetter object propertyKey setter))
+                                (marked (%SetPropertyAttributes object propertyKey
+                                                                (%BitOr 8 (%BitOr enumerable configurable))))]
+                            object)
+                          (let [(newValue (if (HasProperty descriptor "value")
+                                             (GetProperty descriptor "value") oldValue))
+                                (writable (WritableAttribute descriptor
+                                                             (if exists (%BitAnd oldAttributes 1) 0)))
+                                (attributes (%BitOr writable (%BitOr enumerable configurable)))
+                                (stored (%DefinePropertyValue object propertyKey newValue))
+                                (marked (%SetPropertyAttributes object propertyKey attributes))]
+                            object)))))))))
 
-(macro GetOwnPropertyDescriptor
-  :params [(object dyn) (key dyn)] :ret dyn
-  (let [(target (RequireObjectValue object "TypeError: Object.getOwnPropertyDescriptor called on non-object"))
+(builtin GetOwnPropertyDescriptor
+  :transitioning true :params [(object dyn) (key dyn)] :ret dyn
+  (let [(target (RequireObjectValue object "Object.getOwnPropertyDescriptor called on non-object"))
         (propertyKey (ToPropertyKey key))
         (attributes (%OwnPropertyAttributes target propertyKey))]
     (if (%Lt attributes 0)
         (%Box undefined)
         (let [(descriptor (%Box (%NewObject)))
-              (value (SetProperty descriptor "value" (%PropLoadKey target propertyKey)))
-              (writable (SetProperty descriptor "writable"
-                                      (%Not (%Eq (%BitAnd attributes 1) 0))))
               (enumerable (SetProperty descriptor "enumerable"
                                         (%Not (%Eq (%BitAnd attributes 2) 0))))
               (configurable (SetProperty descriptor "configurable"
                                           (%Not (%Eq (%BitAnd attributes 4) 0))))]
-          descriptor))))
+          (if (%Eq (%BitAnd attributes 8) 0)
+              (let [(value (SetProperty descriptor "value" (%PropLoadKey target propertyKey)))
+                    (writable (SetProperty descriptor "writable"
+                                            (%Not (%Eq (%BitAnd attributes 1) 0))))]
+                descriptor)
+              (let [(getter (SetProperty descriptor "get" (%PropertyGetter target propertyKey)))
+                    (setter (SetProperty descriptor "set" (%PropertySetter target propertyKey)))]
+                descriptor))))))
 
 (macro HasOwnProperty :params [(object dyn) (key dyn)] :ret bool
   (%Le 0 (%OwnPropertyAttributes object (ToPropertyKey key))))
@@ -126,20 +242,37 @@
   (let [(attributes (%OwnPropertyAttributes object (ToPropertyKey key)))]
     (if (%Lt attributes 0) false (%Not (%Eq (%BitAnd attributes 2) 0)))))
 
-(macro DefineProperties
-  :params [(object dyn) (descriptors dyn)] :ret dyn
-  (let [(count (%OwnKeyCount descriptors))]
+(builtin DefineProperties
+  :transitioning true :params [(object dyn) (descriptors dyn)] :ret dyn
+  (let [(target (RequireObjectValue object "Object.defineProperties called on non-object"))
+        (source (RequireObjectValue descriptors "Property descriptions must be an object"))
+        (count (%OwnKeyCount source))
+        (keys (%NewArray))
+        (values (%NewArray))
+        ;; ToPropertyDescriptor is completed for every enumerable source property before the first
+        ;; target mutation. A later invalid descriptor must not leave earlier properties defined.
+        (collected
+          (loop [(index 0) (at 0)]
+            (if (%Le count index)
+                at
+                (let [(key (%OwnKeyAt source index))
+                      (attributes (%OwnPropertyAttributes source key))]
+                  (if (%Eq (%BitAnd attributes 2) 0)
+                      (recur (%Add index 1) at)
+                      (let [(descriptor (GetProperty source key))]
+                        (if (%Not (ValidPropertyDescriptor descriptor))
+                            (ThrowTypeError "Invalid property descriptor")
+                            (let [(storedKey (%ArrayStore keys at key))
+                                  (storedValue (%ArrayStore values at descriptor))]
+                              (recur (%Add index 1) (%Add at 1))))))))))]
     (loop [(index 0)]
-      (if (%Le count index)
-          object
-          (let [(key (%OwnKeyAt descriptors index))
-                (attributes (%OwnPropertyAttributes descriptors key))
-                (ignored (if (%Eq (%BitAnd attributes 2) 0)
-                             object
-                             (DefineProperty object key (%PropLoadKey descriptors key))))]
+      (if (%Le collected index)
+          target
+          (let [(ignored (DefineProperty target (%ArrayLoad keys index)
+                                         (%ArrayLoad values index)))]
             (recur (%Add index 1)))))))
 
-(macro ObjectCreate :params [(prototype dyn)] :ret dyn
+(builtin ObjectCreate :transitioning true :params [(prototype dyn)] :ret dyn
   (if (%IsNull prototype)
       (let [(object (%Box (%NewObject)))
             (linked (SetObjectPrototype object prototype))]
@@ -148,4 +281,4 @@
           (let [(object (%Box (%NewObject)))
                 (linked (SetObjectPrototype object prototype))]
             object)
-          (%Throw "TypeError: Object prototype may only be an Object or null"))))
+          (ThrowTypeError "Object prototype may only be an Object or null"))))

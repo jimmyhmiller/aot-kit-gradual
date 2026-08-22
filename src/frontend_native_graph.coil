@@ -2405,14 +2405,34 @@
           (al-set! [i64] (mut (load (field context prototypes))) constructor object)
           object))))))
 
+(defn fng-array-prototype-expression? [(frontend (ptr NativeFrontend)) (node i64)] (-> bool)
+  (let [ast (field frontend ast)]
+    (and (= (ts-kind ast node) TSK-PROPERTY-ACCESS)
+         (and (= (fe-resolution-symbol frontend (ts-child ast node 0)) FE-INTRINSIC-ARRAY)
+              (= (ts-text ast (ts-child ast node 1)) "prototype")))))
+
 (defn fng-array-builtin-name [(context FngContext) (node i64)] (-> (slice u8))
   (let [frontend (load (field context frontend))
         ast (field frontend ast)
         callee (ts-child ast node 0)]
     (if (and (= (ts-kind ast callee) TSK-PROPERTY-ACCESS)
-             (= (fng-infer context (ts-child ast callee 0) FNG-DYNAMIC) FNG-ARRAY))
+             (or (= (fng-infer context (ts-child ast callee 0) FNG-DYNAMIC) FNG-ARRAY)
+                 (fng-array-prototype-expression? frontend (ts-child ast callee 0))))
         (ts-text ast (ts-child ast callee 1))
-        "")))
+        ;; Borrowed Array methods keep the same DSL operation; only the source location of the
+        ;; receiver and arguments differs. Recognize `.call` structurally here and let each array
+        ;; lowering extract those operands, rather than treating the built-in method identity as a
+        ;; generic user function (which cannot dispatch to an opaque built-in identity).
+        (if (and (= (ts-kind ast callee) TSK-PROPERTY-ACCESS)
+                 (= (ts-text ast (ts-child ast callee 1)) "call"))
+            (let [method (ts-child ast callee 0)]
+              (if (and (= (ts-kind ast method) TSK-PROPERTY-ACCESS)
+                       (or (= (fng-infer context (ts-child ast method 0) FNG-DYNAMIC) FNG-ARRAY)
+                           (fng-array-prototype-expression? frontend
+                                                            (ts-child ast method 0))))
+                  (ts-text ast (ts-child ast method 1))
+                  ""))
+            ""))))
 
 (defn fng-array-builtin? [(context FngContext) (node i64)] (-> bool)
   (let [name (fng-array-builtin-name context node)]
@@ -4016,7 +4036,11 @@
   (let [frontend (load (field context frontend))
         symbol (fe-resolution-symbol frontend node)
         index (fng-function-index frontend symbol)]
-    (if (and (>= index 0) (= (fng-capture-count frontend index) 0))
+    ;; `fng-capture-count` takes a function ID, not its position in `.functions`. Those happen to
+    ;; coincide for many small programs, but diverge as soon as nested declarations are indexed.
+    ;; Passing `index` misclassified a capturing Test262 assertion closure as capture-free and
+    ;; substituted an unrelated bare function, so `typeof func` became non-callable at runtime.
+    (if (and (>= index 0) (= (fng-capture-count frontend symbol) 0))
         (al-get [i64] (load (load (field context functions))) index)
         (fng-expression context node))))
 
@@ -4046,10 +4070,18 @@
   (let [frontend (load (field context frontend))
         ast (field frontend ast)
         callee (ts-child ast node 0)
-        source-node (ts-child ast callee 0)
+        ;; `Array.prototype.forEach.call(arrayLike, callback)` is recognized as the same semantic
+        ;; operation as `array.forEach(callback)`, but its receiver and callback are explicit call
+        ;; arguments rather than the base and first argument of the outer call. The previous
+        ;; indexing passed the built-in function identity as `src` and the array-like object as the
+        ;; callback, so the DSL correctly attempted to call an object and hit the dispatch trap.
+        borrowed
+          (and (= (ts-kind ast callee) TSK-PROPERTY-ACCESS)
+               (= (ts-text ast (ts-child ast callee 1)) "call"))
+        source-node (if borrowed (ts-child ast node 1) (ts-child ast callee 0))
         literal (= (ts-kind ast source-node) TSK-ARRAY-LITERAL)
         literal-count (if literal (ts-child-count ast source-node) 0)
-        callback-node (ts-child ast node 1)
+        callback-node (ts-child ast node (if borrowed 2 1))
         callback-symbol (fe-resolution-symbol frontend callback-node)
         callback-index (fng-function-index frontend callback-symbol)
         callback-parameters
@@ -5374,9 +5406,13 @@
         (if (and (= owner FNG-ARRAY) (= (ts-text ast name-node) "length"))
             (fng-jsl-call1 context "ArrayLength" object)
             (if (= field-index -1)
-                (fng-jsl-call2 context "GetNamedProperty"
+                ;; An unshaped field lives in the ordinary PropertyKey table. Route the read
+                ;; through the semantic [[Get]] operation so Object.defineProperty accessors are
+                ;; observed; `%PropLoadNamed` is only a representation primitive and cannot invoke
+                ;; a getter by itself.
+                (fng-jsl-call2 context "GetProperty"
                                object
-                               (fng-const (shape-name-intern! (ts-text ast name-node))))
+                               (n-string-const! (jss-from-utf8! (ts-text ast name-node))))
                 (let [alias (al-get [i64] (load (load (field context aliases))) field-index)
                       shape (al-get [i64] (load (load (field context shapes))) field-owner)
                       ;; `owner < 0` MEANS THE SHAPE IS A GUESS, and this line already knew it: the
@@ -5974,9 +6010,24 @@
                                  (fng-expression context object-node)
                                  (fng-expression context name-node))))
           (= kind TSK-TYPEOF-EXPRESSION)
-            (fng-jsl-call1 context "TypeOfValue"
-                           (n-box! (fng-callback-value context
-                                                       (ts-role ast node TS-ROLE-EXPRESSION 0))))
+            (let [source (ts-role ast node TS-ROLE-EXPRESSION 0)
+                  expected (fng-infer context source FNG-DYNAMIC)
+                  value (fng-expression context source)]
+              (fng-jsl-call1 context "TypeOfValue"
+                ;; `typeof` observes an ordinary expression value. Callback specialization is
+                ;; only for APIs that invoke a statically known callback; applying it here could
+                ;; replace a parameter with an unrelated function sharing its symbol id.
+                ;;
+                ;; Dynamic, numeric, array, and structural-object parameters already use the
+                ;; tagged JavaScript ABI (see `fng-call-argument`). Boxing such a Parm again turns
+                ;; a captured closure into an object-looking pointer. String and boolean
+                ;; parameters are raw and still need the ordinary box below.
+                (if (and (op-is? value Parm [_])
+                         (or (>= expected 0)
+                             (or (= expected FNG-DYNAMIC)
+                                 (or (= expected FNG-NUMBER) (= expected FNG-ARRAY)))))
+                    value
+                    (n-box! value))))
           (= kind TSK-CONDITIONAL-EXPRESSION)
             (let [condition-node (ts-role ast node TS-ROLE-CONDITION 0)
                   then-node (ts-role ast node TS-ROLE-WHEN-TRUE 0)
