@@ -17,6 +17,14 @@
 (import "coil.fmt" :use *)
 (import "coil.slice" :use *)
 
+(const BE-EXCEPTION-RETURN-DESCRIPTOR i64 104)
+
+(defn be-exception-return? [(term i64)] (-> bool)
+  (and (op-is? term Return [])
+       (match (n-op (n-in term 1))
+         (JsBuiltin [descriptor] (= descriptor BE-EXCEPTION-RETURN-DESCRIPTOR))
+         (_ false))))
+
 ;; `-1` MEANS "NO SINGLE TAG", NOT "UNSUPPORTED". The numeric union has two tags and is selected
 ;; as two tests and an OR at the `TypeTest` site; every other union genuinely has no encoding.
 (defn be-js-tag-for-type [(t i64)] (-> i64)
@@ -98,16 +106,19 @@
 (defn be-function-returns-array? [(owner i64) (fuel i64)] (-> bool)
   (let [count (mu-function-return-count owner)
         (mut i) 0
-        ;; A function with no `Return` block promises nothing, so it cannot promise an array.
-        (mut all) (> count 0)]
+        (mut saw) false
+        (mut all) true]
     (loop (if (or (>= (load i) count) (not (load all)))
               (break)
               (let [term (mu-block-terminator (mu-function-return-block owner (load i)))]
                 (if (and (!= term NO-NODE) (op-is? term Return []))
-                    (if (be-array-value? (n-in term 1) fuel) 0 (set! all false))
+                    (if (be-exception-return? term)
+                        0
+                        (do (set! saw true)
+                            (if (be-array-value? (n-in term 1) fuel) 0 (set! all false))))
                     (set! all false))
                 (set! i (+ (load i) 1)))))
-    (load all)))
+    (and (load saw) (load all))))
 
 (defn be-call-returns-array? [(call i64) (fuel i64)] (-> bool)
   (if (<= fuel 0)
@@ -133,6 +144,7 @@
   (let [count (mu-function-return-count owner)
         (mut i) 0
         (mut answer) -1
+        (mut exceptional) false
         (mut boxable) true
         (mut consistent) true]
     (loop (if (or (>= (load i) count) (not (load consistent)))
@@ -140,6 +152,8 @@
               (let [bid (mu-function-return-block owner (load i))
                     term (mu-block-terminator bid)]
                 (if (and (!= term NO-NODE) (op-is? term Return []))
+                    (if (be-exception-return? term)
+                        (set! exceptional true)
                     (let [value (n-in term 1)]
                       (if (op-is? value Call [_])
                           ;; Call nodes have lattice type `dyn` regardless of their eventual native
@@ -176,10 +190,12 @@
                                             ;; returns share the boxed JavaScript return ABI.
                                             (set! answer MLK-BOXED)
                                             (set! consistent false))
-                                        0))))))
+                                        0)))))))
                     0)
                 (set! i (+ (load i) 1)))))
-    (if (load consistent) (load answer) -1)))
+    (if (load consistent)
+        (if (and (< (load answer) 0) (load exceptional)) MLK-BOXED (load answer))
+        -1)))
 
 (defn be-function-return-kind [(owner i64)] (-> i64)
   (be-function-return-kind-fuel owner 32))
@@ -193,7 +209,8 @@
               (let [term (mu-block-terminator (mu-function-return-block owner (load index)))]
                 (if (and (!= term NO-NODE)
                          (and (op-is? term Return [])
-                              (be-node-fp-value? (n-in term 1))))
+                              (and (not (be-exception-return? term))
+                              (be-node-fp-value? (n-in term 1)))))
                     (set! found true)
                     0)
                 (set! index (+ (load index) 1)))))
@@ -241,6 +258,8 @@
               (break)
               (let [term (mu-block-terminator (mu-function-return-block owner (load i)))]
                 (if (and (!= term NO-NODE) (op-is? term Return []))
+                    (if (be-exception-return? term)
+                        0
                     (let [value (n-in term 1)]
                       (if (op-is? value Call [_])
                           0
@@ -249,7 +268,7 @@
                                          (ml-kind-for-source-representation value))]
                             (if (< (load first) 0)
                                 (set! first kind)
-                                (if (!= (load first) kind) (set! mixed true) 0)))))
+                                (if (!= (load first) kind) (set! mixed true) 0))))))
                     0)
                 (set! i (+ (load i) 1)))))
     (load mixed)))
@@ -258,11 +277,14 @@
   (let [count (mu-function-return-count owner)
         (mut i) 0
         (mut answer) -1
+        (mut exceptional) false
         (mut consistent) true]
     (loop (if (or (>= (load i) count) (not (load consistent)))
               (break)
               (let [term (mu-block-terminator (mu-function-return-block owner (load i)))]
                 (if (and (!= term NO-NODE) (op-is? term Return []))
+                    (if (be-exception-return? term)
+                        (set! exceptional true)
                     (let [value (n-in term 1)]
                       (if (op-is? value Call [_])
                           (let [tag
@@ -285,10 +307,12 @@
                                     (set! answer tag)
                                     (if (!= (load answer) tag)
                                         (set! consistent false)
-                                        0))))))
+                                        0)))))))
                     0)
                 (set! i (+ (load i) 1)))))
-    (if (load consistent) (load answer) -1)))
+    (if (load consistent)
+        (if (and (< (load answer) 0) (load exceptional)) JSV-UNDEFINED (load answer))
+        -1)))
 
 (defn be-function-return-tag [(owner i64)] (-> i64)
   (be-function-return-tag-fuel owner 32))
@@ -2705,7 +2729,8 @@
                       term (mu-block-terminator bid)]
                   (if (and (!= term NO-NODE)
                            (and (op-is? term Return [])
-                                (be-node-fp-value? (n-in term 1))))
+                                (and (not (be-exception-return? term))
+                                (be-node-fp-value? (n-in term 1)))))
                       (set! fp true)
                       0))
                 (set! i (+ (load i) 1))
@@ -3091,7 +3116,11 @@
       (match (n-op node)
         (Load [_] true) (PropLoad [_] true) (PropHas [_] true) (ProtoHas [] true)
         (PropLoadKey [] true) (PropHasKey [] true) (InternalLoad [_] true)
-        (ArrayLoad [_] true) (ArrayLen [] true) (JsThrow [] true) (_ false))))
+        (ArrayLoad [_] true) (ArrayLen [] true) (JsThrow [] true)
+        ;; Exception transport descriptors are process state reads/writes and must remain after
+        ;; the call or throw whose status they inspect. Ordinary numeric JsBuiltins remain pure.
+        (JsBuiltin [descriptor] (>= descriptor 101))
+        (_ false))))
 
 ;; The block a control-anchored heap operation belongs to, or -1 when it has none.
 (defn ms-inst-anchor-block [(owner i64) (at i64)] (-> i64)

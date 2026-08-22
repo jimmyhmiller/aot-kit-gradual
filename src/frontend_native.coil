@@ -315,8 +315,25 @@
                       (and (= (ts-text ast (ts-child ast callee 0)) "Math")
                            (< (jbi-find (ts-text ast callee)) 0)))))
             (fe-fail! (mut frontend) FE-CODE-UNKNOWN-BUILTIN node TS-ROLE-CALLEE)
-          (or (= kind TSK-REGEXP-LITERAL) (= kind TSK-TRY))
+          (= kind TSK-REGEXP-LITERAL)
             (fe-fail! (mut frontend) FE-CODE-UNSUPPORTED-SYNTAX node 0)
+          (= kind TSK-TRY)
+            (let [catch-clause (ts-role ast node TS-ROLE-CATCH 0)
+                  finally-block (ts-role ast node TS-ROLE-FINALLY 0)]
+              ;; Catchable exceptions land first without pretending `finally` is an ordinary
+              ;; trailing block: `finally` must run on return, throw, break and continue, and the
+              ;; graph builder does not implement that completion-record machinery yet.
+              (if (or (= catch-clause -1) (!= finally-block -1))
+                  (fe-fail! (mut frontend) FE-CODE-UNSUPPORTED-SYNTAX node
+                            (if (!= finally-block -1) TS-ROLE-FINALLY TS-ROLE-CATCH))
+                  (let [(mut index) 0]
+                    (loop (if (or (>= (load index) (ts-child-count ast node))
+                                  (!= (load (field frontend status)) FE-OK))
+                              (break)
+                              (do (fe-validate-node! (mut frontend)
+                                                     (ts-child ast node (load index))
+                                                     (mut targets))
+                                  (store! index (+ (load index) 1))))))))
           (and (= kind TSK-BINARY) (not (fe-supported-binary? ast node)))
             (fe-fail! (mut frontend) FE-CODE-UNSUPPORTED-OPERATOR node TS-ROLE-OPERATOR)
           (and (= kind TSK-PREFIX-UNARY) (not (fe-supported-prefix? ast node)))
@@ -1401,6 +1418,16 @@
                                 (ts-role ast node TS-ROLE-STATEMENT 0)
                                 owner
                                 (+ depth 1))
+              (store! (field bindings len) saved)
+              0)
+          (= kind TSK-CATCH)
+            (let [saved (al-len [FeBinding] (load bindings))
+                  declaration (ts-role ast node TS-ROLE-CATCH-BINDING 0)
+                  block (ts-role ast node TS-ROLE-BODY 0)]
+              (if (!= declaration -1)
+                  (fe-resolve-node! (mut frontend) (mut bindings) declaration owner (+ depth 1))
+                  0)
+              (fe-resolve-node! (mut frontend) (mut bindings) block owner (+ depth 1))
               (store! (field bindings len) saved)
               0)
           (= kind TSK-BLOCK)

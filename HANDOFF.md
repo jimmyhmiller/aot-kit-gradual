@@ -1,5 +1,40 @@
 # Handoff: move JavaScript semantics into the DSL
 
+## CATCHABLE EXCEPTIONS CROSS NATIVE FRAMES (2026-08-22, latest)
+
+Catch-only `try` statements now lower to explicit exceptional graph edges on Linux x86-64. A
+boxed pending exception lives in the runtime and is relocated as a GC root; generated calls query
+that state before consuming their result, exceptional-only returns no longer contaminate the
+callee's ordinary return ABI, and catch entry atomically takes and clears the value. Source throws,
+nested catch/rethrow, a `%Throw` originating in a JSL definition, and a callback throw crossing a
+JSL array operation all agree with Node through the native ELF harness. The same runtime-call
+dependency convention is encoded on AArch64 so this work does not knowingly regress the existing
+backend.
+
+JavaScript meaning remains in `lib/**/*.jsl`: source `throw` invokes `ThrowValue`, and transitive
+throwability is derived as a fixed point over the JSL call graph. The frontend owns only syntax,
+scope, state snapshots and exceptional control transport. The DSL ownership gate still reports an
+empty list of frontend-open-coded JavaScript operations.
+
+This is a substantial Test262 foundation, not complete exception conformance. `finally` is still
+refused because it requires completion records for return/throw/break/continue. The runner still
+skips `assert.throws`; built-in Error constructor identities/prototypes are not implemented, so
+enabling it now would either create honest failures or require weakening its constructor check.
+A 40-file exploratory catch sample produced 5 native passes, 16 honest failures and 32 refusals;
+the failures/refusals expose unrelated Annex B binding semantics, empty statements, `eval`,
+`for-in`, and built-in Error names rather than platform or exception-transport failures.
+
+Verification on Linux x86-64 with the freshly built Coil main compiler:
+
+* `COIL_META_CACHE=0 coil test tests/native-execution-test.coil` — **32 passed, 0 failed**, including
+  five exception transport witnesses.
+* `COIL_META_CACHE=0 coil test tests/jsl-test.coil` — **38 passed, 0 failed**.
+* `COIL_META_CACHE=0 coil test tests/dsl-ownership-test.coil` — **4 passed, 0 failed**.
+* `COIL_META_CACHE=0 coil test --suite frontier` — intentionally **0 passed, 8 failed**: the same
+  seven named frontend refusals and 26-vs-25 semantic disagreement, with no infrastructure failure.
+* `COIL_META_CACHE=0 coil test` — **433 passed, 0 failed**. The first run correctly caught the
+  changed derived witness count; `docs/WHAT-WORKS.md` was regenerated before this green rerun.
+
 ## STRING SEARCH POSITIONS LIVE IN THE DSL (2026-08-21, latest)
 
 `String.prototype.indexOf`, `includes`, `startsWith`, `endsWith`, and `lastIndexOf` now pass boxed

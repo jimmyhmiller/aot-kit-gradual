@@ -260,6 +260,7 @@ func stableKindCode(kind ast.Kind) int32 {
 	case ast.KindSwitchStatement: return 256
 	case ast.KindThrowStatement: return 257
 	case ast.KindTryStatement: return 258
+	case ast.KindCatchClause: return 300
 	case ast.KindVariableDeclaration: return 261
 	case ast.KindVariableDeclarationList: return 262
 	case ast.KindFunctionDeclaration: return 263
@@ -458,7 +459,10 @@ func roleNode(n *ast.Node, role int32, index int32) *ast.Node {
 			return ast.GetNameOfDeclaration(n)
 		}
 	case 2: // body
-		if index == 0 { return n.Body() }
+		if index == 0 {
+			if n.Kind == ast.KindCatchClause { return n.AsCatchClause().Block }
+			return n.Body()
+		}
 	case 3: // type
 		if index == 0 { return n.Type() }
 	case 4: // initializer
@@ -558,13 +562,21 @@ func roleNode(n *ast.Node, role int32, index int32) *ast.Node {
 		if n.Kind == ast.KindCaseBlock && int(index) < len(n.AsCaseBlock().Clauses.Nodes) {
 			return n.AsCaseBlock().Clauses.Nodes[index]
 		}
+	case 24: // try block
+		if n.Kind == ast.KindTryStatement && index == 0 { return n.AsTryStatement().TryBlock }
+	case 25: // catch clause
+		if n.Kind == ast.KindTryStatement && index == 0 { return n.AsTryStatement().CatchClause }
+	case 26: // finally block
+		if n.Kind == ast.KindTryStatement && index == 0 { return n.AsTryStatement().FinallyBlock }
+	case 27: // catch binding declaration
+		if n.Kind == ast.KindCatchClause && index == 0 { return n.AsCatchClause().VariableDeclaration }
 	}
 	return nil
 }
 
 //export aot_ts_node_role
 func aot_ts_node_role(raw C.uintptr_t, id C.int32_t, role C.int32_t, index C.int32_t) C.int32_t {
-	parsed := result(raw); n := node(parsed, id); if n == nil || role < 1 || role > 23 { return -1 }
+	parsed := result(raw); n := node(parsed, id); if n == nil || role < 1 || role > 27 { return -1 }
 	target := roleNode(n, int32(role), int32(index)); if target == nil { return -1 }
 	targetID, ok := parsed.nodeIDs[target]; if !ok { return -1 }
 	return C.int32_t(targetID)

@@ -44,6 +44,12 @@
 (const FNG-ITERATOR i64 -16)
 (const FNG-JUMP-BREAK i64 0)
 (const FNG-JUMP-CONTINUE i64 1)
+(const FNG-JUMP-THROW i64 2)
+(const FNG-EXCEPTION-TARGET-LABEL i64 -2)
+(const FNG-EXCEPTION-PENDING-DESCRIPTOR i64 101)
+(const FNG-EXCEPTION-TAKE-DESCRIPTOR i64 102)
+(const FNG-EXCEPTION-UNCAUGHT-DESCRIPTOR i64 103)
+(const FNG-EXCEPTION-RETURN-DESCRIPTOR i64 104)
 
 (defstruct FngLValue
   [(kind i64) (symbol i64) (object i64) (key i64) (alias i64) (shape i64)])
@@ -60,7 +66,7 @@
    (jump-start i64)
    (jump-value-start i64)])
 
-(defstruct FngJump [(target i64) (kind i64) (ctrl i64) (value-start i64)])
+(defstruct FngJump [(target i64) (kind i64) (ctrl i64) (value-start i64) (dependency i64)])
 
 (defstruct FngContext
   [(frontend (ptr NativeFrontend))
@@ -81,6 +87,7 @@
    (target-active (ptr (ArrayList i64)))
    (jumps (ptr (ArrayList FngJump)))
    (jump-values (ptr (ArrayList i64)))
+   (exception-dependency (ptr i64))
    (cell-shape i64)
    (cell-alias i64)
    (receiver i64)
@@ -106,6 +113,7 @@
                    (target-active (ptr (ArrayList i64)))
                    (jumps (ptr (ArrayList FngJump)))
                    (jump-values (ptr (ArrayList i64)))
+                   (exception-dependency (ptr i64))
                    (cell-shape i64)
                    (cell-alias i64)
                    (receiver i64)
@@ -148,6 +156,8 @@
               jumps
               :jump-values
               jump-values
+              :exception-dependency
+              exception-dependency
               :cell-shape
               cell-shape
               :cell-alias
@@ -714,9 +724,14 @@
                     (do
                       (let [ret (n-in fun (load i))]
                         (if (and (!= ret NO-NODE) (op-is? ret Return []))
-                            (if (fng-machine-number-value? (n-in ret 1) fuel)
+                            (if (match (n-op (n-in ret 1))
+                                  (JsBuiltin [descriptor]
+                                    (= descriptor FNG-EXCEPTION-RETURN-DESCRIPTOR))
+                                  (_ false))
                                 0
-                                (set! ok false))
+                                (if (fng-machine-number-value? (n-in ret 1) fuel)
+                                    0
+                                    (set! ok false)))
                             0))
                       (set! i (+ (load i) 1))
                       0)))
@@ -3070,6 +3085,82 @@
       (al-free! [i64] (mut memories))
       answer)))
 
+(defn fng-exception-runtime [(context FngContext) (descriptor i64) (value i64)] (-> i64)
+  ;; These descriptors are runtime transport, not JavaScript operations: `%Throw` in the DSL owns
+  ;; the act of raising, while the frontend owns the control edges that catch or propagate it.
+  (n-peephole
+    (n-new3 (JsBuiltin descriptor)
+            (load (load (field context ctrl)))
+            value
+            (fng-const 0))))
+
+(defn fng-find-exception-target [(context FngContext)] (-> i64)
+  (let [targets (load (field context targets))
+        (mut index) (- (al-len [FngTarget] (load targets)) 1)
+        (mut answer) -1]
+    (loop (if (or (< (load index) 0) (>= (load answer) 0))
+              (break)
+              (let [target (al-get [FngTarget] (load targets) (load index))]
+                (if (and (.active target)
+                         (= (.label-node target) FNG-EXCEPTION-TARGET-LABEL))
+                    (set! answer (load index))
+                    0)
+                (set! index (- (load index) 1)))))
+    (load answer)))
+
+(defn fng-add-exception-return! [(context FngContext) (value i64)] (-> i64)
+  ;; The descriptor wrapper marks propagation-only control without changing Return's structural
+  ;; arity. Return ABI inference ignores this arm; generated code still evaluates `value` (the
+  ;; uncaught sink at the outer entry) before the wrapper and its unreachable machine return.
+  (fng-ensure-memory! context)
+  (let [ctrl (load (load (field context ctrl)))
+        memory
+          (if (= (load (load (field context memory))) NO-NODE)
+              (fng-memory ctrl JS-PROPERTY-ALIAS)
+              (load (load (field context memory))))
+        marked
+          (fng-exception-runtime context FNG-EXCEPTION-RETURN-DESCRIPTOR value)
+        ret (n-new3 (Return) ctrl marked memory)]
+    (if (.top-level context)
+        (n-add-def! (g-stop) ret)
+        (let [first (load (field context first-return))]
+          (if (= (load first) NO-NODE)
+              (do (n-fun-close! (.fun context) ret) (set! first ret))
+              (n-fun-add-return! (.fun context) ret))))
+    ret))
+
+(defn fng-abrupt-exception! [(context FngContext) (dependency i64)] (-> i64)
+  (let [target (fng-find-exception-target context)]
+    (if (>= target 0)
+        (fng-capture-target! context target FNG-JUMP-THROW dependency)
+        (do
+          ;; A function returns immediately with the pending flag still set; its caller checks the
+          ;; flag before consuming the meaningless placeholder. The outer entry is the one place
+          ;; that turns an unhandled exception into the established diagnostic and exit status.
+          (fng-add-exception-return!
+            context
+            (if (.top-level context)
+                (fng-exception-runtime context
+                                       FNG-EXCEPTION-UNCAUGHT-DESCRIPTOR
+                                       dependency)
+                dependency))
+          (set! (load (field context ctrl)) NO-NODE)
+          0))))
+
+(defn fng-check-pending-exception! [(context FngContext) (dependency i64)] (-> i64)
+  (let [condition
+          ;; The runtime ignores this operand, but its data edge keeps the raise/call before the
+          ;; pending read and keeps an otherwise value-less `%Throw` alive through scheduling.
+          (fng-exception-runtime context FNG-EXCEPTION-PENDING-DESCRIPTOR dependency)
+        arms
+          (n-if-arms!
+            (fng-peep
+              (n-new2 (If) (load (load (field context ctrl))) condition)))]
+    (set! (load (field context ctrl)) (arms-t arms))
+    (fng-abrupt-exception! context condition)
+    (set! (load (field context ctrl)) (arms-f arms))
+    0))
+
 (defn fng-jsl-call [(context FngContext) (name (slice u8)) (args (slice i64))] (-> i64)
   (if (!= (jsl-require-body-only! name) JSL-OK)
       (do (panic-corrupt "frontend: a JSL definition the frontend emits did not resolve") 0)
@@ -3180,6 +3271,11 @@
                           (fng-preserve-active-memory context (load (index mp 0))))
                     0)
                 0))
+        ;; ThrowValue is used by source `throw`, whose statement lowering already knows the edge is
+        ;; abrupt. Definitions that call it transitively still get the ordinary pending check.
+        (if (and (!= name "ThrowValue") (jsl-name-can-throw? name))
+            (fng-check-pending-exception! context v)
+            0)
         v))))
 
 (defn fng-jsl-call0 [(context FngContext) (name (slice u8))] (-> i64)
@@ -4471,6 +4567,9 @@
       ;; The callee may have changed any active alias. Re-anchor subsequent alias reads at the
       ;; CallEnd instead of reusing a pre-call memory node.
       (set! (load (field context memory)) NO-NODE)
+      ;; A JavaScript call has two successors even though the value ABI stays single-result. The
+      ;; pending flag is checked before the result is cast, boxed, or otherwise consumed.
+      (fng-check-pending-exception! context value)
       (let [ordinary-value
               (if construct
                   (let [result-owner
@@ -6100,8 +6199,8 @@
              :jump-value-start
              jump-value-start))
 
-(defn fng-jump-make [(target i64) (kind i64) (ctrl i64) (value-start i64)] (-> FngJump)
-  (FngJump :target target :kind kind :ctrl ctrl :value-start value-start))
+(defn fng-jump-make [(target i64) (kind i64) (ctrl i64) (value-start i64) (dependency i64)] (-> FngJump)
+  (FngJump :target target :kind kind :ctrl ctrl :value-start value-start :dependency dependency))
 
 (defn fng-push-target! [(context FngContext)
                         (label-node i64)
@@ -6172,7 +6271,7 @@
                 (set! index (- (load index) 1)))))
     (load answer)))
 
-(defn fng-capture-target! [(context FngContext) (target-index i64) (kind i64)] (-> i64)
+(defn fng-capture-target! [(context FngContext) (target-index i64) (kind i64) (dependency i64)] (-> i64)
   (let [targets (load (field context targets))
         target (al-get [FngTarget] (load targets) target-index)
         symbols (load (field context target-symbols))
@@ -6203,12 +6302,13 @@
                 (set! index (+ (load index) 1)))))
     (al-push! [FngJump]
               (mut jumps)
-              (fng-jump-make target-index kind (load (load (field context ctrl))) value-start))
+              (fng-jump-make target-index kind
+                             (load (load (field context ctrl))) value-start dependency))
     (set! (load (field context ctrl)) NO-NODE)
     target-index))
 
 (defn fng-capture-jump! [(context FngContext) (node i64) (kind i64)] (-> i64)
-  (fng-capture-target! context (fng-find-target context node kind) kind))
+  (fng-capture-target! context (fng-find-target context node kind) kind NO-NODE))
 
 ;; A RECORDED JUMP HOLDS NODE IDS, AND THE GRAPH KEEPS MOVING AFTER THE JUMP IS RECORDED.
 ;;
@@ -6272,6 +6372,10 @@
                   0
                   (let [jump (al-get [FngJump] (load jumps) (al-get [i64] (load matching) 0))]
                     (store! (load (field context ctrl)) (load (field jump ctrl)))
+                    (if (= kind FNG-JUMP-THROW)
+                        (store! (load (field context exception-dependency))
+                                (load (field jump dependency)))
+                        0)
                     (store! index 0)
                     (loop (if (>= (load index) (load (field target symbol-count)))
                               (break)
@@ -6312,6 +6416,20 @@
                                           (al-get [i64] (load matching) (load index)))]
                             (n-add-def! region (load (field jump ctrl)))
                             (store! index (+ (load index) 1)))))
+                (if (= kind FNG-JUMP-THROW)
+                    (let [dependency (n-new (Phi (t-dyn)))
+                          (mut ji) 0]
+                      (n-add-def! dependency region)
+                      (loop (if (>= (load ji) (al-len [i64] (load matching)))
+                                (break)
+                                (let [jump
+                                        (al-get [FngJump]
+                                                (load jumps)
+                                                (al-get [i64] (load matching) (load ji)))]
+                                  (n-add-def! dependency (load (field jump dependency)))
+                                  (store! ji (+ (load ji) 1)))))
+                      (store! (load (field context exception-dependency)) dependency))
+                    0)
                 (store! index 0)
                 (loop (if (>= (load index) (load (field target symbol-count)))
                           (break)
@@ -7218,6 +7336,59 @@
               iterator
               symbol)))
 
+(defn fng-try-catch [(context FngContext) (node i64)] (-> bool)
+  (let [frontend (load (field context frontend))
+        ast (field frontend ast)
+        try-block (ts-role ast node TS-ROLE-TRY-BLOCK 0)
+        catch-clause (ts-role ast node TS-ROLE-CATCH 0)
+        catch-block (ts-role ast catch-clause TS-ROLE-BODY 0)
+        catch-declaration (ts-role ast catch-clause TS-ROLE-CATCH-BINDING 0)
+        (mut changed) (al-new [i64] (malloc-allocator))
+        (mut active) (al-new [i64] (malloc-allocator))
+        (mut snapshots) (al-new [i64] (malloc-allocator))
+        (mut answer) false]
+    (fng-assigned! frontend node (mut changed))
+    (fng-record-dynamic-alias! context JS-PROPERTY-ALIAS)
+    (fng-active-memory! context (mut active))
+    (fng-control-aliases! context (mut active))
+    (let [target
+            (fng-push-target! context FNG-EXCEPTION-TARGET-LABEL false false (mut changed))
+          try-continues (fng-statement context try-block)
+          try-ctrl (if try-continues (load (load (field context ctrl))) NO-NODE)
+          try-start (fng-snapshot! context (mut changed) (mut active) (mut snapshots))
+          has-exception (fng-merge-target! context target FNG-JUMP-THROW false)]
+      ;; A rethrow from the catch belongs to the next enclosing handler, never this one.
+      (fng-pop-target! context target)
+      (if has-exception
+          (let [thrown
+                  (fng-exception-runtime context FNG-EXCEPTION-TAKE-DESCRIPTOR
+                                         (load (load (field context exception-dependency))))]
+            (if (!= catch-declaration -1)
+                (fng-set-symbol! context
+                                 (fe-symbol-for-declaration frontend catch-declaration (.owner context))
+                                 thrown)
+                0)
+            (let [catch-continues (fng-statement context catch-block)
+                  catch-ctrl (if catch-continues (load (load (field context ctrl))) NO-NODE)
+                  catch-start (fng-snapshot! context (mut changed) (mut active) (mut snapshots))]
+              (set! answer
+                    (fng-merge-snapshots! context
+                                          try-ctrl try-start
+                                          catch-ctrl catch-start
+                                          (mut changed) (mut active) (mut snapshots)))))
+          (do
+            (if try-continues
+                (do (set! (load (field context ctrl)) try-ctrl)
+                    (fng-restore-snapshot! context
+                                           (mut changed) (mut active) (mut snapshots) try-start))
+                0)
+            (set! answer try-continues)))
+      0)
+    (al-free! [i64] (mut changed))
+    (al-free! [i64] (mut active))
+    (al-free! [i64] (mut snapshots))
+    (load answer)))
+
 (defn fng-statement [(context FngContext) (node i64)] (-> bool)
   (let [frontend (load (field context frontend))
         ast (field frontend ast)
@@ -7260,6 +7431,7 @@
               (fng-loop context condition body increment -1 NO-NODE -1))
           (= kind TSK-FOR-OF) (fng-for-of context node -1)
           (= kind TSK-SWITCH) (fng-switch context node -1)
+          (= kind TSK-TRY) (fng-try-catch context node)
           (= kind TSK-VARIABLE-DECLARATION-LIST) (do (fng-statement context (ts-child ast node 0)) true)
           (= kind TSK-BREAK) (do (fng-capture-jump! context node FNG-JUMP-BREAK) false)
           (= kind TSK-CONTINUE) (do (fng-capture-jump! context node FNG-JUMP-CONTINUE) false)
@@ -7307,12 +7479,14 @@
                                    (fng-expression-expected context value-node expected)))
               false)
           (= kind TSK-THROW)
-            (do
-              (fng-add-return! context
-                               (fng-jsl-call1 context "ThrowValue"
-                                              (n-box!
-                                                (fng-expression context
-                                                                (ts-child ast node 0)))))
+            (let [raised
+                    (fng-jsl-call1 context "ThrowValue"
+                                   (n-box! (fng-expression context (ts-child ast node 0))))]
+              ;; ThrowValue set the runtime pending value. Source `throw` is already known abrupt,
+              ;; so it routes directly. `%Throw` is an anchored effect in this block; unlike a call,
+              ;; source throw does not need a runtime query to decide whether this edge is abrupt.
+              (fng-abrupt-exception! context raised)
+              (set! (load (field context ctrl)) NO-NODE)
               false)
           ;; A nested function declaration contributes no statement effect here — its body is
           ;; compiled as its own graph function. It MUST report fall-through: the default `false`
@@ -7566,6 +7740,7 @@
         (mut target-active) (al-new [i64] (malloc-allocator))
         (mut jumps) (al-new [FngJump] (malloc-allocator))
         (mut jump-values) (al-new [i64] (malloc-allocator))
+        (mut exception-dependency) NO-NODE
         (mut dynamic-aliases) (al-new [i64] (malloc-allocator))
         (mut saved-capture-symbols) (al-new [i64] (malloc-allocator))
         (mut saved-capture-values) (al-new [i64] (malloc-allocator))
@@ -7666,6 +7841,7 @@
                          target-active
                          jumps
                          jump-values
+                         exception-dependency
                          cell-shape
                          cell-alias
                          (load receiver)

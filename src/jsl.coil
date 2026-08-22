@@ -696,6 +696,7 @@
    (ret           i64)          ; a TyId; TY-NO-ID when `:ret` was omitted
    (usesmem       bool)         ; reads the heap, so it takes memory as a trailing parameter
    (callsback     bool)         ; invokes a JavaScript callback value, directly or through a callee
+   (canthrow      bool)         ; may execute %Throw, directly or through a callee/callback
    (heapparams    i64)          ; bitset: parameters whose value reaches a heap-array operand
    (body          (ptr rd/Sexp))
    (fun           i64)])        ; the OPTAG-FUN node once lowered; NO-NODE until then
@@ -883,6 +884,9 @@
 (defn jsl-decl-calls-back? [(i i64)] (-> bool) (.callsback (jsl-decl-p i)))
 (defn jsl-decl-set-calls-back! [(i i64) (v bool)] (-> i64)
   (set! (.callsback (jsl-decl-p i)) v) 0)
+(defn jsl-decl-can-throw? [(i i64)] (-> bool) (.canthrow (jsl-decl-p i)))
+(defn jsl-decl-set-can-throw! [(i i64) (v bool)] (-> i64)
+  (set! (.canthrow (jsl-decl-p i)) v) 0)
 
 ;; A store straight into the live element.
 (defn jsl-decl-set-fun! [(i i64) (fun i64)] (-> i64)
@@ -1424,6 +1428,57 @@
   (let [d (jsl-find name)]
     (and (>= d 0) (jsl-decl-calls-back? d))))
 
+;; Exception checks are emitted only around definitions that can actually raise.  This fixed point
+;; keeps that optimization an exact property of the DSL call graph rather than a frontend list of
+;; operations someone must remember to update.
+(defn jsl-body-can-throw? [(x (ptr rd/Sexp))] (-> bool)
+  (if (and (not (rd/sexp-list? x)) (not (rd/sexp-vec? x))) false
+    (let [n (rd/sexp-count x) (mut i) 0 (mut found) false]
+      (if (and (rd/sexp-list? x) (and (> n 0) (rd/sexp-sym? (rd/sexp-nth x 0))))
+          (let [name (rd/sexp-sym (rd/sexp-nth x 0))]
+            (if (= name "%Throw")
+                (set! found true)
+                (if (or (= name "call")
+                        (or (= name "call-with-receiver") (= name "call-dynamic-with-receiver")))
+                    ;; User callbacks may throw even when their concrete target is not statically
+                    ;; visible to the library definition.
+                    (set! found true)
+                    (if (jsl-prim-name? name)
+                        0
+                        (let [callee (jsl-find name)]
+                          (if (and (>= callee 0) (jsl-decl-can-throw? callee))
+                              (set! found true)
+                              0))))))
+          0)
+      (loop (if (or (>= (load i) n) (load found)) (break)
+              (do (if (jsl-body-can-throw? (rd/sexp-nth x (load i))) (set! found true) 0)
+                  (set! i (+ (load i) 1)))))
+      (load found))))
+
+(defn jsl-resolve-throw-use! [] (-> i64)
+  (let [n (jsl-decl-count) (mut changed) true (mut rounds) 0]
+    (loop (if (not (load changed)) (break)
+            (do
+              (set! changed false)
+              (let [(mut i) 0]
+                (loop (if (>= (load i) n) (break)
+                        (do
+                          (if (jsl-decl-can-throw? (load i)) 0
+                              (if (jsl-body-can-throw? (jsl-decl-body (load i)))
+                                  (do (jsl-decl-set-can-throw! (load i) true)
+                                      (set! changed true))
+                                  0))
+                          (set! i (+ (load i) 1))))))
+              (set! rounds (+ (load rounds) 1))
+              (if (> (load rounds) (+ n 1))
+                  (do (jsl-fail! JSL-ERR-MACRO-RECURSION "throw-use fixpoint") 0)
+                  0))))
+    JSL-OK))
+
+(defn jsl-name-can-throw? [(name (slice u8))] (-> bool)
+  (let [d (jsl-find name)]
+    (and (>= d 0) (jsl-decl-can-throw? d))))
+
 (defn jsl-resolve-memory-use! [] (-> i64)
   (let [n (jsl-decl-count) (mut changed) true (mut rounds) 0]
     (loop (if (not (load changed)) (break)
@@ -1482,7 +1537,9 @@
           (let [mem (jsl-resolve-memory-use!)]
             (if (!= mem JSL-OK) mem
               (let [cb (jsl-resolve-callback-use!)]
-                (if (!= cb JSL-OK) cb (jsl-check-heap-shape))))))))))
+                (if (!= cb JSL-OK) cb
+                    (let [throws (jsl-resolve-throw-use!)]
+                      (if (!= throws JSL-OK) throws (jsl-check-heap-shape))))))))))))
 
 ; ============================================================================
 ; The reader

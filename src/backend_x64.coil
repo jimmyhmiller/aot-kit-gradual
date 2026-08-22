@@ -364,7 +364,11 @@
 
 (defn x64-runtime-call! [(m (ptr MInst)) (at i64)] (-> i64)
   (let [value (ms-inst-arg at 0)
-        rd (x64-write-gpr (.dst m) 14)]
+        rd (x64-write-gpr (.dst m) 14)
+        exception-fence
+          (and (= (.op m) MI-JSSTRING)
+               (or (= (.imm m) 201)
+                   (or (= (.imm m) 202) (or (= (.imm m) 203) (= (.imm m) 204)))))]
     ;; Machine allocation inherits AArch64's eight callee-saved FP colors. SysV has no
     ;; callee-saved XMM registers, so protect those colors explicitly across C runtime calls.
     (x64-sp-adjust! true 96)
@@ -373,16 +377,24 @@
                 (break)
                 (do (x64-fstore! 4 (+ 32 (* (- (load fp) 8) 8)) (load fp))
                     (set! fp (+ (load fp) 1))))))
+    ;; Pending/take/return exception operations use `.a` only as a machine dependency on the
+    ;; preceding call or throw. It may therefore be an FPR result, while the C operation ignores
+    ;; all three value operands. Keep the dependency in Machine IR but pass zero at the ABI.
+    (if exception-fence
+        (do (x64-mov-imm! 14 0) (x64-store! 4 0 14))
     (if (and (= (.op m) MI-JSSTRING) (= (.imm m) JSSOP-FROM-DOUBLE-BITS))
         (let [fa (x64-read-fpr-delta! (.a m) 15 96)]
           (if (< fa 0) (x64-fail! (.node m))
               (do (x64-movq-rx! 14 fa) (x64-store! 4 0 14))))
         (let [ra (x64-read-gpr-delta! (.a m) 14 96)]
-          (if (< ra 0) (x64-fail! (.node m)) (x64-store! 4 0 ra))))
-    (let [rb (x64-read-gpr-delta! (.b m) 14 96)]
-      (if (< rb 0) (x64-fail! (.node m)) (x64-store! 4 8 rb)))
-    (let [rv (x64-read-gpr-delta! value 14 96)]
-      (if (< rv 0) (x64-fail! (.node m)) (x64-store! 4 16 rv)))
+          (if (< ra 0) (x64-fail! (.node m)) (x64-store! 4 0 ra)))))
+    (if exception-fence
+        (do (x64-store! 4 8 14) (x64-store! 4 16 14))
+        (do
+          (let [rb (x64-read-gpr-delta! (.b m) 14 96)]
+            (if (< rb 0) (x64-fail! (.node m)) (x64-store! 4 8 rb)))
+          (let [rv (x64-read-gpr-delta! value 14 96)]
+            (if (< rv 0) (x64-fail! (.node m)) (x64-store! 4 16 rv)))))
     (x64-load! 7 4 0)
     (if (= (.op m) MI-JSPROP)
         (do (x64-load! 6 4 16) (x64-load! 2 4 8))
@@ -409,8 +421,8 @@
 
 (defn x64-fail! [(node i64)] (-> i64)
   (let [m (be-inst (load (x64-current-inst)))]
-    (fmt (stderr) "x64-encoding: unsupported op={d} node={d} owner={d} inst={d} dst={d}/{d}/{d} a={d}/{d}/{d} b={d}/{d}/{d}\n"
-         (load (x64-current-op)) node (load (x64-current-owner)) (load (x64-current-inst))
+    (fmt (stderr) "x64-encoding: unsupported op={d} imm={d} node={d} owner={d} inst={d} dst={d}/{d}/{d} a={d}/{d}/{d} b={d}/{d}/{d}\n"
+         (load (x64-current-op)) (.imm m) node (load (x64-current-owner)) (load (x64-current-inst))
          (.dst m) (if (< (.dst m) 0) -1 (mra-reg (.dst m)))
          (if (< (.dst m) 0) -1 (mra-spill (.dst m)))
          (.a m) (if (< (.a m) 0) -1 (mra-reg (.a m)))

@@ -12,7 +12,7 @@ deleted, and two of the four were fixed and still filed as open.
 
 | | count |
 |---|---|
-| whole programs compiled, run on the CPU and compared against node | 27 |
+| whole programs compiled, run on the CPU and compared against node | 32 |
 | methods agreeing with node, of those the sweep can call | 49 of 53 |
 | **open bugs, each a failing test** | 8 |
 

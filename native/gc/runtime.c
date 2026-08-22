@@ -57,6 +57,10 @@ static uint64_t gc_nanoseconds;
 static int barrier_disabled;
 static int array_scan_disabled;
 static int array_growth_disabled;
+/* Exception transport is process-local today, like the rest of the native harness runtime.  The
+   value is boxed so it can hold every JavaScript value and is treated as a GC root while pending. */
+static AotJsValue pending_exception = AOT_JS_UNDEFINED;
+static int exception_pending;
 
 typedef struct {
   uintptr_t owner;
@@ -787,9 +791,24 @@ AotJsValue aot_js_string(uintptr_t a, int64_t b,
 #ifdef AOT_B14_SWALLOW_THROW
     return (AotJsValue)a;
 #else
+    pending_exception = (AotJsValue)a;
+    exception_pending = 1;
+    return pending_exception;
+#endif
+  }
+  if (operation == 201)
+    return AOT_JS_BOOLEAN | (AotJsValue)(exception_pending != 0);
+  if (operation == 202) {
+    AotJsValue result = exception_pending ? pending_exception : AOT_JS_UNDEFINED;
+    pending_exception = AOT_JS_UNDEFINED;
+    exception_pending = 0;
+    return result;
+  }
+  if (operation == 203) {
+    AotJsValue thrown = exception_pending ? pending_exception : (AotJsValue)a;
 #ifdef AOT_DEBUG_THROW
-    fprintf(stderr, "uncaught JavaScript throw value=0x%016" PRIxPTR "\n", a);
-    uintptr_t thrown_owner = aot_js_payload((AotJsValue)a);
+    fprintf(stderr, "uncaught JavaScript throw value=0x%016" PRIx64 "\n", thrown);
+    uintptr_t thrown_owner = aot_js_payload(thrown);
     for (size_t i = 0; i < js_properties_len; ++i) {
       if (js_properties[i].owner != thrown_owner) continue;
       AotJsValue property_value = js_properties[i].value;
@@ -806,14 +825,15 @@ AotJsValue aot_js_string(uintptr_t a, int64_t b,
       fputc('\n', stderr);
     }
 #else
-    (void)a;
+    (void)thrown;
     fputs("uncaught JavaScript throw\n", stderr);
 #endif
     (void)b; (void)value;
     fflush(stderr);
     exit(70);
-#endif
   }
+  if (operation == 204)
+    return AOT_JS_UNDEFINED;
   if (operation >= 100 && operation < 117)
     return aot_js_builtin((AotJsValue)a, (AotJsValue)b, operation - 100);
   if (operation == AOT_JS_STRING_NEW) {
@@ -2079,6 +2099,7 @@ static int collect_impl(void *context, uint8_t *caller_sp, void *return_pc) {
   for (uint32_t r = 0; r < 10; ++r)
     register_slots[r] = (uintptr_t *)((uint8_t *)context + r * 8);
   if (!relocate_site_roots(site, caller_sp, register_slots)) return 0;
+  if (exception_pending && !relocate_boxed((uintptr_t *)&pending_exception)) return 0;
 
   uint8_t *frame_sp = caller_sp;
   uint32_t owner = site->owner;
@@ -2194,6 +2215,8 @@ int aot_gc_configure(size_t bytes, int stress) {
   barrier_disabled = 0;
   array_scan_disabled = 0;
   array_growth_disabled = 0;
+  pending_exception = AOT_JS_UNDEFINED;
+  exception_pending = 0;
   for (size_t i = 0; i < js_arrays_len; ++i) {
     free(js_arrays[i].elements);
   }
