@@ -509,6 +509,8 @@ static AotJsValue js_builtin_bits(double number) {
 AotJsValue aot_js_builtin(AotJsValue a, AotJsValue b, uint64_t operation) {
   if (operation == 20)
     return AOT_JS_FUNCTION | (UINT64_C(0x10000) + (a & UINT64_C(0xff)));
+  if (operation == 21)
+    return AOT_JS_OBJECT | (UINT64_C(0x20000) + ((a & UINT64_C(0xff)) << 3));
   double x = js_builtin_number(a), y = js_builtin_number(b), result = NAN;
   switch (operation) {
     case AOT_JS_BUILTIN_ABS: result = fabs(x); break;
@@ -850,7 +852,7 @@ AotJsValue aot_js_string(uintptr_t a, int64_t b,
   }
   if (operation == 204)
     return AOT_JS_UNDEFINED;
-  if ((operation >= 100 && operation < 117) || operation == 120)
+  if ((operation >= 100 && operation < 117) || (operation >= 120 && operation <= 121))
     return aot_js_builtin((AotJsValue)a, (AotJsValue)b, operation - 100);
   if (operation == AOT_JS_STRING_NEW) {
     JsStringRec *result = js_string_new(b < 0 ? 0 : (size_t)b);
@@ -1484,8 +1486,9 @@ AotJsValue aot_js_property(uintptr_t owner, uint64_t name,
   int64_t array_index = 0;
   JsArrayRec *indexed_array = js_array(owner, 0);
   if (getenv("AOT_TRACE_ARR"))
-    fprintf(stderr, "js_property owner=%p op=%llu indexed=%d value=%llx\n", (void *)owner,
-            (unsigned long long)operation, indexed_array != NULL, (unsigned long long)value);
+    fprintf(stderr, "js_property owner=%p name=%llx op=%llu indexed=%d value=%llx\n",
+            (void *)owner, (unsigned long long)name, (unsigned long long)operation,
+            indexed_array != NULL, (unsigned long long)value);
   if (indexed_array && js_property_key_ascii_equal((AotJsValue)name, "length")) {
     if (operation == 14) return 1;
     if (operation == 0) return aot_js_box_int((int64_t)indexed_array->length);

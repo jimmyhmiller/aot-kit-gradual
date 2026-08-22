@@ -22,6 +22,15 @@ The mandatory loop remains below one minute: `coil test` is **46 passed, 0 faile
 Frontier reaches all seven current intentional JavaScript bugs as **0 passed, 7 failed in 41.78 s**,
 with no xcrun, Mach-O, encoder, link, or Linux infrastructure failure.
 
+Stable built-in Object/Array prototype identities are now representation primitives, while
+constructor/prototype wiring, ordinary-object and array prototype initialization, `isPrototypeOf`,
+and borrowed `Object.prototype.hasOwnProperty.call`/`propertyIsEnumerable.call` semantics live in
+the DSL. The frontend only recognizes those exact structural call identities. Focused upstream
+Array prototype inheritance and `isPrototypeOf` variants pass, and the first 100
+`Object.defineProperty` files now report **102 passed, 98 failed, 0 refused**. A broad ES5 sample
+started against an older runner became invalid when lib files changed during its execution; its
+later “JSL runtime library did not load” results must not be used as a baseline or progress claim.
+
 ## TEST262 ITERATION IS SUB-MINUTE AND COERCION/ERROR FOUNDATIONS ARE NATIVE (2026-08-22, latest)
 
 The mandatory edit loop remains below one minute: `coil test` is **46 passed, 0 failed in 45.56 s**

@@ -3123,11 +3123,50 @@
         callee (ts-child ast node 0)]
     (if (= (ts-kind ast callee) TSK-PROPERTY-ACCESS)
         (let [name (ts-text ast (ts-child ast callee 1))]
-          (if (or (= name "hasOwnProperty") (= name "propertyIsEnumerable")) name ""))
+          (if (or (= name "hasOwnProperty")
+                  (or (= name "propertyIsEnumerable") (= name "isPrototypeOf"))) name ""))
         "")))
 
 (defn fng-object-prototype-call? [(context FngContext) (node i64)] (-> bool)
   (> (str-len (fng-object-prototype-call-name context node)) 0))
+
+;; The Test262 property helpers deliberately borrow the intrinsic method rather than trusting an
+;; object's possibly-shadowed member: `Object.prototype.hasOwnProperty.call(object, key)`. The
+;; frontend recognizes only that closed syntactic identity; HasOwnProperty still owns the complete
+;; JavaScript operation in lib/abstract/property.jsl.
+(defn fng-object-prototype-borrowed-name [(context FngContext) (node i64)] (-> (slice u8))
+  (let [frontend (load (field context frontend)) ast (field frontend ast)
+        callee (ts-child ast node 0)]
+    (if (and (= (ts-kind ast callee) TSK-PROPERTY-ACCESS)
+             (= (ts-text ast (ts-child ast callee 1)) "call"))
+        (let [method (ts-child ast callee 0)]
+          (if (= (ts-kind ast method) TSK-PROPERTY-ACCESS)
+              (let [name (ts-text ast (ts-child ast method 1))
+                    prototype (ts-child ast method 0)]
+                (if (and (or (= name "hasOwnProperty") (= name "propertyIsEnumerable"))
+                         (and (= (ts-kind ast prototype) TSK-PROPERTY-ACCESS)
+                              (and (= (ts-text ast (ts-child ast prototype 1)) "prototype")
+                                   (= (fe-resolution-symbol frontend (ts-child ast prototype 0))
+                                      FE-INTRINSIC-OBJECT))))
+                    name ""))
+              ""))
+        "")))
+
+(defn fng-object-prototype-borrowed? [(context FngContext) (node i64)] (-> bool)
+  (> (str-len (fng-object-prototype-borrowed-name context node)) 0))
+
+(defn fng-object-prototype-borrowed [(context FngContext) (node i64)] (-> i64)
+  (let [frontend (load (field context frontend)) ast (field frontend ast)
+        receiver (n-box! (if (> (ts-child-count ast node) 1)
+                            (fng-expression context (ts-child ast node 1))
+                            (fng-undefined)))
+        key (n-box! (if (> (ts-child-count ast node) 2)
+                       (fng-expression context (ts-child ast node 2))
+                       (fng-undefined)))]
+    (fng-jsl-call2 context
+      (if (= (fng-object-prototype-borrowed-name context node) "hasOwnProperty")
+          "HasOwnProperty" "PropertyIsEnumerable")
+      receiver key)))
 
 (defn fng-object-prototype-call [(context FngContext) (node i64)] (-> i64)
   (let [frontend (load (field context frontend)) ast (field frontend ast)
@@ -3137,12 +3176,15 @@
                        (fng-expression context (ts-child ast node 1))
                        (fng-undefined)))]
     (fng-jsl-call2 context
-      (if (= (fng-object-prototype-call-name context node) "hasOwnProperty")
-          "HasOwnProperty" "PropertyIsEnumerable")
+      (let [name (fng-object-prototype-call-name context node)]
+        (cond (= name "hasOwnProperty") "HasOwnProperty"
+              (= name "propertyIsEnumerable") "PropertyIsEnumerable"
+              :else "IsPrototypeOf"))
       receiver key)))
 
 (defn fng-object-method-value? [(context FngContext) (node i64)] (-> bool)
-  (> (str-len (fng-object-static-direct-name context node)) 0))
+  (let [name (fng-object-static-direct-name context node)]
+    (and (> (str-len name) 0) (!= name "prototype"))))
 
 (defn fng-object-method-value [(context FngContext) (node i64)] (-> i64)
   (let [name (fng-object-static-direct-name context node)
@@ -5150,6 +5192,9 @@
                     (set! dynamic-at (+ (load dynamic-at) 1))
                     0))))
       (set! (load (field context memory)) (fng-merge stores))
+      ;; Object.prototype identity and constructor wiring are JavaScript semantics, so invoke the
+      ;; DSL operation after the structural allocation rather than open-coding either property.
+      (fng-jsl-call1 context "InitializeOrdinaryObject" object)
       ;; Static slots are the compiler's fast representation, but JavaScript own-key enumeration
       ;; and computed-name access use the DSL property heap. Publish each initialized property
       ;; through SetNamedProperty as well, so both representations begin with the same values and
@@ -5178,6 +5223,7 @@
         object (n-obj-ptr allocation)
         (mut index) 0]
     (fng-record-dynamic-alias! context JS-PROPERTY-ALIAS)
+    (fng-jsl-call1 context "InitializeOrdinaryObject" object)
     (loop (if (>= (load index) (ts-child-count ast node))
               (break)
               (do
@@ -5219,6 +5265,7 @@
         array (n-array-mark! (load (load (field context ctrl))) (n-obj-ptr allocation))
         (mut index) 0]
     (fng-record-dynamic-alias! context JS-PROPERTY-ALIAS)
+    (fng-jsl-call1 context "InitializeArray" array)
     (loop (if (>= (load index) (ts-child-count ast node))
               (break)
               (let [element (ts-child ast node (load index))]
@@ -5356,8 +5403,23 @@
   (let [frontend (load (field context frontend))
         ast (field frontend ast)
         object-node (ts-role ast node TS-ROLE-OBJECT 0)
-        name-node (ts-role ast node TS-ROLE-PROPERTY 0)]
-    (fng-field-load-value context node object-node name-node (fng-expression context object-node))))
+        name-node (ts-role ast node TS-ROLE-PROPERTY 0)
+        symbol (fe-resolution-symbol frontend object-node)
+        builtin-constructor
+          (or (= symbol FE-INTRINSIC-OBJECT)
+              (or (= symbol FE-INTRINSIC-ARRAY)
+                  (or (= symbol FE-INTRINSIC-STRING)
+                      (or (= symbol FE-INTRINSIC-NUMBER)
+                          (= symbol FE-INTRINSIC-BOOLEAN)))))]
+    ;; Built-in constructors are opaque tagged identities with their observable own properties in
+    ;; the DSL property heap. They have no static object layout to load from; syntax resolution is
+    ;; used only to choose that representation path, while generic GetProperty owns the operation.
+    (if builtin-constructor
+        (fng-jsl-call2 context "GetProperty"
+                       (fng-expression context object-node)
+                       (n-string-const! (jss-from-utf8! (ts-text ast name-node))))
+        (fng-field-load-value context node object-node name-node
+                              (fng-expression context object-node)))))
 
 (defn fng-optional-field-load [(context FngContext) (node i64)] (-> i64)
   (let [frontend (load (field context frontend))
@@ -6175,6 +6237,8 @@
                     (fng-object-assign context node)
             (if (fng-object-descriptor-call? context node)
                 (fng-object-descriptor-call context node)
+            (if (fng-object-prototype-borrowed? context node)
+                (fng-object-prototype-borrowed context node)
             (if (fng-object-prototype-call? context node)
                 (fng-object-prototype-call context node)
                 (if (fng-object-freeze? context node)
@@ -6187,7 +6251,7 @@
                         (fng-string-call context node)
                         (if (fng-array-builtin? context node)
                             (fng-array-call context node)
-                            (fng-call context node))))))))))))))))))))))))))
+                            (fng-call context node)))))))))))))))))))))))))))
           (= kind TSK-NEW-EXPRESSION)
             (if (fng-object-convert? context node)
                 (fng-object-convert context node)
