@@ -293,13 +293,13 @@
                 (set! index (+ (load index) 1)))))
     (load found)))
 
-;; `for (const x of xs)` only, and the refusals here are the whole reason this is a separate check.
-;; An assignment target (`for (x of xs)`) writes a binding that already exists, and a binding
-;; pattern (`for (const [a, b] of xs)`) is destructuring; neither is lowered, and both would
+;; A single declared identifier in `for ... of` or `for ... in`, and the refusals here are the
+;; whole reason this is a separate check. An assignment target (`for (x of xs)`) writes a binding
+;; that already exists, and a binding pattern (`for (const [a, b] of xs)`) is destructuring; neither is lowered, and both would
 ;; otherwise reach the graph builder as a declaration list it would silently read the wrong child
 ;; of. `for (let a = 1, b of xs)` is not valid TypeScript, but the single-declarator check costs
 ;; nothing and says so.
-(defn fe-for-of-binding-valid? [(ast TsAst) (node i64)] (-> bool)
+(defn fe-for-enumeration-binding-valid? [(ast TsAst) (node i64)] (-> bool)
   (let [initializer (ts-role ast node TS-ROLE-INITIALIZER 0)]
     (and (!= initializer -1)
          (and (= (ts-kind ast initializer) TSK-VARIABLE-DECLARATION-LIST)
@@ -398,19 +398,22 @@
                                               (or (= statement-kind TSK-DO)
                                                   (or (= statement-kind TSK-WHILE)
                                                       (or (= statement-kind TSK-FOR)
-                                                          (= statement-kind TSK-FOR-OF))))))
+                                                          (or (= statement-kind TSK-FOR-OF)
+                                                              (= statement-kind TSK-FOR-IN)))))))
                     (fe-validate-node! (mut frontend) statement (mut targets))
                     (store! (field targets len) (- (al-len [FeTarget] (load targets)) 1)))))
-          (and (= kind TSK-FOR-OF) (not (fe-for-of-binding-valid? ast node)))
+          (and (or (= kind TSK-FOR-OF) (= kind TSK-FOR-IN))
+               (not (fe-for-enumeration-binding-valid? ast node)))
             (fe-fail! (mut frontend) FE-CODE-UNSUPPORTED-SYNTAX node TS-ROLE-INITIALIZER)
-          ;; `for (k in o)` and `for await (x of xs)` are refused HERE rather than by the graph
-          ;; builder's kind-0 abort. Same answer, three differences that matter: the message names
-          ;; the construct, the refusal is recoverable, and a test can therefore observe it --
-          ;; `tests/native-frontier-test.coil` asserts both on every gate.
-          (or (= kind TSK-FOR-IN) (= kind TSK-FOR-AWAIT))
+          ;; `for await (x of xs)` is refused HERE rather than by the graph builder's kind-0
+          ;; abort. Same answer, three differences that matter: the message names the construct,
+          ;; the refusal is recoverable, and a test can therefore observe it.
+          (= kind TSK-FOR-AWAIT)
             (fe-fail! (mut frontend) FE-CODE-UNSUPPORTED-SYNTAX node TS-ROLE-EXPRESSION)
           (or (= kind TSK-DO)
-              (or (= kind TSK-WHILE) (or (= kind TSK-FOR) (= kind TSK-FOR-OF))))
+              (or (= kind TSK-WHILE)
+                  (or (= kind TSK-FOR)
+                      (or (= kind TSK-FOR-OF) (= kind TSK-FOR-IN)))))
             (let [(mut index) 0]
               (al-push! [FeTarget] (mut targets) (fe-target-make -1 true true))
               (loop (if (or (>= (load index) (ts-child-count ast node))
@@ -1407,7 +1410,7 @@
           ;; inside the loop. The default child walk got both wrong: it walks children in order,
           ;; so it bound the name before descending into the expression, and it never popped the
           ;; binding, leaving it in scope for every statement after the loop.
-          (= kind TSK-FOR-OF)
+          (or (= kind TSK-FOR-OF) (= kind TSK-FOR-IN))
             (let [saved (al-len [FeBinding] (load bindings))]
               (fe-resolve-node! (mut frontend)
                                 (mut bindings)

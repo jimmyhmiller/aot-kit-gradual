@@ -4842,6 +4842,20 @@
                     (set! dynamic-at (+ (load dynamic-at) 1))
                     0))))
       (set! (load (field context memory)) (fng-merge stores))
+      ;; Static slots are the compiler's fast representation, but JavaScript own-key enumeration
+      ;; and computed-name access use the DSL property heap. Publish each initialized property
+      ;; through SetNamedProperty as well, so both representations begin with the same values and
+      ;; the observable property operation remains DSL-owned.
+      (set! index 0)
+      (loop (if (>= (load index) field-count)
+                (break)
+                (let [property (ts-child ast node (load index))
+                      name-node (ts-child ast property 0)]
+                  (fng-jsl-call3 context "SetNamedProperty"
+                                 object
+                                 (fng-const (shape-name-intern! (ts-text ast name-node)))
+                                 (al-get [i64] (load field-values) (load index)))
+                  (set! index (+ (load index) 1)))))
       (al-free! [i64] (mut field-values))
       (al-free! [i64] (mut incoming))
       (al-free! [i64] (mut active))
@@ -5332,6 +5346,13 @@
                 ;; dynamic aliases and the closure cell as well, which this also owed.
                 (set! (load (field context memory))
                       (fng-preserve-active-memory context stored))
+                ;; Keep the DSL property heap synchronized with the static slot. Computed reads
+                ;; and own-key enumeration observe that heap; the slot remains a representation
+                ;; optimization for statically resolved reads.
+                (fng-jsl-call3 context "SetNamedProperty"
+                               (.object target)
+                               (fng-const (.key target))
+                               new-value)
                 new-value))
           (if (= (.kind target) FNG-LVALUE-ELEMENT)
               (fng-jsl-call3 context "SetElement"
@@ -7346,18 +7367,34 @@
 (defn fng-for-of [(context FngContext) (node i64) (label-node i64)] (-> bool)
   (let [frontend (load (field context frontend))
         ast (field frontend ast)
-        ;; `fe-for-of-binding-valid?` has already refused every other initializer shape.
+        ;; `fe-for-enumeration-binding-valid?` has already refused every other initializer shape.
         declaration (ts-child ast (ts-role ast node TS-ROLE-INITIALIZER 0) 0)
         symbol (fe-symbol-for-declaration frontend declaration (.owner context))
-        ;; UNBOXED, exactly as `xs.values()` passes it. `%InternalTarget` hands whatever went in
-        ;; straight to `%ArrayLen`, so a tagged word here makes the iterator answer "done" on its
-        ;; first step and the loop body never runs. `GetIterator` tags for its `%IsArray` test and
-        ;; nowhere else.
         iterable (fng-expression context (ts-role ast node TS-ROLE-EXPRESSION 0))
-        iterator (fng-jsl-call1 context "GetIterator" iterable)]
+        iterator (fng-jsl-call1 context "GetIterator" (n-box! iterable))]
     ;; The element type is whatever the iterable holds, which nothing here claims to know. The
     ;; symbol was initialized to `undefined`/FNG-VOID by `fng-initialize-locals!`, and leaving it
     ;; there would tell inference the binding is undefined on every read.
+    (fng-set-symbol-type! context symbol FNG-DYNAMIC)
+    (fng-loop context
+              -1
+              (ts-role ast node TS-ROLE-STATEMENT 0)
+              -1
+              label-node
+              iterator
+              symbol)))
+
+;; `for (const key in object)` enumerates through DSL-owned ObjectKeys. The frontend owns only the
+;; syntax binding and loop graph; coercion, key discovery, ordering, and iterator behavior remain
+;; JavaScript operations in `lib/`.
+(defn fng-for-in [(context FngContext) (node i64) (label-node i64)] (-> bool)
+  (let [frontend (load (field context frontend))
+        ast (field frontend ast)
+        declaration (ts-child ast (ts-role ast node TS-ROLE-INITIALIZER 0) 0)
+        symbol (fe-symbol-for-declaration frontend declaration (.owner context))
+        object (n-box! (fng-expression context (ts-role ast node TS-ROLE-EXPRESSION 0)))
+        keys (fng-jsl-call1 context "ObjectKeys" object)
+        iterator (fng-jsl-call1 context "GetIterator" (n-box! keys))]
     (fng-set-symbol-type! context symbol FNG-DYNAMIC)
     (fng-loop context
               -1
@@ -7461,6 +7498,7 @@
               (fng-statement context initialize)
               (fng-loop context condition body increment -1 NO-NODE -1))
           (= kind TSK-FOR-OF) (fng-for-of context node -1)
+          (= kind TSK-FOR-IN) (fng-for-in context node -1)
           (= kind TSK-SWITCH) (fng-switch context node -1)
           (= kind TSK-TRY) (fng-try-catch context node)
           (= kind TSK-VARIABLE-DECLARATION-LIST) (do (fng-statement context (ts-child ast node 0)) true)
@@ -7491,6 +7529,7 @@
                         (fng-statement context initialize)
                         (fng-loop context condition body increment label NO-NODE -1))
                     (= (ts-kind ast statement) TSK-FOR-OF) (fng-for-of context statement label)
+                    (= (ts-kind ast statement) TSK-FOR-IN) (fng-for-in context statement label)
                     (= (ts-kind ast statement) TSK-SWITCH) (fng-switch context statement label)
                     :else (fng-labeled-block context statement label)))
           (= kind TSK-VARIABLE-DECLARATION)

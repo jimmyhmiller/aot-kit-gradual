@@ -1,5 +1,40 @@
 # Handoff: move JavaScript semantics into the DSL
 
+## THE MANDATORY GATE IS BOUNDED BELOW ONE MINUTE (2026-08-22, latest)
+
+The former default compiled all 46 test modules into one 3.1 GiB runner before executing 442 tests.
+Compilation alone measured **85.92 s**, and broad native capability/execution tests each consumed
+about 130 CPU-seconds rebuilding and linking many JavaScript programs. That made the standing-order
+gate take many minutes even when nothing failed.
+
+Plain `coil test` now builds one explicit gate aggregator: DSL ownership and complete library
+lowering, frontend indexing/graph checks, and a TypeScript → selection → allocation → x86-64 encode
+→ direct host execution witness. It is **46 passed, 0 failed in 44.87 s** from a cold invocation in
+this orb. The previous 442-test coverage remains unchanged under `coil test --suite full`; the red
+work queue remains `coil test --suite frontier`. `AGENTS.md` names which command belongs in the
+per-edit loop and when the exhaustive suite is warranted.
+
+## DSL-OWNED `FOR ... IN` UNLOCKS TEST262 PROPERTY HELPERS (2026-08-22, latest)
+
+The native frontend now accepts a single declared identifier in `for ... in`, resolves its right
+hand side outside the loop binding, and reuses the existing iterator/control graph. It does not
+open-code enumeration: `ObjectKeys`, `GetIterator`, `ArrayIteratorNext`, `IteratorComplete`, and
+`IteratorValue` remain the operations in `lib/**/*.jsl`. `GetIterator` now has one tagged-value
+parameter contract and performs its representation unbox inside the DSL.
+
+Statically shaped object literals now publish their initial named properties through DSL
+`SetNamedProperty` in addition to their fast slots, and later static writes keep that observable
+property heap synchronized. That makes own-key enumeration and computed reads see the same values
+as static reads. The node-differential regression covers `const` and `var` bindings, nesting,
+labels, and `continue`; the former frontier repro now answers node's 9 and was retired. The derived
+frontier is seven open bugs. Current enumeration is a snapshot of own keys; inherited prototype
+keys and mutation-sensitive `EnumerateObjectProperties` remain future completeness work.
+
+The first 100 lexicographic Test262 paths still report **0 passed, 2 failed, 180 refused, 9
+skipped**, but the 38 earlier `for (var ... in ...)` refusals are gone and now reach later harness
+dependencies, chiefly unsupported `Function`, `Date`, RegExp, and `Reflect`. The two actual failures
+remain both modes of Annex B `String.prototype.anchor`, at the pre-existing NO-NODE graph boundary.
+
 ## PACKED ALLOCATION VERIFICATION UNBLOCKS LARGER TEST262 GRAPHS (2026-08-22, latest)
 
 `mra-verify!` no longer duplicates its quadratic interference matrix as one i64 per boolean cell.

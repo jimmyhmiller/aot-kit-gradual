@@ -1,11 +1,17 @@
 # Standing orders
 
-## Run both suites. Every time.
+## Run the bounded gate and frontier. Every time.
 
 ```
-coil test                      # the gate. MUST be green. Anything red here is a regression.
+coil test                      # the <1 minute gate. MUST be green.
 coil test --suite frontier     # the open bugs. RED, and that is the point.
 ```
+
+The exhaustive suite remains available as `coil test --suite full`. It compiles all test modules,
+runs broad native differential sweeps, regenerates reports, and currently takes many minutes; use
+it before a broad release or when changing shared compiler invariants, not as the per-edit gate.
+The default gate deliberately covers DSL ownership/loading, frontend indexing, graph verification,
+selection, allocation, x86-64 encoding, and one host-native execution witness in one bounded runner.
 
 **Run the frontier suite at the start of a session and again before you hand off.** It is
 `default = false` in `Coil.toml` so a permanently red `coil test` cannot destroy the gate's
@@ -14,7 +20,7 @@ means green. That is the only reason it is opt-in, and it is the one thing about
 could let the frontier drift out of sight. Hence this file, and hence the banner the gate prints:
 
 ```
-=== THE FRONTIER: 8 OPEN BUGS ===
+=== THE FRONTIER: 7 OPEN BUGS ===
 ```
 
 ## The frontier IS the work queue
