@@ -483,17 +483,32 @@
                 (set! vr (+ (load vr) 1))
                 0)))
     (if (= (mra-result) MRA-OK)
-        (let [cells (* vregs vregs) (mut cell) 0]
-          ;; Snapshot the published graph, rebuild it with the same reverse-liveness construction,
-          ;; and compare matrices linearly. Calling mra-expected-interferes? for every pair scanned
-          ;; every block again, making verification quartic on whole benchmark programs.
+        (let [cells (* vregs vregs)
+              words (/ (+ cells 63) 64)
+              (mut word) 0
+              (mut cell) 0]
+          ;; Snapshot the published graph as a BITSET, rebuild it with the same reverse-liveness
+          ;; construction, and compare matrices linearly. The matrix cells are booleans; retaining
+          ;; one i64 per cell doubled the quadratic allocation merely to verify it (4,934 vregs
+          ;; reserved another 256 MiB). Calling mra-expected-interferes? for every pair instead
+          ;; scanned every block again, making verification quartic on whole benchmark programs.
           (al-clear! [i64] (field u alloc-expected))
+          (loop (if (>= (load word) words)
+                    (break)
+                    (do
+                      (al-push! [i64] (field u alloc-expected) 0)
+                      (set! word (+ (load word) 1)))))
           (loop (if (>= (load cell) cells)
                     (break)
                     (do
-                      (al-push! [i64]
-                                (field u alloc-expected)
-                                (al-get (.alloc-interference u) (load cell)))
+                      (if (!= (al-get (.alloc-interference u) (load cell)) 0)
+                          (let [at (/ (load cell) 64)]
+                            (al-set! [i64]
+                                     (field u alloc-expected)
+                                     at
+                                     (| (al-get (.alloc-expected u) at)
+                                        (<< 1 (% (load cell) 64)))))
+                          0)
                       (al-set! [i64] (field u alloc-interference) (load cell) 0)
                       (set! cell (+ (load cell) 1)))))
           (mra-build-interference!)
@@ -502,7 +517,9 @@
                     (break)
                     (do
                       (if (!= (al-get (.alloc-interference u) (load cell))
-                              (al-get (.alloc-expected u) (load cell)))
+                              (& (>> (al-get (.alloc-expected u) (/ (load cell) 64))
+                                     (% (load cell) 64))
+                                 1))
                           (do
                             (set! (.allocation-result u) MRA-INTERFERENCE)
                             (set! (.allocation-item u) (load cell)))

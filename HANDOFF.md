@@ -1,5 +1,25 @@
 # Handoff: move JavaScript semantics into the DSL
 
+## PACKED ALLOCATION VERIFICATION UNBLOCKS LARGER TEST262 GRAPHS (2026-08-22, latest)
+
+`mra-verify!` no longer duplicates its quadratic interference matrix as one i64 per boolean cell.
+Its exact pre-rebuild snapshot is now a bitset, retaining cell-by-cell corruption detection at
+1/64 the storage. GDB identified the old verifier-only copy as the 2 GiB failure: a 4,934-vreg
+Test262 program reserved another 256 MiB while coloring despite using about 405 MiB resident.
+
+The byte-identical upstream `assert-throws-null-fn.js` case, which contains three sequential caught
+assertion failures and previously exhausted the runner's 2 GiB cap, now passes default and strict at
+that original cap. The complete synchronous upstream `assert-throws-*` sample is now **18 passed,
+2 failed, 1 skipped**. Only `assert-throws-custom-typeerror.js` fails, in both modes, because an
+aliased built-in Error identity cannot yet serve as a polymorphic constructor; the `$262` same-realm
+case remains policy-skipped. The pinned runner is **16 passed, 0 failed, 0 refused, 0 skipped** over
+eight upstream files.
+
+Final verification with current Coil: `coil test` is **441 passed, 0 failed**; allocation is
+**10 passed, 0 failed**; focused Test262 harness is **9 passed, 0 failed**. The frontier remains the
+intentional **0 passed, 8 failed**, with the same seven named refusals and 26-vs-25 disagreement and
+no infrastructure failure.
+
 ## ORDINARY CONSTRUCTOR IDENTITY MAKES ASSERTION FAILURES CATCHABLE (2026-08-22, latest)
 
 Synthesized ordinary function prototypes now receive their standard `constructor` property through
