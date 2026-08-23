@@ -1,5 +1,16 @@
 # Handoff: move JavaScript semantics into the DSL
 
+## SELECTION DEPENDENCY REPAIR USES DIRECT INDICES (2026-08-23, latest)
+
+Selection's late-memory-dependency repair now uses the existing direct owner/node instruction
+index rather than repeatedly scanning the entire machine unit. Its independent verifier builds a
+verifier-owned per-function memory-read index, preserving the check while avoiding a whole-unit
+scan for every memory write. On the fixed 177-record Test262 benchmark, all path+variant statuses
+and categories match exactly (16 passed, 95 failed, 49 refused, 17 policy-skipped), while aggregate
+selection time fell from 9.857 s to 8.785 s. Measured Array reduce repair cases improved from about
+229 ms to 160 ms and from about 680 ms to 345 ms. The mandatory gate remains 46/46 green; frontier
+reaches all seven intentional JavaScript failures with no platform infrastructure failure.
+
 ## COMPLETE TEST262 RUN MEASURED; TEN MINUTES REMAINS OPEN (2026-08-23, latest)
 
 A clean run covered all **53,578** upstream files at Test262

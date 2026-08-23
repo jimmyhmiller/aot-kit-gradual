@@ -3726,24 +3726,33 @@
     0))
 
 (defn ms-find-node-inst-after [(owner i64) (node i64) (after i64)] (-> i64)
-  (let [(mut at) (+ after 1)
+  (let [u (machine-unit)
+        nodes (n-count)
+        key (+ (* owner nodes) node)
+        (mut at) (if (or (< owner 0) (or (< node 0)
+                                          (>= key (al-len [i64] (.node-inst-head u)))))
+                     -1
+                     (al-get [i64] (.node-inst-head u) key))
         (mut found) -1]
-    (loop (if (or (>= (load at) (be-inst-count)) (>= (load found) 0))
+    ;; The cached list is newest instruction first. Stop as soon as
+    ;; it reaches `after`; the last greater entry was the nearest producer.
+    (loop (if (< (load at) 0)
               (break)
               (do
-                (let [m (be-inst (load at))]
-                  (if (and (= (.owner m) owner)
-                           (= (.node m) node))
+                (if (<= (load at) after)
+                    (set! at -1)
+                    (do
                       (set! found (load at))
-                      0))
-                (set! at (+ (load at) 1)))))
+                      (set! at (al-get [i64] (.node-inst-next u) (load at)))
+                      0)))))
     (load found)))
 
 ;; GCM preserves provisional instruction order within each destination block. Demand-driven
 ;; selection can nevertheless emit a consumer before an already-ordered memory predecessor. Move
 ;; that predecessor ahead of the consumer before the ordinary scalar/data scheduler runs.
 (defn ms-repair-late-memory-deps! [] (-> bool)
-  (let [limit (* (be-inst-count) (be-inst-count))
+  (let [started (ms-profile-now)
+        limit (* (be-inst-count) (be-inst-count))
         (mut moves) 0
         (mut changed) true
         (mut ok) true]
@@ -3778,12 +3787,19 @@
                                                             (set! (be-inst (load at)) (load (be-inst (- (load at) 1))))
                                                             (set! at (- (load at) 1)))))
                                                 (set! (be-inst (load consumer)) saved)
+                                                ;; The move changes physical instruction indices.
+                                                ;; Rebuild the direct node index before the next
+                                                ;; dependency query instead of falling back to a
+                                                ;; whole-unit scan for every consumer/dependency.
+                                                (ms-cache-def-insts!)
                                                 (set! moves (+ (load moves) 1))
                                                 (set! changed true)
                                                 (if (> (load moves) limit) (set! ok false) 0))
                                               0)
                                           (set! dep (+ (load dep) 1)))))
                               (set! consumer (+ (load consumer) 1)))))))))
+    (fmt (stderr) "AOTK_PROFILE phase=selection_memory_repair ns={d} moves={d}\n"
+         (- (ms-profile-now) started) (load moves))
     (load ok)))
 
 (defn ms-select-built-core! [] (-> bool)
@@ -3856,13 +3872,27 @@
           ; Usually GCM's stable packing is already dependency-topological, and retaining
           ; it keeps selection dumps stable. If a cross-block move put a producer after its use,
           ; repair only that case with the dependency-aware seed-0 scheduler.
-          (if (ms-verify!)
-              true
-              (if (= (ms-result) MSEL-DEPENDENCY)
-                  (if (and (ms-repair-late-memory-deps!) (ms-local-schedule! 0))
-                      (ms-verify!)
-                      false)
-                  false)))
+          (let [verify-start (ms-profile-now)
+                verified (ms-verify!)]
+            (ms-profile-note! "selection_verify" verify-start)
+            (if verified
+                true
+                (if (= (ms-result) MSEL-DEPENDENCY)
+                    (let [repair-start (ms-profile-now)
+                          repaired (ms-repair-late-memory-deps!)]
+                      (ms-profile-note! "selection_repair" repair-start)
+                      (if repaired
+                          (let [schedule-start (ms-profile-now)
+                                scheduled (ms-local-schedule! 0)]
+                            (ms-profile-note! "selection_repair_schedule" schedule-start)
+                            (if scheduled
+                                (let [reverify-start (ms-profile-now)
+                                      reverified (ms-verify!)]
+                                  (ms-profile-note! "selection_reverify" reverify-start)
+                                  reverified)
+                                false))
+                          false))
+                    false))))
         false)))
 
 (defn ms-select-built! [] (-> bool)
@@ -4264,7 +4294,16 @@
         (if (or (< first 0) (or (< count 0) (> (+ first count) total)))
             false
             (do
-              (loop (if (or (>= (load prior) (be-inst-count)) (not (load ok)))
+              ;; Rebuild a verifier-owned read index once, then inspect only this
+              ;; write's function. The previous verifier scanned the entire machine
+              ;; unit for every write with anti-dependencies, making this independent
+              ;; check quadratic even though the selector's builder was indexed.
+              (set! prior
+                    (if (and (>= (.owner m) 0)
+                             (< (.owner m) (al-len [i64] (.verify-memory-read-head u))))
+                        (al-get [i64] (.verify-memory-read-head u) (.owner m))
+                        -1))
+              (loop (if (or (< (load prior) 0) (not (load ok)))
                         (break)
                         (do
                           (let [candidate (be-inst (load prior))]
@@ -4295,7 +4334,8 @@
                                     (if (not (load listed)) (set! ok false) 0))
                                   (set! seen (+ (load seen) 1)))
                                 0))
-                          (set! prior (+ (load prior) 1))
+                          (set! prior
+                                (al-get [i64] (.verify-memory-read-next u) (load prior)))
                           0)))
               (and (load ok) (= (load seen) count)))))))
 
@@ -4502,6 +4542,8 @@
     (al-clear! [i64] (field u verify-membership))
     (al-clear! [i64] (field u verify-block-phi-head))
     (al-clear! [i64] (field u verify-node-phi-next))
+    (al-clear! [i64] (field u verify-memory-read-head))
+    (al-clear! [i64] (field u verify-memory-read-next))
     (loop (if (>= (load i) vregs) (break)
               (do (al-push! [i64] (field u verify-def-count) 0)
                   (set! i (+ (load i) 1)))))
@@ -4513,6 +4555,10 @@
     (set! i 0)
     (loop (if (>= (load i) blocks) (break)
               (do (al-push! [i64] (field u verify-block-phi-head) -1)
+                  (set! i (+ (load i) 1)))))
+    (set! i 0)
+    (loop (if (>= (load i) funcs) (break)
+              (do (al-push! [i64] (field u verify-memory-read-head) -1)
                   (set! i (+ (load i) 1)))))
     (set! i 0)
     (loop (if (>= (load i) nodes) (break)
@@ -4540,6 +4586,7 @@
               (do
                 (al-push! [i64] (field u verify-membership) 0)
                 (al-push! [i64] (field u verify-node-inst-next) -1)
+                (al-push! [i64] (field u verify-memory-read-next) -1)
                 (let [m (be-inst (load i))
                       dst (.dst m)
                       owner (.owner m)
@@ -4550,6 +4597,14 @@
                         (al-set! [i64] (field u verify-node-inst-next) (load i)
                                  (al-get [i64] (.verify-node-inst-head u) key))
                         (al-set! [i64] (field u verify-node-inst-head) key (load i)))
+                      0)
+                  (if (and (>= owner 0)
+                           (and (< owner funcs) (ms-machine-memory-read? m)))
+                      (do
+                        (al-set! [i64] (field u verify-memory-read-next) (load i)
+                                 (al-get [i64] (.verify-memory-read-head u) owner))
+                        (al-set! [i64] (field u verify-memory-read-head) owner (load i))
+                        0)
                       0)
                   (if (>= dst 0)
                       (do
