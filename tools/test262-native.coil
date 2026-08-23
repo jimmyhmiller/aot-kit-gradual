@@ -3,6 +3,7 @@
 (import "coil.primitive" :as primitive)
 (import "nativeharness" :use *)
 (import "frontendnative" :use *)
+(import "frontendnativegraph" :use [frontend-native-reuse-jsl-index!])
 (import "typescriptnative" :use *)
 (import "coil.alloc" :use * :as alloc)
 (import "coil.args" :use *)
@@ -12,11 +13,51 @@
 (import "coil.result" :use *)
 (import "coil.slice" :use *)
 
+(extern fdopen :cc c [i32 (ptr i8)] (-> (ptr u8)))
+(extern fgets :cc c [(ptr i8) i32 (ptr u8)] (-> (ptr i8)))
+(extern fflush :cc c [(ptr u8)] (-> i32))
+
+(defn t262-native-server [] (-> i64)
+  (let [input (fdopen 0 (cast (ptr i8) (slice-data "r")))
+        buffer (primitive/alloc-stack (array i8 4096))
+        (mut index) 0]
+    (loop
+      (let [line (fgets (cast (ptr i8) buffer) 4096 input)]
+        (if (= (cast i64 line) 0)
+            (break)
+            (let [(mut length) 0]
+              (loop (if (or (>= (load length) 4095)
+                            (= (load (index (cast (ptr i8) buffer) (load length))) (cast i8 0)))
+                        (break)
+                        (set! length (+ (load length) 1))))
+              (loop (if (or (<= (load length) 0)
+                            (and (!= (load (index (cast (ptr i8) buffer) (- (load length) 1)))
+                                      (cast i8 10))
+                                 (!= (load (index (cast (ptr i8) buffer) (- (load length) 1)))
+                                      (cast i8 13))))
+                        (break)
+                        (set! length (- (load length) 1))))
+              (if (> (load length) 0)
+                  (do
+                    (fmt (stderr) "AOTK_CASE_BEGIN index={d}\n" (load index))
+                    (let [status (t262-native-one
+                                   (slice-new [u8] (cast (ptr u8) buffer) (load length)))]
+                      ;; stdout ordering guarantees the result line above is visible before this
+                      ;; completion marker even though diagnostics use a separate stderr pipe.
+                      (fmt (stdout) "AOTK_CASE_END index={d} status={d}\n"
+                           (load index) (if (= status 0) 0 1))
+                      (fflush (cast (ptr u8) 0)))
+                    (set! index (+ (load index) 1))
+                    0)
+                  0))))
+    0)))
+
 (defn t262-native-read [(a (dyn Allocator)) (path (slice u8))] (-> (slice u8))
   (try (try-or! (read-file a path) "")))
 
 (defn t262-native-one [(path (slice u8))] (-> i64)
   (block :done
+    (fmt (stderr) "AOTK_READY ns={d}\n" (nh-now-ns))
     (let [a (malloc-allocator)
           source (t262-native-read a path)]
       (if (= (slice-len source) 0)
@@ -28,18 +69,57 @@
           (if (!= (nh-link!) 0)
               (do (fmt (stdout) "LINK-FAILED\n") 3)
               (let [ok (primitive/alloc-stack bool)
+                    exec-start (nh-now-ns)
                     _ (do (set! ok true) (nh-exec-checked! 0 ok))
+                    _ (nh-timing! "native_execution" exec-start)
                     _ (nh-cleanup!)]
                 (if (load ok)
                     (do (fmt (stdout) "PASS\n") 0)
                     (do (fmt (stdout) "RUNTIME-FAILED\n") 1))))))))
 
+(defn t262-native-batch [(path (slice u8)) (count i64)] (-> i64)
+  (block :done
+    (fmt (stderr) "AOTK_READY ns={d}\n" (nh-now-ns))
+    (let [a (malloc-allocator)
+          source (t262-native-read a path)]
+      (if (= (slice-len source) 0)
+          (return-from :done
+                       (do (fmt (stderr) "test262-native: cannot read empty source\n") 66))
+          0)
+      (if (not (nh-try-compile? source))
+          (do (fmt (stdout) "REFUSED\n") 2)
+          (if (!= (nh-link!) 0)
+              (do (fmt (stdout) "LINK-FAILED\n") 3)
+              (let [(mut index) 0]
+                (loop (if (>= (load index) count)
+                          (break)
+                          (let [ok (primitive/alloc-stack bool)
+                                exec-start (nh-now-ns)
+                                _ (do (set! ok true)
+                                      (nh-exec-checked-timeout! (load index) 2 ok))
+                                _ (nh-timing! "native_execution" exec-start)]
+                            (fmt (stdout) "BATCH {d} {s}\n" (load index)
+                                 (if (load ok) "PASS" "RUNTIME-FAILED"))
+                            (set! index (+ (load index) 1)))))
+                (nh-cleanup!)
+                0))))))
+
 (defn main [(argc i32) (argv (ptr (ptr i8)))] (-> i64)
   (block :done
     (args-set! argc argv)
+    (frontend-native-reuse-jsl-index! true)
     (if (< (args-count) 2)
         (return-from :done
                      (do (fmt (stderr) "usage: test262-native <assembled-source.js>...\n") 64))
+        0)
+    (if (and (= (args-count) 2) (= (args-nth 1) "--server"))
+        (return-from :done (t262-native-server))
+        0)
+    (if (= (args-count) 3)
+        (return-from :done
+                     (t262-native-batch
+                       (args-nth 1)
+                       (atoll (cast (ptr i8) (slice-data (args-nth 2))))))
         0)
     (let [(mut index) 1 (mut failed) false]
       (loop (if (>= (load index) (args-count))

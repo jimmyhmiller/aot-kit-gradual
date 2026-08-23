@@ -1,5 +1,101 @@
 # Handoff: move JavaScript semantics into the DSL
 
+## COMPLETE TEST262 RUN MEASURED; TEN MINUTES REMAINS OPEN (2026-08-23, latest)
+
+A clean run covered all **53,578** upstream files at Test262
+`3655e7464de3d52643ecddd4b5f9f4f3e7f62398` and produced **93,209** path/variant records:
+**7,393 passed, 51,746 failed, 22,788 refused, and 11,282 policy-skipped**. The larger record count
+than the old 82,278-record run is intentional: catchable-exception tests are now attempted rather
+than policy-skipped. With 14 persistent workers, 2 GiB per worker, and the original whole-run
+30-second timeout, elapsed time was **58:11.80** (46,729.06 s user, 1,272.17 s system, 1,379,908 KiB
+maximum runner RSS). There were **60** execution timeouts. This is an authoritative complete run,
+and it proves the under-ten-minute goal is not yet met.
+
+The retained semantic/performance change is entirely in `lib/**/*.jsl`. `ToLength` now maps NaN
+to zero rather than the upper saturation bound. Built-in constructor and method identities are
+shared DSL builtins instead of being re-expanded at every use, and constructor/prototype/Error
+initialization uses direct own-property creation rather than generic `[[Set]]` (which can invoke an
+inherited setter). The exact fixed 100-file sample now runs in **22.84 s** (88.30 s user, 2.66 s
+system, 121,980 KiB maximum RSS), with all **177/177** path+variant status/category outcomes equal
+to the prior persistent-worker snapshot: **16 passed, 95 failed, 49 refused, 17 skipped**. This is
+about **6.7×** faster than the roughly 154-second proof-snapshot baseline.
+
+The full run consumed 48,570.25 aggregate attempted-variant seconds. Measured phase totals are:
+frontend graph 22,069.0 s (including analysis 12,122.4 s and graph build 7,728.2 s), selection
+5,627.5 s, allocation 2,728.9 s, graph verification 2,001.2 s, scheduling 1,988.9 s, ELF publication
+1,417.6 s, clang linking 1,107.7 s, and x86 encoding 411.6 s. At 14 cores, reaching ten minutes
+requires another roughly 5.7× CPU reduction; frontend graph construction/analysis is the dominant
+remaining root. Closed-world batching and a compact property-helper substitution were measured and
+rejected: batching recompiles failing groups during bisection, while the helper changed failure
+categories without enough speedup. Callback-bearing property operations also cannot simply become
+shared builtins because their memory effects are caller-local.
+
+Artifacts are under `.amp/in/artifacts/test262-performance-latest/`: the 166 MiB full JSONL,
+summary, resource report, aggregate phase/slow-tail report, exact fixed sample, fixed JSONL,
+resource report, and zero-diff parity report. The mandatory gate is **46 passed, 0 failed**.
+Frontier reaches all seven currently registered intentional bugs as **0 passed, 7 failed**, with no
+Linux/x86-64 infrastructure failure.
+
+## FULL TEST262 UNDER TEN MINUTES IS NOT YET ACHIEVED (2026-08-22, latest)
+
+The complete upstream corpus is 53,578 JavaScript files excluding `_FIXTURE.js`. A direct
+16-worker run had reached 16,345 records after roughly 43 minutes, including 210 variants that
+consumed the old 120-second compile+execute timeout. Native execution now has its own two-second
+bound, and the harness can compile same-policy/include/assertion groups into independently invoked
+entry functions with adaptive standalone fallback so batching never inherits a neighbor's refusal
+or runtime failure. A 24-variant comparison produced exactly the same path+variant status/category
+map as the ordinary runner.
+
+Batching is not yet the answer for the failing majority: a measured full-corpus attempt was stopped
+after 2m16s with 11,452 records (11,282 policy skips, 166 failures, 4 refusals, no completed batched
+passes), because compile failures forced recursive singleton fallback. The checkpoint is under
+`.amp/in/artifacts/test262-full-batched/`. This was stopped rather than allowed to become another
+multi-hour run.
+
+Additional semantics-preserving compiler work since the 10.88× snapshot removed edge×node Phi
+selection and verification, block×instruction packing, global x86 label scans, cross-function
+allocator/live-root scans, and duplicate verifier adjacency construction. On the unchanged fixed
+100-file benchmark, standalone mode improved from 1:20.08 to **56.21s** with exact aggregate
+outcomes (**14 passed, 97 failed, 49 refused, 17 skips**). A 32-function passing batch dropped from
+55.31s to 12.02s before the latest scheduler/allocator work. These are real improvements, but the
+full-run projection remains above ten minutes: failed standalone variants still dominate, and the
+fixed sample consumes 222.05 CPU-seconds. The remaining measured roots are frontend graph/fold
+(102.25 CPU-seconds on the fixed sample), allocator verification (5.1s of a 6.3s allocation on the
+17,883-vreg reverse tail), and pairwise local schedule construction/independent verification.
+
+Current standing checks: `coil test` is **46 passed, 0 failed**; frontier reaches all seven current
+intentional assertions as **0 passed, 7 failed**, with no platform infrastructure failure.
+`lib/**/*.jsl` remains unchanged by this performance work.
+
+## FIXED TEST262 NATIVE COMPILE BENCHMARK IS 10.88× FASTER (2026-08-22, latest)
+
+The exact fixed-seed 100-file upstream Test262 sample (160 attempted default/strict variants plus
+17 policy skips, four workers, warm cache, unchanged 120 s timeout and 4 GiB child limit) now runs
+in **1:20.08**, down from **14:31.44**: **10.88× wall-clock faster**. CPU fell from 3478.60 s user +
+9.79 s system to 316.63 s user + 4.09 s system; peak observed child RSS remains essentially
+unchanged at 123,032 KiB versus 123,196 KiB. All 177 path/variant keys and all aggregate outcomes
+match: **14 passed, 97 failed, 49 refused, 17 policy-skipped**. There are zero status changes. The
+20 category changes expose work hidden by the baseline timeout/segfault (12 timeout→selection,
+4 timeout→verification, 2 timeout→runtime-failed, 2 segfault→verification); none turns a failure
+into a refusal or skip.
+
+The measured roots were structural compiler rescans, not JavaScript semantics. Selection GCM and
+its independent verifier now use dense def/use and owner/node indices; scheduling uses direct
+def/use edges, ready heaps, and packed liveness checks; allocation uses a packed interference graph
+and sparse live set. Frontend constant-proofing computes one O(nodes+edges) proof snapshot per
+transformation sweep instead of revisiting 18.2 million transitive cone nodes on the slow passing
+case. Dynamic callback arity discovery dropped from 353,452,204 whole-graph parameter probes to
+direct Fun def-use walks, and closed-world target discovery is cached after all frontend Fun roots
+exist. Machine CFG adjacency, RPO, and independent verification now derive packed indices in linear
+passes rather than block×edge, edge×edge, and block×ideal-node scans. `lib/**/*.jsl` is unchanged;
+the optimization changes compiler structure only.
+
+Standing verification with Coil current main: `coil test` is **46 passed, 0 failed**. Frontier
+reaches all seven current intentional JavaScript assertions as **0 passed, 7 failed**, with no
+xcrun, Mach-O, encoder, ELF-link, or host-runtime infrastructure failure. The benchmark command,
+raw JSONL, exact sample, resource report, parity report, complete phase distributions, and patch
+are preserved under `.amp/in/artifacts/test262-performance-final/`.
+
 ## ACCESSORS AND BORROWED ARRAYLIKE CALLBACKS RUN THROUGH THE DSL (2026-08-22, latest)
 
 Ordinary property records now carry accessor getter/setter edges and an accessor attribute bit.

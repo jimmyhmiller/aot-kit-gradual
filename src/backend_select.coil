@@ -17,6 +17,19 @@
 (import "coil.fmt" :use *)
 (import "coil.slice" :use *)
 
+(defstruct MsProfileTimespec [(sec i64) (nsec i64)])
+(extern clock_gettime :cc c [i32 (ptr MsProfileTimespec)] (-> i32))
+(defn ms-profile-now [] (-> i64)
+  (let [t (primitive/alloc-stack MsProfileTimespec)]
+    (clock_gettime 1 t)
+    (+ (* (.sec t) 1000000000) (.nsec t))))
+(defn ms-profile-note! [(name (slice u8)) (started i64)] (-> i64)
+  (let [now (ms-profile-now)]
+    (fmt (stderr) "AOTK_PROFILE phase={s} ns={d} nodes={d} functions={d} blocks={d} insts={d} vregs={d}\n"
+         name (- now started) (n-count) (mu-function-count) (mu-block-count)
+         (be-inst-count) (.next-vreg (machine-unit)))
+    now))
+
 (const BE-EXCEPTION-RETURN-DESCRIPTOR i64 104)
 
 (defn be-exception-return? [(term i64)] (-> bool)
@@ -463,7 +476,11 @@
         need (n-count)]
     (loop (if (>= (al-len [i64] (.fp-mark u)) need)
               (break)
-              (do (al-push! [i64] (field u fp-mark) 0) 0)))
+              (do
+                (al-push! [i64] (field u fp-mark) 0)
+                (al-push! [bool] (field u fp-known) false)
+                (al-push! [bool] (field u fp-value) false)
+                0)))
     0))
 
 ;; A node is floating-point at the source: nothing below it needs looking at. `OPTAG-PARM` is terminal
@@ -528,7 +545,12 @@
 ;; general-purpose register nothing had written: wrong, and differently wrong on each run. Depth is
 ;; not something a representation may depend on, so there is no bound here to raise.
 (defn be-node-fp-value? [(node i64)] (-> bool)
+  (block :done
   (let [u (machine-unit)]
+    (be-fp-grow!)
+    (if (al-get [bool] (.fp-known u) node)
+        (return-from :done (al-get [bool] (.fp-value u) node))
+        0)
     ;; The mark array and the stack are ONE buffer shared by every call, so a walk inside a walk
     ;; would truncate the outer one and answer from a graph it never finished looking at. Nothing
     ;; reentrant calls this today, and a named abort is what keeps that true rather than remembered.
@@ -536,7 +558,6 @@
         (do (panic-corrupt "be-node-fp-value?: reentrant operand walk; the mark and stack are shared") 0)
         0)
     (set! (.fp-busy u) true)
-    (be-fp-grow!)
     (set! (.fp-gen u) (+ (.fp-gen u) 1))
     (let [gen (.fp-gen u)
           (mut found) false]
@@ -556,7 +577,9 @@
                               (be-fp-push-operands! m))
                           0))))))
       (set! (.fp-busy u) false)
-      (load found))))
+      (al-set! [bool] (field u fp-known) node true)
+      (al-set! [bool] (field u fp-value) node (load found))
+      (load found)))))
 
 ; Frontend dynamic values cross the JavaScript-value ABI at these nodes. Hand-written
 ; backend fixtures also use t-dyn for unconstrained machine integers, so type alone is
@@ -705,11 +728,13 @@
         (mut i) 0]
     (al-clear! [i64] (field u selected-values))
     (al-clear! [i64] (field u selected-nodes))
+    (al-clear! [i64] (field u selected-blocks))
     (loop (if (>= (load i) total)
               (break)
               (do
                 (al-push! [i64] (field u selected-values) -1)
                 (al-push! [i64] (field u selected-nodes) 0)
+                (al-push! [i64] (field u selected-blocks) -1)
                 (set! i (+ (load i) 1))
                 0)))
     0))
@@ -734,6 +759,7 @@
     (al-push! [i64] (field u vreg-phi-block) -1)
     (al-push! [i64] (field u vreg-node) -1)
     (al-push! [i64] (field u vreg-node-owner) -1)
+    (al-push! [i64] (field u vreg-def-inst) -1)
     v))
 
 ;; The dense-array runtime takes an INTEGER index in a GPR. An index computed in floating
@@ -767,10 +793,18 @@
                   -1))))))
 
 (defn ms-emit! [(owner i64) (bid i64) (m MInst)] (-> i64)
-  (let [id (be-emit! m)
+  (let [u (machine-unit)
+        id (be-emit! m)
         p (be-inst id)]
     (set! (.owner p) owner)
     (set! (.block-id p) bid)
+    (if (and (>= (.dst p) 0)
+             (= (al-get [i64] (.vreg-def-inst u) (.dst p)) -1))
+        (al-set! [i64] (field u vreg-def-inst) (.dst p) id)
+        0)
+    (if (and (>= (.node p) 0) (< (.node p) (n-count)))
+        (al-set! [i64] (field u selected-blocks) (ms-map-index owner (.node p)) bid)
+        0)
     id))
 
 (defn ms-push-memory-dep-tree! [(first i64) (node i64) (fuel i64)] (-> i64)
@@ -1102,23 +1136,15 @@
     (_ fallback)))
 
 (defn ms-array-effect-block [(owner i64) (memory i64) (array i64) (fallback i64)] (-> i64)
-  (let [(mut at) 0
-        (mut selected) -1]
+  (let [selected (if (and (>= memory 0) (< memory (n-count)))
+                     (al-get (.selected-blocks (machine-unit)) (ms-map-index owner memory))
+                     -1)]
     ;; Once the ordered predecessor has been selected, its actual placement is a hard lower bound.
     ;; The ideal memory node itself has no control input, so ms-memory-block can only name its chain
     ;; root and may otherwise place a consumer above a branch-local predecessor.
-    (loop (if (>= (load at) (be-inst-count))
-              (break)
-              (do
-                (let [m (be-inst (load at))]
-                  (if (and (= (.owner m) owner)
-                           (= (.node m) memory))
-                      (set! selected (.block-id m))
-                      0))
-                (set! at (+ (load at) 1)))))
     (let [base
-            (if (>= (load selected) 0)
-                (load selected)
+            (if (>= selected 0)
+                selected
                 (ms-selected-effect-node-block owner memory fallback))]
       (if (ms-memory-chain-phi? memory)
           base
@@ -2563,26 +2589,65 @@
       (let [bid (al-get (.ctrl-block (machine-unit)) (n-in phi 0))]
         (if (and (>= bid 0) (= (mu-block-owner bid) owner)) bid -1))))
 
+(defn ms-cache-block-phis! [] (-> i64)
+  (let [u (machine-unit)
+        (mut i) 0
+        (mut node) (n-count)]
+    (al-clear! [i64] (field u block-phi-head))
+    (al-clear! [i64] (field u node-phi-next))
+    (loop (if (>= (load i) (mu-block-count))
+              (break)
+              (do
+                (al-push! [i64] (field u block-phi-head) -1)
+                (set! i (+ (load i) 1)))))
+    (set! i 0)
+    (loop (if (>= (load i) (n-count))
+              (break)
+              (do
+                (al-push! [i64] (field u node-phi-next) -1)
+                (set! i (+ (load i) 1)))))
+    ;; Prepend in reverse node order so each block list preserves the old ascending graph scan.
+    (loop (if (<= (load node) 0)
+              (break)
+              (do
+                (set! node (- (load node) 1))
+                (if (and (not (n-dead? (load node)))
+                         (and (op-is? (load node) Phi [_]) (> (n-nins (load node)) 0)))
+                    (let [ctrl (n-in (load node) 0)
+                          bid (if (= ctrl NO-NODE) -1 (al-get (.ctrl-block u) ctrl))]
+                      (if (and (>= bid 0) (< bid (mu-block-count)))
+                          (do
+                            (al-set! [i64] (field u node-phi-next) (load node)
+                                     (al-get (.block-phi-head u) bid))
+                            (al-set! [i64] (field u block-phi-head) bid (load node)))
+                          0))
+                    0))))
+    0))
+
 ; Reserve every scalar Phi destination before selecting any incoming expression.  This is the
 ; essential fixed point for loop-carried and mutually recursive Phis: a back-edge expression can
 ; refer to a destination whose copy has not been constructed yet without recursing forever.
 (defn ms-preallocate-phis! [(owner i64)] (-> i64)
-  (let [(mut node) 0]
-    (loop (if (>= (load node) (n-count))
+  (let [u (machine-unit)
+        nblocks (mu-function-block-count owner)
+        (mut rpo) 0]
+    (loop (if (>= (load rpo) nblocks)
               (break)
               (do
-                (if (and (not (n-dead? (load node)))
-                         (and (op-is? (load node) Phi [_])
-                              (>= (ms-phi-block owner (load node)) 0)))
-                    (if (ty-mem? (n-ty (load node)))
-                        (ms-seen! owner (load node))
-                        (let [vreg (ms-new-vreg!)]
-                          (ms-vset! owner (load node) vreg)
-                          (al-set! [i64] (field (machine-unit) vreg-phi-block)
-                                   vreg
-                                   (ms-phi-block owner (load node)))))
-                    0)
-                (set! node (+ (load node) 1))
+                (let [bid (mu-function-block owner (load rpo))
+                      (mut node) (al-get (.block-phi-head u) bid)]
+                  (loop (if (< (load node) 0)
+                            (break)
+                            (do
+                              (if (ty-mem? (n-ty (load node)))
+                                  (ms-seen! owner (load node))
+                                  (let [vreg (ms-new-vreg!)]
+                                    (ms-vset! owner (load node) vreg)
+                                    (al-set! [i64] (field (machine-unit) vreg-phi-block)
+                                             vreg
+                                             bid)))
+                              (set! node (al-get (.node-phi-next u) (load node)))))))
+                (set! rpo (+ (load rpo) 1))
                 0)))
     0))
 
@@ -2600,43 +2665,41 @@
                             target (.target e)
                             source (.source e)
                             slot (.target-slot e)
-                            (mut node) 0]
-                        (loop (if (or (>= (load node) (n-count)) (!= (ms-result) MSEL-OK))
+                            (mut node) (al-get (.block-phi-head u) target)]
+                        (loop (if (or (< (load node) 0) (!= (ms-result) MSEL-OK))
                                   (break)
                                   (do
-                                    (if (and (not (n-dead? (load node)))
-                                             (and (op-is? (load node) Phi [_])
-                                                  (= (ms-phi-block owner (load node)) target)))
-                                        (if (>= slot (n-nins (load node)))
-                                            (ms-fail! MSEL-DEPENDENCY (load node))
-                                            (if (ty-mem? (n-ty (load node)))
-                                                (if (ms-select-memory-at! owner (n-in (load node) slot) source)
-                                                    (al-push! [MCopy]
-                                                              (field u edge-copies)
-                                                              (mc-new (load edge)
-                                                                      (load node)
-                                                                      (load node)
+                                    (if (>= slot (n-nins (load node)))
+                                        (ms-fail! MSEL-DEPENDENCY (load node))
+                                        (if (ty-mem? (n-ty (load node)))
+                                            (if (ms-select-memory-at! owner
                                                                       (n-in (load node) slot)
-                                                                      MCOPY-MEMORY))
-                                                    0)
-                                                (let [input (n-in (load node) slot)
-                                                      raw (ms-select-value-at! owner input source)
-                                                      src
-                                                        (if (and (>= raw 0)
-                                                                 (be-node-fp-value? (load node)))
-                                                            (ms-fp-input! owner input raw source)
-                                                            raw)]
-                                                  (if (< src 0)
-                                                      0
-                                                      (al-push! [MCopy]
-                                                                (field u edge-copies)
-                                                                (mc-new (load edge)
-                                                                        (load node)
-                                                                        (ms-vget owner (load node))
-                                                                        src
-                                                                        MCOPY-VALUE))))))
-                                        0)
-                                    (set! node (+ (load node) 1))
+                                                                      source)
+                                                (al-push! [MCopy]
+                                                          (field u edge-copies)
+                                                          (mc-new (load edge)
+                                                                  (load node)
+                                                                  (load node)
+                                                                  (n-in (load node) slot)
+                                                                  MCOPY-MEMORY))
+                                                0)
+                                            (let [input (n-in (load node) slot)
+                                                  raw (ms-select-value-at! owner input source)
+                                                  src
+                                                    (if (and (>= raw 0)
+                                                             (be-node-fp-value? (load node)))
+                                                        (ms-fp-input! owner input raw source)
+                                                        raw)]
+                                              (if (< src 0)
+                                                  0
+                                                  (al-push! [MCopy]
+                                                            (field u edge-copies)
+                                                            (mc-new (load edge)
+                                                                    (load node)
+                                                                    (ms-vget owner (load node))
+                                                                    src
+                                                                    MCOPY-VALUE))))))
+                                    (set! node (al-get (.node-phi-next u) (load node)))
                                     0)))
                         (set! (.copy-first e) first)
                         (set! (.copy-count e) (- (al-len [MCopy] (.edge-copies u)) first)))))
@@ -3002,54 +3065,120 @@
                 0)))
     0))
 
+(defn ms-cache-def-insts! [] (-> i64)
+  (let [u (machine-unit)
+        nodes (n-count)
+        funcs (mu-function-count)
+        (mut at) 0]
+    (al-clear! [i64] (field u vreg-def-inst))
+    (al-clear! [i64] (field u node-inst-head))
+    (al-clear! [i64] (field u node-inst-next))
+    (loop (if (>= (load at) (.next-vreg u))
+              (break)
+              (do (al-push! [i64] (field u vreg-def-inst) -1)
+                  (set! at (+ (load at) 1)))))
+    (set! at 0)
+    (loop (if (>= (load at) (* funcs nodes))
+              (break)
+              (do (al-push! [i64] (field u node-inst-head) -1)
+                  (set! at (+ (load at) 1)))))
+    (set! at 0)
+    (loop (if (>= (load at) (be-inst-count))
+              (break)
+              (do
+                (let [m (be-inst (load at))
+                      dst (.dst m)
+                      owner (.owner m)
+                      node (.node m)]
+                  (if (and (>= dst 0)
+                           (= (al-get [i64] (.vreg-def-inst u) dst) -1))
+                      (al-set! [i64] (field u vreg-def-inst) dst (load at))
+                      0)
+                  (al-push! [i64] (field u node-inst-next) -1)
+                  (if (and (>= node 0) (and (< node nodes)
+                           (and (>= owner 0) (< owner funcs))))
+                      (let [key (+ (* owner nodes) node)]
+                        (al-set! [i64] (field u node-inst-next) (load at)
+                                 (al-get [i64] (.node-inst-head u) key))
+                        (al-set! [i64] (field u node-inst-head) key (load at)))
+                      0))
+                (set! at (+ (load at) 1)))))
+    0))
+
 (defn ms-pack-instructions! [] (-> i64)
   (let [u (machine-unit)
         original (be-inst-count)
-        funcs (mu-function-count)
-        (mut owner) 0]
+        blocks (mu-block-count)
+        (mut bid) 0
+        (mut at) 0]
     (al-clear! [MInst] (field u packed-insts))
-    (loop (if (>= (load owner) funcs)
+    (al-clear! [i64] (field u pack-next))
+    (al-clear! [i64] (field u pack-term-next))
+    ;; Count ordinary and terminator instructions per block in one instruction pass.
+    (loop (if (>= (load bid) blocks)
               (break)
               (do
-                (let [nblocks (mu-function-block-count (load owner))
-                      (mut rpo) 0]
-                  (loop (if (>= (load rpo) nblocks)
-                            (break)
-                            (do
-                              (let [bid (mu-function-block (load owner) (load rpo))
-                                    b (mu-block bid)
-                                    first (al-len [MInst] (.packed-insts u))
-                                    (mut at) 0]
-                                (loop (if (>= (load at) original)
-                                          (break)
-                                          (do
-                                            (let [m (be-inst (load at))]
-                                              (if (and (= (.owner m) (load owner))
-                                                       (and (= (.block-id m) bid)
-                                                            (not (mi-op-terminator? (.op m)))))
-                                                  (al-push! [MInst] (field u packed-insts) (load m))
-                                                  0))
-                                            (set! at (+ (load at) 1))
-                                            0)))
-                                ; Moving a definition must never put it textually after control transfer.
-                                (set! at 0)
-                                (loop (if (>= (load at) original)
-                                          (break)
-                                          (do
-                                            (let [m (be-inst (load at))]
-                                              (if (and (= (.owner m) (load owner))
-                                                       (and (= (.block-id m) bid)
-                                                            (mi-op-terminator? (.op m))))
-                                                  (al-push! [MInst] (field u packed-insts) (load m))
-                                                  0))
-                                            (set! at (+ (load at) 1))
-                                            0)))
-                                (set! (.inst-first b) first)
-                                (set! (.inst-count b) (- (al-len [MInst] (.packed-insts u)) first)))
-                              (set! rpo (+ (load rpo) 1))
-                              0))))
-                (set! owner (+ (load owner) 1))
-                0)))
+                (set! (.inst-count (mu-block (load bid))) 0)
+                (al-push! [i64] (field u pack-next) 0)
+                (al-push! [i64] (field u pack-term-next) 0)
+                (set! bid (+ (load bid) 1)))))
+    (loop (if (>= (load at) original)
+              (break)
+              (do
+                (let [m (be-inst (load at))
+                      block (.block-id m)]
+                  (if (mi-op-terminator? (.op m))
+                      (al-set! [i64] (field u pack-next) block
+                               (+ (al-get (.pack-next u) block) 1))
+                      (set! (.inst-count (mu-block block))
+                            (+ (.inst-count (mu-block block)) 1))))
+                (set! at (+ (load at) 1)))))
+    ;; Prefix block ranges in function/RPO block order. pack-next and pack-term-next become the
+    ;; ordinary/terminator write cursors after their counts have established both starts.
+    (let [(mut first) 0
+          (mut owner) 0]
+      (loop (if (>= (load owner) (mu-function-count))
+                (break)
+                (do
+                  (let [nblocks (mu-function-block-count (load owner))
+                        (mut rpo) 0]
+                    (loop (if (>= (load rpo) nblocks)
+                              (break)
+                              (do
+                                (let [block (mu-function-block (load owner) (load rpo))
+                                      b (mu-block block)
+                                      nonterms (.inst-count b)
+                                      terms (al-get (.pack-next u) block)]
+                                  (set! (.inst-first b) (load first))
+                                  (set! (.inst-count b) (+ nonterms terms))
+                                  (al-set! [i64] (field u pack-next) block (load first))
+                                  (al-set! [i64] (field u pack-term-next) block
+                                           (+ (load first) nonterms))
+                                  (set! first (+ (+ (load first) nonterms) terms)))
+                                (set! rpo (+ (load rpo) 1)))))
+                  (set! owner (+ (load owner) 1)))))))
+    ;; Reserve exact output length, then scatter in original order into each block's two ranges.
+    (set! at 0)
+    (loop (if (>= (load at) original)
+              (break)
+              (do
+                (al-push! [MInst] (field u packed-insts) (load (be-inst (load at))))
+                (set! at (+ (load at) 1)))))
+    (set! at 0)
+    (loop (if (>= (load at) original)
+              (break)
+              (do
+                (let [m (be-inst (load at))
+                      block (.block-id m)
+                      cursor (if (mi-op-terminator? (.op m))
+                                 (.pack-term-next u)
+                                 (.pack-next u))
+                      out (al-get cursor block)]
+                  (al-set! [MInst] (field u packed-insts) out (load m))
+                  (if (mi-op-terminator? (.op m))
+                      (al-set! [i64] (field u pack-term-next) block (+ out 1))
+                      (al-set! [i64] (field u pack-next) block (+ out 1))))
+                (set! at (+ (load at) 1)))))
     (al-clear! [MInst] (field (backend) ins))
     (let [n (al-len [MInst] (.packed-insts u))
           (mut i) 0]
@@ -3061,7 +3190,8 @@
                             (al-get (.packed-insts u) (load i)))
                   (set! i (+ (load i) 1))
                   0))))
-    0))
+    ;; Cache the first physical definition, matching the old RPO/textual lookup exactly.
+    (ms-cache-def-insts!)))
 
 (defn ms-phi-vreg-block [(owner i64) (vreg i64)] (-> i64)
   (let [u (machine-unit)]
@@ -3071,22 +3201,11 @@
           (if (and (>= block 0) (= (mu-block-owner block) owner)) block -1)))))
 
 (defn ms-owner-def-inst [(owner i64) (vreg i64)] (-> i64)
-  (let [(mut rpo) 0 (mut found) -1]
-    (loop (if (or (>= (load rpo) (mu-function-block-count owner)) (>= (load found) 0))
-              (break)
-              (let [bid (mu-function-block owner (load rpo))
-                    first (mu-block-inst-first bid)
-                    count (mu-block-inst-count bid)
-                    (mut at) first]
-                (loop (if (or (>= (load at) (+ first count)) (>= (load found) 0))
-                          (break)
-                          (do
-                            (if (= (.dst (be-inst (load at))) vreg)
-                                (set! found (load at))
-                                0)
-                            (set! at (+ (load at) 1)))))
-                (set! rpo (+ (load rpo) 1)))))
-    (load found)))
+  (let [defs (.vreg-def-inst (machine-unit))]
+    (if (or (< vreg 0) (>= vreg (al-len [i64] defs)))
+        -1
+        (let [at (al-get [i64] defs vreg)]
+          (if (and (>= at 0) (= (ms-inst-owner at) owner)) at -1)))))
 
 (defn ms-vreg-def-block [(owner i64) (vreg i64)] (-> i64)
   (let [phi-block (ms-phi-vreg-block owner vreg)]
@@ -3556,6 +3675,26 @@
         n (be-inst-count)
         (mut at) 0]
     (al-clear! [i64] (field u memory-anti-deps))
+    (al-clear! [i64] (field u memory-read-head))
+    (al-clear! [i64] (field u memory-read-next))
+    (loop (if (>= (load at) (mu-function-count))
+              (break)
+              (do (al-push! [i64] (field u memory-read-head) -1)
+                  (set! at (+ (load at) 1)))))
+    (set! at 0)
+    (loop (if (>= (load at) n)
+              (break)
+              (do
+                (al-push! [i64] (field u memory-read-next) -1)
+                (let [m (be-inst (load at))]
+                  (if (ms-machine-memory-read? m)
+                      (do
+                        (al-set! [i64] (field u memory-read-next) (load at)
+                                 (al-get (.memory-read-head u) (.owner m)))
+                        (al-set! [i64] (field u memory-read-head) (.owner m) (load at)))
+                      0))
+                (set! at (+ (load at) 1)))))
+    (set! at 0)
     (loop (if (>= (load at) n)
               (break)
               (do
@@ -3564,24 +3703,22 @@
                   (set! (.anti-first m) first)
                   (set! (.anti-count m) 0)
                   (if (ms-machine-memory-write? m)
-                      (let [(mut prior) 0]
-                        (loop (if (>= (load prior) n)
+                      (let [(mut prior) (al-get (.memory-read-head u) (.owner m))]
+                        (loop (if (< (load prior) 0)
                                   (break)
                                   (do
                                     (let [candidate (be-inst (load prior))]
-                                      (if (and (= (.owner candidate) (.owner m))
-                                               (and (ms-memory-operands-may-alias? candidate m)
-                                                    (and (ms-machine-memory-read? candidate)
-                                                    (and (< (.node candidate) (.node m))
-                                                         (mu-dominates? (.block-id candidate)
-                                                                        (.block-id m))))))
+                                      (if (and (ms-memory-operands-may-alias? candidate m)
+                                               (and (< (.node candidate) (.node m))
+                                                    (mu-dominates? (.block-id candidate)
+                                                                   (.block-id m))))
                                           (do
                                             (al-push! [i64]
                                                       (field u memory-anti-deps)
                                                       (.node candidate))
                                             (set! (.anti-count m) (+ (.anti-count m) 1)))
                                           0))
-                                    (set! prior (+ (load prior) 1))
+                                    (set! prior (al-get (.memory-read-next u) (load prior)))
                                     0))))
                       0))
                 (set! at (+ (load at) 1))
@@ -3653,7 +3790,8 @@
   (be-reset!)
   (let [u (machine-unit)
         funcs (mu-function-count)
-        (mut owner) 0]
+        (mut owner) 0
+        (mut profile-start) (ms-profile-now)]
     (set! (.selection-result u) MSEL-OK)
     (set! (.selection-item u) -1)
     (set! (.next-vreg u) 0)
@@ -3664,6 +3802,7 @@
     (al-clear! [MMove] (field u edge-moves))
     (al-clear! [i64] (field u call-args))
     (ms-map-init!)
+    (ms-cache-block-phis!)
     (loop (if (>= (load owner) funcs)
               (break)
               (do
@@ -3684,8 +3823,15 @@
                   (ms-emit-function! (load owner) base))
                 (set! owner (+ (load owner) 1))
                 0)))
+    (set! profile-start (ms-profile-note! "selection_emit" (load profile-start)))
     (if (= (ms-result) MSEL-OK)
-        (do (ms-pack-instructions!) (ms-cache-new-defs!) (ms-build-memory-anti-deps!) true)
+        (do
+          (ms-pack-instructions!)
+          (set! profile-start (ms-profile-note! "selection_pack" (load profile-start)))
+          (ms-cache-new-defs!)
+          (ms-build-memory-anti-deps!)
+          (set! profile-start (ms-profile-note! "selection_antideps_initial" (load profile-start)))
+          true)
         false)))
 
 ;; THE ANTI-DEPENDENCY VECTOR HAS TO DESCRIBE THE SCHEDULE THAT EXISTS. It is built at the end of
@@ -3699,10 +3845,13 @@
 ;; recomputing it against the final placement is what makes the verifier's question well posed. The
 ;; same mistake, in the same shape, is recorded for `schedule-order` in docs/JSL.md.
 (defn ms-place-selected! [] (-> bool)
-  (let [u (machine-unit)]
+  (let [u (machine-unit)
+        (mut profile-start) (ms-profile-now)]
     (if (ms-gcm-place!)
         (do
+          (set! profile-start (ms-profile-note! "selection_gcm" (load profile-start)))
           (ms-build-memory-anti-deps!)
+          (set! profile-start (ms-profile-note! "selection_antideps_final" (load profile-start)))
           (set! (.phase u) 2)
           ; Usually GCM's stable packing is already dependency-topological, and retaining
           ; it keeps selection dumps stable. If a cross-block move put a producer after its use,
@@ -3722,7 +3871,18 @@
 (defn ms-select! [] (-> bool)
   (if (mu-build!) (ms-select-built!) false))
 (defn ms-select-program! [] (-> bool)
-  (if (mu-build-program!) (ms-select-built!) false))
+  (let [started (ms-profile-now)]
+    (if (mu-build-program!)
+        (do (ms-profile-note! "selection_machine_build" started)
+            (ms-select-built!))
+        false)))
+
+(defn ms-select-verified-program! [] (-> bool)
+  (let [started (ms-profile-now)]
+    (if (mu-build-verified-program!)
+        (do (ms-profile-note! "selection_machine_build" started)
+            (ms-select-built!))
+        false)))
 ; Convert verified block terminators to the legacy encodable label/branch vocabulary.  This is a
 ; separate publication step so the block verifier continues to reason about explicit successors.
 (defn ms-lowered-inst [(owner i64)
@@ -3820,10 +3980,11 @@
                         (al-push! [MInst] (field (backend) ins) m))
                       (set! i (+ (load i) 1))
                       0)))
+          (ms-cache-def-insts!)
           (load ok)))))
 
-(defn be-select-machine-program! [] (-> bool)
-  (if (not (ms-select-program!))
+(defn be-select-machine-program-core! [(verified bool)] (-> bool)
+  (if (not (if verified (ms-select-verified-program!) (ms-select-program!)))
       (let [code
               (case (ms-result) MSEL-CALL-LIVE
                     BER-UNSUPPORTED-CALL-LIVE MSEL-CALL
@@ -3836,6 +3997,12 @@
                   item)]
         (be-fail! code node))
       (if (ms-lower-encodable!) true (be-fail! BER-ENCODING NO-NODE))))
+
+(defn be-select-machine-program! [] (-> bool)
+  (be-select-machine-program-core! false))
+
+(defn be-select-verified-machine-program! [] (-> bool)
+  (be-select-machine-program-core! true))
 
 (defn ms-inst-owner [(i i64)] (-> i64)
   (.owner (be-inst i)))
@@ -3875,18 +4042,25 @@
             (+ (.arg-first m) which))))
 
 (defn ms-def-inst [(vreg i64)] (-> i64)
-  (let [n (be-inst-count)
-        (mut i) 0
-        (mut found) -1]
-    (loop (if (or (>= (load i) n) (>= (load found) 0))
-              (break)
-              (do
-                (if (= (.dst (be-inst (load i))) vreg)
-                    (set! found (load i))
-                    0)
-                (set! i (+ (load i) 1))
-                0)))
-    (load found)))
+  (let [defs (.vreg-def-inst (machine-unit))]
+    (if (and (>= vreg 0) (< vreg (al-len [i64] defs)))
+        (let [cached (al-get [i64] defs vreg)]
+          (if (>= cached 0)
+              cached
+              (let [n (be-inst-count) (mut i) 0 (mut found) -1]
+                (loop (if (or (>= (load i) n) (>= (load found) 0)) (break)
+                          (do
+                            (if (= (.dst (be-inst (load i))) vreg)
+                                (set! found (load i)) 0)
+                            (set! i (+ (load i) 1)))))
+                (load found))))
+        (let [n (be-inst-count) (mut i) 0 (mut found) -1]
+          (loop (if (or (>= (load i) n) (>= (load found) 0)) (break)
+                    (do
+                      (if (= (.dst (be-inst (load i))) vreg)
+                          (set! found (load i)) 0)
+                      (set! i (+ (load i) 1)))))
+          (load found)))))
 
 (defn ms-phi-vreg? [(owner i64) (vreg i64)] (-> bool)
   (>= (ms-phi-vreg-block owner vreg) 0))
@@ -4291,47 +4465,120 @@
         dst (.dst m)
         owner (.owner m)
         node (.node m)
-        (mut i) 0]
+        u (machine-unit)]
     (if (or (< dst 0) (= (.op m) MI-COPY))
         true
-        (let [(mut defs) 0
-              (mut nodes) 0]
-          (loop (if (>= (load i) (be-inst-count))
-                    (break)
-                    (do
-                      (let [other (be-inst (load i))]
-                        (if (= (.dst other) dst) (set! defs (+ (load defs) 1)) 0)
-                        (if (and (= (.owner other) owner)
-                                 (and (= (.node other) node)
-                                      (and (>= (.dst other) 0)
-                                           (!= (.op other) MI-LOAD))))
-                            (set! nodes (+ (load nodes) 1))
-                            0))
-                      (set! i (+ (load i) 1))
-                      0)))
+        (let [defs (al-get [i64] (.verify-def-count u) dst)
+              nodes (if (or (< node 0) (= (.op m) MI-LOAD))
+                        1
+                        (al-get [i64] (.verify-node-def-count u)
+                                (+ (* owner (n-count)) node)))]
           ; Materialized closure environments may reload the same logical capture at distinct call
           ; sites. Those are distinct machine definitions but intentionally share the capture node
           ; so GC kind classification remains exact.
-          (and (= (load defs) 1)
+          (and (= defs 1)
                (if (or (< node 0) (= (.op m) MI-LOAD))
                    true
-                   (= (load nodes) 1)))))))
+                   (= nodes 1)))))))
 
 (defn ms-inst-membership-count [(at i64)] (-> i64)
-  (let [blocks (mu-block-count)
-        (mut bid) 0
-        (mut count) 0]
-    (loop (if (>= (load bid) blocks)
-              (break)
+  (let [members (.verify-membership (machine-unit))]
+    (if (or (< at 0) (>= at (al-len [i64] members)))
+        0
+        (al-get [i64] members at))))
+
+(defn ms-build-verifier-indices! [] (-> i64)
+  (let [u (machine-unit)
+        vregs (.next-vreg u)
+        nodes (n-count)
+        funcs (mu-function-count)
+        insts (be-inst-count)
+        blocks (mu-block-count)
+        (mut i) 0]
+    (al-clear! [i64] (field u verify-def-count))
+    (al-clear! [i64] (field u verify-node-def-count))
+    (al-clear! [i64] (field u verify-node-inst-head))
+    (al-clear! [i64] (field u verify-node-inst-next))
+    (al-clear! [i64] (field u verify-membership))
+    (al-clear! [i64] (field u verify-block-phi-head))
+    (al-clear! [i64] (field u verify-node-phi-next))
+    (loop (if (>= (load i) vregs) (break)
+              (do (al-push! [i64] (field u verify-def-count) 0)
+                  (set! i (+ (load i) 1)))))
+    (set! i 0)
+    (loop (if (>= (load i) (* funcs nodes)) (break)
+              (do (al-push! [i64] (field u verify-node-def-count) 0)
+                  (al-push! [i64] (field u verify-node-inst-head) -1)
+                  (set! i (+ (load i) 1)))))
+    (set! i 0)
+    (loop (if (>= (load i) blocks) (break)
+              (do (al-push! [i64] (field u verify-block-phi-head) -1)
+                  (set! i (+ (load i) 1)))))
+    (set! i 0)
+    (loop (if (>= (load i) nodes) (break)
+              (do (al-push! [i64] (field u verify-node-phi-next) -1)
+                  (set! i (+ (load i) 1)))))
+    ;; This is an independent graph walk, in reverse so each block list retains ascending node
+    ;; order. It verifies against ideal Phi ownership without trusting the selector's cache.
+    (set! i nodes)
+    (loop (if (<= (load i) 0) (break)
               (do
-                (let [first (mu-block-inst-first (load bid))
-                      n (mu-block-inst-count (load bid))]
-                  (if (and (>= at first) (< at (+ first n)))
-                      (set! count (+ (load count) 1))
+                (set! i (- (load i) 1))
+                (if (and (not (n-dead? (load i)))
+                         (and (op-is? (load i) Phi [_]) (> (n-nins (load i)) 0)))
+                    (let [ctrl (n-in (load i) 0)
+                          block (if (= ctrl NO-NODE) -1 (al-get (.ctrl-block u) ctrl))]
+                      (if (and (>= block 0) (< block blocks))
+                          (do
+                            (al-set! [i64] (field u verify-node-phi-next) (load i)
+                                     (al-get (.verify-block-phi-head u) block))
+                            (al-set! [i64] (field u verify-block-phi-head) block (load i)))
+                          0))
+                    0))))
+    (set! i 0)
+    (loop (if (>= (load i) insts) (break)
+              (do
+                (al-push! [i64] (field u verify-membership) 0)
+                (al-push! [i64] (field u verify-node-inst-next) -1)
+                (let [m (be-inst (load i))
+                      dst (.dst m)
+                      owner (.owner m)
+                      node (.node m)]
+                  (if (and (>= node 0)
+                           (and (< node nodes) (and (>= owner 0) (< owner funcs))))
+                      (let [key (+ (* owner nodes) node)]
+                        (al-set! [i64] (field u verify-node-inst-next) (load i)
+                                 (al-get [i64] (.verify-node-inst-head u) key))
+                        (al-set! [i64] (field u verify-node-inst-head) key (load i)))
+                      0)
+                  (if (>= dst 0)
+                      (do
+                        (al-set! [i64] (field u verify-def-count) dst
+                                 (+ (al-get [i64] (.verify-def-count u) dst) 1))
+                        (if (and (!= (.op m) MI-LOAD)
+                                 (and (>= node 0) (and (>= owner 0) (< owner funcs))))
+                            (let [key (+ (* owner nodes) node)]
+                              (al-set! [i64] (field u verify-node-def-count) key
+                                       (+ (al-get [i64] (.verify-node-def-count u) key) 1)))
+                            0))
                       0))
-                (set! bid (+ (load bid) 1))
-                0)))
-    (load count)))
+                (set! i (+ (load i) 1)))))
+    (set! i 0)
+    (loop (if (>= (load i) blocks) (break)
+              (do
+                (let [first (mu-block-inst-first (load i))
+                      count (mu-block-inst-count (load i))
+                      (mut k) 0]
+                  (loop (if (>= (load k) count) (break)
+                            (do
+                              (let [at (+ first (load k))]
+                                (if (and (>= at 0) (< at insts))
+                                    (al-set! [i64] (field u verify-membership) at
+                                             (+ (al-get [i64] (.verify-membership u) at) 1))
+                                    0))
+                              (set! k (+ (load k) 1))))))
+                (set! i (+ (load i) 1)))))
+    0))
 
 (defn ms-memory-source-on-edge? [(owner i64) (node i64) (bid i64)] (-> bool)
   (let [(mut edge) 0
@@ -4519,14 +4766,11 @@
                       (set! i (+ (load i) 1))
                       0)))
           ; Every live Phi attached to the target has exactly one record on this edge.
-          (let [(mut node) 0]
-            (loop (if (or (>= (load node) (n-count)) (not (load ok)))
+          (let [(mut node) (al-get (.verify-block-phi-head u) target)]
+            (loop (if (or (< (load node) 0) (not (load ok)))
                       (break)
                       (do
-                        (if (and (not (n-dead? (load node)))
-                                 (and (op-is? (load node) Phi [_])
-                                      (= (ms-phi-block owner (load node)) target)))
-                            (let [(mut j) 0
+                        (let [(mut j) 0
                                   (mut matches) 0]
                               (loop (if (>= (load j) count)
                                         (break)
@@ -4537,13 +4781,13 @@
                                           (set! j (+ (load j) 1))
                                           0)))
                               (if (!= (load matches) 1) (set! ok false) 0))
-                            0)
-                        (set! node (+ (load node) 1))
+                        (set! node (al-get (.verify-node-phi-next u) (load node)))
                         0))))
           (load ok)))))
 
 (defn ms-verify! [] (-> bool)
   (ms-gcm-build-use-lists!)
+  (ms-build-verifier-indices!)
   (let [u (machine-unit)
         blocks (mu-block-count)
         edges (mu-edge-count)
@@ -4885,21 +5129,26 @@
           false)))
 
 (defn ml-kind-for-parm-representation [(parm i64)] (-> i64)
+  ;; Selection normally built this compact index with the CFG. Direct unit queries can reach this
+  ;; helper earlier, so populate it lazily rather than silently treating an empty cache as no calls.
+  (if (= (al-len [i64] (.ideal-calls (machine-unit))) 0) (mu-cache-ideal-calls!) 0)
   (let [fun (n-in parm 0)
         fidx (n-fun-index fun)
         idx (n-parm-index parm)
-        lim (n-count)
-        (mut call) 0
+        calls (.ideal-calls (machine-unit))
+        lim (al-len [i64] calls)
+        (mut call-index) 0
         (mut answer) -1
         (mut consistent) true]
-    (loop (if (or (>= (load call) lim) (not (load consistent)))
+    (loop (if (or (>= (load call-index) lim) (not (load consistent)))
               (break)
               (do
-                (if (or (n-dead? (load call)) (not (op-is? (load call) Call [_])))
+                (let [call (al-get [i64] calls (load call-index))]
+                (if (or (n-dead? call) (not (op-is? call Call [_])))
                     0
-                    (if (not (infer-call-reaches-fun? (load call) fun))
+                    (if (not (infer-call-reaches-fun? call fun))
                         0
-                        (let [source (infer-parm-source (load call) fun idx)]
+                        (let [source (infer-parm-source call fun idx)]
                           (if (= source NO-NODE)
                               0
                               (let [kind (ml-kind-for-source-representation source)]
@@ -4907,22 +5156,38 @@
                                     (set! answer kind)
                                     (if (!= (load answer) kind)
                                         (set! consistent false)
-                                        0)))))))
-                (set! call (+ (load call) 1))
+                                        0))))))))
+                (set! call-index (+ (load call-index) 1))
                 0)))
     (if (and (load consistent) (>= (load answer) 0))
         (load answer)
         (ml-kind-for-type (n-ty parm)))))
 
 (defn ml-kind-for-node [(node i64)] (-> i64)
-  (if (op-is? node Parm [_])
-      (ml-kind-for-parm-representation node)
-      (ml-kind-for-source-representation node)))
+  (let [u (machine-unit)
+        cacheable (> (mu-function-count) 0)]
+    (if cacheable
+        (loop (if (> (al-len [bool] (.kind-known u)) node)
+                  (break)
+                  (do
+                    (al-push! [bool] (field u kind-known) false)
+                    (al-push! [i64] (field u kind-value) MLK-SCALAR)
+                    0)))
+        0)
+    (if (and cacheable (al-get [bool] (.kind-known u) node))
+        (al-get [i64] (.kind-value u) node)
+        (let [answer (if (op-is? node Parm [_])
+                         (ml-kind-for-parm-representation node)
+                         (ml-kind-for-source-representation node))]
+          (if cacheable
+              (do
+                (al-set! [bool] (field u kind-known) node true)
+                (al-set! [i64] (field u kind-value) node answer)
+                0)
+              0)
+          answer))))
 
-;; The reverse map answers most queries directly; a vreg whose recorded node has since died or
-;; been reassigned falls back to the scan, so the answer is always the one the scan would give
-;; (the verifier already requires every definition of a vreg to agree on its kind).
-(defn ml-kind-for-vreg [(vreg i64)] (-> i64)
+(defn ml-kind-for-vreg-direct [(vreg i64)] (-> i64)
   (let [u (machine-unit)
         candidate (if (and (>= vreg 0) (< vreg (al-len [i64] (.vreg-node u))))
                       (al-get [i64] (.vreg-node u) vreg)
@@ -4933,7 +5198,14 @@
     (if (and (and (>= candidate 0) (not (n-dead? candidate)))
              (= (ms-vget candidate-owner candidate) vreg))
         (ml-kind-for-node candidate)
-        (ml-kind-for-vreg-scan vreg))))
+        -1)))
+
+;; The reverse map answers most queries directly; a vreg whose recorded node has since died or
+;; been reassigned falls back to the scan, so the answer is always the one the scan would give
+;; (the verifier already requires every definition of a vreg to agree on its kind).
+(defn ml-kind-for-vreg [(vreg i64)] (-> i64)
+  (let [direct (ml-kind-for-vreg-direct vreg)]
+    (if (>= direct 0) direct (ml-kind-for-vreg-scan vreg))))
 
 (defn ml-kind-for-vreg-scan [(vreg i64)] (-> i64)
   (let [funcs (mu-function-count)
@@ -4968,8 +5240,12 @@
         MLK-SCALAR
         (if (= op MI-NEW)
             MLK-RAW-MANAGED
-            (if (and (or (= op MI-COPY) (= op MI-ABI-COPY)) (>= dst 0))
-                (ml-kind-for-vreg dst)
+            ;; Preserve a destination's graph representation when it has one. A synthetic copy
+            ;; destination has none; asking for its kind used to scan every graph node for every
+            ;; copy only to discover no definition, so inherit the source in that case.
+            (if (and (or (= op MI-COPY) (= op MI-ABI-COPY)) (>= (.a m) 0))
+                (let [direct (ml-kind-for-vreg-direct dst)]
+                  (if (>= direct 0) direct (ml-kind-for-vreg (.a m))))
                 (if (or (< node 0) (>= node (n-count)))
                     MLK-SCALAR
                     (ml-kind-for-node node)))))))
@@ -5123,6 +5399,408 @@
                     3
                     0))))))
 
+(defn ms-schedule-structural-edge? [(producer i64) (consumer i64)] (-> bool)
+  (if (= producer consumer)
+      false
+      (let [p (be-inst producer)
+            c (be-inst consumer)
+            pop (.op p)
+            cop (.op c)
+            before (< (.schedule-order p) (.schedule-order c))
+            relax (load (ms-relax-effect-order))]
+        (or (and before
+                 (or (and (not relax) (and (> (mi-op-effects pop) 0) (= cop MI-CALL)))
+                     (or (and (not relax) (and (= pop MI-CALL) (> (mi-op-effects cop) 0)))
+                         (and (= pop MI-STORE) (= cop MI-STORE)))))
+            (or (= pop MI-LABEL)
+                (or (and (or (= pop MI-ARG) (= pop MI-STACKARG))
+                         (or (and (!= cop MI-LABEL)
+                                  (and (!= cop MI-ARG) (!= cop MI-STACKARG)))
+                             before))
+                    (or (and (= cop MI-COPY)
+                             (and (not (mi-op-terminator? pop))
+                                  (or (!= pop MI-COPY) before)))
+                        (or (and (= pop MI-ABI-COPY)
+                                 (and (!= cop MI-LABEL)
+                                      (and (!= cop MI-ARG)
+                                           (and (!= cop MI-STACKARG)
+                                                (or (!= cop MI-ABI-COPY) before)))))
+                            (and (mi-op-terminator? cop)
+                                 (or (not (mi-op-terminator? pop)) before))))))))))
+
+(defn ms-schedule-add-edge! [(first i64) (count i64) (producer i64) (consumer i64)] (-> i64)
+  (if (or (= producer consumer)
+          (or (< producer first) (or (>= producer (+ first count))
+              (or (< consumer first) (>= consumer (+ first count))))))
+      0
+      (let [u (machine-unit)
+            p (- producer first)
+            c (- consumer first)]
+        (al-set! [i64] (field u schedule-done) c
+                 (+ (al-get [i64] (.schedule-done u) c) 1))
+        (al-push! [i64] (field u sched-edge-consumer) c)
+        (al-push! [i64] (field u sched-edge-next)
+                  (al-get [i64] (.sched-edge-head u) p))
+        (al-set! [i64] (field u sched-edge-head) p
+                 (- (al-len [i64] (.sched-edge-consumer u)) 1))
+        0)))
+
+(defn ms-schedule-add-node-edges! [(first i64) (count i64) (consumer i64)
+                                    (node i64) (anti bool)] (-> i64)
+  (let [u (machine-unit)
+        owner (.owner (be-inst consumer))
+        nodes (n-count)
+        (mut producer)
+          (if (and (>= node 0) (< node nodes))
+              (al-get [i64] (.node-inst-head u) (+ (* owner nodes) node))
+              -1)]
+    (loop (if (< (load producer) 0) (break)
+              (do
+                (if (and (>= (load producer) first)
+                         (and (< (load producer) (+ first count))
+                              (or (not anti)
+                                  (ms-memory-operands-may-alias?
+                                    (be-inst (load producer)) (be-inst consumer)))))
+                    (ms-schedule-add-edge! first count (load producer) consumer)
+                    0)
+                (set! producer (al-get [i64] (.node-inst-next u) (load producer))))))
+    0))
+
+(defn ms-schedule-add-explicit-edges! [(first i64) (count i64) (consumer i64)] (-> i64)
+  (let [m (be-inst consumer)
+        op (.op m)
+        inputs (mi-inputs op)
+        (mut k) 0]
+    (if (> inputs 0)
+        (let [def (ms-def-inst (.a m))]
+          (if (and (>= def 0)
+                   (or (!= (ms-inst-op def) MI-COPY)
+                       (< (.schedule-order (be-inst def)) (.schedule-order m))))
+              (ms-schedule-add-edge! first count def consumer) 0)) 0)
+    (if (> inputs 1)
+        (let [def (ms-def-inst (.b m))]
+          (if (and (>= def 0)
+                   (or (!= (ms-inst-op def) MI-COPY)
+                       (< (.schedule-order (be-inst def)) (.schedule-order m))))
+              (ms-schedule-add-edge! first count def consumer) 0)) 0)
+    (if (= op MI-CSEL)
+        (let [def (ms-def-inst (.imm m))]
+          (if (and (>= def 0)
+                   (or (!= (ms-inst-op def) MI-COPY)
+                       (< (.schedule-order (be-inst def)) (.schedule-order m))))
+              (ms-schedule-add-edge! first count def consumer) 0)) 0)
+    (loop (if (>= (load k) (.arg-count m)) (break)
+              (do
+                (let [def (ms-def-inst (ms-inst-arg consumer (load k)))]
+                  (if (and (>= def 0)
+                           (or (!= (ms-inst-op def) MI-COPY)
+                               (< (.schedule-order (be-inst def)) (.schedule-order m))))
+                      (ms-schedule-add-edge! first count def consumer) 0))
+                (set! k (+ (load k) 1)))))
+    (set! k 0)
+    (loop (if (>= (load k) (.mem-count m)) (break)
+              (do
+                (let [memory (ms-inst-memory-dep-node consumer (load k))]
+                  (ms-schedule-add-node-edges! first count consumer memory false)
+                  (if (and (>= memory 0) (and (op-is? memory Arg [_]) (> (n-nins memory) 0)))
+                      (let [ctrl (n-in memory 0)]
+                        (if (and (op-is? ctrl CallEnd []) (> (n-nins ctrl) 1))
+                            (ms-schedule-add-node-edges!
+                              first count consumer (n-in ctrl 1) false) 0)) 0))
+                (set! k (+ (load k) 1)))))
+    (set! k 0)
+    (loop (if (>= (load k) (.anti-count m)) (break)
+              (do
+                (ms-schedule-add-node-edges!
+                  first count consumer (ms-inst-memory-anti-node consumer (load k)) true)
+                (set! k (+ (load k) 1)))))
+    0))
+
+;; Add a transitive reduction of the block-wide structural rules. The old builder asked
+;; `ms-schedule-structural-edge?` for every producer/consumer pair even though these constraints
+;; are chains and barriers: argument classes lead the block, copies trail ordinary instructions,
+;; terminators end it, and calls partition effect order. Keeping only the immediate chain/barrier
+;; edges preserves exactly the same partial order while making construction linear in block size.
+(defn ms-schedule-add-structural-edges! [(first i64) (count i64)] (-> i64)
+  (let [u (machine-unit)
+        end (+ first count)
+        (mut at) first
+        (mut label) -1
+        (mut last-arg) -1
+        (mut last-abi) -1
+        (mut first-copy) -1
+        (mut last-copy) -1
+        (mut first-term) -1
+        (mut last-term) -1
+        (mut last-store) -1
+        (mut last-call) -1]
+    ;; `sched-ready` is scratch until readiness is initialized below.
+    (al-clear! [i64] (field u sched-ready))
+    (loop (if (>= (load at) end)
+              (break)
+              (do
+                (let [m (be-inst (load at)) op (.op m)]
+                  (if (= op MI-LABEL) (set! label (load at)) 0)
+                  (if (or (= op MI-ARG) (= op MI-STACKARG))
+                      (do
+                        (if (>= (load last-arg) 0)
+                            (ms-schedule-add-edge! first count (load last-arg) (load at)) 0)
+                        (set! last-arg (load at)))
+                      0)
+                  (if (= op MI-ABI-COPY)
+                      (do
+                        (if (>= (load last-abi) 0)
+                            (ms-schedule-add-edge! first count (load last-abi) (load at)) 0)
+                        (set! last-abi (load at)))
+                      0)
+                  (if (= op MI-COPY)
+                      (do
+                        (if (< (load first-copy) 0) (set! first-copy (load at)) 0)
+                        (if (>= (load last-copy) 0)
+                            (ms-schedule-add-edge! first count (load last-copy) (load at)) 0)
+                        (set! last-copy (load at)))
+                      0)
+                  (if (mi-op-terminator? op)
+                      (do
+                        (if (< (load first-term) 0) (set! first-term (load at)) 0)
+                        (if (>= (load last-term) 0)
+                            (ms-schedule-add-edge! first count (load last-term) (load at)) 0)
+                        (set! last-term (load at)))
+                      0)
+                  (if (= op MI-STORE)
+                      (do
+                        (if (>= (load last-store) 0)
+                            (ms-schedule-add-edge! first count (load last-store) (load at)) 0)
+                        (set! last-store (load at)))
+                      0)
+                  ;; Between calls, each effect needs one edge from the preceding call. At the
+                  ;; next call, each intervening effect leads into it. Earlier groups are then
+                  ;; ordered transitively through the preceding call.
+                  (if (= op MI-CALL)
+                      (do
+                        (if (>= (load last-call) 0)
+                            (ms-schedule-add-edge! first count (load last-call) (load at)) 0)
+                        (let [(mut i) 0]
+                          (loop (if (>= (load i) (al-len [i64] (.sched-ready u)))
+                                    (break)
+                                    (do
+                                      (ms-schedule-add-edge!
+                                        first count
+                                        (al-get [i64] (.sched-ready u) (load i)) (load at))
+                                      (set! i (+ (load i) 1))))))
+                        (al-clear! [i64] (field u sched-ready))
+                        (set! last-call (load at)))
+                      (if (> (mi-op-effects op) 0)
+                          (do
+                            (if (>= (load last-call) 0)
+                                (ms-schedule-add-edge! first count (load last-call) (load at)) 0)
+                            (al-push! [i64] (field u sched-ready) (load at))
+                            0)
+                          0)))
+                (set! at (+ (load at) 1)))))
+    ;; Publish each barrier with one incoming chain edge plus one edge per member on the opposite
+    ;; side. Transitivity supplies the all-pairs relation expressed by the old predicate.
+    (set! at first)
+    (loop (if (>= (load at) end)
+              (break)
+              (do
+                (let [op (.op (be-inst (load at)))]
+                  (if (and (>= (load label) 0) (!= (load at) (load label)))
+                      (ms-schedule-add-edge! first count (load label) (load at)) 0)
+                  (if (and (>= (load last-arg) 0)
+                           (and (!= op MI-LABEL)
+                                (and (!= op MI-ARG) (!= op MI-STACKARG))))
+                      (ms-schedule-add-edge! first count (load last-arg) (load at)) 0)
+                  (if (and (>= (load last-abi) 0)
+                           (and (!= op MI-LABEL)
+                                (and (!= op MI-ARG)
+                                     (and (!= op MI-STACKARG) (!= op MI-ABI-COPY)))))
+                      (ms-schedule-add-edge! first count (load last-abi) (load at)) 0)
+                  (if (and (>= (load first-copy) 0)
+                           (and (!= op MI-COPY) (not (mi-op-terminator? op))))
+                      (ms-schedule-add-edge! first count (load at) (load first-copy)) 0)
+                  (if (and (>= (load first-term) 0) (not (mi-op-terminator? op)))
+                      (ms-schedule-add-edge! first count (load at) (load first-term)) 0))
+                (set! at (+ (load at) 1)))))
+    (al-clear! [i64] (field u sched-ready))
+    0))
+
+;; Independent schedule verification asks the same direct graph questions without consulting the
+;; scheduler's indegrees or edge lists.
+(defn ms-schedule-node-producers-before? [(consumer i64) (node i64) (anti bool)] (-> bool)
+  (let [u (machine-unit)
+        c (be-inst consumer)
+        owner (.owner c)
+        bid (.block-id c)
+        nodes (n-count)
+        (mut producer)
+          (if (and (>= node 0) (< node nodes))
+              (al-get [i64] (.verify-node-inst-head u) (+ (* owner nodes) node))
+              -1)
+        (mut ok) true]
+    (loop (if (or (< (load producer) 0) (not (load ok))) (break)
+              (do
+                (let [p (be-inst (load producer))]
+                  (if (and (!= (load producer) consumer)
+                           (and (= (.block-id p) bid)
+                                (or (not anti) (ms-memory-operands-may-alias? p c))))
+                      (if (< (load producer) consumer) 0 (set! ok false))
+                      0))
+                (set! producer (al-get [i64] (.verify-node-inst-next u) (load producer))))))
+    (load ok)))
+
+(defn ms-schedule-explicit-dependencies-before? [(consumer i64)] (-> bool)
+  (let [m (be-inst consumer)
+        op (.op m)
+        inputs (mi-inputs op)
+        bid (.block-id m)
+        (mut k) 0
+        (mut ok) true]
+    (if (> inputs 0)
+        (let [def (ms-def-inst (.a m))]
+          (if (and (>= def 0) (= (ms-inst-block def) bid)
+                   (or (!= (ms-inst-op def) MI-COPY)
+                       (< (.schedule-order (be-inst def)) (.schedule-order m))))
+              (if (< def consumer) 0 (set! ok false)) 0)) 0)
+    (if (and (load ok) (> inputs 1))
+        (let [def (ms-def-inst (.b m))]
+          (if (and (>= def 0) (= (ms-inst-block def) bid)
+                   (or (!= (ms-inst-op def) MI-COPY)
+                       (< (.schedule-order (be-inst def)) (.schedule-order m))))
+              (if (< def consumer) 0 (set! ok false)) 0)) 0)
+    (if (and (load ok) (= op MI-CSEL))
+        (let [def (ms-def-inst (.imm m))]
+          (if (and (>= def 0) (= (ms-inst-block def) bid)
+                   (or (!= (ms-inst-op def) MI-COPY)
+                       (< (.schedule-order (be-inst def)) (.schedule-order m))))
+              (if (< def consumer) 0 (set! ok false)) 0)) 0)
+    (loop (if (or (>= (load k) (.arg-count m)) (not (load ok))) (break)
+              (do
+                (let [def (ms-def-inst (ms-inst-arg consumer (load k)))]
+                  (if (and (>= def 0) (= (ms-inst-block def) bid)
+                           (or (!= (ms-inst-op def) MI-COPY)
+                               (< (.schedule-order (be-inst def)) (.schedule-order m))))
+                      (if (< def consumer) 0 (set! ok false)) 0))
+                (set! k (+ (load k) 1)))))
+    (set! k 0)
+    (loop (if (or (>= (load k) (.mem-count m)) (not (load ok))) (break)
+              (do
+                (let [memory (ms-inst-memory-dep-node consumer (load k))]
+                  (if (not (ms-schedule-node-producers-before? consumer memory false))
+                      (set! ok false) 0)
+                  (if (and (load ok) (and (>= memory 0)
+                           (and (op-is? memory Arg [_]) (> (n-nins memory) 0))))
+                      (let [ctrl (n-in memory 0)]
+                        (if (and (op-is? ctrl CallEnd []) (> (n-nins ctrl) 1))
+                            (if (not (ms-schedule-node-producers-before?
+                                       consumer (n-in ctrl 1) false))
+                                (set! ok false) 0) 0)) 0))
+                (set! k (+ (load k) 1)))))
+    (set! k 0)
+    (loop (if (or (>= (load k) (.anti-count m)) (not (load ok))) (break)
+              (do
+                (if (not (ms-schedule-node-producers-before?
+                           consumer (ms-inst-memory-anti-node consumer (load k)) true))
+                    (set! ok false) 0)
+                (set! k (+ (load k) 1)))))
+    (load ok)))
+
+(defn ms-schedule-anti-dependencies-before? [(consumer i64)] (-> bool)
+  (let [m (be-inst consumer)
+        (mut k) 0
+        (mut ok) true]
+    (loop (if (or (>= (load k) (.anti-count m)) (not (load ok)))
+              (break)
+              (do
+                (if (not (ms-schedule-node-producers-before?
+                           consumer (ms-inst-memory-anti-node consumer (load k)) true))
+                    (set! ok false) 0)
+                (set! k (+ (load k) 1)))))
+    (load ok)))
+
+;; Independently verify the block-wide structural partial order in one scheduled-order scan. These
+;; are the same pairwise invariants as `ms-schedule-structural-edge?`, expressed as monotone class
+;; boundaries and original-order chains rather than consulting the scheduler's reduced edge set.
+(defn ms-schedule-structural-valid? [(first i64) (count i64)] (-> bool)
+  (let [end (+ first count)
+        (mut at) first
+        (mut labels) 0
+        (mut seen-arg-regular) false
+        (mut seen-abi-regular) false
+        (mut seen-copy) false
+        (mut seen-term) false
+        (mut last-arg-order) -1
+        (mut last-abi-order) -1
+        (mut last-copy-order) -1
+        (mut last-term-order) -1
+        (mut last-store-order) -1
+        (mut max-call-order) -1
+        (mut max-effect-order) -1
+        (mut ok) true]
+    (loop (if (or (>= (load at) end) (not (load ok)))
+              (break)
+              (do
+                (let [m (be-inst (load at))
+                      op (.op m)
+                      order (.schedule-order m)
+                      arg (or (= op MI-ARG) (= op MI-STACKARG))
+                      term (mi-op-terminator? op)]
+                  ;; A label leads every other instruction (and two labels would lead each other).
+                  (if (= op MI-LABEL)
+                      (do
+                        (if (or (> (- (load at) first) 0) (> (load labels) 0))
+                            (set! ok false) 0)
+                        (set! labels (+ (load labels) 1)))
+                      0)
+                  ;; Argument and ABI-copy classes lead every later class and retain source order.
+                  (if arg
+                      (do
+                        (if (or (load seen-arg-regular) (<= order (load last-arg-order)))
+                            (set! ok false) 0)
+                        (set! last-arg-order order))
+                      (if (!= op MI-LABEL) (set! seen-arg-regular true) 0))
+                  (if (= op MI-ABI-COPY)
+                      (do
+                        (if (or (load seen-abi-regular) (<= order (load last-abi-order)))
+                            (set! ok false) 0)
+                        (set! last-abi-order order))
+                      (if (and (!= op MI-LABEL) (not arg))
+                          (set! seen-abi-regular true) 0))
+                  ;; All non-terminator non-copies lead the copy chain; all non-terminators lead
+                  ;; the terminator chain.
+                  (if (= op MI-COPY)
+                      (do
+                        (if (<= order (load last-copy-order)) (set! ok false) 0)
+                        (set! last-copy-order order)
+                        (set! seen-copy true))
+                      (if (and (load seen-copy) (not term)) (set! ok false) 0))
+                  (if term
+                      (do
+                        (if (<= order (load last-term-order)) (set! ok false) 0)
+                        (set! last-term-order order)
+                        (set! seen-term true))
+                      (if (load seen-term) (set! ok false) 0))
+                  (if (= op MI-STORE)
+                      (do
+                        (if (<= order (load last-store-order)) (set! ok false) 0)
+                        (set! last-store-order order))
+                      0)
+                  ;; Calls retain source order against every effect. Non-call effects may reorder
+                  ;; among themselves, so maxima encode exactly the pairs having a call endpoint.
+                  (if (= op MI-CALL)
+                      (do
+                        (if (<= order (load max-effect-order)) (set! ok false) 0)
+                        (set! max-call-order order)
+                        (if (> order (load max-effect-order)) (set! max-effect-order order) 0))
+                      (if (> (mi-op-effects op) 0)
+                          (do
+                            (if (<= order (load max-call-order)) (set! ok false) 0)
+                            (if (> order (load max-effect-order))
+                                (set! max-effect-order order) 0))
+                          0)))
+                (set! at (+ (load at) 1)))))
+    (load ok)))
+
 (defn ms-schedule-priority [(at i64)] (-> i64)
   (let [m (be-inst at)]
     ; Correctness edges decide readiness. Latency remains separately queryable target metadata;
@@ -5137,6 +5815,66 @@
           (& (+ (* (+ seed 1) 1103515245)
                 (* (+ (.schedule-order (be-inst at)) 1) 2654435761))
              2147483647))))
+
+(defn ms-schedule-ready-better? [(first i64) (seed i64) (left i64) (right i64)] (-> bool)
+  (let [lp (ms-schedule-priority (+ first left))
+        rp (ms-schedule-priority (+ first right))]
+    (or (> lp rp)
+        (and (= lp rp)
+             (> (ms-schedule-tie (+ first left) seed)
+                (ms-schedule-tie (+ first right) seed))))))
+
+(defn ms-schedule-ready-push! [(first i64) (seed i64) (item i64)] (-> i64)
+  (let [u (machine-unit)
+        (mut at) (al-len [i64] (.sched-ready u))]
+    (al-push! [i64] (field u sched-ready) item)
+    (loop (if (<= (load at) 0) (break)
+              (let [parent (/ (- (load at) 1) 2)
+                    here (al-get [i64] (.sched-ready u) (load at))
+                    above (al-get [i64] (.sched-ready u) parent)]
+                (if (not (ms-schedule-ready-better? first seed here above))
+                    (break)
+                    (do
+                      (al-set! [i64] (field u sched-ready) (load at) above)
+                      (al-set! [i64] (field u sched-ready) parent here)
+                      (set! at parent))))))
+    0))
+
+(defn ms-schedule-ready-pop! [(first i64) (seed i64)] (-> i64)
+  (let [u (machine-unit)
+        n (al-len [i64] (.sched-ready u))
+        answer (al-get [i64] (.sched-ready u) 0)
+        last (al-get [i64] (.sched-ready u) (- n 1))]
+    (al-pop! [i64] (field u sched-ready))
+    (if (> n 1)
+        (do
+          (al-set! [i64] (field u sched-ready) 0 last)
+          (let [(mut at) 0]
+            (loop
+              (let [left (+ (* (load at) 2) 1)
+                    right (+ left 1)
+                    len (al-len [i64] (.sched-ready u))
+                    (mut best) (load at)]
+                (if (and (< left len)
+                         (ms-schedule-ready-better?
+                           first seed (al-get [i64] (.sched-ready u) left)
+                           (al-get [i64] (.sched-ready u) (load best))))
+                    (set! best left) 0)
+                (if (and (< right len)
+                         (ms-schedule-ready-better?
+                           first seed (al-get [i64] (.sched-ready u) right)
+                           (al-get [i64] (.sched-ready u) (load best))))
+                    (set! best right) 0)
+                (if (= (load best) (load at))
+                    (break)
+                    (let [a (al-get [i64] (.sched-ready u) (load at))
+                          b (al-get [i64] (.sched-ready u) (load best))]
+                      (al-set! [i64] (field u sched-ready) (load at) b)
+                      (al-set! [i64] (field u sched-ready) (load best) a)
+                      (set! at (load best)))))))
+          0)
+        0)
+    answer))
 
 ;; Schedule one block, and if the edge set has no topological order, drop the two order-preserving
 ;; call/effect edges and schedule it again.
@@ -5218,70 +5956,40 @@
                   (al-push! [i64] (field u sched-edge-head) -1)
                   (set! i (+ (load i) 1))
                   0))))
+    (ms-schedule-add-structural-edges! first count)
     (let [(mut consumer) 0]
       (loop (if (>= (load consumer) count)
                 (break)
-                (let [(mut producer) 0 (mut degree) 0]
-                  (loop (if (>= (load producer) count)
-                            (break)
-                            (do
-                              (if (> (ms-schedule-dependency-kind
-                                       (+ first (load producer))
-                                       (+ first (load consumer)))
-                                     0)
-                                  (do
-                                    (set! degree (+ (load degree) 1))
-                                    (al-push! [i64] (field u sched-edge-consumer)
-                                              (load consumer))
-                                    (al-push! [i64] (field u sched-edge-next)
-                                              (al-get [i64]
-                                                      (.sched-edge-head u)
-                                                      (load producer)))
-                                    (al-set! [i64] (field u sched-edge-head) (load producer)
-                                             (- (al-len [i64]
-                                                        (.sched-edge-consumer u))
-                                                1))
-                                    0)
-                                  0)
-                              (set! producer (+ (load producer) 1)))))
-                  (al-set! [i64] (field u schedule-done) (load consumer) (load degree))
+                (do
+                  (ms-schedule-add-explicit-edges!
+                    first count (+ first (load consumer)))
                   (set! consumer (+ (load consumer) 1))))))
+    (al-clear! [i64] (field u sched-ready))
+    (let [(mut i) 0]
+      (loop (if (>= (load i) count) (break)
+                (do
+                  (if (= (al-get [i64] (.schedule-done u) (load i)) 0)
+                      (ms-schedule-ready-push! first seed (load i)) 0)
+                  (set! i (+ (load i) 1))))))
     (set! (.inst-first b) (al-len [MInst] (.schedule-work u)))
     (loop (if (>= (load emitted) count)
               (break)
-              (let [(mut i) 0
-                    (mut choice) -1
-                    (mut best-priority) -1
-                    (mut best-tie) -1]
-                (loop (if (>= (load i) count)
-                          (break)
-                          (do
-                            (if (= (al-get (.schedule-done u) (load i)) 0)
-                                (let [priority (ms-schedule-priority (+ first (load i)))
-                                      tie (ms-schedule-tie (+ first (load i)) seed)]
-                                  (if (or (> priority (load best-priority))
-                                          (and (= priority (load best-priority)) (> tie (load best-tie))))
-                                      (do
-                                        (set! choice (load i))
-                                        (set! best-priority priority)
-                                        (set! best-tie tie))
-                                      0))
-                                0)
-                            (set! i (+ (load i) 1))
-                            0)))
-                (if (< (load choice) 0)
+              (let [choice (if (> (al-len [i64] (.sched-ready u)) 0)
+                               (ms-schedule-ready-pop! first seed)
+                               -1)]
+                (if (< choice 0)
                     (do
                       (set! (.schedule-result u) MSCHED-CYCLE)
                       (set! (.schedule-item u) bid)
                       (break))
                     (do
-                      (al-set! [i64] (field u schedule-done) (load choice) -1)
+                      (al-set! [i64] (field u schedule-done) choice -1)
                       (al-push! [MInst]
                                 (field u schedule-work)
-                                (load (be-inst (+ first (load choice)))))
+                                (load (be-inst (+ first choice))))
                       (let [(mut e) (al-get [i64]
                                             (.sched-edge-head u)
-                                            (load choice))]
+                                            choice)]
                         (loop (if (< (load e) 0)
                                   (break)
                                   (do
@@ -5296,6 +6004,10 @@
                                                      (field u schedule-done)
                                                      consumer
                                                      (- degree 1))
+                                            (if (= degree 1)
+                                                (ms-schedule-ready-push!
+                                                  first seed consumer)
+                                                0)
                                             0)
                                           0))
                                     (set! e
@@ -5314,6 +6026,37 @@
         (mut at) 0]
     (set! (.schedule-result u) MSCHED-OK)
     (set! (.schedule-item u) -1)
+    (ms-build-verifier-indices!)
+    (al-clear! [i64] (field u verify-order-count))
+    (loop (if (>= (load at) n) (break)
+              (do (al-push! [i64] (field u verify-order-count) 0)
+                  (set! at (+ (load at) 1)))))
+    (set! at 0)
+    (loop (if (>= (load at) n) (break)
+              (do
+                (let [order (.schedule-order (be-inst (load at)))]
+                  (if (and (>= order 0) (< order n))
+                      (al-set! [i64] (field u verify-order-count) order
+                               (+ (al-get [i64] (.verify-order-count u) order) 1))
+                      0))
+                (set! at (+ (load at) 1)))))
+    ;; Establish identity/coverage before asking semantic ordering questions so a duplicated
+    ;; instruction retains the verifier's precise EXACTLY-ONCE diagnosis.
+    (set! at 0)
+    (loop (if (or (>= (load at) n) (!= (ms-schedule-result) MSCHED-OK))
+              (break)
+              (do
+                (let [owner-count (al-get [i64] (.verify-membership u) (load at))
+                      order (.schedule-order (be-inst (load at)))
+                      order-count (if (and (>= order 0) (< order n))
+                                      (al-get [i64] (.verify-order-count u) order) 0)]
+                  (if (or (!= owner-count 1)
+                          (or (< order 0) (or (>= order n) (!= order-count 1))))
+                      (do
+                        (set! (.schedule-result u) MSCHED-EXACTLY-ONCE)
+                        (set! (.schedule-item u) (load at)))
+                      0))
+                (set! at (+ (load at) 1)))))
     (loop (if (or (>= (load bid) blocks) (!= (ms-schedule-result) MSCHED-OK))
               (break)
               (do
@@ -5327,12 +6070,17 @@
                         (set! (.schedule-result u) MSCHED-EXACTLY-ONCE)
                         (set! (.schedule-item u) (load bid)))
                       0)
+                  (if (and (= (ms-schedule-result) MSCHED-OK)
+                           (not (ms-schedule-structural-valid? first count)))
+                      (do
+                        (set! (.schedule-result u) MSCHED-DEPENDENCY)
+                        (set! (.schedule-item u) (load bid)))
+                      0)
                   (loop (if (or (>= (load i) count) (!= (ms-schedule-result) MSCHED-OK))
                             (break)
                             (do
                               (let [current (+ first (load i))
-                                    m (be-inst (+ first (load i)))
-                                    (mut p) 0]
+                                    m (be-inst (+ first (load i)))]
                                 (if (!= (.block-id m) (load bid))
                                     (do
                                       (set! (.schedule-result u) MSCHED-EXACTLY-ONCE)
@@ -5351,19 +6099,19 @@
                                       (set! (.schedule-result u) MSCHED-MEMORY)
                                       (set! (.schedule-item u) current))
                                     0)
-                                (loop (if (>= (load p) count)
-                                          (break)
-                                          (do
-                                            (let [producer (+ first (load p))
-                                                  kind (ms-schedule-dependency-kind producer current)]
-                                              (if (and (> kind 0) (>= producer current))
-                                                  (do
-                                                    (set! (.schedule-result u)
-                                                          (if (= kind 2) MSCHED-MEMORY MSCHED-DEPENDENCY))
-                                                    (set! (.schedule-item u) current))
-                                                  0))
-                                            (set! p (+ (load p) 1))
-                                            0))))
+                                (if (and (= (ms-schedule-result) MSCHED-OK)
+                                         (not (ms-schedule-anti-dependencies-before? current)))
+                                    (do
+                                      (set! (.schedule-result u) MSCHED-MEMORY)
+                                      (set! (.schedule-item u) current))
+                                    0)
+                                (if (and (= (ms-schedule-result) MSCHED-OK)
+                                         (not (ms-schedule-explicit-dependencies-before? current)))
+                                    (do
+                                      (set! (.schedule-result u) MSCHED-DEPENDENCY)
+                                      (set! (.schedule-item u) current))
+                                    0)
+                                0)
                               (set! i (+ (load i) 1))
                               0))))
                 (set! bid (+ (load bid) 1))
@@ -5373,32 +6121,12 @@
     (loop (if (or (>= (load at) n) (!= (ms-schedule-result) MSCHED-OK))
               (break)
               (do
-                (let [(mut owner-count) 0
-                      (mut order-count) 0
-                      (mut b) 0
-                      order (.schedule-order (be-inst (load at)))]
-                  (loop (if (>= (load b) blocks)
-                            (break)
-                            (do
-                              (let [rec (mu-block (load b))
-                                    first (.inst-first rec)]
-                                (if (and (>= (load at) first)
-                                         (< (load at) (+ first (.inst-count rec))))
-                                    (set! owner-count (+ (load owner-count) 1))
-                                    0))
-                              (set! b (+ (load b) 1))
-                              0)))
-                  (let [(mut other) 0]
-                    (loop (if (>= (load other) n)
-                              (break)
-                              (do
-                                (if (= (.schedule-order (be-inst (load other))) order)
-                                    (set! order-count (+ (load order-count) 1))
-                                    0)
-                                (set! other (+ (load other) 1))
-                                0))))
-                  (if (or (!= (load owner-count) 1)
-                          (or (< order 0) (or (>= order n) (!= (load order-count) 1))))
+                (let [owner-count (al-get [i64] (.verify-membership u) (load at))
+                      order (.schedule-order (be-inst (load at)))
+                      order-count (if (and (>= order 0) (< order n))
+                                      (al-get [i64] (.verify-order-count u) order) 0)]
+                  (if (or (!= owner-count 1)
+                          (or (< order 0) (or (>= order n) (!= order-count 1))))
                       (do
                         (set! (.schedule-result u) MSCHED-EXACTLY-ONCE)
                         (set! (.schedule-item u) (load at)))
@@ -5423,10 +6151,22 @@
         n (be-inst-count)
         blocks (mu-block-count)
         (mut at) 0
-        (mut bid) 0]
+        (mut bid) 0
+        (mut max-block) 0
+        (mut pairs) 0
+        (mut profile-start) (ms-profile-now)]
     (set! (.schedule-result u) MSCHED-OK)
     (set! (.schedule-item u) -1)
     (set! (.schedule-seed u) seed)
+    (loop (if (>= (load bid) blocks) (break)
+              (do
+                (let [count (mu-block-inst-count (load bid))]
+                  (if (> count (load max-block)) (set! max-block count) 0)
+                  (set! pairs (+ (load pairs) (* count count))))
+                (set! bid (+ (load bid) 1)))))
+    (fmt (stderr) "AOTK_PROFILE phase=schedule_shape insts={d} blocks={d} max_block={d} pair_queries={d}\n"
+         n blocks (load max-block) (load pairs))
+    (set! bid 0)
     (al-clear! [MInst] (field u schedule-work))
     (loop (if (>= (load at) n)
               (break)
@@ -5442,6 +6182,7 @@
                 (ms-schedule-block! (load bid) seed)
                 (set! bid (+ (load bid) 1))
                 0)))
+    (set! profile-start (ms-profile-note! "schedule_build" (load profile-start)))
     (if (!= (ms-schedule-result) MSCHED-OK)
         false
         (do
@@ -5471,7 +6212,10 @@
                       (do (set! (.schedule-order (be-inst (load k))) (load k))
                           (set! k (+ (load k) 1))
                           0))))
-          (ms-verify-schedule!)))))
+          (ms-cache-def-insts!)
+          (let [ok (ms-verify-schedule!)]
+            (ms-profile-note! "schedule_verify" (load profile-start))
+            ok)))))
 
 ;; Selection emits a dependency-topological order. This explicit scheduler computes live intervals
 ;; and is the hook where M10's global code motion adds block placement for control graphs.

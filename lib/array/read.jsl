@@ -14,7 +14,8 @@
 ;; https://tc39.es/ecma262/#sec-array.prototype.indexof, steps 6-10. ToIntegerOrInfinity of the
 ;; start is normalized into [0, len]: negative values count from the end, then clamp at zero.
 (macro ArrayIndexOf :params [(a dyn) (target dyn) (from dyn)] :ret int
-  (let [(len (%ArrayLen a))]
+  (let [(object (ObjectFromValue (ObjectCoercible a)))
+        (len (ArrayLikeLength object))]
     (if (%Le len 0)
         -1
         (let [(n (%ToInteger from))
@@ -24,17 +25,22 @@
                          (if (%Lt (%UnboxFlt n) 0.0) 0 len)))]
           (loop [(i start)]
             (if (%Le len i) -1
-              (let [(value (%ArrayLoad a i))
-                    (same (if (%IsString value)
-                              (if (%IsString target) (StringEquals value target) false)
-                              (if (%IsString target) false (%Eq value target))))]
-                (if same i (recur (%Add i 1))))))))))
+              ;; indexOf skips absent properties; inherited numeric properties still count through
+              ;; HasProperty/GetProperty, as required for this intentionally generic Array method.
+              (if (ArrayLikeHasIndex object i)
+                  (let [(value (ArrayLikeGet object i))
+                        (same (if (%IsString value)
+                                  (if (%IsString target) (StringEquals value target) false)
+                                  (if (%IsString target) false (%Eq value target))))]
+                    (if same i (recur (%Add i 1))))
+                  (recur (%Add i 1)))))))))
 
 ;; https://tc39.es/ecma262/#sec-array.prototype.includes. It differs from `indexOf` in EXACTLY one
 ;; way and it is the reason both exist: `includes` compares with SameValueZero, so it finds a NaN
 ;; that `indexOf` — using strict equality — never can.
 (macro ArrayIncludes :params [(a dyn) (target dyn) (from dyn)] :ret bool
-  (let [(len (%ArrayLen a))]
+  (let [(object (ObjectFromValue (ObjectCoercible a)))
+        (len (ArrayLikeLength object))]
     (if (%Le len 0)
         false
         (let [(n (%ToInteger from))
@@ -44,11 +50,13 @@
                          (if (%Lt (%UnboxFlt n) 0.0) 0 len)))]
           (loop [(i start)]
             (if (%Le len i) false
-              (if (SameValueZero (%ArrayLoad a i) target) true (recur (%Add i 1)))))))))
+              ;; includes deliberately reads holes as undefined rather than skipping them.
+              (if (SameValueZero (ArrayLikeGet object i) target) true (recur (%Add i 1)))))))))
 
 ;; https://tc39.es/ecma262/#sec-array.prototype.lastindexof, searching the whole array.
 (macro ArrayLastIndexOf :params [(a dyn) (target dyn) (from dyn) (has-from bool)] :ret int
-  (let [(len (%ArrayLen a))]
+  (let [(object (ObjectFromValue (ObjectCoercible a)))
+        (len (ArrayLikeLength object))]
     (if (%Le len 0)
         -1
         (let [(n (%ToInteger from))
@@ -63,11 +71,13 @@
                          (%Sub len 1)))]
           (loop [(i start)]
             (if (%Lt i 0) -1
-              (let [(value (%ArrayLoad a i))
-                    (same (if (%IsString value)
-                              (if (%IsString target) (StringEquals value target) false)
-                              (if (%IsString target) false (%Eq value target))))]
-                (if same i (recur (%Sub i 1))))))))))
+              (if (ArrayLikeHasIndex object i)
+                  (let [(value (ArrayLikeGet object i))
+                        (same (if (%IsString value)
+                                  (if (%IsString target) (StringEquals value target) false)
+                                  (if (%IsString target) false (%Eq value target))))]
+                    (if same i (recur (%Sub i 1))))
+                  (recur (%Sub i 1)))))))))
 
 ;; https://tc39.es/ecma262/#sec-array.prototype.at — a negative index counts from the end.
 ;;
@@ -85,14 +95,15 @@
 ;;
 ;; `undefined` and `null` become the EMPTY string rather than "undefined" and "null", which is the
 ;; one place `join` disagrees with `String(x)` and the reason this cannot just call `%ToString`.
-(macro ArrayJoin :params [(a dyn) (sep dyn)] :ret dyn
+(macro ArrayJoin :transitioning true :params [(a dyn) (sep dyn)] :ret dyn
   (ArrayJoinSeen a sep (%NewArray)))
 
-(macro ArrayJoinSeen :params [(a dyn) (sep dyn) (seen dyn)] :ret dyn
-  (let [(len (%ArrayLen a))]
+(macro ArrayJoinSeen :transitioning true :params [(a dyn) (sep dyn) (seen dyn)] :ret dyn
+  (let [(object (ObjectFromValue (ObjectCoercible a)))
+        (len (ArrayLikeLength object))]
     (loop [(i 0) (out "")]
       (if (%Le len i) out
-        (let [(v (%ArrayLoad a i))
+        (let [(v (ArrayLikeGet object i))
               ;; Boxed constants, for the reason `ArrayAt` above states: `v` is a tagged element and
               ;; a bare `undefined` is the machine word 0, so the unboxed spelling compared a tag
               ;; against a payload and never matched. `[1, undefined, null, 4].join(",")` came out

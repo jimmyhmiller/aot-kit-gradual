@@ -26,15 +26,8 @@
               (break)
               (do
                 (let [vr (ms-inst-arg at (load argi))
-                      (mut k) 0]
-                  (loop (if (>= (load k) n)
-                            (break)
-                            (do
-                              (if (= (.dst (be-inst (load k))) vr)
-                                  (set! (.last (be-inst (load k))) at)
-                                  0)
-                              (set! k (+ (load k) 1))
-                              0))))
+                      def (ms-def-inst vr)]
+                  (if (>= def 0) (set! (.last (be-inst def)) at) 0))
                 (set! argi (+ (load argi) 1))
                 0)))
     0))
@@ -63,16 +56,12 @@
                       a (.a m)
                       b (.b m)
                       pred (if (= (.op m) MI-CSEL) (.imm m) -1)
-                      (mut j) 0]
-                  (loop (if (>= (load j) n)
-                            (break)
-                            (do
-                              (let [d (.dst (be-inst (load j)))]
-                                (if (and (>= d 0) (or (or (= d a) (= d b)) (= d pred)))
-                                    (set! (.last (be-inst (load j))) (load i))
-                                    0))
-                              (set! j (+ (load j) 1))
-                              0)))
+                      adef (ms-def-inst a)
+                      bdef (ms-def-inst b)
+                      pdef (ms-def-inst pred)]
+                  (if (>= adef 0) (set! (.last (be-inst adef)) (load i)) 0)
+                  (if (>= bdef 0) (set! (.last (be-inst bdef)) (load i)) 0)
+                  (if (>= pdef 0) (set! (.last (be-inst pdef)) (load i)) 0)
                   (if (> (ms-inst-arg-count (load i)) 0)
                       (be-note-call-arg-uses! (load i) n)
                       0))
@@ -118,14 +107,19 @@
     n))
 
 (defn be-schedule-seeded! [(seed i64)] (-> i64)
-  (let [n (be-inst-count)]
+  (let [n (be-inst-count)
+        (mut profile-start) (ms-profile-now)]
     (if (and (> n 0) (>= (ms-inst-owner 0) 0))
         ;; Run the legality scheduler for production seed zero as well as perturbation seeds. GCM
         ;; placement alone does not order a heap read before a later aliasing write; the explicit
         ;; memory anti-edge is enforced here.
         (if (ms-local-schedule! seed)
-            (let [scheduled (be-schedule-intervals!)]
-              (if (ml-compute! seed) scheduled -1))
+            ;; CFG allocation consumes exact liveness and never reads the legacy linear interval
+            ;; endpoints. Building those endpoints included a quadratic backedge repair over the
+            ;; whole unit; retain it only for the ownerless legacy allocator below.
+            (let [ok (ml-compute! seed)]
+              (set! profile-start (ms-profile-note! "schedule_liveness" (load profile-start)))
+              (if ok n -1))
             -1)
         (be-schedule-intervals!))))
 

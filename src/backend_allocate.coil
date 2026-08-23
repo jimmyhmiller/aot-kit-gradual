@@ -40,10 +40,71 @@
   (if (and (ml-safepoint? at) (ml-live-before? at vreg)) (mra-spill vreg) -2))
 (defn mra-safepoint-kind [(at i64) (vreg i64)] (-> i64)
   (if (and (ml-safepoint? at) (ml-live-before? at vreg)) (ml-value-kind vreg) -1))
+(defn mra-interference-word [(a i64) (b i64)] (-> i64)
+  (+ (al-get (.alloc-row-first (machine-unit)) a) (/ (ml-vreg-local b) 64)))
 (defn mra-interferes? [(a i64) (b i64)] (-> bool)
-  (!= (al-get (.alloc-interference (machine-unit))
-              (+ (* a (ml-vreg-count)) b))
+  (!= (& (al-get (.alloc-interference (machine-unit))
+                  (mra-interference-word a b))
+          (ml-local-bit b))
       0))
+(defn mra-verifying-interference? [] (-> (ptr bool)) (primitive/alloc-static bool))
+
+(defn mra-verify-edge-key [(a i64) (b i64)] (-> i64)
+  (if (< a b) (+ (* a (ml-vreg-count)) b) (+ (* b (ml-vreg-count)) a)))
+
+(defn mra-verify-edge-slot [(key i64)] (-> i64)
+  (let [keys (.alloc-expected (machine-unit))
+        mask (- (al-len [i64] keys) 1)
+        (mut slot) (& (* key 1140071481932319849) mask)]
+    (loop (let [found (al-get keys (load slot))]
+            (if (or (= found -1) (= found key))
+                (break)
+                (set! slot (& (+ (load slot) 1) mask)))))
+    (load slot)))
+
+(defn mra-build-verifier-edge-index! [] (-> i64)
+  (let [u (machine-unit)
+        directed (al-len [i64] (.alloc-adj-other u))
+        (mut cap) 1
+        (mut vr) 0]
+    (loop (if (>= (load cap) (if (> directed 0) directed 1))
+              (break)
+              (set! cap (* (load cap) 2))))
+    (al-clear! [i64] (field u alloc-expected))
+    (al-clear! [i64] (field u alloc-verify-seen))
+    (loop (if (<= (load cap) 0)
+              (break)
+              (do
+                (al-push! [i64] (field u alloc-expected) -1)
+                (al-push! [i64] (field u alloc-verify-seen) 0)
+                (set! cap (- (load cap) 1)))))
+    (loop (if (>= (load vr) (ml-vreg-count))
+              (break)
+              (do
+                (let [(mut edge) (al-get (.alloc-adj-head u) (load vr))]
+                  (loop (if (< (load edge) 0)
+                            (break)
+                            (do
+                              (let [other (al-get (.alloc-adj-other u) (load edge))]
+                                (if (< (load vr) other)
+                                    (let [key (mra-verify-edge-key (load vr) other)
+                                          slot (mra-verify-edge-slot key)]
+                                      (al-set! [i64] (field u alloc-expected) slot key))
+                                    0))
+                              (set! edge (al-get (.alloc-adj-next u) (load edge))))))
+                (set! vr (+ (load vr) 1))))))
+    0))
+
+(defn mra-verify-note-edge! [(a i64) (b i64)] (-> i64)
+  (let [u (machine-unit)
+        key (mra-verify-edge-key a b)
+        slot (mra-verify-edge-slot key)]
+    (if (= (al-get (.alloc-expected u) slot) key)
+        (al-set! [i64] (field u alloc-verify-seen) slot 1)
+        (do
+          (set! (.allocation-result u) MRA-INTERFERENCE)
+          (set! (.allocation-item u) a)))
+    0))
 
 (defn mra-phys-reg [(color i64)] (-> i64)
   (if (< color 8)
@@ -65,23 +126,46 @@
         vregs (ml-vreg-count)
         (mut i) 0]
     (al-clear! [i64] (field u alloc-interference))
+    (al-clear! [i64] (field u alloc-row-first))
     (al-clear! [i64] (field u alloc-live))
+    (al-clear! [i64] (field u alloc-live-list))
+    (al-clear! [i64] (field u alloc-live-pos))
+    (al-clear! [i64] (field u alloc-owner-head))
+    (al-clear! [i64] (field u alloc-owner-next))
+    (al-clear! [i64] (field u alloc-adj-head))
+    (al-clear! [i64] (field u alloc-adj-other))
+    (al-clear! [i64] (field u alloc-adj-next))
+    (al-clear! [i64] (field u alloc-copy-peer))
     (al-clear! [i64] (field u alloc-reg))
     (al-clear! [i64] (field u alloc-spill))
     (al-clear! [i64] (field u alloc-owner))
     (al-clear! [i64] (field u alloc-forbidden))
     (al-clear! [i64] (field u alloc-spill-kind))
-    (loop (if (>= (load i) (* vregs vregs))
+    ;; Interference is intra-function. Give each global vreg one row containing only its owner's
+    ;; local values instead of allocating all-unit V*V cells across unrelated functions.
+    (let [(mut words) 0]
+      (loop (if (>= (load i) vregs)
+                (break)
+                (do
+                  (al-push! [i64] (field u alloc-row-first) (load words))
+                  (set! words (+ (load words) (ml-owner-words (ml-vreg-owner (load i)))))
+                  (set! i (+ (load i) 1)))))
+      (set! i 0)
+      (loop (if (>= (load i) (load words))
               (break)
               (do
                 (al-push! [i64] (field u alloc-interference) 0)
                 (set! i (+ (load i) 1))
-                0)))
+                0))))
     (set! i 0)
     (loop (if (>= (load i) vregs)
               (break)
               (do
                 (al-push! [i64] (field u alloc-live) 0)
+                (al-push! [i64] (field u alloc-live-pos) -1)
+                (al-push! [i64] (field u alloc-owner-next) -1)
+                (al-push! [i64] (field u alloc-adj-head) -1)
+                (al-push! [i64] (field u alloc-copy-peer) -1)
                 (al-push! [i64] (field u alloc-reg) -1)
                 (al-push! [i64] (field u alloc-spill) -1)
                 (al-push! [i64] (field u alloc-owner) -1)
@@ -90,6 +174,12 @@
                 (set! i (+ (load i) 1))
                 0)))
     (set! i 0)
+    (loop (if (>= (load i) (mu-function-count))
+              (break)
+              (do
+                (al-push! [i64] (field u alloc-owner-head) -1)
+                (set! i (+ (load i) 1)))))
+    (set! i 0)
     (loop (if (>= (load i) (be-inst-count))
               (break)
               (do
@@ -97,7 +187,9 @@
                       dst (.dst m)]
                   (if (>= dst 0)
                       (do
-                        (al-set! [i64] (field u alloc-owner) dst (.owner m))
+                        (if (< (al-get (.alloc-owner u) dst) 0)
+                            (al-set! [i64] (field u alloc-owner) dst (.owner m))
+                            0)
                         (if (= (.op m) MI-ARG)
                             (al-set! [i64]
                                      (field u alloc-reg)
@@ -108,6 +200,20 @@
                       0))
                 (set! i (+ (load i) 1))
                 0)))
+    ;; Build each owner's list in ascending vreg order so independent consumers (including stack
+    ;; map publication) retain the canonical root order while skipping other functions' vregs.
+    (set! i vregs)
+    (loop (if (<= (load i) 0)
+              (break)
+              (do
+                (set! i (- (load i) 1))
+                (let [owner (al-get (.alloc-owner u) (load i))]
+                  (if (>= owner 0)
+                      (do
+                        (al-set! [i64] (field u alloc-owner-next) (load i)
+                                 (al-get (.alloc-owner-head u) owner))
+                        (al-set! [i64] (field u alloc-owner-head) owner (load i)))
+                      0)))))
     ;; Ingress copies are sequential moves. A fresh destination must avoid every still-fixed
     ;; ingress register in its function, or one copy can overwrite another argument before that
     ;; argument has been copied. Calls/safepoints remain governed by ordinary liveness masks.
@@ -149,14 +255,106 @@
                 (set! i (+ (load i) 1)))))
     0))
 
+(defn mra-live-add! [(vreg i64)] (-> i64)
+  (let [u (machine-unit)]
+    (if (= (al-get [i64] (.alloc-live u) vreg) 0)
+        (do
+          (al-set! [i64] (field u alloc-live) vreg 1)
+          (al-set! [i64] (field u alloc-live-pos) vreg
+                   (al-len [i64] (.alloc-live-list u)))
+          (al-push! [i64] (field u alloc-live-list) vreg)
+          0)
+        0)))
+
+(defn mra-live-remove! [(vreg i64)] (-> i64)
+  (let [u (machine-unit)
+        pos (al-get [i64] (.alloc-live-pos u) vreg)
+        last-pos (- (al-len [i64] (.alloc-live-list u)) 1)]
+    (if (< pos 0)
+        0
+        (let [last (al-get [i64] (.alloc-live-list u) last-pos)]
+          (al-set! [i64] (field u alloc-live-list) pos last)
+          (al-set! [i64] (field u alloc-live-pos) last pos)
+          (al-pop! [i64] (field u alloc-live-list))
+          (al-set! [i64] (field u alloc-live-pos) vreg -1)
+          (al-set! [i64] (field u alloc-live) vreg 0)
+          0))))
+
+(defn mra-live-from-block-out! [(bid i64)] (-> i64)
+  (let [u (machine-unit)
+        owner (mu-block-owner bid)
+        base (al-get (.live-block-first u) bid)
+        (mut pos) 0
+        (mut word) 0]
+    ;; Clear exactly the prior sparse members; unrelated vregs were already zero.
+    (loop (if (>= (load pos) (al-len [i64] (.alloc-live-list u)))
+              (break)
+              (do
+                (let [vr (al-get (.alloc-live-list u) (load pos))]
+                  (al-set! [i64] (field u alloc-live) vr 0)
+                  (al-set! [i64] (field u alloc-live-pos) vr -1))
+                (set! pos (+ (load pos) 1)))))
+    (al-clear! [i64] (field u alloc-live-list))
+    (loop (if (>= (load word) (ml-block-words bid))
+              (break)
+              (do
+                (let [bits (al-get (.live-out u) (+ base (load word)))]
+                  (if (!= bits 0)
+                      (let [(mut bit) 0]
+                        (loop (if (>= (load bit) 64)
+                                  (break)
+                                  (do
+                                    (if (!= (& bits (<< 1 (load bit))) 0)
+                                        (let [local (+ (* (load word) 64) (load bit))]
+                                          (if (< local
+                                                 (al-get (.live-owner-count u) owner))
+                                              (mra-live-add! (ml-owner-vreg owner local))
+                                              0))
+                                        0)
+                                    (set! bit (+ (load bit) 1))
+                                    0))))
+                      0))
+                (set! word (+ (load word) 1))
+                0)))
+    0))
+
 (defn mra-add-interference! [(a i64) (b i64)] (-> i64)
   (if (or (< a 0) (or (< b 0) (= a b)))
       0
       (let [u (machine-unit)
-            n (ml-vreg-count)]
-        (al-set! [i64] (field u alloc-interference) (+ (* a n) b) 1)
-        (al-set! [i64] (field u alloc-interference) (+ (* b n) a) 1)
-        0)))
+            ab (mra-interference-word a b)
+            ba (mra-interference-word b a)
+            fresh (= (& (al-get [i64] (.alloc-interference u) ab) (ml-local-bit b)) 0)]
+        ;; Verification rebuilds the graph independently from liveness. Check assigned colors at
+        ;; the edge as it is rediscovered, rather than rescanning every adjacency list per vreg.
+        (if (and (load (mra-verifying-interference?))
+                 (and (>= (mra-reg a) 0) (= (mra-reg a) (mra-reg b))))
+            (do
+              (set! (.allocation-result u) MRA-INTERFERENCE)
+              (set! (.allocation-item u) a))
+            0)
+        (if (load (mra-verifying-interference?))
+            (do
+              (mra-verify-note-edge! a b)
+              0)
+            (do
+              (al-set! [i64] (field u alloc-interference) ab
+                       (| (al-get [i64] (.alloc-interference u) ab) (ml-local-bit b)))
+              (al-set! [i64] (field u alloc-interference) ba
+                       (| (al-get [i64] (.alloc-interference u) ba) (ml-local-bit a)))
+              (if fresh
+                  (do
+                    (let [edge (al-len [i64] (.alloc-adj-other u))]
+                      (al-push! [i64] (field u alloc-adj-other) b)
+                      (al-push! [i64] (field u alloc-adj-next) (al-get (.alloc-adj-head u) a))
+                      (al-set! [i64] (field u alloc-adj-head) a edge))
+                    (let [edge (al-len [i64] (.alloc-adj-other u))]
+                      (al-push! [i64] (field u alloc-adj-other) a)
+                      (al-push! [i64] (field u alloc-adj-next) (al-get (.alloc-adj-head u) b))
+                      (al-set! [i64] (field u alloc-adj-head) b edge))
+                    0)
+                  0)
+              0)))))
 
 (defstruct MraUseScratch [(list (ArrayList i64)) (inited bool)])
 (defn mra-use-scratch [] (-> (ptr MraUseScratch))
@@ -218,9 +416,7 @@
     (loop (if (>= (load k) uses)
               (break)
               (do
-                (al-set! [i64] (field u alloc-live)
-                         (al-get [i64] (.list (mra-use-scratch)) (load k))
-                         1)
+                (mra-live-add! (al-get [i64] (.list (mra-use-scratch)) (load k)))
                 (set! k (+ (load k) 1))
                 0)))
     0))
@@ -233,16 +429,7 @@
     (loop (if (>= (load bid) blocks)
               (break)
               (do
-                (let [(mut vr) 0]
-                  (loop (if (>= (load vr) vregs)
-                            (break)
-                            (do
-                              (al-set! [i64]
-                                       (field u alloc-live)
-                                       (load vr)
-                                       (if (ml-live-out? (load bid) (load vr)) 1 0))
-                              (set! vr (+ (load vr) 1))
-                              0))))
+                (mra-live-from-block-out! (load bid))
                 (let [first (mu-block-inst-first (load bid))
                       count (mu-block-inst-count (load bid))
                       (mut i) count
@@ -256,33 +443,37 @@
                                     dst (.dst m)]
                                 ; Values live after any call-like instruction cannot occupy its clobber mask.
                                 (if (!= (mi-desc-clobbers (mi-desc (.op m))) 0)
-                                    (let [(mut vr) 0]
-                                      (loop (if (>= (load vr) vregs)
+                                    (let [(mut live-at) 0]
+                                      (loop (if (>= (load live-at)
+                                                    (al-len [i64] (.alloc-live-list u)))
                                                 (break)
                                                 (do
-                                                  (if (and (!= (load vr) dst)
-                                                           (!= (al-get (.alloc-live u) (load vr)) 0))
+                                                  (let [vr (al-get [i64] (.alloc-live-list u)
+                                                                   (load live-at))]
+                                                  (if (!= vr dst)
                                                       (al-set! [i64]
                                                                (field u alloc-forbidden)
-                                                               (load vr)
-                                                               (| (al-get (.alloc-forbidden u) (load vr))
+                                                               vr
+                                                               (| (al-get (.alloc-forbidden u) vr)
                                                                   (mi-desc-clobbers (mi-desc (.op m)))))
-                                                      0)
-                                                  (set! vr (+ (load vr) 1))
+                                                      0))
+                                                  (set! live-at (+ (load live-at) 1))
                                                   0))))
                                     0)
                                 (if (>= dst 0)
                                     (do
-                                      (set! vr 0)
-                                      (loop (if (>= (load vr) vregs)
+                                      (let [(mut live-at) 0]
+                                      (loop (if (>= (load live-at)
+                                                    (al-len [i64] (.alloc-live-list u)))
                                                 (break)
                                                 (do
-                                                  (if (!= (al-get (.alloc-live u) (load vr)) 0)
-                                                      (mra-add-interference! dst (load vr))
-                                                      0)
-                                                  (set! vr (+ (load vr) 1))
-                                                  0)))
-                                      (al-set! [i64] (field u alloc-live) dst 0))
+                                                  (mra-add-interference!
+                                                    dst
+                                                    (al-get [i64] (.alloc-live-list u)
+                                                            (load live-at)))
+                                                  (set! live-at (+ (load live-at) 1))
+                                                  0))))
+                                      (mra-live-remove! dst))
                                     0)
                                 (mra-mark-uses-live! at))))))
                 (set! bid (+ (load bid) 1))
@@ -294,44 +485,50 @@
       false
       (let [u (machine-unit)
             forbidden (al-get (.alloc-forbidden u) vreg)
-            vregs (ml-vreg-count)
-            (mut other) 0
+            (mut edge) (al-get (.alloc-adj-head u) vreg)
             (mut ok) true]
         (if (or (!= (= (ml-register-class vreg) MRC-FPR) (>= reg 32))
                 (!= (& forbidden (<< 1 reg)) 0))
             false
             (do
-              (loop (if (or (>= (load other) vregs) (not (load ok)))
+              (loop (if (or (< (load edge) 0) (not (load ok)))
                         (break)
                         (do
-                          (if (and (mra-interferes? vreg (load other))
-                                   (= (mra-reg (load other)) reg))
+                          (if (= (mra-reg (al-get (.alloc-adj-other u) (load edge))) reg)
                               (set! ok false)
                               0)
-                          (set! other (+ (load other) 1))
+                          (set! edge (al-get (.alloc-adj-next u) (load edge)))
                           0)))
               (load ok))))))
 
+(defn mra-reg-basic-legal? [(vreg i64) (reg i64)] (-> bool)
+  (and (>= reg 0)
+       (and (= (= (ml-register-class vreg) MRC-FPR) (>= reg 32))
+            (= (& (al-get (.alloc-forbidden (machine-unit)) vreg) (<< 1 reg)) 0))))
+
 (defn mra-copy-preference [(vreg i64)] (-> i64)
-  (let [(mut at) 0
-        (mut preferred) -1]
-    (loop (if (or (>= (load at) (be-inst-count)) (>= (load preferred) 0))
-              (break)
+  (let [peer (al-get [i64] (.alloc-copy-peer (machine-unit)) vreg)]
+    (if (>= peer 0) (mra-reg peer) -1)))
+
+(defn mra-build-copy-preferences! [] (-> i64)
+  (let [u (machine-unit) (mut at) 0]
+    (loop (if (>= (load at) (be-inst-count)) (break)
               (do
                 (let [m (be-inst (load at))]
                   (if (= (.op m) MI-COPY)
-                      (let [dst (.dst m)
-                            src (.a m)
-                            other (if (= dst vreg) src (if (= src vreg) dst -1))]
-                        (if (and (>= other 0)
-                                 (and (not (mra-interferes? vreg other))
-                                      (= (ml-value-kind vreg) (ml-value-kind other))))
-                            (set! preferred (mra-reg other))
+                      (let [dst (.dst m) src (.a m)]
+                        (if (and (>= dst 0) (and (>= src 0)
+                                 (and (not (mra-interferes? dst src))
+                                      (= (ml-value-kind dst) (ml-value-kind src)))))
+                            (do
+                              (if (= (al-get [i64] (.alloc-copy-peer u) dst) -1)
+                                  (al-set! [i64] (field u alloc-copy-peer) dst src) 0)
+                              (if (= (al-get [i64] (.alloc-copy-peer u) src) -1)
+                                  (al-set! [i64] (field u alloc-copy-peer) src dst) 0))
                             0))
                       0))
-                (set! at (+ (load at) 1))
-                0)))
-    (load preferred)))
+                (set! at (+ (load at) 1)))))
+    0))
 
 (defn mra-assign! [(nregs i64) (seed i64)] (-> i64)
   (let [u (machine-unit)
@@ -469,7 +666,7 @@
                             (set! (.allocation-item u) (load vr)))
                           0)
                       (if (and (>= (mra-reg (load vr)) 0)
-                               (not (mra-reg-legal? (load vr) (mra-reg (load vr)))))
+                               (not (mra-reg-basic-legal? (load vr) (mra-reg (load vr)))))
                           (do
                             (set! (.allocation-result u) MRA-INTERFERENCE)
                             (set! (.allocation-item u) (load vr)))
@@ -483,48 +680,40 @@
                 (set! vr (+ (load vr) 1))
                 0)))
     (if (= (mra-result) MRA-OK)
-        (let [cells (* vregs vregs)
-              words (/ (+ cells 63) 64)
+        (let [words (al-len [i64] (.alloc-interference u))
+              directed (al-len [i64] (.alloc-adj-other u))
               (mut word) 0
-              (mut cell) 0]
-          ;; Snapshot the published graph as a BITSET, rebuild it with the same reverse-liveness
-          ;; construction, and compare matrices linearly. The matrix cells are booleans; retaining
-          ;; one i64 per cell doubled the quadratic allocation merely to verify it (4,934 vregs
-          ;; reserved another 256 MiB). Calling mra-expected-interferes? for every pair instead
-          ;; scanned every block again, making verification quartic on whole benchmark programs.
-          (al-clear! [i64] (field u alloc-expected))
+              (mut bits) 0
+              (mut slot) 0]
+          ;; Validate the published packed graph against its sparse adjacency, then independently
+          ;; rebuild liveness edges into a hash-indexed seen set. This proves exact edge-set
+          ;; equality without allocating and touching a second VxV matrix.
           (loop (if (>= (load word) words)
                     (break)
                     (do
-                      (al-push! [i64] (field u alloc-expected) 0)
+                      (set! bits (+ (load bits)
+                                    (popcount64 (al-get (.alloc-interference u) (load word)))))
                       (set! word (+ (load word) 1)))))
-          (loop (if (>= (load cell) cells)
-                    (break)
-                    (do
-                      (if (!= (al-get (.alloc-interference u) (load cell)) 0)
-                          (let [at (/ (load cell) 64)]
-                            (al-set! [i64]
-                                     (field u alloc-expected)
-                                     at
-                                     (| (al-get (.alloc-expected u) at)
-                                        (<< 1 (% (load cell) 64)))))
-                          0)
-                      (al-set! [i64] (field u alloc-interference) (load cell) 0)
-                      (set! cell (+ (load cell) 1)))))
+          (if (!= (load bits) directed)
+              (do
+                (set! (.allocation-result u) MRA-INTERFERENCE)
+                (set! (.allocation-item u) (load bits)))
+              0)
+          (mra-build-verifier-edge-index!)
+          (set! (mra-verifying-interference?) true)
           (mra-build-interference!)
-          (set! cell 0)
-          (loop (if (or (>= (load cell) cells) (!= (mra-result) MRA-OK))
+          (set! (mra-verifying-interference?) false)
+          (loop (if (or (>= (load slot) (al-len [i64] (.alloc-expected u)))
+                        (!= (mra-result) MRA-OK))
                     (break)
                     (do
-                      (if (!= (al-get (.alloc-interference u) (load cell))
-                              (& (>> (al-get (.alloc-expected u) (/ (load cell) 64))
-                                     (% (load cell) 64))
-                                 1))
+                      (if (and (!= (al-get (.alloc-expected u) (load slot)) -1)
+                               (= (al-get (.alloc-verify-seen u) (load slot)) 0))
                           (do
                             (set! (.allocation-result u) MRA-INTERFERENCE)
-                            (set! (.allocation-item u) (load cell)))
+                            (set! (.allocation-item u) (load slot)))
                           0)
-                      (set! cell (+ (load cell) 1))))))
+                      (set! slot (+ (load slot) 1))))))
         0)
     ; Positional cross-call diagnostic (liveness-independent): within each block walked
     ; FORWARD, any instruction that reads a vreg whose register is caller-clobbered, after a
@@ -589,14 +778,7 @@
           (loop (if (or (>= (load bid) blocks) (!= (mra-result) MRA-OK))
                     (break)
                     (do
-                      (let [(mut vr2) 0]
-                        (loop (if (>= (load vr2) vregs)
-                                  (break)
-                                  (do
-                                    (al-set! [i64] (field u alloc-live) (load vr2)
-                                             (if (ml-live-out? (load bid) (load vr2)) 1 0))
-                                    (set! vr2 (+ (load vr2) 1))
-                                    0))))
+                      (mra-live-from-block-out! (load bid))
                       (let [first (mu-block-inst-first (load bid))
                             count (mu-block-inst-count (load bid))
                             (mut i) count]
@@ -609,28 +791,31 @@
                                           dst (.dst m)
                                           mask (mi-desc-clobbers (mi-desc (.op m)))]
                                       (if (!= mask 0)
-                                          (let [(mut vr2) 0]
-                                            (loop (if (>= (load vr2) vregs)
+                                          (let [(mut live-at) 0]
+                                            (loop (if (>= (load live-at)
+                                                          (al-len [i64] (.alloc-live-list u)))
                                                       (break)
                                                       (do
-                                                        (if (and (!= (load vr2) dst)
-                                                                 (and (!= (al-get (.alloc-live u) (load vr2)) 0)
-                                                                      (and (>= (mra-reg (load vr2)) 0)
-                                                                           (!= (& mask (<< 1 (mra-reg (load vr2)))) 0))))
+                                                        (let [vr2 (al-get (.alloc-live-list u)
+                                                                         (load live-at))]
+                                                        (if (and (!= vr2 dst)
+                                                                 (and (!= (al-get (.alloc-live u) vr2) 0)
+                                                                      (and (>= (mra-reg vr2) 0)
+                                                                           (!= (& mask (<< 1 (mra-reg vr2))) 0))))
                                                             (do
                                                               (fmt (stderr)
                                                                    "CLOBBER-LIVE vreg={d} reg={d} call-inst={d} op={d} block={d} forbidden={d}\n"
-                                                                   (load vr2) (mra-reg (load vr2)) at
+                                                                   vr2 (mra-reg vr2) at
                                                                    (load (field m op)) (load bid)
-                                                                   (al-get (load (field u alloc-forbidden)) (load vr2)))
+                                                                   (al-get (load (field u alloc-forbidden)) vr2))
                                                               (set! (.allocation-result u) MRA-INTERFERENCE)
-                                                              (set! (.allocation-item u) (load vr2)))
+                                                              (set! (.allocation-item u) vr2))
                                                             0)
-                                                        (set! vr2 (+ (load vr2) 1))
+                                                        (set! live-at (+ (load live-at) 1)))
                                                         0))))
                                           0)
                                       (if (>= dst 0)
-                                          (al-set! [i64] (field u alloc-live) dst 0)
+                                          (mra-live-remove! dst)
                                           0)
                                       (mra-mark-uses-live! at))
                                     0)))
@@ -678,22 +863,39 @@
   0)
 (defn mra-corrupt-interference! [(a i64) (b i64) (present bool)] (-> i64)
   (let [u (machine-unit)
-        n (ml-vreg-count)
-        value (if present 1 0)]
-    (al-set! [i64] (field u alloc-interference) (+ (* a n) b) value)
-    (al-set! [i64] (field u alloc-interference) (+ (* b n) a) value)
+        ab (mra-interference-word a b)
+        ba (mra-interference-word b a)
+        abit (ml-local-bit b)
+        babit (ml-local-bit a)]
+    (al-set! [i64] (field u alloc-interference) ab
+             (if present
+                 (| (al-get [i64] (.alloc-interference u) ab) abit)
+                 (& (al-get [i64] (.alloc-interference u) ab) (^ abit -1))))
+    (al-set! [i64] (field u alloc-interference) ba
+             (if present
+                 (| (al-get [i64] (.alloc-interference u) ba) babit)
+                 (& (al-get [i64] (.alloc-interference u) ba) (^ babit -1))))
     0))
 
 (defn mra-allocate! [(nregs i64) (seed i64)] (-> i64)
-  (let [u (machine-unit)]
+  (let [u (machine-unit)
+        (mut profile-start) (ms-profile-now)]
     (set! (.allocation-seed u) seed)
     (set! (.allocation-result u) MRA-OK)
     (set! (.allocation-item u) -1)
     (mra-init!)
+    (set! profile-start (ms-profile-note! "allocation_init" (load profile-start)))
     (mra-build-interference!)
+    (set! profile-start (ms-profile-note! "allocation_interference" (load profile-start)))
+    (mra-build-copy-preferences!)
+    (set! profile-start (ms-profile-note! "allocation_preferences" (load profile-start)))
     (let [spills (mra-assign! nregs seed)]
+      (set! profile-start (ms-profile-note! "allocation_assign" (load profile-start)))
       (mra-publish!)
-      (if (mra-verify!) spills -1))))
+      (set! profile-start (ms-profile-note! "allocation_publish" (load profile-start)))
+      (let [ok (mra-verify!)]
+        (ms-profile-note! "allocation_verify" (load profile-start))
+        (if ok spills -1)))))
 
 ;; Greedy coloring over the exact interval interference graph. Values beyond the register budget
 ;; receive distinct spill slots; lowering treats each slot boundary as a split point.
@@ -789,23 +991,55 @@
         funcs (mu-function-count)
         n (be-inst-count)
         work (field u schedule-work)
-        (mut rank) 0]
+        (mut rank) 0
+        (mut at) 0]
     (al-clear! [MInst] work)
+    (al-clear! [i64] (field u pack-next))
+    (al-clear! [i64] (field u pack-term-next))
     (loop (if (>= (load rank) funcs)
               (break)
               (do
-                (let [owner (% (+ (load rank) seed) funcs)
-                      (mut at) 0]
-                  (loop (if (>= (load at) n)
-                            (break)
-                            (do
-                              (if (= (ms-inst-owner (load at)) owner)
-                                  (al-push! [MInst] work (load (be-inst (load at))))
-                                  0)
-                              (set! at (+ (load at) 1))
-                              0))))
+                (al-push! [i64] (field u pack-next) 0)
+                (al-push! [i64] (field u pack-term-next) 0)
                 (set! rank (+ (load rank) 1))
                 0)))
+    ;; Count once, prefix in seeded owner order, then stable-scatter each function's text. The old
+    ;; owner-outer scan was O(functions*instructions) on every publication/layout verification.
+    (loop (if (>= (load at) n)
+              (break)
+              (do
+                (let [owner (ms-inst-owner (load at))]
+                  (if (and (>= owner 0) (< owner funcs))
+                      (al-set! [i64] (field u pack-next) owner
+                               (+ (al-get (.pack-next u) owner) 1))
+                      0))
+                (set! at (+ (load at) 1)))))
+    (set! rank 0)
+    (let [(mut first) 0]
+      (loop (if (>= (load rank) funcs)
+                (break)
+                (do
+                  (let [owner (% (+ (load rank) seed) funcs)
+                        count (al-get (.pack-next u) owner)]
+                    (al-set! [i64] (field u pack-term-next) owner (load first))
+                    (set! first (+ (load first) count)))
+                  (set! rank (+ (load rank) 1))))))
+    (set! at 0)
+    (loop (if (>= (load at) n)
+              (break)
+              (do
+                (al-push! [MInst] work (load (be-inst (load at))))
+                (set! at (+ (load at) 1)))))
+    (set! at 0)
+    (loop (if (>= (load at) n)
+              (break)
+              (do
+                (let [m (be-inst (load at))
+                      owner (.owner m)
+                      out (al-get (.pack-term-next u) owner)]
+                  (al-set! [MInst] work out (load m))
+                  (al-set! [i64] (field u pack-term-next) owner (+ out 1)))
+                (set! at (+ (load at) 1)))))
     (if (!= (al-len [MInst] (load work)) n)
         -1
         (do

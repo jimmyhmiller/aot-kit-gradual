@@ -16,6 +16,15 @@
 (import "coil.fmt" :use *)
 (import "coil.slice" :use *)
 
+(defstruct MuProfileTimespec [(sec i64) (nsec i64)])
+(extern clock_gettime :cc c [i32 (ptr MuProfileTimespec)] (-> i32))
+(defn mu-profile-now [] (-> i64)
+  (let [t (primitive/alloc-stack MuProfileTimespec)]
+    (clock_gettime 1 t)
+    (+ (* (.sec t) 1000000000) (.nsec t))))
+(defn mu-edge-probes-cell [] (-> (ptr i64)) (primitive/alloc-static i64))
+(defn mu-function-build-ns-cell [] (-> (ptr i64)) (primitive/alloc-static i64))
+
 (defn be-has-input? [(n i64) (want i64)] (-> bool)
   (let [len (n-nins n)
         (mut i) 0
@@ -90,22 +99,27 @@
 (defn mu-add-edge! [(owner i64) (source i64) (target i64) (slot i64)] (-> i64)
   (let [u (machine-unit)
         len (mu-edge-count)
-        (mut i) 0
+        (mut i) (al-get (.build-edge-head u) source)
         (mut prior) -1]
-    (loop (if (or (>= (load i) len) (>= (load prior) 0))
+    (loop (if (or (< (load i) 0) (>= (load prior) 0))
               (break)
               (do
+                (set! (mu-edge-probes-cell) (+ (load (mu-edge-probes-cell)) 1))
                 (let [e (mu-edge (load i))]
                   (if (and (= (.source e) source)
                            (and (= (.target e) target)
                                 (= (.target-slot e) slot)))
                       (set! prior (load i))
                       0))
-                (set! i (+ (load i) 1))
+                (set! i (al-get (.build-edge-next u) (load i)))
                 0)))
     (if (>= (load prior) 0)
         (load prior)
-        (do (al-push! [MEdge] (field u edges) (me-new len owner source target slot)) len))))
+        (do
+          (al-push! [MEdge] (field u edges) (me-new len owner source target slot))
+          (al-push! [i64] (field u build-edge-next) (al-get (.build-edge-head u) source))
+          (al-set! [i64] (field u build-edge-head) source len)
+          len))))
 
 (defn mu-note-return! [(owner i64) (ret i64)] (-> i64)
   (let [u (machine-unit)
@@ -128,6 +142,7 @@
               (mut ctrl) head
               (mut done) false]
           (al-push! [MBlock] (field u blocks) (mb-new bid owner head))
+          (al-push! [i64] (field u build-edge-head) -1)
           (loop (if (load done)
                     (break)
                     (let [mapped (al-get (.ctrl-block u) (load ctrl))]
@@ -180,6 +195,9 @@
         id (mu-function-count)
         first (mu-block-count)]
     (al-push! [MFunction] (field u functions) (mf-new id ideal entry))
+    (if (and (>= ideal 0) (< ideal (al-len [i64] (.ideal-function-owner u))))
+        (al-set! [i64] (field u ideal-function-owner) ideal id)
+        0)
     (al-push! [i64]
               (field u symbols)
               (if (= ideal NO-NODE)
@@ -193,9 +211,13 @@
     id))
 
 (defn mu-find-function [(ideal i64)] (-> i64)
-  (let [n (mu-function-count)
+  (let [cached (if (and (>= ideal 0)
+                        (< ideal (al-len [i64] (.ideal-function-owner (machine-unit)))))
+                   (al-get (.ideal-function-owner (machine-unit)) ideal)
+                   -1)
+        n (mu-function-count)
         (mut i) 0
-        (mut found) -1]
+        (mut found) cached]
     (loop (if (or (>= (load i) n) (>= (load found) 0))
               (break)
               (do
@@ -239,30 +261,34 @@
                 (set! fidx (+ (load fidx) 1)))))
     0))
 
+(defn mu-cache-ideal-calls! [] (-> i64)
+  (let [calls (.ideal-calls (machine-unit))
+        (mut node) 0]
+    (al-clear! [i64] (field (machine-unit) ideal-calls))
+    (loop (if (>= (load node) (n-count))
+              (break)
+              (do
+                (if (and (not (n-dead? (load node))) (op-is? (load node) Call [_]))
+                    (al-push! [i64] (field (machine-unit) ideal-calls) (load node))
+                    0)
+                (set! node (+ (load node) 1)))))
+    0))
+
 (defn mu-build-reachable-function! [(ideal i64)] (-> i64)
   (let [prior (mu-find-function ideal)]
     (if (>= prior 0)
         prior
-        (let [owner (mu-build-function! ideal (n-fun-entry ideal))
-              lim (n-count)
+        (let [build-start (mu-profile-now)
+              owner (mu-build-function! ideal (n-fun-entry ideal))
+              build-ns (- (mu-profile-now) build-start)
               (mut i) 0]
-          ; Function ownership is already recorded on every reachable control in this function.
-          ; A call belongs here exactly when its control maps to one of those blocks.
-          (loop (if (>= (load i) lim)
-                    (break)
-                    (do
-                      (if (and (not (n-dead? (load i))) (op-is? (load i) Call [_]))
-                          (let [ctrl (n-in (load i) 0)
-                                bid
-                                  (if (= ctrl NO-NODE)
-                                      -1
-                                      (al-get (.ctrl-block (machine-unit)) ctrl))]
-                            (if (and (>= bid 0) (= (mu-block-owner bid) owner))
-                                (mu-build-call-targets! (load i))
-                                0))
-                          0)
-                      (set! i (+ (load i) 1))
-                      0)))
+          (set! (mu-function-build-ns-cell) (+ (load (mu-function-build-ns-cell)) build-ns))
+          (if (> build-ns 100000000)
+              (do
+                (fmt (stderr) "AOTK_PROFILE phase=mu_function owner={d} ideal={d} ns={d} blocks={d}\n"
+                     owner ideal build-ns (mu-function-block-count owner))
+                0)
+              0)
           owner))))
 
 (defn mu-finalize-adjacency! [] (-> i64)
@@ -272,32 +298,81 @@
         (mut b) 0]
     (al-clear! [i64] (field u pred-edges))
     (al-clear! [i64] (field u succ-edges))
+    (al-clear! [i64] (field u block-terminator))
+    (al-clear! [i64] (field u verify-def-count))
+    (al-clear! [i64] (field u verify-node-def-count))
+    ;; Count degrees once. The previous block-outer/edge-inner construction did B*E comparisons
+    ;; merely to group an already materialized edge vector by endpoint.
     (loop (if (>= (load b) blocks)
               (break)
               (do
-                (let [block (mu-block (load b))
-                      (mut e) 0]
-                  (set! (.pred-first block) (al-len [i64] (.pred-edges u)))
+                (let [block (mu-block (load b))]
                   (set! (.pred-count block) 0)
-                  (set! (.succ-first block) (al-len [i64] (.succ-edges u)))
                   (set! (.succ-count block) 0)
-                  (loop (if (>= (load e) edges)
-                            (break)
-                            (do
-                              (if (= (mu-edge-target (load e)) (load b))
-                                  (do
-                                    (al-push! [i64] (field u pred-edges) (load e))
-                                    (set! (.pred-count block) (+ (.pred-count block) 1)))
-                                  0)
-                              (if (= (mu-edge-source (load e)) (load b))
-                                  (do
-                                    (al-push! [i64] (field u succ-edges) (load e))
-                                    (set! (.succ-count block) (+ (.succ-count block) 1)))
-                                  0)
-                              (set! e (+ (load e) 1))
-                              0))))
+                  (al-push! [i64] (field u block-terminator) NO-NODE)
+                  (al-push! [i64] (field u verify-def-count) 0)
+                  (al-push! [i64] (field u verify-node-def-count) 0))
                 (set! b (+ (load b) 1))
                 0)))
+    (let [(mut node) 0]
+      (loop (if (>= (load node) (n-count))
+                (break)
+                (do
+                  (if (or (op-is? (load node) If []) (op-is? (load node) Return []))
+                      (let [bid (al-get (.ctrl-block u) (load node))]
+                        (if (and (>= bid 0) (< bid blocks))
+                            (al-set! [i64] (field u block-terminator) bid (load node))
+                            0))
+                      0)
+                  (set! node (+ (load node) 1))))))
+    (let [(mut e) 0]
+      (loop (if (>= (load e) edges)
+                (break)
+                (do
+                  (let [edge (mu-edge (load e))]
+                    (set! (.pred-count (mu-block (.target edge)))
+                          (+ (.pred-count (mu-block (.target edge))) 1))
+                    (set! (.succ-count (mu-block (.source edge)))
+                          (+ (.succ-count (mu-block (.source edge))) 1)))
+                  (set! e (+ (load e) 1))))))
+    ;; Prefix ranges and allocate the two packed vectors.
+    (set! b 0)
+    (let [(mut pred-first) 0 (mut succ-first) 0]
+      (loop (if (>= (load b) blocks)
+                (break)
+                (do
+                  (let [block (mu-block (load b))]
+                    (set! (.pred-first block) (load pred-first))
+                    (set! (.succ-first block) (load succ-first))
+                    (set! pred-first (+ (load pred-first) (.pred-count block)))
+                    (set! succ-first (+ (load succ-first) (.succ-count block))))
+                  (set! b (+ (load b) 1))))))
+    (set! b 0)
+    (loop (if (>= (load b) edges)
+              (break)
+              (do
+                (al-push! [i64] (field u pred-edges) -1)
+                (al-push! [i64] (field u succ-edges) -1)
+                (set! b (+ (load b) 1)))))
+    ;; Fill in original edge order, preserving the order each block observed before this change.
+    (let [(mut e) 0]
+      (loop (if (>= (load e) edges)
+                (break)
+                (do
+                  (let [edge (mu-edge (load e))
+                        target (.target edge)
+                        source (.source edge)
+                        pred-at (+ (.pred-first (mu-block target))
+                                   (al-get (.verify-def-count u) target))
+                        succ-at (+ (.succ-first (mu-block source))
+                                   (al-get (.verify-node-def-count u) source))]
+                    (al-set! [i64] (field u pred-edges) pred-at (load e))
+                    (al-set! [i64] (field u succ-edges) succ-at (load e))
+                    (al-set! [i64] (field u verify-def-count) target
+                             (+ (al-get (.verify-def-count u) target) 1))
+                    (al-set! [i64] (field u verify-node-def-count) source
+                             (+ (al-get (.verify-node-def-count u) source) 1)))
+                  (set! e (+ (load e) 1))))))
     0))
 
 (defn mu-rpo-visit! [(owner i64) (bid i64)] (-> i64)
@@ -306,12 +381,15 @@
         0
         (do
           (al-set! [i64] (field u rpo-seen) bid 1)
-          (let [edges (mu-edge-count)
+          (let [block (mu-block bid)
                 (mut i) 0]
-            (loop (if (>= (load i) edges)
+            ;; Adjacency is already finalized. Walking the global edge vector at every DFS node
+            ;; made RPO O(blocks*edges) on large control graphs.
+            (loop (if (>= (load i) (.succ-count block))
                       (break)
                       (do
-                        (let [e (mu-edge (load i))]
+                        (let [e (mu-edge (al-get (.succ-edges u)
+                                                 (+ (.succ-first block) (load i))))]
                           (if (and (= (.owner e) owner)
                                    (= (.source e) bid))
                               (mu-rpo-visit! owner (.target e))
@@ -543,26 +621,66 @@
     (set! (.verify-item u) item)
     false))
 
-(defn mu-adj-count [(edge i64) (pred bool)] (-> i64)
+;; Independent dense facts for the CFG verifier. The builder's adjacency ranges remain the thing
+;; being checked; these counts are derived afresh from the published vectors so reciprocity does
+;; not rescan both complete vectors once per edge, and terminators do not rescan the ideal graph
+;; once per block.
+(defn mu-build-verifier-indices! [] (-> i64)
   (let [u (machine-unit)
-        len
-          (if pred
-              (al-len [i64] (.pred-edges u))
-              (al-len [i64] (.succ-edges u)))
-        (mut i) 0
-        (mut count) 0]
-    (loop (if (>= (load i) len)
+        edges (mu-edge-count)
+        blocks (mu-block-count)
+        (mut i) 0]
+    (al-clear! [i64] (field u verify-def-count))
+    (al-clear! [i64] (field u verify-node-def-count))
+    (al-clear! [i64] (field u verify-membership))
+    (loop (if (>= (load i) edges)
               (break)
               (do
-                (if (= (if pred
-                           (al-get (.pred-edges u) (load i))
-                           (al-get (.succ-edges u) (load i)))
-                       edge)
-                    (set! count (+ (load count) 1))
+                (al-push! [i64] (field u verify-def-count) 0)
+                (al-push! [i64] (field u verify-node-def-count) 0)
+                (set! i (+ (load i) 1)))))
+    (set! i 0)
+    (loop (if (>= (load i) blocks)
+              (break)
+              (do (al-push! [i64] (field u verify-membership) NO-NODE)
+                  (set! i (+ (load i) 1)))))
+    (set! i 0)
+    (loop (if (>= (load i) (al-len [i64] (.pred-edges u)))
+              (break)
+              (do
+                (let [eid (al-get (.pred-edges u) (load i))]
+                  (if (and (>= eid 0) (< eid edges))
+                      (al-set! [i64] (field u verify-def-count) eid
+                               (+ (al-get (.verify-def-count u) eid) 1))
+                      0))
+                (set! i (+ (load i) 1)))))
+    (set! i 0)
+    (loop (if (>= (load i) (al-len [i64] (.succ-edges u)))
+              (break)
+              (do
+                (let [eid (al-get (.succ-edges u) (load i))]
+                  (if (and (>= eid 0) (< eid edges))
+                      (al-set! [i64] (field u verify-node-def-count) eid
+                               (+ (al-get (.verify-node-def-count u) eid) 1))
+                      0))
+                (set! i (+ (load i) 1)))))
+    (set! i 0)
+    (loop (if (>= (load i) (n-count))
+              (break)
+              (do
+                (if (or (op-is? (load i) If []) (op-is? (load i) Return []))
+                    (let [bid (al-get (.ctrl-block u) (load i))]
+                      (if (and (>= bid 0) (< bid blocks))
+                          (al-set! [i64] (field u verify-membership) bid (load i))
+                          0))
                     0)
-                (set! i (+ (load i) 1))
-                0)))
-    (load count)))
+                (set! i (+ (load i) 1)))))
+    0))
+
+(defn mu-adj-count [(edge i64) (pred bool)] (-> i64)
+  (if pred
+      (al-get (.verify-def-count (machine-unit)) edge)
+      (al-get (.verify-node-def-count (machine-unit)) edge)))
 
 (defn mu-block-adj-valid? [(bid i64) (pred bool)] (-> bool)
   (let [u (machine-unit)
@@ -606,13 +724,14 @@
             false
             (let [incoming (n-in target slot)
                   mapped (al-get (.ctrl-block u) incoming)
-                  edges (mu-edge-count)
+                  block (mu-block t)
                   (mut i) 0
                   (mut same) 0]
-              (loop (if (>= (load i) edges)
+              (loop (if (>= (load i) (.pred-count block))
                         (break)
                         (do
-                          (let [other (mu-edge (load i))]
+                          (let [other (mu-edge (al-get (.pred-edges u)
+                                                       (+ (.pred-first block) (load i))))]
                             (if (and (= (.target other) t)
                                      (= (.target-slot other) slot))
                                 (set! same (+ (load same) 1))
@@ -623,38 +742,10 @@
         (= slot 0))))
 
 (defn mu-block-terminator-op [(bid i64)] (-> i64)
-  (let [lim (n-count)
-        (mut i) 0
-        (mut op) NO-NODE]
-    (loop (if (>= (load i) lim)
-              (break)
-              (do
-                (if (= (al-get (.ctrl-block (machine-unit)) (load i)) bid)
-                    (let [candidate (load i)]
-                      (if (or (op-is? candidate If []) (op-is? candidate Return []))
-                          (set! op candidate)
-                          0))
-                    0)
-                (set! i (+ (load i) 1))
-                0)))
-    (load op)))
+  (al-get (.block-terminator (machine-unit)) bid))
 
 (defn mu-block-terminator [(bid i64)] (-> i64)
-  (let [lim (n-count)
-        (mut i) 0
-        (mut found) NO-NODE]
-    (loop (if (>= (load i) lim)
-              (break)
-              (do
-                (if (= (al-get (.ctrl-block (machine-unit)) (load i)) bid)
-                    (let [candidate (load i)]
-                      (if (or (op-is? candidate If []) (op-is? candidate Return []))
-                          (set! found (load i))
-                          0))
-                    0)
-                (set! i (+ (load i) 1))
-                0)))
-    (load found)))
+  (mu-block-terminator-op bid))
 
 (defn mu-verify-terminators! [] (-> bool)
   (let [blocks (mu-block-count)
@@ -663,12 +754,14 @@
               (break)
               (do
                 (let [term (mu-block-terminator-op (load i))
+                      verify-term (al-get (.verify-membership (machine-unit)) (load i))
                       succ (.succ-count (mu-block (load i)))]
-                  (if (or (and (!= term NO-NODE) (and (op-is? term If []) (!= succ 2)))
-                          (and (!= term NO-NODE) (and (op-is? term Return []) (!= succ 0))))
+                  (if (or (!= term verify-term)
+                          (or (and (!= verify-term NO-NODE) (and (op-is? verify-term If []) (!= succ 2)))
+                              (and (!= verify-term NO-NODE) (and (op-is? verify-term Return []) (!= succ 0)))))
                       (do
                         (fmt (stderr) "machine-cfg: terminator arity block={d} head={d} term={d} succ={d}\n"
-                             (load i) (.ideal-ctrl (mu-block (load i))) term succ)
+                             (load i) (.ideal-ctrl (mu-block (load i))) verify-term succ)
                         (mu-fail-verify! MCFG-TERMINATOR-ARITY (load i))
                         (break))
                       0))
@@ -768,6 +861,7 @@
         (mut i) 0]
     (set! (.verify-result u) MCFG-OK)
     (set! (.verify-item u) -1)
+    (mu-build-verifier-indices!)
     (loop (if (>= (load i) blocks)
               (break)
               (do
@@ -908,13 +1002,31 @@
       (slice-new [u8] (cast (ptr u8) buf) n))))
 
 (defn mu-finish-build! [] (-> bool)
-  (mu-finalize-adjacency!)
-  (set! (.phase (machine-unit)) 1)
-  (if (mu-compute-rpo!)
-      (if (mu-compute-idoms!)
-          (do (mu-compute-loop-depth!) (mu-verify!))
-          (mu-fail-verify! MCFG-RPO -1))
-      (mu-fail-verify! MCFG-RPO -1)))
+  (let [(mut started) (mu-profile-now)]
+    (mu-finalize-adjacency!)
+    (fmt (stderr) "AOTK_PROFILE phase=mu_adjacency ns={d} blocks={d} edges={d} edge_probes={d}\n"
+         (- (mu-profile-now) (load started)) (mu-block-count) (mu-edge-count)
+         (load (mu-edge-probes-cell)))
+    (set! started (mu-profile-now))
+    (set! (.phase (machine-unit)) 1)
+    (let [rpo (mu-compute-rpo!)]
+      (fmt (stderr) "AOTK_PROFILE phase=mu_rpo ns={d}\n" (- (mu-profile-now) (load started)))
+      (if rpo
+          (do
+            (set! started (mu-profile-now))
+            (let [idoms (mu-compute-idoms!)]
+              (fmt (stderr) "AOTK_PROFILE phase=mu_idoms ns={d}\n" (- (mu-profile-now) (load started)))
+              (if idoms
+                  (do
+                    (set! started (mu-profile-now))
+                    (mu-compute-loop-depth!)
+                    (fmt (stderr) "AOTK_PROFILE phase=mu_loops ns={d}\n" (- (mu-profile-now) (load started)))
+                    (set! started (mu-profile-now))
+                    (let [ok (mu-verify!)]
+                      (fmt (stderr) "AOTK_PROFILE phase=mu_verify ns={d}\n" (- (mu-profile-now) (load started)))
+                      ok))
+                  (mu-fail-verify! MCFG-RPO -1))))
+          (mu-fail-verify! MCFG-RPO -1)))))
 
 (defn mu-build-entry! [(entry-fun i64)] (-> bool)
   (mu-reset!)
@@ -923,31 +1035,30 @@
       (if (not (op-is? entry-fun Fun [_]))
           false
           (do
+            (mu-cache-ideal-calls!)
             (mu-build-reachable-function! entry-fun)
             (mu-finish-build!)))))
 
-(defn mu-build-program! [] (-> bool)
+(defn mu-build-program-core! [(verify-graph bool)] (-> bool)
   (mu-reset!)
-  (if (!= (g-verify) 0)
+  (set! (mu-edge-probes-cell) 0)
+  (set! (mu-function-build-ns-cell) 0)
+  (let [(mut profile-start) (mu-profile-now)
+        verified (if verify-graph (= (g-verify) 0) true)]
+  (fmt (stderr) "AOTK_PROFILE phase=mu_graph_verify ns={d}\n" (- (mu-profile-now) (load profile-start)))
+  (if (not verified)
       false
+      (do
+      (mu-cache-ideal-calls!)
+      (set! profile-start (mu-profile-now))
       (let [owner (mu-build-function! NO-NODE (g-start))
             lim (n-count)
             (mut i) 0]
-        (loop (if (>= (load i) lim)
-                  (break)
-                  (do
-                    (if (and (not (n-dead? (load i))) (op-is? (load i) Call [_]))
-                        (let [ctrl (n-in (load i) 0)
-                              bid
-                                (if (= ctrl NO-NODE)
-                                    -1
-                                    (al-get (.ctrl-block (machine-unit)) ctrl))]
-                          (if (and (>= bid 0) (= (mu-block-owner bid) owner))
-                              (mu-build-call-targets! (load i))
-                              0))
-                        0)
-                    (set! i (+ (load i) 1))
-                    0)))
+        (fmt (stderr) "AOTK_PROFILE phase=mu_reachable ns={d} functions={d} blocks={d} edges={d} calls={d} function_ns={d}\n"
+             (- (mu-profile-now) (load profile-start)) (mu-function-count) (mu-block-count)
+             (mu-edge-count) (al-len [i64] (.ideal-calls (machine-unit)))
+             (load (mu-function-build-ns-cell)))
+        (set! profile-start (mu-profile-now))
         ;; Closed-world dispatch reaches every live function: a callable whose identity escapes
         ;; only as a VALUE (a callback stored through a dynamic method call) has no direct call
         ;; edge, but the universal dispatcher can still land on it, so it must be in the unit.
@@ -960,7 +1071,18 @@
                         0)
                     (set! i (+ (load i) 1))
                     0)))
-        (mu-finish-build!))))
+        (fmt (stderr) "AOTK_PROFILE phase=mu_all_functions ns={d} functions={d} blocks={d} edges={d}\n"
+             (- (mu-profile-now) (load profile-start)) (mu-function-count) (mu-block-count) (mu-edge-count))
+        (mu-finish-build!))))))
+
+(defn mu-build-program! [] (-> bool)
+  (mu-build-program-core! true))
+
+;; The native harness reports graph-verifier diagnostics itself immediately before selection. This
+;; explicit seam avoids repeating that same read-only whole-graph pass while keeping every ordinary
+;; selector caller independently verified.
+(defn mu-build-verified-program! [] (-> bool)
+  (mu-build-program-core! false))
 
 (defn mu-build! [] (-> bool)
   (mu-reset!)

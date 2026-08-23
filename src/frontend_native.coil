@@ -107,6 +107,7 @@
    (functions (ArrayList FeFunction))
    (symbols (ArrayList FeSymbol))
    (resolutions (ArrayList FeResolution))
+   (resolution-symbols (ArrayList i64))
    (captures (ArrayList FeCapture))
    (types (ArrayList FeTypeDecl))
    (fields (ArrayList FeField))
@@ -178,6 +179,7 @@
     (set! (.functions frontend) (al-new [FeFunction] a))
     (set! (.symbols frontend) (al-new [FeSymbol] a))
     (set! (.resolutions frontend) (al-new [FeResolution] a))
+    (set! (.resolution-symbols frontend) (al-new [i64] a))
     (set! (.captures frontend) (al-new [FeCapture] a))
     (set! (.types frontend) (al-new [FeTypeDecl] a))
     (set! (.fields frontend) (al-new [FeField] a))
@@ -666,15 +668,9 @@
     0))
 
 (defn fe-resolution-symbol [(frontend (ptr NativeFrontend)) (node i64)] (-> i64)
-  (let [(mut index) 0
-        (mut answer) -1]
-    (loop (if (or (>= (load index) (al-len [FeResolution] (.resolutions frontend)))
-                  (!= (load answer) -1))
-              (break)
-              (let [resolution (al-get [FeResolution] (.resolutions frontend) (load index))]
-                (if (= (.node resolution) node) (set! answer (.symbol resolution)) 0)
-                (set! index (+ (load index) 1)))))
-    (load answer)))
+  (if (or (< node 0) (>= node (al-len [i64] (.resolution-symbols frontend))))
+      -1
+      (al-get [i64] (.resolution-symbols frontend) node)))
 
 (defn fe-function-for-node [(frontend (ptr NativeFrontend)) (node i64)] (-> i64)
   (let [(mut index) 0
@@ -1265,6 +1261,38 @@
                 (set! index (+ (load index) 1)))))
     (load answer)))
 
+;; Declaration hoisting is lexical. A global name-only scan makes same-named declarations in
+;; unrelated functions alias each other when several Test262 entries share one compilation unit.
+(defn fe-find-function-name-in-owner [(frontend (ptr NativeFrontend))
+                                      (name-node i64)
+                                      (owner i64)] (-> i64)
+  (let [name (ts-text (field frontend ast) name-node)
+        (mut scope) owner
+        (mut answer) -1
+        (mut done) false]
+    (loop (if (or (load done) (>= (load answer) 0))
+              (break)
+              (do
+                (let [(mut index) 0]
+                  (loop (if (or (>= (load index) (al-len [FeFunction] (.functions frontend)))
+                                (>= (load answer) 0))
+                            (break)
+                            (let [fn (al-get [FeFunction] (.functions frontend) (load index))]
+                              (if (and (= (.parent fn) (load scope))
+                                       (and (= (ts-kind (field frontend ast) (.node fn))
+                                               TSK-FUNCTION-DECLARATION)
+                                            (= name
+                                               (ts-text (field frontend ast) (.name-node fn)))))
+                                  (set! answer (.id fn))
+                                  0)
+                              (set! index (+ (load index) 1)))))
+                (if (< (load scope) 0)
+                    (set! done true)
+                    (let [parent-fn
+                            (al-get [FeFunction] (.functions frontend) (load scope))]
+                      (set! scope (.parent parent-fn))))))))
+    (load answer)))
+
 (defn fe-main-id [(frontend (ptr NativeFrontend))] (-> i64)
   (let [(mut index) 0
         (mut answer) -1]
@@ -1329,7 +1357,9 @@
                     (set! answer (.symbol binding))
                     0)
                 (set! index (- (load index) 1)))))
-    (if (= (load answer) -1) (set! answer (fe-find-function-name frontend node)) 0)
+    (if (= (load answer) -1)
+        (set! answer (fe-find-function-name-in-owner frontend node owner))
+        0)
     (if (= (load answer) -1) (set! answer (fe-intrinsic-name name)) 0)
     ;; An unresolved identifier is a JavaScript runtime ReferenceError, not an indexing failure.
     ;; Keep a distinguished resolution so expression lowering can route it through the ordinary
@@ -1339,6 +1369,10 @@
     (al-push! [FeResolution]
               (mut (.resolutions frontend))
               (fe-resolution-make node (load answer)))
+    (loop (if (> (al-len [i64] (.resolution-symbols frontend)) node)
+              (break)
+              (do (al-push! [i64] (mut (.resolution-symbols frontend)) -1) 0)))
+    (al-set! [i64] (mut (.resolution-symbols frontend)) node (load answer))
     (if (and (and (>= (load answer) 0)
                   (>= (load answer) (al-len [FeFunction] (.functions frontend))))
              (!= (fe-symbol-owner frontend (load answer)) owner))
@@ -1995,6 +2029,7 @@
   (al-free! [FeFunction] (mut (.functions frontend)))
   (al-free! [FeSymbol] (mut (.symbols frontend)))
   (al-free! [FeResolution] (mut (.resolutions frontend)))
+  (al-free! [i64] (mut (.resolution-symbols frontend)))
   (al-free! [FeCapture] (mut (.captures frontend)))
   (al-free! [FeTypeDecl] (mut (.types frontend)))
   (al-free! [FeField] (mut (.fields frontend)))

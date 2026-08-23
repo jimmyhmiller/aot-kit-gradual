@@ -32,6 +32,7 @@ const optionNames = new Set([
   "--jobs",
   "--timeout-ms",
   "--memory-mb",
+  "--batch-size",
 ]);
 const flagNames = new Set(["--quiet", "--no-build", "--resume", "--es5-only"]);
 const hasFlag = (name) => argv.includes(name);
@@ -54,6 +55,7 @@ const start = Number(option("--start", "0"));
 const jobs = Math.max(1, Number(option("--jobs", "1")));
 const timeoutMs = Math.max(1, Number(option("--timeout-ms", "30000")));
 const memoryMb = Math.max(1, Number(option("--memory-mb", "2048")));
+const batchSize = Math.max(1, Number(option("--batch-size", "1")));
 const results = option("--results");
 const quiet = hasFlag("--quiet");
 const resume = hasFlag("--resume");
@@ -171,6 +173,59 @@ function assemble(source, metadata, strict) {
   return pieces.join("");
 }
 
+function assertionKey(source, includes) {
+  const users = [source, ...includes].join("\n");
+  if (!/\bassert\b/.test(users)) return "";
+  return [
+    "base",
+    /\bassert\.(?:sameValue|notSameValue|compareArray)\b/.test(users) ? "helper" : "",
+    /\bassert\.sameValue\b/.test(users) ? "same" : "",
+    /\bassert\.notSameValue\b/.test(users) ? "notSame" : "",
+    /\bassert\.throws\b/.test(users) ? "throws" : "",
+    /\bassert\.compareArray\b/.test(users) ? "compare" : "",
+  ].filter(Boolean).join(",");
+}
+
+function batchSignature(task) {
+  const flags = new Set(task.metadata.flags || []);
+  const includeNames = task.metadata.includes || [];
+  const includes = includeNames.map((include) => readFileSync(join(root, "harness", include), "utf8"));
+  return JSON.stringify({ raw: flags.has("raw"), strict: task.variant.strict, includeNames,
+    assertions: assertionKey(task.source, includes) });
+}
+
+function assembleBatch(tasks) {
+  const first = tasks[0];
+  const flags = new Set(first.metadata.flags || []);
+  const includes = (first.metadata.includes || []).map((include) =>
+    readFileSync(join(root, "harness", include), "utf8")
+  );
+  const pieces = [];
+  if (!flags.has("raw")) {
+    pieces.push(sta, "\n");
+    const key = assertionKey(first.source, includes).split(",");
+    if (key.includes("base")) pieces.push(assertionParts.base);
+    if (key.includes("helper")) pieces.push(assertionParts.sameHelper);
+    if (key.includes("same")) pieces.push(assertionParts.sameValue);
+    if (key.includes("notSame")) pieces.push(assertionParts.notSameValue);
+    if (key.includes("throws")) pieces.push(assertionParts.throws);
+    if (key.includes("compare")) pieces.push(assertionParts.compareArray);
+    if (key.length > 0) pieces.push("\n");
+  }
+  for (const include of includes) pieces.push(include, "\n");
+  for (let i = 0; i < tasks.length; i++) {
+    pieces.push(`function __aotk_test_${i}(n) {\n`);
+    if (tasks[i].variant.strict) pieces.push('"use strict";\n');
+    pieces.push(tasks[i].source, "\nreturn 0;\n}\n");
+  }
+  pieces.push("function main(n) {\n");
+  for (let i = 0; i < tasks.length - 1; i++) {
+    pieces.push(`if (n === ${i}) return __aotk_test_${i}(n);\n`);
+  }
+  pieces.push(`return __aotk_test_${tasks.length - 1}(n);\n}\n`);
+  return pieces.join("");
+}
+
 let files = [];
 for (const path of paths) collect(path, files);
 if (es5Only) {
@@ -251,17 +306,26 @@ for (let index = 0; index < files.length; index++) {
   }
 }
 
-function runNative(assembled) {
+function runNative(assembled, count = 0) {
   return new Promise((resolveRun) => {
+    const spawnStartedNs = process.hrtime.bigint();
     const detached = process.platform !== "win32";
     const command = process.platform === "linux" ? "prlimit" : native;
     const args = process.platform === "linux"
-      ? [`--as=${memoryMb * 1024 * 1024}`, "--", native, assembled]
-      : [assembled];
+      ? [`--as=${memoryMb * 1024 * 1024}`, "--", native, assembled, ...(count > 0 ? [String(count)] : [])]
+      : [assembled, ...(count > 0 ? [String(count)] : [])];
     const child = spawn(command, args, { cwd: process.cwd(), detached });
     let stdout = "";
     let stderr = "";
     let timedOut = false;
+    let peakRssKb = 0;
+    const monitor = setInterval(() => {
+      try {
+        const status = readFileSync(`/proc/${child.pid}/status`, "utf8");
+        const rss = Number(status.match(/^VmRSS:\s+(\d+)/m)?.[1] || 0);
+        peakRssKb = Math.max(peakRssKb, rss);
+      } catch {}
+    }, 20);
     const timer = setTimeout(() => {
       timedOut = true;
       try {
@@ -277,28 +341,50 @@ function runNative(assembled) {
     child.stderr.on("data", (chunk) => { stderr = append(stderr, chunk); });
     child.on("error", (error) => {
       clearTimeout(timer);
-      resolveRun({ pid: child.pid, status: null, signal: "SPAWN", stdout, stderr: error.message });
+      clearInterval(monitor);
+      resolveRun({ pid: child.pid, status: null, signal: "SPAWN", stdout,
+        stderr: error.message, spawnStartedNs, peakRssKb });
     });
     child.on("close", (status, signal) => {
       clearTimeout(timer);
-      resolveRun({ pid: child.pid, status, signal: timedOut ? "TIMEOUT" : signal, stdout, stderr });
+      clearInterval(monitor);
+      resolveRun({ pid: child.pid, status, signal: timedOut ? "TIMEOUT" : signal, stdout, stderr,
+        spawnStartedNs, peakRssKb });
     });
   });
 }
 
-async function runOne(task) {
-  const { index, path, source, metadata, variant } = task;
-  const assembled = join(temporary, `${index}-${variant.name}-${basename(path)}`);
-  writeFileSync(assembled, assemble(source, metadata, variant.strict));
-  const started = performance.now();
-  const run = await runNative(assembled);
-  const durationMs = Math.round(performance.now() - started);
+function timingFields(run, assemblyMs, durationMs) {
+  const phases = { source_assembly: assemblyMs };
+  for (const match of run.stderr.matchAll(/^AOTK_TIMING phase=([a-z0-9_]+) ns=(\d+)$/gmi)) {
+    phases[match[1]] = Number(match[2]) / 1e6;
+  }
+  const profile = {};
+  for (const match of run.stderr.matchAll(/^AOTK_PROFILE phase=([a-z0-9_]+) (.+)$/gmi)) {
+    profile[match[1]] = Object.fromEntries(
+      [...match[2].matchAll(/([a-z0-9_]+)=(\d+)/gi)].map((field) => [field[1], Number(field[2])]),
+    );
+  }
+  const ready = run.stderr.match(/^AOTK_READY ns=(\d+)$/m);
+  if (ready) phases.process_startup = Number(BigInt(ready[1]) - run.spawnStartedNs) / 1e6;
+  const compileNames = ["source_assembly", "process_startup", "frontend_index", "frontend_graph",
+    "graph_verify", "selection", "scheduling", "allocation", "x86_encoding",
+    "elf_publication"];
+  const compileMs = compileNames.reduce((sum, name) => sum + (phases[name] || 0), 0);
+  return { phasesMs: phases, profile, compileMs, attemptWallMs: durationMs,
+    peakRssKb: run.peakRssKb };
+}
+
+function finishOne(task, assembled, run, assemblyMs, durationMs) {
+  const { path, variant } = task;
+  const timings = timingFields(run, assemblyMs, durationMs);
   rmSync(assembled, { force: true });
   for (const suffix of [".o", ".err", ""]) {
     rmSync(`/tmp/aotk-native-${run.pid}${suffix}`, { force: true });
   }
   if (run.status === 0 && run.stdout.trim().endsWith("PASS")) {
-    report({ path, variant: variant.name, status: "passed", durationMs });
+    report({ path, variant: variant.name, status: "passed", durationMs: Math.round(durationMs),
+      ...timings });
   } else if (
     (run.status === 2 && run.stdout.trim().endsWith("REFUSED")) ||
     run.stderr.includes("frontend: unsupported")
@@ -313,26 +399,199 @@ async function runOne(task) {
     const detail = phaseDetail ||
       lines.find((line) => line.startsWith("test262-native: frontend")) ||
       lines.find((line) => line.startsWith("frontend: unsupported")) || lines.at(-1);
-    report({ path, variant: variant.name, status: "refused", detail, durationMs });
+    report({ path, variant: variant.name, status: "refused", detail,
+      durationMs: Math.round(durationMs), ...timings });
     if (run.stderr && !quiet) process.stderr.write(run.stderr);
   } else {
     const stderrLines = run.stderr.trim().split("\n");
     const detail = stderrLines.find((line) => line.startsWith("graph corruption:")) ||
       stderrLines.find((line) => line.startsWith("native-harness:")) || run.signal ||
       run.stdout.trim() || `exit ${run.status}`;
-    report({ path, variant: variant.name, status: "failed", detail, durationMs });
+    report({ path, variant: variant.name, status: "failed", detail,
+      durationMs: Math.round(durationMs), ...timings });
     if (run.stderr && !quiet) process.stderr.write(run.stderr);
   }
 }
 
-let next = 0;
-async function worker() {
-  while (next < work.length) {
-    const task = work[next++];
-    await runOne(task);
+async function runOne(task) {
+  const { index, path, source, metadata, variant } = task;
+  const assembled = join(temporary, `${index}-${variant.name}-${basename(path)}`);
+  const assemblyStarted = performance.now();
+  writeFileSync(assembled, assemble(source, metadata, variant.strict));
+  const assemblyMs = performance.now() - assemblyStarted;
+  const started = performance.now();
+  const run = await runNative(assembled);
+  const durationMs = performance.now() - started;
+  finishOne(task, assembled, run, assemblyMs, durationMs);
+}
+
+async function runBatch(tasks) {
+  if (tasks.length === 1) return runOne(tasks[0]);
+  const assembled = join(temporary, `batch-${tasks[0].index}-${tasks.length}.js`);
+  const assemblyStarted = performance.now();
+  writeFileSync(assembled, assembleBatch(tasks));
+  const assemblyMs = performance.now() - assemblyStarted;
+  const started = performance.now();
+  const run = await runNative(assembled, tasks.length);
+  const durationMs = performance.now() - started;
+  const timings = timingFields(run, assemblyMs, durationMs);
+  rmSync(assembled, { force: true });
+  for (const suffix of [".o", ".err", ""]) rmSync(`/tmp/aotk-native-${run.pid}${suffix}`, { force: true });
+  const outcomes = new Map(
+    [...run.stdout.matchAll(/^BATCH (\d+) (PASS|RUNTIME-FAILED)$/gm)].map((m) => [Number(m[1]), m[2]]),
+  );
+  if (run.status === 0 && outcomes.size === tasks.length) {
+    for (let i = 0; i < tasks.length; i++) {
+      if (outcomes.get(i) !== "PASS") {
+        const share = timings.compileMs / tasks.length;
+        report({ path: tasks[i].path, variant: tasks[i].variant.name, status: "failed",
+          detail: "RUNTIME-FAILED", durationMs: Math.round(durationMs), ...timings,
+          compileMs: share, batchCompileMs: timings.compileMs, batchSize: tasks.length });
+      } else {
+        const share = timings.compileMs / tasks.length;
+        report({ path: tasks[i].path, variant: tasks[i].variant.name, status: "passed",
+          durationMs: Math.round(durationMs), ...timings, compileMs: share,
+          batchCompileMs: timings.compileMs, batchSize: tasks.length });
+      }
+    }
+    return;
+  }
+  // One unsupported/corrupt member can reject a closed-world graph. Bisect until each member has
+  // its ordinary standalone status; no refusal or failure is inherited from a neighbor.
+  const middle = Math.floor(tasks.length / 2);
+  await runBatch(tasks.slice(0, middle));
+  await runBatch(tasks.slice(middle));
+}
+
+function nativeServer() {
+  let child = null;
+  let current = null;
+  let stderr = "";
+  let stdout = "";
+  let stdoutBuffer = "";
+  let monitor = null;
+  const appendOutput = (currentOutput, chunk) =>
+    currentOutput.length >= 65536
+      ? currentOutput
+      : (currentOutput + chunk.toString()).slice(0, 65536);
+
+  const stopMonitor = () => {
+    if (monitor) clearInterval(monitor);
+    monitor = null;
+  };
+  const settle = (status, signal) => {
+    if (!current) return;
+    const request = current;
+    current = null;
+    clearTimeout(request.timer);
+    // CASE_END is written after the ordinary PASS/REFUSED/etc line on the same stdout stream.
+    const cleanStdout = stdout.replace(/^AOTK_CASE_END .*$/gm, "").trimEnd();
+    const run = { pid: child?.pid, status, signal, stdout: cleanStdout, stderr,
+      spawnStartedNs: request.startedNs, peakRssKb: request.peakRssKb };
+    stdout = "";
+    stderr = "";
+    setTimeout(() => request.resolve(run), 0);
+  };
+  const start = () => {
+    const detached = process.platform !== "win32";
+    const command = process.platform === "linux" ? "prlimit" : native;
+    const args = process.platform === "linux"
+      ? [`--as=${memoryMb * 1024 * 1024}`, "--", native, "--server"]
+      : ["--server"];
+    child = spawn(command, args, { cwd: process.cwd(), detached, stdio: ["pipe", "pipe", "pipe"] });
+    stdoutBuffer = "";
+    child.stdout.on("data", (chunk) => {
+      const text = chunk.toString();
+      stdout += text;
+      stdoutBuffer += text;
+      let newline;
+      while ((newline = stdoutBuffer.indexOf("\n")) >= 0) {
+        const line = stdoutBuffer.slice(0, newline);
+        stdoutBuffer = stdoutBuffer.slice(newline + 1);
+        const end = line.match(/^AOTK_CASE_END index=\d+ status=(\d+)$/);
+        if (end) settle(Number(end[1]), null);
+      }
+    });
+    child.stderr.on("data", (chunk) => { stderr = appendOutput(stderr, chunk); });
+    child.on("error", (error) => {
+      stderr = appendOutput(stderr, error.message);
+      settle(null, "SPAWN");
+    });
+    child.on("close", (_status, signal) => {
+      stopMonitor();
+      settle(null, current?.forcedSignal || signal || "SERVER-EXIT");
+      child = null;
+    });
+    monitor = setInterval(() => {
+      if (!current || !child) return;
+      try {
+        const status = readFileSync(`/proc/${child.pid}/status`, "utf8");
+        const rss = Number(status.match(/^VmRSS:\s+(\d+)/m)?.[1] || 0);
+        current.peakRssKb = Math.max(current.peakRssKb, rss);
+      } catch {}
+    }, 20);
+  };
+  const run = (assembled) => new Promise((resolveRun) => {
+    if (!child) start();
+    const startedNs = process.hrtime.bigint();
+    current = { resolve: resolveRun, startedNs, peakRssKb: 0, timer: null };
+    current.timer = setTimeout(() => {
+      if (!child) return;
+      current.forcedSignal = "TIMEOUT";
+      try {
+        if (process.platform !== "win32") process.kill(-child.pid, "SIGKILL");
+        else child.kill("SIGKILL");
+      } catch (error) {
+        if (error.code !== "ESRCH") throw error;
+      }
+    }, timeoutMs);
+    child.stdin.write(`${assembled}\n`);
+  });
+  const close = () => {
+    if (child) child.stdin.end();
+    stopMonitor();
+  };
+  return { run, close };
+}
+
+async function runServerOne(server, task) {
+  const { index, path, source, metadata, variant } = task;
+  const assembled = join(temporary, `${index}-${variant.name}-${basename(path)}`);
+  const assemblyStarted = performance.now();
+  writeFileSync(assembled, assemble(source, metadata, variant.strict));
+  const assemblyMs = performance.now() - assemblyStarted;
+  const started = performance.now();
+  const run = await server.run(assembled);
+  const durationMs = performance.now() - started;
+  finishOne(task, assembled, run, assemblyMs, durationMs);
+}
+
+let units;
+if (batchSize === 1) {
+  units = work.map((task) => [task]);
+} else {
+  const groups = new Map();
+  for (const task of work) {
+    const key = batchSignature(task);
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(task);
+  }
+  units = [];
+  for (const group of groups.values()) {
+    for (let i = 0; i < group.length; i += batchSize) units.push(group.slice(i, i + batchSize));
   }
 }
-await Promise.all(Array.from({ length: Math.min(jobs, work.length) }, worker));
+let next = 0;
+async function worker() {
+  const server = batchSize === 1 ? nativeServer() : null;
+  while (next < units.length) {
+    const unit = units[next++];
+    if (server) await runServerOne(server, unit[0]);
+    else await runBatch(unit);
+  }
+  if (server) server.close();
+}
+await Promise.all(Array.from({ length: Math.min(jobs, units.length) }, worker));
 
 console.log(
   `test262 result: ${totals.passed} passed; ${totals.failed} failed; ` +

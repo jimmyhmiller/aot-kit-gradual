@@ -22,6 +22,19 @@
 (import "coil.io" :use *)
 (import "coil.fmt" :use *)
 
+(defstruct FngProfileTimespec [(sec i64) (nsec i64)])
+(extern clock_gettime :cc c [i32 (ptr FngProfileTimespec)] (-> i32))
+(defn fng-profile-now [] (-> i64)
+  (let [t (primitive/alloc-stack FngProfileTimespec)]
+    (clock_gettime 1 t)
+    (+ (* (.sec t) 1000000000) (.nsec t))))
+(defn fng-profile-note! [(name (slice u8)) (started i64)] (-> i64)
+  (let [now (fng-profile-now)]
+    (fmt (stderr) "AOTK_TIMING phase={s} ns={d}\n" name (- now started))
+    now))
+(defn fng-window-calls-cell [] (-> (ptr i64)) (primitive/alloc-static i64))
+(defn fng-window-scans-cell [] (-> (ptr i64)) (primitive/alloc-static i64))
+
 (const FNG-DYNAMIC i64 -1)
 (const FNG-NUMBER i64 -2)
 (const FNG-BOOLEAN i64 -3)
@@ -175,6 +188,27 @@
 (defn fng-optimize-ptr [] (-> (ptr bool))
   (let [enabled (primitive/alloc-static bool)] enabled))
 
+(defn fng-reuse-jsl-index-ptr [] (-> (ptr bool))
+  (primitive/alloc-static bool))
+
+(defn fng-jsl-index-ready-ptr [] (-> (ptr bool))
+  (primitive/alloc-static bool))
+
+(defn fng-profile-memory-alias-calls-ptr [] (-> (ptr i64)) (primitive/alloc-static i64))
+(defn fng-profile-memory-alias-edges-ptr [] (-> (ptr i64)) (primitive/alloc-static i64))
+(defn fng-profile-preserve-calls-ptr [] (-> (ptr i64)) (primitive/alloc-static i64))
+(defn fng-profile-preserve-fields-ptr [] (-> (ptr i64)) (primitive/alloc-static i64))
+(defn fng-profile-current-scans-ptr [] (-> (ptr i64)) (primitive/alloc-static i64))
+(defn fng-profile-method-chains-ptr [] (-> (ptr i64)) (primitive/alloc-static i64))
+(defn fng-profile-method-candidates-ptr [] (-> (ptr i64)) (primitive/alloc-static i64))
+
+;; Long-lived harness workers compile many isolated graphs against the same immutable library.
+;; Ordinary frontend users retain the full reset/read/check behavior on every build.
+(defn frontend-native-reuse-jsl-index! [(enabled bool)] (-> i64)
+  (set! (fng-reuse-jsl-index-ptr) enabled)
+  (if (not enabled) (set! (fng-jsl-index-ready-ptr) false) 0)
+  0)
+
 (defn fng-numeric-string-add-ptr [] (-> (ptr bool))
   (let [enabled (primitive/alloc-static bool)] enabled))
 
@@ -188,7 +222,8 @@
   (let [enabled (primitive/alloc-static bool)] enabled))
 
 (defn fng-analyze-fresh! [] (-> i64)
-  (let [(mut index) 0]
+  (let [(mut index) 0
+        started (fng-profile-now)]
     (loop (if (>= (load index) (n-count))
               (break)
               (do
@@ -210,16 +245,28 @@
     ;; Bounded because each round must FOLD something to earn the next one, and folding is
     ;; monotone: it only ever replaces nodes with constants and deletes control.
     (let [(mut rounds) 0
-          (mut stable) 0]
-      (loop (do (g-analyze!)
+          (mut stable) 0
+          (mut analyze-ns) 0
+          (mut fold-ns) 0
+          (mut iterate-ns) 0
+          (mut fold-rounds) 0
+          (mut iterate-steps) 0]
+      (loop (do
+                (let [phase (fng-profile-now)]
+                  (g-analyze!)
+                  (set! analyze-ns (+ (load analyze-ns) (- (fng-profile-now) phase))))
                 (let [before (g-live-count)]
-                  (g-fold-proven!)
+                  (let [phase (fng-profile-now)]
+                    (set! fold-rounds (+ (load fold-rounds) (g-fold-proven-for-iterate!)))
+                    (set! fold-ns (+ (load fold-ns) (- (fng-profile-now) phase))))
                   ;; `g-fold-proven!` turns a proven predicate into a constant; `iterate!` is what
                   ;; then collapses the `If`, retires the unreachable projection and reduces the
                   ;; phis on the region that loses an arm. Folding without it leaves the branch
                   ;; standing with one dead side -- every guard proved and none of them removed,
                   ;; which is most of the cost the DSL was being blamed for.
-                  (iterate!)
+                  (let [phase (fng-profile-now)]
+                    (set! iterate-steps (+ (load iterate-steps) (iterate!)))
+                    (set! iterate-ns (+ (load iterate-ns) (- (fng-profile-now) phase))))
                   (set! rounds (+ (load rounds) 1))
                   ;; TWO STABLE ROUNDS, not one. A round that folds nothing may still have PROVEN
                   ;; something -- the analysis at the top of it -- and that proof only becomes a
@@ -233,7 +280,25 @@
                       (break)
                       0))))
       ;; One last analysis so the types describe the graph that actually survived.
-      (g-analyze!))))
+      (let [phase (fng-profile-now)]
+        (g-analyze!)
+        (set! analyze-ns (+ (load analyze-ns) (- (fng-profile-now) phase))))
+      (fmt (stderr) "AOTK_TIMING phase=frontend_analyze_core ns={d}\n" (load analyze-ns))
+      (fmt (stderr) "AOTK_TIMING phase=frontend_fold ns={d}\n" (load fold-ns))
+      (fmt (stderr) "AOTK_TIMING phase=frontend_iterate ns={d}\n" (load iterate-ns))
+      (fmt (stderr) "AOTK_TIMING phase=frontend_analyze_rounds ns={d}\n" (load rounds))
+      (fmt (stderr) "AOTK_TIMING phase=frontend_fold_rounds ns={d}\n" (load fold-rounds))
+      (fmt (stderr) "AOTK_TIMING phase=frontend_iterate_steps ns={d}\n" (load iterate-steps))
+      (fmt (stderr) "AOTK_PROFILE phase=peephole peeps={d} compute_ns={d} proof_ns={d} proof_calls={d} proof_snapshot_ns={d} proof_snapshot_calls={d} proof_visits={d} proof_max={d} idealize_ns={d} gvn_ns={d}\n"
+           (g-profile-peeps) (g-profile-compute-ns) (g-profile-proof-ns)
+           (g-profile-proof-calls) (g-profile-proof-snapshot-ns)
+           (g-profile-proof-snapshot-calls) (g-profile-proof-visits) (g-profile-proof-max)
+           (g-profile-idealize-ns) (g-profile-gvn-ns))
+      (fmt (stderr) "AOTK_PROFILE phase=frontend_work analyze_pops={d} fold_scans={d} fold_candidates={d} iterate_live_scans={d} iterate_pops={d} iterate_sweeps={d} proof_snapshot_seeds={d} proof_snapshot_edges={d}\n"
+           (g-profile-analyze-pops) (g-profile-fold-scans) (g-profile-fold-candidates)
+           (g-profile-iterate-live-scans) (g-profile-iterate-pops) (g-profile-iterate-sweeps)
+           (g-profile-proof-snapshot-seeds) (g-profile-proof-snapshot-edges))
+      (fng-profile-note! "frontend_analyze" started))))
 
 (defn fng-peep [(node i64)] (-> i64)
   (if (load (fng-optimize-ptr)) (n-peephole node) node))
@@ -1125,6 +1190,7 @@
     (fng-peep merge)))
 
 (defn fng-memory-has-alias? [(memory i64) (alias i64)] (-> bool)
+  (set! (fng-profile-memory-alias-calls-ptr) (+ (load (fng-profile-memory-alias-calls-ptr)) 1))
   (if (= memory NO-NODE)
       false
       (match (n-op memory)
@@ -1139,7 +1205,9 @@
           (let [(mut index) 1 (mut found) false]
             (loop (if (or (>= (load index) (n-nins memory)) (load found))
                       (break)
-                      (do (if (fng-memory-has-alias? (n-in memory (load index)) alias)
+                      (do (set! (fng-profile-memory-alias-edges-ptr)
+                                (+ (load (fng-profile-memory-alias-edges-ptr)) 1))
+                          (if (fng-memory-has-alias? (n-in memory (load index)) alias)
                               (set! found true) 0)
                           (set! index (+ (load index) 1)))))
             (load found)))
@@ -1195,6 +1263,8 @@
               (loop (if (or (>= (load index) (n-nins memory)) (!= (load answer) NO-NODE))
                         (break)
                         (let [candidate (n-in memory (load index))]
+                          (set! (fng-profile-current-scans-ptr)
+                                (+ (load (fng-profile-current-scans-ptr)) 1))
                           (if (fng-memory-has-alias? candidate alias) (set! answer candidate) 0)
                           (set! index (+ (load index) 1)))))
               (if (= (load answer) NO-NODE)
@@ -1221,12 +1291,15 @@
   (let [(mut active) (al-new [i64] (malloc-allocator))
         (mut memories) (al-new [i64] (malloc-allocator))
         (mut i) 0]
+    (set! (fng-profile-preserve-calls-ptr) (+ (load (fng-profile-preserve-calls-ptr)) 1))
     (al-push! [i64] (mut memories) primary)
     (fng-active-memory! context (mut active))
     (loop (if (>= (load i) (al-len [i64] (load active)))
               (break)
               (let [field-index (al-get [i64] (load active) (load i))
                     alias (al-get [i64] (load (load (field context aliases))) field-index)]
+                (set! (fng-profile-preserve-fields-ptr)
+                      (+ (load (fng-profile-preserve-fields-ptr)) 1))
                 (if (not (fng-memory-has-alias? primary alias))
                     (al-push! [i64] (mut memories) (fng-current-memory context alias))
                     0)
@@ -2489,9 +2562,18 @@
   (let [frontend (load (field context frontend))
         ast (field frontend ast)
         callee (ts-child ast node 0)
-        array (fng-expression context (ts-child ast callee 0))]
+        borrowed (and (= (ts-kind ast callee) TSK-PROPERTY-ACCESS)
+                      (= (ts-text ast (ts-child ast callee 1)) "call"))
+        argument-base (if borrowed 2 1)
+        array (n-box! (fng-expression context
+                                      (if borrowed (ts-child ast node 1)
+                                          (ts-child ast callee 0))))]
     (fng-jsl-call2 context "ArrayJoin" array
-                   (fng-string-argument context node 1 ","))))
+                   (if (> (ts-child-count ast node) argument-base)
+                       (fng-jsl-call1 context "ToStringValue"
+                                      (n-box! (fng-expression context
+                                                              (ts-child ast node argument-base))))
+                       (n-string-const! (jss-from-utf8! ","))))))
 
 ;; The read-only searches, straight out of lib/array/read.jsl.
 ;;
@@ -2499,32 +2581,43 @@
 ;; publishes whatever the body left on the way out. Larger or recursive definitions can instead be
 ;; builtins; their calls carry the same heap as an implicit trailing effect argument.
 ;;
-;; The receiver stays a RAW array pointer, which is what `%ArrayLen` and `%ArrayLoad` expect. The
-;; search target and fromIndex are BOXED because the DSL owns StrictEqual/SameValueZero and
-;; ToIntegerOrInfinity rather than receiving pre-decided machine values from the frontend.
+;; The receiver is BOXED because these methods are intentionally generic: `array.indexOf(x)` and
+;; `Array.prototype.indexOf.call(arrayLike, x)` reach the same ArrayLike DSL operation. For the
+;; borrowed form child 1 is the receiver and real arguments begin at child 2; treating the method
+;; expression as the receiver made `%ArrayLen` read an arbitrary tagged word and native execution
+;; scan forever. The frontend decides only this syntax shape. Length, property access, equality and
+;; coercion remain wholly in JSL.
 (defn fng-array-search [(context FngContext) (node i64) (name (slice u8))] (-> i64)
   (let [frontend (load (field context frontend))
         ast (field frontend ast)
         callee (ts-child ast node 0)
-        array (fng-expression context (ts-child ast callee 0))
-        argc (- (ts-child-count ast node) 1)
+        borrowed (and (= (ts-kind ast callee) TSK-PROPERTY-ACCESS)
+                      (= (ts-text ast (ts-child ast callee 1)) "call"))
+        argument-base (if borrowed 2 1)
+        array (n-box! (fng-expression context
+                                      (if borrowed (ts-child ast node 1)
+                                          (ts-child ast callee 0))))
+        argc (- (ts-child-count ast node) (if borrowed 2 1))
         target (n-box! (if (> argc 0)
-                           (fng-expression context (ts-child ast node 1))
+                           (fng-expression context (ts-child ast node argument-base))
                            (fng-undefined)))]
     (if (= name "includes")
         (fng-jsl-call3 context "ArrayIncludes" array target
                        (n-box! (if (> argc 1)
-                                   (fng-expression context (ts-child ast node 2))
+                                   (fng-expression context
+                                                   (ts-child ast node (+ argument-base 1)))
                                    (fng-const 0))))
         (if (= name "lastIndexOf")
             (fng-jsl-call4 context "ArrayLastIndexOf" array target
                            (n-box! (if (> argc 1)
-                                       (fng-expression context (ts-child ast node 2))
+                                       (fng-expression context
+                                                       (ts-child ast node (+ argument-base 1)))
                                        (fng-undefined)))
                            (fng-const (if (> argc 1) 1 0)))
             (fng-jsl-call3 context "ArrayIndexOf" array target
                            (n-box! (if (> argc 1)
-                                       (fng-expression context (ts-child ast node 2))
+                                       (fng-expression context
+                                                       (ts-child ast node (+ argument-base 1)))
                                        (fng-const 0))))))))
 
 (defn fng-math-member-id [(context FngContext) (node i64)] (-> i64)
@@ -3518,9 +3611,11 @@
   ;; externs in otherwise standalone code. Ask the lowered window instead: these are the two graph
   ;; operations that can set the pending exception transport.
   (let [(mut node) start (mut found) false]
+    (set! (fng-window-calls-cell) (+ (load (fng-window-calls-cell)) 1))
     (loop (if (or (>= (load node) (n-count)) (load found))
               (break)
               (do
+                (set! (fng-window-scans-cell) (+ (load (fng-window-scans-cell)) 1))
                 (if (and (not (n-dead? (load node)))
                          (or (op-is? (load node) Call [_]) (op-is? (load node) JsThrow [])))
                     (set! found true)
@@ -3553,7 +3648,11 @@
 
 (defn fng-jsl-call [(context FngContext) (name (slice u8)) (args (slice i64))] (-> i64)
   (if (!= (jsl-require-body-only! name) JSL-OK)
-      (do (panic-corrupt "frontend: a JSL definition the frontend emits did not resolve") 0)
+      (do
+        (fmt (stderr) "frontend: JSL dependency failure name={s} code={d} where={s}\n"
+             name (jsl-err) (jsl-where))
+        (panic-corrupt "frontend: a JSL definition the frontend emits did not resolve")
+        0)
       0)
   ;; A NO-NODE argument binds a JSL parameter to nothing and surfaces later as a baffling
   ;; "unbound symbol" panic deep in lowering. Refuse it here, where the callee name is known.
@@ -3636,14 +3735,36 @@
     ;; resize-before-and-after-the-loop shape then fails placement outright --
     ;; `[1, 2, 3, 4].filter(v => v > lo)`, which compiles and answers correctly today, stopped
     ;; compiling at all. Naming it on the `Call` leaves every other memory edge the shape it had.
-    (let [calls-back (jsl-name-calls-back? name)]
+    (let [calls-back (jsl-name-calls-back? name)
+          callee (jsl-find name)]
       (set! (index mp 0) (fng-current-memory context JS-PROPERTY-ALIAS))
       (if calls-back (jl-set-outer-mem! (fng-callback-outer-memory context)) 0)
       (let [lowered-start (n-count)
             owner-entry (if (.top-level context)
                             (g-start)
                             (n-fun-entry (.fun context)))
-            v (jsl-inline! (load (field context ctrl)) mp owner-entry name args)]
+            (mut v) NO-NODE]
+        ;; Builtins already have an independent DSL body and can be shared by every source call.
+        ;; Macros and callback-bearing definitions remain expansions because they deliberately bind
+        ;; caller control or caller-local memory. Keeping ordinary builtins as calls avoids copying
+        ;; their often loop-heavy graph once per JavaScript operation.
+        (if (and (>= callee 0) (and (not (jsl-macro? callee)) (not calls-back)))
+            (do
+              (if (!= (jsl-require! name) JSL-OK)
+                  (panic-corrupt "frontend: a called JSL builtin did not lower")
+                  0)
+              (let [call (jsl-call-with-memory!
+                           (load (load (field context ctrl))) name args (load (index mp 0)))]
+                (set! v (call-value call))
+                (set! (load (field context ctrl)) (call-end call))
+                (if (jsl-decl-uses-memory? callee)
+                    (do
+                      (set! (index mp 0)
+                            (n-new1 (Arg (t-mem-alias JS-PROPERTY-ALIAS (t-undef)))
+                                    (call-end call)))
+                      0)
+                    0)))
+            (set! v (jsl-inline! (load (field context ctrl)) mp owner-entry name args)))
         (jl-set-outer-mem! NO-NODE)
         (if calls-back
             ;; The callback may have written any alias the caller can reach, so nothing recorded
@@ -3669,9 +3790,9 @@
         (if (and (!= name "ThrowValue")
                  (and (not (fng-proven-numeric-nonthrowing-call? name args))
                       (fng-lowered-window-can-throw? lowered-start)))
-            (fng-check-pending-exception! context v)
+            (fng-check-pending-exception! context (load v))
             0)
-        v))))
+        (load v)))))
 
 (defn fng-jsl-call0 [(context FngContext) (name (slice u8))] (-> i64)
   (fng-jsl-call context name (slice-new [i64] (cast (ptr i64) 0) 0)))
@@ -3705,6 +3826,16 @@
     (set! (index p 2) c)
     (set! (index p 3) d)
     (fng-jsl-call context name (slice-new [i64] p 4))))
+
+(defn fng-jsl-call5 [(context FngContext) (name (slice u8))
+                      (a i64) (b i64) (c i64) (d i64) (e i64)] (-> i64)
+  (let [buf (primitive/alloc-stack (array i64 5)) p (cast (ptr i64) buf)]
+    (set! (index p 0) a)
+    (set! (index p 1) b)
+    (set! (index p 2) c)
+    (set! (index p 3) d)
+    (set! (index p 4) e)
+    (fng-jsl-call context name (slice-new [i64] p 5))))
 
 (defn fng-jsl-call9 [(context FngContext) (name (slice u8))
                       (a i64) (b i64) (c i64) (d i64) (e i64)
@@ -3947,16 +4078,25 @@
 
 (defn fng-array-fill [(context FngContext) (node i64)] (-> i64)
   (let [frontend (load (field context frontend)) ast (field frontend ast)
-        callee (ts-child ast node 0) array (fng-expression context (ts-child ast callee 0))
-        value (if (> (ts-child-count ast node) 1)
-                  (n-box! (fng-expression context (ts-child ast node 1)))
+        callee (ts-child ast node 0)
+        borrowed (and (= (ts-kind ast callee) TSK-PROPERTY-ACCESS)
+                      (= (ts-text ast (ts-child ast callee 1)) "call"))
+        argument-base (if borrowed 2 1)
+        argc (- (ts-child-count ast node) (if borrowed 2 1))
+        array (n-box! (fng-expression context
+                                      (if borrowed (ts-child ast node 1)
+                                          (ts-child ast callee 0))))
+        value (if (> argc 0)
+                  (n-box! (fng-expression context (ts-child ast node argument-base)))
                   (n-box! (fng-undefined)))
-        start (if (> (ts-child-count ast node) 2)
-                  (fng-expression context (ts-child ast node 2)) (fng-const 0))
-        end (if (> (ts-child-count ast node) 3)
-                (fng-expression context (ts-child ast node 3))
-                (fng-jsl-call1 context "ArrayLength" array))]
-    (fng-jsl-call4 context "ArrayFill" array value start end)))
+        start (n-box! (if (> argc 1)
+                          (fng-expression context (ts-child ast node (+ argument-base 1)))
+                          (fng-const 0)))
+        end (n-box! (if (> argc 2)
+                        (fng-expression context (ts-child ast node (+ argument-base 2)))
+                        (fng-undefined)))]
+    (fng-jsl-call5 context "ArrayFill" array value start end
+                   (fng-const (if (> argc 2) 1 0)))))
 
 (defn fng-array-splice [(context FngContext) (node i64)] (-> i64)
   (let [frontend (load (field context frontend)) ast (field frontend ast)
@@ -4002,9 +4142,16 @@
 
 (defn fng-array-flat [(context FngContext) (node i64)] (-> i64)
   (let [frontend (load (field context frontend)) ast (field frontend ast)
-        callee (ts-child ast node 0) array (fng-expression context (ts-child ast callee 0))
-        depth (if (> (ts-child-count ast node) 1)
-                  (fng-expression context (ts-child ast node 1)) (fng-const 1))]
+        callee (ts-child ast node 0)
+        borrowed (and (= (ts-kind ast callee) TSK-PROPERTY-ACCESS)
+                      (= (ts-text ast (ts-child ast callee 1)) "call"))
+        argument-base (if borrowed 2 1)
+        array (n-box! (fng-expression context
+                                      (if borrowed (ts-child ast node 1)
+                                          (ts-child ast callee 0))))
+        depth (n-box! (if (> (ts-child-count ast node) argument-base)
+                          (fng-expression context (ts-child ast node argument-base))
+                          (fng-const 1)))]
     (fng-jsl-call2 context "ArrayFlat" array depth)))
 
 ;; `Array.prototype.slice`, out of `ArraySlice` in lib/array/build.jsl.
@@ -4451,6 +4598,9 @@
         (mut arm-values) (al-new [i64] (malloc-allocator))
         (mut call-args) (al-new [i64] (malloc-allocator))
         (mut index) 0]
+    (set! (fng-profile-method-chains-ptr) (+ (load (fng-profile-method-chains-ptr)) 1))
+    (set! (fng-profile-method-candidates-ptr)
+          (+ (load (fng-profile-method-candidates-ptr)) (al-len [i64] (load candidates))))
     (fng-record-dynamic-alias! context JS-PROPERTY-ALIAS)
     (fng-active-memory! context (mut active))
     (fng-control-aliases! context (mut active))
@@ -4633,7 +4783,8 @@
                         (if (>= unique 0) unique typed))))
               (let [resolved (fe-resolution-symbol frontend callee-node)
                     local-target (fng-local-function-target frontend callee-node)
-                    declaration-target (fe-find-function-name frontend callee-node)]
+                    declaration-target
+                      (fe-find-function-name-in-owner frontend callee-node (.owner context))]
                 (if (>= declaration-target 0) declaration-target
                     (if (>= local-target 0) local-target resolved)))))
         ;; A property-call syntax does not by itself add a receiver slot to a statically resolved
@@ -5920,16 +6071,19 @@
                     (< symbol 0) NO-NODE
                     :else
                       (let [stored (fng-symbol-node context symbol)
-                            declaration (fe-find-function-name frontend node)
+                            declaration
+                              (fe-find-function-name-in-owner frontend node (.owner context))
                             ; The stored binding wins whenever it holds a value: a nested
                             ; declaration's binding is its materialized CLOSURE, and preferring
                             ; the bare Fun here handed callers an environment-less callable.
-                            ; The declaration is only the hoisting fallback for a name read
-                            ; before its statement was reached.
+                            ; The resolved lexical function id is the hoisting fallback for a name
+                            ; read before its statement was reached.
                             value
                               (if (= stored NO-NODE)
                                   (if (>= declaration 0)
-                                      (al-get [i64] (load (load (field context functions))) declaration)
+                                      (al-get [i64]
+                                              (load (load (field context functions)))
+                                              declaration)
                                       stored)
                                   stored)]
                         value)))
@@ -8500,11 +8654,31 @@
   ;; definition and its callees the first time the frontend emits a call to it, so a program that
   ;; uses no library builtin gets exactly the graph it got before this existed — which is what the
   ;; exact-`g-render` migration oracle in tests/frontend-exact-graph-test.mjs compares.
-  (jsl-reset!)
-  (if (!= (jsl-load-index! "lib/index") JSL-OK)
+  (let [reuse (load (fng-reuse-jsl-index-ptr))
+        ready (load (fng-jsl-index-ready-ptr))
+        status (if (and reuse ready)
+                   (jsl-reuse-checked!)
+                   (do
+                     (jsl-reset!)
+                     (let [loaded (jsl-load-index! "lib/index")]
+                       (if (and reuse (= loaded JSL-OK))
+                           (set! (fng-jsl-index-ready-ptr) true)
+                           0)
+                       loaded)))]
+  (if (!= status JSL-OK)
       (do (panic-corrupt "frontend: the JSL runtime library did not load") 0)
       0)
+  )
   (jl-reset!)
+  (set! (fng-window-calls-cell) 0)
+  (set! (fng-window-scans-cell) 0)
+  (set! (fng-profile-memory-alias-calls-ptr) 0)
+  (set! (fng-profile-memory-alias-edges-ptr) 0)
+  (set! (fng-profile-preserve-calls-ptr) 0)
+  (set! (fng-profile-preserve-fields-ptr) 0)
+  (set! (fng-profile-current-scans-ptr) 0)
+  (set! (fng-profile-method-chains-ptr) 0)
+  (set! (fng-profile-method-candidates-ptr) 0)
   (set! (fng-optimize-ptr) optimize)
   (let [main-index (fng-main-index frontend)
         main (al-get [FeFunction] (.functions frontend) main-index)
@@ -8521,7 +8695,8 @@
         (mut effects) (al-new [bool] (malloc-allocator))
         (mut cell-shape) SHAPE-ROOT
         (mut cell-alias) 0
-        (mut index) 0]
+        (mut index) 0
+        (mut profile-start) (fng-profile-now)]
     (loop (if (>= (load index) symbol-count)
               (break)
               (do
@@ -8551,8 +8726,10 @@
               (break)
               (do (al-push! [bool] (mut effects) false) (set! index (+ (load index) 1)))))
     (fng-compute-effects! frontend (mut effects))
+    (set! profile-start (fng-profile-note! "frontend_effects" (load profile-start)))
     ;; Shapes and aliases precede every graph function binding.
     (fng-build-layouts! frontend (mut shapes) (mut aliases))
+    (set! profile-start (fng-profile-note! "frontend_layouts" (load profile-start)))
     (if (> (al-len [FeCapture] (.captures frontend)) 0)
         (do
           (set! cell-shape (shape-transition SHAPE-ROOT "__closure_cell" (t-dyn)))
@@ -8648,16 +8825,45 @@
                            main-index
                            true)
     (fng-distribute-deferred-phi-boxes!)
+    (fmt (stderr) "AOTK_PROFILE phase=frontend_build_shape nodes={d} live={d} peeps={d} window_calls={d} window_scans={d}\n"
+         (n-count) (g-live-count) (g-profile-peeps)
+         (load (fng-window-calls-cell)) (load (fng-window-scans-cell)))
+    (fmt (stderr) "AOTK_PROFILE phase=jsl_dynamic_calls target_calls={d} target_scans={d} jsl_scans={d} max_calls={d} max_scans={d} param_scans={d} lower_ns={d} lower_calls={d} lower_nodes={d}\n"
+         (jl-profile-target-calls) (jl-profile-target-scans) (jl-profile-jsl-scans)
+         (jl-profile-max-calls) (jl-profile-max-scans) (jl-profile-param-scans)
+         (jl-profile-lower-ns) (jl-profile-lower-calls) (jl-profile-lower-nodes))
+    (fmt (stderr) "AOTK_PROFILE phase=frontend_memory alias_calls={d} alias_edges={d} preserve_calls={d} preserve_fields={d} current_scans={d} method_chains={d} method_candidates={d}\n"
+         (load (fng-profile-memory-alias-calls-ptr))
+         (load (fng-profile-memory-alias-edges-ptr))
+         (load (fng-profile-preserve-calls-ptr))
+         (load (fng-profile-preserve-fields-ptr))
+         (load (fng-profile-current-scans-ptr))
+         (load (fng-profile-method-chains-ptr))
+         (load (fng-profile-method-candidates-ptr)))
+    (set! profile-start (fng-profile-note! "frontend_graph_build" (load profile-start)))
     (if analyze
         (do
+          (let [phase (fng-profile-now)]
           (fng-discard-memory-scaffolding!)
+          (fmt (stderr) "AOTK_TIMING phase=frontend_discard_memory ns={d}\n"
+               (- (fng-profile-now) phase)))
           (fng-analyze-fresh!)
-          (if (and optimize (> (jl-inline-callback-calls!) 0))
-              (do (fng-analyze-fresh!)
-                  (if (> (g-eliminate-dead-local-arrays!) 0)
-                      (fng-analyze-fresh!) 0)) 0))
+          (let [phase (fng-profile-now)
+                inlined (if optimize (jl-inline-callback-calls!) 0)]
+            (fmt (stderr) "AOTK_TIMING phase=frontend_inline_callbacks ns={d}\n"
+                 (- (fng-profile-now) phase))
+            (if (> inlined 0)
+                (do (fng-analyze-fresh!)
+                    (let [eliminate-phase (fng-profile-now)
+                          eliminated (g-eliminate-dead-local-arrays!)]
+                      (fmt (stderr) "AOTK_TIMING phase=frontend_eliminate_arrays ns={d}\n"
+                           (- (fng-profile-now) eliminate-phase))
+                      (if (> eliminated 0) (fng-analyze-fresh!) 0))) 0)))
         0)
+    (let [phase (fng-profile-now)]
     (fng-discard-unused!)
+      (fmt (stderr) "AOTK_TIMING phase=frontend_discard_unused ns={d}\n"
+           (- (fng-profile-now) phase)))
     ;; A LOOP NOBODY READS SURVIVES EVERY FOLD. `n-kill!` refuses a node that still has users, and
     ;; each node in a loop's Phi cycle has one -- the next node round the cycle -- so a definition
     ;; from `lib/` whose result goes unread stays live, reachable from no root, and `v-pass-leaks`
@@ -8671,7 +8877,14 @@
     ;; The uncalled functions go FIRST: their bodies are full of memory nodes and calls, and the
     ;; sweep below refuses to run at all when an unreachable node has an effect. Pruning them here
     ;; leaves the sweep the question it was written for -- a dead loop with no consumer.
-    (if analyze (do (g-kill-uncalled-functions!) (g-sweep-unreachable!)) 0)
+    (if analyze
+        (let [phase (fng-profile-now)]
+          (g-kill-uncalled-functions!)
+          (g-sweep-unreachable!)
+          (fmt (stderr) "AOTK_TIMING phase=frontend_sweep_unreachable ns={d}\n"
+               (- (fng-profile-now) phase))
+          0)
+        0)
     ; The first-parameter symbol may not exist: a zero-parameter main leaves the symbol list
     ; empty and parameter-start at 0, so the lookup must sit INSIDE the count guard. Binding
     ; it unconditionally was an out-of-bounds al-get that only ever ran because the previous

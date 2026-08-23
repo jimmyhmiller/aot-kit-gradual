@@ -55,8 +55,19 @@
 (extern getpid :cc c [] (-> i32))
 (extern unlink :cc c [(ptr i8)] (-> i32))
 (extern aot_host_is_x86_64 :cc c [] (-> i32))
+(defstruct NhTimespec [(sec i64) (nsec i64)])
+(extern clock_gettime :cc c [i32 (ptr NhTimespec)] (-> i32))
 ;; native/js-oracle/oracle.c, on the link line through Coil.toml's `[cc] sources`.
 (extern js_oracle_run :cc c [(ptr i8) i64 i64 (ptr i8) i64] (-> i32))
+
+(defn nh-now-ns [] (-> i64)
+  (let [t (primitive/alloc-stack NhTimespec)]
+    (clock_gettime 1 t)
+    (+ (* (.sec t) 1000000000) (.nsec t))))
+(defn nh-timing! [(phase (slice u8)) (started i64)] (-> i64)
+  (let [now (nh-now-ns)]
+    (fmt (stderr) "AOTK_TIMING phase={s} ns={d}\n" phase (- now started))
+    now))
 
 ;; A NUL-terminated C string in a caller buffer.
 (defn nh-cstr! [(buf (ptr i8)) (cap i64) (s (slice u8))] (-> (ptr i8))
@@ -124,11 +135,13 @@
 ;; machine code came out the other end.
 (defn nh-try-compile? [(source (slice u8))] (-> bool)
   (block :done
+    (let [(mut phase-start) (nh-now-ns)]
     (graph-reset! 7001)
     (shape-reset!)
     (jss-reset!)
     (let [(mut fe) (fe-native-new source)]
       (let [status (fe-native-index! (mut fe))]
+        (set! phase-start (nh-timing! "frontend_index" (load phase-start)))
         (if (!= status FE-OK)
             (do (fmt (stderr)
                      "native-harness: frontend status={d} code={d} node={d}: {s}\n"
@@ -138,8 +151,10 @@
                 (return-from :done false))
             0))
       (frontend-native-build! (mut fe) 7001 true)
+      (set! phase-start (nh-timing! "frontend_graph" (load phase-start)))
       (fe-native-free! (mut fe)))
     (let [violations (g-verify)]
+      (set! phase-start (nh-timing! "graph_verify" (load phase-start)))
       (if (!= violations 0)
           (do (fmt (stderr) "native-harness: verify violations={d}\n" violations)
               (g-verify-print (stderr))
@@ -158,7 +173,9 @@
                     0))
               (return-from :done false))
           0))
-    (if (not (be-select-machine-program!))
+    (let [selected (be-select-verified-machine-program!)]
+    (set! phase-start (nh-timing! "selection" (load phase-start)))
+    (if (not selected)
         (do (fmt (stderr) "native-harness: selection code={d} node={d} machine={d}/{d}\n"
                  (be-result) (be-result-node) (ms-result) (ms-result-item))
             ;; ms-result-item is a machine-instruction index, not a graph node. Always report the
@@ -177,29 +194,35 @@
                       0))
                 0)
             (return-from :done false))
-        0)
+        0))
     (be-use-runtime-allocation! true)
     (be-schedule!)
-    (if (< (be-color! 10) 0)
+    (set! phase-start (nh-timing! "scheduling" (load phase-start)))
+    (let [colored (be-color! 10)]
+    (set! phase-start (nh-timing! "allocation" (load phase-start)))
+    (if (< colored 0)
         (do (fmt (stderr) "native-harness: allocation code={d} node={d}\n"
                  (be-result) (be-result-node))
             (return-from :done false))
-        0)
+        0))
     (if (!= (aot_host_is_x86_64) (cast i32 0))
-        (if (not (be-x64-encode-checked!))
+        (let [encoded (be-x64-encode-checked!)]
+          (set! phase-start (nh-timing! "x86_encoding" (load phase-start)))
+        (if (not encoded)
             (do (fmt (stderr) "native-harness: x64 encode code={d} node={d}\n"
                      (be-result) (be-result-node))
                 (return-from :done false))
-            (if (be-elf-checked!)
-                true
-                (do (fmt (stderr) "native-harness: ELF emission failed\n") false)))
+            (let [published (be-elf-checked!)]
+              (set! phase-start (nh-timing! "elf_publication" (load phase-start)))
+              (if published true
+                  (do (fmt (stderr) "native-harness: ELF emission failed\n") false)))))
         (if (not (be-encode-checked!))
             (do (fmt (stderr) "native-harness: AArch64 encode code={d} node={d}\n"
                      (be-result) (be-result-node))
                 (return-from :done false))
             (if (be-macho-checked!)
                 true
-                (do (fmt (stderr) "native-harness: Mach-O emission failed\n") false))))))
+                (do (fmt (stderr) "native-harness: Mach-O emission failed\n") false)))))))
 
 (defn nh-compile! [(source (slice u8))] (-> i64)
   (graph-reset! 7001)
@@ -212,7 +235,7 @@
   (let [violations (g-verify)]
     (if (> violations 0) (g-verify-print (stderr)) 0)
     (assert (= violations 0)))
-  (let [selected (be-select-machine-program!)]
+  (let [selected (be-select-verified-machine-program!)]
     (if (not selected)
         (do (fmt (stderr) "native-harness: selection code={d} node={d} machine={d}/{d} cfg={d}/{d}\n"
                  (be-result) (be-result-node) (ms-result) (ms-result-item)
@@ -290,11 +313,13 @@
         object (nh-process-path! (cast (ptr i8) object-buf) 128 ".o")
         binary (nh-process-path! (cast (ptr i8) binary-buf) 128 "")
         error (nh-process-path! (cast (ptr i8) error-buf) 128 ".err")]
-    (let [f (fopen (cast (ptr i8) (slice-data object))
+    (let [object-start (nh-now-ns)
+          f (fopen (cast (ptr i8) (slice-data object))
                    (nh-cstr! (cast (ptr i8) mode-buf) 8 "w"))]
       (assert (!= (cast i64 f) 0))
       (fwrite (be-object-data) 1 (be-object-len) f)
-      (fclose f))
+      (fclose f)
+      (nh-timing! "object_write" object-start))
     (let [fb (primitive/alloc-stack FixBuf) w (primitive/alloc-stack Writer)]
       (set! (.data fb) (cast (ptr i8) command-buf))
       (set! (.cap fb) 1024) (set! (.len fb) 0)
@@ -304,9 +329,12 @@
                object binary error)
           (fmt w "xcrun clang -arch arm64 /tmp/aotk-driver.o /tmp/aotk-runtime.o /tmp/aotk-trampoline.o {s} -o {s} 2>{s}"
                object binary error))
-      (nh-run-shell! (slice-new [u8]
-                                (cast (ptr u8) command-buf)
-                                (load (field fb len)))))))
+      (let [link-start (nh-now-ns)
+            status (nh-run-shell! (slice-new [u8]
+                                             (cast (ptr u8) command-buf)
+                                             (load (field fb len))))]
+        (nh-timing! "clang_link" link-start)
+        status))))
 
 (defn nh-exec-command! [(cmd (ptr i8)) (arg i64)] (-> i64)
   (let [binary-buf (primitive/alloc-stack (array i8 128))
@@ -335,6 +363,20 @@
 (defn nh-exec-checked! [(arg i64) (ok (ptr bool))] (-> i64)
   (let [cmd (primitive/alloc-stack (array i8 256))]
     (nh-exec-command! (cast (ptr i8) cmd) arg)
+    (nh-shell-answer (cast (ptr i8) cmd) ok)))
+
+;; Batch Test262 execution needs a bound distinct from compilation: one nonterminating JavaScript
+;; body must not consume the compile timeout or prevent the remaining entry points from running.
+(defn nh-exec-checked-timeout! [(arg i64) (seconds i64) (ok (ptr bool))] (-> i64)
+  (let [cmd (primitive/alloc-stack (array i8 256))
+        binary-buf (primitive/alloc-stack (array i8 128))
+        binary (nh-process-path! (cast (ptr i8) binary-buf) 128 "")
+        fb (primitive/alloc-stack FixBuf) w (primitive/alloc-stack Writer)]
+    (set! (.data fb) (cast (ptr i8) cmd))
+    (set! (.cap fb) 256) (set! (.len fb) 0)
+    (fixed-buffer-writer w fb)
+    (fmt w "timeout --signal=KILL {d}s {s} {d}" seconds binary arg)
+    (set! (index (cast (ptr i8) cmd) (load (field fb len))) (cast i8 0))
     (nh-shell-answer (cast (ptr i8) cmd) ok)))
 
 (defn nh-run! [(arg i64)] (-> i64)

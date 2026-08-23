@@ -22,6 +22,12 @@
 (import "coil.fmt" :use *)
 (import "coil.slice" :use *)
 
+;; Stack-map PCs are target instruction offsets, not portable Machine IR facts. Mach-O/AArch64
+;; historically reconstructed them from fixed-width instruction counts; x86 records the exact
+;; byte offset while encoding variable-length calls. Object publication selects the matching
+;; interpretation before writing and independently verifying metadata.
+(defn mobj-x64-target [] (-> (ptr bool)) (primitive/alloc-static bool))
+
 (defn obj-u8! [(v i64)] (-> i64)
   (al-push! [u8] (field (backend) obj) (cast u8 (& v 255)))
   0)
@@ -202,7 +208,12 @@
 (defn mobj-safepoint-pc [(at i64)] (-> i64)
   (let [m (be-inst at)
         op (.op m)]
-    (case op MI-NEW
+    (if (load (mobj-x64-target))
+        ;; The x64 encoder stores the byte immediately after each direct call in `.earliest`.
+        ;; Polymorphic dispatch currently stores its common continuation there, matching the
+        ;; previous one-record-per-MI-CALL metadata contract without re-running AArch64 sizing.
+        (.earliest m)
+        (case op MI-NEW
           (if (be-runtime-allocation?)
               (+ (mobj-new-branch-pc at) 4)
               (load (field m first)))
@@ -226,7 +237,7 @@
                       (+ 2 common))]
             ;; setup includes the call instruction itself; stack maps name its return PC.
             (+ here (* 4 setup)))
-            -1)))
+            -1))))
 
 (defn mobj-branch-reloc-info [(symbol i64)] (-> i64)
   (| symbol (| (<< 1 24) (| (<< 2 25) (| (<< 1 27) (<< 2 28))))))
@@ -249,7 +260,8 @@
    (tmp-first (ArrayList i64))
    (tmp-count (ArrayList i64))
    (tmp-vreg (ArrayList i64))
-   (flags (ArrayList bool))   ; per-vreg live flag during the block walk
+   (flags (ArrayList i64))    ; packed per-vreg live flags during the block walk
+   (touched (ArrayList i64))  ; vregs whose flag may need clearing before the next block
    (inited bool)])
 
 (defn mobj-roots [] (-> (ptr MobjRootCache))
@@ -263,15 +275,25 @@
           (set! (.tmp-first c) (al-new [i64] (malloc-allocator)))
           (set! (.tmp-count c) (al-new [i64] (malloc-allocator)))
           (set! (.tmp-vreg c) (al-new [i64] (malloc-allocator)))
-          (set! (.flags c) (al-new [bool] (malloc-allocator)))
+          (set! (.flags c) (al-new [i64] (malloc-allocator)))
+          (set! (.touched c) (al-new [i64] (malloc-allocator)))
           (set! (.inited c) true)
           0))
     c))
 
 (defn mobj-mark-use! [(vreg i64)] (-> i64)
   (let [c (mobj-roots)]
-    (if (and (>= vreg 0) (< vreg (al-len [bool] (.flags c))))
-        (do (al-set! [bool] (field c flags) vreg true) 0)
+    (if (>= vreg 0)
+        (let [word (/ vreg 64)]
+          (if (< word (al-len [i64] (.flags c)))
+              (let [old (al-get [i64] (.flags c) word)]
+                (if (= (& old (ml-bit vreg)) 0)
+                    (do
+                      (al-set! [i64] (field c flags) word (| old (ml-bit vreg)))
+                      (al-push! [i64] (field c touched) vreg))
+                    0)
+                0)
+              0))
         0)))
 
 (defn mobj-mark-inst-uses! [(at i64)] (-> i64)
@@ -296,20 +318,34 @@
 (defn mobj-note-root-snapshot! [(at i64) (exclude i64) (vregs i64)] (-> i64)
   (let [c (mobj-roots)
         first (al-len [i64] (.tmp-vreg c))
-        (mut vr) 0
+        words (al-len [i64] (.flags c))
+        (mut word) 0
         (mut count) 0]
-    (loop (if (>= (load vr) vregs)
+    ;; Packed flags preserve ascending vreg publication while skipping wholly-dead groups of 64.
+    (loop (if (>= (load word) words)
               (break)
               (do
-                (if (and (al-get [bool] (.flags c) (load vr))
-                         (and (!= (load vr) exclude)
-                              (!= (ml-value-kind (load vr)) MLK-SCALAR)))
-                    (do
-                      (al-push! [i64] (field c tmp-vreg) (load vr))
-                      (set! count (+ (load count) 1))
-                      0)
-                    0)
-                (set! vr (+ (load vr) 1))
+                (let [bits (al-get [i64] (.flags c) (load word))]
+                  (if (!= bits 0)
+                      (let [(mut bit) 0]
+                        (loop (if (>= (load bit) 64)
+                                  (break)
+                                  (do
+                                    (if (!= (& bits (<< 1 (load bit))) 0)
+                                        (let [vr (+ (* (load word) 64) (load bit))]
+                                          (if (and (< vr vregs)
+                                                   (and (!= vr exclude)
+                                                        (!= (ml-value-kind vr) MLK-SCALAR)))
+                                              (do
+                                                (al-push! [i64] (field c tmp-vreg) vr)
+                                                (set! count (+ (load count) 1))
+                                                0)
+                                              0))
+                                        0)
+                                    (set! bit (+ (load bit) 1))
+                                    0))))
+                      0))
+                (set! word (+ (load word) 1))
                 0)))
     (al-push! [i64] (field c tmp-site) at)
     (al-push! [i64] (field c tmp-first) first)
@@ -318,21 +354,53 @@
 
 (defn mobj-build-block-roots! [(bid i64) (vregs i64)] (-> i64)
   (let [c (mobj-roots)
+        u (machine-unit)
+        words (ml-live-words)
+        owner (mu-block-owner bid)
+        local-words (ml-block-words bid)
+        local-base (al-get (.live-block-first u) bid)
         first (mu-block-inst-first bid)
         count (mu-block-inst-count bid)
-        (mut vr) 0
+        (mut touched) 0
+        (mut word) 0
         (mut i) count]
     (al-clear! [i64] (field c tmp-site))
     (al-clear! [i64] (field c tmp-first))
     (al-clear! [i64] (field c tmp-count))
     (al-clear! [i64] (field c tmp-vreg))
-    (al-clear! [bool] (field c flags))
-    (loop (if (>= (load vr) vregs)
+    (loop (if (>= (al-len [i64] (.flags c)) words)
+              (break)
+              (do (al-push! [i64] (field c flags) 0))))
+    ;; Clear only bits touched by the prior block, then expand this block's function-local row.
+    (loop (if (>= (load touched) (al-len [i64] (.touched c)))
               (break)
               (do
-                (al-push! [bool] (field c flags) (ml-live-out? bid (load vr)))
-                (set! vr (+ (load vr) 1))
+                (let [vr (al-get [i64] (.touched c) (load touched))
+                      global-word (/ vr 64)]
+                  (al-set! [i64] (field c flags) global-word
+                           (& (al-get [i64] (.flags c) global-word) (^ (ml-bit vr) -1))))
+                (set! touched (+ (load touched) 1))
                 0)))
+    (al-clear! [i64] (field c touched))
+    (set! word 0)
+    (loop (if (>= (load word) local-words)
+              (break)
+              (do
+                (let [bits (al-get [i64] (.live-out u) (+ local-base (load word)))
+                      (mut bit) 0]
+                  (loop (if (>= (load bit) 64)
+                            (break)
+                            (do
+                              (if (!= (& bits (<< 1 (load bit))) 0)
+                                  (let [local (+ (* (load word) 64) (load bit))]
+                                    (if (< local (al-get (.live-owner-count u) owner))
+                                        (let [vr (ml-owner-vreg owner local)
+                                              global-word (/ vr 64)]
+                                          (mobj-mark-use! vr))
+                                        0))
+                                  0)
+                              (set! bit (+ (load bit) 1))))))
+                (set! word (+ (load word) 1)))))
     (loop (if (<= (load i) 0)
               (break)
               (do
@@ -346,7 +414,11 @@
                   (if (= op MI-CALL)
                       (mobj-note-root-snapshot! at dst vregs)
                       0)
-                  (if (>= dst 0) (al-set! [bool] (field c flags) dst false) 0)
+                  (if (>= dst 0)
+                      (let [word (/ dst 64)]
+                        (al-set! [i64] (field c flags) word
+                                 (& (al-get [i64] (.flags c) word) (^ (ml-bit dst) -1))))
+                      0)
                   (mobj-mark-inst-uses! at)
                   ; After the kill and the uses the flags hold live-BEFORE `at`.
                   (if (= op MI-NEW)
@@ -419,6 +491,7 @@
 (defn mobj-write-stackmaps! [] (-> i64)
   (let [sites (mobj-safepoint-count)
         roots (mobj-root-count)
+        (mut phase-start) (ms-profile-now)
         (mut at) 0
         (mut root-first) 0]
     (obj-u32! 1398034241)
@@ -440,6 +513,10 @@
                   (obj-u32! 0)
                   (set! owner (+ (load owner) 1))
                   0))))
+    (fmt (stderr) "AOTK_PROFILE phase=stackmap_functions ns={d} x64={d}\n"
+         (- (ms-profile-now) (load phase-start))
+         (if (load (mobj-x64-target)) 1 0))
+    (set! phase-start (ms-profile-now))
     (let [c (mobj-roots)
           total (al-len [i64] (.site c))
           (mut cursor) 0]
@@ -467,6 +544,9 @@
                       0)
                   (set! at (+ (load at) 1))
                   0)))
+      (fmt (stderr) "AOTK_PROFILE phase=stackmap_sites ns={d} count={d}\n"
+           (- (ms-profile-now) (load phase-start)) sites)
+      (set! phase-start (ms-profile-now))
       (let [(mut r) 0]
         (loop (if (>= (load r) total)
                   (break)
@@ -479,6 +559,8 @@
                       (obj-u32! (if (>= reg 0) reg (be-spill-off-vreg vr))))
                     (set! r (+ (load r) 1))
                     0)))))
+    (fmt (stderr) "AOTK_PROFILE phase=stackmap_roots ns={d} count={d}\n"
+         (- (ms-profile-now) (load phase-start)) roots)
     0))
 
 (defn mobj-shape-bitmap [(shape i64)] (-> i64)
@@ -846,6 +928,7 @@
   0)
 
 (defn be-macho! [] (-> i64)
+  (store! (mobj-x64-target) false)
   (mobj-build-roots!)
   (let [p (backend)
         textlen (be-code-len)

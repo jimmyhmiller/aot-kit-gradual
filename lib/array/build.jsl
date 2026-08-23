@@ -37,19 +37,23 @@
 ;; Iterative depth-first flattening. The explicit value/depth stacks are the DSL equivalent of
 ;; Torque builtins using a work list: recursion remains a source-level policy, not compiler
 ;; recursion that would infinitely expand an inlined macro.
-(macro ArrayFlat :params [(source dyn) (depth int)] :ret dyn
-  (let [(out (%NewArray))
+(macro ArrayFlat :transitioning true :params [(source dyn) (depth dyn)] :ret dyn
+  (let [(object (ObjectFromValue (ObjectCoercible source)))
+        (max-depth (ClampedIndex depth 2147483647))
+        (out (%NewArray))
         (values (%NewArray))
         (depths (%NewArray))
-        (seed-len (%ArrayLen source))
+        (seed-len (ArrayLikeLength object))
         (seeded
-          (loop [(i seed-len)]
-            (if (%Le i 0) i
-              (let [(j (%Sub i 1))
-                    (sv (%ArrayStore values (%ArrayLen values) (%ArrayLoad source j)))
-                    (sd (%ArrayStore depths (%ArrayLen depths) (%Box depth)))]
-                (recur j)))))]
-    (loop [(remaining seed-len)]
+          (loop [(i seed-len) (count 0)]
+            (if (%Le i 0) count
+              (let [(j (%Sub i 1))]
+                (if (ArrayLikeHasIndex object j)
+                    (let [(sv (%ArrayStore values (%ArrayLen values) (ArrayLikeGet object j)))
+                          (sd (%ArrayStore depths (%ArrayLen depths) (%Box max-depth)))]
+                      (recur j (%Add count 1)))
+                    (recur j count))))))]
+    (loop [(remaining seeded)]
       (if (%Le remaining 0) out
         (let [(slot (%Sub (%ArrayLen values) 1))
               (value (%ArrayLoad values slot))
@@ -60,13 +64,17 @@
               (let [(array (%UnboxArray value))
                     (n (%ArrayLen array))
                     (pushed
-                      (loop [(i n)]
-                        (if (%Le i 0) i
-                          (let [(j (%Sub i 1))
-                                (sv (%ArrayStore values (%ArrayLen values) (%ArrayLoad array j)))
-                                (sd (%ArrayStore depths (%ArrayLen depths) (%Box (%Sub d 1))))]
-                            (recur j)))))]
-                (recur (%Add (%Sub remaining 1) n)))
+                      (loop [(i n) (count 0)]
+                        (if (%Le i 0) count
+                          (let [(j (%Sub i 1))]
+                            (if (ArrayLikeHasIndex value j)
+                                (let [(sv (%ArrayStore values (%ArrayLen values)
+                                                       (ArrayLikeGet value j)))
+                                      (sd (%ArrayStore depths (%ArrayLen depths)
+                                                       (%Box (%Sub d 1))))]
+                                  (recur j (%Add count 1)))
+                                (recur j count))))))]
+                (recur (%Add (%Sub remaining 1) pushed)))
               (let [(stored (%ArrayStore out (%ArrayLen out) value))]
                 (recur (%Sub remaining 1)))))))))
 
@@ -187,13 +195,25 @@
 
 ;; https://tc39.es/ecma262/#sec-array.prototype.fill. Bounds use the same relative-index rule as
 ;; slice, but fill mutates and returns its receiver.
-(macro ArrayFill :params [(a dyn) (value dyn) (start int) (end int)] :ret dyn
-  (let [(len (%ArrayLen a))
-        (lo (Clamp (if (%Lt start 0) (%Add len start) start) 0 len))
-        (hi (Clamp (if (%Lt end 0) (%Add len end) end) 0 len))]
+(macro ArrayFill :transitioning true
+  :params [(a dyn) (value dyn) (start dyn) (end dyn) (has-end bool)] :ret dyn
+  (let [(object (ObjectFromValue (ObjectCoercible a)))
+        (len (ArrayLikeLength object))
+        (lo (let [(n (%ToInteger (ToNumberValue start)))]
+              (if (%IsInt n)
+                  (let [(i (%UnboxInt n))]
+                    (Clamp (if (%Lt i 0) (%Add len i) i) 0 len))
+                  (if (%Lt (%UnboxFlt n) 0.0) 0 len))))
+        (hi (if has-end
+                (let [(n (%ToInteger (ToNumberValue end)))]
+                  (if (%IsInt n)
+                      (let [(i (%UnboxInt n))]
+                        (Clamp (if (%Lt i 0) (%Add len i) i) 0 len))
+                      (if (%Lt (%UnboxFlt n) 0.0) 0 len)))
+                len))]
     (loop [(i lo)]
-      (if (%Le hi i) a
-        (let [(stored (%ArrayStore a i value))]
+      (if (%Le hi i) object
+        (let [(stored (SetProperty object i value))]
           (recur (%Add i 1)))))))
 
 ;; The normalized insertion/deletion point shared by splice's deletion and the frontend's
@@ -441,36 +461,52 @@
 ;; load and store around every callback while spelling the specification more faithfully.
 (macro ArrayReduceInitial :transitioning true
   :params [(src dyn) (callback dyn) (initial dyn)] :ret dyn
-  (let [(len (%ArrayLen src))]
+  (let [(object (ObjectFromValue (ObjectCoercible src)))
+        (len (ArrayLikeLength object))]
     (loop [(i 0) (acc initial)]
       (if (%Le len i) acc
-        (recur (%Add i 1)
-               (call callback acc (%ArrayLoad src i) (%Box i) src))))))
+        (if (ArrayLikeHasIndex object i)
+            (recur (%Add i 1)
+                   (call callback acc (ArrayLikeGet object i) (%Box i) object))
+            (recur (%Add i 1) acc))))))
 
 (macro ArrayReduce :transitioning true :params [(src dyn) (callback dyn)] :ret dyn
-  (let [(len (%ArrayLen src))]
-    (if (%Le len 0)
-        (%Throw "TypeError: Reduce of empty array with no initial value")
-        (loop [(i 1) (acc (%ArrayLoad src 0))]
-          (if (%Le len i) acc
-            (recur (%Add i 1)
-                   (call callback acc (%ArrayLoad src i) (%Box i) src)))))))
+  (let [(object (ObjectFromValue (ObjectCoercible src)))
+        (len (ArrayLikeLength object))]
+    (loop [(i 0) (found false) (acc (%Box undefined))]
+      (if (%Le len i)
+          (if found acc (%Throw "TypeError: Reduce of empty array with no initial value"))
+          (if (ArrayLikeHasIndex object i)
+              (let [(value (ArrayLikeGet object i))]
+                (if found
+                    (recur (%Add i 1) true
+                           (call callback acc value (%Box i) object))
+                    (recur (%Add i 1) true value)))
+              (recur (%Add i 1) found acc))))))
 
 (macro ArrayReduceRightInitial :transitioning true
   :params [(src dyn) (callback dyn) (initial dyn)] :ret dyn
-  (loop [(i (%Sub (%ArrayLen src) 1)) (acc initial)]
-    (if (%Lt i 0) acc
-      (recur (%Sub i 1)
-             (call callback acc (%ArrayLoad src i) (%Box i) src)))))
+  (let [(object (ObjectFromValue (ObjectCoercible src)))]
+    (loop [(i (%Sub (ArrayLikeLength object) 1)) (acc initial)]
+      (if (%Lt i 0) acc
+        (if (ArrayLikeHasIndex object i)
+            (recur (%Sub i 1)
+                   (call callback acc (ArrayLikeGet object i) (%Box i) object))
+            (recur (%Sub i 1) acc))))))
 
 (macro ArrayReduceRight :transitioning true :params [(src dyn) (callback dyn)] :ret dyn
-  (let [(len (%ArrayLen src))]
-    (if (%Le len 0)
-        (%Throw "TypeError: Reduce of empty array with no initial value")
-        (loop [(i (%Sub len 2)) (acc (%ArrayLoad src (%Sub len 1)))]
-          (if (%Lt i 0) acc
-            (recur (%Sub i 1)
-                   (call callback acc (%ArrayLoad src i) (%Box i) src)))))))
+  (let [(object (ObjectFromValue (ObjectCoercible src)))
+        (len (ArrayLikeLength object))]
+    (loop [(i (%Sub len 1)) (found false) (acc (%Box undefined))]
+      (if (%Lt i 0)
+          (if found acc (%Throw "TypeError: Reduce of empty array with no initial value"))
+          (if (ArrayLikeHasIndex object i)
+              (let [(value (ArrayLikeGet object i))]
+                (if found
+                    (recur (%Sub i 1) true
+                           (call callback acc value (%Box i) object))
+                    (recur (%Sub i 1) true value)))
+              (recur (%Sub i 1) found acc))))))
 
 (macro ArraySort :transitioning true :params [(src dyn) (callback dyn)] :ret dyn
   (let [(len (%ArrayLen src))]

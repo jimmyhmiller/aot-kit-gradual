@@ -32,6 +32,13 @@
 (import "shape" :use *)
 (import "jsint32" :use *)
 
+(defstruct NodeProfileTimespec [(sec i64) (nsec i64)])
+(extern clock_gettime :cc c [i32 (ptr NodeProfileTimespec)] (-> i32))
+(defn node-profile-now [] (-> i64)
+  (let [t (primitive/alloc-stack NodeProfileTimespec)]
+    (clock_gettime 1 t)
+    (+ (* (.sec t) 1000000000) (.nsec t))))
+
 ;; A node id is a plain `i64` index into the arena, for the same reason a type id is: a
 ;; one-field struct would be passed by reference in Coil. `nid`/`n` for node ids, `t` for
 ;; type ids, so the two never get mixed up by accident.
@@ -872,6 +879,7 @@
 ; ============================================================================
 (defstruct Graph
   [(nodes (ArrayList i64))  ; id -> (ptr Node), held as an integer address
+   (fun-index (ArrayList i64))  ; fidx -> live Fun node, or NO-NODE
    (gvn (HashMap i64 i64))  ; structural key -> node id (see gvn-keyops)
    (wl (ArrayList i64))  ; the worklist
    (onwl (ArrayList bool))  ; id -> is it on the worklist
@@ -887,8 +895,29 @@
    (infer bool)  ; explicit whole-world interprocedural inference mode (M7)
    (pmark (ArrayList i64))  ; id -> generation stamp, for n-ty-proven?'s input-cone walk
    (pstack (ArrayList i64))  ; its DFS stack; both are reused rather than reallocated
+   (pvalueproof (ArrayList bool))  ; proof snapshot for ordinary value transformations
+   (pctrlproof (ArrayList bool))  ; proof snapshot while proving dead control
+   (psnapshot bool)
    (pgen i64)  ; the current generation
    (pbusy bool)  ; a cone walk is in progress; the buffers above are not reentrant
+   (prof-peeps i64)
+   (prof-compute-ns i64)
+   (prof-proof-ns i64)
+   (prof-proof-calls i64)
+   (prof-proof-snapshot-ns i64)
+   (prof-proof-snapshot-calls i64)
+   (prof-proof-snapshot-seeds i64)
+   (prof-proof-snapshot-edges i64)
+   (prof-proof-visits i64)
+   (prof-proof-max i64)
+   (prof-idealize-ns i64)
+   (prof-gvn-ns i64)
+   (prof-analyze-pops i64)
+   (prof-fold-scans i64)
+   (prof-fold-candidates i64)
+   (prof-iterate-live-scans i64)
+   (prof-iterate-pops i64)
+   (prof-iterate-sweeps i64)
    (nchg i64)  ; peephole changes; see iterate!'s sweep loop
    ;; TWO ENGINE COUNTERS, and they exist because the gate that used to stand in for them stopped
    ;; being an equality. Until 4c-2 the only thing that removed a `Load` was `load-idealize`, so
@@ -918,6 +947,7 @@
         (do
           (set! (.inited p) true)
           (set! (.nodes p) (al-new [i64] (malloc-allocator)))
+          (set! (.fun-index p) (al-new [i64] (malloc-allocator)))
           (set! (.gvn p) (hm-new [i64 i64] (malloc-allocator) (gvn-keyops)))
           (set! (.wl p) (al-new [i64] (malloc-allocator)))
           (set! (.onwl p) (al-new [bool] (malloc-allocator)))
@@ -933,8 +963,29 @@
           (set! (.infer p) false)
           (set! (.pmark p) (al-new [i64] (malloc-allocator)))
           (set! (.pstack p) (al-new [i64] (malloc-allocator)))
+          (set! (.pvalueproof p) (al-new [bool] (malloc-allocator)))
+          (set! (.pctrlproof p) (al-new [bool] (malloc-allocator)))
+          (set! (.psnapshot p) false)
           (set! (.pgen p) 0)
           (set! (.pbusy p) false)
+          (set! (.prof-peeps p) 0)
+          (set! (.prof-compute-ns p) 0)
+          (set! (.prof-proof-ns p) 0)
+          (set! (.prof-proof-calls p) 0)
+          (set! (.prof-proof-snapshot-ns p) 0)
+          (set! (.prof-proof-snapshot-calls p) 0)
+          (set! (.prof-proof-snapshot-seeds p) 0)
+          (set! (.prof-proof-snapshot-edges p) 0)
+          (set! (.prof-proof-visits p) 0)
+          (set! (.prof-proof-max p) 0)
+          (set! (.prof-idealize-ns p) 0)
+          (set! (.prof-gvn-ns p) 0)
+          (set! (.prof-analyze-pops p) 0)
+          (set! (.prof-fold-scans p) 0)
+          (set! (.prof-fold-candidates p) 0)
+          (set! (.prof-iterate-live-scans p) 0)
+          (set! (.prof-iterate-pops p) 0)
+          (set! (.prof-iterate-sweeps p) 0)
           (set! (.nchg p) 0)
           (set! (.nfwd p) 0)
           (set! (.nselim p) 0)
@@ -957,7 +1008,22 @@
 ;; order: the same program must optimise to the same graph under every seed.
 (defn graph-reset! [(seed i64)] (-> i64)
   (let [p (graph)]
+    ;; Node ids die at this boundary. Release each node's edge buffers and header before dropping
+    ;; the pointer table so long-lived compiler workers stay bounded by one graph's high-water mark
+    ;; instead of accumulating every graph they have compiled.
+    (let [(mut i) 0]
+      (loop (if (>= (load i) (al-len [i64] (.nodes p)))
+                (break)
+                (do
+                  (let [node (cast (ptr Node) (al-get (.nodes p) (load i)))]
+                    (al-free! [i64] (mut (.ins node)))
+                    (al-free! [i64] (mut (.outs node)))
+                    (al-free! [i64] (mut (.deps node)))
+                    (destroy [Node] (malloc-allocator) node))
+                  (set! i (+ (load i) 1))
+                  0))))
     (al-clear! [i64] (field p nodes))
+    (al-clear! [i64] (field p fun-index))
     (hm-clear! [i64 i64] (field p gvn))
     (al-clear! [i64] (field p wl))
     (al-clear! [bool] (field p onwl))
@@ -965,7 +1031,28 @@
     (al-clear! [i64] (field p ldep))
     (al-clear! [i64] (field p pmark))
     (al-clear! [i64] (field p pstack))
+    (al-clear! [bool] (field p pvalueproof))
+    (al-clear! [bool] (field p pctrlproof))
+    (set! (.psnapshot p) false)
     (set! (.pbusy p) false)
+    (set! (.prof-peeps p) 0)
+    (set! (.prof-compute-ns p) 0)
+    (set! (.prof-proof-ns p) 0)
+    (set! (.prof-proof-calls p) 0)
+    (set! (.prof-proof-snapshot-ns p) 0)
+    (set! (.prof-proof-snapshot-calls p) 0)
+    (set! (.prof-proof-snapshot-seeds p) 0)
+    (set! (.prof-proof-snapshot-edges p) 0)
+    (set! (.prof-proof-visits p) 0)
+    (set! (.prof-proof-max p) 0)
+    (set! (.prof-idealize-ns p) 0)
+    (set! (.prof-gvn-ns p) 0)
+    (set! (.prof-analyze-pops p) 0)
+    (set! (.prof-fold-scans p) 0)
+    (set! (.prof-fold-candidates p) 0)
+    (set! (.prof-iterate-live-scans p) 0)
+    (set! (.prof-iterate-pops p) 0)
+    (set! (.prof-iterate-sweeps p) 0)
     (set! (.analysed p) false)
     (set! (.provingctrl p) false)
     (set! (.nchg p) 0)
@@ -1240,6 +1327,15 @@
         ;; value was a dead `Box` with four live uses is how this was found. Refusing here names
         ;; the caller that did it instead of the node that noticed.
         (if (> (n-nouts n) 0) (do (panic-corrupt "n-kill!: node still has uses") 0) 0)
+        (if (op-is? n Fun [_])
+            (let [fidx (n-fun-index n)
+                  index (.fun-index (graph))]
+              (if (and (>= fidx 0)
+                       (and (< fidx (al-len [i64] index))
+                            (= (al-get [i64] index fidx) n)))
+                  (al-set! [i64] (field (graph) fun-index) fidx NO-NODE)
+                  0))
+            0)
         (set! (.dead (nd n)) true)
         (gvn-remove! n)
         (let [(mut i) 0]
@@ -2348,6 +2444,10 @@
 (defn n-fun-open! [(fidx i64)] (-> i64)
   (let [fun (n-new (Fun fidx))
         entry (n-new1 (FunStart) fun)]
+    (loop (if (> (al-len [i64] (.fun-index (graph))) fidx)
+              (break)
+              (do (al-push! [i64] (field (graph) fun-index) NO-NODE) 0)))
+    (al-set! [i64] (field (graph) fun-index) fidx fun)
     (n-add-def! fun entry)
     fun))
 (defn n-fun-entry [(fun i64)] (-> i64)
@@ -3986,9 +4086,18 @@
         NO-NODE)))
 
 (defn n-find-fun-index [(fidx i64)] (-> i64)
-  (let [lim (n-count)
+  (let [index (.fun-index (graph))
+        cached (if (and (>= fidx 0) (< fidx (al-len [i64] index)))
+                   (al-get [i64] index fidx)
+                   NO-NODE)
+        lim (n-count)
         (mut i) 0
-        (mut found) NO-NODE]
+        (mut found)
+          (if (and (!= cached NO-NODE)
+                   (and (not (n-dead? cached))
+                        (and (op-is? cached Fun [_]) (= (n-fun-index cached) fidx))))
+              cached
+              NO-NODE)]
     (loop (if (or (>= (load i) lim) (!= (load found) NO-NODE))
               (break)
               (do
@@ -4447,9 +4556,105 @@
            (and (.analysed (graph)) (.provingctrl (graph))))
        (= (n-ty n) (n-compute n))))
 
+;; Freeze the transitive proof answers used by one transformation sweep. At sweep entry no rewrite
+;; has happened yet, so every answer describes the same graph snapshot. A false seed is a node
+;; whose reported type is not a compute fixpoint (or is still ANY for value folding); false then
+;; propagates through def-use edges. This computes the same greatest fixed point as walking every
+;; candidate's entire input cone, including settled cycles, in O(nodes+edges) once per sweep.
+;; Nodes created by the sweep are beyond the snapshot and deliberately fall back to the exact walk.
+(defn n-proof-snapshot! [] (-> i64)
+  (let [p (graph)
+        count (n-count)
+        was (g-verifying?)
+        started (node-profile-now)
+        (mut i) 0]
+    (al-clear! [bool] (field p pvalueproof))
+    (al-clear! [bool] (field p pctrlproof))
+    (al-clear! [i64] (field p pstack))
+    (g-set-verifying! true)
+    (loop (if (>= (load i) count)
+              (break)
+              (do
+                (let [n (load i)
+                      fixed (or (n-dead? n) (= (n-ty n) (n-compute n)))
+                      value-ok (and fixed (or (n-dead? n) (not (ty-unanalysed? (n-ty n)))))]
+                  (al-push! [bool] (field p pvalueproof) value-ok)
+                  (al-push! [bool] (field p pctrlproof) fixed)
+                  (if (and (not (n-dead? n)) (not value-ok))
+                      (do
+                        (set! (.prof-proof-snapshot-seeds p) (+ (.prof-proof-snapshot-seeds p) 1))
+                        (al-push! [i64] (field p pstack) n)
+                        0)
+                      0))
+                (set! i (+ (load i) 1)))))
+    ;; Value-proof failures include every control-proof failure, so propagate them together first.
+    (loop (let [depth (al-len [i64] (.pstack p))]
+            (if (= depth 0)
+                (break)
+                (let [n (al-get (.pstack p) (- depth 1))]
+                  (al-pop! [i64] (field p pstack))
+                  (let [len (n-nouts n)
+                        (mut j) 0]
+                    (loop (if (>= (load j) len)
+                              (break)
+                              (do
+                                (let [use (n-out n (load j))]
+                                  (set! (.prof-proof-snapshot-edges p) (+ (.prof-proof-snapshot-edges p) 1))
+                                  (if (and (not (n-dead? use)) (al-get (.pvalueproof p) use))
+                                      (do
+                                        (al-set! [bool] (field p pvalueproof) use false)
+                                        (al-push! [i64] (field p pstack) use)
+                                        0)
+                                      0))
+                                (set! j (+ (load j) 1))))))))))
+    ;; Control proof accepts settled ANY after analysis, so seed and propagate only non-fixpoints.
+    (set! i 0)
+    (loop (if (>= (load i) count)
+              (break)
+              (do
+                (if (and (not (n-dead? (load i))) (not (al-get (.pctrlproof p) (load i))))
+                    (al-push! [i64] (field p pstack) (load i))
+                    0)
+                (set! i (+ (load i) 1)))))
+    (loop (let [depth (al-len [i64] (.pstack p))]
+            (if (= depth 0)
+                (break)
+                (let [n (al-get (.pstack p) (- depth 1))]
+                  (al-pop! [i64] (field p pstack))
+                  (let [len (n-nouts n)
+                        (mut j) 0]
+                    (loop (if (>= (load j) len)
+                              (break)
+                              (do
+                                (let [use (n-out n (load j))]
+                                  (set! (.prof-proof-snapshot-edges p) (+ (.prof-proof-snapshot-edges p) 1))
+                                  (if (and (not (n-dead? use)) (al-get (.pctrlproof p) use))
+                                      (do
+                                        (al-set! [bool] (field p pctrlproof) use false)
+                                        (al-push! [i64] (field p pstack) use)
+                                        0)
+                                      0))
+                                (set! j (+ (load j) 1))))))))))
+    (g-set-verifying! was)
+    (set! (.psnapshot p) true)
+    (set! (.prof-proof-snapshot-calls p) (+ (.prof-proof-snapshot-calls p) 1))
+    (set! (.prof-proof-snapshot-ns p)
+          (+ (.prof-proof-snapshot-ns p) (- (node-profile-now) started)))
+    0))
+
+(defn n-proof-snapshot-clear! [] (-> i64)
+  (set! (.psnapshot (graph)) false)
+  0)
+
 (defn n-ty-proven? [(n i64)] (-> bool)
   (let [p (graph)
-        was (g-verifying?)]
+        was (g-verifying?)
+        started (node-profile-now)
+        (mut visits) 0]
+    (set! (.prof-proof-calls p) (+ (.prof-proof-calls p) 1))
+    (if (and (.psnapshot p) (< n (al-len [bool] (.pvalueproof p))))
+        (if (.provingctrl p) (al-get (.pctrlproof p) n) (al-get (.pvalueproof p) n))
+        (do
     ; The mark array and the stack are ONE buffer shared by every call, so a walk inside a walk would
     ; silently truncate the outer one and answer "proven" for a cone it never finished looking at.
     ; Nothing reentrant calls this today (`n-compute` below never asks for a proof), and a named abort
@@ -4475,6 +4680,7 @@
                     (if (= (al-get (.pmark p) m) gen)
                         0
                         (do
+                          (set! visits (+ (load visits) 1))
                           (al-set! [i64] (field p pmark) m gen)
                           (if (not (n-ty-settled? m))
                               (set! ok false)
@@ -4493,7 +4699,29 @@
                           0))))))
       (g-set-verifying! was)
       (set! (.pbusy p) false)
-      (load ok))))
+      (set! (.prof-proof-visits p) (+ (.prof-proof-visits p) (load visits)))
+      (if (> (load visits) (.prof-proof-max p)) (set! (.prof-proof-max p) (load visits)) 0)
+      (set! (.prof-proof-ns p) (+ (.prof-proof-ns p) (- (node-profile-now) started)))
+      (load ok))))))
+
+(defn g-profile-peeps [] (-> i64) (.prof-peeps (graph)))
+(defn g-profile-compute-ns [] (-> i64) (.prof-compute-ns (graph)))
+(defn g-profile-proof-ns [] (-> i64) (.prof-proof-ns (graph)))
+(defn g-profile-proof-calls [] (-> i64) (.prof-proof-calls (graph)))
+(defn g-profile-proof-snapshot-ns [] (-> i64) (.prof-proof-snapshot-ns (graph)))
+(defn g-profile-proof-snapshot-calls [] (-> i64) (.prof-proof-snapshot-calls (graph)))
+(defn g-profile-proof-snapshot-seeds [] (-> i64) (.prof-proof-snapshot-seeds (graph)))
+(defn g-profile-proof-snapshot-edges [] (-> i64) (.prof-proof-snapshot-edges (graph)))
+(defn g-profile-proof-visits [] (-> i64) (.prof-proof-visits (graph)))
+(defn g-profile-proof-max [] (-> i64) (.prof-proof-max (graph)))
+(defn g-profile-idealize-ns [] (-> i64) (.prof-idealize-ns (graph)))
+(defn g-profile-gvn-ns [] (-> i64) (.prof-gvn-ns (graph)))
+(defn g-profile-analyze-pops [] (-> i64) (.prof-analyze-pops (graph)))
+(defn g-profile-fold-scans [] (-> i64) (.prof-fold-scans (graph)))
+(defn g-profile-fold-candidates [] (-> i64) (.prof-fold-candidates (graph)))
+(defn g-profile-iterate-live-scans [] (-> i64) (.prof-iterate-live-scans (graph)))
+(defn g-profile-iterate-pops [] (-> i64) (.prof-iterate-pops (graph)))
+(defn g-profile-iterate-sweeps [] (-> i64) (.prof-iterate-sweeps (graph)))
 
 ;; PROVEN dead, not merely reported dead. `= (t-xctrl)` alone is not proof: XCtrl is the HIGH
 ;; element of the control axis, so meet(~ctrl, anything reachable) is `ctrl` and a node reporting
@@ -4522,11 +4750,14 @@
   (if (n-dead? n)
       n
       (do
+        (set! (.prof-peeps (graph)) (+ (.prof-peeps (graph)) 1))
         ; Canonical operand order for commutative ops, FIRST. It is what lets value numbering
         ; see `a+b` and `b+a` as one node, and it means every identity rule below only has to
         ; handle the constant-on-the-right form.
         (if (and (op-commutes? (n-op n)) (should-swap? n)) (n-swap-args! n) 0)
-        (let [t (n-compute n)]
+        (let [compute-started (node-profile-now)
+              t (n-compute n)]
+          (set! (.prof-compute-ns (graph)) (+ (.prof-compute-ns (graph)) (- (node-profile-now) compute-started)))
           (if (!= t (n-ty n))
               (do (n-set-ty! n t) (wl-push-outs! n) (n-move-deps! n) (g-changed!) 0)
               0)
@@ -4562,10 +4793,20 @@
                   (n-unkeep! c2)
                   (g-changed!)
                   c2))
-              (let [m (n-idealize n)]
+              (let [idealize-started (node-profile-now)
+                    m (n-idealize n)]
+                (set! (.prof-idealize-ns (graph)) (+ (.prof-idealize-ns (graph)) (- (node-profile-now) idealize-started)))
                 (if (and (!= m NO-NODE) (!= m n))
                     (do (n-keep! m) (n-subsume! n m) (n-unkeep! m) (g-changed!) (n-peephole m))
-                    (let [e (gvn! n)]
+                    (let [gvn-started (node-profile-now)
+                          ;; A nonzero structural hash can only have been computed by this node's
+                          ;; prior GVN lookup. Every supported input rewrite and operand swap
+                          ;; clears it, so an unchanged node is already canonical and need not
+                          ;; repeat the same hash-table probe on every whole-graph fold sweep.
+                          e (if (and (op-gvn? (n-op n)) (= (.hash (nd n)) 0))
+                                (gvn! n)
+                                n)]
+                      (set! (.prof-gvn-ns (graph)) (+ (.prof-gvn-ns (graph)) (- (node-profile-now) gvn-started)))
                       (if (!= e n)
                           (do (n-keep! e) (n-subsume! n e) (n-unkeep! e) (g-changed!) e)
                           n)))))))))
@@ -4619,6 +4860,7 @@
                 (break)
                 (do
                   (if (n-dead? n) 0 (do (n-peephole n) 0))
+                  (set! (.prof-iterate-pops (graph)) (+ (.prof-iterate-pops (graph)) 1))
                   (set! steps (+ (load steps) 1))
                   ; a runaway worklist is a bug in a peephole, not something to grind on
                   (if (> (load steps) 10000000)
@@ -4643,9 +4885,16 @@
   (let [(mut steps) 0
         (mut sweeps) 0]
     (loop (let [before (g-changes)]
+            ;; The frontend's fold pass may hand off its final no-change snapshot. Standalone
+            ;; iterate callers arrive with psnapshot clear and retain the original behavior.
+            (if (not (.psnapshot (graph))) (n-proof-snapshot!) 0)
+            (set! (.prof-iterate-live-scans (graph))
+                  (+ (.prof-iterate-live-scans (graph)) (n-count)))
             (wl-push-live!)
             (set! steps (+ (load steps) (wl-drain!)))
+            (n-proof-snapshot-clear!)
             (set! sweeps (+ (load sweeps) 1))
+            (set! (.prof-iterate-sweeps (graph)) (+ (.prof-iterate-sweeps (graph)) 1))
             ; Each sweep needs the previous one to have changed something, and change is monotone
             ; (types only fall, nodes only die, GVN only merges), so this terminates. A cap anyway:
             ; two peepholes that undo each other would otherwise sweep for ever, and the per-drain
@@ -4723,30 +4972,57 @@
 ;; `v-check-phi` rejects as VERR-PHI-REGION. A zero-trip `while` after a call produced exactly
 ;; that. Progress is monotone (types only fall, nodes only die), so this terminates; the round cap
 ;; is a backstop against a non-monotone peephole rather than an expected exit.
-(defn g-fold-proven! [] (-> i64)
+(defn g-fold-proven-core! [(retain-final-snapshot bool)] (-> i64)
   (let [(mut rounds) 0
         (mut changed) true]
     (loop (if (not (load changed))
               (break)
               (do
                 (set! changed false)
+                ;; In the frontend handoff, retain one analysis snapshot through all monotone
+                ;; folding rounds and the immediately following iterate drain. Rewrites only narrow
+                ;; types or retire nodes, so a proof that was true at sweep entry remains sound;
+                ;; newly created nodes already fall back to the exact cone walk. Standalone folding
+                ;; rebuilds per round so it can discover newly true proofs without another analysis.
+                (if (not (.psnapshot (graph))) (n-proof-snapshot!) 0)
                 (let [(mut i) 0]
                   (loop (if (>= (load i) (n-count))
                             (break)
-                            (do (if (n-dead? (load i))
+                            (do (set! (.prof-fold-scans (graph)) (+ (.prof-fold-scans (graph)) 1))
+                                (if (or (n-dead? (load i))
+                                        ;; The first ordered round seeds every operation. Rewrites
+                                        ;; queue every dependent that can change; retain that queue
+                                        ;; membership through later ascending rounds so an affected
+                                        ;; node may fold repeatedly without rescanning unrelated
+                                        ;; graph nodes. `iterate!` drains it after this handoff.
+                                        (and retain-final-snapshot
+                                             (and (> (load rounds) 0)
+                                                  (not (wl-on? (load i))))))
                                     0
-                                    (let [r (n-peephole (load i))]
-                                      (if (or (!= r (load i)) (n-dead? (load i)))
-                                          (set! changed true)
-                                          0)))
+                                    (let [candidate (load i)]
+                                      (set! (.prof-fold-candidates (graph)) (+ (.prof-fold-candidates (graph)) 1))
+                                      (let [r (n-peephole candidate)]
+                                        (if (or (!= r candidate) (n-dead? candidate))
+                                            (set! changed true)
+                                            0))))
                                 (set! i (+ (load i) 1))
                                 0))))
+                ;; Standalone folding rebuilds so later rounds can discover newly true proofs. The
+                ;; frontend deliberately retains its sound entry proofs through monotone rewrites
+                ;; and hands them to the immediately following iterate drain.
+                (if (not retain-final-snapshot) (n-proof-snapshot-clear!) 0)
                 (set! rounds (+ (load rounds) 1))
                 (if (> (load rounds) 1000)
                     (do (panic-corrupt "g-fold-proven!: folding did not converge") 0)
                     0)
                 0)))
     (load rounds)))
+
+(defn g-fold-proven! [] (-> i64)
+  (g-fold-proven-core! false))
+
+(defn g-fold-proven-for-iterate! [] (-> i64)
+  (g-fold-proven-core! true))
 
 (defn g-analyze! [] (-> i64)
   (set! (.achecks (graph)) 0)
@@ -4782,6 +5058,7 @@
                                 0)
                             0)))
                   (set! steps (+ (load steps) 1))
+                  (set! (.prof-analyze-pops (graph)) (+ (.prof-analyze-pops (graph)) 1))
                   (if (> (load steps) 10000000)
                       (do (panic-corrupt "g-analyze!: types did not reach a fixpoint") 0)
                       0)

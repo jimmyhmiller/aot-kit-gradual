@@ -299,7 +299,10 @@
   (x64-alu! 33 dst 0))
 
 (defn x64-label-off [(label i64)] (-> i64)
-  (let [(mut i) 0 (mut answer) -1]
+  (let [cached (if (and (>= label 0) (< label (al-len [i64] (.x64-label-offs (backend)))))
+                   (al-get (.x64-label-offs (backend)) label)
+                   -1)
+        (mut i) 0 (mut answer) cached]
     (loop (if (or (>= (load i) (be-inst-count)) (>= (load answer) 0)) (break)
               (do (let [m (be-inst (load i))]
                     (if (and (= (.op m) MI-LABEL) (= (.imm m) label))
@@ -308,7 +311,10 @@
     (load answer)))
 
 (defn x64-entry-owner [(bid i64)] (-> i64)
-  (let [(mut owner) 0 (mut answer) -1]
+  (let [cached (if (and (>= bid 0) (< bid (al-len [i64] (.x64-entry-owners (backend)))))
+                   (al-get (.x64-entry-owners (backend)) bid)
+                   -1)
+        (mut owner) 0 (mut answer) cached]
     (loop (if (or (>= (load owner) (mu-function-count)) (>= (load answer) 0)) (break)
               (do (if (= (mu-function-block (load owner) 0) bid)
                       (set! answer (load owner)) 0)
@@ -447,6 +453,23 @@
       (let [n (be-inst-count)
             (mut at) 0]
         (al-clear! [u8] (field (backend) code))
+        (al-clear! [i64] (field (backend) x64-label-offs))
+        (al-clear! [i64] (field (backend) x64-entry-owners))
+        (loop (if (>= (load at) (mu-block-count))
+                  (break)
+                  (do
+                    (al-push! [i64] (field (backend) x64-label-offs) -1)
+                    (al-push! [i64] (field (backend) x64-entry-owners) -1)
+                    (set! at (+ (load at) 1)))))
+        (set! at 0)
+        (loop (if (>= (load at) (mu-function-count))
+                  (break)
+                  (do
+                    (al-set! [i64] (field (backend) x64-entry-owners)
+                             (mu-function-block (load at) 0)
+                             (load at))
+                    (set! at (+ (load at) 1)))))
+        (set! at 0)
         (loop (if (or (>= (load at) n) (!= (be-result) BER-OK))
                   (break)
                   (do
@@ -462,6 +485,11 @@
                       (set! (x64-current-owner) (.owner m))
                       (set! (x64-current-inst) (load at))
                       (set! (.first m) (al-len [u8] (.code (backend))))
+                      (if (and (= op MI-LABEL)
+                               (and (>= (.imm m) 0)
+                                    (< (.imm m) (al-len [i64] (.x64-label-offs (backend))))))
+                          (al-set! [i64] (field (backend) x64-label-offs) (.imm m) (.first m))
+                          0)
                       (case op MI-LABEL
                             (let [owner (x64-entry-owner (.imm m))]
                               (if (< owner 0) 0

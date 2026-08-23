@@ -29,6 +29,7 @@
 (import "coil.control" :use *)
 (import "coil.io" :use *)
 (import "coil.fmt" :use *)
+(import "coil.hashmap" :use *)
 (import "coil.slice" :use *)
 (import "ty" :use *)
 (import "shape" :use *)  ; a New's shape and a memory op's alias are checked against it
@@ -148,10 +149,36 @@
 (defstruct Verify
   [(count i64)
    (code i64)
-   (node i64)])
+   (node i64)
+   (parm-counts (ArrayList i64))
+   (edge-ins (HashMap i64 i64))
+   (edge-outs (HashMap i64 i64))
+   (edge-seen (HashMap i64 i64))
+   (inited bool)])
+
+(defn v-edge-keyhash [(slot (ptr i8)) (n i64)] (-> i64)
+  (ty-hash-finalize (load (cast (ptr i64) slot))))
+(defn v-edge-keyeq [(a (ptr i8)) (b (ptr i8)) (n i64)] (-> bool)
+  (= (load (cast (ptr i64) a)) (load (cast (ptr i64) b))))
+(defn v-edge-keyops [] (-> (ptr KeyOps))
+  (let [o (primitive/alloc-static KeyOps)]
+    (set! (.hash o) (fnptr-of v-edge-keyhash))
+    (set! (.eq o) (fnptr-of v-edge-keyeq))
+    (set! (.size o) (sizeof i64))
+    o))
 
 (defn verify-state [] (-> (ptr Verify))
-  (primitive/alloc-static Verify))
+  (let [p (primitive/alloc-static Verify)]
+    (if (not (.inited p))
+        (do
+          (set! (.parm-counts p) (al-new [i64] (malloc-allocator)))
+          (set! (.edge-ins p) (hm-new [i64 i64] (malloc-allocator) (v-edge-keyops)))
+          (set! (.edge-outs p) (hm-new [i64 i64] (malloc-allocator) (v-edge-keyops)))
+          (set! (.edge-seen p) (hm-new [i64 i64] (malloc-allocator) (v-edge-keyops)))
+          (set! (.inited p) true)
+          0)
+        0)
+    p))
 
 (defn g-verify-count [] (-> i64)
   (.count (verify-state)))
@@ -195,70 +222,78 @@
 ;; directions are MULTISETS and comparing "does it appear at all" would miss a `del-def!` that
 ;; removed one copy of an edge and left the other. That is precisely the bug that makes a phi
 ;; read the wrong arm.
-(defn v-count-ins [(u i64) (d i64)] (-> i64)
-  (let [len (n-nins u)
-        (mut i) 0
-        (mut c) 0]
-    (loop (if (>= (load i) len)
-              (break)
-              (do
-                (if (= (n-in u (load i)) d) (set! c (+ (load c) 1)) 0)
-                (set! i (+ (load i) 1))
-                0)))
-    (load c)))
+(defn v-edge-key [(d i64) (u i64)] (-> i64)
+  (+ (* d (n-count)) u))
 
-(defn v-count-outs [(d i64) (u i64)] (-> i64)
-  (let [len (n-nouts d)
-        (mut i) 0
-        (mut c) 0]
-    (loop (if (>= (load i) len)
-              (break)
-              (do
-                (if (= (n-out d (load i)) u) (set! c (+ (load c) 1)) 0)
-                (set! i (+ (load i) 1))
-                0)))
-    (load c)))
+(defn v-edge-count [(map (HashMap i64 i64)) (key i64)] (-> i64)
+  (match (hm-get map key) (Some [count] count) (None [] 0)))
 
-;; The index of the first occurrence of `u` in `d`'s outputs, or NO-NODE. Used only to visit
-;; each distinct pair once, so a mismatch is one violation and not one per duplicated edge.
-(defn v-first-out [(d i64) (u i64)] (-> i64)
-  (let [len (n-nouts d)
-        (mut i) 0
-        (mut at) NO-NODE]
-    (loop (if (or (>= (load i) len) (!= (load at) NO-NODE))
+(defn v-edge-inc! [(map (ptr (HashMap i64 i64))) (key i64)] (-> i64)
+  (hm-put! [i64 i64] map key (+ (v-edge-count (load map) key) 1))
+  0)
+
+;; Independently count each use-def and def-use pair once. Multiplicity remains exact, while the
+;; verifier no longer rescans a high-arity node or high-fanout definition once per edge.
+(defn v-build-edge-counts! [] (-> i64)
+  (let [p (verify-state)
+        lim (n-count)
+        (mut n) 0]
+    (hm-clear! [i64 i64] (field p edge-ins))
+    (hm-clear! [i64 i64] (field p edge-outs))
+    (hm-clear! [i64 i64] (field p edge-seen))
+    (loop (if (>= (load n) lim)
               (break)
               (do
-                (if (= (n-out d (load i)) u) (set! at (load i)) 0)
-                (set! i (+ (load i) 1))
-                0)))
-    (load at)))
+                (let [(mut i) 0]
+                  (loop (if (>= (load i) (n-nins (load n)))
+                            (break)
+                            (do
+                              (let [d (n-in (load n) (load i))]
+                                (if (!= d NO-NODE)
+                                    (v-edge-inc! (field p edge-ins)
+                                                 (v-edge-key d (load n))) 0))
+                              (set! i (+ (load i) 1))))))
+                (let [(mut i) 0]
+                  (loop (if (>= (load i) (n-nouts (load n)))
+                            (break)
+                            (do
+                              (v-edge-inc! (field p edge-outs)
+                                           (v-edge-key (load n) (n-out (load n) (load i))))
+                              (set! i (+ (load i) 1))))))
+                (set! n (+ (load n) 1)))))
+    0))
+
+(defn v-check-edge-pair [(d i64) (u i64) (blame i64)] (-> i64)
+  (let [p (verify-state) key (v-edge-key d u)]
+    (match (hm-get (.edge-seen p) key)
+      (Some [seen] 0)
+      (None []
+        (do
+          (hm-put! [i64 i64] (field p edge-seen) key 1)
+          (v-need (= (v-edge-count (.edge-ins p) key)
+                     (v-edge-count (.edge-outs p) key))
+                  VERR-EDGE-ASYM blame)
+          0)))))
 
 (defn v-check-edges [(u i64)] (-> i64)
-  ; use-def side: for each distinct def this node reads, the two multiplicities must agree
+  ; use-def side
   (let [len (n-nins u)
         (mut i) 0]
     (loop (if (>= (load i) len)
               (break)
               (do
                 (let [d (n-in u (load i))]
-                  (if (or (= d NO-NODE) (!= (n-find-in u d) (load i)))
-                      0
-                      (v-need (= (v-count-ins u d) (v-count-outs d u)) VERR-EDGE-ASYM u)))
+                  (if (= d NO-NODE) 0 (v-check-edge-pair d u u)))
                 (set! i (+ (load i) 1))
                 0))))
-  ; def-use side, for the case the loop above cannot see: an out edge u->x where x does not
-  ; read u at all. Walking inputs finds nothing to compare, so it has to be walked from here.
-  ; A dead x lands here too, since `n-kill!` clears its inputs: a dead node must not be
-  ; anybody's listed user.
+  ; def-use side, including an out edge u->x where x does not read u at all
   (let [len (n-nouts u)
         (mut k) 0]
     (loop (if (>= (load k) len)
               (break)
               (do
                 (let [x (n-out u (load k))]
-                  (if (!= (v-first-out u x) (load k))
-                      0
-                      (v-need (> (v-count-ins x u) 0) VERR-EDGE-ASYM u)))
+                  (v-check-edge-pair u x u))
                 (set! k (+ (load k) 1))
                 0))))
   0)
@@ -850,20 +885,37 @@
     (_ 0)))
 
 (defn v-fun-parm-count [(fun i64)] (-> i64)
-  (let [lim (n-count)
-        (mut i) 0
-        (mut count) 0]
+  (let [counts (.parm-counts (verify-state))]
+    (if (or (< fun 0) (>= fun (al-len [i64] counts)))
+        0
+        (al-get [i64] counts fun))))
+
+;; Derive the call-arity verifier's Fun -> live Parm counts independently in one graph walk.
+;; Recounting every node for every direct call made closure-contract verification O(calls*nodes).
+(defn v-build-parm-counts! [] (-> i64)
+  (let [p (verify-state)
+        counts (field p parm-counts)
+        lim (n-count)
+        (mut i) 0]
+    (al-clear! [i64] counts)
+    (loop (if (>= (load i) lim)
+              (break)
+              (do
+                (al-push! [i64] counts 0)
+                (set! i (+ (load i) 1)))))
+    (set! i 0)
     (loop (if (>= (load i) lim)
               (break)
               (do
                 (if (and (not (n-dead? (load i)))
-                         (and (match (n-op (load i)) (Parm [index] true) (_ false))
-                              (= (n-in (load i) 0) fun)))
-                    (set! count (+ (load count) 1))
+                         (match (n-op (load i)) (Parm [index] true) (_ false)))
+                    (let [fun (n-in (load i) 0)]
+                      (if (and (>= fun 0) (< fun lim))
+                          (al-set! [i64] counts fun (+ (al-get [i64] (load counts) fun) 1))
+                          0))
                     0)
-                (set! i (+ (load i) 1))
-                0)))
-    (load count)))
+                (set! i (+ (load i) 1)))))
+    0))
 
 (defn v-direct-callee-fun [(callee i64)] (-> i64)
   (match (n-op callee)
@@ -1174,11 +1226,13 @@
       0
       (do
         (v-pass-dead)
+        (v-build-edge-counts!)
         (v-pass-structure)
         (v-pass-leaks)
         (if (> (g-verify-count) 0)
             0
             (do
+              (v-build-parm-counts!)
               (v-pass-closure-contracts)
               (if (> (g-verify-count) 0) 0 (v-pass-types))
               ; after types so a precise code (VERR-PTR-SLOT etc.) wins the report when both

@@ -68,6 +68,17 @@
    (frame  i64)               ; lookup floor: a macro body cannot see its caller's bindings
    (decl   i64)               ; which declaration is being lowered, for diagnostics
    (fun    i64)               ; its OPTAG-FUN
+   (frontend-targets i64)
+   (frontend-targets-valid bool)
+   (profile-target-calls i64)
+   (profile-target-scans i64)
+   (profile-jsl-scans i64)
+   (profile-max-calls i64)
+   (profile-max-scans i64)
+   (profile-param-scans i64)
+   (profile-lower-ns i64)
+   (profile-lower-calls i64)
+   (profile-lower-nodes i64)
    (inited bool)])
 
 (defn jl [] (-> (ptr JslLower))
@@ -88,6 +99,17 @@
           (set! (.frame p) 0)
           (set! (.decl p) -1)
           (set! (.fun p) NO-NODE)
+          (set! (.frontend-targets p) 0)
+          (set! (.frontend-targets-valid p) false)
+          (set! (.profile-target-calls p) 0)
+          (set! (.profile-target-scans p) 0)
+          (set! (.profile-jsl-scans p) 0)
+          (set! (.profile-max-calls p) 0)
+          (set! (.profile-max-scans p) 0)
+          (set! (.profile-param-scans p) 0)
+          (set! (.profile-lower-ns p) 0)
+          (set! (.profile-lower-calls p) 0)
+          (set! (.profile-lower-nodes p) 0)
           0))
     p))
 
@@ -135,7 +157,28 @@
     (set! (.frame p) 0)
     (set! (.decl p) -1)
     (set! (.fun p) NO-NODE)
+    (set! (.frontend-targets p) 0)
+    (set! (.frontend-targets-valid p) false)
+    (set! (.profile-target-calls p) 0)
+    (set! (.profile-target-scans p) 0)
+    (set! (.profile-jsl-scans p) 0)
+    (set! (.profile-max-calls p) 0)
+    (set! (.profile-max-scans p) 0)
+    (set! (.profile-param-scans p) 0)
+    (set! (.profile-lower-ns p) 0)
+    (set! (.profile-lower-calls p) 0)
+    (set! (.profile-lower-nodes p) 0)
     0))
+
+(defn jl-profile-target-calls [] (-> i64) (.profile-target-calls (jl)))
+(defn jl-profile-target-scans [] (-> i64) (.profile-target-scans (jl)))
+(defn jl-profile-jsl-scans [] (-> i64) (.profile-jsl-scans (jl)))
+(defn jl-profile-max-calls [] (-> i64) (.profile-max-calls (jl)))
+(defn jl-profile-max-scans [] (-> i64) (.profile-max-scans (jl)))
+(defn jl-profile-param-scans [] (-> i64) (.profile-param-scans (jl)))
+(defn jl-profile-lower-ns [] (-> i64) (.profile-lower-ns (jl)))
+(defn jl-profile-lower-calls [] (-> i64) (.profile-lower-calls (jl)))
+(defn jl-profile-lower-nodes [] (-> i64) (.profile-lower-nodes (jl)))
 
 (defn jl-ctrl [] (-> i64) (.ctrl (jl)))
 (defn jl-set-ctrl! [(n i64)] (-> i64) (set! (.ctrl (jl)) n) 0)
@@ -550,7 +593,8 @@
 (defn jl-jsl-function? [(node i64)] (-> bool)
   (let [(mut i) 0 (mut found) false]
     (loop (if (or (>= (load i) (jsl-decl-count)) (load found)) (break)
-            (do (if (= (jsl-decl-fun (load i)) node) (set! found true) 0)
+            (do (set! (.profile-jsl-scans (jl)) (+ (.profile-jsl-scans (jl)) 1))
+                (if (= (jsl-decl-fun (load i)) node) (set! found true) 0)
                 (set! i (+ (load i) 1)))))
     (load found)))
 
@@ -559,45 +603,65 @@
 ;; explicitly restores the set of frontend-visible targets. Internal JSL builtins are excluded:
 ;; they are implementation functions, never JavaScript values stored in user objects.
 (defn jl-frontend-function-targets [] (-> i64)
-  (let [(mut node) 0 (mut targets) 0]
-    (loop (if (>= (load node) (n-count)) (break)
-            (do
-              (if (and (op-is? (load node) Fun [_])
-                       (not (jl-jsl-function? (load node))))
-                  (let [fidx (n-fun-index (load node))]
-                    (if (and (>= fidx 0) (< fidx 63))
-                        (set! targets (| (load targets) (<< 1 fidx)))
-                        0))
-                  0)
-              (set! node (+ (load node) 1)))))
-    (load targets)))
+  (let [p (jl)
+        (mut node) 0
+        (mut targets) 0]
+    (set! (.profile-target-calls (jl)) (+ (.profile-target-calls (jl)) 1))
+    (if (.frontend-targets-valid p)
+        (.frontend-targets p)
+        (do
+          ;; Every frontend Fun root is opened before any body (and therefore before the first
+          ;; dynamic JSL callback) is lowered. Internal JSL Funs may appear later, but are excluded
+          ;; from this closed-world set, so the answer is graph-stable after its first computation.
+          (loop (if (>= (load node) (n-count)) (break)
+                  (do
+                    (set! (.profile-target-scans p) (+ (.profile-target-scans p) 1))
+                    (if (and (op-is? (load node) Fun [_])
+                             (not (jl-jsl-function? (load node))))
+                        (let [fidx (n-fun-index (load node))]
+                          (if (and (>= fidx 0) (< fidx 63))
+                              (set! targets (| (load targets) (<< 1 fidx)))
+                              0))
+                        0)
+                    (set! node (+ (load node) 1)))))
+          (set! (.frontend-targets p) (load targets))
+          (set! (.frontend-targets-valid p) true)
+          (load targets)))))
 
 (defn jl-function-param-count [(fun i64)] (-> i64)
-  (let [(mut node) 0 (mut count) 0]
-    (loop (if (>= (load node) (n-count)) (break)
+  ;; Parameters are direct users of their Fun. Walking the entire graph for every candidate target
+  ;; made dynamic callback lowering cubic: max-arity scans every Fun for every call, and each Fun
+  ;; used to rescan every node to rediscover these edges. The def-use list is the same source of
+  ;; truth and bounds this by the Fun's actual users.
+  (let [(mut index) 0 (mut count) 0]
+    (loop (if (>= (load index) (n-nouts fun)) (break)
             (do
-              (if (and (not (n-dead? (load node)))
-                       (and (op-is? (load node) Parm [_])
-                            (= (n-in (load node) 0) fun)))
-                  (let [next (+ (n-parm-index (load node)) 1)]
+              (set! (.profile-param-scans (jl)) (+ (.profile-param-scans (jl)) 1))
+              (let [node (n-out fun (load index))]
+                (if (and (not (n-dead? node))
+                         (and (op-is? node Parm [_]) (= (n-in node 0) fun)))
+                  (let [next (+ (n-parm-index node) 1)]
                     (if (> next (load count)) (set! count next) 0))
-                  0)
-              (set! node (+ (load node) 1)))))
+                  0))
+              (set! index (+ (load index) 1)))))
     (load count)))
 
 (defn jl-frontend-max-params [(targets i64)] (-> i64)
-  (let [(mut node) 0 (mut count) 0]
-    (loop (if (>= (load node) (n-count)) (break)
+  (let [(mut fidx) 0 (mut count) 0]
+    (set! (.profile-max-calls (jl)) (+ (.profile-max-calls (jl)) 1))
+    ;; The finite target mask already excludes internal JSL functions. Probe its at most 63 exact
+    ;; Fun identities instead of rescanning every graph node once per dynamic call.
+    (loop (if (>= (load fidx) 63) (break)
             (do
-              (if (and (op-is? (load node) Fun [_])
-                       (and (not (jl-jsl-function? (load node)))
-                            (and (>= (n-fun-index (load node)) 0)
-                                 (and (< (n-fun-index (load node)) 63)
-                                      (!= (& targets (<< 1 (n-fun-index (load node)))) 0)))))
-                  (let [arity (jl-function-param-count (load node))]
-                    (if (> arity (load count)) (set! count arity) 0))
+              (set! (.profile-max-scans (jl)) (+ (.profile-max-scans (jl)) 1))
+              (if (!= (& targets (<< 1 (load fidx))) 0)
+                  (let [fun (n-find-fun-index (load fidx))]
+                    (if (!= fun NO-NODE)
+                        (let [arity (jl-function-param-count fun)]
+                          (if (> arity (load count)) (set! count arity) 0))
+                        0))
                   0)
-              (set! node (+ (load node) 1)))))
+              (set! fidx (+ (load fidx) 1)))))
     (load count)))
 
 (defn jl-js-call-receiver-core [(x (ptr rd/Sexp)) (dynamic bool)] (-> i64)
@@ -1137,7 +1201,10 @@
                 (store! i (+ (load i) 1))
                 0)))
     (if (jl-diverged?) (return-from :call NO-NODE) 0)
-    (if uses-mem (store! (index p nargs) (jl-mem)) 0)
+    (if uses-mem
+        (store! (index p nargs)
+                (if (jsl-decl-calls-back? callee) (jl-call-mem) (jl-mem)))
+        0)
     (let [fun (jsl-decl-fun callee)
           cs (n-call! (jl-ctrl) fun (slice-new [i64] p (+ nargs (if uses-mem 1 0))))
           end (call-end cs)]
@@ -1221,6 +1288,7 @@
 (defn jl-lower-decl! [(d i64)] (-> i64)
   (let [fun (jsl-decl-fun d)
         before (n-count)
+        started (node-profile-now)
         p (jl)]
     (jl-unpin-binds!)
     (al-clear! [JslBind] (field p binds))
@@ -1242,7 +1310,12 @@
       ; across an `if` whose writing arm diverges. The checker already knows which definitions touch
       ; the heap, so this uses that rather than discovering it mid-lowering.
       (set! (.mem p) NO-NODE)
-      (if (jsl-decl-uses-memory? d) (jl-mem) 0))
+      (set! (.outer p) NO-NODE)
+      (if (jsl-decl-uses-memory? d) (jl-mem) 0)
+      ;; Callback-bearing builtins receive the caller's merged state in their ordinary trailing
+      ;; memory argument. Reuse that dependency for calls into user code instead of capturing the
+      ;; first source caller present while this shared DSL function happened to be lowered.
+      (if (jsl-decl-calls-back? d) (jl-set-outer-mem! (jl-mem)) 0))
     (let [v (jl-expr (jsl-decl-body d))
           ; RAW, not peepholed, and not added to Stop: a function body's Return belongs to its Fun
           ; (`n-fun-close!`), and only a top-level Return is a def of Stop.
@@ -1255,11 +1328,24 @@
                   (n-new2 (Return) (jl-ctrl) v)
                   (n-new3 (Return) (jl-ctrl) v (jl-mem-raw)))]
       (n-fun-close! fun ret)
+      (jl-set-outer-mem! NO-NODE)
       (if (jsl-decl-cold? d) (n-mark-cold! (n-fun-entry fun)) 0)
       ; A failure recorded DURING lowering (a loop that cannot iterate or cannot exit) has to be
       ; returned, not just stored: `jsl-lower!` reports its caller's return value, and a recorded
       ; error nobody propagates is a lowering that reports success over a graph it knows is wrong.
-      (if (not (jsl-ok?)) (jsl-err) (jl-transition-check d before (n-count))))))
+      (let [result (if (not (jsl-ok?))
+                       (jsl-err)
+                       (jl-transition-check d before (n-count)))]
+        ;; A declaration's lexical bindings end with its body. Eagerly release their construction
+        ;; pins rather than relying on a later declaration to do so: demand-lowered shared builtins
+        ;; may be the last declaration opened in a graph, in which case the stale pins make an
+        ;; otherwise unreachable node survive `g-write`'s two-root reachability check.
+        (jl-unpin-binds!)
+        (al-clear! [JslBind] (field p binds))
+        (set! (.profile-lower-calls p) (+ (.profile-lower-calls p) 1))
+        (set! (.profile-lower-nodes p) (+ (.profile-lower-nodes p) (- (n-count) before)))
+        (set! (.profile-lower-ns p) (+ (.profile-lower-ns p) (- (node-profile-now) started)))
+        result))))
 
 ;; Lower every checked declaration into the CURRENT graph. The caller owns `graph-reset!` and
 ;; `g-analyze!` around this, exactly as the frontend's caller does, because a runtime library is
@@ -1426,28 +1512,46 @@
         (jl-set-ctrl! saved-ctrl)
         v))))
 
-(defn jsl-call! [(ctrl i64) (name (slice u8)) (args (slice i64))] (-> CallSite)
+(defn jsl-call-with-memory! [(ctrl i64) (name (slice u8)) (args (slice i64))
+                             (memory i64)] (-> CallSite)
   (let [d (jsl-find name)]
     (if (< d 0)
-        (do (panic-corrupt "jsl-call!: no such builtin") 0)
+        (do (panic-corrupt "jsl-call-with-memory!: no such builtin") 0)
         0)
     (if (jsl-macro? d)
-        (do (panic-corrupt "jsl-call!: a macro is inlined at its call site and has no callable entry") 0)
+        (do (panic-corrupt "jsl-call-with-memory!: a macro has no callable entry") 0)
         0)
-    ;; This public boundary accepts source arguments only. Heap effects are a lowering concern and
-    ;; stay implicit just as they do for JSL-to-JSL calls.
     (if (!= (slice-len args) (jsl-decl-nparams d))
-        (do (panic-corrupt "jsl-call!: argument count does not match the declaration") 0)
+        (do (panic-corrupt "jsl-call-with-memory!: argument count does not match the declaration") 0)
         0)
-    (if (not (jsl-decl-uses-memory? d))
-        (n-call! ctrl (jsl-decl-fun d) args)
-        (let [buf (primitive/alloc-stack (array i64 10))
-              p (cast (ptr i64) buf)
-              n (slice-len args)
-              (mut i) 0]
-          (loop (if (>= (load i) n) (break)
-                  (do (set! (index p (load i)) (slice-get args (load i)))
-                      (set! i (+ (load i) 1))
-                      0)))
-          (set! (index p n) (n-new1 (Arg (t-mem-alias JS-PROPERTY-ALIAS (t-undef))) ctrl))
-          (n-call! ctrl (jsl-decl-fun d) (slice-new [i64] p (+ n 1)))))))
+    (let [buf (primitive/alloc-stack (array i64 10))
+          p (cast (ptr i64) buf)
+          n (slice-len args)
+          uses-mem (jsl-decl-uses-memory? d)
+          (mut i) 0
+          (mut answer) (zeroed CallSite)]
+      (loop (if (>= (load i) n) (break)
+              (do (set! (index p (load i)) (slice-get args (load i)))
+                  (set! i (+ (load i) 1))
+                  0)))
+      (if uses-mem (set! (index p n) memory) 0)
+      (let [call (n-call! ctrl (jsl-decl-fun d)
+                          (slice-new [i64] p (+ n (if uses-mem 1 0))))
+            ret (jsl-decl-ret d)
+            value (call-value call)]
+        (set! (.end answer) (call-end call))
+        (set! (.value answer)
+              (if (or (= ret TY-NO-ID) (= ret (t-dyn)))
+                  value
+                  (n-peephole (n-new2 (Cast ret) (call-end call) value))))
+        (load answer)))))
+
+(defn jsl-call! [(ctrl i64) (name (slice u8)) (args (slice i64))] (-> CallSite)
+  ;; This public boundary accepts source arguments only. Heap effects are a lowering concern and
+  ;; stay implicit just as they do for JSL-to-JSL calls.
+  (let [d (jsl-find name)]
+    (jsl-call-with-memory!
+      ctrl name args
+      (if (and (>= d 0) (jsl-decl-uses-memory? d))
+          (n-new1 (Arg (t-mem-alias JS-PROPERTY-ALIAS (t-undef))) ctrl)
+          NO-NODE))))

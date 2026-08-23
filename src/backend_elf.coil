@@ -10,6 +10,8 @@
 (import "node" :use *)
 (import "coil.alloc" :use * :as alloc)
 (import "coil.arraylist" :use *)
+(import "coil.fmt" :use *)
+(import "coil.io" :use *)
 (import "coil.slice" :use *)
 
 (defn elf-u8! [(b (mut (ArrayList u8))) (v i64)] (-> i64)
@@ -69,7 +71,11 @@
 ;; Publish ET_REL.  Calls use the x86 `call rel32` relocation contract: the four-byte field is at
 ;; instruction+1 and RELA's -4 addend accounts for x86 PC-relative addressing from its end.
 (defn be-elf! [] (-> i64)
-  (mobj-build-roots!)
+  (store! (mobj-x64-target) true)
+  (let [roots-start (ms-profile-now)]
+    (mobj-build-roots!)
+    (fmt (stderr) "AOTK_PROFILE phase=elf_roots ns={d} roots={d}\n"
+         (- (ms-profile-now) roots-start) (mobj-root-count)))
   (let [a (malloc-allocator)
         p (backend)
         funcs (mu-function-count)
@@ -81,16 +87,26 @@
         (mut layout) (al-new [u8] a)
         (mut rela) (al-new [u8] a)
         (mut sym) (al-new [u8] a)
-        (mut str) (al-new [u8] a)]
+        (mut str) (al-new [u8] a)
+        (mut phase-start) (ms-profile-now)]
     (let [(mut i) 0]
       (loop (if (>= (load i) textlen) (break)
                 (do (elf-u8! (mut text) (be-x64-code-byte (load i)))
                     (set! i (+ (load i) 1))))))
+    (fmt (stderr) "AOTK_PROFILE phase=elf_text_copy ns={d} bytes={d}\n"
+         (- (ms-profile-now) (load phase-start)) textlen)
+    (set! phase-start (ms-profile-now))
     ;; Reuse the authoritative byte producers, then retain each result independently.
     (al-clear! [u8] (field p obj)) (mobj-write-stackmaps!)
     (elf-copy! (mut stack) (.obj p))
+    (fmt (stderr) "AOTK_PROFILE phase=elf_stackmap_write ns={d} bytes={d}\n"
+         (- (ms-profile-now) (load phase-start)) (al-len [u8] (load stack)))
+    (set! phase-start (ms-profile-now))
     (al-clear! [u8] (field p obj)) (mobj-write-layouts!)
     (elf-copy! (mut layout) (.obj p))
+    (fmt (stderr) "AOTK_PROFILE phase=elf_layout_write ns={d} bytes={d}\n"
+         (- (ms-profile-now) (load phase-start)) (al-len [u8] (load layout)))
+    (set! phase-start (ms-profile-now))
     ;; Null symbol, local function definitions, then the sole global definition `kernel`.
     (let [(mut z) 0]
       (loop (if (>= (load z) 24) (break)
@@ -137,6 +153,9 @@
                         (elf-u64! (mut rela) -4)) 0)
                   )
                   (set! at (+ (load at) 1))))))
+    (fmt (stderr) "AOTK_PROFILE phase=elf_symbols_relocs ns={d} bytes={d}\n"
+         (- (ms-profile-now) (load phase-start)) (al-len [u8] (load rela)))
+    (set! phase-start (ms-profile-now))
     (let [textoff 64
           stackoff (elf-align (+ textoff textlen) 8)
           layoutoff (elf-align (+ stackoff stacklen) 8)
