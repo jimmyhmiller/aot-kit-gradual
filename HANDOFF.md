@@ -1,5 +1,18 @@
 # Handoff: move JavaScript semantics into the DSL
 
+## SELECTION ABI CLASSIFICATION NO LONGER RESCANS THE IDEAL GRAPH (2026-08-23, latest)
+
+Selection now classifies parameter FP/ABI positions from the machine unit's compact live-call list
+and each Fun's direct parameter uses, rather than repeatedly scanning all ideal nodes. Source
+argument, parameter ABI/stack, and allocation ordinals are cached once per selection run. On the
+slow Object representative, selection emission fell from about 1.27–1.29 s to 0.44 s and total
+selection fell from about 2.23–2.36 s to 1.37–1.39 s, with the same runtime-failure result and
+identical graph shape. The 19-variant Object shard retained exact status/category parity while
+aggregate emission fell from 25.88 s to 8.21 s and selection from 44.01 s to 25.50 s. The fixed
+177-record benchmark also retained exact parity; selection fell from 7.099 s to 6.599 s. The
+mandatory gate remains 46/46 green, and frontier reaches all seven intentional JavaScript failures
+without platform infrastructure errors.
+
 ## MEMORY-ORDER VERIFICATION USES ITS INDEPENDENT DIRECT INDEX (2026-08-23, latest)
 
 The selection verifier now answers memory-producer placement queries from its independently rebuilt

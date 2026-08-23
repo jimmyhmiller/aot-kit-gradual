@@ -457,16 +457,17 @@
         slot (n-parm-index node)
         (mut at) 0
         (mut found) false]
-    (loop (if (or (>= (load at) (n-count)) (load found))
+    ;; Machine CFG discovery already retains every live ideal Call in node order. Scanning that
+    ;; compact list preserves the exact query while avoiding one whole-graph pass per Parm.
+    (loop (if (or (>= (load at) (al-len [i64] (.ideal-calls (machine-unit))))
+                  (load found))
               (break)
               (do
-                (if (and (not (n-dead? (load at)))
-                         (and (op-is? (load at) Call [_])
-                              (and (> (n-nins (load at)) (+ slot 2))
-                                   (= (n-in (load at) 1) fun))))
-                    (let [actual (n-in (load at) (+ slot 2))]
+                (let [call (al-get [i64] (.ideal-calls (machine-unit)) (load at))]
+                  (if (and (> (n-nins call) (+ slot 2)) (= (n-in call 1) fun))
+                    (let [actual (n-in call (+ slot 2))]
                       (if (be-float-only? (n-ty actual)) (set! found true) 0))
-                    0)
+                    0))
                 (set! at (+ (load at) 1))
                 0)))
     (load found)))
@@ -603,94 +604,77 @@
         (_ false))))
 
 (defn graph-arg-index [(n i64)] (-> i64)
-  (let [(mut i) 0
-        (mut idx) 0
-        want-fp (be-float-only? (n-ty n))]
-    (loop (if (>= (load i) n)
-              (break)
-              (do
-                (if (and (not (n-dead? (load i)))
-                         (and (op-is? (load i) Arg [_])
-                              (and (not (ty-mem? (n-arg-type (load i))))
-                                   (and (> (n-nins (load i)) 0)
-                                        (and (= (n-in (load i) 0) (g-start))
-                                             (= (be-float-only? (n-ty (load i))) want-fp))))))
-                    (set! idx (+ (load idx) 1))
-                    0)
-                (set! i (+ (load i) 1))
-                0)))
-    (load idx)))
+  (al-get [i64] (.arg-abi-index (machine-unit)) n))
 
 (defn graph-parm-position-fp? [(fun i64) (position i64)] (-> bool)
   (block :done
     ;; Prefer a surviving Parm. If optimization removed that parameter, recover its ABI class from
     ;; a closed-world call argument: dead parameters still occupy their declared register slot.
     (let [(mut i) 0]
-      (loop (if (>= (load i) (n-count)) (break)
+      (loop (if (>= (load i) (n-nouts fun)) (break)
               (do
-                (if (and (not (n-dead? (load i)))
-                         (and (op-is? (load i) Parm [_])
-                              (and (= (n-in (load i) 0) fun)
-                                   (= (n-parm-index (load i)) position))))
-                    (return-from :done (be-node-fp-value? (load i)))
+                (let [use (n-out fun (load i))]
+                  (if (and (not (n-dead? use))
+                           (and (op-is? use Parm [_]) (= (n-parm-index use) position)))
+                    (return-from :done (be-node-fp-value? use))
                     0)
+                  0)
                 (store! i (+ (load i) 1))))))
     (let [(mut call) 0]
-      (loop (if (>= (load call) (n-count)) (break)
+      (loop (if (>= (load call) (al-len [i64] (.ideal-calls (machine-unit)))) (break)
               (do
-                (if (and (not (n-dead? (load call))) (op-is? (load call) Call [_]))
-                    (let [source (infer-parm-source (load call) fun position)]
-                      (if (!= source NO-NODE)
-                          (return-from :done (be-node-fp-value? source))
-                          0))
-                    0)
+                (let [call-node (al-get [i64] (.ideal-calls (machine-unit)) (load call))
+                      source (infer-parm-source call-node fun position)]
+                  (if (!= source NO-NODE)
+                      (return-from :done (be-node-fp-value? source))
+                      0))
                 (store! call (+ (load call) 1))))))
     false))
 
 (defn graph-parm-abi-index [(n i64)] (-> i64)
-  (let [fun (n-in n 0)
-        want-fp (be-node-fp-value? n)
-        limit (n-parm-index n)
-        (mut position) 0
-        (mut idx) 0]
-    (loop (if (>= (load position) limit)
-              (break)
-              (do
-                (if (= (graph-parm-position-fp? fun (load position)) want-fp)
-                    (set! idx (+ (load idx) 1))
-                    0)
-                (set! position (+ (load position) 1)))))
-    (load idx)))
+  (let [u (machine-unit)
+        cached (al-get [i64] (.parm-abi-index u) n)]
+    (if (>= cached 0)
+        cached
+        (let [fun (n-in n 0)
+              want-fp (be-node-fp-value? n)
+              limit (n-parm-index n)
+              (mut position) 0
+              (mut idx) 0]
+          (loop (if (>= (load position) limit)
+                    (break)
+                    (do
+                      (if (= (graph-parm-position-fp? fun (load position)) want-fp)
+                          (set! idx (+ (load idx) 1))
+                          0)
+                      (set! position (+ (load position) 1)))))
+          (al-set! [i64] (field u parm-abi-index) n (load idx))
+          (load idx)))))
 
 (defn graph-parm-stack-index [(n i64)] (-> i64)
-  (let [fun (n-in n 0)
-        (mut i) 0
-        (mut idx) 0]
-    (loop (if (>= (load i) n)
-              (break)
-              (do
-                (if (and (not (n-dead? (load i)))
-                         (and (op-is? (load i) Parm [_])
-                              (and (= (n-in (load i) 0) fun)
-                                   (>= (graph-parm-abi-index (load i)) 8))))
-                    (set! idx (+ (load idx) 1))
-                    0)
-                (set! i (+ (load i) 1))
-                0)))
-    (load idx)))
+  (let [u (machine-unit)
+        cached (al-get [i64] (.parm-stack-index u) n)]
+    (if (>= cached 0)
+        cached
+        (let [fun (n-in n 0)
+              (mut i) 0
+              (mut idx) 0]
+          (loop (if (>= (load i) (n-nouts fun))
+                    (break)
+                    (do
+                      (let [use (n-out fun (load i))]
+                        (if (and (not (n-dead? use))
+                                 (and (op-is? use Parm [_])
+                                      (and (< use n)
+                                           (>= (graph-parm-abi-index use) 8))))
+                            (set! idx (+ (load idx) 1))
+                            0))
+                      (set! i (+ (load i) 1)))))
+          (al-set! [i64] (field u parm-stack-index) n (load idx))
+          (load idx)))))
 
 (defn graph-new-index [(n i64)] (-> i64)
-  (let [(mut i) 0
-        (mut idx) 0]
-    (loop (if (>= (load i) n)
-              (break)
-              (do
-                (if (and (not (n-dead? (load i))) (op-is? (load i) New [_]))
-                    (set! idx (+ (load idx) 1))
-                    0)
-                (set! i (+ (load i) 1))
-                0)))
-    (load idx)))
+  (al-get [i64] (.new-index (machine-unit)) n))
 
 (defn be-field-off [(alias i64)] (-> i64)
   (if (shape-alias-defined? alias) (shape-alias-offset alias) (* (% alias 16) 8)))
@@ -725,16 +709,54 @@
 (defn ms-map-init! [] (-> i64)
   (let [u (machine-unit)
         total (* (mu-function-count) (n-count))
-        (mut i) 0]
+        (mut i) 0
+        (mut arg-gpr) 0
+        (mut arg-fp) 0
+        (mut next-new) 0]
     (al-clear! [i64] (field u selected-values))
     (al-clear! [i64] (field u selected-nodes))
     (al-clear! [i64] (field u selected-blocks))
+    (al-clear! [i64] (field u arg-abi-index))
+    (al-clear! [i64] (field u parm-abi-index))
+    (al-clear! [i64] (field u parm-stack-index))
+    (al-clear! [i64] (field u new-index))
     (loop (if (>= (load i) total)
               (break)
               (do
                 (al-push! [i64] (field u selected-values) -1)
                 (al-push! [i64] (field u selected-nodes) 0)
                 (al-push! [i64] (field u selected-blocks) -1)
+                (set! i (+ (load i) 1))
+                0)))
+    (set! i 0)
+    (loop (if (>= (load i) (n-count))
+              (break)
+              (do
+                (let [node (load i)
+                      arg-index
+                        (if (and (not (n-dead? node))
+                                 (and (op-is? node Arg [_])
+                                      (and (not (ty-mem? (n-arg-type node)))
+                                           (and (> (n-nins node) 0)
+                                                (= (n-in node 0) (g-start))))))
+                            (if (be-float-only? (n-ty node))
+                                (let [index (load arg-fp)]
+                                  (set! arg-fp (+ index 1))
+                                  index)
+                                (let [index (load arg-gpr)]
+                                  (set! arg-gpr (+ index 1))
+                                  index))
+                            -1)
+                      allocation-index
+                        (if (and (not (n-dead? node)) (op-is? node New [_]))
+                            (let [index (load next-new)]
+                              (set! next-new (+ index 1))
+                              index)
+                            -1)]
+                  (al-push! [i64] (field u arg-abi-index) arg-index)
+                  (al-push! [i64] (field u parm-abi-index) -1)
+                  (al-push! [i64] (field u parm-stack-index) -1)
+                  (al-push! [i64] (field u new-index) allocation-index))
                 (set! i (+ (load i) 1))
                 0)))
     0))
