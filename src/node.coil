@@ -702,46 +702,47 @@
 (const OPC-FOLDABLE i64 64)
 (const OPC-COMMUTES i64 128)
 (const OPC-BINARY i64 256)
+(const OPC-IDEALIZABLE i64 512)
 
 (defn op-class [(op Op)] (-> i64)
   (match op
     (Start [] 1)
-    (Stop [] 1)
+    (Stop [] 513)
     (Return [] 49)
     (If [] 49)
-    (Region [] 41)
-    (Loop [] 41)
-    (CProj [_] 33)
+    (Region [] 553)
+    (Loop [] 553)
+    (CProj [_] 545)
     (XCtrl [] 33)
     (Const [_] 34)
     (Arg [_] 2)
-    (Proj [_] 98)
-    (Phi [_] 102)
-    (Cast [_] 98)
-    (Add [] 482)
-    (Sub [] 354)
-    (Mul [] 482)
+    (Proj [_] 610)
+    (Phi [_] 614)
+    (Cast [_] 610)
+    (Add [] 994)
+    (Sub [] 866)
+    (Mul [] 994)
     (Div [] 354)
-    (Minus [] 98)
+    (Minus [] 610)
     (Not [] 98)
-    (Eq [] 482)
-    (Lt [] 354)
-    (Le [] 354)
+    (Eq [] 994)
+    (Lt [] 866)
+    (Le [] 866)
     (New [_] 82)
-    (Load [_] 98)
-    (Store [_] 98)
+    (Load [_] 610)
+    (Store [_] 610)
     (MemMerge [] 98)
-    (Box [_] 98)
-    (Unbox [_] 98)
+    (Box [_] 610)
+    (Unbox [_] 610)
     (TypeTest [_] 98)
-    (CallEnd [] 1)
+    (CallEnd [] 513)
     (Fun [_] 2)
     (Parm [_] 98)
-    (Call [_] 2)
+    (Call [_] 514)
     (FunStart [] 33)
     (Closure [_] 2)
     (Safepoint [] 17)
-    (Barrier [] 2)
+    (Barrier [] 514)
     (Mod [] 354)
     (BitAnd [] 482)
     (BitOr [] 482)
@@ -754,7 +755,7 @@
     (PropStore [_] 98)
     (SetProto [] 98)
     (ArrayMark [] 98)
-    (ArrayLoad [_] 98)
+    (ArrayLoad [_] 610)
     (ArrayStore [] 98)
     (ArrayLen [] 98)
     (ArrayResize [] 98)
@@ -857,6 +858,11 @@
 ;; ranges rather than one; the verifier's arity contract is the reason it needs a name.
 (defn op-binary? [(op Op)] (-> bool)
   (op-has-class? op OPC-BINARY))
+
+;; Has a nontrivial arm in `n-idealize`. Keep this in the exhaustive opcode metadata rather than
+;; rediscovering it by dispatching every already-analysed node during each fold seed.
+(defn op-idealizable? [(op Op)] (-> bool)
+  (op-has-class? op OPC-IDEALIZABLE))
 
 ; ============================================================================
 ; The node
@@ -3425,21 +3431,45 @@
                           ; XCtrl AND PROVEN: see the notes on n-ty-proven? and phi-single-input. `if-compute`
                           ; used to report [~ctrl ~ctrl] for an If whose own control was merely unanalysed,
                           ; and this rewrite then replaced BOTH live projections with XCtrl, deleting the arms.
-                          (if (not (n-ty-proven? m))
-                              NO-NODE
-                              (if (= (ty-kid off idx) (t-xctrl))
-                                  (n-xctrl)
-                                  ; the sibling is dead, so the If does not branch: this projection IS its control
-                                  (if (and (and (op-is? m If []) (= len 2))
-                                           (= (ty-kid off (- 1 idx)) (t-xctrl)))
-                                      (n-in m 0)
-                                      NO-NODE)))))
+                          (let [this-control (ty-kid off idx)
+                                sibling-dead (and (and (op-is? m If []) (= len 2))
+                                                  (= (ty-kid off (- 1 idx)) (t-xctrl)))]
+                            ;; Most projections are the two live arms of an unresolved branch.
+                            ;; A proof can only enable either rewrite when this arm or its sibling
+                            ;; is already XCtrl, so do not repeat a snapshot lookup for every live
+                            ;; CProj on every fold round.
+                            (if (and (!= this-control (t-xctrl)) (not sibling-dead))
+                                NO-NODE
+                                (if (not (n-ty-proven? m))
+                                    NO-NODE
+                                    (if (= this-control (t-xctrl))
+                                        (n-xctrl)
+                                        ; the sibling is dead, so this projection IS the If's control
+                                        (n-in m 0)))))))
               (TBot [] NO-NODE)
               (TTop [] NO-NODE)
               (TCtrl [] NO-NODE)
               (TXCtrl [] NO-NODE)
               (TVal [v] NO-NODE)
               (TMem [a c] NO-NODE))))))
+
+;; Whether a settled CProj has the one state that its idealizer can rewrite. The fold seed runs
+;; after analysis reached a type fixpoint; seeding every ordinary two-live-arm projection only to
+;; rediscover that neither arm is XCtrl accounted for tens of thousands of repeated visits in a
+;; medium Test262 graph. Worklist-driven visits after a rewrite still run unconditionally.
+(defn cproj-seed-may-idealize? [(n i64)] (-> bool)
+  (let [m (n-in n 0)]
+    (if (or (= m NO-NODE) (n-dead? m))
+        true
+        (match (ty-get (n-ty m))
+          (TTuple [off len]
+            (let [idx (n-cproj-label n)]
+              (if (or (< idx 0) (>= idx len))
+                  true
+                  (or (= (ty-kid off idx) (t-xctrl))
+                      (and (and (op-is? m If []) (= len 2))
+                           (= (ty-kid off (- 1 idx)) (t-xctrl)))))))
+          (_ false)))))
 
 ;; The one value every live path contributes, ignoring self-references (a loop phi fed by its
 ;; own back edge), or NO-NODE when the paths disagree.
@@ -4649,12 +4679,12 @@
 (defn n-ty-proven? [(n i64)] (-> bool)
   (let [p (graph)
         was (g-verifying?)
-        started (node-profile-now)
         (mut visits) 0]
     (set! (.prof-proof-calls p) (+ (.prof-proof-calls p) 1))
     (if (and (.psnapshot p) (< n (al-len [bool] (.pvalueproof p))))
         (if (.provingctrl p) (al-get (.pctrlproof p) n) (al-get (.pvalueproof p) n))
         (do
+    (let [started (node-profile-now)]
     ; The mark array and the stack are ONE buffer shared by every call, so a walk inside a walk would
     ; silently truncate the outer one and answer "proven" for a cone it never finished looking at.
     ; Nothing reentrant calls this today (`n-compute` below never asks for a proof), and a named abort
@@ -4702,7 +4732,7 @@
       (set! (.prof-proof-visits p) (+ (.prof-proof-visits p) (load visits)))
       (if (> (load visits) (.prof-proof-max p)) (set! (.prof-proof-max p) (load visits)) 0)
       (set! (.prof-proof-ns p) (+ (.prof-proof-ns p) (- (node-profile-now) started)))
-      (load ok))))))
+      (load ok)))))))
 
 (defn g-profile-peeps [] (-> i64) (.prof-peeps (graph)))
 (defn g-profile-compute-ns [] (-> i64) (.prof-compute-ns (graph)))
@@ -4794,7 +4824,7 @@
                   (g-changed!)
                   c2))
               (let [idealize-started (node-profile-now)
-                    m (n-idealize n)]
+                    m (if (op-idealizable? (n-op n)) (n-idealize n) NO-NODE)]
                 (set! (.prof-idealize-ns (graph)) (+ (.prof-idealize-ns (graph)) (- (node-profile-now) idealize-started)))
                 (if (and (!= m NO-NODE) (!= m n))
                     (do (n-keep! m) (n-subsume! n m) (n-unkeep! m) (g-changed!) (n-peephole m))
@@ -4990,6 +5020,21 @@
                             (break)
                             (do (set! (.prof-fold-scans (graph)) (+ (.prof-fold-scans (graph)) 1))
                                 (if (or (n-dead? (load i))
+                                        ;; Analysis has just brought every node's type to a
+                                        ;; fixpoint. On the seed round only operations that can
+                                        ;; actually rewrite need a peephole visit; immutable
+                                        ;; Arg/Const/runtime nodes still enter later through the
+                                        ;; worklist if an earlier rewrite changes one of their
+                                        ;; inputs and type propagation is then required.
+                                        (and (= (load rounds) 0)
+                                             (and (not (wl-on? (load i)))
+                                                  (and (not (and (op-foldable? (n-op (load i)))
+                                                                 (ty-const? (n-ty (load i)))))
+                                                       (and (not (and (op-idealizable? (n-op (load i)))
+                                                                      (or (not (op-is? (load i) CProj [_]))
+                                                                          (cproj-seed-may-idealize? (load i)))))
+                                                            (or (not (op-gvn? (n-op (load i))))
+                                                                (!= (.hash (nd (load i))) 0))))))
                                         ;; The first ordered round seeds every operation. Rewrites
                                         ;; queue every dependent that can change; retain that queue
                                         ;; membership through later ascending rounds so an affected

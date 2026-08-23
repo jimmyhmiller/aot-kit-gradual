@@ -1,5 +1,26 @@
 # Handoff: move JavaScript semantics into the DSL
 
+## PROVEN-FOLD SEEDS ONLY VISIT OPERATIONS THAT CAN TRANSFORM (2026-08-23, latest)
+
+The frontend's proven-fold seed no longer sends every already-analysed node through the complete
+compute/idealize/GVN pipeline. Exact opcode metadata records which operations have a nontrivial
+idealizer; foldable nodes are seeded only when their settled type is constant, and a settled
+`CProj` is seeded only when its own or sibling arm is `XCtrl`. Nodes affected by an earlier rewrite
+still enter through the worklist, so type propagation and proof-dependent follow-up rewrites are
+unchanged. The `CProj` idealizer also checks whether either rewrite is structurally possible before
+asking for a proof snapshot. This changes compiler structure only; no JavaScript operation or DSL
+lowering changed.
+
+On the profiled TypedArray representative, proven-fold candidates fell from roughly 450,000 to
+348,000 and proof queries from roughly 133,000 to 42,000 with identical graph shape and failure
+category. The fixed 177-record sample retained exact path+variant status/category parity (16
+passed, 95 failed, 49 refused, 17 skipped). Aggregate frontend analysis fell from 23.950 s to
+21.305 s (-11.0%), including fold from 9.776 s to 8.248 s (-15.6%); user CPU fell from 88.05 s to
+83.03 s and wall time from 6.98 s to 6.67 s at 14 workers. Against the original fixed benchmark,
+successful-variant mean is now 0.652 s versus 20.512 s (31.4× faster), though the original corpus
+had 14 successes and the current parity baseline has 16, so status parity is asserted only against
+the immediately preceding checkpoint. The mandatory gate remains 46/46 green.
+
 ## FRONTEND BUILTIN CLASSIFICATION REJECTS BY NAME BEFORE RECURSING (2026-08-23, latest)
 
 Call-result inference no longer recursively infers an unrelated method receiver before checking
