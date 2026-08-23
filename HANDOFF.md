@@ -1,5 +1,28 @@
 # Handoff: move JavaScript semantics into the DSL
 
+## UNREACHABLE JAVASCRIPT FUNCTION BODIES ARE NEVER BUILT (2026-08-23, latest)
+
+The closed-world frontend now computes exact function reachability before graph publication. The
+walk starts from `main` and executable top-level initializers, follows resolved function symbols,
+nested declarations/expressions, and default-parameter initializers, while indexing, captures,
+effects, and diagnostics still see the complete source. Only reachable bodies and function objects
+are published; this moves dead-function elimination ahead of graph construction instead of first
+building, analyzing, verifying, selecting, and finally killing every unused Test262 include helper.
+No JavaScript operation or DSL lowering changed.
+
+The profiled TypedArray representative requested 48 functions but could reach only 29. Its graph
+fell from 70,901 to 42,732 nodes, graph build from 1.072 s to 0.607 s (-43.4%), analysis from
+2.075 s to 1.134 s (-45.3%), and attempt time from 3.927 s to 2.289 s (-41.7%). On the 20-variant
+slow TypedArray shard, exact status/category parity held while user CPU fell from 70.32 s to 36.64 s
+(-47.9%) and wall time from 7.68 s to 4.34 s (-43.5%).
+
+The fixed 177-record sample also retained exact path+variant status/category parity (16 passed, 95
+failed, 49 refused, 17 skipped). User CPU fell from 83.03 s to 71.03 s (-14.5%), wall time from
+6.67 s to 5.71 s (-14.4%), frontend graph from 44.684 s to 36.017 s (-19.4%), graph build from
+12.796 s to 9.781 s (-23.6%), analysis from 21.305 s to 15.792 s (-25.9%), and verification from
+3.806 s to 2.766 s (-27.3%). The mandatory gate remains 46/46 green; frontier reaches all seven
+intentional JavaScript failures with no infrastructure failure.
+
 ## PROVEN-FOLD SEEDS ONLY VISIT OPERATIONS THAT CAN TRANSFORM (2026-08-23, latest)
 
 The frontend's proven-fold seed no longer sends every already-analysed node through the complete

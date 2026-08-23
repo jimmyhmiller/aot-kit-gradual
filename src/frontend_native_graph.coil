@@ -1391,6 +1391,125 @@
                 (set! index (+ (load index) 1)))))
     (load answer)))
 
+;; Closed-world function reachability for graph publication. Indexing still sees every declaration
+;; (resolution, captures, effects and diagnostics need the complete source), but a function body
+;; that no reachable expression can materialize need not become thousands of ideal nodes. Direct
+;; references use the frontend's exact resolution table; nested function syntax is marked when its
+;; enclosing reachable body is walked. Nested bodies are then walked once from their own queue item.
+(defn fng-reachable-functions [(frontend (ptr NativeFrontend)) (main-index i64)]
+                              (-> (ArrayList bool))
+  (let [count (al-len [FeFunction] (.functions frontend))
+        ast (field frontend ast)
+        (mut reachable) (al-new [bool] (malloc-allocator))
+        (mut id-to-index) (al-new [i64] (malloc-allocator))
+        (mut pending) (al-new [i64] (malloc-allocator))
+        (mut stack) (al-new [i64] (malloc-allocator))
+        (mut i) 0]
+    (loop (if (>= (load i) count)
+              (break)
+              (do
+                (al-push! [bool] (mut reachable) false)
+                (al-push! [i64] (mut id-to-index) -1)
+                (set! i (+ (load i) 1)))))
+    (set! i 0)
+    (loop (if (>= (load i) count)
+              (break)
+              (let [fn (al-get [FeFunction] (.functions frontend) (load i))]
+                (if (and (>= (.id fn) 0) (< (.id fn) count))
+                    (al-set! [i64] (mut id-to-index) (.id fn) (load i))
+                    0)
+                (set! i (+ (load i) 1)))))
+    (al-push! [i64] (mut pending) main-index)
+    ;; Top-level variable initializers and expression statements execute before `main`; function
+    ;; values they mention are roots even when the declaration itself is outside main's body.
+    ;; Walk the script root but stop at function declarations, whose bodies are discovered only
+    ;; when an executable reference reaches them.
+    (al-push! [i64] (mut stack) (ts-root ast))
+    (loop (if (= (al-len [i64] (load stack)) 0)
+              (break)
+              (let [last (- (al-len [i64] (load stack)) 1)
+                    node (al-get [i64] (load stack) last)
+                    kind (ts-kind ast node)
+                    symbol (fe-resolution-symbol frontend node)
+                    target (if (and (>= symbol 0) (< symbol count))
+                               (al-get [i64] (load id-to-index) symbol)
+                               -1)]
+                (al-pop! [i64] (mut stack))
+                (if (and (>= target 0) (not (al-get [bool] (load reachable) target)))
+                    (al-push! [i64] (mut pending) target)
+                    0)
+                (if (= kind TSK-FUNCTION-DECLARATION)
+                    0
+                    (if (or (= kind TSK-FUNCTION-EXPRESSION) (= kind TSK-ARROW-FUNCTION))
+                        (let [nested (fng-function-node-index frontend node)]
+                          (if (and (>= nested 0)
+                                   (not (al-get [bool] (load reachable) nested)))
+                              (al-push! [i64] (mut pending) nested)
+                              0))
+                        (let [(mut child) 0]
+                          (loop (if (>= (load child) (ts-child-count ast node))
+                                    (break)
+                                    (do
+                                      (al-push! [i64] (mut stack) (ts-child ast node (load child)))
+                                      (set! child (+ (load child) 1)))))))))))
+    (loop (if (= (al-len [i64] (load pending)) 0)
+              (break)
+              (let [last (- (al-len [i64] (load pending)) 1)
+                    index (al-get [i64] (load pending) last)]
+                (al-pop! [i64] (mut pending))
+                (if (al-get [bool] (load reachable) index)
+                    0
+                    (do
+                      (al-set! [bool] (mut reachable) index true)
+                      (let [fn (al-get [FeFunction] (.functions frontend) index)]
+                        (al-clear! [i64] (mut stack))
+                        ;; Default-parameter initializers execute as part of the call and may
+                        ;; materialize callbacks not present in the function body.
+                        (let [(mut parameter) 0]
+                          (loop (if (>= (load parameter) (.parameter-count fn))
+                                    (break)
+                                    (let [symbol
+                                            (al-get [FeSymbol]
+                                                    (.symbols frontend)
+                                                    (+ (.parameter-start fn) (load parameter)))]
+                                      (al-push! [i64] (mut stack) (.node symbol))
+                                      (set! parameter (+ (load parameter) 1))))))
+                        (al-push! [i64] (mut stack) (.body-node fn))
+                        (loop (if (= (al-len [i64] (load stack)) 0)
+                                  (break)
+                                  (let [last (- (al-len [i64] (load stack)) 1)
+                                        node (al-get [i64] (load stack) last)
+                                        kind (ts-kind ast node)
+                                        symbol (fe-resolution-symbol frontend node)
+                                        target (if (and (>= symbol 0) (< symbol count))
+                                                   (al-get [i64] (load id-to-index) symbol)
+                                                   -1)]
+                                    (al-pop! [i64] (mut stack))
+                                    (if (and (>= target 0)
+                                             (not (al-get [bool] (load reachable) target)))
+                                        (al-push! [i64] (mut pending) target)
+                                        0)
+                                    (if (or (= kind TSK-FUNCTION-DECLARATION)
+                                            (or (= kind TSK-FUNCTION-EXPRESSION)
+                                                (= kind TSK-ARROW-FUNCTION)))
+                                        (let [nested (fng-function-node-index frontend node)]
+                                          (if (and (>= nested 0) (!= nested index))
+                                              (if (not (al-get [bool] (load reachable) nested))
+                                                  (al-push! [i64] (mut pending) nested)
+                                                  0)
+                                              0))
+                                        (let [(mut child) 0]
+                                          (loop (if (>= (load child) (ts-child-count ast node))
+                                                    (break)
+                                                    (do
+                                                      (al-push! [i64] (mut stack)
+                                                                (ts-child ast node (load child)))
+                                                      (set! child (+ (load child) 1))))))))))))))))
+    (al-free! [i64] (mut id-to-index))
+    (al-free! [i64] (mut pending))
+    (al-free! [i64] (mut stack))
+    (load reachable)))
+
 (defn fng-function-receiver-aware? [(frontend (ptr NativeFrontend)) (id i64)] (-> bool)
   (let [index (fng-function-index frontend id)]
     (if (< index 0)
@@ -6702,7 +6821,8 @@
                 (set! index (+ (load index) 1)))))
     (load found)))
 
-(defn fng-top-level-initialize! [(context FngContext)] (-> i64)
+(defn fng-top-level-initialize! [(context FngContext)
+                                 (reachable-functions (ptr (ArrayList bool)))] (-> i64)
   (let [frontend (load (field context frontend))
         ast (field frontend ast)
         root (ts-root ast)
@@ -6730,9 +6850,10 @@
                 ; Nested declarations belong to their lexical invocation. Publishing
                 ; their function object/prototype here would embed a parent function's
                 ; allocation directly in the synthetic top-level graph.
-                (if (and (= (ts-kind ast (.node fn)) TSK-FUNCTION-DECLARATION)
+                (if (and (al-get [bool] (load reachable-functions) (load index))
+                         (and (= (ts-kind ast (.node fn)) TSK-FUNCTION-DECLARATION)
                          (and (!= (.id fn) (.owner context))
-                              (= (.parent fn) -1)))
+                              (= (.parent fn) -1))))
                     (let [object
                             (al-get [i64]
                                     (load (load (field context functions)))
@@ -8467,6 +8588,7 @@
                              (shapes (mut (ArrayList i64)))
                              (aliases (mut (ArrayList i64)))
                              (effects (mut (ArrayList bool)))
+                             (reachable-functions (ptr (ArrayList bool)))
                              (type-count i64)
                              (cell-shape i64)
                              (cell-alias i64)
@@ -8663,7 +8785,7 @@
       (fng-materialize-nested-declarations! context
                                             (mut saved-capture-symbols)
                                             (mut saved-capture-values))
-      (if top-level (fng-top-level-initialize! context) 0)
+      (if top-level (fng-top-level-initialize! context (mut reachable-functions)) 0)
       (let [body-node (.body-node fn)
             expression-body (!= (ts-kind (field frontend ast) body-node) TSK-BLOCK)
             falls-through
@@ -8742,6 +8864,7 @@
         main (al-get [FeFunction] (.functions frontend) main-index)
         main-id (.id main)
         function-count (al-len [FeFunction] (.functions frontend))
+        (mut reachable-functions) (fng-reachable-functions frontend main-index)
         type-count (al-len [FeTypeDecl] (.types frontend))
         symbol-count (+ function-count (al-len [FeSymbol] (.symbols frontend)))
         (mut values) (al-new [i64] (malloc-allocator))
@@ -8806,7 +8929,8 @@
     (loop (if (>= (load index) function-count)
               (break)
               (let [fn (al-get [FeFunction] (.functions frontend) (load index))]
-                (if (!= (.id fn) main-id)
+                (if (and (!= (.id fn) main-id)
+                         (al-get [bool] (load reachable-functions) (load index)))
                     (al-set! [i64] (mut functions) (.id fn)
                              (n-fun-open! (+ (.id fn) 1)))
                     0)
@@ -8830,7 +8954,8 @@
     (loop (if (>= (load index) function-count)
               (break)
               (let [fn (al-get [FeFunction] (.functions frontend) (load index))]
-                (if (!= (.id fn) main-id)
+                (if (and (!= (.id fn) main-id)
+                         (al-get [bool] (load reachable-functions) (load index)))
                     (do
                       (fng-compile-function! frontend
                                              (mut values)
@@ -8840,6 +8965,7 @@
                                              (mut shapes)
                                              (mut aliases)
                                              (mut effects)
+                                             (mut reachable-functions)
                                              type-count
                                              (load cell-shape)
                                              (load cell-alias)
@@ -8877,6 +9003,7 @@
                            (mut shapes)
                            (mut aliases)
                            (mut effects)
+                           (mut reachable-functions)
                            type-count
                            (load cell-shape)
                            (load cell-alias)
@@ -8964,6 +9091,7 @@
       (al-free! [i64] (mut shapes))
       (al-free! [i64] (mut aliases))
       (al-free! [bool] (mut effects))
+      (al-free! [bool] (mut reachable-functions))
       answer)))
 
 (defn frontend-native-build! [(frontend (mut NativeFrontend)) (seed i64) (optimize bool)] (-> i64)
