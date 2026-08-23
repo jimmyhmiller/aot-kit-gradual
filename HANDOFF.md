@@ -1,5 +1,23 @@
 # Handoff: move JavaScript semantics into the DSL
 
+## FRONTEND BUILTIN CLASSIFICATION REJECTS BY NAME BEFORE RECURSING (2026-08-23, latest)
+
+Call-result inference no longer recursively infers an unrelated method receiver before checking
+whether its property name can belong to the Number, String, Array, or iterator builtin family.
+Closed-world static-method AST queries are also cached by their exact receiver-symbol/property-name
+key. This is structural frontend work only; JavaScript operations and all DSL lowering are
+unchanged. Profiling the slowest record in the highest-total frontend cluster identified four
+`Function.prototype.call.bind(...)` initializers that each spent 53–59 ms classifying only 488
+nodes; each now takes 26.6–28.8 ms with identical graph shape and failure category.
+
+The 20-variant slow `TypedArray/prototype` shard retained exact path+variant status/category parity.
+Aggregate graph build fell from 23.328 s to 20.099 s (-13.8%), total frontend graph from 70.719 s
+to 65.915 s (-6.8%), and summed attempt duration from 77.500 s to 72.392 s. The fixed 177-record
+sample also retained exact parity (16 passed, 95 failed, 49 refused, 17 skipped); graph build fell
+from 13.859 s to 13.075 s, while other frontend phases were noisy under 14-way contention and are
+not claimed as an improvement. The mandatory gate remains 46/46 green. Frontier reaches all seven
+intentional JavaScript failures with no platform infrastructure errors.
+
 ## SELECTION ABI CLASSIFICATION NO LONGER RESCANS THE IDEAL GRAPH (2026-08-23, latest)
 
 Selection now classifies parameter FP/ABI positions from the machine unit's compact live-call list

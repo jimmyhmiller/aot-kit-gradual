@@ -201,6 +201,9 @@
 (defn fng-profile-current-scans-ptr [] (-> (ptr i64)) (primitive/alloc-static i64))
 (defn fng-profile-method-chains-ptr [] (-> (ptr i64)) (primitive/alloc-static i64))
 (defn fng-profile-method-candidates-ptr [] (-> (ptr i64)) (primitive/alloc-static i64))
+(defn fng-profile-static-method-calls-ptr [] (-> (ptr i64)) (primitive/alloc-static i64))
+(defn fng-profile-static-method-hits-ptr [] (-> (ptr i64)) (primitive/alloc-static i64))
+(defn fng-profile-static-method-scans-ptr [] (-> (ptr i64)) (primitive/alloc-static i64))
 
 ;; Long-lived harness workers compile many isolated graphs against the same immutable library.
 ;; Ordinary frontend users retain the full reset/read/check behavior on every build.
@@ -2508,30 +2511,56 @@
             ""))))
 
 (defn fng-array-builtin? [(context FngContext) (node i64)] (-> bool)
-  (let [name (fng-array-builtin-name context node)]
-    (cond (= name "concat") true (= name "flat") true
-          (= name "splice") true (= name "fill") true
-          (= name "reverse") true (= name "unshift") true
-          (= name "push") true (= name "pop") true
-          (= name "shift") true (= name "slice") true
-          (= name "indexOf") true (= name "includes") true
-          (= name "lastIndexOf") true (= name "at") true
-          (= name "join") true (= name "map") true
-          (= name "filter") true (= name "forEach") true
-          (= name "reduce") true (= name "reduceRight") true
-          (= name "find") true (= name "findIndex") true
-          (= name "some") true (= name "every") true
-          (= name "sort") true (= name "flatMap") true
-          (= name "keys") true (= name "values") true
-          (= name "entries") true :else false)))
+  (let [frontend (load (field context frontend))
+        ast (field frontend ast)
+        callee (ts-child ast node 0)
+        syntax-name (if (= (ts-kind ast callee) TSK-PROPERTY-ACCESS)
+                        (ts-text ast (ts-child ast callee 1))
+                        "")
+        supported (cond (= syntax-name "call") true
+                        (= syntax-name "concat") true (= syntax-name "flat") true
+                        (= syntax-name "splice") true (= syntax-name "fill") true
+                        (= syntax-name "reverse") true (= syntax-name "unshift") true
+                        (= syntax-name "push") true (= syntax-name "pop") true
+                        (= syntax-name "shift") true (= syntax-name "slice") true
+                        (= syntax-name "indexOf") true (= syntax-name "includes") true
+                        (= syntax-name "lastIndexOf") true (= syntax-name "at") true
+                        (= syntax-name "join") true (= syntax-name "map") true
+                        (= syntax-name "filter") true (= syntax-name "forEach") true
+                        (= syntax-name "reduce") true (= syntax-name "reduceRight") true
+                        (= syntax-name "find") true (= syntax-name "findIndex") true
+                        (= syntax-name "some") true (= syntax-name "every") true
+                        (= syntax-name "sort") true (= syntax-name "flatMap") true
+                        (= syntax-name "keys") true (= syntax-name "values") true
+                        (= syntax-name "entries") true :else false)]
+    ;; Receiver inference recursively classifies call expressions. Reject unrelated method names
+    ;; before entering it; borrowed `Array.prototype.x.call(...)` remains on the structural path.
+    (if (not supported)
+        false
+        (let [name (fng-array-builtin-name context node)]
+          (cond (= name "concat") true (= name "flat") true
+                (= name "splice") true (= name "fill") true
+                (= name "reverse") true (= name "unshift") true
+                (= name "push") true (= name "pop") true
+                (= name "shift") true (= name "slice") true
+                (= name "indexOf") true (= name "includes") true
+                (= name "lastIndexOf") true (= name "at") true
+                (= name "join") true (= name "map") true
+                (= name "filter") true (= name "forEach") true
+                (= name "reduce") true (= name "reduceRight") true
+                (= name "find") true (= name "findIndex") true
+                (= name "some") true (= name "every") true
+                (= name "sort") true (= name "flatMap") true
+                (= name "keys") true (= name "values") true
+                (= name "entries") true :else false)))))
 
 (defn fng-array-iterator-next? [(context FngContext) (node i64)] (-> bool)
   (let [frontend (load (field context frontend)) ast (field frontend ast)
         callee (ts-child ast node 0)]
     (and (= (ts-child-count ast node) 1)
          (and (= (ts-kind ast callee) TSK-PROPERTY-ACCESS)
-              (and (= (fng-infer context (ts-child ast callee 0) FNG-DYNAMIC) FNG-ITERATOR)
-                   (= (ts-text ast (ts-child ast callee 1)) "next"))))))
+              (and (= (ts-text ast (ts-child ast callee 1)) "next")
+                   (= (fng-infer context (ts-child ast callee 0) FNG-DYNAMIC) FNG-ITERATOR))))))
 
 (defn fng-array-iterator-next [(context FngContext) (node i64)] (-> i64)
   (let [frontend (load (field context frontend)) ast (field frontend ast)
@@ -3332,8 +3361,8 @@
         ast (field frontend ast)
         callee (ts-child ast node 0)]
     (and (= (ts-kind ast callee) TSK-PROPERTY-ACCESS)
-         (and (= (fng-infer context (ts-child ast callee 0) FNG-DYNAMIC) FNG-NUMBER)
-              (= (ts-text ast (ts-child ast callee 1)) "toString")))))
+         (and (= (ts-text ast (ts-child ast callee 1)) "toString")
+              (= (fng-infer context (ts-child ast callee 0) FNG-DYNAMIC) FNG-NUMBER)))))
 
 (defn fng-number-to-string [(context FngContext) (node i64)] (-> i64)
   (let [frontend (load (field context frontend))
@@ -3356,8 +3385,8 @@
         ast (field frontend ast)
         callee (ts-child ast node 0)]
     (and (= (ts-kind ast callee) TSK-PROPERTY-ACCESS)
-         (and (= (fng-infer context (ts-child ast callee 0) FNG-DYNAMIC) FNG-NUMBER)
-              (= (ts-text ast (ts-child ast callee 1)) "toFixed")))))
+         (and (= (ts-text ast (ts-child ast callee 1)) "toFixed")
+              (= (fng-infer context (ts-child ast callee 0) FNG-DYNAMIC) FNG-NUMBER)))))
 
 (defn fng-number-to-fixed [(context FngContext) (node i64)] (-> i64)
   (let [frontend (load (field context frontend))
@@ -3456,8 +3485,8 @@
         callee (ts-child ast node 0)
         name (fng-string-builtin-name context node)]
     (and (= (ts-kind ast callee) TSK-PROPERTY-ACCESS)
-         (and (= (fng-infer context (ts-child ast callee 0) FNG-DYNAMIC) FNG-STRING)
-              (fng-string-builtin-arity? name (- (ts-child-count ast node) 1))))))
+         (and (fng-string-builtin-arity? name (- (ts-child-count ast node) 1))
+              (= (fng-infer context (ts-child ast callee 0) FNG-DYNAMIC) FNG-STRING)))))
 
 ;; Emit a call to a JSL runtime-library definition.
 ;;
@@ -4499,13 +4528,39 @@
               direct
               (if (= (ts-kind ast receiver-node) TSK-THIS)
                   (fng-static-owner-scan frontend (ts-root ast) owner)
-                  -1))]
+                  -1))
+        name (ts-text ast name-node)
+        (mut index) 0
+        (mut cached) false
+        (mut answer) -1]
+    (set! (fng-profile-static-method-calls-ptr)
+          (+ (load (fng-profile-static-method-calls-ptr)) 1))
     (if (< symbol 0)
         -1
-        (fng-static-method-scan frontend
-                                (ts-root ast)
-                                symbol
-                                (ts-text ast name-node)))))
+        (do
+          (loop (if (or (>= (load index) (al-len [i64] (.static-method-symbols frontend)))
+                        (load cached))
+                    (break)
+                    (do
+                      (if (and (= (al-get (.static-method-symbols frontend) (load index)) symbol)
+                               (= (ts-text ast (al-get (.static-method-names frontend) (load index)))
+                                  name))
+                          (do
+                            (set! answer (al-get (.static-method-results frontend) (load index)))
+                            (set! cached true))
+                          0)
+                      (set! index (+ (load index) 1)))))
+          (if (load cached)
+              (set! (fng-profile-static-method-hits-ptr)
+                    (+ (load (fng-profile-static-method-hits-ptr)) 1))
+              (do
+                (set! (fng-profile-static-method-scans-ptr)
+                      (+ (load (fng-profile-static-method-scans-ptr)) 1))
+                (set! answer (fng-static-method-scan frontend (ts-root ast) symbol name))
+                (al-push! [i64] (field frontend static-method-symbols) symbol)
+                (al-push! [i64] (field frontend static-method-names) name-node)
+                (al-push! [i64] (field frontend static-method-results) (load answer))))
+          (load answer)))))
 
 ;; Resolve the callable denoted by the receiver of Function.prototype.call.  DeltaBlue's
 ;; inheritance shim publishes constructors as `Ctor.superConstructor` and inherited methods as
@@ -8679,6 +8734,9 @@
   (set! (fng-profile-current-scans-ptr) 0)
   (set! (fng-profile-method-chains-ptr) 0)
   (set! (fng-profile-method-candidates-ptr) 0)
+  (set! (fng-profile-static-method-calls-ptr) 0)
+  (set! (fng-profile-static-method-hits-ptr) 0)
+  (set! (fng-profile-static-method-scans-ptr) 0)
   (set! (fng-optimize-ptr) optimize)
   (let [main-index (fng-main-index frontend)
         main (al-get [FeFunction] (.functions frontend) main-index)
@@ -8832,14 +8890,17 @@
          (jl-profile-target-calls) (jl-profile-target-scans) (jl-profile-jsl-scans)
          (jl-profile-max-calls) (jl-profile-max-scans) (jl-profile-param-scans)
          (jl-profile-lower-ns) (jl-profile-lower-calls) (jl-profile-lower-nodes))
-    (fmt (stderr) "AOTK_PROFILE phase=frontend_memory alias_calls={d} alias_edges={d} preserve_calls={d} preserve_fields={d} current_scans={d} method_chains={d} method_candidates={d}\n"
+    (fmt (stderr) "AOTK_PROFILE phase=frontend_memory alias_calls={d} alias_edges={d} preserve_calls={d} preserve_fields={d} current_scans={d} method_chains={d} method_candidates={d} static_method_calls={d} static_method_hits={d} static_method_scans={d}\n"
          (load (fng-profile-memory-alias-calls-ptr))
          (load (fng-profile-memory-alias-edges-ptr))
          (load (fng-profile-preserve-calls-ptr))
          (load (fng-profile-preserve-fields-ptr))
          (load (fng-profile-current-scans-ptr))
          (load (fng-profile-method-chains-ptr))
-         (load (fng-profile-method-candidates-ptr)))
+         (load (fng-profile-method-candidates-ptr))
+         (load (fng-profile-static-method-calls-ptr))
+         (load (fng-profile-static-method-hits-ptr))
+         (load (fng-profile-static-method-scans-ptr)))
     (set! profile-start (fng-profile-note! "frontend_graph_build" (load profile-start)))
     (if analyze
         (do
