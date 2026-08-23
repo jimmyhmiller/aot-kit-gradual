@@ -1,5 +1,17 @@
 # Handoff: move JavaScript semantics into the DSL
 
+## MEMORY-ORDER VERIFICATION USES ITS INDEPENDENT DIRECT INDEX (2026-08-23, latest)
+
+The selection verifier now answers memory-producer placement queries from its independently rebuilt
+owner/node instruction lists instead of rescanning the complete machine prefix for every memory
+dependency. On the slow `Object/defineProperty/15.2.3.6-4-321.js` representative, selection fell
+from about 4.05–4.20 s to 2.23–2.36 s and selection verification itself fell from about
+1.04–1.10 s to 0.204–0.209 s, with the same runtime-failure outcome and identical graph shape.
+A 19-variant slow Object shard retained exact status/category parity while aggregate selection fell
+from 77.47 s to 44.01 s. The fixed 177-record benchmark also retained exact parity; aggregate
+selection fell from 8.785 s to 7.099 s. The mandatory gate remains 46/46 green, and frontier still
+reaches its seven intentional JavaScript failures without platform infrastructure errors.
+
 ## SELECTION DEPENDENCY REPAIR USES DIRECT INDICES (2026-08-23, latest)
 
 Selection's late-memory-dependency repair now uses the existing direct owner/node instruction

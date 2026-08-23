@@ -4118,17 +4118,29 @@
                            (or (= def-bid (ms-entry-block owner))
                                (or (= def-bid bid) (ms-block-dominates? def-bid bid)))))))))))
 
-(defn ms-node-inst-before [(owner i64) (node i64) (at i64)] (-> i64)
-  (let [(mut i) 0
+(defn ms-verifier-node-inst-head [(owner i64) (node i64)] (-> i64)
+  (let [u (machine-unit)
+        nodes (n-count)
+        key (+ (* owner nodes) node)]
+    (if (or (< owner 0)
+            (or (>= owner (mu-function-count))
+                (or (< node 0)
+                    (or (>= node nodes)
+                        (>= key (al-len [i64] (.verify-node-inst-head u)))))))
+        -1
+        (al-get [i64] (.verify-node-inst-head u) key))))
+
+(defn ms-node-inst-before [(owner i64) (node i64) (before i64)] (-> i64)
+  (let [u (machine-unit)
+        (mut i) (ms-verifier-node-inst-head owner node)
         (mut found) -1]
-    (loop (if (or (>= (load i) at) (>= (load found) 0))
+    ;; Verifier lists are newest instruction first, so the first entry below `before` is the
+    ;; nearest producer. The previous verifier rescanned the whole machine prefix per query.
+    (loop (if (or (< (load i) 0) (>= (load found) 0))
               (break)
               (do
-                (let [m (be-inst (load i))]
-                  (if (and (= (.owner m) owner) (= (.node m) node))
-                      (set! found (load i))
-                      0))
-                (set! i (+ (load i) 1))
+                (if (< (load i) before) (set! found (load i)) 0)
+                (set! i (al-get [i64] (.verify-node-inst-next u) (load i)))
                 0)))
     (load found)))
 
@@ -4178,27 +4190,25 @@
     (_ false)))
 
 (defn ms-memory-node-on-incoming-edge? [(owner i64) (node i64) (at i64)] (-> bool)
-  (let [consumer-block (ms-inst-block at)
-        (mut producer) 0
+  (let [u (machine-unit)
+        consumer-block (ms-inst-block at)
+        (mut producer) (ms-verifier-node-inst-head owner node)
         (mut found) false]
-    (loop (if (or (>= (load producer) (be-inst-count)) (load found))
+    (loop (if (or (< (load producer) 0) (load found))
               (break)
               (do
                 (let [m (be-inst (load producer))]
-                  (if (and (= (.owner m) owner)
-                           (= (.node m) node))
-                      (let [(mut edge) 0]
-                        (loop (if (or (>= (load edge) (mu-edge-count)) (load found))
-                                  (break)
-                                  (do
-                                    (if (and (= (mu-edge-source (load edge))
-                                                (.block-id m))
-                                             (= (mu-edge-target (load edge)) consumer-block))
-                                        (set! found true)
-                                        0)
-                                    (set! edge (+ (load edge) 1))))))
-                      0))
-                (set! producer (+ (load producer) 1)))))
+                  (let [(mut edge) 0]
+                    (loop (if (or (>= (load edge) (mu-edge-count)) (load found))
+                              (break)
+                              (do
+                                (if (and (= (mu-edge-source (load edge)) (.block-id m))
+                                         (= (mu-edge-target (load edge)) consumer-block))
+                                    (set! found true)
+                                    0)
+                                (set! edge (+ (load edge) 1)))))))
+                (set! producer
+                      (al-get [i64] (.verify-node-inst-next u) (load producer))))))
     (load found)))
 
 (defn ms-block-reaches? [(source i64) (target i64)] (-> bool)
@@ -4232,23 +4242,23 @@
       answer)))
 
 (defn ms-memory-node-on-loop-backedge? [(owner i64) (node i64) (at i64)] (-> bool)
-  (let [consumer-block (ms-inst-block at)
-        (mut producer) 0
+  (let [u (machine-unit)
+        consumer-block (ms-inst-block at)
+        (mut producer) (ms-verifier-node-inst-head owner node)
         (mut found) false]
-    (loop (if (or (>= (load producer) (be-inst-count)) (load found))
+    (loop (if (or (< (load producer) 0) (load found))
               (break)
               (do
                 (let [m (be-inst (load producer))
                       producer-block (.block-id m)]
-                  (if (and (= (.owner m) owner)
-                           (and (= (.node m) node)
-                                (and (!= producer-block consumer-block)
-                                     (or (= (ms-memory-block owner node) consumer-block)
-                                         (and (mu-dominates? consumer-block producer-block)
-                                              (ms-block-reaches? producer-block consumer-block))))))
+                  (if (and (!= producer-block consumer-block)
+                           (or (= (ms-memory-block owner node) consumer-block)
+                               (and (mu-dominates? consumer-block producer-block)
+                                    (ms-block-reaches? producer-block consumer-block))))
                       (set! found true)
                       0))
-                (set! producer (+ (load producer) 1)))))
+                (set! producer
+                      (al-get [i64] (.verify-node-inst-next u) (load producer))))))
     (load found)))
 
 (defn ms-memory-dependencies-valid? [(at i64)] (-> bool)
