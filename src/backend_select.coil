@@ -1206,7 +1206,7 @@
 (defn ms-selection-deeper-block [(current i64) (candidate i64)] (-> i64)
   (if (< candidate 0)
       current
-      (if (mu-dominates? current candidate) candidate current)))
+          (if (mu-dominates? current candidate) candidate current)))
 
 (defn ms-selection-value-block-fuel [(owner i64) (fallback i64) (vreg i64) (fuel i64)] (-> i64)
   (let [def (ms-def-inst vreg)]
@@ -3897,6 +3897,27 @@
                (or (= (.imm m) 2)
                    (or (= (.imm m) 4) (= (.imm m) 5)))))))
 
+;; A memory Phi can expose the same read through more than one dependency arm. Anti-dependencies
+;; are a set of required reads, not a path-counted multiset; duplicate nodes make the independent
+;; verifier observe one machine read but a larger declared count.
+(defn ms-add-memory-anti-dep! [(m (ptr MInst)) (first i64) (node i64)] (-> i64)
+  (let [u (machine-unit)
+        (mut at) first
+        (mut found) false]
+    (loop (if (or (load found) (>= (load at) (al-len [i64] (.memory-anti-deps u))))
+              (break)
+              (do
+                (if (= (al-get [i64] (.memory-anti-deps u) (load at)) node)
+                    (set! found true)
+                    0)
+                (set! at (+ (load at) 1)))))
+    (if (load found)
+        0
+        (do
+          (al-push! [i64] (field u memory-anti-deps) node)
+          (set! (.anti-count m) (+ (.anti-count m) 1))
+          0))))
+
 (defn ms-build-memory-anti-deps! [] (-> i64)
   (let [u (machine-unit)
         n (be-inst-count)
@@ -3935,7 +3956,8 @@
                   (set! (.anti-first m) first)
                   (set! (.anti-count m) 0)
                   (if (ms-machine-memory-write? m)
-                      (let [(mut dep) 0]
+                      (do
+                        (let [(mut dep) 0]
                         (loop (if (>= (load dep) (.mem-count m))
                                   (break)
                                   (do
@@ -3958,16 +3980,31 @@
                                                                        (mu-dominates?
                                                                          (.block-id candidate)
                                                                          (.block-id m)))))
-                                                        (do
-                                                          (al-push! [i64]
-                                                                    (field u memory-anti-deps)
-                                                                    (.node candidate))
-                                                          (set! (.anti-count m)
-                                                                (+ (.anti-count m) 1)))
+                                                        (ms-add-memory-anti-dep!
+                                                          m first (.node candidate))
                                                         0))
                                                   (set! prior
                                                         (al-get (.memory-read-next u) (load prior)))))))
                                     (set! dep (+ (load dep) 1))))))
+                        ;; Exact ideal-memory users are only a fast seed. A read can precede this
+                        ;; write through a different arm of a memory Phi and still dominate it;
+                        ;; that is a real read-before-write ordering constraint. Complete the set
+                        ;; from this owner's machine reads using the same semantic predicate the
+                        ;; independent verifier applies.
+                        (let [(mut candidate-at) 0]
+                          (loop (if (>= (load candidate-at) n)
+                                    (break)
+                                    (let [candidate (be-inst (load candidate-at))]
+                                      (if (and (= (.owner candidate) (.owner m))
+                                               (and (ms-machine-memory-read? candidate)
+                                                    (and (ms-memory-operands-may-alias? candidate m)
+                                                         (and (< (.node candidate) (.node m))
+                                                              (mu-dominates? (.block-id candidate)
+                                                                             (.block-id m))))))
+                                          (ms-add-memory-anti-dep! m first (.node candidate))
+                                          0)
+                                      (set! candidate-at (+ (load candidate-at) 1)))))
+                        ))
                       0))
                 (set! at (+ (load at) 1))
                 0)))
@@ -4620,12 +4657,29 @@
                                                 0)
                                             (set! dep (+ (load dep) 1))
                                             0)))
-                                    (if (not (load listed)) (set! ok false) 0))
+                                    (if (not (load listed))
+                                        (do
+                                          (fmt (stderr)
+                                               "selection anti-dependency missing write={d} read={d} write-block={d} read-block={d} declared={d}\n"
+                                               (.node m)
+                                               (.node candidate)
+                                               (.block-id m)
+                                               (.block-id candidate)
+                                               count)
+                                          (set! ok false))
+                                        0))
                                   (set! seen (+ (load seen) 1)))
                                 0))
                           (set! prior
                                 (al-get [i64] (.verify-memory-read-next u) (load prior)))
                           0)))
+              (if (and (load ok) (!= (load seen) count))
+                  (do
+                    (fmt (stderr)
+                         "selection anti-dependency count mismatch write={d} seen={d} declared={d}\n"
+                         (.node m) (load seen) count)
+                    0)
+                  0)
               (and (load ok) (= (load seen) count)))))))
 
 (defn ms-inst-dependencies-valid? [(at i64)] (-> bool)

@@ -17,12 +17,10 @@ diff here rather than as a paragraph nobody rechecked.
 | `an-inherited-data-property-reads-as-undefined.js` | disagrees |
 | `closure-capturing-a-loop-variable.js` | refused |
 | `for-await-has-no-bridge-kind.js` | refused |
-| `for-in-has-no-bridge-kind.js` | refused |
 | `for-of-destructuring-pattern.js` | refused |
 | `for-of-into-an-existing-binding.js` | refused |
 | `rest-parameters-are-unimplemented.js` | refused |
 | `shortest-round-trip-digits.js` | disagrees |
-| `shorthand-method-in-an-object-literal.js` | refused |
 
 `refused` means the frontend declines the program by name. `crashes` means it compiled
 and the binary did not answer. `disagrees` means it compiled, ran, and computed something
