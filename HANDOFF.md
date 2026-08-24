@@ -1,3 +1,10 @@
+## 2026-08-24: JSL callable closures use the source closure ABI
+
+- Added `:captures [name ...]` to `callable` declarations and a checked `(closure Callable value ...)` expression. Non-callables and wrong capture arities are rejected before lowering.
+- Creator and callee derive one deterministic environment shape: `__closure_target` followed by tagged capture fields. Creation uses `n-materialized-closure!`; entry unboxes hidden Parm 0 and loads captures through alias-typed memory Args, matching source closures rather than inventing a second representation.
+- On-demand linking follows closure targets, and callable bodies remain subject to the existing `:transitioning` effect contract.
+- Gate: `coil test` passed 48/48. Frontier remained intentionally red at 0/2.
+
 ## 2026-08-24: JSL can declare JavaScript-callable functions
 
 - Added a `callable` top-level declaration kind alongside `builtin` and `macro`.

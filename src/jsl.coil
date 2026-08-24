@@ -770,6 +770,8 @@
    (cold          bool)
    (params-off    i64)          ; window into the shared `params` array
    (nparams       i64)
+   (captures-off  i64)
+   (ncaptures     i64)
    (ret           i64)          ; a TyId; TY-NO-ID when `:ret` was omitted
    (usesmem       bool)         ; reads the heap, so it takes memory as a trailing parameter
    (callsback     bool)         ; invokes a JavaScript callback value, directly or through a callee
@@ -789,6 +791,7 @@
 (defstruct Jsl
   [(decls   (ArrayList JslDecl))
    (params  (ArrayList JslParam))
+   (captures (ArrayList (slice u8)))
    (binds   (ArrayList (slice u8)))   ; the checker's binding stack
    (marks   (ArrayList i64))          ; DFS colours, for macro-cycle detection
    (arities (ArrayList i64))          ; enclosing `loop` binding counts, innermost last
@@ -811,6 +814,7 @@
       (do (set! (.inited p) true)   ; set FIRST: `jsl-reset!` re-enters through here
           (set! (.decls p) (al-new [JslDecl] (malloc-allocator)))
           (set! (.params p) (al-new [JslParam] (malloc-allocator)))
+          (set! (.captures p) (al-new [(slice u8)] (malloc-allocator)))
           (set! (.binds p) (al-new [(slice u8)] (malloc-allocator)))
           (set! (.marks p) (al-new [i64] (malloc-allocator)))
           (set! (.paths p) (al-new [(slice u8)] (malloc-allocator)))
@@ -824,6 +828,7 @@
   (let [p (jsl)]
     (al-clear! [JslDecl]     (field p decls))
     (al-clear! [JslParam]    (field p params))
+    (al-clear! [(slice u8)]  (field p captures))
     (al-clear! [(slice u8)]  (field p binds))
     (al-clear! [i64]         (field p marks))
     (al-clear! [(slice u8)]  (field p paths))
@@ -913,6 +918,7 @@
 
 (defn jsl-decl-count [] (-> i64) (al-len [JslDecl] (.decls (jsl))))
 (defn jsl-param-count [] (-> i64) (al-len [JslParam] (.params (jsl))))
+(defn jsl-capture-count [] (-> i64) (al-len [(slice u8)] (.captures (jsl))))
 
 ;; `al-elem` returns a POINTER to the live element, so a field read is one expression and a field
 ;; write needs no read-modify-write. This used to be ten by-ref accessor functions plus an
@@ -969,6 +975,7 @@
     (load n)))
 
 (defn jsl-decl-nparams [(i i64)] (-> i64) (.nparams (jsl-decl-p i)))
+(defn jsl-decl-ncaptures [(i i64)] (-> i64) (.ncaptures (jsl-decl-p i)))
 (defn jsl-decl-ret [(i i64)] (-> i64) (.ret (jsl-decl-p i)))
 (defn jsl-decl-transitioning? [(i i64)] (-> bool) (.transitioning (jsl-decl-p i)))
 (defn jsl-decl-cold? [(i i64)] (-> bool) (.cold (jsl-decl-p i)))
@@ -1002,6 +1009,14 @@
   (al-elem [JslParam] (field (jsl) params) (+ (.params-off (jsl-decl-p d)) k)))
 (defn jsl-param-name [(d i64) (k i64)] (-> (slice u8)) (.name (jsl-param-p d k)))
 (defn jsl-param-ty [(d i64) (k i64)] (-> i64) (.ty (jsl-param-p d k)))
+(defn jsl-capture-name [(d i64) (k i64)] (-> (slice u8))
+  (al-get (.captures (jsl)) (+ (.captures-off (jsl-decl-p d)) k)))
+(defn jsl-capture-index [(d i64) (name (slice u8))] (-> i64)
+  (let [(mut k) 0 (mut found) -1]
+    (loop (if (or (>= (load k) (jsl-decl-ncaptures d)) (>= (load found) 0)) (break)
+            (do (if (= name (jsl-capture-name d (load k))) (set! found (load k)) 0)
+                (set! k (+ (load k) 1)))))
+    (load found)))
 
 ;; The parameter index a name denotes in this declaration, or -1. Linear because a signature is
 ;; capped at JSL-MAX-PARAMS and a hash here would cost more than it saves.
@@ -1324,6 +1339,7 @@
           (if (!= (jsl-literal-ty s) TY-NO-ID) (return-from :done JSL-OK) 0)
           (if (jsl-scope-has? s) (return-from :done JSL-OK) 0)
           (if (>= (jsl-param-index d s) 0) (return-from :done JSL-OK) 0)
+          (if (>= (jsl-capture-index d s) 0) (return-from :done JSL-OK) 0)
           (if (and (jsl-callable? d) (= s "this")) (return-from :done JSL-OK) 0)
           (return-from :done (jsl-fail! JSL-ERR-UNBOUND s)))
         0)
@@ -1344,6 +1360,20 @@
             (return-from :done (jsl-check-js-call-with-receiver x d)) 0)
         (if (= name "call-dynamic-with-receiver")
             (return-from :done (jsl-check-js-call-with-receiver x d)) 0)
+        (if (= name "closure")
+            (let [count (rd/sexp-count x)]
+              (if (< count 2) (return-from :done (jsl-fail! JSL-ERR-ARITY name)) 0)
+              (let [target-form (rd/sexp-nth x 1)]
+                (if (not (rd/sexp-sym? target-form))
+                    (return-from :done (jsl-fail! JSL-ERR-UNKNOWN-CALL name)) 0)
+                (let [target (jsl-find (rd/sexp-sym target-form))]
+                  (if (or (< target 0) (not (jsl-callable? target)))
+                      (return-from :done (jsl-fail! JSL-ERR-UNKNOWN-CALL
+                                                     (rd/sexp-sym target-form))) 0)
+                  (if (!= (- count 2) (jsl-decl-ncaptures target))
+                      (return-from :done (jsl-fail! JSL-ERR-ARITY
+                                                     (rd/sexp-sym target-form))) 0)
+                  (return-from :done (jsl-check-args x d 2))))) 0)
         (jsl-check-call x d)))))
 
 ; ============================================================================
@@ -1690,6 +1720,20 @@
         (store! out n)
         (load err)))))
 
+(defn jsl-read-captures! [(x (ptr rd/Sexp)) (name (slice u8)) (out (ptr i64))] (-> i64)
+  (block :done
+    (if (not (rd/sexp-vec? x)) (return-from :done (jsl-fail! JSL-ERR-BAD-PARAMS name)) 0)
+    (let [n (rd/sexp-count x) (mut i) 0]
+      (if (> n 4) (return-from :done (jsl-fail! JSL-ERR-TOO-MANY-PARAMS name)) 0)
+      (loop (if (>= (load i) n) (break)
+              (let [capture (rd/sexp-nth x (load i))]
+                (if (not (rd/sexp-sym? capture))
+                    (return-from :done (jsl-fail! JSL-ERR-BAD-PARAMS name)) 0)
+                (al-push! [(slice u8)] (field (jsl) captures) (rd/sexp-sym capture))
+                (set! i (+ (load i) 1)))))
+      (store! out n)
+      JSL-OK)))
+
 ;; `:labels (Name)`. A label may only appear on a `macro`: a label is a control edge into the
 ;; caller's CFG and a control edge cannot cross a call boundary, so declaring one on a `builtin` is
 ;; refused rather than ignored.
@@ -1730,7 +1774,9 @@
                          (if (= head-name "callable") JSL-KIND-CALLABLE
                            JSL-KIND-BUILTIN)))
                 params-off (jsl-param-count)
+                captures-off (jsl-capture-count)
                 (mut nparams) 0
+                (mut ncaptures) 0
                 (mut ret) TY-NO-ID
                 (mut label) ""
                 (mut transitioning) false
@@ -1747,6 +1793,10 @@
                                 v (rd/sexp-nth form (+ (load i) 1))]
                             (if (= key "params")
                                 (store! err (jsl-read-params! v name (mut nparams)))
+                              (if (= key "captures")
+                                (if (= kind JSL-KIND-CALLABLE)
+                                    (store! err (jsl-read-captures! v name (mut ncaptures)))
+                                    (store! err (jsl-fail! JSL-ERR-BAD-KEY key)))
                               (if (= key "ret")
                                   (let [t (jsl-type-of v)]
                                     (if (= t TY-NO-ID)
@@ -1761,7 +1811,7 @@
                                           (store! err (jsl-fail! JSL-ERR-BAD-BOOL name)))
                                     (if (= key "labels")
                                         (store! err (jsl-read-labels! v name kind (mut label)))
-                                      (store! err (jsl-fail! JSL-ERR-BAD-KEY key)))))))
+                                      (store! err (jsl-fail! JSL-ERR-BAD-KEY key))))))))
                             (store! i (+ (load i) 2))
                             0))))))
             (if (!= (load err) JSL-OK) (return-from :done (load err)) 0)
@@ -1776,6 +1826,8 @@
               (store! (field d cold)          (load cold))
               (store! (field d params-off)    params-off)
               (store! (field d nparams)       (load nparams))
+              (store! (field d captures-off)  captures-off)
+              (store! (field d ncaptures)     (load ncaptures))
               (store! (field d ret)           (load ret))
               (store! (field d body)          (rd/sexp-nth form (load i)))
               (store! (field d fun)           NO-NODE)

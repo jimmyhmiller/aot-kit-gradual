@@ -534,22 +534,79 @@
 (defn jl-expr [(x (ptr rd/Sexp))] (-> i64)
   (if (jl-diverged?) NO-NODE
     (if (rd/sexp-int? x) (jl-const (t-int-con (rd/sexp-int x)))
-     (if (rd/sexp-float? x) (jl-const (t-flt-bits (jl-float-bits x)))
-      (if (rd/sexp-str? x) (n-string-const! (jss-from-utf8! (rd/sexp-str x)))
-       (if (rd/sexp-sym? x) (jl-symbol (rd/sexp-sym x))
-        (let [head (rd/sexp-nth x 0)
-              name (rd/sexp-sym head)]
-          (if (= name "let") (jl-let x)
-            (if (= name "if") (jl-if x)
-              (if (= name "goto") (jl-goto x)
-               (if (= name "loop") (jl-loop x)
-                (if (= name "recur") (jl-recur x)
-                (if (= name "call") (jl-js-call x)
-                (if (= name "call-with-receiver") (jl-js-call-with-receiver x)
-                (if (= name "call-dynamic-with-receiver")
-                    (jl-js-call-dynamic-with-receiver x)
-                (if (jsl-prim-name? name) (jl-prim-call x name)
-                  (jl-call x name)))))))))))))))))
+      (if (rd/sexp-float? x) (jl-const (t-flt-bits (jl-float-bits x)))
+        (if (rd/sexp-str? x) (n-string-const! (jss-from-utf8! (rd/sexp-str x)))
+          (if (rd/sexp-sym? x) (jl-symbol (rd/sexp-sym x))
+            (let [name (rd/sexp-sym (rd/sexp-nth x 0))]
+              (cond (= name "let") (jl-let x)
+                    (= name "if") (jl-if x)
+                    (= name "goto") (jl-goto x)
+                    (= name "loop") (jl-loop x)
+                    (= name "recur") (jl-recur x)
+                    (= name "call") (jl-js-call x)
+                    (= name "call-with-receiver") (jl-js-call-with-receiver x)
+                    (= name "call-dynamic-with-receiver")
+                      (jl-js-call-dynamic-with-receiver x)
+                    (= name "closure") (jl-closure x)
+                    (jsl-prim-name? name) (jl-prim-call x name)
+                    :else (jl-call x name)))))))))
+
+(defn jl-capture-field-name [(i i64)] (-> (slice u8))
+  (case i 0 "__jsl_capture_0" 1 "__jsl_capture_1"
+          2 "__jsl_capture_2" 3 "__jsl_capture_3" "__jsl_capture_bad"))
+
+(defn jl-callable-env-shape [(d i64)] (-> i64)
+  (let [(mut shape) (shape-transition SHAPE-ROOT "__closure_target" (t-int))
+        (mut i) 0]
+    (loop (if (>= (load i) (jsl-decl-ncaptures d)) (break)
+            (do (set! shape (shape-transition (load shape)
+                                              (jl-capture-field-name (load i))
+                                              (t-dyn)))
+                (set! i (+ (load i) 1)))))
+    (load shape)))
+
+(defn jl-closure [(x (ptr rd/Sexp))] (-> i64)
+  (let [target (jsl-find (rd/sexp-sym (rd/sexp-nth x 1)))
+        fun (jsl-decl-fun target)
+        shape (jl-callable-env-shape target)
+        n (jsl-decl-ncaptures target)
+        (mut incoming) (al-new [i64] (malloc-allocator))
+        (mut captures) (al-new [i64] (malloc-allocator))
+        (mut stores) (al-new [i64] (malloc-allocator))
+        base-memory (jl-mem)
+        (mut i) 0]
+    (loop (if (>= (load i) (+ n 1)) (break)
+            (do (al-push! [i64] (mut incoming) base-memory)
+                (set! i (+ (load i) 1)))))
+    (set! i 0)
+    (loop (if (>= (load i) n) (break)
+            (do (al-push! [i64] (mut captures) (jl-expr (rd/sexp-nth x (+ (load i) 2))))
+                (set! i (+ (load i) 1)))))
+    (let [nw (n-new-obj! (jl-ctrl) shape (al-slice [i64] (load incoming)))
+          object (n-obj-ptr nw)]
+      (al-push! [i64] (mut stores)
+                (n-store! (n-obj-mem nw 0) object
+                          (jl-const (t-int-con (jsl-decl-fidx target)))
+                          (shape-field-alias shape 0)))
+      (set! i 0)
+      (loop (if (>= (load i) n) (break)
+              (do (al-push! [i64] (mut stores)
+                            (n-store! (n-obj-mem nw (+ (load i) 1)) object
+                                      (al-get [i64] (load captures) (load i))
+                                      (shape-field-alias shape (+ (load i) 1))))
+                  (set! i (+ (load i) 1)))))
+      (let [(mut merged) (al-get [i64] (load stores) 0)]
+        (set! i 1)
+        (loop (if (>= (load i) (al-len [i64] (load stores))) (break)
+                (do (set! merged (n-new3 (MemMerge) NO-NODE (load merged)
+                                         (al-get [i64] (load stores) (load i))))
+                    (set! i (+ (load i) 1)))))
+        (jl-set-mem! (load merged)))
+      (let [answer (n-materialized-closure! fun object (al-slice [i64] (load captures)))]
+        (al-free! [i64] (mut incoming))
+        (al-free! [i64] (mut captures))
+        (al-free! [i64] (mut stores))
+        answer))))
 
 ;; Invoke a JavaScript callback value and thread its effect through the same implicit heap cell as
 ;; the memory primitives. The pre-call heap is a trailing effect argument, never a source-level
@@ -1303,7 +1360,22 @@
     ; Parameters are the outermost bindings, created ONCE each. `jl-lookup` searches innermost
     ; first, so a `let` may shadow a parameter, and the checker resolves in the same order.
     (let [np (jsl-decl-nparams d) (mut k) 0]
-      (if (jsl-callable? d) (jl-bind! "this" (n-parm! fun 1)) 0)
+      (if (jsl-callable? d)
+          (do
+            (jl-bind! "this" (n-parm! fun 1))
+            (if (> (jsl-decl-ncaptures d) 0)
+                (let [entry (n-fun-entry fun)
+                      shape (jl-callable-env-shape d)
+                      env (n-unbox! (n-parm! fun 0) (t-obj-shape shape))
+                      (mut capture) 0]
+                  (loop (if (>= (load capture) (jsl-decl-ncaptures d)) (break)
+                          (let [alias (shape-field-alias shape (+ (load capture) 1))
+                                memory (n-new1 (Arg (t-mem-alias alias (t-dyn))) entry)]
+                            (jl-bind! (jsl-capture-name d (load capture))
+                                      (n-load! memory env alias))
+                            (set! capture (+ (load capture) 1))))))
+                0))
+          0)
       (loop (if (>= (load k) np) (break)
               (do (jl-bind! (jsl-param-name d (load k))
                             (n-parm! fun (+ (load k) (if (jsl-callable? d) 2 0))))
@@ -1403,6 +1475,10 @@
     (let [n (rd/sexp-count x) (mut i) 0 (mut err) JSL-OK]
       (if (and (rd/sexp-list? x) (and (> n 0) (rd/sexp-sym? (rd/sexp-nth x 0))))
           (let [name (rd/sexp-sym (rd/sexp-nth x 0))]
+            (if (and (= name "closure") (> n 1))
+                (let [target (jsl-find (rd/sexp-sym (rd/sexp-nth x 1)))]
+                  (if (>= target 0) (set! err (jl-require-decl! target)) 0))
+                0)
             ;; A `%Prim` has no declaration to pull; it is lowered inline wherever it appears.
             (if (jsl-prim-name? name) 0
               (let [c (jsl-find name)]
