@@ -98,6 +98,7 @@ typedef struct {
   uintptr_t owner;
   uintptr_t prototype;
   int frozen;
+  int extensible;
   int internal_kind;
   AotJsValue internal_target;
   int64_t internal_index;
@@ -250,7 +251,7 @@ static JsObjectRec *js_object(uintptr_t owner, int create) {
                        js_objects_len + 1, sizeof(*js_objects))) return NULL;
   int state = side_index_reserve(&js_object_index, js_objects_len + 1);
   if (!state) return NULL;
-  js_objects[js_objects_len] = (JsObjectRec){owner, 0, 0, -1, AOT_JS_UNDEFINED, 0};
+  js_objects[js_objects_len] = (JsObjectRec){owner, 0, 0, 1, -1, AOT_JS_UNDEFINED, 0};
   ++js_objects_len;
   if (state == 2) {
     if (!js_object_index_rebuild()) return NULL;
@@ -1533,6 +1534,7 @@ AotJsValue aot_js_property(uintptr_t owner, uint64_t name,
     JsObjectRec *object = js_object(owner, 1);
     if (!object) return AOT_JS_UNDEFINED;
     object->frozen = 1;
+    object->extensible = 0;
     js_any_frozen = 1;
     for (size_t i = 0; i < js_properties_len; ++i)
       if (js_properties[i].owner == owner) js_properties[i].attributes &= 10;
@@ -1543,6 +1545,17 @@ AotJsValue aot_js_property(uintptr_t owner, uint64_t name,
           uint8_t attrs = array->attributes[i] ? array->attributes[i] - 1 : 7;
           array->attributes[i] = (uint8_t)((attrs & 2) + 1);
         }
+    return (AotJsValue)owner;
+  }
+  if (operation == 22) {
+    JsObjectRec *object = js_object(owner, 1);
+    return object && object->extensible ? 1 : 0;
+  }
+  if (operation == 23) {
+    JsObjectRec *object = js_object(owner, 1);
+    if (!object) return AOT_JS_UNDEFINED;
+    object->extensible = 0;
+    js_any_frozen = 1;
     return (AotJsValue)owner;
   }
   JsObjectRec *integrity = js_object(owner, 0);
@@ -1724,6 +1737,7 @@ AotJsValue aot_js_property(uintptr_t owner, uint64_t name,
     JsPropertyRec *property = js_own_property(owner, name);
     if (property && operation != 16 && !(property->attributes & 1)) return property->value;
     if (!property) {
+      if (integrity && !integrity->extensible) return AOT_JS_UNDEFINED;
       if (!reserve_records((void **)&js_properties, &js_properties_cap,
                            js_properties_len + 1, sizeof(*js_properties)))
         return AOT_JS_UNDEFINED;

@@ -1814,3 +1814,14 @@ Fixed `MSEL-MEMORY-ORDER` on `ArrayResize`: the selector seeded anti-dependencie
 - It now asks the existing representation-aware value classifier. A numeric Phi normalized to a
   GPR returns as an integer; one normalized to an FPR returns as a double. The exact repro returns
   Node's `17` and is pinned in `tests/native-execution-test.coil`.
+# 2026-08-24: Object extensibility moved from accidental callable IDs into JSL
+
+- Closed `a-boolean-read-is-recomputed-after-a-write.js`; it now returns Node's `8`.
+- `Object.isExtensible` and `Object.preventExtensions` had no implementation. Unknown `Object.*`
+  members were all fabricated as opaque function kind 37, which could collide with source callable
+  IDs and crash. Unknown methods are no longer synthesized.
+- Added runtime capability operations for the object [[Extensible]] slot, exposed as JSL primitives.
+  `ObjectIsExtensibleValue` and `ObjectPreventExtensionsValue` in `lib/abstract/property.jsl` own
+  primitive handling and JavaScript results. The frontend owns only name and argument sequencing.
+- The permanent witness covers read-before-write ordering, primitive false, transition to
+  non-extensible, writes to existing properties, and rejection of new properties.
