@@ -1795,3 +1795,15 @@ Measured all 20,629 retained `frontend-bridge-kind-0` refusals by path and sourc
 ## 2026-08-24: selector anti-dependencies unlock object methods and for-in
 
 Fixed `MSEL-MEMORY-ORDER` on `ArrayResize`: the selector seeded anti-dependencies only from reads attached to the write's exact ideal memory inputs, missing earlier aliasing reads that reached the write through another memory-Phi arm. The builder now completes each write's deduplicated set with all earlier aliasing reads in the owner that dominate it, matching the independent verifier's semantic predicate. This moved both `shorthand-method-in-an-object-literal.js` and `for-in-has-no-bridge-kind.js` to agreement with Node. Both are pinned in `tests/native-execution-test.coil`, removed from `repros/open/` and the frontier suite, and the generated frontier is now 9 open bugs. Evidence: native frontier index 3/3 green, bounded gate 46/46 green, frontier 0/9 expected red.
+# 2026-08-24: prototype data writes execute; JSL bound closures remain the Function blocker
+
+- Fixed `Ctor.prototype.x = value` by executing every top-level prototype assignment in source
+  order through the ordinary lvalue and DSL property path. Prototype indexing remains call-target
+  metadata only; it no longer substitutes for JavaScript execution.
+- Closed `an-inherited-data-property-reads-as-undefined.js`: the exact program now returns Node's
+  `132`, and is pinned in `tests/native-execution-test.coil`.
+- Investigated Test262's 7,470 missing-`Function` failures. The high-fan-out harness operation is
+  `Function.prototype.call.bind(method)`. JSL can invoke a first-class callable, but cannot create
+  a callable closure capturing a target, receiver, or bound arguments. The proper next step is a
+  JSL closure-construction form integrated with the existing Closure ABI, not a frontend rewrite
+  of the harness expression.

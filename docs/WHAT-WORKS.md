@@ -12,9 +12,9 @@ deleted, and two of the four were fixed and still filed as open.
 
 | | count |
 |---|---|
-| whole programs compiled, run on the CPU and compared against node | 44 |
+| whole programs compiled, run on the CPU and compared against node | 45 |
 | methods agreeing with node, of those the sweep can call | 49 of 53 |
-| **open bugs, each a failing test** | 9 |
+| **open bugs, each a failing test** | 8 |
 
 ## The two commands
 
@@ -31,7 +31,6 @@ regression test it already was.
 
 - `a-boolean-read-is-recomputed-after-a-write.js` -- crashes
 - `a-numeric-ternary-return-cannot-be-called.js` -- refused
-- `an-inherited-data-property-reads-as-undefined.js` -- disagrees
 - `closure-capturing-a-loop-variable.js` -- refused
 - `for-await-has-no-bridge-kind.js` -- refused
 - `for-of-destructuring-pattern.js` -- refused
