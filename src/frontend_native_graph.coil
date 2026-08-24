@@ -605,13 +605,56 @@
 (defn fng-parameter-type [(frontend (ptr NativeFrontend))
                           (fn FeFunction)
                           (ordinal i64)] (-> i64)
-  (if (or (< ordinal 0) (>= ordinal (.parameter-count fn)))
+  ;; Surplus actuals are ELEMENTS of a rest array, not values of the array's declared type.
+  (if (or (< ordinal 0)
+          (or (>= ordinal (.parameter-count fn))
+              (and (.rest fn) (>= ordinal (- (.parameter-count fn) 1)))))
       FNG-DYNAMIC
       (let [symbol
               (al-get [FeSymbol]
                       (.symbols frontend)
                       (+ (.parameter-start fn) ordinal))]
         (fng-type-tag frontend (.type-node symbol)))))
+
+;; Normalize already-evaluated actuals for one exact target. The compiler owns the statically
+;; known formal/surplus split; allocation and element writes remain JSL operations.
+(defn fng-normalize-call-arguments! [(context FngContext)
+                                     (fn FeFunction)
+                                     (args (mut (ArrayList i64)))] (-> i64)
+  (let [frontend (load (field context frontend))
+        source-count (al-len [i64] (load args))
+        fixed-count (if (.rest fn) (- (.parameter-count fn) 1) (.parameter-count fn))
+        (mut normalized) (al-new [i64] (malloc-allocator))
+        (mut ordinal) 0]
+    (loop (if (>= (load ordinal) fixed-count) (break)
+            (do (al-push! [i64]
+                          (mut normalized)
+                          (fng-call-argument frontend fn (load ordinal)
+                            (if (< (load ordinal) source-count)
+                                (al-get [i64] (load args) (load ordinal))
+                                (fng-undefined))))
+                (set! ordinal (+ (load ordinal) 1)))))
+    (if (.rest fn)
+        (let [rest-array (fng-jsl-call0 context "NewArray")]
+          (set! ordinal fixed-count)
+          (loop (if (>= (load ordinal) source-count) (break)
+                  (do (fng-jsl-call2 context "ArrayOfAppend1"
+                                     rest-array
+                                     (fng-box-dynamic-argument!
+                                       (al-get [i64] (load args) (load ordinal))))
+                      (set! ordinal (+ (load ordinal) 1)))))
+          (al-push! [i64]
+                    (mut normalized)
+                    (fng-call-argument frontend fn fixed-count rest-array)))
+        0)
+    (set! (.len args) 0)
+    (set! ordinal 0)
+    (loop (if (>= (load ordinal) (al-len [i64] (load normalized))) (break)
+            (do (al-push! [i64] (mut args)
+                          (al-get [i64] (load normalized) (load ordinal)))
+                (set! ordinal (+ (load ordinal) 1)))))
+    (al-free! [i64] (mut normalized))
+    0))
 
 ;; The expected type an ARGUMENT expression is lowered under, which is only ever a structural shape.
 ;;
@@ -4817,22 +4860,13 @@
                                                 (mut snapshots))]
                 (set! (load (field context ctrl)) (arms-t arms))
                 (set! (.len call-args) 0)
-                (let [source-count (al-len [i64] (load args))
-                      parameter-count (.parameter-count fn)
-                      total (if (> source-count parameter-count) source-count parameter-count)
-                      (mut ordinal) 0]
-                  (loop (if (>= (load ordinal) total)
-                            (break)
-                            (let [value
-                                    (if (< (load ordinal) source-count)
-                                        (al-get [i64] (load args) (load ordinal))
-                                        (fng-undefined))]
-                              (al-push! [i64]
+                (let [(mut ordinal) 0]
+                  (loop (if (>= (load ordinal) (al-len [i64] (load args))) (break)
+                          (do (al-push! [i64]
                                         (mut call-args)
-                                        (if (< (load ordinal) parameter-count)
-                                            (fng-call-argument frontend fn (load ordinal) value)
-                                            value))
-                              (set! ordinal (+ (load ordinal) 1))))))
+                                        (al-get [i64] (load args) (load ordinal)))
+                              (set! ordinal (+ (load ordinal) 1)))))
+                  (fng-normalize-call-arguments! context fn (mut call-args)))
                 (fng-ensure-memory! context)
                 (if (!= (load (load (field context memory))) NO-NODE)
                     (al-push! [i64] (mut call-args) (load (load (field context memory))))
@@ -5241,15 +5275,9 @@
                                     value
                                     (fng-box-dynamic-argument! value)))))
                 (set! index (+ (load index) 1)))))
-    ; JavaScript fills omitted formal parameters with undefined. Native calls use a fixed register
-    ; ABI, so materialize those values explicitly for statically known targets.
+    ; Omitted fixed formals become undefined; a final rest formal receives a fresh DSL-built array.
     (if (>= argument-function-index 0)
-        (loop (if (>= (al-len [i64] (load args)) (.parameter-count argument-fn))
-                  (break)
-                  (let [ordinal (al-len [i64] (load args))]
-                    (al-push! [i64]
-                              (mut args)
-                              (fng-call-argument frontend argument-fn ordinal (fng-undefined))))))
+        (fng-normalize-call-arguments! context argument-fn (mut args))
         0)
     ;; Name/symbol resolution and callable dispatch use separate id spaces.  A call can therefore
     ;; reach an exact Fun even when the source-level lookup above could not recover its FeFunction.
@@ -5266,14 +5294,7 @@
                       (al-get [FeFunction]
                               (.functions frontend)
                               target-function-index)]
-                (loop (if (>= (al-len [i64] (load args))
-                                (.parameter-count target-fn))
-                          (break)
-                          (let [ordinal (al-len [i64] (load args))]
-                            (al-push! [i64]
-                                      (mut args)
-                                      (fng-call-argument frontend target-fn ordinal
-                                                         (fng-undefined)))))))
+                (fng-normalize-call-arguments! context target-fn (mut args)))
               0))
         0)
     (if chain-dispatch

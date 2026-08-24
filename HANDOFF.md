@@ -1,3 +1,11 @@
+## 2026-08-24: exact calls materialize rest arrays through JSL
+
+- Added a rest bit to `FeFunction`; `...xs` remains one final formal in the native ABI rather than being silently treated as an ordinary scalar parameter.
+- Exact and closed-world method call sites now evaluate all source arguments first, preserve fixed formals, and materialize surplus values with DSL `NewArray` and `ArrayOfAppend1`. Array allocation, growth, tagging, and stores remain owned by `lib/array/build.jsl`.
+- Surplus expressions are lowered dynamically rather than under the rest array's declared type. Empty rest arrays and fixed-prefix exclusion have permanent JavaScript native differential coverage; the frontier witness covers a closure-valued exact call. Multiple distinct rest callees in one function still expose a call-normalization defect and are not claimed here.
+- Removed `rest-parameters-are-unimplemented.js`; the frontier is now 2 open bugs. Polymorphic calls whose runtime target may have a rest formal still require a target-sensitive ABI and are not claimed by this strike.
+- Gate before promotion: `coil test` passed 46/46. The frontier rest witness compiled, executed natively, and agreed with Node.
+
 ## 2026-08-24: array binding patterns use DSL iterator semantics
 
 - Added stable bridge kinds for `BindingElement`, `ArrayBindingPattern`, and `ObjectBindingPattern`; the frontend no longer receives array binding patterns as anonymous kind zero.

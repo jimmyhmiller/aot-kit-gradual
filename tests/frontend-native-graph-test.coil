@@ -26,6 +26,7 @@
 (import "ty" :use *)
 (import "coil.io" :use *)
 (import "coil.alloc" :use * :as alloc)
+(import "coil.arraylist" :use *)
 (import "coil.fmt" :use *)
 
 ;; The rendered graph for one TypeScript program. 6201 is the seed the smoke programs used; it
@@ -139,36 +140,20 @@ n7: Return <- n0 n5 n6 : [ctrl,num,mem#-9223372036854775808 undefined]
   (jss-reset!)
   0)
 
-;; A REST PARAMETER IS REFUSED BY NAME RATHER THAN SILENTLY BOUND TO NOTHING.
-;;
-;; Nothing here implements `...xs`, and nothing noticed: it was indexed as an ordinary parameter
-;; named `xs`, the call site passed it nothing, and every read came back undefined. `xs.length` was
-;; therefore `undefined`, and `undefined | 0` is 0 -- so `(...xs) => xs.length` returned zero for
-;; every call, with a well-formed graph and no diagnostic anywhere. A wrong answer nothing signals
-;; is the worst outcome available, and it is what the sweep in docs/SWEEP-CATALOGUE.md found first.
-;;
-;; THIS PINS THE REFUSAL, NOT THE FEATURE. Rest parameters are still unimplemented; the fix is that
-;; saying so is now distinguishable from computing zero. The second case is the falsification: the
-;; same function without the ellipsis must still index, or the check would pass by refusing
-;; everything. repros/open/rest-parameters-report-length-zero.js.
-(deftest a_rest_parameter_is_refused_rather_than_bound_to_nothing
+;; Rest syntax is indexed as a final formal plus explicit function metadata. Native differential
+;; coverage below the frontend layer pins the array materialization and argument split.
+(deftest a_rest_parameter_is_indexed_with_rest_metadata
   (js-reset-world!)
   (let [(mut fe) (fe-native-new "function main(n: number): number {
   const f = (...xs: number[]): number => xs.length;
   return (n + f(1, 2, 3)) | 0;
 }
 ")]
-    (assert (!= (fe-native-index! (mut fe)) FE-OK))
-    (assert (= (load (field fe error-code)) FE-CODE-UNSUPPORTED-SYNTAX))
+    (assert (= (fe-native-index! (mut fe)) FE-OK))
+    (let [fn (al-get [FeFunction] (.functions fe) 1)]
+      (assert (.rest fn))
+      (assert (= (.parameter-count fn) 1)))
     (fe-native-free! (mut fe)))
-  (js-reset-world!)
-  (let [(mut ok) (fe-native-new "function main(n: number): number {
-  const f = (a: number, b: number, c: number): number => 3;
-  return (n + f(1, 2, 3)) | 0;
-}
-")]
-    (assert (= (fe-native-index! (mut ok)) FE-OK))
-    (fe-native-free! (mut ok)))
   0)
 
 (deftest catch_only_try_indexes_but_finally_is_still_refused

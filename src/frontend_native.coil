@@ -92,6 +92,7 @@
    (receiver-type-node i64)
    (arrow bool)
    (lexical-this bool)
+   (rest bool)
    (parameter-start i64)
    (parameter-count i64)])
 
@@ -140,6 +141,7 @@
                         (receiver-type i64)
                         (arrow bool)
                         (lexical-this bool)
+                        (rest bool)
                         (parameter-start i64)
                         (parameter-count i64)] (-> FeFunction)
   (FeFunction :id
@@ -162,6 +164,8 @@
               arrow
               :lexical-this
               lexical-this
+              :rest
+              rest
               :parameter-start
               parameter-start
               :parameter-count
@@ -1127,19 +1131,9 @@
                           (set! index (+ (load index) 1)))))
               (load found))))))
 
-;; A REST PARAMETER, DETECTED FROM ITS OWN SOURCE TEXT. Nothing in this frontend implements one,
-;; and until this check existed nothing noticed: `...xs` was indexed as an ordinary parameter named
-;; `xs`, the call site passed it nothing, and every read came back undefined. `xs.length` was
-;; therefore `undefined`, and `undefined | 0` is 0 -- so `(...xs) => xs.length` returned zero for
-;; every call, with a well-formed graph and no diagnostic anywhere.
-;;
-;; That is the worst outcome available: a wrong answer nothing signals. Refusing by name is not the
-;; feature, but it is the difference between "this is not supported" and a number that is quietly
-;; false. repros/open/rest-parameters-report-length-zero.js.
-;;
-;; The text, not a token kind: the bridge maps every syntax it does not enumerate to kind 0, so a
-;; `DotDotDotToken` is not reliably distinguishable from anything else it has not been taught. The
-;; parameter's extent always begins with the ellipsis when one is present.
+;; A REST PARAMETER, detected from its own source text because the bridge deliberately does not
+;; expose punctuation tokens. The graph frontend records this bit on the function and exact call
+;; sites pack surplus actuals into a DSL-built array after evaluating every argument.
 (defn fe-rest-parameter? [(ast TsAst) (parameter i64)] (-> bool)
   (let [t (ts-text ast parameter)]
     (and (>= (slice-len t) 3)
@@ -1155,6 +1149,7 @@
         (mut body) (ts-role ast node TS-ROLE-BODY 0)
         (mut result) (ts-role ast node TS-ROLE-TYPE 0)
         (mut receiver-type) -1
+        (mut rest) false
         (mut parameter-start) (al-len [FeSymbol] (.symbols frontend))
         (mut parameter-count) 0
         (mut index) 0]
@@ -1165,9 +1160,7 @@
                 (if (= kind TSK-PARAMETER)
                     (let [parameter-name (ts-role ast child TS-ROLE-NAME 0)
                           type-node (ts-role ast child TS-ROLE-TYPE 0)]
-                      (if (fe-rest-parameter? ast child)
-                          (fe-fail! (mut frontend) FE-CODE-UNSUPPORTED-SYNTAX child FE-ROLE-PARAMETER)
-                          0)
+                      (if (fe-rest-parameter? ast child) (set! rest true) 0)
                       (if (and (!= parameter-name -1)
                                (or (= (ts-kind ast parameter-name) TSK-THIS)
                                    (= (ts-text ast parameter-name) "this")))
@@ -1206,6 +1199,7 @@
                                   (load receiver-type)
                                   arrow
                                   lexical-this
+                                  (load rest)
                                   (load parameter-start)
                                   (load parameter-count))))
     0))
