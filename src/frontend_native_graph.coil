@@ -7688,12 +7688,12 @@
                 (increment-node i64)
                 (label-node i64)
                 ;; `for ... of` only, and NO-NODE/-1 for every other loop: the iterator object
-                ;; built once BEFORE the Loop, and the symbol its per-iteration value binds to.
+                ;; built once BEFORE the Loop, and the syntax node receiving each iteration value.
                 ;; Everything that makes for-of a loop rather than a syntax -- the phi set, the
                 ;; memory phis, the break/continue target, the label -- is this function's job
                 ;; already, so the two differences are passed in rather than copied out.
                 (iterator i64)
-                (binding-symbol i64)] (-> bool)
+                (binding-node i64)] (-> bool)
   (let [frontend (load (field context frontend))
         ast (field frontend ast)
         (mut carried) (al-new [i64] (malloc-allocator))
@@ -7705,6 +7705,15 @@
     (fng-assigned! frontend body-node (mut carried))
     (if (!= increment-node -1) (fng-assigned! frontend increment-node (mut carried)) 0)
     (if (!= condition-node -1) (fng-assigned! frontend condition-node (mut carried)) 0)
+    ;; An existing local assigned by `for (x of xs)` is itself loop-carried even when the body
+    ;; contains no other write to x. Declaration bindings are fresh loop locals and need no such
+    ;; addition; property/element targets carry their state through memory phis.
+    (if (and (!= binding-node -1) (= (ts-kind ast binding-node) TSK-IDENTIFIER))
+        (let [symbol (fe-resolution-symbol frontend binding-node)]
+          (if (and (>= symbol 0) (not (fng-list-has (mut carried) symbol)))
+              (al-push! [i64] (mut carried) symbol)
+              0))
+        0)
     (let [target-index (fng-push-target! context label-node true true (mut carried))]
       (n-add-def! loop-node NO-NODE)
       (n-add-def! loop-node (load (load (field context ctrl))))
@@ -7789,9 +7798,12 @@
         ;; object for nothing.
         (if (= iterator NO-NODE)
             0
-            (fng-set-symbol! context
-                             binding-symbol
-                             (fng-jsl-call1 context "IteratorValue" step)))
+            (let [value (fng-jsl-call1 context "IteratorValue" step)]
+              (if (= (ts-kind ast binding-node) TSK-VARIABLE-DECLARATION)
+                  (fng-set-symbol! context
+                                   (fe-symbol-for-declaration frontend binding-node (.owner context))
+                                   value)
+                  (fng-lvalue-write context (fng-lvalue context binding-node) value))))
         (let [body-continues (fng-statement context body-node)
               reaches-increment (fng-merge-target! context target-index FNG-JUMP-CONTINUE body-continues)]
           (if (and reaches-increment (!= increment-node -1)) (fng-expression context increment-node) 0)
@@ -8178,22 +8190,26 @@
 (defn fng-for-of [(context FngContext) (node i64) (label-node i64)] (-> bool)
   (let [frontend (load (field context frontend))
         ast (field frontend ast)
-        ;; `fe-for-enumeration-binding-valid?` has already refused every other initializer shape.
-        declaration (ts-child ast (ts-role ast node TS-ROLE-INITIALIZER 0) 0)
-        symbol (fe-symbol-for-declaration frontend declaration (.owner context))
+        initializer (ts-role ast node TS-ROLE-INITIALIZER 0)
+        declaration (if (= (ts-kind ast initializer) TSK-VARIABLE-DECLARATION-LIST)
+                        (ts-child ast initializer 0) initializer)
         iterable (fng-expression context (ts-role ast node TS-ROLE-EXPRESSION 0))
         iterator (fng-jsl-call1 context "GetIterator" (n-box! iterable))]
     ;; The element type is whatever the iterable holds, which nothing here claims to know. The
     ;; symbol was initialized to `undefined`/FNG-VOID by `fng-initialize-locals!`, and leaving it
     ;; there would tell inference the binding is undefined on every read.
-    (fng-set-symbol-type! context symbol FNG-DYNAMIC)
+    (if (= (ts-kind ast declaration) TSK-VARIABLE-DECLARATION)
+        (fng-set-symbol-type! context
+                              (fe-symbol-for-declaration frontend declaration (.owner context))
+                              FNG-DYNAMIC)
+        0)
     (fng-loop context
               -1
               (ts-role ast node TS-ROLE-STATEMENT 0)
               -1
               label-node
               iterator
-              symbol)))
+              declaration)))
 
 ;; `for (const key in object)` enumerates through DSL-owned ObjectKeys. The frontend owns only the
 ;; syntax binding and loop graph; coercion, key discovery, ordering, and iterator behavior remain
@@ -8201,19 +8217,24 @@
 (defn fng-for-in [(context FngContext) (node i64) (label-node i64)] (-> bool)
   (let [frontend (load (field context frontend))
         ast (field frontend ast)
-        declaration (ts-child ast (ts-role ast node TS-ROLE-INITIALIZER 0) 0)
-        symbol (fe-symbol-for-declaration frontend declaration (.owner context))
+        initializer (ts-role ast node TS-ROLE-INITIALIZER 0)
+        declaration (if (= (ts-kind ast initializer) TSK-VARIABLE-DECLARATION-LIST)
+                        (ts-child ast initializer 0) initializer)
         object (n-box! (fng-expression context (ts-role ast node TS-ROLE-EXPRESSION 0)))
         keys (fng-jsl-call1 context "ObjectKeys" object)
         iterator (fng-jsl-call1 context "GetIterator" (n-box! keys))]
-    (fng-set-symbol-type! context symbol FNG-DYNAMIC)
+    (if (= (ts-kind ast declaration) TSK-VARIABLE-DECLARATION)
+        (fng-set-symbol-type! context
+                              (fe-symbol-for-declaration frontend declaration (.owner context))
+                              FNG-DYNAMIC)
+        0)
     (fng-loop context
               -1
               (ts-role ast node TS-ROLE-STATEMENT 0)
               -1
               label-node
               iterator
-              symbol)))
+              declaration)))
 
 (defn fng-try-catch [(context FngContext) (node i64)] (-> bool)
   (let [frontend (load (field context frontend))

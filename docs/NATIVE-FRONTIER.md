@@ -15,7 +15,6 @@ diff here rather than as a paragraph nobody rechecked.
 | `closure-capturing-a-loop-variable.js` | refused |
 | `for-await-has-no-bridge-kind.js` | refused |
 | `for-of-destructuring-pattern.js` | refused |
-| `for-of-into-an-existing-binding.js` | refused |
 | `rest-parameters-are-unimplemented.js` | refused |
 | `shortest-round-trip-digits.js` | disagrees |
 

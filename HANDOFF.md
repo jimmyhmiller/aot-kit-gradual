@@ -1,3 +1,11 @@
+## 2026-08-24: `for (target of iterable)` assignment targets
+
+- Expanded for-of/for-in validation from declaration-only bindings to ordinary identifier, named-property, and computed-property assignment targets; destructuring remains explicitly refused.
+- The loop graph now carries existing local targets and writes each successful `IteratorValue` through `fng-lvalue-write`. Property and element semantics therefore remain delegated to JSL rather than being open-coded in control-flow lowering.
+- Added a permanent native differential witness covering `for (x of xs)`, `for (o.v of xs)`, and `for (o[k] of xs)`.
+- Removed `repros/open/for-of-into-an-existing-binding.js`; the frontier is now 5 open bugs.
+- Gate: `coil test` passed 46/46. Frontier: `coil test --suite frontier` remained intentionally red, 0/5. The report generator confirmed the removed repro and regenerated both derived status documents.
+
 # Handoff: move JavaScript semantics into the DSL
 
 ## DEAD IF ARMS NO LONGER CAUSE 6,316 SELECTION FAILURES (2026-08-24, latest)
