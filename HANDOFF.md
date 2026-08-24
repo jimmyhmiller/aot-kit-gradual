@@ -1,3 +1,11 @@
+## 2026-08-24: lexical loop closures and the AArch64 closure ABI
+
+- Fixed scalar loop entry arms that loaded captured cells through loop-header memory. Entry values are now snapshotted before loop memory phis are installed, so phi inputs are defined on their actual incoming edges.
+- Implemented CreatePerIterationEnvironment structure for captured `let`/`const` loop-header bindings. The body and increment receive distinct fresh cells; closures retain the body cell and therefore observe `0, 1, 2`, not the final `3`.
+- Brought AArch64 dynamic callable dispatch into parity with x64: `JSV-CLOSURE` is callable, ordinary objects are not, and only hidden environment argument 0 is retagged to `JSV-OBJECT` before entering the closure body.
+- Added a permanent native differential witness and removed `closure-capturing-a-loop-variable.js`; the frontier is now 4 open bugs.
+- Gate: `coil test` passed 46/46. Frontier: `coil test --suite frontier` remained intentionally red, 0/4. The broader `tests/native-execution-test.coil` currently remains red at 32/49 on unrelated pre-existing cases; the promoted loop-closure case was proven green by the identical frontier harness before promotion.
+
 ## 2026-08-24: `for (target of iterable)` assignment targets
 
 - Expanded for-of/for-in validation from declaration-only bindings to ordinary identifier, named-property, and computed-property assignment targets; destructuring remains explicitly refused.

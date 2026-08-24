@@ -579,18 +579,19 @@
                                 (if (be-poly-call? m) 1 0)))
                       poly-words
                         (if (be-poly-call? m)
-                            ; +5 fixed words and one extra mov over the function-only sequence:
-                            ; the dispatcher now also accepts an object-tagged closure and reads
-                            ; its __closure_target field for the callable id.
-                            (+ 33
+                            ; A materialized closure has its own callable tag. The closure arm also
+                            ; retags argument 0 as an object before entering the body, because that
+                            ; slot is the hidden environment pointer rather than the callable value.
+                            (+ 35
                                (+ (if (< (be-reg-of (load (field m a))) 0) 1 0)
                                   (+ (be-mov-words JSV-TAG-MASK)
                                      (+ (be-mov-words JSV-FUNCTION)
-                                        (+ (be-mov-words JSV-OBJECT)
+                                        (+ (be-mov-words JSV-CLOSURE)
                                            (+ (be-mov-words JSV-PAYLOAD-MASK)
-                                              (+ (be-mov-words -3)
-                                                 (+ (be-mov-words -4)
-                                                    (be-poly-call-dispatch-words m)))))))))
+                                              (+ (be-mov-words JSV-OBJECT)
+                                                 (+ (be-mov-words -3)
+                                                    (+ (be-mov-words -4)
+                                                       (be-poly-call-dispatch-words m))))))))))
                             5)]
                   (+ (+ poly-words
                         (* 2 (- (be-sp-adjust-words area) 1)))
@@ -1160,24 +1161,27 @@
                                 (let [targets (be-poly-call-targets m)
                                       (mut fidx) 0]
                                   ; The callee value dispatches by tag: a bare function's payload
-                                  ; IS the callable id, and an object-tagged closure carries its
-                                  ; id in the environment's __closure_target field (field 0 lives
-                                  ; just past the shape header word). Anything else traps loudly.
-                                  ; The environment itself needs no synthesis here — the call site
-                                  ; already passed the callee value in the environment slot.
+                                  ; IS the callable id, and a closure carries its id in the
+                                  ; environment's __closure_target field. Ordinary objects are not
+                                  ; callable. The closure VALUE remains tagged as a closure, while
+                                  ; hidden environment argument x0 is retagged as an object before
+                                  ; entering the body, matching the x64 ABI.
                                   (be-u32! (a64-ldr 16 31 (* argc 8)))
                                   (be-mov-imm! 17 JSV-TAG-MASK)
                                   (be-u32! (a64-and-reg 17 16 17))
                                   (be-mov-imm! 15 JSV-FUNCTION)
-                                  (be-mov-imm! 14 JSV-OBJECT)
+                                  (be-mov-imm! 14 JSV-CLOSURE)
                                   (be-mov-imm! 13 JSV-PAYLOAD-MASK)
                                   (be-u32! (a64-cmp-reg 17 15))
-                                  (be-u32! (a64-bcond 0 7))
+                                  (be-u32! (a64-bcond 0 (+ 9 (be-mov-words JSV-OBJECT))))
                                   (be-u32! (a64-cmp-reg 17 14))
                                   (be-u32! (a64-bcond 0 2))
                                   (be-u32! (a64-brk))
                                   (be-u32! (a64-and-reg 16 16 13))
                                   (be-u32! (a64-ldr 16 16 8))
+                                  (be-u32! (a64-and-reg 0 0 13))
+                                  (be-mov-imm! 14 JSV-OBJECT)
+                                  (be-u32! (a64-orr-reg 0 0 14))
                                   (be-u32! (a64-b 2))
                                   (be-u32! (a64-and-reg 16 16 13))
                                   (be-u32! (a64-add-reg 13 31 31))

@@ -7682,6 +7682,21 @@
     (al-free! [i64] (mut snapshots))
     (load answer)))
 
+(defn fng-loop-lexical-cell-symbol [(context FngContext) (initializer i64)] (-> i64)
+  (let [frontend (load (field context frontend))
+        ast (field frontend ast)]
+    (if (and (!= initializer -1)
+             (= (ts-kind ast initializer) TSK-VARIABLE-DECLARATION-LIST))
+        (let [text (ts-text ast initializer)]
+          (if (and (or (and (>= (slice-len text) 3) (= (substr text 0 3) "let"))
+                       (and (>= (slice-len text) 5) (= (substr text 0 5) "const")))
+                   (= (ts-child-count ast initializer) 1))
+              (let [declaration (ts-child ast initializer 0)
+                    symbol (fe-symbol-for-declaration frontend declaration (.owner context))]
+                (if (and (>= symbol 0) (fng-symbol-cell? context symbol)) symbol -1))
+              -1))
+        -1)))
+
 (defn fng-loop [(context FngContext)
                 (condition-node i64)
                 (body-node i64)
@@ -7693,10 +7708,13 @@
                 ;; memory phis, the break/continue target, the label -- is this function's job
                 ;; already, so the two differences are passed in rather than copied out.
                 (iterator i64)
-                (binding-node i64)] (-> bool)
+                (binding-node i64)
+                ;; A captured `let`/`const` loop-header binding gets a fresh cell each iteration.
+                (fresh-symbol i64)] (-> bool)
   (let [frontend (load (field context frontend))
         ast (field frontend ast)
         (mut carried) (al-new [i64] (malloc-allocator))
+        (mut initial-values) (al-new [i64] (malloc-allocator))
         (mut phis) (al-new [i64] (malloc-allocator))
         (mut active) (al-new [i64] (malloc-allocator))
         (mut memory-phis) (al-new [i64] (malloc-allocator))
@@ -7714,6 +7732,18 @@
               (al-push! [i64] (mut carried) symbol)
               0))
         0)
+    ;; Snapshot scalar entry values BEFORE replacing current memory with loop-header memory Phis.
+    ;; A captured local is a load through its cell alias; reading it after that replacement makes
+    ;; the value depend on the loop header while wiring it to the preheader Phi arm.
+    (set! index 0)
+    (loop (if (>= (load index) (al-len [i64] (load carried)))
+              (break)
+              (do
+                (al-push! [i64]
+                          (mut initial-values)
+                          (fng-symbol-node context
+                                           (al-get [i64] (load carried) (load index))))
+                (set! index (+ (load index) 1)))))
     (let [target-index (fng-push-target! context label-node true true (mut carried))]
       (n-add-def! loop-node NO-NODE)
       (n-add-def! loop-node (load (load (field context ctrl))))
@@ -7770,7 +7800,7 @@
                 (let [symbol (al-get [i64] (load carried) (load index))
                       phi (al-get [i64] (load phis) (load index))]
                   (n-add-def! phi loop-node)
-                  (n-add-def! phi (fng-symbol-node context symbol))
+                  (n-add-def! phi (al-get [i64] (load initial-values) (load index)))
                   (n-add-def! phi NO-NODE)
                   (fng-set-symbol! context symbol phi)
                   (set! index (+ (load index) 1)))))
@@ -7793,6 +7823,17 @@
             body-arm (if (= iterator NO-NODE) (arms-t arms) (arms-f arms))
             exit-arm (if (= iterator NO-NODE) (arms-f arms) (arms-t arms))]
         (set! (load (field context ctrl)) body-arm)
+        ;; CreatePerIterationEnvironment: carry the prior iteration's VALUE through the scalar Phi,
+        ;; but publish a fresh CELL before closures in this iteration are materialized. Existing
+        ;; `fng-set-symbol!` allocation and closure capture then implement the identity semantics.
+        (if (>= fresh-symbol 0)
+            (let [value (fng-symbol-node context fresh-symbol)]
+              (al-set! [i64]
+                       (mut (load (field context values)))
+                       fresh-symbol
+                       NO-NODE)
+              (fng-set-symbol! context fresh-symbol value))
+            0)
         ;; The binding is written INSIDE the body arm, after the done test: on the exhausted trip
         ;; there is no value, and IteratorValue would be reading `undefined` out of the result
         ;; object for nothing.
@@ -7806,6 +7847,17 @@
                   (fng-lvalue-write context (fng-lvalue context binding-node) value))))
         (let [body-continues (fng-statement context body-node)
               reaches-increment (fng-merge-target! context target-index FNG-JUMP-CONTINUE body-continues)]
+          ;; A classic `for (let i = ...; ...; i++)` creates the next iteration environment
+          ;; AFTER the body and BEFORE increment. Closures created by the body therefore retain
+          ;; the pre-increment cell; increment and the next condition operate on the fresh one.
+          (if (and (= iterator NO-NODE) (and reaches-increment (>= fresh-symbol 0)))
+              (let [value (fng-symbol-node context fresh-symbol)]
+                (al-set! [i64]
+                         (mut (load (field context values)))
+                         fresh-symbol
+                         NO-NODE)
+                (fng-set-symbol! context fresh-symbol value))
+              0)
           (if (and reaches-increment (!= increment-node -1)) (fng-expression context increment-node) 0)
           (set! index 0)
           (loop (if (>= (load index) (al-len [i64] (load carried)))
@@ -7870,8 +7922,9 @@
               (set! (load (field context memory)) NO-NODE))
           (let [continues (fng-merge-target! context target-index FNG-JUMP-BREAK true)]
             (fng-pop-target! context target-index)
-            (al-free! [i64] (mut carried))
-            (al-free! [i64] (mut phis))
+    (al-free! [i64] (mut carried))
+    (al-free! [i64] (mut initial-values))
+    (al-free! [i64] (mut phis))
             (al-free! [i64] (mut active))
             (al-free! [i64] (mut memory-phis))
             continues))))))
@@ -8209,7 +8262,8 @@
               -1
               label-node
               iterator
-              declaration)))
+              declaration
+              (fng-loop-lexical-cell-symbol context initializer))))
 
 ;; `for (const key in object)` enumerates through DSL-owned ObjectKeys. The frontend owns only the
 ;; syntax binding and loop graph; coercion, key discovery, ordering, and iterator behavior remain
@@ -8234,7 +8288,8 @@
               -1
               label-node
               iterator
-              declaration)))
+              declaration
+              (fng-loop-lexical-cell-symbol context initializer))))
 
 (defn fng-try-catch [(context FngContext) (node i64)] (-> bool)
   (let [frontend (load (field context frontend))
@@ -8321,7 +8376,7 @@
                          (ts-role ast node TS-ROLE-CONDITION 0)
                          -1)
           (= kind TSK-WHILE)
-            (fng-loop context (ts-child ast node 0) (ts-child ast node 1) -1 -1 NO-NODE -1)
+            (fng-loop context (ts-child ast node 0) (ts-child ast node 1) -1 -1 NO-NODE -1 -1)
           (= kind TSK-FOR)
             (let [count (ts-child-count ast node)
                   initialize (ts-child ast node 0)
@@ -8329,7 +8384,8 @@
                   increment (ts-child ast node 2)
                   body (ts-child ast node (- count 1))]
               (fng-statement context initialize)
-              (fng-loop context condition body increment -1 NO-NODE -1))
+              (fng-loop context condition body increment -1 NO-NODE -1
+                        (fng-loop-lexical-cell-symbol context initialize)))
           (= kind TSK-FOR-OF) (fng-for-of context node -1)
           (= kind TSK-FOR-IN) (fng-for-in context node -1)
           (= kind TSK-SWITCH) (fng-switch context node -1)
@@ -8352,6 +8408,7 @@
                                 -1
                                 label
                                 NO-NODE
+                                -1
                                 -1)
                     (= (ts-kind ast statement) TSK-FOR)
                       (let [count (ts-child-count ast statement)
@@ -8360,7 +8417,8 @@
                             increment (ts-child ast statement 2)
                             body (ts-child ast statement (- count 1))]
                         (fng-statement context initialize)
-                        (fng-loop context condition body increment label NO-NODE -1))
+                        (fng-loop context condition body increment label NO-NODE -1
+                                  (fng-loop-lexical-cell-symbol context initialize)))
                     (= (ts-kind ast statement) TSK-FOR-OF) (fng-for-of context statement label)
                     (= (ts-kind ast statement) TSK-FOR-IN) (fng-for-in context statement label)
                     (= (ts-kind ast statement) TSK-SWITCH) (fng-switch context statement label)
