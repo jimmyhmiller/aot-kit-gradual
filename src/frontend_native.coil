@@ -314,10 +314,32 @@
                 (set! index (+ (load index) 1)))))
     (load found)))
 
-;; A single declared identifier or an ordinary assignment target in `for ... of` / `for ... in`.
-;; Binding patterns remain a distinct missing feature. Keeping this check syntactic is deliberate:
+;; A declared identifier, an array binding pattern, or an ordinary assignment target in
+;; `for ... of` / `for ... in`. Keeping this check syntactic is deliberate:
 ;; the graph builder owns assignment structure, while IteratorValue and property writes remain JSL
 ;; operations.
+(defn fe-array-binding-pattern-valid? [(ast TsAst) (node i64)] (-> bool)
+  (let [kind (ts-kind ast node)]
+    (if (= kind TSK-IDENTIFIER)
+        true
+        (if (= kind TSK-BINDING-ELEMENT)
+            (let [name (ts-role ast node TS-ROLE-NAME 0)]
+              ;; Defaults and rest require their own abrupt/evaluation semantics. Refuse them
+              ;; until those semantics exist rather than quietly ignoring either one.
+              (and (!= name -1)
+                   (and (= (ts-role ast node TS-ROLE-INITIALIZER 0) -1)
+                        (fe-array-binding-pattern-valid? ast name))))
+            (if (= kind TSK-ARRAY-BINDING-PATTERN)
+                (let [(mut i) 0 (mut valid) true]
+                  (loop (if (or (>= (load i) (ts-child-count ast node)) (not (load valid)))
+                            (break)
+                            (do (if (not (fe-array-binding-pattern-valid?
+                                           ast (ts-child ast node (load i))))
+                                    (set! valid false) 0)
+                                (set! i (+ (load i) 1)))))
+                  (load valid))
+                false)))))
+
 (defn fe-for-enumeration-binding-valid? [(ast TsAst) (node i64)] (-> bool)
   (let [initializer (ts-role ast node TS-ROLE-INITIALIZER 0)]
     (and (!= initializer -1)
@@ -329,8 +351,8 @@
                                (let [declaration (ts-child ast initializer 0)]
                                  (and (= (ts-kind ast declaration) TSK-VARIABLE-DECLARATION)
                                       (and (= (ts-child-count ast declaration) 1)
-                                           (= (ts-kind ast (ts-child ast declaration 0))
-                                              TSK-IDENTIFIER))))))))))))
+                                           (fe-array-binding-pattern-valid?
+                                             ast (ts-role ast declaration TS-ROLE-NAME 0)))))))))))))
 
 (defn fe-validate-node! [(frontend (mut NativeFrontend))
                          (node i64)
@@ -1209,16 +1231,48 @@
                   (set! index (+ (load index) 1))))))
     0))
 
+;; One declaration may introduce several lexical names. Symbols retain the declaration node for
+;; the ordinary one-name case (many existing queries use that identity), while pattern leaves use
+;; their identifier node as the unique declaration identity.
+(defn fe-index-binding-names! [(frontend (mut NativeFrontend))
+                               (declaration i64)
+                               (name i64)
+                               (owner i64)
+                               (role i64)
+                               (type-node i64)
+                               (symbol-base i64)] (-> i64)
+  (let [ast (field frontend ast) kind (ts-kind ast name)]
+    (if (= kind TSK-IDENTIFIER)
+        (let [sid (+ symbol-base (al-len [FeSymbol] (.symbols frontend)))
+              identity (if (= (ts-kind ast (ts-role ast declaration TS-ROLE-NAME 0)) TSK-IDENTIFIER)
+                           declaration name)]
+          (al-push! [FeSymbol]
+                    (mut (.symbols frontend))
+                    (fe-symbol-make sid identity name owner role type-node)))
+        (if (or (= kind TSK-ARRAY-BINDING-PATTERN) (= kind TSK-OBJECT-BINDING-PATTERN))
+            (let [(mut i) 0]
+              (loop (if (>= (load i) (ts-child-count ast name)) (break)
+                      (do (fe-index-binding-names! (mut frontend)
+                                                   declaration
+                                                   (ts-child ast name (load i))
+                                                   owner role type-node symbol-base)
+                          (set! i (+ (load i) 1))))))
+            (if (= kind TSK-BINDING-ELEMENT)
+                (let [nested (ts-role ast name TS-ROLE-NAME 0)]
+                  (if (!= nested -1)
+                      (fe-index-binding-names! (mut frontend)
+                                               declaration nested owner role type-node symbol-base)
+                      0))
+                0))))
+  0)
+
 (defn fe-scan-locals! [(frontend (mut NativeFrontend)) (node i64) (owner i64) (symbol-base i64)] (-> i64)
   (let [ast (field frontend ast)]
     (if (= (ts-kind ast node) TSK-VARIABLE-DECLARATION)
-        (let [name (ts-child-of-kind ast node TSK-IDENTIFIER)
+        (let [name (ts-role ast node TS-ROLE-NAME 0)
               count (ts-child-count ast node)
-              maybe-type (if (> count 2) (ts-child ast node 1) -1)
-              sid (+ symbol-base (al-len [FeSymbol] (.symbols frontend)))]
-          (al-push! [FeSymbol]
-                    (mut (.symbols frontend))
-                    (fe-symbol-make sid node name owner FE-ROLE-LOCAL maybe-type)))
+              maybe-type (if (> count 2) (ts-child ast node 1) -1)]
+          (fe-index-binding-names! (mut frontend) node name owner FE-ROLE-LOCAL maybe-type symbol-base))
         0)
     (if (fe-function-expression-kind? (ts-kind ast node))
         0
@@ -1242,11 +1296,9 @@
                       (loop (if (>= (load declaration-index) (ts-child-count ast list))
                                 (break)
                                 (let [declaration (ts-child ast list (load declaration-index))
-                                      name (ts-child-of-kind ast declaration TSK-IDENTIFIER)
-                                      sid (+ symbol-base (al-len [FeSymbol] (.symbols frontend)))]
-                                  (al-push! [FeSymbol]
-                                            (mut (.symbols frontend))
-                                            (fe-symbol-make sid declaration name owner FE-ROLE-GLOBAL -1))
+                                      name (ts-role ast declaration TS-ROLE-NAME 0)]
+                                  (fe-index-binding-names! (mut frontend) declaration name owner
+                                                           FE-ROLE-GLOBAL -1 symbol-base)
                                   (set! declaration-index (+ (load declaration-index) 1))))))
                     0)
                 (set! index (+ (load index) 1)))))
@@ -1261,6 +1313,17 @@
                 (if (and (= (.node symbol) node) (= (.owner symbol) owner))
                     (set! answer (.id symbol))
                     0)
+                (set! index (+ (load index) 1)))))
+    (load answer)))
+
+(defn fe-symbol-for-binding-name [(frontend (ptr NativeFrontend)) (node i64) (owner i64)] (-> i64)
+  (let [(mut index) 0 (mut answer) -1]
+    (loop (if (or (>= (load index) (al-len [FeSymbol] (.symbols frontend)))
+                  (!= (load answer) -1))
+              (break)
+              (let [symbol (al-get [FeSymbol] (.symbols frontend) (load index))]
+                (if (and (= (.name-node symbol) node) (= (.owner symbol) owner))
+                    (set! answer (.id symbol)) 0)
                 (set! index (+ (load index) 1)))))
     (load answer)))
 
@@ -1398,6 +1461,30 @@
         0)
     (load answer)))
 
+(defn fe-resolve-binding-pattern! [(frontend (mut NativeFrontend))
+                                   (bindings (mut (ArrayList FeBinding)))
+                                   (node i64)
+                                   (owner i64)
+                                   (depth i64)] (-> i64)
+  (let [ast (field frontend ast) kind (ts-kind ast node)]
+    (if (= kind TSK-IDENTIFIER)
+        (let [symbol (fe-symbol-for-binding-name frontend node owner)]
+          (al-push! [FeBinding] (mut bindings) (fe-binding-make node symbol depth)))
+        (if (= kind TSK-BINDING-ELEMENT)
+            (let [name (ts-role ast node TS-ROLE-NAME 0)]
+              (if (!= name -1)
+                  (fe-resolve-binding-pattern! (mut frontend) (mut bindings) name owner depth) 0))
+            (if (or (= kind TSK-ARRAY-BINDING-PATTERN) (= kind TSK-OBJECT-BINDING-PATTERN))
+                (let [(mut i) 0]
+                  (loop (if (>= (load i) (ts-child-count ast node)) (break)
+                          (do (fe-resolve-binding-pattern! (mut frontend)
+                                                           (mut bindings)
+                                                           (ts-child ast node (load i))
+                                                           owner depth)
+                              (set! i (+ (load i) 1))))))
+                0))))
+  0)
+
 (defn fe-resolve-node! [(frontend (mut NativeFrontend))
                         (bindings (mut (ArrayList FeBinding)))
                         (node i64)
@@ -1449,14 +1536,13 @@
               0)
           (= kind TSK-VARIABLE-DECLARATION)
             (let [count (ts-child-count ast node)
-                  name (ts-child-of-kind ast node TSK-IDENTIFIER)
-                  value (if (> count 1) (ts-child ast node (- count 1)) -1)
-                  symbol (fe-symbol-for-declaration frontend node owner)]
+                  name (ts-role ast node TS-ROLE-NAME 0)
+                  value (ts-role ast node TS-ROLE-INITIALIZER 0)]
               ;; Initializers are resolved before the declaration enters scope.
               (if (and (!= value -1) (!= value name))
                   (fe-resolve-node! (mut frontend) (mut bindings) value owner depth)
                   0)
-              (al-push! [FeBinding] (mut bindings) (fe-binding-make name symbol depth))
+              (fe-resolve-binding-pattern! (mut frontend) (mut bindings) name owner depth)
               0)
           ;; The ITERABLE is evaluated in the enclosing scope and the binding is visible only
           ;; inside the loop. The default child walk got both wrong: it walks children in order,

@@ -218,6 +218,9 @@ func stableKindCode(kind ast.Kind) int32 {
 	case ast.KindStringKeyword: return 154
 	case ast.KindUnknownKeyword: return 159
 	case ast.KindComputedPropertyName: return 168
+	case ast.KindBindingElement: return 308
+	case ast.KindObjectBindingPattern: return 309
+	case ast.KindArrayBindingPattern: return 310
 	case ast.KindParameter: return 170
 	case ast.KindPropertySignature: return 172
 	case ast.KindTypeReference: return 184

@@ -13,7 +13,6 @@ diff here rather than as a paragraph nobody rechecked.
 | repro | status |
 |---|---|
 | `for-await-has-no-bridge-kind.js` | refused |
-| `for-of-destructuring-pattern.js` | refused |
 | `rest-parameters-are-unimplemented.js` | refused |
 | `shortest-round-trip-digits.js` | disagrees |
 

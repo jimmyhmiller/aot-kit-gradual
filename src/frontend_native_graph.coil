@@ -7697,6 +7697,28 @@
               -1))
         -1)))
 
+;; Binding patterns are syntax structure. Array extraction deliberately goes through the same JSL
+;; iterator protocol as source `for-of`; the frontend only walks the pattern and publishes each
+;; resulting value into its lexical symbol.
+(defn fng-bind-pattern! [(context FngContext) (pattern i64) (value i64)] (-> i64)
+  (let [frontend (load (field context frontend)) ast (field frontend ast) kind (ts-kind ast pattern)]
+    (if (= kind TSK-IDENTIFIER)
+        (let [symbol (fe-symbol-for-binding-name frontend pattern (.owner context))]
+          (fng-set-symbol! context symbol value)
+          (fng-set-symbol-type! context symbol FNG-DYNAMIC))
+        (if (= kind TSK-BINDING-ELEMENT)
+            (fng-bind-pattern! context (ts-role ast pattern TS-ROLE-NAME 0) value)
+            (if (= kind TSK-ARRAY-BINDING-PATTERN)
+                (let [iterator (fng-jsl-call1 context "GetIterator" (n-box! value))
+                      (mut i) 0]
+                  (loop (if (>= (load i) (ts-child-count ast pattern)) (break)
+                          (let [step (fng-jsl-call1 context "ArrayIteratorNext" iterator)
+                                element (fng-jsl-call1 context "IteratorValue" step)]
+                            (fng-bind-pattern! context (ts-child ast pattern (load i)) element)
+                            (set! i (+ (load i) 1))))))
+                0))))
+  value)
+
 (defn fng-loop [(context FngContext)
                 (condition-node i64)
                 (body-node i64)
@@ -7841,9 +7863,9 @@
             0
             (let [value (fng-jsl-call1 context "IteratorValue" step)]
               (if (= (ts-kind ast binding-node) TSK-VARIABLE-DECLARATION)
-                  (fng-set-symbol! context
-                                   (fe-symbol-for-declaration frontend binding-node (.owner context))
-                                   value)
+                  (fng-bind-pattern! context
+                                     (ts-role ast binding-node TS-ROLE-NAME 0)
+                                     value)
                   (fng-lvalue-write context (fng-lvalue context binding-node) value))))
         (let [body-continues (fng-statement context body-node)
               reaches-increment (fng-merge-target! context target-index FNG-JUMP-CONTINUE body-continues)]
@@ -8188,14 +8210,15 @@
   (let [frontend (load (field context frontend))
         ast (field frontend ast)
         count (ts-child-count ast node)
-        name (ts-child-of-kind ast node TSK-IDENTIFIER)
+        name (ts-role ast node TS-ROLE-NAME 0)
         ;; The initializer is a ROLE, not the last child: `let x: any;` has the TYPE ANNOTATION
         ;; as its last child, and lowering that as an expression panicked the initializer
         ;; tripwire on every annotated-but-uninitialized declaration.
         value-node (ts-role ast node TS-ROLE-INITIALIZER 0)
         has-value (and (!= value-node -1) (!= value-node name))
-        symbol (fe-symbol-for-declaration frontend node (.owner context))
-        declared (fng-declared-symbol-type frontend symbol)
+        pattern (= (ts-kind ast name) TSK-ARRAY-BINDING-PATTERN)
+        symbol (if pattern -1 (fe-symbol-for-declaration frontend node (.owner context)))
+        declared (if pattern FNG-DYNAMIC (fng-declared-symbol-type frontend symbol))
         value (if has-value
                   (fng-expression-expected context value-node declared)
                   (fng-symbol-node context symbol))]
@@ -8203,9 +8226,11 @@
         (do (panic-corrupt "declaration initializer evaluated to NO-NODE") 0)
         0)
     (if has-value
-        (do
-          (fng-set-symbol! context symbol value)
-          (fng-set-symbol-type! context symbol (fng-infer context value-node declared)))
+        (if pattern
+            (fng-bind-pattern! context name value)
+            (do
+              (fng-set-symbol! context symbol value)
+              (fng-set-symbol-type! context symbol (fng-infer context value-node declared))))
         0)
     value))
 
@@ -8251,7 +8276,8 @@
     ;; The element type is whatever the iterable holds, which nothing here claims to know. The
     ;; symbol was initialized to `undefined`/FNG-VOID by `fng-initialize-locals!`, and leaving it
     ;; there would tell inference the binding is undefined on every read.
-    (if (= (ts-kind ast declaration) TSK-VARIABLE-DECLARATION)
+    (if (and (= (ts-kind ast declaration) TSK-VARIABLE-DECLARATION)
+             (= (ts-kind ast (ts-role ast declaration TS-ROLE-NAME 0)) TSK-IDENTIFIER))
         (fng-set-symbol-type! context
                               (fe-symbol-for-declaration frontend declaration (.owner context))
                               FNG-DYNAMIC)
@@ -8277,7 +8303,8 @@
         object (n-box! (fng-expression context (ts-role ast node TS-ROLE-EXPRESSION 0)))
         keys (fng-jsl-call1 context "ObjectKeys" object)
         iterator (fng-jsl-call1 context "GetIterator" (n-box! keys))]
-    (if (= (ts-kind ast declaration) TSK-VARIABLE-DECLARATION)
+    (if (and (= (ts-kind ast declaration) TSK-VARIABLE-DECLARATION)
+             (= (ts-kind ast (ts-role ast declaration TS-ROLE-NAME 0)) TSK-IDENTIFIER))
         (fng-set-symbol-type! context
                               (fe-symbol-for-declaration frontend declaration (.owner context))
                               FNG-DYNAMIC)

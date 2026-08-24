@@ -1,3 +1,11 @@
+## 2026-08-24: array binding patterns use DSL iterator semantics
+
+- Added stable bridge kinds for `BindingElement`, `ArrayBindingPattern`, and `ObjectBindingPattern`; the frontend no longer receives array binding patterns as anonymous kind zero.
+- Replaced the one-declaration/one-symbol assumption with recursive binding-name indexing and lexical resolution. Pattern leaves get independent symbols, so nested declarations and loop headers use the same scope machinery.
+- Lowered array pattern extraction through `GetIterator`, `ArrayIteratorNext`, and `IteratorValue` from `lib/array/iterator.jsl`. The frontend owns only recursive binding structure; it does not open-code iteration or indexed-read semantics.
+- Added permanent native differential coverage for ordinary, nested, and `for-of` array binding patterns. Removed `for-of-destructuring-pattern.js`; the frontier is now 3 open bugs.
+- Gate: `coil test` passed 46/46. Before promotion, the frontier case compiled, executed natively, and agreed with Node; the remaining frontier was intentionally red at 0/3.
+
 ## 2026-08-24: lexical loop closures and the AArch64 closure ABI
 
 - Fixed scalar loop entry arms that loaded captured cells through loop-header memory. Entry values are now snapshotted before loop memory phis are installed, so phi inputs are defined on their actual incoming edges.
