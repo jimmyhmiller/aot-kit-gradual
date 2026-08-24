@@ -302,12 +302,22 @@
    (selected-values (ArrayList i64))
    (selected-nodes (ArrayList i64))
    (selected-blocks (ArrayList i64))
+   ;; Selection runs owners sequentially, so one node-indexed memo plus an owner tag preserves
+   ;; isolation without allocating function-count * graph-node-count slots.
+   (selected-value-owners (ArrayList i64))
+   (selected-node-owners (ArrayList i64))
+   (selected-block-owners (ArrayList i64))
    ;; Live Phi nodes grouped by target block in ideal-node order. Selection consumes this index
    ;; for reservation and edge copies instead of scanning the whole ideal graph per function/edge.
    (block-phi-head (ArrayList i64))
    (node-phi-next (ArrayList i64))
    (packed-insts (ArrayList MInst))
    (selection-memory-deps (ArrayList i64))
+   (selection-memory-pending (ArrayList i64))
+   ;; One-time candidate indexes for selection roots. The old selector rediscovered these by
+   ;; scanning every ideal node twice for every function.
+   (selection-ingress-candidates (ArrayList i64))
+   (selection-effect-candidates (ArrayList i64))
    (memory-anti-deps (ArrayList i64))
    (memory-read-head (ArrayList i64))
    (memory-read-next (ArrayList i64))
@@ -318,6 +328,8 @@
    ;; Dense vreg -> defining instruction index. Rebuilt whenever instruction packing changes so
    ;; placement, scheduling, and verification never recover a definition by scanning the unit.
    (vreg-def-inst (ArrayList i64))
+   ;; Dense block id -> final encoded byte offset, published by the sizing pass.
+   (block-code-offset (ArrayList i64))
    (node-inst-head (ArrayList i64))
    (node-inst-next (ArrayList i64))
    (pack-next (ArrayList i64))
@@ -463,10 +475,16 @@
           (set! (.selected-values u) (al-new [i64] (malloc-allocator)))
           (set! (.selected-nodes u) (al-new [i64] (malloc-allocator)))
           (set! (.selected-blocks u) (al-new [i64] (malloc-allocator)))
+          (set! (.selected-value-owners u) (al-new [i64] (malloc-allocator)))
+          (set! (.selected-node-owners u) (al-new [i64] (malloc-allocator)))
+          (set! (.selected-block-owners u) (al-new [i64] (malloc-allocator)))
           (set! (.block-phi-head u) (al-new [i64] (malloc-allocator)))
           (set! (.node-phi-next u) (al-new [i64] (malloc-allocator)))
           (set! (.packed-insts u) (al-new [MInst] (malloc-allocator)))
           (set! (.selection-memory-deps u) (al-new [i64] (malloc-allocator)))
+          (set! (.selection-memory-pending u) (al-new [i64] (malloc-allocator)))
+          (set! (.selection-ingress-candidates u) (al-new [i64] (malloc-allocator)))
+          (set! (.selection-effect-candidates u) (al-new [i64] (malloc-allocator)))
           (set! (.memory-anti-deps u) (al-new [i64] (malloc-allocator)))
           (set! (.memory-read-head u) (al-new [i64] (malloc-allocator)))
           (set! (.memory-read-next u) (al-new [i64] (malloc-allocator)))
@@ -475,6 +493,7 @@
           (set! (.schedule-done u) (al-new [i64] (malloc-allocator)))
           (set! (.vreg-new-def u) (al-new [i64] (malloc-allocator)))
           (set! (.vreg-def-inst u) (al-new [i64] (malloc-allocator)))
+          (set! (.block-code-offset u) (al-new [i64] (malloc-allocator)))
           (set! (.node-inst-head u) (al-new [i64] (malloc-allocator)))
           (set! (.node-inst-next u) (al-new [i64] (malloc-allocator)))
           (set! (.pack-next u) (al-new [i64] (malloc-allocator)))
@@ -571,13 +590,14 @@
     (al-clear! [i64] (field u block-idom))
     (al-clear! [i64] (field u rpo-seen))
     (al-clear! [i64] (field u rpo-post))
-    (al-clear! [i64] (field u selected-values))
-    (al-clear! [i64] (field u selected-nodes))
-    (al-clear! [i64] (field u selected-blocks))
+    ;; Selection memo storage is prepared by ms-map-init! at node density, not owner*node density.
     (al-clear! [i64] (field u block-phi-head))
     (al-clear! [i64] (field u node-phi-next))
     (al-clear! [MInst] (field u packed-insts))
     (al-clear! [i64] (field u selection-memory-deps))
+    (al-clear! [i64] (field u selection-memory-pending))
+    (al-clear! [i64] (field u selection-ingress-candidates))
+    (al-clear! [i64] (field u selection-effect-candidates))
     (al-clear! [i64] (field u memory-anti-deps))
     (al-clear! [i64] (field u memory-read-head))
     (al-clear! [i64] (field u memory-read-next))
@@ -586,6 +606,7 @@
     (al-clear! [i64] (field u schedule-done))
     (al-clear! [i64] (field u vreg-new-def))
     (al-clear! [i64] (field u vreg-def-inst))
+    (al-clear! [i64] (field u block-code-offset))
     (al-clear! [i64] (field u node-inst-head))
     (al-clear! [i64] (field u node-inst-next))
     (al-clear! [i64] (field u pack-next))
@@ -849,6 +870,10 @@
    (nval (ArrayList i64))  ; graph node -> virtual register, -1 when unselected
    (mseen (ArrayList i64))
    (clabel (ArrayList i64))
+   ;; AArch64 is fixed-width. Store one machine word per append so emission performs one capacity
+   ;; check and one length update per instruction instead of four generic byte pushes. `code`
+   ;; remains the variable-width x64 buffer; the AArch64 public API presents `a64-code` as bytes.
+   (a64-code (ArrayList i64))
    (code (ArrayList u8))
    (obj (ArrayList u8))
    (x64-poly-call-offs (ArrayList i64))
@@ -876,6 +901,7 @@
           (set! (.nval p) (al-new [i64] (malloc-allocator)))
           (set! (.mseen p) (al-new [i64] (malloc-allocator)))
           (set! (.clabel p) (al-new [i64] (malloc-allocator)))
+          (set! (.a64-code p) (al-new [i64] (malloc-allocator)))
           (set! (.code p) (al-new [u8] (malloc-allocator)))
           (set! (.obj p) (al-new [u8] (malloc-allocator)))
           (set! (.x64-poly-call-offs p) (al-new [i64] (malloc-allocator)))
@@ -893,6 +919,7 @@
     (al-clear! [i64] (field p nval))
     (al-clear! [i64] (field p mseen))
     (al-clear! [i64] (field p clabel))
+    (al-clear! [i64] (field p a64-code))
     (al-clear! [u8] (field p code))
     (al-clear! [u8] (field p obj))
     (al-clear! [i64] (field p x64-poly-call-offs))
@@ -953,6 +980,7 @@
         (do (set! (.result p) code) (set! (.result-node p) node))
         0)
     ; Publication is atomic: a failure invalidates bytes from this and all prior compilations.
+    (al-clear! [i64] (field p a64-code))
     (al-clear! [u8] (field p code))
     (al-clear! [u8] (field p obj))
     false))
@@ -1145,3 +1173,42 @@
 ;; Shared typed ArrayList indexing lives in the core because every later phase uses it.
 (defn be-al-elem [T] [(p (ptr (ArrayList T))) (i i64)] (-> (ptr T))
   (index (load (field p data)) i))
+
+;; Expensive structural verification is enabled by default so ordinary unit tests exercise every
+;; invariant. Corpus drivers may disable it explicitly; this temporary runtime policy will become
+;; an expansion-time `(primitive/testing?)` branch when Coil exposes test compilation context.
+(defstruct BackendVerificationPolicy [(enabled bool) (initialized bool)])
+
+(defn be-verification-policy [] (-> (ptr BackendVerificationPolicy))
+  (let [policy (primitive/alloc-static BackendVerificationPolicy)]
+    (if (not (.initialized policy))
+        (do (set! (.enabled policy) true)
+            (set! (.initialized policy) true))
+        0)
+    policy))
+
+(defn be-use-verification! [(enabled bool)] (-> i64)
+  (set! (.enabled (be-verification-policy)) enabled)
+  0)
+
+(defn be-verification? [] (-> bool)
+  (.enabled (be-verification-policy)))
+
+;; Profiling is diagnostic work, not compilation work. Keep it independently switchable from
+;; verification so production throughput and phase-traced investigations are both honest.
+(defstruct BackendProfilingPolicy [(enabled bool) (initialized bool)])
+
+(defn be-profiling-policy [] (-> (ptr BackendProfilingPolicy))
+  (let [policy (primitive/alloc-static BackendProfilingPolicy)]
+    (if (.initialized policy)
+        0
+        (do (set! (.enabled policy) false)
+            (set! (.initialized policy) true)))
+    policy))
+
+(defn be-use-profiling! [(enabled bool)] (-> i64)
+  (set! (.enabled (be-profiling-policy)) enabled)
+  0)
+
+(defn be-profiling? [] (-> bool)
+  (.enabled (be-profiling-policy)))

@@ -16,19 +16,18 @@
 (import "coil.io" :use *)
 (import "coil.fmt" :use *)
 (import "coil.slice" :use *)
+(import "monotonic" :as monotonic)
 
-(defstruct MsProfileTimespec [(sec i64) (nsec i64)])
-(extern clock_gettime :cc c [i32 (ptr MsProfileTimespec)] (-> i32))
 (defn ms-profile-now [] (-> i64)
-  (let [t (primitive/alloc-stack MsProfileTimespec)]
-    (clock_gettime 1 t)
-    (+ (* (.sec t) 1000000000) (.nsec t))))
+  (if (be-profiling?) (monotonic/monotonic-now-ns) 0))
 (defn ms-profile-note! [(name (slice u8)) (started i64)] (-> i64)
-  (let [now (ms-profile-now)]
-    (fmt (stderr) "AOTK_PROFILE phase={s} ns={d} nodes={d} functions={d} blocks={d} insts={d} vregs={d}\n"
-         name (- now started) (n-count) (mu-function-count) (mu-block-count)
-         (be-inst-count) (.next-vreg (machine-unit)))
-    now))
+  (if (be-profiling?)
+      (let [now (ms-profile-now)]
+        (fmt (stderr) "AOTK_PROFILE phase={s} ns={d} nodes={d} functions={d} blocks={d} insts={d} vregs={d}\n"
+             name (- now started) (n-count) (mu-function-count) (mu-block-count)
+             (be-inst-count) (.next-vreg (machine-unit)))
+        now)
+      0))
 
 (const BE-EXCEPTION-RETURN-DESCRIPTOR i64 104)
 
@@ -693,6 +692,11 @@
   (.selection-result (machine-unit)))
 (defn ms-result-item [] (-> i64)
   (.selection-item (machine-unit)))
+(defn ms-result-item-is-machine? [] (-> bool)
+  ;; Phase 2 begins only after construction and GCM have completed, immediately before optional
+  ;; machine verification. Construction failures carry ideal nodes (or CFG items); verifier
+  ;; failures carry machine-instruction indices. Numeric range cannot distinguish those domains.
+  (= (.phase (machine-unit)) 2))
 
 (defn ms-fail! [(code i64) (item i64)] (-> i64)
   (let [u (machine-unit)]
@@ -704,28 +708,40 @@
     -1))
 
 (defn ms-map-index [(owner i64) (node i64)] (-> i64)
-  (+ (* owner (n-count)) node))
+  node)
 
 (defn ms-map-init! [] (-> i64)
   (let [u (machine-unit)
-        total (* (mu-function-count) (n-count))
+        total (n-count)
         (mut i) 0
         (mut arg-gpr) 0
         (mut arg-fp) 0
         (mut next-new) 0]
-    (al-clear! [i64] (field u selected-values))
-    (al-clear! [i64] (field u selected-nodes))
-    (al-clear! [i64] (field u selected-blocks))
+    (al-clear! [i64] (field u selected-value-owners))
+    (al-clear! [i64] (field u selected-node-owners))
+    (al-clear! [i64] (field u selected-block-owners))
     (al-clear! [i64] (field u arg-abi-index))
     (al-clear! [i64] (field u parm-abi-index))
     (al-clear! [i64] (field u parm-stack-index))
     (al-clear! [i64] (field u new-index))
+    ;; Keep value storage at its high-water mark. Only owner tags need resetting, and those are
+    ;; node-dense rather than function*node-dense.
+    (set! i (al-len [i64] (.selected-values u)))
     (loop (if (>= (load i) total)
               (break)
               (do
                 (al-push! [i64] (field u selected-values) -1)
                 (al-push! [i64] (field u selected-nodes) 0)
                 (al-push! [i64] (field u selected-blocks) -1)
+                (set! i (+ (load i) 1))
+                0)))
+    (set! i 0)
+    (loop (if (>= (load i) total)
+              (break)
+              (do
+                (al-push! [i64] (field u selected-value-owners) -1)
+                (al-push! [i64] (field u selected-node-owners) -1)
+                (al-push! [i64] (field u selected-block-owners) -1)
                 (set! i (+ (load i) 1))
                 0)))
     (set! i 0)
@@ -762,10 +778,14 @@
     0))
 
 (defn ms-vget [(owner i64) (node i64)] (-> i64)
-  (al-get (.selected-values (machine-unit)) (ms-map-index owner node)))
+  (let [u (machine-unit) index (ms-map-index owner node)]
+    (if (= (al-get (.selected-value-owners u) index) owner)
+        (al-get (.selected-values u) index)
+        -1)))
 (defn ms-vset! [(owner i64) (node i64) (vreg i64)] (-> i64)
-  (al-set! [i64] (field (machine-unit) selected-values) (ms-map-index owner node) vreg)
-  (let [u (machine-unit)]
+  (let [u (machine-unit) index (ms-map-index owner node)]
+    (al-set! [i64] (field u selected-values) index vreg)
+    (al-set! [i64] (field u selected-value-owners) index owner)
     (if (and (>= vreg 0) (< vreg (al-len [i64] (.vreg-node u))))
         (do
           (al-set! [i64] (field u vreg-node) vreg node)
@@ -796,10 +816,24 @@
           (ms-emit! owner bid (mi-new MI-I32FROMFP fresh raw -1 0 NO-NODE))
           fresh))))
 (defn ms-seen? [(owner i64) (node i64)] (-> bool)
-  (!= (al-get (.selected-nodes (machine-unit)) (ms-map-index owner node)) 0))
+  (let [u (machine-unit)]
+    (= (al-get (.selected-node-owners u) (ms-map-index owner node)) owner)))
 (defn ms-seen! [(owner i64) (node i64)] (-> i64)
-  (al-set! [i64] (field (machine-unit) selected-nodes) (ms-map-index owner node) 1)
+  (let [u (machine-unit)]
+    (al-set! [i64] (field u selected-node-owners) (ms-map-index owner node) owner))
   0)
+
+(defn ms-selected-block [(owner i64) (node i64)] (-> i64)
+  (let [u (machine-unit) index (ms-map-index owner node)]
+    (if (= (al-get (.selected-block-owners u) index) owner)
+        (al-get (.selected-blocks u) index)
+        -1)))
+
+(defn ms-record-selected-block! [(owner i64) (node i64) (bid i64)] (-> i64)
+  (let [u (machine-unit) index (ms-map-index owner node)]
+    (al-set! [i64] (field u selected-blocks) index bid)
+    (al-set! [i64] (field u selected-block-owners) index owner)
+    0))
 
 ;; The whole-program graph root is the kernel's entry control. Other unmapped or foreign controls
 ;; must remain rejected so instructions cannot leak across function owners.
@@ -823,9 +857,6 @@
     (if (and (>= (.dst p) 0)
              (= (al-get [i64] (.vreg-def-inst u) (.dst p)) -1))
         (al-set! [i64] (field u vreg-def-inst) (.dst p) id)
-        0)
-    (if (and (>= (.node p) 0) (< (.node p) (n-count)))
-        (al-set! [i64] (field u selected-blocks) (ms-map-index owner (.node p)) bid)
         0)
     id))
 
@@ -1159,7 +1190,7 @@
 
 (defn ms-array-effect-block [(owner i64) (memory i64) (array i64) (fallback i64)] (-> i64)
   (let [selected (if (and (>= memory 0) (< memory (n-count)))
-                     (al-get (.selected-blocks (machine-unit)) (ms-map-index owner memory))
+                     (ms-selected-block owner memory)
                      -1)]
     ;; Once the ordered predecessor has been selected, its actual placement is a hard lower bound.
     ;; The ideal memory node itself has no control input, so ms-memory-block can only name its chain
@@ -1231,7 +1262,9 @@
 (defn ms-select-memory-at! [(owner i64) (node i64) (bid i64)] (-> bool)
   (if (ms-seen? owner node)
       true
-      (let [(mut pending) (al-new [i64] (malloc-allocator))
+      (let [u (machine-unit)
+            pending (field u selection-memory-pending)
+            base (al-len [i64] (load pending))
             (mut current) node
             (mut ok) true]
         ;; Heap effects form long predecessor chains in real JavaScript programs. Walk that spine
@@ -1240,7 +1273,7 @@
                       (not (ms-linear-memory-effect? (load current))))
                   (break)
                   (do
-                    (al-push! [i64] (mut pending) (load current))
+                    (al-push! [i64] pending (load current))
                     (set! current (n-in (load current) 1)))))
         (if (not (ms-seen? owner (load current)))
             (let [placement (ms-memory-block owner (load current))]
@@ -1250,7 +1283,7 @@
                                                (if (>= placement 0) placement bid))))
             0)
         (let [(mut index) (al-len [i64] (load pending))]
-          (loop (if (or (<= (load index) 0) (not (load ok)))
+          (loop (if (or (<= (load index) base) (not (load ok)))
                     (break)
                     (do
                       (set! index (- (load index) 1))
@@ -1263,7 +1296,9 @@
                                                            (if (>= placement 0)
                                                                placement
                                                                bid)))))))))
-        (al-free! [i64] (mut pending))
+        ;; This ArrayList is a reentrant stack. Nested memory selection restores its own suffix;
+        ;; restoring our base retains the caller's pending chain and all allocated capacity.
+        (store! (field pending len) base)
         (load ok))))
 
 (defn ms-select-memory-at-core! [(owner i64) (node i64) (bid i64)] (-> bool)
@@ -1505,7 +1540,12 @@
                             0)))))
             (Phi [declared] (do (ms-fail! MSEL-UNSUPPORTED node) (set! ok false)))
             (_ 0))
-        (if (load ok) (do (ms-seen! owner node) true) false))))
+        (if (load ok)
+            (do
+              (ms-record-selected-block! owner node bid)
+              (ms-seen! owner node)
+              true)
+            false))))
 
 (defn ms-select-memory! [(owner i64) (node i64)] (-> bool)
   (ms-select-memory-at! owner node (ms-memory-block owner node)))
@@ -2357,6 +2397,7 @@
                       ; node cannot be scheduled.
                       fresh (ms-new-vreg!)]
                   (ms-vset! owner node fresh)
+                  (ms-record-selected-block! owner node mark-bid)
                   (let [object (ms-select-value-at! owner (n-in node 1) mark-bid)]
                     (if (< object 0)
                         (ms-fail! MSEL-UNSUPPORTED node)
@@ -2489,7 +2530,16 @@
             (Closure [captures] (if (= (n-nins node) (+ captures 2))
                     (set! vr (ms-select-value-at! owner (n-in node 1) bid))
                     (ms-fail! MSEL-UNSUPPORTED node)))
-            (Phi [declared] 0)
+            (Phi [declared]
+              (if (be-profiling?)
+                  (let [index (ms-map-index owner node)]
+                    (do
+                      (fmt (stderr)
+                           "AOTK_PROFILE phase=selection_phi_miss owner={d} node={d} bid={d} ctrl={d} phi_block={d} memo_owner={d}\n"
+                           owner node bid (n-in node 0) (ms-phi-block owner node)
+                           (al-get (.selected-value-owners (machine-unit)) index))
+                      0))
+                  0))
             (Call [abi] (let [callee-node (n-in node 1)
                       callee (mu-direct-callee node)
                       targets (ty-fun-targets (n-ty callee-node))
@@ -2603,7 +2653,10 @@
             (_ (ms-fail! MSEL-UNSUPPORTED node)))
           (if (< (load vr) 0)
               -1
-              (do (ms-vset! owner node (load vr)) (load vr)))))))
+              (do
+                (ms-vset! owner node (load vr))
+                (ms-record-selected-block! owner node bid)
+                (load vr)))))))
 
 (defn ms-phi-block [(owner i64) (phi i64)] (-> i64)
   (if (or (not (op-is? phi Phi [_])) (= (n-in phi 0) NO-NODE))
@@ -2675,15 +2728,20 @@
 
 (defn ms-build-edge-copies! [(owner i64)] (-> i64)
   (let [u (machine-unit)
-        edges (mu-edge-count)
-        (mut edge) 0]
-    (loop (if (or (>= (load edge) edges) (!= (ms-result) MSEL-OK))
+        nblocks (mu-function-block-count owner)
+        (mut rpo) 0]
+    (loop (if (or (>= (load rpo) nblocks) (!= (ms-result) MSEL-OK))
               (break)
               (do
-                (let [e (mu-edge (load edge))]
-                  (if (!= (.owner e) owner)
-                      0
-                      (let [first (al-len [MCopy] (.edge-copies u))
+                (let [bid (mu-function-block owner (load rpo))
+                      succs (mu-block-succ-count bid)
+                      (mut succ) 0]
+                  (loop (if (or (>= (load succ) succs) (!= (ms-result) MSEL-OK))
+                            (break)
+                            (do
+                      (let [edge (mu-block-succ-edge bid (load succ))
+                            e (mu-edge edge)
+                            first (al-len [MCopy] (.edge-copies u))
                             target (.target e)
                             source (.source e)
                             slot (.target-slot e)
@@ -2699,7 +2757,7 @@
                                                                       source)
                                                 (al-push! [MCopy]
                                                           (field u edge-copies)
-                                                          (mc-new (load edge)
+                                                          (mc-new edge
                                                                   (load node)
                                                                   (load node)
                                                                   (n-in (load node) slot)
@@ -2716,7 +2774,7 @@
                                                   0
                                                   (al-push! [MCopy]
                                                             (field u edge-copies)
-                                                            (mc-new (load edge)
+                                                            (mc-new edge
                                                                     (load node)
                                                                     (ms-vget owner (load node))
                                                                     src
@@ -2724,8 +2782,9 @@
                                     (set! node (al-get (.node-phi-next u) (load node)))
                                     0)))
                         (set! (.copy-first e) first)
-                        (set! (.copy-count e) (- (al-len [MCopy] (.edge-copies u)) first)))))
-                (set! edge (+ (load edge) 1))
+                        (set! (.copy-count e) (- (al-len [MCopy] (.edge-copies u)) first)))
+                      (set! succ (+ (load succ) 1))))))
+                (set! rpo (+ (load rpo) 1))
                 0)))
     0))
 
@@ -2818,14 +2877,20 @@
     0))
 
 (defn ms-resolve-owner-copies! [(owner i64)] (-> i64)
-  (let [(mut edge) 0]
-    (loop (if (>= (load edge) (mu-edge-count))
+  (let [nblocks (mu-function-block-count owner)
+        (mut rpo) 0]
+    (loop (if (>= (load rpo) nblocks)
               (break)
               (do
-                (if (= (.owner (mu-edge (load edge))) owner)
-                    (ms-resolve-edge-copies! (load edge))
-                    0)
-                (set! edge (+ (load edge) 1))
+                (let [bid (mu-function-block owner (load rpo))
+                      succs (mu-block-succ-count bid)
+                      (mut succ) 0]
+                  (loop (if (>= (load succ) succs)
+                            (break)
+                            (do
+                              (ms-resolve-edge-copies! (mu-block-succ-edge bid (load succ)))
+                              (set! succ (+ (load succ) 1))))))
+                (set! rpo (+ (load rpo) 1))
                 0)))
     0))
 
@@ -2873,6 +2938,28 @@
             (and (op-is? ctrl FunStart [])
                  (= (mu-find-function (n-in ctrl 0)) owner))))))
 
+(defn ms-build-preselect-candidates! [] (-> i64)
+  (let [u (machine-unit) (mut node) 0]
+    (al-clear! [i64] (field u selection-ingress-candidates))
+    (al-clear! [i64] (field u selection-effect-candidates))
+    (loop (if (>= (load node) (n-count))
+              (break)
+              (do
+                (if (not (n-dead? (load node)))
+                    (do
+                      (if (and (or (op-is? (load node) Arg [_])
+                                   (op-is? (load node) Parm [_]))
+                               (not (ty-mem? (n-ty (load node)))))
+                          (al-push! [i64] (field u selection-ingress-candidates) (load node))
+                          0)
+                      (if (or (op-is? (load node) Call [_])
+                              (ms-linear-memory-effect? (load node)))
+                          (al-push! [i64] (field u selection-effect-candidates) (load node))
+                          0))
+                    0)
+                (set! node (+ (load node) 1)))))
+    0))
+
 (defn ms-preselect-function! [(owner i64)] (-> i64)
   (let [nblocks (mu-function-block-count owner)
         (mut node) 0
@@ -2880,18 +2967,18 @@
     ;; ABI ingress exists only at function entry. Select source arguments before recursively
     ;; selecting a body whose allocations/calls may clobber their physical ingress registers.
     ;; Memory Args are effect tokens and never become machine arguments.
-    (loop (if (or (>= (load node) (n-count)) (!= (ms-result) MSEL-OK))
+    (loop (if (or (>= (load node) (al-len [i64] (.selection-ingress-candidates (machine-unit))))
+                  (!= (ms-result) MSEL-OK))
               (break)
               (do
-                (if (and (not (n-dead? (load node)))
-                         (and (or (op-is? (load node) Arg [_]) (op-is? (load node) Parm [_]))
-                              (not (ty-mem? (n-ty (load node))))))
-                    (let [bid (ms-node-block owner (load node))]
-                      (if (and (ms-ingress-owned-by? owner (load node))
+                (let [candidate (al-get [i64]
+                                        (.selection-ingress-candidates (machine-unit))
+                                        (load node))
+                      bid (ms-node-block owner candidate)]
+                      (if (and (ms-ingress-owned-by? owner candidate)
                                (and (>= bid 0) (= (.owner (mu-block bid)) owner)))
-                          (ms-select-value-at! owner (load node) bid)
+                          (ms-select-value-at! owner candidate bid)
                           0))
-                    0)
                 (set! node (+ (load node) 1)))))
     (loop (if (or (>= (load rpo) nblocks) (!= (ms-result) MSEL-OK))
               (break)
@@ -2978,29 +3065,31 @@
     ;; tuple. Select them after control predicates and returns have established the earliest shared
     ;; value placements; an effect-only branch must not pin a common predicate below its use.
     (set! node 0)
-    (loop (if (or (>= (load node) (n-count)) (!= (ms-result) MSEL-OK))
+    (loop (if (or (>= (load node) (al-len [i64] (.selection-effect-candidates (machine-unit))))
+                  (!= (ms-result) MSEL-OK))
               (break)
               (do
-                (if (not (n-dead? (load node)))
-                    (if (op-is? (load node) Call [_])
-                        (let [bid (ms-node-block owner (load node))]
+                (let [candidate (al-get [i64]
+                                        (.selection-effect-candidates (machine-unit))
+                                        (load node))]
+                    (if (op-is? candidate Call [_])
+                        (let [bid (ms-node-block owner candidate)]
                           (if (and (>= bid 0) (= (mu-block-owner bid) owner))
-                              (do (ms-select-value-at! owner (load node) bid) 0)
+                              (do (ms-select-value-at! owner candidate bid) 0)
                               0))
-                        (if (ms-linear-memory-effect? (load node))
+                        (if (ms-linear-memory-effect? candidate)
                             ;; THIS SWEEP WALKS THE WHOLE GRAPH, so the block query alone is not an
                             ;; ownership test -- see `ms-memory-chain-owner`. When the chain names a
                             ;; function, only that function adopts the effect; when it names none,
                             ;; the block fallback still decides, exactly as before.
-                            (let [bid (ms-memory-block owner (load node))
-                                  chain-owner (ms-memory-chain-owner (load node))]
+                            (let [bid (ms-memory-block owner candidate)
+                                  chain-owner (ms-memory-chain-owner candidate)]
                               (if (and (>= bid 0)
                                        (and (= (mu-block-owner bid) owner)
                                             (or (< chain-owner 0) (= chain-owner owner))))
-                                  (do (ms-select-memory-at! owner (load node) bid) 0)
+                                  (do (ms-select-memory-at! owner candidate bid) 0)
                                   0))
-                            0))
-                    0)
+                            0)))
                 (set! node (+ (load node) 1)))))
     0))
 
@@ -3024,17 +3113,34 @@
                       (set! i (+ (load i) 1))
                       0))))
         0)
-    (if (= term NO-NODE)
-        (if (= (mu-block-succ-count bid) 1)
-            (ms-emit! owner
-                      bid
-                      (mi-new MI-JMP
-                              -1
-                              -1
-                              -1
-                              (mu-block-succ-target bid 0)
-                              (mu-block-control bid)))
-            (ms-fail! MSEL-TERMINATOR bid))
+    ;; Reachability can collapse an ideal If to one machine-CFG successor. The CFG is authoritative:
+    ;; emit its sole edge as an unconditional jump instead of requiring a target for the dead arm.
+    (if (= (mu-block-succ-count bid) 1)
+        (ms-emit! owner
+                  bid
+                  (mi-new MI-JMP
+                          -1
+                          -1
+                          -1
+                          (mu-block-succ-target bid 0)
+                          (mu-block-control bid)))
+        (if (= term NO-NODE)
+            (do
+              (if (be-profiling?)
+                  (let [(mut out) 0
+                        ctrl (mu-block-control bid)]
+                    (fmt (stderr)
+                         "AOTK_PROFILE phase=selection_missing_terminator owner={d} bid={d} ctrl={d} succ={d} pred={d}\n"
+                         owner bid ctrl (mu-block-succ-count bid)
+                         (mu-block-pred-count bid))
+                    (loop (if (>= (load out) (n-nouts ctrl))
+                              (break)
+                              (do
+                                (n-print-flat (stderr) (n-out ctrl (load out)))
+                                (set! out (+ (load out) 1)))))
+                    0)
+                  0)
+              (ms-fail! MSEL-TERMINATOR (mu-block-control bid)))
         (match (n-op term)
           (If [] (let [pred-node (n-in term 1)
                     raw-pred (ms-vget owner pred-node)
@@ -3054,7 +3160,15 @@
                     yes (ms-if-target bid 0)
                     no (ms-if-target bid 1)]
                 (if (or (< pred 0) (or (< yes 0) (< no 0)))
-                    (ms-fail! MSEL-TERMINATOR term)
+                    (do
+                      (if (be-profiling?)
+                          (do
+                            (fmt (stderr)
+                                 "AOTK_PROFILE phase=selection_terminator_miss owner={d} bid={d} term={d} raw_pred={d} pred={d} yes={d} no={d} succ={d}\n"
+                                 owner bid term raw-pred pred yes no (mu-block-succ-count bid))
+                            0)
+                          0)
+                      (ms-fail! MSEL-TERMINATOR term))
                     (ms-emit! owner bid (mi-new MI-CBR -1 pred yes no term)))))
           (Return [] (let [node (n-in term 1)
                     raw (ms-vget owner node)
@@ -3068,7 +3182,7 @@
                 (if (< value 0)
                     (ms-fail! MSEL-DEPENDENCY term)
                     (ms-emit! owner bid (mi-new MI-RET -1 value -1 0 term)))))
-          (_ (ms-fail! MSEL-TERMINATOR term))))))
+          (_ (ms-fail! MSEL-TERMINATOR term)))))))
 
 (defn ms-emit-function! [(owner i64) (base i64)] (-> i64)
   (let [nblocks (mu-function-block-count owner)
@@ -3079,7 +3193,17 @@
               (do
                 (let [bid (mu-function-block owner (load rpo))
                       b (mu-block bid)
-                      first (if (= bid entry) base (be-inst-count))]
+                      first (if (= bid entry) base (be-inst-count))
+                      succs (mu-block-succ-count bid)
+                      (mut succ) 0]
+                  ;; Copy descriptions for the whole owner are complete. Resolve this block's
+                  ;; outgoing edges immediately before emitting its terminator, so control
+                  ;; materialization and edge post-selection share one adjacency walk.
+                  (loop (if (>= (load succ) succs)
+                            (break)
+                            (do
+                              (ms-resolve-edge-copies! (mu-block-succ-edge bid (load succ)))
+                              (set! succ (+ (load succ) 1)))))
                   (set! (.inst-first b) first)
                   (ms-emit-block-terminator! owner bid)
                   (set! (.inst-count b) (- (be-inst-count) first)))
@@ -3356,6 +3480,7 @@
 
 (defn ms-gcm-compute-earliest! [] (-> bool)
   (let [n (be-inst-count)
+        started (ms-profile-now)
         (mut round) 0
         (mut changed) true
         (mut ok) true]
@@ -3384,8 +3509,7 @@
                                     bid (.block-id m)]
                                 (if (mi-op-pinned? op)
                                     (if (!= (.earliest m) bid)
-                                        (do (set! (.earliest m) bid)
-                                            (set! changed true))
+                                        (set! (.earliest m) bid)
                                         0)
                                     (let [(mut bound) (ms-entry-block owner)
                                           inputs (mi-op-inputs op)]
@@ -3424,11 +3548,14 @@
                                       ; A definition may have been emitted later than this use. Leave
                                       ; the use unresolved for this round; the forward fixed point will
                                       ; revisit it after the definition acquires an earliest block.
-                                      (if (and (>= (load bound) 0)
-                                               (!= (.earliest m) (load bound)))
-                                          (do (set! (.earliest m) (load bound))
-                                              (set! changed true))
-                                          0))))
+                                      (if (>= (load bound) 0)
+                                          (if (!= (.earliest m) (load bound))
+                                              (set! (.earliest m) (load bound))
+                                              0)
+                                          ;; A use emitted before its definition is the only reason
+                                          ;; another def-first round is needed. Ordinary ordered
+                                          ;; graphs finish in one pass, as Simple's schedEarly does.
+                                          (set! changed true)))))
                               (set! at (+ (load at) 1))
                               0))))
                 (set! round (+ (load round) 1))
@@ -3444,6 +3571,11 @@
                             (set! ok false))
                           0)
                       (set! at (+ (load at) 1))))))
+        0)
+    (if (be-profiling?)
+        (do (fmt (stderr) "AOTK_PROFILE phase=selection_gcm_early ns={d} rounds={d}\n"
+                 (- (ms-profile-now) started) (load round))
+            0)
         0)
     (load ok)))
 
@@ -3496,6 +3628,7 @@
 ;; instructions and edge copies as that pass sees them; block assignments read at query time.
 (defn ms-gcm-build-use-lists! [] (-> i64)
   (let [u (machine-unit)
+        started (ms-profile-now)
         vregs (.next-vreg u)
         (mut i) 0]
     (al-clear! [i64] (field u vreg-use-head))
@@ -3544,6 +3677,11 @@
                                 0))))
                   (set! e (+ (load e) 1))
                   0))))
+    (if (be-profiling?)
+        (do (fmt (stderr) "AOTK_PROFILE phase=selection_gcm_uses ns={d} entries={d}\n"
+                 (- (ms-profile-now) started) (al-len [i64] (.vreg-use-entry u)))
+            0)
+        0)
     0))
 
 (defn ms-gcm-latest-use-block [(owner i64) (vreg i64)] (-> i64)
@@ -3569,6 +3707,62 @@
                 0)))
     (load latest)))
 
+;; A reverse late-scheduling pass sees ordinary producer-before-consumer instruction order in the
+;; useful direction: the consumer moves first and its producer has not yet been visited. Only an
+;; out-of-order definition after this use can invalidate work already completed in this pass.
+(defn ms-gcm-vreg-def-after? [(owner i64) (vreg i64) (at i64)] (-> bool)
+  (if (or (< vreg 0) (ms-phi-vreg? owner vreg))
+      false
+      (> (ms-owner-def-inst owner vreg) at)))
+
+(defn ms-gcm-move-needs-repeat? [(at i64)] (-> bool)
+  (let [m (be-inst at)
+        owner (.owner m)
+        inputs (mi-op-inputs (.op m))
+        (mut repeat) false]
+    (if (and (> inputs 0) (ms-gcm-vreg-def-after? owner (.a m) at))
+        (set! repeat true)
+        0)
+    (if (and (not (load repeat))
+             (and (> inputs 1) (ms-gcm-vreg-def-after? owner (.b m) at)))
+        (set! repeat true)
+        0)
+    (if (and (not (load repeat))
+             (and (= (.op m) MI-CSEL)
+                  (ms-gcm-vreg-def-after? owner (.imm m) at)))
+        (set! repeat true)
+        0)
+    (if (not (load repeat))
+        (let [(mut arg) 0]
+          (loop (if (or (load repeat) (>= (load arg) (ms-inst-arg-count at)))
+                    (break)
+                    (do
+                      (if (ms-gcm-vreg-def-after? owner (ms-inst-arg at (load arg)) at)
+                          (set! repeat true)
+                          0)
+                      (set! arg (+ (load arg) 1))))))
+        0)
+    (load repeat)))
+
+;; Validate EARLIEST -> LATEST dominance and choose the lowest-loop-depth block in one idom walk.
+;; Returning -1 preserves the old dependency failure without paying for a separate dominates walk.
+(defn ms-gcm-best-late-block [(earliest i64) (latest i64)] (-> i64)
+  (let [(mut choice) latest
+        (mut cursor) latest
+        (mut valid) true]
+    (loop (if (or (= (load cursor) earliest) (not (load valid)))
+              (break)
+              (let [next (mu-block-idom (load cursor))]
+                (if (= next (load cursor))
+                    (set! valid false)
+                    (do
+                      (set! cursor next)
+                      (if (< (mu-block-loop-depth next)
+                             (mu-block-loop-depth (load choice)))
+                          (set! choice next)
+                          0))))))
+    (if (load valid) (load choice) -1)))
+
 (defn ms-gcm-place! [] (-> bool)
   (ms-gcm-build-use-lists!)
   (if (not (ms-gcm-compute-earliest!))
@@ -3576,7 +3770,8 @@
       (let [(mut round) 0
             (mut moved) true
             (mut at) 0
-            (mut ok) true]
+            (mut ok) true
+            late-start (ms-profile-now)]
       ;; ONE BACKWARD PASS IS NOT A FIXPOINT. Placement walks instructions from last to first, so a
       ;; value's uses are normally settled before the value itself -- but not always: the deferred
       ;; phi boxes `fng-distribute-deferred-phi-boxes!` creates are NEW instructions consumed by
@@ -3599,15 +3794,16 @@
                   (do
                     (set! at (- (load at) 1))
                     (let [m (be-inst (load at))
-                          desc (mi-desc (.op m))
+                          op (.op m)
                           owner (.owner m)
                           anchor (ms-inst-anchor-block owner (load at))
-                          fixed (or (mi-desc-pinned? desc) (>= anchor 0))
+                          fixed (or (mi-op-pinned? op) (>= anchor 0))
                           original (if (>= anchor 0) anchor (.block-id m))
-                          refreshed
-                            (if fixed
-                                true
-                                (ms-gcm-refresh-earliest! (load at)))
+                          ;; Early scheduling is already at a fixed point. Simple likewise finishes
+                          ;; schedEarly once, then performs late scheduling solely from use
+                          ;; placement. Recomputing the same input bound in every late round was a
+                          ;; redundant full instruction pass hidden inside this loop.
+                          refreshed true
                           earliest (.earliest m)]
                       (if (not refreshed)
                           (do (ms-fail! MSEL-DEPENDENCY (load at)) (set! ok false))
@@ -3622,23 +3818,32 @@
                                       -1)
                                 latest (if (< use-block 0) earliest use-block)]
                             (set! (.latest m) latest)
-                            (if (not (mu-dominates? earliest latest))
-                                (do (ms-fail! MSEL-DEPENDENCY (load at)) (set! ok false))
-                                (let [(mut choice) latest
-                                      (mut cursor) latest]
-                                  (loop (if (= (load cursor) earliest)
-                                            (break)
-                                            (do
-                                              (set! cursor (mu-block-idom (load cursor)))
-                                              (if (< (mu-block-loop-depth (load cursor))
-                                                     (mu-block-loop-depth (load choice)))
-                                                  (set! choice (load cursor))
-                                                  0))))
-                                  (if (!= (.block-id m) (load choice)) (set! moved true) 0)
-                                  (set! (.block-id m) (load choice))))))))
+                            (let [choice (ms-gcm-best-late-block earliest latest)]
+                              (if (< choice 0)
+                                  (do (ms-fail! MSEL-DEPENDENCY (load at)) (set! ok false))
+                                  (do
+                                  (if (and (!= (.block-id m) choice)
+                                           (ms-gcm-move-needs-repeat? (load at)))
+                                      (set! moved true)
+                                      0)
+                                  (set! (.block-id m) choice))))))))
                     0)))
                   0)))
-        (if (load ok) (do (ms-pack-instructions!) true) false))))
+        (if (load ok)
+            (let [pack-start (ms-profile-now)]
+              (if (be-profiling?)
+                  (do (fmt (stderr) "AOTK_PROFILE phase=selection_gcm_late ns={d} rounds={d}\n"
+                           (- pack-start late-start) (load round))
+                      0)
+                  0)
+              (ms-pack-instructions!)
+              (if (be-profiling?)
+                  (do (fmt (stderr) "AOTK_PROFILE phase=selection_gcm_pack ns={d}\n"
+                           (- (ms-profile-now) pack-start))
+                      0)
+                  0)
+              true)
+            false))))
 
 (defn ms-cache-new-defs! [] (-> i64)
   (let [u (machine-unit) (mut vreg) 0 (mut at) 0]
@@ -3699,7 +3904,8 @@
     (al-clear! [i64] (field u memory-anti-deps))
     (al-clear! [i64] (field u memory-read-head))
     (al-clear! [i64] (field u memory-read-next))
-    (loop (if (>= (load at) (mu-function-count))
+    ;; Heads are keyed by IDEAL MEMORY DEFINITION, matching Simple's `load.mem().outs()` walk.
+    (loop (if (>= (load at) (n-count))
               (break)
               (do (al-push! [i64] (field u memory-read-head) -1)
                   (set! at (+ (load at) 1)))))
@@ -3709,11 +3915,15 @@
               (do
                 (al-push! [i64] (field u memory-read-next) -1)
                 (let [m (be-inst (load at))]
-                  (if (ms-machine-memory-read? m)
-                      (do
+                  (if (and (ms-machine-memory-read? m)
+                           (and (>= (.node m) 0) (> (n-nins (.node m)) 1)))
+                      (let [memory (n-in (.node m) 1)]
+                        (if (and (>= memory 0) (< memory (al-len [i64] (.memory-read-head u))))
+                          (do
                         (al-set! [i64] (field u memory-read-next) (load at)
-                                 (al-get (.memory-read-head u) (.owner m)))
-                        (al-set! [i64] (field u memory-read-head) (.owner m) (load at)))
+                                     (al-get (.memory-read-head u) memory))
+                            (al-set! [i64] (field u memory-read-head) memory (load at)))
+                          0))
                       0))
                 (set! at (+ (load at) 1)))))
     (set! at 0)
@@ -3725,23 +3935,39 @@
                   (set! (.anti-first m) first)
                   (set! (.anti-count m) 0)
                   (if (ms-machine-memory-write? m)
-                      (let [(mut prior) (al-get (.memory-read-head u) (.owner m))]
-                        (loop (if (< (load prior) 0)
+                      (let [(mut dep) 0]
+                        (loop (if (>= (load dep) (.mem-count m))
                                   (break)
                                   (do
-                                    (let [candidate (be-inst (load prior))]
-                                      (if (and (ms-memory-operands-may-alias? candidate m)
-                                               (and (< (.node candidate) (.node m))
-                                                    (mu-dominates? (.block-id candidate)
-                                                                   (.block-id m))))
-                                          (do
-                                            (al-push! [i64]
-                                                      (field u memory-anti-deps)
-                                                      (.node candidate))
-                                            (set! (.anti-count m) (+ (.anti-count m) 1)))
-                                          0))
-                                    (set! prior (al-get (.memory-read-next u) (load prior)))
-                                    0))))
+                                    (let [memory (al-get [i64]
+                                                         (.selection-memory-deps u)
+                                                         (+ (.mem-first m) (load dep)))
+                                          (mut prior)
+                                            (if (and (>= memory 0)
+                                                     (< memory (al-len [i64] (.memory-read-head u))))
+                                                (al-get (.memory-read-head u) memory)
+                                                -1)]
+                                      (loop (if (< (load prior) 0)
+                                                (break)
+                                                (do
+                                                  (let [candidate (be-inst (load prior))]
+                                                    (if (and (= (.owner candidate) (.owner m))
+                                                             (and (ms-memory-operands-may-alias?
+                                                                    candidate m)
+                                                                  (and (< (.node candidate) (.node m))
+                                                                       (mu-dominates?
+                                                                         (.block-id candidate)
+                                                                         (.block-id m)))))
+                                                        (do
+                                                          (al-push! [i64]
+                                                                    (field u memory-anti-deps)
+                                                                    (.node candidate))
+                                                          (set! (.anti-count m)
+                                                                (+ (.anti-count m) 1)))
+                                                        0))
+                                                  (set! prior
+                                                        (al-get (.memory-read-next u) (load prior)))))))
+                                    (set! dep (+ (load dep) 1))))))
                       0))
                 (set! at (+ (load at) 1))
                 0)))
@@ -3820,8 +4046,11 @@
                                               0)
                                           (set! dep (+ (load dep) 1)))))
                               (set! consumer (+ (load consumer) 1)))))))))
-    (fmt (stderr) "AOTK_PROFILE phase=selection_memory_repair ns={d} moves={d}\n"
-         (- (ms-profile-now) started) (load moves))
+    (if (be-profiling?)
+        (do (fmt (stderr) "AOTK_PROFILE phase=selection_memory_repair ns={d} moves={d}\n"
+                 (- (ms-profile-now) started) (load moves))
+            0)
+        0)
     (load ok)))
 
 (defn ms-select-built-core! [] (-> bool)
@@ -3829,7 +4058,11 @@
   (let [u (machine-unit)
         funcs (mu-function-count)
         (mut owner) 0
-        (mut profile-start) (ms-profile-now)]
+        (mut profile-start) (ms-profile-now)
+        (mut part-start) (ms-profile-now)
+        (mut preselect-ns) 0
+        (mut copies-ns) 0
+        (mut terminators-ns) 0]
     (set! (.selection-result u) MSEL-OK)
     (set! (.selection-item u) -1)
     (set! (.next-vreg u) 0)
@@ -3841,34 +4074,57 @@
     (al-clear! [i64] (field u call-args))
     (ms-map-init!)
     (ms-cache-block-phis!)
-    (loop (if (>= (load owner) funcs)
-              (break)
-              (do
-                (ms-preallocate-phis! (load owner))
-                (set! owner (+ (load owner) 1))
-                0)))
+    (ms-build-preselect-candidates!)
+    (if (be-profiling?)
+        (do (fmt (stderr) "AOTK_PROFILE phase=selection_emit_setup ns={d} ingress={d} effects={d}\n"
+                 (- (ms-profile-now) (load part-start))
+                 (al-len [i64] (.selection-ingress-candidates u))
+                 (al-len [i64] (.selection-effect-candidates u)))
+            0)
+        0)
     (set! owner 0)
     (loop (if (or (>= (load owner) funcs) (!= (ms-result) MSEL-OK))
               (break)
               (do
-                (let [base (be-inst-count)]
+                (let [base (be-inst-count)
+                      (mut started) (ms-profile-now)]
+                  ;; The selection memo is node-dense and owner-tagged because owners are selected
+                  ;; sequentially. Preallocating every owner's Phis up front violated that contract:
+                  ;; selecting an earlier owner could overwrite a later owner's reservation, and a
+                  ;; later If then found no vreg for its Phi predicate. Reserve only the owner whose
+                  ;; complete selection is about to run; its tags remain live through edge copies.
+                  (ms-preallocate-phis! (load owner))
                   ; Establish control-rooted placement before edge copies request shared Phi
                   ; inputs. Otherwise a loop-header value first seen through its backedge copy can
                   ; be pinned to the backedge even when the branch condition consumes it in-header.
                   (ms-preselect-function! (load owner))
+                  (set! preselect-ns (+ (load preselect-ns)
+                                        (- (ms-profile-now) (load started))))
+                  (set! started (ms-profile-now))
                   (ms-build-edge-copies! (load owner))
-                  (ms-resolve-owner-copies! (load owner))
-                  (ms-emit-function! (load owner) base))
+                  (set! copies-ns (+ (load copies-ns)
+                                     (- (ms-profile-now) (load started))))
+                  (set! started (ms-profile-now))
+                  (ms-emit-function! (load owner) base)
+                  (set! terminators-ns (+ (load terminators-ns)
+                                          (- (ms-profile-now) (load started)))))
                 (set! owner (+ (load owner) 1))
                 0)))
+    (if (be-profiling?)
+        (do
+          (fmt (stderr) "AOTK_PROFILE phase=selection_emit_preselect ns={d}\n" (load preselect-ns))
+          (fmt (stderr) "AOTK_PROFILE phase=selection_emit_copies ns={d}\n" (load copies-ns))
+          (fmt (stderr) "AOTK_PROFILE phase=selection_emit_terminators ns={d}\n" (load terminators-ns))
+          0)
+        0)
     (set! profile-start (ms-profile-note! "selection_emit" (load profile-start)))
     (if (= (ms-result) MSEL-OK)
         (do
-          (ms-pack-instructions!)
-          (set! profile-start (ms-profile-note! "selection_pack" (load profile-start)))
+          ;; Keep demand-selected instructions in graph order through GCM. Their block-id fields
+          ;; and dense def/use indexes are sufficient for placement; packing here only copied and
+          ;; indexed the whole unit a first time before GCM changed those blocks. Simple likewise
+          ;; materializes block order after global scheduling, once.
           (ms-cache-new-defs!)
-          (ms-build-memory-anti-deps!)
-          (set! profile-start (ms-profile-note! "selection_antideps_initial" (load profile-start)))
           true)
         false)))
 
@@ -3895,7 +4151,7 @@
           ; it keeps selection dumps stable. If a cross-block move put a producer after its use,
           ; repair only that case with the dependency-aware seed-0 scheduler.
           (let [verify-start (ms-profile-now)
-                verified (ms-verify!)]
+                verified (if (be-verification?) (ms-verify!) true)]
             (ms-profile-note! "selection_verify" verify-start)
             (if verified
                 true
@@ -3952,7 +4208,7 @@
     (load p)))
 
 (defn ms-lower-encodable! [] (-> bool)
-  (if (not (ms-verify!))
+  (if (and (be-verification?) (not (ms-verify!)))
       false
       (let [u (machine-unit)
             blocks (mu-block-count)
@@ -4044,7 +4300,8 @@
                     BER-UNSUPPORTED-OPCODE BER-MALFORMED-GRAPH)
             item (ms-result-item)
             node
-              (if (and (>= item 0) (< item (be-inst-count)))
+              (if (and (ms-result-item-is-machine?)
+                       (and (>= item 0) (< item (be-inst-count))))
                   (ms-inst-node item)
                   item)]
         (be-fail! code node))
@@ -4525,12 +4782,14 @@
                 0)))
     (and (= (load terms) 1)
          (and (mi-op-terminator? (ms-inst-op (- (+ first count) 1)))
-              (if (= term NO-NODE)
-                  (and (= succ 1) (= (load last-op) MI-JMP))
-                  (match (n-op term)
-                    (If [] (and (= succ 2) (= (load last-op) MI-CBR)))
-                    (Return [] (and (= succ 0) (= (load last-op) MI-RET)))
-                    (_ false)))))))
+              (if (= succ 1)
+                  (= (load last-op) MI-JMP)
+                  (if (= term NO-NODE)
+                      false
+                      (match (n-op term)
+                        (If [] (and (= succ 2) (= (load last-op) MI-CBR)))
+                        (Return [] (and (= succ 0) (= (load last-op) MI-RET)))
+                        (_ false))))))))
 
 (defn ms-definition-unique? [(at i64)] (-> bool)
   (let [m (be-inst at)
@@ -4890,7 +5149,14 @@
                 (if (not (ms-block-range-valid? (load bid)))
                     (ms-fail! MSEL-OWNER (load bid))
                     (if (not (ms-block-terminator-valid? (load bid)))
-                        (ms-fail! MSEL-TERMINATOR (load bid))
+                        ;; Verifier failure items are machine-instruction indices. Reporting the
+                        ;; block id here made the harness print an unrelated instruction whose
+                        ;; index happened to equal that block number, hiding the actual terminator
+                        ;; defect across thousands of Test262 cases.
+                        (ms-fail! MSEL-TERMINATOR
+                                  (- (+ (mu-block-inst-first (load bid))
+                                        (mu-block-inst-count (load bid)))
+                                     1))
                         0))
                 (set! bid (+ (load bid) 1))
                 0)))
@@ -5083,6 +5349,24 @@
                 0)
               0))))
   0)
+
+(defn ms-print-block [(w (ptr Writer)) (bid i64)] (-> i64)
+  (if (or (< bid 0) (>= bid (mu-block-count)))
+      (do (fmt w "block {d}: out of range\n" bid) 0)
+      (let [first (mu-block-inst-first bid)
+            count (mu-block-inst-count bid)
+            term (mu-block-terminator bid)
+            succ (mu-block-succ-count bid)
+            (mut i) 0]
+        (fmt w "block {d}: owner={d} first={d} count={d} ideal-term={d} succ={d} valid={d}\n"
+             bid (mu-block-owner bid) first count term succ
+             (if (ms-block-terminator-valid? bid) 1 0))
+        (loop (if (>= (load i) count)
+                  (break)
+                  (do
+                    (ms-print-inst w (+ first (load i)))
+                    (set! i (+ (load i) 1)))))
+        0)))
 
 (defn ms-dump [(w (ptr Writer))] (-> i64)
   (let [funcs (mu-function-count)
@@ -6300,7 +6584,7 @@
                           (set! k (+ (load k) 1))
                           0))))
           (ms-cache-def-insts!)
-          (let [ok (ms-verify-schedule!)]
+          (let [ok (if (be-verification?) (ms-verify-schedule!) true)]
             (ms-profile-note! "schedule_verify" (load profile-start))
             ok)))))
 

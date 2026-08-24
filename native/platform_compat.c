@@ -1,5 +1,11 @@
 #include <stddef.h>
 
+#if defined(__APPLE__)
+__asm__(".weak_definition _kernel\n"
+        "_kernel:\n"
+        ".byte 0\n");
+#endif
+
 #if !defined(__APPLE__)
 // Darwin exposes sys_icache_invalidate directly. Other hosts use the compiler
 // builtin, which is a no-op on coherent-cache targets such as x86-64 and emits

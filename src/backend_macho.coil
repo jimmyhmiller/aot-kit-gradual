@@ -21,6 +21,14 @@
 (import "coil.io" :use *)
 (import "coil.fmt" :use *)
 (import "coil.slice" :use *)
+(import "monotonic" :as monotonic)
+
+(extern realloc :cc c [(ptr u8) i64] (-> (ptr u8)))
+
+(defn mobj-profile! [(phase (slice u8)) (started i64)] (-> i64)
+  (let [now (monotonic/monotonic-now-ns)]
+    (fmt (stderr) "AOTK_PROFILE phase={s} ns={d}\n" phase (- now started))
+    now))
 
 ;; Stack-map PCs are target instruction offsets, not portable Machine IR facts. Mach-O/AArch64
 ;; historically reconstructed them from fixed-width instruction counts; x86 records the exact
@@ -28,9 +36,82 @@
 ;; interpretation before writing and independently verifying metadata.
 (defn mobj-x64-target [] (-> (ptr bool)) (primitive/alloc-static bool))
 
+;; Facts discovered while encoding/publication begins. Simple records these while emitting; this
+;; cache is the AOT Kit phase boundary until relocation records move into the encoder itself. Most
+;; importantly, every query below is O(1): the former implementation rescanned all instructions
+;; for each symbol query and then repeated those queries for every relocation.
+(defstruct MobjPublicationIndex
+  [(external-mask i64)
+   (external-inst (ArrayList i64))
+   (inited bool)])
+
+(defn mobj-index [] (-> (ptr MobjPublicationIndex))
+  (let [p (primitive/alloc-static MobjPublicationIndex)]
+    (if (.inited p)
+        0
+        (do
+          (set! (.external-inst p) (al-new [i64] (malloc-allocator)))
+          (set! (.inited p) true)
+          0))
+    p))
+
+(defn mobj-index-jsarray-bit [(operation i64)] (-> i64)
+  (if (and (>= operation 1) (<= operation 3)) (<< 1 (+ 51 operation)) 0))
+
+(defn mobj-build-index! [] (-> i64)
+  (let [p (mobj-index)
+        (mut at) 0
+        (mut mask) 0]
+    (al-clear! [i64] (field p external-inst))
+    (loop (if (>= (load at) (be-inst-count))
+              (break)
+              (do
+                (let [m (be-inst (load at))
+                      op (.op m)
+                      external
+                        (or (= op MI-JSPROP)
+                            (or (= op MI-JSARRAY)
+                                (or (= op MI-JSSTRING)
+                                    (and (be-runtime-allocation?) (= op MI-NEW)))))]
+                  (if external
+                      (do
+                        (al-push! [i64] (field p external-inst) (load at))
+                        (set! mask (| (load mask) (<< 1 op)))
+                        (if (= op MI-JSARRAY)
+                            (set! mask (| (load mask) (mobj-index-jsarray-bit (.imm m))))
+                            0)
+                        0)
+                      0))
+                (set! at (+ (load at) 1))
+                0)))
+    (set! (.external-mask p) (load mask))
+    0))
+
 (defn obj-u8! [(v i64)] (-> i64)
-  (al-push! [u8] (field (backend) obj) (cast u8 (& v 255)))
-  0)
+  (let [out (field (backend) obj)
+        at (.len out)]
+    (if (>= at (.cap out))
+        (do (be-fail! BER-OBJECT NO-NODE) 0)
+        (do
+          (set! (index (.data out) at) (cast u8 (& v 255)))
+          (set! (.len out) (+ at 1))
+          0))))
+
+;; Mach-O computes its exact final size before writing its first byte. Materialize that phase
+;; boundary in the output buffer: one allocation, then cursor writes. This is the same ownership
+;; model as Simple's exact-size ByteBuffer and avoids generic ArrayList growth checks per byte.
+(defn obj-begin! [(size i64)] (-> bool)
+  (let [out (field (backend) obj)]
+    (if (< (.cap out) size)
+        (let [data (realloc (.data out) size)]
+          (if (= (cast i64 data) 0)
+              (be-fail! BER-OBJECT NO-NODE)
+              (do
+                (set! (.data out) data)
+                (set! (.cap out) size)
+                (set! (.len out) 0)
+                true)))
+        (do (set! (.len out) 0) true))))
 (defn obj-u32! [(v i64)] (-> i64)
   (obj-u8! v)
   (obj-u8! (>> v 8))
@@ -96,44 +177,13 @@
     (load count)))
 
 (defn mobj-external-reloc-count [] (-> i64)
-  (let [(mut at) 0
-        (mut count) 0]
-    (loop (if (>= (load at) (be-inst-count))
-              (break)
-              (do
-                (if (or (= (ms-inst-op (load at)) MI-JSPROP)
-                        (or (= (ms-inst-op (load at)) MI-JSARRAY)
-                            (or (= (ms-inst-op (load at)) MI-JSSTRING)
-                                (and (be-runtime-allocation?) (= (ms-inst-op (load at)) MI-NEW)))))
-                    (set! count (+ (load count) 1))
-                    0)
-                (set! at (+ (load at) 1))
-                0)))
-    (load count)))
+  (al-len [i64] (.external-inst (mobj-index))))
 
 (defn mobj-has-external-op? [(wanted i64)] (-> bool)
-  (let [(mut at) 0
-        (mut found) false]
-    (loop (if (or (>= (load at) (be-inst-count)) (load found))
-              (break)
-              (do
-                (if (and (= (ms-inst-op (load at)) wanted)
-                         (or (!= wanted MI-NEW) (be-runtime-allocation?)))
-                    (set! found true)
-                    0)
-                (set! at (+ (load at) 1))
-                0)))
-    (load found)))
+  (!= (& (.external-mask (mobj-index)) (<< 1 wanted)) 0))
 
 (defn mobj-has-jsarray-imm? [(wanted i64)] (-> bool)
-  (let [(mut at) 0 (mut found) false]
-    (loop (if (or (>= (load at) (be-inst-count)) (load found))
-              (break)
-              (do (if (and (= (ms-inst-op (load at)) MI-JSARRAY)
-                           (= (.imm (be-inst (load at))) wanted))
-                      (set! found true) 0)
-                  (set! at (+ (load at) 1)))))
-    (load found)))
+  (!= (& (.external-mask (mobj-index)) (mobj-index-jsarray-bit wanted)) 0))
 
 (defn mobj-external-symbol-count [] (-> i64)
   (+ (if (mobj-has-external-op? MI-NEW) 1 0)
@@ -957,7 +1007,7 @@
                          (+ (if (mobj-has-jsarray-imm? 2) 15 0)
                             (+ (if (mobj-has-jsarray-imm? 3) 13 0)
                                (if (mobj-has-external-op? MI-JSSTRING) 15 0))))))))]
-    (al-clear! [u8] (field p obj))
+    (obj-begin! (+ stroff strsize))
     ; mach_header_64
     (obj-u32! 4277009103)
     (obj-u32! 16777228)
@@ -1046,16 +1096,23 @@
     (let [(mut i) 0]
       (loop (if (>= (load i) textlen)
                 (break)
-                (do (obj-u8! (be-code-byte (load i))) (set! i (+ (load i) 1)) 0))))
+                (do
+                  ;; AArch64 text is a little-endian sequence of aligned 32-bit instructions.
+                  ;; Copy words, as Simple copies its completed encoding buffer, rather than
+                  ;; re-entering the code accessor and publication loop for every byte.
+                  (obj-u32! (be-code-u32 (load i)))
+                  (set! i (+ (load i) 4))
+                  0))))
     (obj-pad-to! stackoff)
     (mobj-write-stackmaps!)
     (obj-pad-to! layoutoff)
     (mobj-write-layouts!)
     (obj-pad-to! relocoff)
-    (let [(mut at) 0]
-      (loop (if (>= (load at) (be-inst-count))
+    (let [relocs (.external-inst (mobj-index))
+          (mut reloc) 0]
+      (loop (if (>= (load reloc) (al-len [i64] relocs))
                 (break)
-                (do
+                (let [(mut at) (al-get [i64] relocs (load reloc))]
                   (if (and (be-runtime-allocation?) (= (ms-inst-op (load at)) MI-NEW))
                       (do
                         (obj-u32! (mobj-new-branch-pc (load at)))
@@ -1083,7 +1140,7 @@
                         (obj-u32! (mobj-branch-reloc-info (mobj-external-symbol basesyms MI-JSSTRING)))
                         0)
                       0)
-                  (set! at (+ (load at) 1))
+                  (set! reloc (+ (load reloc) 1))
                   0)))
       0)
     (obj-pad-to! symoff)
@@ -1210,16 +1267,27 @@
     (al-len [u8] (.obj p))))
 
 (defn be-macho-checked! [] (-> bool)
-  (let [p (backend)]
+  (let [p (backend)
+        (mut started) (monotonic/monotonic-now-ns)]
     ; Never let a previous successful publication survive a new validation attempt.
     (al-clear! [u8] (field p obj))
+    (mobj-build-index!)
+    (set! started (mobj-profile! "macho_index" (load started)))
     (if (or (!= (be-result) BER-OK) (= (be-code-len) 0))
         (be-fail! BER-OBJECT NO-NODE)
-        (if (not (mobj-verify-model!))
-            (be-fail! BER-OBJECT (mobj-item))
-            (if (<= (be-macho!) (be-code-len))
-                (be-fail! BER-OBJECT NO-NODE)
-                (if (mobj-verify-bytes!) true (be-fail! BER-OBJECT (mobj-item))))))))
+        (let [model-ok (mobj-verify-model!)]
+          (set! started (mobj-profile! "macho_model_verify" (load started)))
+          (if (not model-ok)
+              (be-fail! BER-OBJECT (mobj-item))
+              (let [published (be-macho!)]
+                (set! started (mobj-profile! "macho_serialize" (load started)))
+                (fmt (stderr) "AOTK_PROFILE phase=macho_output bytes={d} code_bytes={d}\n"
+                     published (be-code-len))
+                (if (<= published (be-code-len))
+                    (be-fail! BER-OBJECT NO-NODE)
+                    (let [bytes-ok (mobj-verify-bytes!)]
+                      (set! started (mobj-profile! "macho_bytes_verify" (load started)))
+                      (if bytes-ok true (be-fail! BER-OBJECT (mobj-item)))))))))))
 
 (defn be-object-len [] (-> i64)
   (if (= (be-result) BER-OK) (al-len [u8] (.obj (backend))) 0))

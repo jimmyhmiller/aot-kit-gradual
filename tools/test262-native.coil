@@ -4,6 +4,7 @@
 (import "nativeharness" :use *)
 (import "frontendnative" :use *)
 (import "frontendnativegraph" :use [frontend-native-reuse-jsl-index!])
+(import "backend_core" :use [be-use-profiling! be-profiling?])
 (import "typescriptnative" :use *)
 (import "coil.alloc" :use * :as alloc)
 (import "coil.args" :use *)
@@ -70,9 +71,11 @@
               (do (fmt (stdout) "LINK-FAILED\n") 3)
               (let [ok (primitive/alloc-stack bool)
                     exec-start (nh-now-ns)
-                    _ (do (set! ok true) (nh-exec-checked! 0 ok))
+                    _ (do (set! ok true) (nh-exec-checked-timeout! 0 2 ok))
                     _ (nh-timing! "native_execution" exec-start)
-                    _ (nh-cleanup!)]
+                    cleanup-start (nh-now-ns)
+                    _ (nh-cleanup!)
+                    _ (nh-timing! "native_cleanup" cleanup-start)]
                 (if (load ok)
                     (do (fmt (stdout) "PASS\n") 0)
                     (do (fmt (stdout) "RUNTIME-FAILED\n") 1))))))))
@@ -95,36 +98,48 @@
                           (break)
                           (let [ok (primitive/alloc-stack bool)
                                 exec-start (nh-now-ns)
-                                _ (do (set! ok true)
+                                _ (do (fmt (stderr) "AOTK_BATCH_EXEC index={d}\n" (load index))
+                                      (set! ok true)
                                       (nh-exec-checked-timeout! (load index) 2 ok))
                                 _ (nh-timing! "native_execution" exec-start)]
                             (fmt (stdout) "BATCH {d} {s}\n" (load index)
                                  (if (load ok) "PASS" "RUNTIME-FAILED"))
                             (set! index (+ (load index) 1)))))
-                (nh-cleanup!)
+                (let [cleanup-start (nh-now-ns)]
+                  (nh-cleanup!)
+                  (nh-timing! "native_cleanup" cleanup-start))
                 0))))))
 
 (defn main [(argc i32) (argv (ptr (ptr i8)))] (-> i64)
   (block :done
     (args-set! argc argv)
     (frontend-native-reuse-jsl-index! true)
-    (if (< (args-count) 2)
-        (return-from :done
-                     (do (fmt (stderr) "usage: test262-native <assembled-source.js>...\n") 64))
+    ;; The bounded/native test suites leave exhaustive graph verification enabled by default.
+    ;; Test262 is the production-throughput corpus and does not pay for that debug pass.
+    (nh-use-graph-verification! false)
+    (let [profile (and (> (args-count) 1) (= (args-nth 1) "--profile"))
+          first (if profile 2 1)]
+    (be-use-profiling! profile)
+    (if (be-profiling?)
+        (do (fmt (stderr) "AOTK_PROFILE enabled\n") 0)
         0)
-    (if (and (= (args-count) 2) (= (args-nth 1) "--server"))
+    (if (< (args-count) (+ first 1))
+        (return-from :done
+                     (do (fmt (stderr) "usage: test262-native [--profile] <assembled-source.js>...\n") 64))
+        0)
+    (if (and (= (args-count) (+ first 1)) (= (args-nth first) "--server"))
         (return-from :done (t262-native-server))
         0)
-    (if (= (args-count) 3)
+    (if (= (args-count) (+ first 2))
         (return-from :done
                      (t262-native-batch
-                       (args-nth 1)
-                       (atoll (cast (ptr i8) (slice-data (args-nth 2))))))
+                       (args-nth first)
+                       (atoll (cast (ptr i8) (slice-data (args-nth (+ first 1)))))))
         0)
-    (let [(mut index) 1 (mut failed) false]
+    (let [(mut index) first (mut failed) false]
       (loop (if (>= (load index) (args-count))
                 (break)
                 (let [status (t262-native-one (args-nth (load index)))]
                   (if (!= status 0) (set! failed true) 0)
                   (set! index (+ (load index) 1)))))
-      (if (load failed) 1 0))))
+      (if (load failed) 1 0)))))

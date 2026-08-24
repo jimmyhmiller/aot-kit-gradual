@@ -56,6 +56,12 @@ aot_alloc_slow:
 .section .note.GNU-stack,"",@progbits
 #else
 .text
+#ifdef __APPLE__
+.weak_definition _kernel
+_kernel:
+  .byte 0
+.p2align 2
+#endif
 .p2align 2
 .globl _aot_gc_enter
 _aot_gc_enter:

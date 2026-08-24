@@ -15,17 +15,21 @@ decides pass/fail; a successful test must compile, link, execute, and return nor
 The same runner can make an incremental, parallel attempt over the complete checkout:
 
 ```sh
-node tools/run-test262.mjs --no-build --jobs 8 --results test262-full.jsonl \
+node tools/run-test262.mjs --no-build --jobs 8 \
   --test262 /path/to/test262 /path/to/test262/test
 node tools/run-test262.mjs --no-build --jobs 8 --resume --results test262-full.jsonl \
   --test262 /path/to/test262 /path/to/test262/test
 ```
 
-Each completed variant is appended to the JSONL file before the next one starts, and the final
-category totals are written to `test262-full.jsonl.summary.json`. `--start` and `--limit` select a
-file range. `--timeout-ms` defaults to 30 seconds per variant. On Linux, `--memory-mb` defaults to
-2048 MiB and is enforced with `prlimit`, so a broken generated program is recorded as a failure
-instead of exhausting the host. Neither limit turns a test green.
+Every run saves results by default to a unique timestamped `test262-results-*.jsonl` file in the
+working directory and prints its absolute path at startup and completion. Each completed variant
+is appended before the next one starts, and final category totals are written beside it as
+`*.jsonl.summary.json`. Use `--results FILE` to choose a stable path, which is required with
+`--resume`. Use `--quick` only when intentionally opting out of persistence; it cannot be combined
+with `--results` or `--resume`. `--start` and `--limit` select a file range. `--timeout-ms` defaults
+to 30 seconds per variant. On Linux, `--memory-mb` defaults to 2048 MiB and is enforced with
+`prlimit`, so a broken generated program is recorded as a failure instead of exhausting the host.
+Neither limit turns a test green.
 
 ## Current boundary
 

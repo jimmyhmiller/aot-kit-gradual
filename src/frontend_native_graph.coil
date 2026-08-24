@@ -21,13 +21,10 @@
 (import "coil.str" :use *)
 (import "coil.io" :use *)
 (import "coil.fmt" :use *)
+(import "monotonic" :as monotonic)
 
-(defstruct FngProfileTimespec [(sec i64) (nsec i64)])
-(extern clock_gettime :cc c [i32 (ptr FngProfileTimespec)] (-> i32))
 (defn fng-profile-now [] (-> i64)
-  (let [t (primitive/alloc-stack FngProfileTimespec)]
-    (clock_gettime 1 t)
-    (+ (* (.sec t) 1000000000) (.nsec t))))
+  (monotonic/monotonic-now-ns))
 (defn fng-profile-note! [(name (slice u8)) (started i64)] (-> i64)
   (let [now (fng-profile-now)]
     (fmt (stderr) "AOTK_TIMING phase={s} ns={d}\n" name (- now started))
@@ -1440,7 +1437,7 @@
                     0)
                 (if (= kind TSK-FUNCTION-DECLARATION)
                     0
-                    (if (or (= kind TSK-FUNCTION-EXPRESSION) (= kind TSK-ARROW-FUNCTION))
+                    (if (fe-function-expression-kind? kind)
                         (let [nested (fng-function-node-index frontend node)]
                           (if (and (>= nested 0)
                                    (not (al-get [bool] (load reachable) nested)))
@@ -1490,8 +1487,7 @@
                                         (al-push! [i64] (mut pending) target)
                                         0)
                                     (if (or (= kind TSK-FUNCTION-DECLARATION)
-                                            (or (= kind TSK-FUNCTION-EXPRESSION)
-                                                (= kind TSK-ARROW-FUNCTION)))
+                                            (fe-function-expression-kind? kind))
                                         (let [nested (fng-function-node-index frontend node)]
                                           (if (and (>= nested 0) (!= nested index))
                                               (if (not (al-get [bool] (load reachable) nested))
@@ -5455,7 +5451,9 @@
     (loop (if (>= (load index) (ts-child-count ast node))
               (break)
               (let [property (ts-child ast node (load index))]
-                (if (or (= (ts-kind ast property) TSK-PROPERTY-ASSIGNMENT)
+                (if (or (or (= (ts-kind ast property) TSK-PROPERTY-ASSIGNMENT)
+                            (or (= (ts-kind ast property) TSK-METHOD-DECLARATION)
+                                (= (ts-kind ast property) TSK-SHORTHAND-PROPERTY-ASSIGNMENT)))
                         (and allow-spread (fng-object-spread-element? ast property)))
                     0
                     (fng-unsupported-syntax! "object literal element"
@@ -5480,7 +5478,7 @@
     (loop (if (>= (load index) field-count)
               (break)
               (let [property (ts-child ast node (load index))
-                    value-node (ts-child ast property (- (ts-child-count ast property) 1))
+                    value-node (fe-object-property-value-node ast property)
                     field-value (al-get [FeField] (.fields frontend) (+ field-start (load index)))
                     expected (fng-type-tag frontend (.type-node field-value))]
                 (al-push! [i64] (mut field-values) (fng-expression-expected context value-node expected))
@@ -5596,7 +5594,7 @@
                                                   (fng-box-dynamic-argument! source))]
                         0)
                       (let [name-node (ts-child ast property 0)
-                            value-node (ts-child ast property (- (ts-child-count ast property) 1))
+                            value-node (fe-object-property-value-node ast property)
                             computed (= (ts-kind ast name-node) TSK-COMPUTED-PROPERTY-NAME)
                             key (if computed (fng-expression context (ts-child ast name-node 0)) NO-NODE)
                             value (fng-expression context value-node)

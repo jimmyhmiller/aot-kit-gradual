@@ -1,0 +1,85 @@
+;; ONE JAVASCRIPT FILE, COMPILED AND RUN AND COMPARED WITH NODE, IN ONE COMMAND.
+;;
+;;   coil run tools/js-probe.coil -o builds/js-probe --quiet -- FILE.js   # build once
+;;   builds/js-probe FILE.js [ARG]                                        # ~1s per file after
+;;
+;; Exit status: 0 agrees with node · 1 disagrees · 2 the compiler refused · 3 it crashed ·
+;; 4 node itself threw. So it scripts: `for f in *.js; do coil run tools/js-probe.coil $f; done`.
+;;
+;; WHY THIS EXISTS AGAIN. `tools/js-repro` did this and was deleted with the interpreter on
+;; 2026-08-18, and nothing replaced it. What replaced it in practice was: append a temporary
+;; `deftest` to `tests/native-execution-test.coil`, run the whole 429-test gate to compile one
+;; file, scrape stderr, then `git checkout` to undo. Fifty seconds and a dirty tree for a question
+;; that takes two seconds to ask. Every diagnosis in HANDOFF's 2026-08-20 entry was done that way,
+;; which is the argument for this file.
+;;
+;; It shares `tests/native_harness.coil` with the two differential suites rather than reimplementing
+;; the pipeline, so a program that compiles here compiles there, and neither can drift.
+(module jsprobe)
+
+(import "nativeharness" :use *)
+(import "node" :use *)
+(import "coil.args" :use *)
+(import "coil.io" :use *)
+(import "coil.fmt" :use *)
+(import "coil.slice" :use *)
+(import "coil.str" :use *)
+(import "coil.alloc" :use *)
+
+(defn ps [(w (ptr Writer)) (s (slice u8))] (-> i64) (print-str w s) 0)
+
+(defn usage [] (-> i64)
+  (ps (stderr) "usage: coil run tools/js-probe.coil FILE.js [ARG]\n")
+  (ps (stderr) "  FILE.js   a program defining `main(n)`; .ts annotations are accepted\n")
+  (ps (stderr) "  ARG       the integer passed to main, default 7\n")
+  2)
+
+;; The first positional argument that is not a flag. `args-nth 0` is the program itself.
+(defn positional [(k i64)] (-> (slice u8))
+  (let [n (args-count) (mut i) 1 (mut seen) 0 (mut found) (slice-new [u8] (cast (ptr u8) 0) 0)]
+    (loop (if (>= (load i) n) (break)
+            (do (let [a (args-nth (load i))]
+                  (if (or (slice-empty? a) (= (slice-get a 0) 45))
+                      0
+                      (do (if (= (load seen) k) (set! found a) 0)
+                          (set! seen (+ (load seen) 1))
+                          0)))
+                (set! i (+ (load i) 1))
+                0)))
+    (load found)))
+
+(defn parse-int-or [(s (slice u8)) (dflt i64)] (-> i64)
+  (if (slice-empty? s) dflt
+    (let [n (slice-len s)
+          neg (= (slice-get s 0) 45)
+          (mut i) (if neg 1 0)
+          (mut acc) 0
+          (mut ok) true]
+      (loop (if (>= (load i) n) (break)
+              (do (let [c (slice-get s (load i))]
+                    (if (or (< c 48) (> c 57))
+                        (set! ok false)
+                        (set! acc (+ (* (load acc) 10) (cast i64 (- c 48))))))
+                  (set! i (+ (load i) 1))
+                  0)))
+      (if (not (load ok)) dflt (if neg (- 0 (load acc)) (load acc))))))
+
+(defn main [(argc i32) (argv (ptr (ptr i8)))] (-> i64)
+  (args-set! argc argv)
+  (let [path (positional 0)]
+    (if (slice-empty? path)
+        (usage)
+        (let [a (malloc-allocator)
+              arg (parse-int-or (positional 1) 7)
+              source (nh-read-text a path)]
+          (if (slice-empty? source)
+              (do (fmt (stderr) "js-probe: cannot read {s}\n" path) 2)
+              (do
+                (fmt (stdout) "{s}  main({d})\n" path arg)
+                (let [status (nh-status source arg)]
+                  (fmt (stdout) "  {s}\n" (nh-status-name status))
+                  (cond (= status NH-AGREES) 0
+                        (= status NH-DISAGREES) 1
+                        (= status NH-REFUSED) 2
+                        (= status NH-CRASHES) 3
+                        :else 4))))))))

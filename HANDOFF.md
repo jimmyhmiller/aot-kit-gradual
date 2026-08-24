@@ -1,5 +1,179 @@
 # Handoff: move JavaScript semantics into the DSL
 
+## DEAD IF ARMS NO LONGER CAUSE 6,316 SELECTION FAILURES (2026-08-24, latest)
+
+The Test262 selection cohort exposed two layers of misleading diagnostics before the compiler bug:
+`machine=4/N` means `MSEL-TERMINATOR` at item N, not operand slot 4, and construction-time items are
+ideal nodes or CFG blocks rather than machine instructions. The backend and native harness now keep
+construction and verifier result domains distinct and retain targeted block/node diagnostics.
+
+The dominant root cause was reachability collapsing an ideal `If` to one machine-CFG successor
+while terminator selection still demanded both CProj targets. The machine CFG is authoritative;
+every one-successor block now emits `MI-JMP`, and verification accepts that canonical form. A direct
+backend regression pins a dead true arm selecting as one jump and one return with no `MI-CBR`.
+
+Across the exact 6,788-variant / 3,433-file cohort, selection failures fell from 6,603 to 633
+(90.4%), `MSEL-TERMINATOR` fell from 6,316 to 361 (94.3%), 75 variants became passes, and runtime
+fell from 11m41.61s to 5m53.84s. The residual 361 terminator cases are not the same bug: their live
+Region has both an `If` and a `Loop` as direct control users, which the current unique-successor CFG
+walk cannot represent. Residual selection counts are 361 terminator, 220 unsupported, 50
+dependency, and 2 call failures.
+
+## TEST262 FAILURES HAVE A COMPLETE RECORDED-REASON INVENTORY (2026-08-24, latest)
+
+`tools/analyze-test262-results.mjs` turns a retained JSONL run into
+`docs/TEST262-FAILURE-INVENTORY.md`: every non-passing record is assigned to its most specific
+retained reason, with variant count, distinct-file count, recorded wall time, dominant test
+families, and examples. The report explicitly marks coarse evidence as coarse. In particular,
+30,304 `RUNTIME-FAILED` variants lack assertion diagnostics, and the historical 6,596 selection
+failures lack the machine/node lines printed after the headline diagnostic. The runner now retains
+those native diagnostic lines in new result records so targeted selection reruns can be clustered
+by actual failure shape before fixes are attempted.
+
+## TEST262 RESULTS ARE PERSISTENT BY DEFAULT (2026-08-24, latest)
+
+`tools/run-test262.mjs` now appends every per-variant result to a unique timestamped
+`test262-results-*.jsonl` file by default and writes category totals to its adjacent summary JSON.
+The runner announces both absolute paths, explicit `--results FILE` remains available and is
+required for `--resume`, and `--quick` is the deliberate opt-out when persistence is unwanted.
+Conflicting `--quick --results` and `--quick --resume` invocations are rejected rather than silently
+discarding requested evidence.
+
+## INSTRUCTION SELECTION EXCEEDS THE SIMPLE BASELINE (2026-08-23, latest)
+
+The final late-GCM gap was not the backward scan or a missing worklist. The large witness completed
+late placement in one round, but every movable instruction walked `latest -> earliest` twice:
+`mu-dominates?` first validated dominance, then the placement loop traversed the identical idom
+path to choose the minimum-loop-depth block. Simple's `_doSchedLate` validates and chooses during
+one idom walk. AOT Kit now does the same through `ms-gcm-best-late-block`.
+
+On the 54,612-node / 120,293-machine-instruction witness, late GCM fell from approximately 201.2 ms
+to 120.1 ms and total selection from approximately 280 ms to approximately 200 ms. Three
+unprofiled two-variant repetitions produced six selection measurements with a 200.735 ms median.
+Normalized to Simple chapter 23's 32,378 nodes, that is 54.030 ms versus Simple's measured 67.228
+ms selection+GCM baseline: AOT Kit is 19.6% faster on the agreed normalized comparison.
+
+The fixed-seed 1,000-file sample retained exactly 145 passed, 946 failed, 466 refused, and 199
+policy-skipped outcomes. Aggregate selection CPU fell from 4,571.424 ms before the Simple-driven
+selection work to 3,360.055 ms, a 26.5% reduction.
+
+Final invariant evidence: the bounded gate is 46/46, backend motion is 10/10, backend selection is
+16/16, and the frontier remains the same 11 intentionally failing bugs. The exhaustive suite had
+two stale integration errors (`v-count-ins`/`v-count-outs` were missing test measurements and
+`native_harness` gave Darwin's void `sys_icache_invalidate` an `i64` return); after repairing those,
+it runs to completion at 399 passed / 49 broad native failures. Those failures are not presented as
+green and remain outside both the bounded gate and the 11-case frontier.
+
+Backend selection tracing is now opt-in rather than production work. `tools/run-test262.mjs
+--profile ...` passes `--profile` through both one-shot and persistent native-worker paths and
+retains all `AOTK_PROFILE phase=selection_*` records. Normal runs skip selection trace formatting
+and monotonic-clock calls. Alternating runs measured only about 0.5 ms median tracing overhead, so
+tracing was fixed for honesty but was not used to explain the architectural speedup.
+
+## SELECTION MEMOIZATION IS NODE-DENSE AND EFFECT WALKING ALLOCATES NOTHING (2026-08-23, latest)
+
+The next comparison against Simple found another fundamental mismatch: AOT Kit eagerly initialized
+three `function-count * graph-node-count` tables before demand selection. Simple has one memo entry
+per reached graph node. AOT Kit now uses one node-indexed memo with explicit owner tags. Functions
+are selected sequentially, so a shared constant can be remapped for the next owner without retaining
+an owner-by-node matrix; owner-local values and phis remain stable for the entire owner selection.
+
+Memory-effect chain selection also no longer allocates and frees an `ArrayList` for each unseen
+chain. It uses a reentrant MachineUnit stack with saved lengths, so nested selection preserves the
+caller's suffix and all capacity is reused. Finally, edge-copy construction and resolution traverse
+each owner's block successor adjacency instead of scanning every machine edge once per owner.
+
+The bounded gate remains 46/46. The fixed 1,000-file sample retained exactly 145 passed, 946 failed,
+466 refused, and 199 policy-skipped outcomes. Its aggregate selection CPU fell from the earlier
+4,571.424 ms baseline to 3,552.976 ms in the latest parallel run, while parallel wall timing remained
+too noisy for phase attribution. The single-worker large witness is stable at 278.807--282.101 ms
+total selection; strict emission is 40.122 ms and GCM 230.909 ms. Normalized to Simple's 32,378
+nodes, strict combined selection is about 75.1 ms versus Simple's 67.2 ms. The remaining measured
+gap is still emission/control materialization, not GCM.
+
+## INSTRUCTION SELECTION NOW FOLLOWS SIMPLE'S SCHEDULING SHAPE (2026-08-23, latest)
+
+The instruction-selection investigation used SeaOfNodes/Simple chapter 23 as the baseline rather
+than optimizing the old phase structure in place. The backend now maintains def/use adjacency,
+computes early placement once, drives late placement from ready uses, derives memory
+anti-dependencies from ideal-memory adjacency, and materializes block order once after placement.
+Repeated early refresh, unconditional late fixed points, Cartesian read/write scans, the pre-GCM
+pack, and the pre-GCM anti-dependency build are gone. Production Test262 compilation skips backend
+verification while normal tests retain it.
+
+The large witness `language/expressions/property-accessors/S11.2.1_A4_T9.js` has 54,611 ideal
+nodes, 120,293 machine instructions, and 8,687 blocks. Its variants measured 273.292 ms and 283.441
+ms total selection. The strict variant used 39.982 ms for emission, 225.387 ms for GCM, and 0.945
+ms for final anti-dependency publication. Simple chapter 23 measured 5.965 ms selection plus 61.263
+ms GCM for 32,378 nodes. Normalized by node count, AOT Kit's GCM is 60.7--61.7 ms and at parity;
+combined selection is 73.6--76.3 ms, leaving a 10--14% gap in rewrite/emission rather than GCM.
+
+The fixed-seed 1,000-file sample (`seed=2621000`, 16 workers, `--batch-size 8`) completed 1,557
+executable variants in 10.327 seconds wall time. Aggregate selection CPU was 4,571.424 ms:
+1,676.376 ms machine construction, 1,830.652 ms emission, 881.332 ms GCM, and 22.691 ms final
+anti-dependencies. Outcomes were 145 passed, 946 failed, 466 refused, and 199 policy-skipped.
+
+The remaining target is emission: on the large witness, preselection costs 27.7--29.2 ms and the
+separate terminator pass costs 8.6--9.1 ms. GCM is no longer the architectural outlier.
+
+## GENERATED MACH-O EXECUTION NO LONGER LINKS OR PAYS GATEKEEPER PER CASE (2026-08-23, latest)
+
+Darwin Test262 execution now writes the already-verified Mach-O object but does not link it into a
+new executable. A stable prebuilt `native/gc/in-memory-driver.c` parses that object, copies its text
+onto W^X pages, resolves every external AArch64 branch relocation through a nearby absolute-jump
+veneer, registers stack maps/layouts with the GC, and calls the generated kernel through
+`aot_gc_enter1`. The same assessed host path is reused; generated programs remain separate child
+processes, so crashes and 2-second timeouts cannot take down the persistent compiler worker. Linux
+retains its existing ELF/Clang path.
+
+The 20-variant passing smoke stayed 20/20, with warm median native execution 6.85 ms, compiler
+phases 18.50 ms, and zero Clang-link phases. End-to-end warm request latency fell from the earlier
+436 ms to 174 ms. The requested pinned, sorted 100-file Test262 slice produced 191 variants in
+9.20 s at 14 workers (0 passed, 158 failed, 24 refused, 9 policy-skipped); this Annex B prefix is
+pathological and included eight runtime failures plus two bounded 2-second timeouts. Treating it as
+representative exactly as requested, the corpus's 53,872 files extrapolate to 4,956 seconds, or
+82.6 minutes, at the same concurrency. No generated case reported a Clang-link phase.
+
+Top-level tracing now includes `aarch64_encoding`, `macho_publication`, and `native_cleanup`. The
+longest record in that 100-file run, Annex B RegExp legacy-accessors `index/prop-desc.js`, reproduced
+at 7.64 s default and 7.34 s strict. AArch64 encoding consumed 5.90 s per variant and Mach-O
+publication 1.17 s; frontend graph construction was 97-107 ms, allocation 69-74 ms, selection
+47-53 ms, and isolated native execution only 8.7-9.0 ms. The previously unexplained delay is
+therefore compiler backend work, not execution, linking, cleanup, or protocol overhead.
+
+The Simple-style linearization design is recorded in `docs/LINEAR-BACKEND-PUBLICATION.md`. The
+first implementation replaces production `be-reg-of`/`be-spill-of`/`be-owner-of` instruction
+searches with the allocator's dense `mra-*` tables (retaining an explicit legacy-fixture fallback),
+and publishes dense block byte offsets during sizing so branch lookup is constant time. On the same
+31,847-instruction witness, default fell from 7.643 s to 1.851 s (4.1x) and strict from 7.336 s to
+1.348 s (5.4x). AArch64 encoding fell from about 5.90 s to 0.784/0.672 s (7.5x/8.8x). Mach-O
+publication fell from about 1.17 s to 0.428/0.370 s because publication also used the scan-based
+register helper. Remaining work is recorded relocations and one-time metadata materialization.
+
+## CROSS-PLATFORM MONOTONIC TRACING AND PERSISTENT-WORKER BREAKDOWN (2026-08-23, latest)
+
+`src/monotonic.coil` is now the single profiler clock. Coil compile-time target selection uses
+`(= (primitive/target-os) `linux)` to emit Linux `CLOCK_MONOTONIC` (`1`) or Darwin's (`6`), with
+no C shim and no runtime platform probing. The native harness, frontend, selector, node optimizer,
+and machine-CFG profiler all use that helper. This removes Darwin's negative/huge profile values
+caused by hard-coded Linux clock ID `1`; the final gate/frontier logs contained zero negative or
+13+-digit `ns` values. `tools/run-test262.mjs` also measures worker readiness entirely in Node's
+monotonic clock domain instead of subtracting timestamps from different processes.
+
+A 20-variant, one-worker tiny-program run passed 20/20. Warm medians were 494.3 ms wall, 32.2 ms
+compiler phases, 36.7 ms Clang link, and 295.2 ms native execution. Within compilation, graph
+construction was 18.1 ms, indexing 4.0 ms, selection 3.9 ms, and allocation 2.4 ms. Cold worker
+startup varied substantially between runs (296.5-574.8 ms), so it is not a stable compiler cost.
+
+The native-execution trace now splits `popen` spawn, wait-to-first-output, and `pclose` reap. On a
+20-variant warm run their medians were 0.225 ms, 194.575 ms, and 0.254 ms respectively. A control
+experiment with a freshly linked trivial Mach-O took 203.3 ms on first launch, then 5.6, 4.5, 4.1,
+and 3.5 ms on repeated launches. The apparent execution cost is therefore macOS first-launch
+assessment of each newly linked binary, not time spent executing the tiny JavaScript program.
+
+Witness: `coil test` passed 46/46. `coil test --suite frontier` remained intentionally red with
+0/11 passing, preserving all currently recorded open bugs.
+
 ## UNREACHABLE JAVASCRIPT FUNCTION BODIES ARE NEVER BUILT (2026-08-23, latest)
 
 The closed-world frontend now computes exact function reachability before graph publication. The
@@ -43,6 +217,28 @@ passed, 95 failed, 49 refused, 17 skipped). Aggregate frontend analysis fell fro
 successful-variant mean is now 0.652 s versus 20.512 s (31.4× faster), though the original corpus
 had 14 successes and the current parity baseline has 16, so status parity is asserted only against
 the immediately preceding checkpoint. The mandatory gate remains 46/46 green.
+
+## DIVERGED LOCAL WORK RECONCILED ONTO REMOTE MAIN (2026-08-23, latest)
+
+The former local `main` at `b631e3f` is preserved as
+`backup/local-divergence-2026-08-23`; `main` now follows remote commit `bcb36b1`. The lines had
+diverged by 20 local and ultimately 26 remote commits, with broad conflicts across the frontend, backend,
+runtime, and DSL. Remote is the functional base: its exception, descriptor/accessor, Test262,
+x86-64/Linux, and compiler-performance work supersedes the narrower local implementations.
+
+Six local bug witnesses were rerun through remote's real native differential pipeline after
+rebuilding the pinned TypeScript-Go bridge. The accessor-definition and source try/catch cases now
+agree with Node and are pinned in `native-execution-test.coil`. Four remain open and were registered
+in the frontier: for-in machine-CFG verification, numeric conditional call results, a boolean
+heap-read crash across mutation, and inherited data properties. `tools/js-probe.coil` was retained
+and adapted to the current allocator API as the single-file differential tool. The generated
+frontier report records the resulting 11 open bugs.
+
+The report integrity test counts all 11 files correctly, but its renderer aborts before comparison
+when `nh-status` reaches the pre-existing shorthand-method repro: the frontend's unsupported object
+literal element path aborts instead of returning `NH-REFUSED`. The two reports were updated from
+the individually measured statuses; fixing that recoverability defect is required before the
+byte-for-byte generator check can become green on this platform.
 
 ## FRONTEND BUILTIN CLASSIFICATION REJECTS BY NAME BEFORE RECURSING (2026-08-23, latest)
 
@@ -1563,3 +1759,36 @@ deftest. Phase A's first step gives that back.
    shortest-round-trip digit generator; the native side prints %.17g noise today).
 6. The stdlib's own `bytewise-hash` likely shares the low-bits weakness — that fix belongs in
    the compiler repo.
+# TEST262'S 30,304 RUNTIME FAILURES ARE A BROAD SEMANTICS POPULATION, NOT SELECTION
+
+The retained full run has 30,304 generic runtime-failed variants across 15,933 files. A
+300-file, 15-family stratified rerun produced 554 variants: 541 remained generic runtime
+failures, nine exposed selection failures, three crashed, one exposed graph corruption, and
+none passed. The exact exclusive capability breakdown and work queue are in
+`docs/TEST262-RUNTIME-FAILURES.md`. The blocking observability defect is now precise: native
+assertion failures do not carry assertion kind, expected/actual values, or source identity back
+to the runner, so finer root-cause claims would currently be guesses.
+# TEST262 RUNTIME FAILURES NOW RETAIN THROWN VALUES, MESSAGES, AND DECODED PROPERTIES
+
+`tools/run-test262.mjs` enables the native runtime's existing `AOT_TRACE_THROW` path in standalone
+and persistent workers. `native/gc/runtime.c` prints property names and decoded JavaScript values;
+a witnessed assertion failure now retains its `Test262Error.message` in JSONL instead of collapsing
+to `RUNTIME-FAILED`. Attempts to add assertion-kind and actual/expected properties reproduced the
+open property-store/control-fanout selection failure even when centralized in the error constructor,
+so the standard passing assertion harness was restored. Exact actual/expected capture is now a
+named dependency on that compiler fix, not an unrecorded observability gap.
+# OBSERVED RUNTIME DATA POINTS FIRST TO FUNCTION, DESTRUCTURING, AND CALLBACK CALLS
+
+The 300-file stratified corpus was rerun with throw tracing. Of 554 variants, 461 produced
+structured throws; 371 were `ReferenceError`, including 211 for a missing `Function` binding.
+Eighty remained untraced runtime failures, concentrated in destructuring (34), function/declaration
+cases (18), Temporal (14), and Array callbacks (10). The prioritized work queue and non-extrapolation
+caveat are recorded in `docs/TEST262-RUNTIME-FAILURES.md`. The next core implementation target is
+the ordinary Function intrinsic/prototype surface, followed by destructuring's untraced exits and
+Array callback receiver/call semantics.
+## 2026-08-24: complete observed Test262 run and failure reduction
+
+Ran all 93,209 runner-policy variants with retained diagnostics: 7,663 passed, 51,465 failed, 22,799 refused, and 11,282 policy-skipped. Wall time was 946.374s. The complete mutually exclusive breakdown and prioritized work order are in `docs/TEST262-FULL-BREAKDOWN.md`; raw records and exhaustive aggregation are retained at `test262-results-observed-full-2026-08-24.jsonl` and `test262-full-breakdown-2026-08-24.json`.
+## 2026-08-24: object shorthand and method syntax cross the bridge
+
+Measured all 20,629 retained `frontend-bridge-kind-0` refusals by path and source shape. Classes dominate with 9,913 variants; object expressions are next at 1,200. Added stable bridge kinds for object-literal method declarations (304) and shorthand property assignments (305), then taught Coil indexing, capture/reachability, static/dynamic object construction, and DSL property publication to treat `{method(){}}` as a closure-valued property and `{value}` as `{value: value}`. Rebuilt the Go bridge. The bounded gate remains 46/46 green. The method frontier no longer refuses at bridge/index/graph construction; it now reaches the pre-existing `ArrayResize` selector defect and fails `MSEL-OWNER` on a `MI-JSARRAY` whose block membership disagrees with block 87. Frontier remains honestly red at 0/11.

@@ -48,7 +48,15 @@
 (const FE-INTRINSIC-UNBOUND i64 -24)
 
 (defn fe-function-expression-kind? [(kind i64)] (-> bool)
-  (or (= kind TSK-FUNCTION-EXPRESSION) (= kind TSK-ARROW-FUNCTION)))
+  (or (= kind TSK-FUNCTION-EXPRESSION)
+      (or (= kind TSK-ARROW-FUNCTION) (= kind TSK-METHOD-DECLARATION))))
+
+(defn fe-object-property-value-node [(ast (ref TsAst)) (property i64)] (-> i64)
+  (if (= (ts-kind ast property) TSK-METHOD-DECLARATION)
+      property
+      (if (= (ts-kind ast property) TSK-SHORTHAND-PROPERTY-ASSIGNMENT)
+          (ts-child ast property 0)
+          (ts-child ast property (- (ts-child-count ast property) 1)))))
 
 (defn fe-intrinsic-name [(name (slice u8))] (-> i64)
   (cond (= name "String") FE-INTRINSIC-STRING
@@ -626,7 +634,9 @@
         (loop (if (>= (load index) (ts-child-count ast node))
                   (break)
                   (let [property (ts-child ast node (load index))]
-                    (if (or (!= (ts-kind ast property) TSK-PROPERTY-ASSIGNMENT)
+                    (if (or (not (or (= (ts-kind ast property) TSK-PROPERTY-ASSIGNMENT)
+                                     (or (= (ts-kind ast property) TSK-METHOD-DECLARATION)
+                                         (= (ts-kind ast property) TSK-SHORTHAND-PROPERTY-ASSIGNMENT))))
                             (= (ts-kind ast (ts-child ast property 0)) TSK-COMPUTED-PROPERTY-NAME))
                         (set! eligible false) 0)
                     (set! index (+ (load index) 1))))) 0)
@@ -664,7 +674,7 @@
                                 (mut (.fields frontend))
                                 (fe-field-make owner property
                                                (ts-child ast property 0)
-                                               (ts-child ast property (- (ts-child-count ast property) 1))))
+                                               (fe-object-property-value-node ast property)))
                       (set! index (+ (load index) 1)))))
           (al-push! [FeTypeDecl] (mut (.types frontend))
                     (fe-type-make node node start (ts-child-count ast node)))) 0)
@@ -1080,7 +1090,8 @@
     (if (= kind TSK-THIS)
         true
         ; Arrows inherit `this`, so they remain transparent to the enclosing receiver scan.
-        (if (or (= kind TSK-FUNCTION-DECLARATION) (= kind TSK-FUNCTION-EXPRESSION))
+        (if (or (= kind TSK-FUNCTION-DECLARATION)
+                (or (= kind TSK-FUNCTION-EXPRESSION) (= kind TSK-METHOD-DECLARATION)))
             false
             (let [(mut index) 0
                   (mut found) false]
@@ -1182,8 +1193,7 @@
   (let [ast (field frontend ast)
         kind (ts-kind ast node)
         (mut child-parent) parent]
-    (if (or (= kind TSK-FUNCTION-DECLARATION)
-            (or (= kind TSK-FUNCTION-EXPRESSION) (= kind TSK-ARROW-FUNCTION)))
+    (if (or (= kind TSK-FUNCTION-DECLARATION) (fe-function-expression-kind? kind))
         (let [id (al-len [FeFunction] (.functions frontend))]
           (fe-find-function-parts! (mut frontend) node id parent)
           (set! child-parent id))
@@ -1209,8 +1219,7 @@
                     (mut (.symbols frontend))
                     (fe-symbol-make sid node name owner FE-ROLE-LOCAL maybe-type)))
         0)
-    (if (or (= (ts-kind ast node) TSK-FUNCTION-EXPRESSION)
-            (= (ts-kind ast node) TSK-ARROW-FUNCTION))
+    (if (fe-function-expression-kind? (ts-kind ast node))
         0
         (let [(mut index) 0]
           (loop (if (>= (load index) (ts-child-count ast node))

@@ -34,7 +34,14 @@ const optionNames = new Set([
   "--memory-mb",
   "--batch-size",
 ]);
-const flagNames = new Set(["--quiet", "--no-build", "--resume", "--es5-only"]);
+const flagNames = new Set([
+  "--quiet",
+  "--quick",
+  "--no-build",
+  "--resume",
+  "--es5-only",
+  "--profile",
+]);
 const hasFlag = (name) => argv.includes(name);
 const paths = [];
 for (let i = 0; i < argv.length; i++) {
@@ -56,35 +63,52 @@ const jobs = Math.max(1, Number(option("--jobs", "1")));
 const timeoutMs = Math.max(1, Number(option("--timeout-ms", "30000")));
 const memoryMb = Math.max(1, Number(option("--memory-mb", "2048")));
 const batchSize = Math.max(1, Number(option("--batch-size", "1")));
-const results = option("--results");
 const quiet = hasFlag("--quiet");
+const quick = hasFlag("--quick");
 const resume = hasFlag("--resume");
 const es5Only = hasFlag("--es5-only");
+const profile = hasFlag("--profile");
+const explicitResults = option("--results");
+const defaultResults = resolve(
+  `test262-results-${new Date().toISOString().replace(/[:.]/g, "-")}.jsonl`,
+);
+const results = quick ? "" : resolve(explicitResults || defaultResults);
+const invocationStarted = performance.now();
+let buildMs = 0;
 if (paths.length === 0) {
   console.error(
     "usage: node tools/run-test262.mjs --test262 DIR [--start N] [--limit N] " +
       "[--jobs N] [--timeout-ms N] [--memory-mb N] [--results FILE] [--resume] [--quiet] " +
-      "[--es5-only] TEST_OR_DIRECTORY...",
+      "[--quick] [--es5-only] TEST_OR_DIRECTORY...",
   );
   process.exit(64);
 }
-if (resume && !results) {
-  console.error("run-test262: --resume requires --results FILE");
+if (quick && explicitResults) {
+  console.error("run-test262: --quick cannot be combined with --results");
   process.exit(64);
 }
+if (resume && !explicitResults) {
+  console.error("run-test262: --resume requires an explicit --results FILE");
+  process.exit(64);
+}
+if (results) console.error(`test262 results: ${results}`);
 
 if (!hasFlag("--no-build")) {
+  const buildStarted = performance.now();
   const build = spawnSync(
     "coil",
     ["build", "tools/test262-native.coil", "-o", native, "--meta-opt=1", "--quiet"],
     { cwd: process.cwd(), encoding: "utf8" },
   );
+  buildMs = performance.now() - buildStarted;
   if (build.status !== 0) {
     process.stderr.write(build.stdout || "");
     process.stderr.write(build.stderr || "");
     process.exit(build.status || 1);
   }
 }
+
+const executionStarted = performance.now();
 
 const localHarness = resolve("tests/test262/harness");
 const sta = readFileSync(join(localHarness, "sta.js"), "utf8");
@@ -311,14 +335,18 @@ function runNative(assembled, count = 0) {
     const spawnStartedNs = process.hrtime.bigint();
     const detached = process.platform !== "win32";
     const command = process.platform === "linux" ? "prlimit" : native;
+    const nativeArgs = [...(profile ? ["--profile"] : []), assembled,
+      ...(count > 0 ? [String(count)] : [])];
     const args = process.platform === "linux"
-      ? [`--as=${memoryMb * 1024 * 1024}`, "--", native, assembled, ...(count > 0 ? [String(count)] : [])]
-      : [assembled, ...(count > 0 ? [String(count)] : [])];
-    const child = spawn(command, args, { cwd: process.cwd(), detached });
+      ? [`--as=${memoryMb * 1024 * 1024}`, "--", native, ...nativeArgs]
+      : nativeArgs;
+    const child = spawn(command, args, { cwd: process.cwd(), detached,
+      env: { ...process.env, AOT_TRACE_THROW: "1" } });
     let stdout = "";
     let stderr = "";
     let timedOut = false;
     let peakRssKb = 0;
+    let readyReceivedNs;
     const monitor = setInterval(() => {
       try {
         const status = readFileSync(`/proc/${child.pid}/status`, "utf8");
@@ -338,18 +366,23 @@ function runNative(assembled, count = 0) {
     const append = (current, chunk) =>
       current.length >= 65536 ? current : (current + chunk.toString()).slice(0, 65536);
     child.stdout.on("data", (chunk) => { stdout = append(stdout, chunk); });
-    child.stderr.on("data", (chunk) => { stderr = append(stderr, chunk); });
+    child.stderr.on("data", (chunk) => {
+      stderr = append(stderr, chunk);
+      if (readyReceivedNs === undefined && stderr.includes("AOTK_READY")) {
+        readyReceivedNs = process.hrtime.bigint();
+      }
+    });
     child.on("error", (error) => {
       clearTimeout(timer);
       clearInterval(monitor);
       resolveRun({ pid: child.pid, status: null, signal: "SPAWN", stdout,
-        stderr: error.message, spawnStartedNs, peakRssKb });
+        stderr: error.message, spawnStartedNs, readyReceivedNs, peakRssKb });
     });
     child.on("close", (status, signal) => {
       clearTimeout(timer);
       clearInterval(monitor);
       resolveRun({ pid: child.pid, status, signal: timedOut ? "TIMEOUT" : signal, stdout, stderr,
-        spawnStartedNs, peakRssKb });
+        spawnStartedNs, readyReceivedNs, peakRssKb });
     });
   });
 }
@@ -365,14 +398,79 @@ function timingFields(run, assemblyMs, durationMs) {
       [...match[2].matchAll(/([a-z0-9_]+)=(\d+)/gi)].map((field) => [field[1], Number(field[2])]),
     );
   }
-  const ready = run.stderr.match(/^AOTK_READY ns=(\d+)$/m);
-  if (ready) phases.process_startup = Number(BigInt(ready[1]) - run.spawnStartedNs) / 1e6;
+  if (run.readyReceivedNs !== undefined) {
+    phases.process_startup = Number(run.readyReceivedNs - run.spawnStartedNs) / 1e6;
+  }
   const compileNames = ["source_assembly", "process_startup", "frontend_index", "frontend_graph",
-    "graph_verify", "selection", "scheduling", "allocation", "x86_encoding",
-    "elf_publication"];
+    "graph_verify", "selection", "scheduling", "allocation", "aarch64_encoding",
+    "macho_publication", "x86_encoding", "elf_publication"];
   const compileMs = compileNames.reduce((sum, name) => sum + (phases[name] || 0), 0);
   return { phasesMs: phases, profile, compileMs, attemptWallMs: durationMs,
     peakRssKb: run.peakRssKb };
+}
+
+function nativeDiagnostic(stderr) {
+  const lines = stderr.trim().split("\n");
+  const phaseIndex = lines.findIndex((line) => line.startsWith("native-harness:"));
+  if (phaseIndex < 0) return "";
+  return [lines[phaseIndex], ...lines.slice(phaseIndex + 1).filter((line) =>
+    /^[mn]\d+:/.test(line) || /^  (?:[ab] <-|call )/.test(line),
+  )].join("; ");
+}
+
+function runtimeThrowDiagnostic(stderr) {
+  const lines = stderr.trim().split("\n");
+  const at = lines.findIndex((line) => line.startsWith("uncaught JavaScript throw"));
+  if (at < 0) return "";
+  return lines.slice(at).filter((line) =>
+    line.startsWith("uncaught JavaScript throw") || line.startsWith(" property "),
+  ).join("; ");
+}
+
+function batchRuntimeThrowDiagnostic(stderr, index) {
+  const marker = `AOTK_BATCH_EXEC index=${index}\n`;
+  const at = stderr.indexOf(marker);
+  if (at < 0) return "";
+  const tail = stderr.slice(at + marker.length);
+  const next = tail.indexOf("AOTK_BATCH_EXEC index=");
+  return runtimeThrowDiagnostic(next < 0 ? tail : tail.slice(0, next));
+}
+
+const diagnosticKinds = ["unknown", "assert", "sameValue", "notSameValue",
+  "throws-non-function", "throws-non-object", "throws-wrong-constructor",
+  "throws-missing", "compareArray", "uncaught-exception"];
+const diagnosticTags = ["undefined", "null", "boolean", "integer", "number", "string",
+  "object", "function", "other"];
+function decodeRuntimeDiagnostic(codeText) {
+  let code = Number(codeText);
+  if (!Number.isSafeInteger(code) || code < 1073741824) return null;
+  code -= 1073741824;
+  const site = Math.floor(code / 4194304); code %= 4194304;
+  const kind = Math.floor(code / 262144); code %= 262144;
+  const actualTag = Math.floor(code / 16384); code %= 16384;
+  const expectedTag = Math.floor(code / 1024); code %= 1024;
+  const actualBits = Math.floor(code / 32);
+  const expectedBits = code % 32;
+  const value = (bits, tag) => bits === 31 ? undefined :
+    tag === 2 ? bits !== 15 : bits - 15;
+  const actualValue = value(actualBits, actualTag);
+  const expectedValue = value(expectedBits, expectedTag);
+  const result = { assertionSite: site, failureKind: diagnosticKinds[kind] || `kind-${kind}`,
+    actualType: diagnosticTags[actualTag] || `tag-${actualTag}`,
+    expectedType: diagnosticTags[expectedTag] || `tag-${expectedTag}` };
+  if (actualValue !== undefined) result.actualValue = actualValue;
+  if (expectedValue !== undefined) result.expectedValue = expectedValue;
+  return result;
+}
+
+function runtimeFailure(codeText) {
+  const diagnostic = decodeRuntimeDiagnostic(codeText);
+  if (!diagnostic) return { detail: "RUNTIME-FAILED" };
+  const shown = (type, value) => value === undefined ? type : `${type}(${value})`;
+  return { detail: `runtime ${diagnostic.failureKind} at assertion #${diagnostic.assertionSite}: ` +
+      `actual=${shown(diagnostic.actualType, diagnostic.actualValue)} ` +
+      `expected=${shown(diagnostic.expectedType, diagnostic.expectedValue)}`,
+    diagnostic };
 }
 
 function finishOne(task, assembled, run, assemblyMs, durationMs) {
@@ -390,12 +488,7 @@ function finishOne(task, assembled, run, assemblyMs, durationMs) {
     run.stderr.includes("frontend: unsupported")
   ) {
     const lines = run.stderr.trim().split("\n");
-    const phaseIndex = lines.findIndex((line) => line.startsWith("native-harness:"));
-    const phaseDetail = phaseIndex >= 0
-      ? [lines[phaseIndex], ...lines.slice(phaseIndex + 1).filter((line) =>
-          /^[mn]\d+:/.test(line) || /^  (?:[ab] <-|call )/.test(line),
-        )].join("; ")
-      : "";
+    const phaseDetail = nativeDiagnostic(run.stderr);
     const detail = phaseDetail ||
       lines.find((line) => line.startsWith("test262-native: frontend")) ||
       lines.find((line) => line.startsWith("frontend: unsupported")) || lines.at(-1);
@@ -405,7 +498,7 @@ function finishOne(task, assembled, run, assemblyMs, durationMs) {
   } else {
     const stderrLines = run.stderr.trim().split("\n");
     const detail = stderrLines.find((line) => line.startsWith("graph corruption:")) ||
-      stderrLines.find((line) => line.startsWith("native-harness:")) || run.signal ||
+      nativeDiagnostic(run.stderr) || runtimeThrowDiagnostic(run.stderr) || run.signal ||
       run.stdout.trim() || `exit ${run.status}`;
     report({ path, variant: variant.name, status: "failed", detail,
       durationMs: Math.round(durationMs), ...timings });
@@ -445,7 +538,8 @@ async function runBatch(tasks) {
       if (outcomes.get(i) !== "PASS") {
         const share = timings.compileMs / tasks.length;
         report({ path: tasks[i].path, variant: tasks[i].variant.name, status: "failed",
-          detail: "RUNTIME-FAILED", durationMs: Math.round(durationMs), ...timings,
+          detail: batchRuntimeThrowDiagnostic(run.stderr, i) || "RUNTIME-FAILED",
+          durationMs: Math.round(durationMs), ...timings,
           compileMs: share, batchCompileMs: timings.compileMs, batchSize: tasks.length });
       } else {
         const share = timings.compileMs / tasks.length;
@@ -487,7 +581,8 @@ function nativeServer() {
     // CASE_END is written after the ordinary PASS/REFUSED/etc line on the same stdout stream.
     const cleanStdout = stdout.replace(/^AOTK_CASE_END .*$/gm, "").trimEnd();
     const run = { pid: child?.pid, status, signal, stdout: cleanStdout, stderr,
-      spawnStartedNs: request.startedNs, peakRssKb: request.peakRssKb };
+      spawnStartedNs: request.startedNs, readyReceivedNs: request.readyReceivedNs,
+      peakRssKb: request.peakRssKb };
     stdout = "";
     stderr = "";
     setTimeout(() => request.resolve(run), 0);
@@ -495,10 +590,12 @@ function nativeServer() {
   const start = () => {
     const detached = process.platform !== "win32";
     const command = process.platform === "linux" ? "prlimit" : native;
+    const serverArgs = [...(profile ? ["--profile"] : []), "--server"];
     const args = process.platform === "linux"
-      ? [`--as=${memoryMb * 1024 * 1024}`, "--", native, "--server"]
-      : ["--server"];
-    child = spawn(command, args, { cwd: process.cwd(), detached, stdio: ["pipe", "pipe", "pipe"] });
+      ? [`--as=${memoryMb * 1024 * 1024}`, "--", native, ...serverArgs]
+      : serverArgs;
+    child = spawn(command, args, { cwd: process.cwd(), detached, stdio: ["pipe", "pipe", "pipe"],
+      env: { ...process.env, AOT_TRACE_THROW: "1" } });
     stdoutBuffer = "";
     child.stdout.on("data", (chunk) => {
       const text = chunk.toString();
@@ -512,7 +609,12 @@ function nativeServer() {
         if (end) settle(Number(end[1]), null);
       }
     });
-    child.stderr.on("data", (chunk) => { stderr = appendOutput(stderr, chunk); });
+    child.stderr.on("data", (chunk) => {
+      stderr = appendOutput(stderr, chunk);
+      if (current && current.readyReceivedNs === undefined && stderr.includes("AOTK_READY")) {
+        current.readyReceivedNs = process.hrtime.bigint();
+      }
+    });
     child.on("error", (error) => {
       stderr = appendOutput(stderr, error.message);
       settle(null, "SPAWN");
@@ -597,9 +699,17 @@ console.log(
   `test262 result: ${totals.passed} passed; ${totals.failed} failed; ` +
     `${totals.refused} refused; ${totals.skipped} skipped`,
 );
+const executionMs = performance.now() - executionStarted;
+const invocationMs = performance.now() - invocationStarted;
+console.error(
+  `test262 timing: build=${buildMs.toFixed(0)}ms execution=${executionMs.toFixed(0)}ms ` +
+    `total=${invocationMs.toFixed(0)}ms variants=${work.length}`,
+);
 if (results) {
   const summary = { totals, categories };
   writeFileSync(`${results}.summary.json`, `${JSON.stringify(summary, null, 2)}\n`);
+  console.error(`test262 results: ${results}`);
+  console.error(`test262 summary: ${results}.summary.json`);
 }
 cleanupTemporary();
 process.exit(totals.failed > 0 || totals.refused > 0 || totals.passed === 0 ? 1 : 0);

@@ -43,6 +43,7 @@
 (import "coil.str" :use *)
 (import "coil.arraylist" :use *)
 (import "coil.fs" :use *)
+(import "monotonic" :as monotonic)
 
 (extern fopen :cc c [(ptr i8) (ptr i8)] (-> (ptr u8)))
 (extern fwrite :cc c [(ptr u8) i64 i64 (ptr u8)] (-> i64))
@@ -55,15 +56,38 @@
 (extern getpid :cc c [] (-> i32))
 (extern unlink :cc c [(ptr i8)] (-> i32))
 (extern aot_host_is_x86_64 :cc c [] (-> i32))
-(defstruct NhTimespec [(sec i64) (nsec i64)])
-(extern clock_gettime :cc c [i32 (ptr NhTimespec)] (-> i32))
+(extern aot_mmap_anon_flags :cc c [] (-> i32))
+(extern mmap :cc c [(ptr u8) i64 i32 i32 i32 i64] (-> (ptr u8)))
+(extern mprotect :cc c [(ptr u8) i64 i32] (-> i32))
+(extern munmap :cc c [(ptr u8) i64] (-> i32))
+(extern sys_icache_invalidate :cc c [(ptr u8) i64] (-> void))
+(extern aot_gc_configure :cc c [i64 i32] (-> i32))
+(extern aot_gc_register_unit :cc c [(ptr u8) (ptr u8) (ptr u8)] (-> i64))
+(extern aot_gc_runtime_symbol :cc c [i32] (-> i64))
+(extern aot_gc_enter1 :cc c [(ptr u8) i64] (-> i64))
 ;; native/js-oracle/oracle.c, on the link line through Coil.toml's `[cc] sources`.
 (extern js_oracle_run :cc c [(ptr i8) i64 i64 (ptr i8) i64] (-> i32))
 
 (defn nh-now-ns [] (-> i64)
-  (let [t (primitive/alloc-stack NhTimespec)]
-    (clock_gettime 1 t)
-    (+ (* (.sec t) 1000000000) (.nsec t))))
+  (monotonic/monotonic-now-ns))
+
+;; Exhaustive graph verification is a test/debug policy, not an inseparable frontend phase.
+;; Default it on so every existing native test keeps its current guarantees; corpus tools that
+;; measure production throughput must opt out explicitly.
+(defstruct NhPolicy [(verify-graph bool) (inited bool)])
+(defn nh-policy [] (-> (ptr NhPolicy))
+  (let [p (primitive/alloc-static NhPolicy)]
+    (if (.inited p)
+        0
+        (do (set! (.verify-graph p) true) (set! (.inited p) true) 0))
+    p))
+(defn nh-use-graph-verification! [(enabled bool)] (-> i64)
+  (set! (.verify-graph (nh-policy)) enabled)
+  (be-use-verification! enabled)
+  0)
+(defn nh-graph-verification? [] (-> bool)
+  (.verify-graph (nh-policy)))
+
 (defn nh-timing! [(phase (slice u8)) (started i64)] (-> i64)
   (let [now (nh-now-ns)]
     (fmt (stderr) "AOTK_TIMING phase={s} ns={d}\n" phase (- now started))
@@ -106,10 +130,16 @@
   (let [mode (primitive/alloc-stack (array i8 8))
         out (primitive/alloc-stack (array i8 256))]
     (set! (index (cast (ptr i8) out) 0) (cast i8 0))
-    (let [p (popen cmd (nh-cstr! (cast (ptr i8) mode) 8 "r"))]
+    (let [spawn-start (nh-now-ns)
+          p (popen cmd (nh-cstr! (cast (ptr i8) mode) 8 "r"))
+          _ (nh-timing! "native_spawn" spawn-start)]
       (assert (!= (cast i64 p) 0))
-      (let [line (fgets (cast (ptr i8) out) 256 p)
-            status (pclose p)]
+      (let [output-start (nh-now-ns)
+            line (fgets (cast (ptr i8) out) 256 p)
+            _ (nh-timing! "native_to_first_output" output-start)
+            reap-start (nh-now-ns)
+            status (pclose p)
+            _ (nh-timing! "native_reap" reap-start)]
         (if (or (= (cast i64 line) 0) (!= (cast i64 status) 0))
             (do (set! ok false) 0)
             (do (set! ok true) 0))
@@ -127,6 +157,90 @@
 (defn nh-run-shell! [(text (slice u8))] (-> i64)
   (let [cmd (primitive/alloc-stack (array i8 4096))]
     (cast i64 (system (nh-cstr! (cast (ptr i8) cmd) 4096 text)))))
+
+(defn nh-store-u32! [(p (ptr u8)) (at i64) (v i64)] (-> i64)
+  (set! (index p at) (cast u8 v))
+  (set! (index p (+ at 1)) (cast u8 (>> v 8)))
+  (set! (index p (+ at 2)) (cast u8 (>> v 16)))
+  (set! (index p (+ at 3)) (cast u8 (>> v 24)))
+  0)
+
+(defn nh-store-u64! [(p (ptr u8)) (at i64) (v i64)] (-> i64)
+  (nh-store-u32! p at v)
+  (nh-store-u32! p (+ at 4) (>> v 32))
+  0)
+
+(defn nh-runtime-target [(m (ptr MInst))] (-> i64)
+  (case (.op m)
+    MI-NEW (aot_gc_runtime_symbol 0)
+    MI-JSPROP (aot_gc_runtime_symbol 1)
+    MI-JSARRAY (case (.imm m)
+                 1 (aot_gc_runtime_symbol 3)
+                 2 (aot_gc_runtime_symbol 4)
+                 3 (aot_gc_runtime_symbol 5)
+                 (aot_gc_runtime_symbol 2))
+    MI-JSSTRING (aot_gc_runtime_symbol 6)
+    0))
+
+(defn nh-runtime-branch-pc [(at i64)] (-> i64)
+  (let [m (be-inst at)]
+    (case (.op m)
+      MI-NEW (mobj-new-branch-pc at)
+      MI-JSPROP (mobj-jsprop-branch-pc at)
+      MI-JSARRAY (mobj-jsarray-branch-pc at)
+      MI-JSSTRING (mobj-jsstring-branch-pc at)
+      -1)))
+
+;; Install the verified AArch64 code directly. Each external BL targets a nearby 16-byte veneer:
+;; `ldr x16, #8; br x16; .quad target`. This avoids both the BL range limit and a native linker.
+(defn nh-exec-memory-checked! [(arg i64) (ok (ptr bool))] (-> i64)
+  (let [code-len (be-code-len)
+        relocs (mobj-external-reloc-count)
+        image-len (& (+ (+ code-len (* relocs 16)) 4095) -4096)
+        mem (mmap (cast (ptr u8) 0) image-len 3 (aot_mmap_anon_flags) -1 0)]
+    (if (= (cast i64 mem) -1)
+        (do (set! ok false) 0)
+        (let [(mut i) 0]
+          (loop (if (>= (load i) code-len)
+                    (break)
+                    (do (set! (index mem (load i)) (cast u8 (be-code-byte (load i))))
+                        (set! i (+ (load i) 1)) 0)))
+          (let [(mut at) 0 (mut reloc) 0]
+            (loop (if (>= (load at) (be-inst-count))
+                      (break)
+                      (do
+                        (let [m (be-inst (load at))
+                              pc (nh-runtime-branch-pc (load at))]
+                          (if (and (>= pc 0)
+                                   (or (!= (.op m) MI-NEW) (be-runtime-allocation?)))
+                              (let [stub (+ code-len (* (load reloc) 16))
+                                    delta (/ (- stub pc) 4)]
+                                (nh-store-u32! mem pc (| 2483027968 (& delta 67108863)))
+                                (nh-store-u32! mem stub 1476395088)
+                                (nh-store-u32! mem (+ stub 4) 3592356352)
+                                (nh-store-u64! mem (+ stub 8) (nh-runtime-target m))
+                                (set! reloc (+ (load reloc) 1))
+                                0)
+                              0))
+                        (set! at (+ (load at) 1))
+                        0))))
+          (let [obj (be-object-data)
+                stackoff (cast i64 (mobj-u32 232))
+                layoutoff (cast i64 (mobj-u32 312))
+                kernel (+ (cast i64 mem) (mu-function-code-start 0))]
+            (aot_gc_register_unit (cast (ptr u8) kernel)
+                                  (cast (ptr u8) (+ (cast i64 obj) stackoff))
+                                  (cast (ptr u8) (+ (cast i64 obj) layoutoff)))
+            (if (or (!= (cast i64 (mprotect mem image-len 5)) 0)
+                    (= (cast i64 (aot_gc_configure 1048576 0)) 0))
+                (do (set! ok false) 0)
+                (do
+                  (sys_icache_invalidate mem image-len)
+                  (set! ok true)
+                  (let [answer (aot_gc_enter1 (cast (ptr u8) kernel) arg)]
+                    (aot_gc_register_unit (cast (ptr u8) 0) (cast (ptr u8) 0) (cast (ptr u8) 0))
+                    (munmap mem image-len)
+                    answer))))))))
 
 ;; ---------------------------------------------------------------------------
 ;; Leg 1: source -> graph -> machine code
@@ -153,7 +267,7 @@
       (frontend-native-build! (mut fe) 7001 true)
       (set! phase-start (nh-timing! "frontend_graph" (load phase-start)))
       (fe-native-free! (mut fe)))
-    (let [violations (g-verify)]
+    (let [violations (if (nh-graph-verification?) (g-verify) 0)]
       (set! phase-start (nh-timing! "graph_verify" (load phase-start)))
       (if (!= violations 0)
           (do (fmt (stderr) "native-harness: verify violations={d}\n" violations)
@@ -178,10 +292,18 @@
     (if (not selected)
         (do (fmt (stderr) "native-harness: selection code={d} node={d} machine={d}/{d}\n"
                  (be-result) (be-result-node) (ms-result) (ms-result-item))
-            ;; ms-result-item is a machine-instruction index, not a graph node. Always report the
-            ;; exact instruction (CALL and CALL-LIVE are particularly useful), and only pass the
-            ;; separately recorded graph node to graph diagnostics.
-            (ms-print-inst (stderr) (ms-result-item))
+            ;; Verifier failures carry a machine-instruction index. Terminator failures also need
+            ;; their complete block: one instruction alone cannot distinguish a missing,
+            ;; duplicate, misplaced, or wrong-kind terminator.
+            (if (ms-result-item-is-machine?)
+                (do
+                  (ms-print-inst (stderr) (ms-result-item))
+                  (if (and (= (ms-result) MSEL-TERMINATOR)
+                           (and (>= (ms-result-item) 0)
+                                (< (ms-result-item) (be-inst-count))))
+                      (ms-print-block (stderr) (ms-inst-block (ms-result-item)))
+                      0))
+                0)
             (if (and (>= (be-result-node) 0) (< (be-result-node) (n-count)))
                 (let [failed (be-result-node)]
                   (n-print-flat (stderr) failed)
@@ -216,13 +338,17 @@
               (set! phase-start (nh-timing! "elf_publication" (load phase-start)))
               (if published true
                   (do (fmt (stderr) "native-harness: ELF emission failed\n") false)))))
-        (if (not (be-encode-checked!))
+        (let [encoded (be-encode-checked!)]
+          (set! phase-start (nh-timing! "aarch64_encoding" (load phase-start)))
+        (if (not encoded)
             (do (fmt (stderr) "native-harness: AArch64 encode code={d} node={d}\n"
                      (be-result) (be-result-node))
                 (return-from :done false))
-            (if (be-macho-checked!)
+            (let [published (be-macho-checked!)]
+              (set! phase-start (nh-timing! "macho_publication" (load phase-start)))
+            (if published
                 true
-                (do (fmt (stderr) "native-harness: Mach-O emission failed\n") false)))))))
+                (do (fmt (stderr) "native-harness: Mach-O emission failed\n") false)))))))))
 
 (defn nh-compile! [(source (slice u8))] (-> i64)
   (graph-reset! 7001)
@@ -278,7 +404,7 @@
 
 (defn nh-prebuilt-current? [] (-> bool)
   (= (nh-run-shell!
-       "test -f /tmp/aotk-driver.o && test /tmp/aotk-driver.o -nt native/gc/driver.c && test -f /tmp/aotk-runtime.o && test /tmp/aotk-runtime.o -nt native/gc/runtime.c && test -f /tmp/aotk-trampoline.o && test /tmp/aotk-trampoline.o -nt native/gc/trampoline.S")
+       "test -f /tmp/aotk-memory-driver && test /tmp/aotk-memory-driver -nt native/gc/in-memory-driver.c && test /tmp/aotk-memory-driver -nt native/gc/runtime.c && test /tmp/aotk-memory-driver -nt native/gc/trampoline.S")
      0))
 
 (defn nh-prepare! [] (-> i64)
@@ -291,7 +417,7 @@
         (assert (= (nh-run-shell!
           (if (!= (aot_host_is_x86_64) (cast i32 0))
               "clang -O1 -fno-omit-frame-pointer -Inative/gc -c native/gc/driver.c -o /tmp/aotk-driver.$$.o && clang -O1 -fno-omit-frame-pointer -Inative/gc -c native/gc/runtime.c -o /tmp/aotk-runtime.$$.o && clang -c native/gc/trampoline.S -o /tmp/aotk-trampoline.$$.o && mv /tmp/aotk-driver.$$.o /tmp/aotk-driver.o && mv /tmp/aotk-runtime.$$.o /tmp/aotk-runtime.o && mv /tmp/aotk-trampoline.$$.o /tmp/aotk-trampoline.o"
-              "xcrun clang -arch arm64 -O1 -fno-omit-frame-pointer -Inative/gc -c native/gc/driver.c -o /tmp/aotk-driver.$$.o && xcrun clang -arch arm64 -O1 -fno-omit-frame-pointer -Inative/gc -c native/gc/runtime.c -o /tmp/aotk-runtime.$$.o && xcrun clang -arch arm64 -c native/gc/trampoline.S -o /tmp/aotk-trampoline.$$.o && mv /tmp/aotk-driver.$$.o /tmp/aotk-driver.o && mv /tmp/aotk-runtime.$$.o /tmp/aotk-runtime.o && mv /tmp/aotk-trampoline.$$.o /tmp/aotk-trampoline.o"))
+              "xcrun clang -arch arm64 -O1 -fno-omit-frame-pointer -DAOT_IN_MEMORY_HOST=1 -Inative/gc native/gc/in-memory-driver.c native/gc/runtime.c native/gc/trampoline.S -o /tmp/aotk-memory-driver.$$.bin && mv /tmp/aotk-memory-driver.$$.bin /tmp/aotk-memory-driver"))
           0))
         0))))
 
@@ -320,7 +446,9 @@
       (fwrite (be-object-data) 1 (be-object-len) f)
       (fclose f)
       (nh-timing! "object_write" object-start))
-    (let [fb (primitive/alloc-stack FixBuf) w (primitive/alloc-stack Writer)]
+    (if (= (aot_host_is_x86_64) (cast i32 0))
+        0
+        (let [fb (primitive/alloc-stack FixBuf) w (primitive/alloc-stack Writer)]
       (set! (.data fb) (cast (ptr i8) command-buf))
       (set! (.cap fb) 1024) (set! (.len fb) 0)
       (fixed-buffer-writer w fb)
@@ -334,7 +462,7 @@
                                              (cast (ptr u8) command-buf)
                                              (load (field fb len))))]
         (nh-timing! "clang_link" link-start)
-        status))))
+        status)))))
 
 (defn nh-exec-command! [(cmd (ptr i8)) (arg i64)] (-> i64)
   (let [binary-buf (primitive/alloc-stack (array i8 128))
@@ -343,7 +471,11 @@
     (set! (.data fb) cmd)
     (set! (.cap fb) 256) (set! (.len fb) 0)
     (fixed-buffer-writer w fb)
-    (fmt w "{s} {d}" binary arg)
+    (if (!= (aot_host_is_x86_64) (cast i32 0))
+        (fmt w "{s} {d}" binary arg)
+        (let [object-buf (primitive/alloc-stack (array i8 128))
+              object (nh-process-path! (cast (ptr i8) object-buf) 128 ".o")]
+          (fmt w "/tmp/aotk-memory-driver {s} {d}" object arg)))
     (set! (index cmd (load (field fb len))) (cast i8 0))
     0))
 
@@ -375,7 +507,12 @@
     (set! (.data fb) (cast (ptr i8) cmd))
     (set! (.cap fb) 256) (set! (.len fb) 0)
     (fixed-buffer-writer w fb)
-    (fmt w "timeout --signal=KILL {d}s {s} {d}" seconds binary arg)
+    (if (!= (aot_host_is_x86_64) (cast i32 0))
+        (fmt w "timeout --signal=KILL {d}s {s} {d}" seconds binary arg)
+        (let [object-buf (primitive/alloc-stack (array i8 128))
+              object (nh-process-path! (cast (ptr i8) object-buf) 128 ".o")]
+          (fmt w "timeout --signal=KILL {d}s /tmp/aotk-memory-driver {s} {d}"
+               seconds object arg)))
     (set! (index (cast (ptr i8) cmd) (load (field fb len))) (cast i8 0))
     (nh-shell-answer (cast (ptr i8) cmd) ok)))
 

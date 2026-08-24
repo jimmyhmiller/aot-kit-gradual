@@ -12,8 +12,12 @@ diff here rather than as a paragraph nobody rechecked.
 
 | repro | status |
 |---|---|
+| `a-boolean-read-is-recomputed-after-a-write.js` | crashes |
+| `a-numeric-ternary-return-cannot-be-called.js` | refused |
+| `an-inherited-data-property-reads-as-undefined.js` | disagrees |
 | `closure-capturing-a-loop-variable.js` | refused |
 | `for-await-has-no-bridge-kind.js` | refused |
+| `for-in-has-no-bridge-kind.js` | refused |
 | `for-of-destructuring-pattern.js` | refused |
 | `for-of-into-an-existing-binding.js` | refused |
 | `rest-parameters-are-unimplemented.js` | refused |

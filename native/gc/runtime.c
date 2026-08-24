@@ -9,16 +9,48 @@
 #include "js-value.h"
 
 #ifdef __APPLE__
-extern const uint8_t aot_text_start[] __asm("section$start$__TEXT$__text");
+extern const uint8_t aot_text_start[] __asm("section$start$__TEXT$__text") __attribute__((weak_import));
 extern const uint8_t aot_kernel[] __asm("_kernel");
-extern const uint8_t aot_stackmaps[] __asm("section$start$__DATA$__aot_stackmap");
-extern const uint8_t aot_layouts[] __asm("section$start$__DATA$__aot_layout");
+extern const uint8_t aot_stackmaps[] __asm("section$start$__DATA$__aot_stackmap") __attribute__((weak_import));
+extern const uint8_t aot_layouts[] __asm("section$start$__DATA$__aot_layout") __attribute__((weak_import));
 #else
 extern const uint8_t aot_text_start[];
 extern const uint8_t aot_kernel[] __asm("kernel");
 extern const uint8_t aot_stackmaps[] __asm("__start_aot_stackmap");
 extern const uint8_t aot_layouts[] __asm("__start_aot_layout");
 #endif
+
+static const uint8_t *registered_kernel;
+static const uint8_t *registered_stackmaps;
+static const uint8_t *registered_layouts;
+static const uint8_t *unit_kernel(void) {
+#ifdef AOT_IN_MEMORY_HOST
+  return registered_kernel;
+#else
+  return registered_kernel ? registered_kernel : aot_kernel;
+#endif
+}
+static const uint8_t *unit_stackmaps(void) {
+#ifdef AOT_IN_MEMORY_HOST
+  return registered_stackmaps;
+#else
+  return registered_stackmaps ? registered_stackmaps : aot_stackmaps;
+#endif
+}
+static const uint8_t *unit_layouts(void) {
+#ifdef AOT_IN_MEMORY_HOST
+  return registered_layouts;
+#else
+  return registered_layouts ? registered_layouts : aot_layouts;
+#endif
+}
+
+void aot_gc_register_unit(const uint8_t *kernel, const uint8_t *stackmaps,
+                          const uint8_t *layouts) {
+  registered_kernel = kernel;
+  registered_stackmaps = stackmaps;
+  registered_layouts = layouts;
+}
 
 typedef struct {
   uint32_t owner, code_start, code_size, frame_size;
@@ -841,14 +873,37 @@ AotJsValue aot_js_string(uintptr_t a, int64_t b,
     for (size_t i = 0; i < js_properties_len; ++i) {
       if (js_properties[i].owner != thrown_owner) continue;
       AotJsValue property_value = js_properties[i].value;
-      fprintf(stderr, " property name=%" PRIu64 " value=0x%016" PRIx64,
-              js_properties[i].name, property_value);
+      fprintf(stderr, " property");
+      JsStringRec *property_name = js_string_lookup(js_properties[i].name);
+      if (property_name) {
+        fputs(" name=", stderr);
+        for (size_t j = 0; j < property_name->length; ++j)
+          fputc(property_name->units[j] < 128 ? (char)property_name->units[j] : '?', stderr);
+      } else {
+        fprintf(stderr, " name=%" PRIu64, js_properties[i].name);
+      }
+      fprintf(stderr, " value=0x%016" PRIx64, property_value);
+      uint64_t property_tag = aot_js_tag(property_value);
+      if (property_tag == AOT_JS_UNDEFINED) fputs(" decoded=undefined", stderr);
+      else if (property_tag == AOT_JS_NULL) fputs(" decoded=null", stderr);
+      else if (property_tag == AOT_JS_BOOLEAN)
+        fprintf(stderr, " decoded=boolean(%s)", aot_js_payload(property_value) ? "true" : "false");
+      else if (property_tag == AOT_JS_INTEGER)
+        fprintf(stderr, " decoded=integer(%" PRId64 ")", aot_js_unbox_int(property_value));
+      else if (!aot_js_tagged(property_value)) {
+        union { uint64_t bits; double number; } decoded = {property_value};
+        fprintf(stderr, " decoded=number(%.17g)", decoded.number);
+      } else if (property_tag == AOT_JS_OBJECT) fputs(" decoded=object", stderr);
+      else if (property_tag == AOT_JS_ARRAY) fputs(" decoded=array", stderr);
+      else if (property_tag == AOT_JS_FUNCTION) fputs(" decoded=function", stderr);
+      else if (property_tag == AOT_JS_CLOSURE) fputs(" decoded=closure", stderr);
       if (aot_js_tag(property_value) == AOT_JS_STRING) {
         JsStringRec *string = js_string_lookup(aot_js_payload(property_value));
         if (string) {
-          fputs(" text=", stderr);
+          fputs(" decoded=string(", stderr);
           for (size_t j = 0; j < string->length; ++j)
             fputc(string->units[j] < 128 ? (char)string->units[j] : '?', stderr);
+          fputc(')', stderr);
         }
       }
       fputc('\n', stderr);
@@ -1782,18 +1837,18 @@ static void js_write_barrier(uintptr_t owner, uintptr_t target) {
 }
 
 static uint32_t u32(const uint8_t *p) { uint32_t v; memcpy(&v, p, 4); return v; }
-static const FunctionRec *functions(void) { return (const FunctionRec *)(aot_stackmaps + 24); }
-static uint32_t function_count(void) { return u32(aot_stackmaps + 16); }
-static uint32_t site_count(void) { return u32(aot_stackmaps + 8); }
-static uint32_t root_count(void) { return u32(aot_stackmaps + 12); }
+static const FunctionRec *functions(void) { return (const FunctionRec *)(unit_stackmaps() + 24); }
+static uint32_t function_count(void) { return u32(unit_stackmaps() + 16); }
+static uint32_t site_count(void) { return u32(unit_stackmaps() + 8); }
+static uint32_t root_count(void) { return u32(unit_stackmaps() + 12); }
 static const SiteRec *sites(void) {
   return (const SiteRec *)(aot_stackmaps + 24 + function_count() * sizeof(FunctionRec));
 }
 static const RootRec *roots(void) {
   return (const RootRec *)((const uint8_t *)sites() + site_count() * sizeof(SiteRec));
 }
-static uint32_t layout_count(void) { return u32(aot_layouts + 8); }
-static const LayoutRec *layouts(void) { return (const LayoutRec *)(aot_layouts + 16); }
+static uint32_t layout_count(void) { return u32(unit_layouts() + 8); }
+static const LayoutRec *layouts(void) { return (const LayoutRec *)(unit_layouts() + 16); }
 
 static const LayoutRec *layout_for(uint64_t shape) {
   const LayoutRec *table = layouts();
@@ -2042,7 +2097,7 @@ static void discard_dead_side_records(void) {
 }
 
 static const SiteRec *site_for(void *return_pc) {
-  uintptr_t unit_base = (uintptr_t)aot_kernel - functions()[0].code_start;
+  uintptr_t unit_base = (uintptr_t)unit_kernel() - functions()[0].code_start;
   uintptr_t offset = (uintptr_t)return_pc - unit_base;
   const SiteRec *table = sites();
   for (uint32_t i = 0; i < site_count(); ++i) if (table[i].pc == offset) return &table[i];
@@ -2416,6 +2471,20 @@ void aot_gc_disable_barrier_for_test(void) {
 }
 void aot_gc_disable_array_scan_for_test(void) { array_scan_disabled = 1; }
 void aot_gc_disable_array_growth_for_test(void) { array_growth_disabled = 1; }
-uintptr_t aot_gc_unit_base(void) { return (uintptr_t)aot_kernel - functions()[0].code_start; }
+uintptr_t aot_gc_unit_base(void) { return (uintptr_t)unit_kernel() - functions()[0].code_start; }
 uint64_t aot_gc_site_pc(uint32_t i) { return i < site_count() ? sites()[i].pc : UINT64_MAX; }
-uint64_t aot_gc_stack_u32(uint32_t i) { return u32(aot_stackmaps + i); }
+uint64_t aot_gc_stack_u32(uint32_t i) { return u32(unit_stackmaps() + i); }
+
+extern void aot_alloc_slow(void);
+uintptr_t aot_gc_runtime_symbol(int operation) {
+  switch (operation) {
+    case 0: return (uintptr_t)aot_alloc_slow;
+    case 1: return (uintptr_t)aot_js_property;
+    case 2: return (uintptr_t)aot_js_array;
+    case 3: return (uintptr_t)aot_arr_load;
+    case 4: return (uintptr_t)aot_arr_store;
+    case 5: return (uintptr_t)aot_arr_len;
+    case 6: return (uintptr_t)aot_js_string;
+    default: return 0;
+  }
+}

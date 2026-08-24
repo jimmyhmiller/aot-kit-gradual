@@ -141,11 +141,8 @@
 (defn be-u32! [(w i64)] (-> i64)
   (if (or (< w 0) (> w 4294967295))
       (do (be-fail! BER-ENCODING NO-NODE) 0)
-  (let [b (field (backend) code)]
-    (al-push! [u8] b (cast u8 (& w 255)))
-    (al-push! [u8] b (cast u8 (& (>> w 8) 255)))
-    (al-push! [u8] b (cast u8 (& (>> w 16) 255)))
-    (al-push! [u8] b (cast u8 (& (>> w 24) 255)))
+  (let [words (field (backend) a64-code)]
+    (al-push! [i64] words w)
     0)))
 
 ; ADD/SUB (immediate) has a 12-bit unshifted immediate. Stack areas are
@@ -173,7 +170,7 @@
                 0)))
     0))
 
-(defn be-reg-of [(vr i64)] (-> i64)
+(defn be-reg-of-legacy [(vr i64)] (-> i64)
   (let [n (be-inst-count)
         (mut i) 0
         (mut r) -1]
@@ -186,8 +183,17 @@
                 (set! i (+ (load i) 1))
                 0)))
     (load r)))
+(defn be-reg-of [(vr i64)] (-> i64)
+  (let [dense (.alloc-reg (machine-unit))]
+    (if (and (>= vr 0) (< vr (al-len [i64] dense)))
+        (al-get dense vr)
+        ;; Hand-built legacy fixtures have no allocator publication at all. A production miss is
+        ;; a sentinel/invalid vreg and must be constant-time; eagerly evaluated operand helpers
+        ;; routinely ask about -1, and scanning every instruction for each such query made sizing
+        ;; quadratic on large programs.
+        (if (= (al-len [i64] dense) 0) (be-reg-of-legacy vr) -1))))
 
-(defn be-spill-of [(vr i64)] (-> i64)
+(defn be-spill-of-legacy [(vr i64)] (-> i64)
   (let [n (be-inst-count)
         (mut i) 0
         (mut s) -1]
@@ -200,8 +206,13 @@
                 (set! i (+ (load i) 1))
                 0)))
     (load s)))
+(defn be-spill-of [(vr i64)] (-> i64)
+  (let [dense (.alloc-spill (machine-unit))]
+    (if (and (>= vr 0) (< vr (al-len [i64] dense)))
+        (al-get dense vr)
+        (if (= (al-len [i64] dense) 0) (be-spill-of-legacy vr) -1))))
 
-(defn be-owner-of [(vr i64)] (-> i64)
+(defn be-owner-of-legacy [(vr i64)] (-> i64)
   (let [n (be-inst-count)
         (mut i) 0
         (mut owner) -1]
@@ -214,6 +225,11 @@
                 (set! i (+ (load i) 1))
                 0)))
     (load owner)))
+(defn be-owner-of [(vr i64)] (-> i64)
+  (let [dense (.alloc-owner (machine-unit))]
+    (if (and (>= vr 0) (< vr (al-len [i64] dense)))
+        (al-get dense vr)
+        (if (= (al-len [i64] dense) 0) (be-owner-of-legacy vr) -1))))
 
 (defn be-spill-off [(slot i64)] (-> i64)
   (+ 1024 (* slot 8)))
@@ -628,26 +644,17 @@
     (+ base (+ aload (+ bload (+ pload dstore))))))
 
 (defn be-label-off [(label i64)] (-> i64)
-  (let [n (be-inst-count)
-        (mut i) 0
-        (mut off) -1]
-    (loop (if (or (>= (load i) n) (>= (load off) 0))
-              (break)
-              (do
-                (let [m (be-inst (load i))]
-                  (if (and (= (.op m) MI-LABEL) (= (.imm m) label))
-                      (set! off (.first m))
-                      0))
-                (set! i (+ (load i) 1))
-                0)))
-    (load off)))
+  (let [offsets (.block-code-offset (machine-unit))]
+    (if (and (>= label 0) (< label (al-len [i64] offsets)))
+        (al-get offsets label)
+        -1)))
 
 (defn be-encode! [] (-> i64)
   (let [p (backend)
         n (be-inst-count)
         legacy-entry (and (> n 0) (< (.owner (be-inst 0)) 0))
         (mut i) 0]
-    (al-clear! [u8] (field p code))
+    (al-clear! [i64] (field p a64-code))
     (do
       (if legacy-entry
           (be-u32! (a64-sub-imm 31 31 2048))
@@ -656,10 +663,22 @@
       ; instruction. Instruction, branch, relocation, and stack-map offsets are absolute within
       ; the published text, so account for that word in the same offset model used by encoding.
       (let [(mut off) (if legacy-entry 4 0)]
+        (al-clear! [i64] (field (machine-unit) block-code-offset))
+        (let [(mut block) 0]
+          (loop (if (>= (load block) (mu-block-count))
+                    (break)
+                    (do
+                      (al-push! [i64] (field (machine-unit) block-code-offset) -1)
+                      (set! block (+ (load block) 1))
+                      0))))
         (loop (if (>= (load i) n)
                   (break)
                   (do
                     (set! (.first (be-inst (load i))) (load off))
+                    (if (= (.op (be-inst (load i))) MI-LABEL)
+                        (al-set! [i64] (field (machine-unit) block-code-offset)
+                                 (.imm (be-inst (load i))) (load off))
+                        0)
                     (set! off (+ (load off) (* 4 (be-inst-words (be-inst (load i))))))
                     (set! i (+ (load i) 1))
                     0))))
@@ -1490,19 +1509,13 @@
               (if (> (be-code-len) 0) true (be-fail! BER-ENCODING NO-NODE)))))))
 
 (defn be-code-len [] (-> i64)
-  (if (= (be-result) BER-OK) (al-len [u8] (.code (backend))) 0))
+  (if (= (be-result) BER-OK) (* 4 (al-len [i64] (.a64-code (backend)))) 0))
 (defn be-code-byte [(i i64)] (-> i64)
-  (cast i64 (al-get (.code (backend)) i)))
+  (& (>> (al-get [i64] (.a64-code (backend)) (/ i 4)) (* (& i 3) 8)) 255))
 (defn be-code-u32 [(at i64)] (-> i64)
-  (| (be-code-byte at)
-     (| (<< (be-code-byte (+ at 1)) 8)
-        (| (<< (be-code-byte (+ at 2)) 16)
-           (<< (be-code-byte (+ at 3)) 24)))))
+  (al-get [i64] (.a64-code (backend)) (/ at 4)))
 
 (defn be-code-set-u32! [(at i64) (word i64)] (-> i64)
-  (let [code (field (backend) code)]
-    (al-set! [u8] code at (cast u8 (& word 255)))
-    (al-set! [u8] code (+ at 1) (cast u8 (& (>> word 8) 255)))
-    (al-set! [u8] code (+ at 2) (cast u8 (& (>> word 16) 255)))
-    (al-set! [u8] code (+ at 3) (cast u8 (& (>> word 24) 255)))
+  (let [words (field (backend) a64-code)]
+    (al-set! [i64] words (/ at 4) word)
     0))
