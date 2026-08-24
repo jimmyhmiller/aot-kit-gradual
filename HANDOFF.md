@@ -1807,3 +1807,10 @@ Fixed `MSEL-MEMORY-ORDER` on `ArrayResize`: the selector seeded anti-dependencie
   a callable closure capturing a target, receiver, or bound arguments. The proper next step is a
   JSL closure-construction form integrated with the existing Closure ABI, not a frontend rewrite
   of the harness expression.
+# 2026-08-24: numeric Phi returns use their selected representation
+
+- Closed `a-numeric-ternary-return-cannot-be-called.js`. Return-tag classification used the
+  lattice type directly, so `num` (`int|flt`) had no tag and selection refused `Box(Call(...))`.
+- It now asks the existing representation-aware value classifier. A numeric Phi normalized to a
+  GPR returns as an integer; one normalized to an FPR returns as a double. The exact repro returns
+  Node's `17` and is pinned in `tests/native-execution-test.coil`.
