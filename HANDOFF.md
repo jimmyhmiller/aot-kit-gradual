@@ -1,3 +1,10 @@
+## 2026-08-24: JSL can declare JavaScript-callable functions
+
+- Added a `callable` top-level declaration kind alongside `builtin` and `macro`.
+- Callable bodies use the established JavaScript ABI: hidden environment at Parm 0, `this` at receiver Parm 1, and declared arguments beginning at Parm 2. Ordinary builtins still reject `this` as unbound.
+- JavaScript-callable JSL functions remain in dynamic target discovery; implementation-only JSL builtins remain excluded. This is the non-capturing prerequisite for DSL-owned `Function.prototype.call`; captured callable construction for `bind` is next.
+- Gate: `coil test` passed 47/47. Frontier remained intentionally red at 0/2.
+
 ## 2026-08-24: exact calls materialize rest arrays through JSL
 
 - Added a rest bit to `FeFunction`; `...xs` remains one final formal in the native ABI rather than being silently treated as an ordinary scalar parameter.

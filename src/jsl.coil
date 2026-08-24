@@ -753,6 +753,7 @@
 ;; a call boundary. Torque draws the same line for the same reason.
 (const JSL-KIND-BUILTIN i64 0)
 (const JSL-KIND-MACRO   i64 1)
+(const JSL-KIND-CALLABLE i64 2)
 
 ;; ONE LABEL. The pattern a label exists for is a fast path with a bail-out to a generic path, which
 ;; needs exactly one. Supporting N is not hard, but an unbounded design here would be untested
@@ -939,6 +940,7 @@
 (defn jsl-decl-kind [(i i64)] (-> i64) (.kind (jsl-decl-p i)))
 (defn jsl-decl-label [(i i64)] (-> (slice u8)) (.label (jsl-decl-p i)))
 (defn jsl-macro? [(i i64)] (-> bool) (= (jsl-decl-kind i) JSL-KIND-MACRO))
+(defn jsl-callable? [(i i64)] (-> bool) (= (jsl-decl-kind i) JSL-KIND-CALLABLE))
 (defn jsl-labelled? [(i i64)] (-> bool) (> (slice-len (jsl-decl-label i)) 0))
 ;; THE CLOSED-WORLD FUNCTION INDEX, WHICH IS NOT THE DECLARATION INDEX.
 ;;
@@ -1322,6 +1324,7 @@
           (if (!= (jsl-literal-ty s) TY-NO-ID) (return-from :done JSL-OK) 0)
           (if (jsl-scope-has? s) (return-from :done JSL-OK) 0)
           (if (>= (jsl-param-index d s) 0) (return-from :done JSL-OK) 0)
+          (if (and (jsl-callable? d) (= s "this")) (return-from :done JSL-OK) 0)
           (return-from :done (jsl-fail! JSL-ERR-UNBOUND s)))
         0)
     (if (= (rd/sexp-count x) 0)
@@ -1715,15 +1718,17 @@
       (let [kw (rd/sexp-sym head)]
         (if (jsl-unsupported-form? kw)
             (return-from :done (jsl-fail! JSL-ERR-UNSUPPORTED kw)) 0)
-        (if (or (= kw "builtin") (= kw "macro")) 0
+        (if (or (= kw "builtin") (or (= kw "macro") (= kw "callable"))) 0
             (return-from :done (jsl-fail! JSL-ERR-UNKNOWN-FORM kw))))
       (let [nameform (rd/sexp-nth form 1)]
         (if (not (rd/sexp-sym? nameform)) (return-from :done (jsl-fail! JSL-ERR-BAD-NAME "")) 0)
         (let [name (rd/sexp-sym nameform)]
           (if (>= (jsl-find name) 0) (return-from :done (jsl-fail! JSL-ERR-DUP-NAME name)) 0)
           (let [n (rd/sexp-count form)
-                kind (if (= (rd/sexp-sym (rd/sexp-nth form 0)) "macro")
-                         JSL-KIND-MACRO JSL-KIND-BUILTIN)
+                kind (let [head-name (rd/sexp-sym (rd/sexp-nth form 0))]
+                       (if (= head-name "macro") JSL-KIND-MACRO
+                         (if (= head-name "callable") JSL-KIND-CALLABLE
+                           JSL-KIND-BUILTIN)))
                 params-off (jsl-param-count)
                 (mut nparams) 0
                 (mut ret) TY-NO-ID
