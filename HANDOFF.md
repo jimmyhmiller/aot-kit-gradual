@@ -1,3 +1,23 @@
+## 2026-08-24: zero-capture callable values clear selection and retain runtime codes
+
+- Zero-capture JSL `closure` expressions now lower to the callable's bare `Fun`; captured callables
+  retain the materialized environment path. This removes empty environment allocation, gives
+  intrinsic built-ins stable identity, and avoids pinning a useless `New` to branch-local control.
+- Fixed machine edge-copy verification across multiple function owners. Selection deliberately
+  keeps a node-dense owner-tagged cache, so later owners may overwrite an earlier input's cache
+  entry; verification now accepts either the live owner cache or persistent vreg provenance. It
+  still checks the exact phi, source node, owner, and permitted floating-point widening.
+- The exact `Object.getOwnPropertyDescriptor/length.js` case now clears the former `CProj.1`
+  selection failure in both variants. It reaches native execution and currently fails by crashing
+  or producing no answer, so this is not claimed as a Test262 pass.
+- Test262's native runner now preserves a failed program's numeric answer in single and batch
+  output, and the JavaScript driver applies its existing assertion decoder. This case yields zero,
+  not an encoded assertion, but future encoded runtime failures retain assertion site, kind, and
+  compact actual/expected values in JSONL.
+- Focused native witnesses for aliased `Object.getOwnPropertyDescriptor` and first-class
+  `String.prototype.indexOf` metadata both pass. Exact retained results are in
+  `test262-results-object-gopd-diagnostic-2026-08-24.jsonl`.
+
 ## 2026-08-24: dynamic Object descriptor arguments preserve tagged source values
 
 - Replaced blind `n-box!` calls across Object descriptor/create/name operations with the frontend's

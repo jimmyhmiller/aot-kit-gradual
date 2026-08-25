@@ -497,10 +497,13 @@ function finishOne(task, assembled, run, assemblyMs, durationMs) {
     if (run.stderr && !quiet) process.stderr.write(run.stderr);
   } else {
     const stderrLines = run.stderr.trim().split("\n");
+    const runtimeCode = run.stdout.trim().match(/RUNTIME-FAILED\s+(-?\d+)$/)?.[1];
+    const runtime = runtimeCode === undefined ? null : runtimeFailure(runtimeCode);
     const detail = stderrLines.find((line) => line.startsWith("graph corruption:")) ||
       nativeDiagnostic(run.stderr) || runtimeThrowDiagnostic(run.stderr) || run.signal ||
-      run.stdout.trim() || `exit ${run.status}`;
+      runtime?.detail || run.stdout.trim() || `exit ${run.status}`;
     report({ path, variant: variant.name, status: "failed", detail,
+      ...(runtime?.diagnostic ? { diagnostic: runtime.diagnostic } : {}),
       durationMs: Math.round(durationMs), ...timings });
     if (run.stderr && !quiet) process.stderr.write(run.stderr);
   }
@@ -531,14 +534,17 @@ async function runBatch(tasks) {
   rmSync(assembled, { force: true });
   for (const suffix of [".o", ".err", ""]) rmSync(`/tmp/aotk-native-${run.pid}${suffix}`, { force: true });
   const outcomes = new Map(
-    [...run.stdout.matchAll(/^BATCH (\d+) (PASS|RUNTIME-FAILED)$/gm)].map((m) => [Number(m[1]), m[2]]),
+    [...run.stdout.matchAll(/^BATCH (\d+) (PASS|RUNTIME-FAILED)(?: (-?\d+))?$/gm)]
+      .map((m) => [Number(m[1]), { status: m[2], code: m[3] }]),
   );
   if (run.status === 0 && outcomes.size === tasks.length) {
     for (let i = 0; i < tasks.length; i++) {
-      if (outcomes.get(i) !== "PASS") {
+      if (outcomes.get(i).status !== "PASS") {
         const share = timings.compileMs / tasks.length;
+        const runtime = outcomes.get(i).code === undefined ? null : runtimeFailure(outcomes.get(i).code);
         report({ path: tasks[i].path, variant: tasks[i].variant.name, status: "failed",
-          detail: batchRuntimeThrowDiagnostic(run.stderr, i) || "RUNTIME-FAILED",
+          detail: batchRuntimeThrowDiagnostic(run.stderr, i) || runtime?.detail || "RUNTIME-FAILED",
+          ...(runtime?.diagnostic ? { diagnostic: runtime.diagnostic } : {}),
           durationMs: Math.round(durationMs), ...timings,
           compileMs: share, batchCompileMs: timings.compileMs, batchSize: tasks.length });
       } else {

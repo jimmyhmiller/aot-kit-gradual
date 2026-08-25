@@ -2774,7 +2774,7 @@
                                                         (ms-fp-input! owner input raw source)
                                                         raw)]
                                               (if (< src 0)
-                                                  0
+                                                  (ms-fail! MSEL-DEPENDENCY input)
                                                   (al-push! [MCopy]
                                                             (field u edge-copies)
                                                             (mc-new edge
@@ -3570,6 +3570,15 @@
                     (do
                       (if (< (.earliest (be-inst (load at))) 0)
                           (do
+                            (if (be-profiling?)
+                                (let [m (be-inst (load at))]
+                                  (do
+                                    (fmt (stderr)
+                                         "AOTK_PROFILE phase=selection_unresolved_earliest at={d} op={d} node={d} owner={d} block={d} a={d} b={d} argc={d}\n"
+                                         (load at) (.op m) (.node m) (.owner m) (.block-id m)
+                                         (.a m) (.b m) (ms-inst-arg-count (load at)))
+                                    0))
+                                0)
                             (ms-fail! MSEL-DEPENDENCY (load at))
                             (set! ok false))
                           0)
@@ -5121,6 +5130,13 @@
             (or (= (ms-inst-op def) MI-SCVTF)
                 (and (= (ms-inst-op def) MI-JSUNBOX) (= (ms-inst-imm def) 0))))))
 
+(defn ms-vreg-selects-node? [(owner i64) (vreg i64) (node i64)] (-> bool)
+  (let [u (machine-unit)]
+    (and (>= vreg 0)
+         (and (< vreg (al-len [i64] (.vreg-node u)))
+              (and (= (al-get [i64] (.vreg-node-owner u) vreg) owner)
+                   (= (al-get [i64] (.vreg-node u) vreg) node))))))
+
 (defn ms-edge-copies-valid? [(edge i64)] (-> bool)
   (let [u (machine-unit)
         e (mu-edge edge)
@@ -5160,10 +5176,18 @@
                                 (if (or (!= kind MCOPY-VALUE)
                                         (or (!= (.dst c) (ms-vget owner phi))
                                             (let [src (.src c)
-                                                  input (ms-vget owner (n-in phi slot))
+                                                  input-node (n-in phi slot)
                                                   def (ms-owner-def-inst owner src)]
-                                              (and (!= src input)
-                                                   (not (ms-fp-widening-of? def input))))))
+                                              (not
+                                                (or (= src (ms-vget owner input-node))
+                                                    (or (ms-vreg-selects-node? owner src input-node)
+                                                    (and (ms-fp-widening-of?
+                                                           def
+                                                           (if (>= def 0) (ms-inst-a def) -1))
+                                                         (ms-vreg-selects-node?
+                                                           owner
+                                                           (if (>= def 0) (ms-inst-a def) -1)
+                                                           input-node))))))))
                                     (set! ok false)
                                     0))))
                       (set! i (+ (load i) 1))
@@ -5221,7 +5245,36 @@
               (break)
               (do
                 (if (not (ms-edge-copies-valid? (load edge)))
-                    (ms-fail! MSEL-PHI (load edge))
+                    (do
+                      (let [e (mu-edge (load edge))
+                                (mut copy) 0
+                                (mut phi) (al-get (.verify-block-phi-head u) (.target e))]
+                            (do
+                              (fmt (stderr)
+                                   "AOTK_PROFILE phase=selection_invalid_phi_edge edge={d} owner={d} source={d} target={d} slot={d} copies={d}\n"
+                                   (load edge) (.owner e) (.source e) (.target e)
+                                   (.target-slot e) (.copy-count e))
+                              (loop (if (>= (load copy) (.copy-count e))
+                                        (break)
+                                        (do
+                                          (let [c (mu-edge-copy (load edge) (load copy))]
+                                            (fmt (stderr)
+                                                 "AOTK_PROFILE phase=selection_invalid_phi_copy phi={d} dst={d} src={d} kind={d}\n"
+                                                 (.phi c) (.dst c) (.src c) (.kind c)))
+                                          (set! copy (+ (load copy) 1))
+                                          0)))
+                              (loop (if (< (load phi) 0)
+                                        (break)
+                                        (do
+                                          (fmt (stderr)
+                                               "AOTK_PROFILE phase=selection_invalid_phi_expected phi={d} dst={d} input={d} src={d}\n"
+                                               (load phi) (ms-vget (.owner e) (load phi))
+                                               (n-in (load phi) (.target-slot e))
+                                               (ms-vget (.owner e)
+                                                        (n-in (load phi) (.target-slot e))))
+                                          (set! phi (al-get (.verify-node-phi-next u) (load phi)))
+                                          0)))))
+                      (ms-fail! MSEL-PHI (load edge)))
                     0)
                 (set! edge (+ (load edge) 1))
                 0)))

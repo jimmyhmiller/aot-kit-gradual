@@ -566,6 +566,7 @@
     (load shape)))
 
 (defn jl-closure [(x (ptr rd/Sexp))] (-> i64)
+  (block :done
   (let [target (jsl-find (rd/sexp-sym (rd/sexp-nth x 1)))
         fun (jsl-decl-fun target)
         shape (jl-callable-env-shape target)
@@ -575,6 +576,17 @@
         (mut stores) (al-new [i64] (malloc-allocator))
         base-memory (jl-mem)
         (mut i) 0]
+    ;; A zero-capture intrinsic callable needs no environment object: its bare Fun is both a stable
+    ;; built-in identity and a complete dynamic-call target. Allocating an empty environment under
+    ;; a JSL `if` pinned that New to one arm even after the value Phi simplified, producing a live
+    ;; closure use that did not dominate its consumer in large property-helper graphs.
+    (if (= n 0)
+        (do
+          (al-free! [i64] (mut incoming))
+          (al-free! [i64] (mut captures))
+          (al-free! [i64] (mut stores))
+          (return-from :done fun))
+        0)
     (loop (if (>= (load i) (+ n 1)) (break)
             (do (al-push! [i64] (mut incoming) base-memory)
                 (set! i (+ (load i) 1)))))
@@ -606,7 +618,7 @@
         (al-free! [i64] (mut incoming))
         (al-free! [i64] (mut captures))
         (al-free! [i64] (mut stores))
-        answer))))
+        answer)))))
 
 ;; Invoke a JavaScript callback value and thread its effect through the same implicit heap cell as
 ;; the memory primitives. The pre-call heap is a trailing effect argument, never a source-level
