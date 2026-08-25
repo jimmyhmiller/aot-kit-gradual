@@ -1,3 +1,21 @@
+## 2026-08-25: batched Test262 runs no longer drop or misroute variants
+
+- `--batch-size > 1` isolated parse-negative tasks into singleton units and then accidentally sent
+  them through the ordinary one-shot execution path. A correct parser rejection was therefore
+  reported as a native compilation failure. Parse negatives now run in an explicit persistent-
+  server phase before positive compilation batches; batch size no longer changes test semantics.
+- The runner now computes the exact expected result count before execution and aborts on any
+  expected-versus-recorded mismatch. This caught an intermediate lifecycle design that silently
+  omitted 254 object-expression variants instead of allowing another plausible but false summary.
+- A mixed positive/negative witness under `--jobs 8 --batch-size 16` retained exactly 4/4 records.
+  The complete accounted object-expression run retains exactly 2,042 records: 1,818 runnable
+  variants plus 224 policy skips. Its 300 parse-negative variants all pass, yielding 856 pass, 880
+  fail, 82 refuse, and 224 skip overall.
+- This is runner correctness, not a JavaScript semantic gain. The authoritative full baseline had
+  already passed 8,023 of the current parse-negative artifact's 8,420 variants; the current parser
+  would recover 199 there. No harness-only reclassification is added to the rough compiler gain,
+  and the active 30% goal remains incomplete.
+
 ## 2026-08-25: canonical escaped object keys add 258 passes
 
 - The TypeScript bridge now exposes canonical identifier-name text separately from raw source

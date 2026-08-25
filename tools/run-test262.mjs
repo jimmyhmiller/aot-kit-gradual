@@ -684,36 +684,51 @@ async function runServerOne(server, task) {
   finishOne(task, assembled, run, assemblyMs, durationMs);
 }
 
-let units;
+const expectedCompleted = completed.size + work.length;
+const negativeUnits = work.filter((task) => task.parseNegative).map((task) => [task]);
+let positiveUnits;
 if (batchSize === 1) {
-  units = work.map((task) => [task]);
+  positiveUnits = work.filter((task) => !task.parseNegative).map((task) => [task]);
 } else {
   const groups = new Map();
-  for (const task of work) {
+  for (const task of work.filter((candidate) => !candidate.parseNegative)) {
     const key = batchSignature(task);
     if (!groups.has(key)) groups.set(key, []);
     groups.get(key).push(task);
   }
-  units = [];
+  positiveUnits = [];
   for (const group of groups.values()) {
-    if (group[0].parseNegative) {
-      for (const task of group) units.push([task]);
-    } else {
-      for (let i = 0; i < group.length; i += batchSize) units.push(group.slice(i, i + batchSize));
+    for (let i = 0; i < group.length; i += batchSize) {
+      positiveUnits.push(group.slice(i, i + batchSize));
     }
   }
 }
-let next = 0;
-async function worker() {
-  const server = batchSize === 1 ? nativeServer() : null;
-  while (next < units.length) {
-    const unit = units[next++];
-    if (server) await runServerOne(server, unit[0]);
-    else await runBatch(unit);
+
+async function runUnits(units, throughServer) {
+  let next = 0;
+  async function worker() {
+    const server = throughServer ? nativeServer() : null;
+    while (next < units.length) {
+      const unit = units[next++];
+      if (server) await runServerOne(server, unit[0]);
+      else await runBatch(unit);
+    }
+    if (server) server.close();
   }
-  if (server) server.close();
+  await Promise.all(Array.from({ length: Math.min(jobs, units.length) }, worker));
 }
-await Promise.all(Array.from({ length: Math.min(jobs, units.length) }, worker));
+
+// Parse-negative mode is a protocol operation (`!path`) implemented by the persistent server,
+// not by the one-shot native CLI. Keep it in an explicit phase so batch size cannot change
+// semantics and server lifecycle cannot interfere with positive compilation batches.
+await runUnits(negativeUnits, true);
+await runUnits(positiveUnits, batchSize === 1);
+
+if (completed.size !== expectedCompleted) {
+  throw new Error(
+    `test262 accounting mismatch: expected ${expectedCompleted} results, recorded ${completed.size}`,
+  );
+}
 
 console.log(
   `test262 result: ${totals.passed} passed; ${totals.failed} failed; ` +
