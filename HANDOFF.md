@@ -1,3 +1,21 @@
+## 2026-08-24: dynamic Object descriptor arguments preserve tagged source values
+
+- Replaced blind `n-box!` calls across Object descriptor/create/name operations with the frontend's
+  representation-aware dynamic argument boxer. Explicit JavaScript arguments at Parm 3+ are now
+  structurally recognized as tagged by the uniform receiver ABI. A permanent native differential
+  test carries an object and key through source parameters before descriptor lookup.
+- Started an exact rerun of the 5,241-file property-helper cohort with retained results in
+  `test262-results-property-helper-argc-2026-08-24.jsonl`. It was stopped after 3,416 variants when
+  newly executable 40k-50k-node helper graphs projected roughly another 30 minutes. The retained
+  prefix has 2,818 failures, 594 policy skips, and 4 refusals; it is evidence, not a full-cohort
+  result and must not be compared as one.
+- The formerly isolated argc check now proceeds into descriptor verification. A direct witness
+  shows the next property-helper blocker for many cases: methods such as
+  `String.prototype.anchor` are still syntax-only direct-call paths and evaluate as `undefined`
+  when used as first-class function values. Descriptor lookup then correctly rejects that value.
+  First-class built-in method publication is the next broad surface strike.
+- Gate: `coil test` passed 48/48. Frontier remained intentionally red at 0/2.
+
 ## 2026-08-24: source calls transport actual argc and expose `arguments.length`
 
 - Extended the uniform JavaScript receiver ABI with hidden actual argc at Parm 2; declared source
