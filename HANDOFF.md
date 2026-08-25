@@ -1,3 +1,16 @@
+## 2026-08-25: authoritative full suite reaches 20.63 percent
+
+- Ran the complete current Test262 corpus after the parser/static-semantics checkpoints. The
+  retained result is `test262-results-current-full-v2-2026-08-25.jsonl`: 17,337 passed, 58,595
+  failed, 8,112 refused, and 6,542 policy skips among 84,044 executed variants. Execution took
+  1,638.398 seconds; total time including the worker build was 1,645.603 seconds.
+- The authoritative pass rate is 20.63%, up from the stale pre-checkpoint 11.39% baseline. Reaching
+  30% at the current denominator requires 25,214 passes, or 7,877 additional passes. The largest
+  actionable shared cohort is destructuring/function-like execution: class expression and
+  statement destructuring alone contain 5,152 failures, including 1,952 getter declarations
+  refused at frontend structure indexing. Related object, function, generator, arrow, loop, and
+  declaration templates repeat the same semantics. The active 30% goal remains incomplete.
+
 ## 2026-08-25: async-arrow early errors add 20 negative-parse passes
 
 - Added async-arrow static semantics for contextual `await` bindings and identifier references,
