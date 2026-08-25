@@ -1091,6 +1091,8 @@ func (parsed *parseResult) addClassElementEarlyErrors(node *ast.Node) {
 	if node.Kind != ast.KindClassDeclaration && node.Kind != ast.KindClassExpression { return }
 	constructors := 0
 	privateKinds := make(map[string]uint8)
+	privateSeen := make(map[string]bool)
+	privateStatic := make(map[string]bool)
 	hasHeritage := node.ClassLikeData().HeritageClauses != nil &&
 		len(node.ClassLikeData().HeritageClauses.Nodes) != 0
 	for _, member := range node.ClassLikeData().Members.Nodes {
@@ -1171,10 +1173,16 @@ func (parsed *parseResult) addClassElementEarlyErrors(node *ast.Node) {
 		if member.Kind == ast.KindGetAccessor { kind = 1 }
 		if member.Kind == ast.KindSetAccessor { kind = 2 }
 		previous := privateKinds[name]
-		if previous != 0 && previous|kind != 3 {
+		if privateSeen[name] && privateStatic[name] != isStatic {
+			parsed.addJavaScriptDiagnostic(member, 90080)
+		} else if previous != 0 && previous|kind != 3 {
 			parsed.addJavaScriptDiagnostic(member, 90013)
 		} else {
 			privateKinds[name] = previous | kind
+		}
+		if !privateSeen[name] {
+			privateSeen[name] = true
+			privateStatic[name] = isStatic
 		}
 	}
 }

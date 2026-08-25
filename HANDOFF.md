@@ -2850,3 +2850,12 @@ and use `call-dynamic-with-receiver`, matching `map`, `filter`, `forEach`, `some
 - Exact targeted result is `test262-results-static-block-context-v2-2026-08-25.jsonl`:
   26 passed, 0 failed, 0 refused, 0 skipped. All 26 variants failed in the saved negative-parse
   frontier.
+# 2026-08-25: private accessor pairs must agree on staticness (+8 Test262)
+
+- Class-wide private-name state now records staticness in addition to getter/setter kind. The sole
+  valid duplicate private declaration remains one getter plus one setter, and that pair must both
+  be instance members or both be static members; the rule is independent of declaration order.
+- The bounded ABI gate pins a mismatched pair and a valid matched static pair.
+- Exact targeted result is `test262-results-private-accessor-staticness-v1-2026-08-25.jsonl`:
+  8 passed, 0 failed, 0 refused, 0 skipped. All eight variants failed in the saved negative-parse
+  frontier.

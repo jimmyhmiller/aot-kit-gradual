@@ -186,6 +186,19 @@ int main(int argc, char **argv) {
     "class static block context stops at nested function bodies");
   aot_ts_parse_delete(static_block_valid_parse);
 
+  const char *private_accessor_mismatch = "class C { get #x() {} static set #x(v) {} }";
+  AotTsParse private_accessor_mismatch_parse = aot_ts_parse_ex(private_accessor_mismatch,
+    (int32_t)strlen(private_accessor_mismatch), "private-mismatch.js", 19, AOT_TS_SCRIPT_JS);
+  require(aot_ts_diagnostic_count(private_accessor_mismatch_parse) > 0,
+    "private getter and setter staticness must match");
+  aot_ts_parse_delete(private_accessor_mismatch_parse);
+  const char *private_accessor_valid = "class C { static get #x() {} static set #x(v) {} }";
+  AotTsParse private_accessor_valid_parse = aot_ts_parse_ex(private_accessor_valid,
+    (int32_t)strlen(private_accessor_valid), "private-valid.js", 16, AOT_TS_SCRIPT_JS);
+  require(aot_ts_diagnostic_count(private_accessor_valid_parse) == 0,
+    "matching private getter and setter pair accepted");
+  aot_ts_parse_delete(private_accessor_valid_parse);
+
   const char *operators = "var x=1,o={}; x += 2; ++x; x--; typeof x; delete o.x; void (x += 3); o?.x; o?.[x]; x?.(); `plain`; `a${x}b`; (a) => { return a; }; true; null;";
   AotTsParse operator_parse = aot_ts_parse_ex(operators, (int32_t)strlen(operators), "operators.js", 12, AOT_TS_SCRIPT_JS);
   require(find_operator(operator_parse, "PlusEquals") >= 0, "assignment operator API");
