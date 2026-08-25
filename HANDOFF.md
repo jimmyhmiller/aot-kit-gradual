@@ -1871,3 +1871,26 @@ Fixed `MSEL-MEMORY-ORDER` on `ArrayResize`: the selector seeded anti-dependencie
   primitive handling and JavaScript results. The frontend owns only name and argument sequencing.
 - The permanent witness covers read-before-write ordering, primitive false, transition to
   non-extensible, writes to existing properties, and rejection of new properties.
+# 2026-08-24: Function call/bind moved onto first-class JSL closures
+
+- Added `Function` as a frontend intrinsic identity, while keeping its observable constructor,
+  prototype, `call`, and `bind` properties in `lib/function/call-bind.jsl`.
+- `Function.prototype.bind` now returns the captured callable environment introduced by the JSL
+  `closure` form; invoking it exercises the ordinary dynamic closure ABI rather than a frontend
+  rewrite of the Test262 harness idiom.
+- Added a native differential witness for direct `call` and `Function.prototype.call.bind` over a
+  source callable. Existing opaque built-in method identities still need migration to callable JSL
+  values before the Test262 property helper can invoke `Object.prototype.hasOwnProperty` this way.
+# 2026-08-24: captured JSL bind closures execute natively
+
+- Added the `Function` intrinsic and a JSL-owned `Function.prototype.bind` implementation for the
+  first exact two-argument invocation shape. `FunctionBind1` returns a boxed materialized closure;
+  `BoundFunction2` captures the target and bound receiver and uses ordinary dynamic dispatch.
+- Compact source functions are indices rather than heap objects, so the runtime prototype chain
+  cannot represent their inherited Function methods. Central JSL `GetProperty` now supplies
+  `bind` only when ordinary lookup reports the property missing; own/runtime properties still win.
+- A permanent native differential witness proves closure allocation, both capture loads, target
+  dispatch, and execution. It answers Node's `12` for `add.bind(object)(2, 3)`.
+- The investigation also isolated the next ABI defect: a bound tagged object receiver reaches a
+  source function whose shaped `this` load expects a raw pointer. Callable rest parameters are
+  also required before `bind` can support arbitrary bound and invocation argument counts.
