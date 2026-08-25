@@ -1,3 +1,25 @@
+## 2026-08-25: array binding rest drains its iterator in JSL
+
+- Added DSL `IteratorRestArray`, which owns the complete rest-binding operation: repeated iterator
+  stepping, completion tests, value extraction, ordinary Array allocation, and append stores. The
+  frontend recognizes only the structural `...` binding element and lowers it to that operation;
+  no JavaScript value semantics were added to compiler code.
+- Added a native differential witness covering a method parameter with a preceding elision, rest
+  length, all retained element values, and the fixed head binding. It agrees with Node.
+- The complete `language/expressions/object/dstr` cohort is retained in
+  `test262-results-array-rest-dstr-2026-08-25.jsonl`: 806 variants completed in 9.865 seconds with
+  80 passed, 690 failed, 36 refused, and 158 policy-skipped. Against the committed parameter-pattern
+  baseline, 18 moved failed-to-passed; all 62 prior passes stayed passing and every refused/skipped
+  variant was unchanged. Passing cases include direct, elided, exhausted, nested-array, nested-rest,
+  and nested-object rest bindings in both default and strict modes.
+- The focused seven-file upstream rest set is retained in
+  `test262-results-array-rest-focused-2026-08-25.jsonl`: 8 passed and 6 failed. The remaining six
+  are abrupt custom-iterator cases and require the broader iterator protocol/error propagation,
+  not ordinary Array rest consumption.
+- The exhaustive native execution module still has an unrelated pre-existing failure in
+  `tagged_constants_and_boolean_results_keep_their_javascript_representation` (`undefined + null`
+  produces the wrong representation). The new focused native witness passes independently.
+
 ## 2026-08-25: formal parameter patterns have distinct ABI slots and lexical leaves
 
 - Added a parameter-symbol index to the native frontend. Each formal still occupies exactly one
