@@ -1,3 +1,19 @@
+## 2026-08-25: stable JSON namespace identity adds 62 passes
+
+- `JSON` was resolved as an intrinsic for direct `parse` and `stringify` calls but had no value
+  materialization, so ordinary property writes, borrowed methods, and generic Array receivers sent
+  `NO-NODE` into JSL. `JSONObjectValue` now gives it a stable, object-tagged `%BuiltinObject 22`
+  identity. Frontend changes are structural routing only; generic reads and writes remain DSL
+  `GetProperty` and `SetProperty` operations.
+- `ObjectPrototypeToString` now derives `[object JSON]` from that stable DSL identity. A native
+  differential witness pins identity, branding, property persistence, and a borrowed generic Array
+  callback together.
+- The complete authoritative-baseline JSON `NO-NODE` cohort is retained in
+  `test262-results-json-no-node-cohort-v1-2026-08-25.jsonl`: 62 failures become passes and 60 remain
+  failures. There is no overlap with the previously measured 94 Math/object-branding gains, so
+  these related slices prove 156 unique failed-to-passed transitions. `coil test` is green at
+  48/48. The active 30% full Test262 goal remains incomplete.
+
 ## 2026-08-25: stable Math identity and DSL-owned object branding add 60 passes
 
 - Ordinary reads of the intrinsic `Math` namespace previously lowered to `NO-NODE`; only direct
