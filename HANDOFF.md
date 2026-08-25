@@ -1,3 +1,17 @@
+## 2026-08-25: block and switch redeclarations use scope-level name analysis
+
+- Added ECMAScript-style block/case-block redeclaration checks. The pass collects direct
+  `LexicallyDeclaredNames`, recursively collects `VarDeclaredNames` without crossing function or
+  class boundaries, recursively expands binding-pattern names, and reports duplicate lexical names
+  or lexical/var intersections. This is one scope algorithm, not a matrix of declaration pairs.
+- Both complete focused redeclaration directories pass 316/316. The complete negative-parse corpus
+  is retained in `test262-results-negative-parse-redeclaration-checkpoint-2026-08-25.jsonl`: 5,195
+  passed, 3,255 failed, no refusals, and 205 module-policy skips. Exactly 318 variants moved to
+  passing from the private-delete checkpoint, including ten redeclarations outside the focused
+  directories, with no lost pass.
+- Holding the authoritative full baseline's other outcomes fixed now projects 14,529 passes among
+  90,377 non-skipped variants, or 16.08%. The active 30% goal remains incomplete.
+
 ## 2026-08-25: deleting a private reference is an early error
 
 - Added the ECMAScript early error for `delete` applied to a private-reference property access.

@@ -122,6 +122,7 @@ func (parsed *parseResult) addJavaScriptModeDiagnostics() {
 		parsed.addAssignmentTargetEarlyErrors(n)
 		parsed.addBindingRestEarlyErrors(n)
 		parsed.addPrivateDeleteEarlyErrors(n)
+		parsed.addBlockRedeclarationEarlyErrors(n)
 	}
 }
 
@@ -261,6 +262,105 @@ func (parsed *parseResult) addPrivateDeleteEarlyErrors(node *ast.Node) {
 	if target != nil && target.Kind == ast.KindPropertyAccessExpression &&
 		target.Name() != nil && target.Name().Kind == ast.KindPrivateIdentifier {
 		parsed.addJavaScriptDiagnostic(target, 90005)
+	}
+}
+
+type declaredName struct {
+	text string
+	node *ast.Node
+}
+
+func appendBoundNames(node *ast.Node, names []declaredName) []declaredName {
+	if node == nil { return names }
+	switch node.Kind {
+	case ast.KindIdentifier:
+		return append(names, declaredName{text: node.Text(), node: node})
+	case ast.KindBindingElement:
+		return appendBoundNames(node.Name(), names)
+	case ast.KindArrayBindingPattern, ast.KindObjectBindingPattern:
+		for _, element := range node.AsBindingPattern().Elements.Nodes {
+			names = appendBoundNames(element, names)
+		}
+	}
+	return names
+}
+
+func appendDeclarationNames(node *ast.Node, names []declaredName) []declaredName {
+	if node != nil && node.Name() != nil {
+		return appendBoundNames(node.Name(), names)
+	}
+	return names
+}
+
+func directLexicalNames(statements []*ast.Node) []declaredName {
+	var names []declaredName
+	for _, statement := range statements {
+		switch statement.Kind {
+		case ast.KindVariableStatement:
+			list := statement.AsVariableStatement().DeclarationList
+			if list.Flags&ast.NodeFlagsBlockScoped != 0 {
+				for _, declaration := range list.AsVariableDeclarationList().Declarations.Nodes {
+					names = appendDeclarationNames(declaration, names)
+				}
+			}
+		case ast.KindFunctionDeclaration, ast.KindClassDeclaration:
+			names = appendDeclarationNames(statement, names)
+		}
+	}
+	return names
+}
+
+func appendVarDeclaredNames(node *ast.Node, names []declaredName) []declaredName {
+	if node == nil { return names }
+	switch node.Kind {
+	case ast.KindFunctionDeclaration, ast.KindFunctionExpression, ast.KindArrowFunction,
+		ast.KindClassDeclaration, ast.KindClassExpression:
+		return names
+	case ast.KindVariableDeclarationList:
+		if node.Flags&ast.NodeFlagsBlockScoped == 0 {
+			for _, declaration := range node.AsVariableDeclarationList().Declarations.Nodes {
+				names = appendDeclarationNames(declaration, names)
+			}
+		}
+		return names
+	}
+	node.ForEachChild(func(child *ast.Node) bool {
+		names = appendVarDeclaredNames(child, names)
+		return false
+	})
+	return names
+}
+
+func blockScopeStatements(node *ast.Node) []*ast.Node {
+	if node.Kind == ast.KindBlock { return node.AsBlock().Statements.Nodes }
+	if node.Kind != ast.KindCaseBlock { return nil }
+	var statements []*ast.Node
+	for _, clause := range node.AsCaseBlock().Clauses.Nodes {
+		statements = append(statements, clause.AsCaseOrDefaultClause().Statements.Nodes...)
+	}
+	return statements
+}
+
+func (parsed *parseResult) addBlockRedeclarationEarlyErrors(node *ast.Node) {
+	if node.Kind != ast.KindBlock && node.Kind != ast.KindCaseBlock { return }
+	statements := blockScopeStatements(node)
+	lexical := directLexicalNames(statements)
+	var vars []declaredName
+	for _, statement := range statements {
+		vars = appendVarDeclaredNames(statement, vars)
+	}
+	seen := make(map[string]*ast.Node)
+	for _, name := range lexical {
+		if seen[name.text] != nil {
+			parsed.addJavaScriptDiagnostic(name.node, 90006)
+		} else {
+			seen[name.text] = name.node
+		}
+	}
+	for _, name := range vars {
+		if seen[name.text] != nil {
+			parsed.addJavaScriptDiagnostic(name.node, 90006)
+		}
 	}
 }
 
