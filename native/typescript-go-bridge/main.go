@@ -120,6 +120,7 @@ func (parsed *parseResult) addJavaScriptModeDiagnostics() {
 		}
 		parsed.addDynamicImportEarlyErrors(n)
 		parsed.addAssignmentTargetEarlyErrors(n)
+		parsed.addBindingRestEarlyErrors(n)
 	}
 }
 
@@ -225,6 +226,24 @@ func (parsed *parseResult) addAssignmentTargetEarlyErrors(node *ast.Node) {
 			!(!strict && isCallAssignmentTarget(initializer)) {
 			parsed.addJavaScriptDiagnostic(initializer, 90003)
 		}
+	}
+}
+
+func (parsed *parseResult) addBindingRestEarlyErrors(node *ast.Node) {
+	if node.Kind != ast.KindBindingElement { return }
+	element := node.AsBindingElement()
+	if element.DotDotDotToken == nil { return }
+	if element.Initializer != nil {
+		parsed.addJavaScriptDiagnostic(element.Initializer, 90004)
+	}
+	parent := node.Parent
+	if parent == nil ||
+		(parent.Kind != ast.KindArrayBindingPattern && parent.Kind != ast.KindObjectBindingPattern) {
+		return
+	}
+	elements := parent.AsBindingPattern().Elements.Nodes
+	if len(elements) > 0 && elements[len(elements)-1] != node {
+		parsed.addJavaScriptDiagnostic(node, 90004)
 	}
 }
 

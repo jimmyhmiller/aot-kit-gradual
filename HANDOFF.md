@@ -1,3 +1,17 @@
+## 2026-08-25: binding rest grammar is checked once for every syntax context
+
+- Added JavaScript-mode early errors for the two universal binding-rest invariants: a rest element
+  cannot carry an initializer and it must be the final element of its array or object binding
+  pattern. The check uses `BindingElement` structure and its ordered parent list, so it applies
+  uniformly to functions, methods, classes, loops, declarations, catches, and assignment forms.
+- The complete negative-parse corpus is retained in
+  `test262-results-negative-parse-binding-rest-checkpoint-2026-08-25.jsonl`: 4,493 passed, 3,957
+  failed, no refusals, and 205 module-policy skips. Exactly 1,104 variants moved to passing from the
+  assignment-target checkpoint, with no lost pass.
+- Holding the authoritative full baseline's other outcomes fixed now projects 13,827 passes among
+  90,377 non-skipped variants, or 15.30%. This remains a projection until the next full run, and the
+  active 30% goal remains incomplete.
+
 ## 2026-08-25: ECMAScript assignment targets are checked structurally
 
 - Added a JavaScript-mode `AssignmentTargetType` early-error pass at assignment, update, and
