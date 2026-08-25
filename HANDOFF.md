@@ -1,3 +1,22 @@
+## 2026-08-24: Test262's bound `hasOwnProperty` helper is first-class JSL
+
+- Added JSL callables for `Function.prototype.call`, `Function.prototype.bind`, and
+  `Object.prototype.hasOwnProperty`; ordinary property lookup remains authoritative, and intrinsic
+  fallback happens only when the requested runtime property is absent.
+- The exact high-fan-out Test262 shape
+  `Function.prototype.call.bind(Object.prototype.hasOwnProperty)(object, key)` now compiles and
+  agrees with Node in a permanent native differential test. The implementation uses captured JSL
+  closures and dynamic receiver dispatch rather than frontend syntax recognition or open-coded
+  JavaScript semantics.
+- This strike is intentionally fixed-arity: the current native JavaScript call ABI carries values
+  but no argument count, so a callee cannot distinguish omitted arguments from explicit
+  `undefined`. General variadic `call` and `bind` require an argc channel or an equivalent universal
+  argument-vector ABI; they are not claimed here.
+- The prior full Test262 report contains 7,387 records whose retained diagnostic reports missing
+  global `Function`. That is an affected upper bound, not a pass delta: `propertyHelper.js` also
+  initializes bound `Array.prototype.join`, `Array.prototype.push`, and
+  `Object.prototype.propertyIsEnumerable`, which remain subsequent blockers.
+
 ## 2026-08-24: JSL callable closures use the source closure ABI
 
 - Added `:captures [name ...]` to `callable` declarations and a checked `(closure Callable value ...)` expression. Non-callables and wrong capture arities are rejected before lowering.
