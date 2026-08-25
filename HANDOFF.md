@@ -1986,3 +1986,15 @@ Fixed `MSEL-MEMORY-ORDER` on `ArrayResize`: the selector seeded anti-dependencie
 - The first exact Test262 property-helper probe exposed that `SetProperty` ignored the writable bit
   on data descriptors. It now leaves non-writable properties unchanged and stores only when bit 1
   is present; the native method witness also attempts and rejects mutation of `length`.
+- A four-way helper isolation then proved the captured `Object.getOwnPropertyDescriptor` primordial
+  was still an opaque identity with no executable body. `ObjectGetOwnPropertyDescriptorValue` now
+  publishes a caller-local closure for the real `ObjectGetOwnPropertyDescriptor2` callable adapter,
+  which delegates to the existing DSL operation. Constructing the closure inside the shared
+  `BuiltinMethodValue` builtin was measured and rejected because the value did not survive that
+  call boundary as an executable closure.
+- Four minimized native helper stages now pass independently: aliased descriptor invocation,
+  descriptor own-name enumeration, configurable method-length deletion, and `arguments.length` in
+  two distinct helpers. The exact Test262 `Object/getOwnPropertyDescriptor/length.js` case advanced:
+  default mode now fails selection at `CProj.1` node 19813, while strict mode reaches a remaining
+  opaque runtime failure. The exact retained result is
+  `test262-results-object-gopd-callable-2026-08-24.jsonl`; neither variant is claimed passing.
