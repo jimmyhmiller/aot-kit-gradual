@@ -135,6 +135,7 @@ func (parsed *parseResult) addJavaScriptModeDiagnostics() {
 		parsed.addFormalParameterEarlyErrors(n)
 		parsed.addClassElementEarlyErrors(n)
 		parsed.addPrivateNameEarlyErrors(n)
+		parsed.addObjectMethodEarlyErrors(n)
 	}
 }
 
@@ -583,6 +584,55 @@ func containsReservedBinding(node *ast.Node, target string, stopAtOrdinaryFuncti
 		return false
 	})
 	return found
+}
+
+func containsYieldExpression(node *ast.Node) bool {
+	if node == nil { return false }
+	if node.Kind == ast.KindYieldExpression { return true }
+	if node.Kind == ast.KindFunctionDeclaration || node.Kind == ast.KindFunctionExpression ||
+		node.Kind == ast.KindArrowFunction || node.Kind == ast.KindClassDeclaration ||
+		node.Kind == ast.KindClassExpression { return false }
+	found := false
+	node.ForEachChild(func(child *ast.Node) bool {
+		if containsYieldExpression(child) { found = true; return true }
+		return false
+	})
+	return found
+}
+
+func (parsed *parseResult) addObjectMethodEarlyErrors(node *ast.Node) {
+	if node.Kind != ast.KindMethodDeclaration { return }
+	method := node.AsMethodDeclaration()
+	generator := method.AsteriskToken != nil
+	async := node.ModifierFlags()&ast.ModifierFlagsAsync != 0
+	parameterNames := make(map[string]bool)
+	for _, parameter := range node.Parameters() {
+		for _, name := range appendBoundNames(parameter.Name(), nil) { parameterNames[name.text] = true }
+		if classElementContains(parameter, false, true, false) {
+			parsed.addJavaScriptDiagnostic(parameter, 90029)
+		}
+		if generator && (containsReservedBinding(parameter, "yield", false) ||
+			containsYieldExpression(parameter)) {
+			parsed.addJavaScriptDiagnostic(parameter, 90030)
+		}
+		if async && containsReservedBinding(parameter, "await", true) {
+			parsed.addJavaScriptDiagnostic(parameter, 90031)
+		}
+	}
+	if classElementContains(method.Body, false, true, false) {
+		parsed.addJavaScriptDiagnostic(method.Body, 90032)
+	}
+	if generator && containsReservedBinding(method.Body, "yield", false) {
+		parsed.addJavaScriptDiagnostic(method.Body, 90033)
+	}
+	if async && containsReservedBinding(method.Body, "await", true) {
+		parsed.addJavaScriptDiagnostic(method.Body, 90034)
+	}
+	if method.Body != nil && method.Body.Kind == ast.KindBlock {
+		for _, lexical := range directLexicalNames(method.Body.AsBlock().Statements.Nodes) {
+			if parameterNames[lexical.text] { parsed.addJavaScriptDiagnostic(lexical.node, 90035) }
+		}
+	}
 }
 
 func copyPrivateEnvironment(outer map[string]bool) map[string]bool {

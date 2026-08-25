@@ -1,3 +1,15 @@
+## 2026-08-25: object methods share function-like early errors
+
+- Added one method-declaration static-semantics pass for forbidden `super()` in parameters and
+  bodies, async/generator reserved bindings, `yield` expressions in generator parameters, and
+  intersections between formal `BoundNames` and direct body `LexicallyDeclaredNames`. It composes
+  the same structural helpers used by class and formal-parameter checks.
+- The retained complete object method-definition result is
+  `test262-results-object-method-early-errors-v1-2026-08-25.jsonl`: 203 passed, 131 positive
+  execution failures, 34 refusals, and 101 policy skips among 368 executed variants. All 44
+  failures in this family from the current complete negative-parse run now pass. The active 30%
+  goal remains incomplete.
+
 ## 2026-08-25: Unicode-set reserved punctuators are validated
 
 - Added a `v`-mode character-class scanner with nested-class depth, escaped-character handling,
