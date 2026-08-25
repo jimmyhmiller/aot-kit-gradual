@@ -1,3 +1,17 @@
+## 2026-08-25: function-expression early errors add 83 negative-parse passes
+
+- Added shared static semantics for async and generator function expressions: contextual
+  `await`/`yield` bindings, forbidden `AwaitExpression`/`YieldExpression` in formal parameters,
+  `super` calls and properties, formal/body lexical-name collisions, and strict `eval`/`arguments`
+  names. The checks walk AST structure with nested function/class boundaries and contain no
+  Test262 paths or expected answers.
+- The complete async-generator expression directory moved from 172 to 218 passes, closing all 46
+  negative-parse variants previously open there. The retained complete negative corpus result is
+  `test262-results-negative-parse-current-v4-2026-08-25.jsonl`: 7,702 passed, 514 failed, no
+  refusals, and 204 policy skips among 8,216 variants in 3.100 seconds. The 83 total gains also
+  cover async-function and generator expression families. The active 30% full-suite goal remains
+  incomplete.
+
 ## 2026-08-25: current complete negative-parse corpus reaches 7,619 passes
 
 - Rebuilt the retained negative-only corpus from the authoritative Test262 checkout and ran all

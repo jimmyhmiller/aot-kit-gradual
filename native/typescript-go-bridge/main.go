@@ -136,6 +136,7 @@ func (parsed *parseResult) addJavaScriptModeDiagnostics() {
 		parsed.addClassElementEarlyErrors(n)
 		parsed.addPrivateNameEarlyErrors(n)
 		parsed.addObjectMethodEarlyErrors(n)
+		parsed.addFunctionExpressionEarlyErrors(n)
 		parsed.addDestructuringEarlyErrors(n)
 	}
 }
@@ -599,6 +600,80 @@ func containsYieldExpression(node *ast.Node) bool {
 		return false
 	})
 	return found
+}
+
+func containsAwaitExpression(node *ast.Node) bool {
+	if node == nil { return false }
+	if node.Kind == ast.KindAwaitExpression { return true }
+	if node.Kind == ast.KindFunctionDeclaration || node.Kind == ast.KindFunctionExpression ||
+		node.Kind == ast.KindArrowFunction || node.Kind == ast.KindClassDeclaration ||
+		node.Kind == ast.KindClassExpression { return false }
+	found := false
+	node.ForEachChild(func(child *ast.Node) bool {
+		if containsAwaitExpression(child) { found = true; return true }
+		return false
+	})
+	return found
+}
+
+func containsSuperReference(node *ast.Node) bool {
+	if node == nil { return false }
+	if node.Kind == ast.KindCallExpression && node.AsCallExpression().Expression.Kind == ast.KindSuperKeyword {
+		return true
+	}
+	if node.Kind == ast.KindPropertyAccessExpression && node.AsPropertyAccessExpression().Expression.Kind == ast.KindSuperKeyword {
+		return true
+	}
+	if node.Kind == ast.KindElementAccessExpression && node.AsElementAccessExpression().Expression.Kind == ast.KindSuperKeyword {
+		return true
+	}
+	if node.Kind == ast.KindFunctionDeclaration || node.Kind == ast.KindFunctionExpression ||
+		node.Kind == ast.KindClassDeclaration || node.Kind == ast.KindClassExpression { return false }
+	found := false
+	node.ForEachChild(func(child *ast.Node) bool {
+		if containsSuperReference(child) { found = true; return true }
+		return false
+	})
+	return found
+}
+
+func (parsed *parseResult) addFunctionExpressionEarlyErrors(node *ast.Node) {
+	if node.Kind != ast.KindFunctionExpression { return }
+	function := node.AsFunctionExpression()
+	generator := function.AsteriskToken != nil
+	async := node.ModifierFlags()&ast.ModifierFlagsAsync != 0
+	if !generator && !async { return }
+	if function.Name() != nil {
+		name := function.Name().Text()
+		if generator && name == "yield" { parsed.addJavaScriptDiagnostic(function.Name(), 90045) }
+		if async && name == "await" { parsed.addJavaScriptDiagnostic(function.Name(), 90046) }
+		if parsed.isStrictScript() && (name == "eval" || name == "arguments") {
+			parsed.addJavaScriptDiagnostic(function.Name(), 90047)
+		}
+	}
+	parameterNames := make(map[string]bool)
+	for _, parameter := range node.Parameters() {
+		for _, name := range appendBoundNames(parameter.Name(), nil) { parameterNames[name.text] = true }
+		if containsSuperReference(parameter) { parsed.addJavaScriptDiagnostic(parameter, 90048) }
+		if generator && (containsReservedBinding(parameter, "yield", false) || containsYieldExpression(parameter)) {
+			parsed.addJavaScriptDiagnostic(parameter, 90049)
+		}
+		if async && (containsReservedBinding(parameter, "await", true) || containsAwaitExpression(parameter)) {
+			parsed.addJavaScriptDiagnostic(parameter, 90050)
+		}
+	}
+	if containsSuperReference(function.Body) { parsed.addJavaScriptDiagnostic(function.Body, 90051) }
+	if generator && containsReservedBinding(function.Body, "yield", false) {
+		parsed.addJavaScriptDiagnostic(function.Body, 90052)
+	}
+	if async && containsReservedBinding(function.Body, "await", true) {
+		parsed.addJavaScriptDiagnostic(function.Body, 90053)
+	}
+	if function.Body != nil && function.Body.Kind == ast.KindBlock {
+		for _, lexical := range directLexicalNames(function.Body.AsBlock().Statements.Nodes) {
+			if parameterNames[lexical.text] { parsed.addJavaScriptDiagnostic(lexical.node, 90054) }
+		}
+	}
 }
 
 func (parsed *parseResult) addObjectMethodEarlyErrors(node *ast.Node) {
