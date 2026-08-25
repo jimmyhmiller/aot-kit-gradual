@@ -145,6 +145,7 @@ func (parsed *parseResult) addJavaScriptModeDiagnostics() {
 		parsed.addStrictStatementEarlyErrors(n)
 		parsed.addOptionalTaggedTemplateEarlyErrors(n)
 		parsed.addCoalesceEarlyErrors(n)
+		parsed.addExecutionContextEarlyErrors(n)
 		parsed.addControlContextEarlyErrors(n)
 		parsed.addDestructuringEarlyErrors(n)
 	}
@@ -1202,6 +1203,84 @@ func isImportMeta(node *ast.Node) bool {
 func importMetaName(node *ast.Node) string {
 	if !isImportMeta(node) { return "" }
 	return node.AsMetaProperty().Name().Text()
+}
+
+func isNewTarget(node *ast.Node) bool {
+	return node != nil && node.Kind == ast.KindMetaProperty &&
+		node.AsMetaProperty().KeywordToken == ast.KindNewKeyword
+}
+
+func withinNode(node, ancestor *ast.Node) bool {
+	for current := node; current != nil; current = current.Parent {
+		if current == ancestor { return true }
+	}
+	return false
+}
+
+func newTargetContext(node *ast.Node) bool {
+	for current := node.Parent; current != nil; current = current.Parent {
+		if current.Kind == ast.KindClassStaticBlockDeclaration { return false }
+		if current.Kind == ast.KindArrowFunction { continue }
+		if ast.IsFunctionLike(current) { return true }
+	}
+	return false
+}
+
+func superPropertyContext(node *ast.Node) bool {
+	for current := node.Parent; current != nil; current = current.Parent {
+		if current.Kind == ast.KindArrowFunction { continue }
+		switch current.Kind {
+		case ast.KindClassStaticBlockDeclaration:
+			return true
+		case ast.KindPropertyDeclaration, ast.KindMethodDeclaration, ast.KindGetAccessor,
+			ast.KindSetAccessor, ast.KindConstructor:
+			name := ast.GetNameOfDeclaration(current)
+			return name == nil || !withinNode(node, name)
+		}
+		if ast.IsFunctionLike(current) { return false }
+	}
+	return false
+}
+
+func derivedConstructorContext(node *ast.Node) bool {
+	for current := node.Parent; current != nil; current = current.Parent {
+		if current.Kind == ast.KindArrowFunction { continue }
+		if current.Kind == ast.KindConstructor {
+			body := current.AsConstructorDeclaration().Body
+			if body == nil || !withinNode(node, body) { return false }
+			owner := current.Parent
+			return owner != nil && (owner.Kind == ast.KindClassDeclaration || owner.Kind == ast.KindClassExpression) &&
+				owner.ClassLikeData().HeritageClauses != nil &&
+				len(owner.ClassLikeData().HeritageClauses.Nodes) != 0
+		}
+		if ast.IsFunctionLike(current) || current.Kind == ast.KindClassStaticBlockDeclaration { return false }
+	}
+	return false
+}
+
+func (parsed *parseResult) addExecutionContextEarlyErrors(node *ast.Node) {
+	if isNewTarget(node) {
+		meta := node.AsMetaProperty()
+		start := scanner.SkipTrivia(parsed.source, meta.Name().Pos())
+		rawName := ""
+		if start >= 0 && start <= meta.Name().End() && meta.Name().End() <= len(parsed.source) {
+			rawName = parsed.source[start:meta.Name().End()]
+		}
+		if meta.Name().Text() != "target" || rawName != "target" || !newTargetContext(node) {
+			parsed.addJavaScriptDiagnostic(node, 90083)
+		}
+		return
+	}
+	if node.Kind == ast.KindCallExpression && node.AsCallExpression().Expression.Kind == ast.KindSuperKeyword {
+		if !derivedConstructorContext(node) { parsed.addJavaScriptDiagnostic(node, 90084) }
+		return
+	}
+	if node.Kind == ast.KindPropertyAccessExpression &&
+		node.AsPropertyAccessExpression().Expression.Kind == ast.KindSuperKeyword ||
+		node.Kind == ast.KindElementAccessExpression &&
+			node.AsElementAccessExpression().Expression.Kind == ast.KindSuperKeyword {
+		if !superPropertyContext(node) { parsed.addJavaScriptDiagnostic(node, 90085) }
+	}
 }
 
 func isAnyImportCall(node *ast.Node) bool {

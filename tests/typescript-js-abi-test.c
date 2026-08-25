@@ -231,6 +231,20 @@ int main(int argc, char **argv) {
     "sloppy yield parameter reference remains accepted");
   aot_ts_parse_delete(sloppy_yield_parameter_parse);
 
+  const char *invalid_execution_context = "new.target; super(); super.x;";
+  AotTsParse invalid_execution_parse = aot_ts_parse_ex(invalid_execution_context,
+    (int32_t)strlen(invalid_execution_context), "execution-errors.js", 19, AOT_TS_SCRIPT_JS);
+  require(aot_ts_diagnostic_count(invalid_execution_parse) >= 3,
+    "global new.target and super forms rejected");
+  aot_ts_parse_delete(invalid_execution_parse);
+  const char *valid_execution_context = "function f() { return new.target; } class B {} "
+    "class C extends B { constructor() { super(); return super.x; } }";
+  AotTsParse valid_execution_parse = aot_ts_parse_ex(valid_execution_context,
+    (int32_t)strlen(valid_execution_context), "execution-valid.js", 18, AOT_TS_SCRIPT_JS);
+  require(aot_ts_diagnostic_count(valid_execution_parse) == 0,
+    "function new.target and derived-constructor super forms accepted");
+  aot_ts_parse_delete(valid_execution_parse);
+
   const char *operators = "var x=1,o={}; x += 2; ++x; x--; typeof x; delete o.x; void (x += 3); o?.x; o?.[x]; x?.(); `plain`; `a${x}b`; (a) => { return a; }; true; null;";
   AotTsParse operator_parse = aot_ts_parse_ex(operators, (int32_t)strlen(operators), "operators.js", 12, AOT_TS_SCRIPT_JS);
   require(find_operator(operator_parse, "PlusEquals") >= 0, "assignment operator API");

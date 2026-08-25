@@ -2882,3 +2882,17 @@ and use `call-dynamic-with-receiver`, matching `map`, `filter`, `forEach`, `some
 - Full negative-parse result `test262-results-negative-parse-current-v11-2026-08-25.jsonl`:
   8,153 passed, 63 failed, 0 refused, 204 skipped. Relative to v10: 18 failed-to-passed,
   8,135 passed-to-passed, 63 failed-to-failed, 204 skipped-to-skipped, zero regressions.
+# 2026-08-25: new.target and super enforce lexical execution contexts (+14 Test262)
+
+- `new.target` is accepted only when lexical parent traversal reaches a non-arrow function before a
+  static-block/source boundary; arrows inherit the surrounding context. Its property token must be
+  the literal source spelling `target`, so escaped spellings are rejected even when they decode to
+  the same identifier value.
+- `super` property access is accepted in method/accessor/constructor bodies, class field
+  initializers, and static blocks, with arrows inheriting that context. Computed member names do not
+  incorrectly acquire the member body's super context.
+- `super()` is accepted only in the body (or nested arrow body) of a constructor whose class has
+  heritage. Bounded controls pin ordinary-function `new.target` and derived-constructor forms.
+- Full negative-parse result `test262-results-negative-parse-current-v12-2026-08-25.jsonl`:
+  8,167 passed, 49 failed, 0 refused, 204 skipped. Relative to v11: 14 failed-to-passed,
+  8,153 passed-to-passed, 49 failed-to-failed, 204 skipped-to-skipped, zero regressions.
