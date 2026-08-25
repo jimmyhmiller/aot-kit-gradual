@@ -1,3 +1,17 @@
+## 2026-08-25: formal parameters share one static-semantics pass
+
+- Added function-level formal-parameter early errors across declarations, expressions, arrows,
+  object methods, class methods, accessors, and constructors. The pass handles rest initializer,
+  rest position and trailing comma, non-simple parameters with a `use strict` directive, duplicate
+  bound names under strict/non-simple/arrow/method rules, inherited class/function strictness, and
+  strict `eval`/`arguments` bindings. Binding names are expanded recursively from AST patterns.
+- The complete negative-parse corpus is retained in
+  `test262-results-negative-parse-formal-parameters-checkpoint-2026-08-25.jsonl`: 6,118 passed,
+  2,332 failed, no refusals, and 205 module-policy skips. Exactly 492 variants moved to passing from
+  the RegExp-flags checkpoint, with no lost pass.
+- Holding the authoritative full baseline's other outcomes fixed now projects 15,452 passes among
+  90,377 non-skipped variants, or 17.10%. The active 30% goal remains incomplete.
+
 ## 2026-08-25: RegExp literal and inline modifier flags are validated
 
 - Added RegExp flag grammar checks at JavaScript parse time. Trailing literal flags are limited to

@@ -125,6 +125,7 @@ func (parsed *parseResult) addJavaScriptModeDiagnostics() {
 		parsed.addBlockRedeclarationEarlyErrors(n)
 		parsed.addEmbeddedStatementEarlyErrors(n)
 		parsed.addRegExpFlagEarlyErrors(n)
+		parsed.addFormalParameterEarlyErrors(n)
 	}
 }
 
@@ -475,6 +476,79 @@ func (parsed *parseResult) addRegExpFlagEarlyErrors(node *ast.Node) {
 	if !validRegExpLiteralFlags(literal[delimiter+1:]) ||
 		invalidRegExpModifier(literal[1:delimiter]) {
 		parsed.addJavaScriptDiagnostic(node, 90008)
+	}
+}
+
+func functionHasUseStrict(node *ast.Node) bool {
+	if node == nil || !ast.IsFunctionLike(node) { return false }
+	body := node.Body()
+	if body == nil || body.Kind != ast.KindBlock { return false }
+	for _, statement := range body.AsBlock().Statements.Nodes {
+		if statement.Kind != ast.KindExpressionStatement { return false }
+		expression := statement.AsExpressionStatement().Expression
+		if expression.Kind != ast.KindStringLiteral { return false }
+		if expression.Text() == "use strict" { return true }
+	}
+	return false
+}
+
+func (parsed *parseResult) strictAt(node *ast.Node) bool {
+	if parsed.isStrictScript() { return true }
+	for current := node; current != nil; current = current.Parent {
+		if current.Kind == ast.KindClassDeclaration || current.Kind == ast.KindClassExpression {
+			return true
+		}
+		if ast.IsFunctionLike(current) && functionHasUseStrict(current) { return true }
+	}
+	return false
+}
+
+func simpleParameterList(node *ast.Node) bool {
+	for _, parameter := range node.Parameters() {
+		data := parameter.AsParameterDeclaration()
+		if data.Name().Kind != ast.KindIdentifier || data.Initializer != nil || data.DotDotDotToken != nil {
+			return false
+		}
+	}
+	return true
+}
+
+func parameterDuplicatesAlwaysForbidden(node *ast.Node) bool {
+	switch node.Kind {
+	case ast.KindArrowFunction, ast.KindMethodDeclaration, ast.KindGetAccessor,
+		ast.KindSetAccessor, ast.KindConstructor:
+		return true
+	}
+	return false
+}
+
+func (parsed *parseResult) addFormalParameterEarlyErrors(node *ast.Node) {
+	if !ast.IsFunctionLike(node) || node.ParameterList() == nil { return }
+	parameters := node.Parameters()
+	strict := parsed.strictAt(node)
+	simple := simpleParameterList(node)
+	if !simple && functionHasUseStrict(node) {
+		parsed.addJavaScriptDiagnostic(node, 90009)
+	}
+	seen := make(map[string]*ast.Node)
+	for i, parameter := range parameters {
+		data := parameter.AsParameterDeclaration()
+		if data.DotDotDotToken != nil {
+			if data.Initializer != nil || i != len(parameters)-1 ||
+				i == len(parameters)-1 && node.ParameterList().HasTrailingComma() {
+				parsed.addJavaScriptDiagnostic(parameter, 90009)
+			}
+		}
+		for _, name := range appendBoundNames(data.Name(), nil) {
+			if strict && (name.text == "eval" || name.text == "arguments") {
+				parsed.addJavaScriptDiagnostic(name.node, 90009)
+			}
+			if seen[name.text] != nil && (strict || !simple || parameterDuplicatesAlwaysForbidden(node)) {
+				parsed.addJavaScriptDiagnostic(name.node, 90009)
+			} else {
+				seen[name.text] = name.node
+			}
+		}
 	}
 }
 
