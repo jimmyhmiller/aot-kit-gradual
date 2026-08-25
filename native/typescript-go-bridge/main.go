@@ -140,6 +140,7 @@ func (parsed *parseResult) addJavaScriptModeDiagnostics() {
 		parsed.addAsyncArrowEarlyErrors(n)
 		parsed.addLexicalDeclarationEarlyErrors(n)
 		parsed.addStrictBindingEarlyErrors(n)
+		parsed.addControlContextEarlyErrors(n)
 		parsed.addDestructuringEarlyErrors(n)
 	}
 }
@@ -801,6 +802,68 @@ func (parsed *parseResult) addStrictBindingEarlyErrors(node *ast.Node) {
 			}
 		}
 	}
+}
+
+func iterationStatement(node *ast.Node) bool {
+	if node == nil { return false }
+	switch node.Kind {
+	case ast.KindDoStatement, ast.KindWhileStatement, ast.KindForStatement,
+		ast.KindForInStatement, ast.KindForOfStatement:
+		return true
+	}
+	return false
+}
+
+func labelTargetsIteration(node *ast.Node) bool {
+	if node == nil || node.Kind != ast.KindLabeledStatement { return false }
+	target := node.AsLabeledStatement().Statement
+	for target != nil && target.Kind == ast.KindLabeledStatement {
+		target = target.AsLabeledStatement().Statement
+	}
+	return iterationStatement(target)
+}
+
+func controlBoundary(node *ast.Node) bool {
+	return node != nil && (ast.IsFunctionLike(node) || node.Kind == ast.KindClassStaticBlockDeclaration)
+}
+
+func (parsed *parseResult) addControlContextEarlyErrors(node *ast.Node) {
+	if node.Kind == ast.KindReturnStatement {
+		valid := false
+		for current := node.Parent; current != nil; current = current.Parent {
+			if ast.IsFunctionLike(current) { valid = true; break }
+			if current.Kind == ast.KindClassStaticBlockDeclaration { break }
+		}
+		if !valid { parsed.addJavaScriptDiagnostic(node, 90063) }
+		return
+	}
+	if node.Kind == ast.KindLabeledStatement {
+		label := node.AsLabeledStatement().Label.Text()
+		for current := node.Parent; current != nil && !controlBoundary(current); current = current.Parent {
+			if current.Kind == ast.KindLabeledStatement && current.AsLabeledStatement().Label.Text() == label {
+				parsed.addJavaScriptDiagnostic(node, 90064)
+				break
+			}
+		}
+		return
+	}
+	if node.Kind != ast.KindBreakStatement && node.Kind != ast.KindContinueStatement { return }
+	continuing := node.Kind == ast.KindContinueStatement
+	var label *ast.Node
+	if continuing { label = node.AsContinueStatement().Label } else { label = node.AsBreakStatement().Label }
+	valid := false
+	for current := node.Parent; current != nil && !controlBoundary(current); current = current.Parent {
+		if label != nil {
+			if current.Kind == ast.KindLabeledStatement && current.AsLabeledStatement().Label.Text() == label.Text() {
+				valid = !continuing || labelTargetsIteration(current)
+				break
+			}
+		} else if iterationStatement(current) || !continuing && current.Kind == ast.KindSwitchStatement {
+			valid = true
+			break
+		}
+	}
+	if !valid { parsed.addJavaScriptDiagnostic(node, 90065) }
 }
 
 func invalidStrictReference(node *ast.Node) bool {

@@ -1,3 +1,13 @@
+## 2026-08-25: control-context validation adds 88 negative-parse passes
+
+- Added ancestor-based early errors for `return`, `break`, `continue`, and active labels. Function
+  and class-static-block boundaries reset control targets; labeled continues must denote iteration
+  statements; unlabeled breaks accept loops or switches; duplicate active labels are rejected.
+- The retained complete negative corpus result is
+  `test262-results-negative-parse-current-v9-2026-08-25.jsonl`: 8,023 passed, 193 failed, no
+  refusals, and 204 policy skips among 8,216 variants in 3.766 seconds. This checkpoint adds 88
+  passes. The active 30% full-suite goal remains incomplete.
+
 ## 2026-08-25: declaration and ordinary-function early errors add 45 passes
 
 - Generalized the function-expression static-semantics pass to function declarations and ordinary
