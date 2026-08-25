@@ -1,3 +1,19 @@
+## 2026-08-24: Test262 property-helper publication reaches the argc frontier
+
+- Published callable JSL wrappers for `Array.prototype.join`, `Array.prototype.push`, and
+  `Object.prototype.propertyIsEnumerable`, completing the four bound methods initialized by
+  Test262's `propertyHelper.js`. Existing runtime properties still win; intrinsic fallback applies
+  only to absent properties on the exact Object and Array prototype identities.
+- Ran the complete 5,241-file property-helper cohort with retained results in
+  `test262-results-property-helper-after-2026-08-24.jsonl`: 9,195 executable variants finished in
+  272.037 seconds, with 0 passed, 7,084 failed, 2,111 refused, and 594 policy-skipped. Against the
+  same variants in the prior full report, 96 moved from refusal into execution, but none passed.
+- A one-file full-harness isolation proves the first runtime blocker is `arguments.length` inside
+  `verifyProperty`, not bound-method initialization. The current source ABI has no actual-argc
+  channel, so it cannot implement `arguments.length`, omitted-versus-explicit-`undefined`, or
+  general variadic `call`/`bind` correctly. Adding that channel and building the arguments object
+  through DSL-owned semantics is the next architectural strike.
+
 ## 2026-08-24: Test262's bound `hasOwnProperty` helper is first-class JSL
 
 - Added JSL callables for `Function.prototype.call`, `Function.prototype.bind`, and
