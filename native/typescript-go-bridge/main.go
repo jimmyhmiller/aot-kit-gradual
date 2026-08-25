@@ -102,6 +102,7 @@ func aot_ts_parse_ex(source *C.char, sourceLength C.int32_t, filename *C.char, f
 }
 
 func (parsed *parseResult) addJavaScriptModeDiagnostics() {
+	if len(parsed.diagnosticCodes) == 0 { parsed.addRestrictedLineTerminatorErrors() }
 	for _, n := range parsed.nodes {
 		var forbidden *ast.Node
 		switch n.Kind {
@@ -151,6 +152,31 @@ func (parsed *parseResult) addJavaScriptModeDiagnostics() {
 		parsed.addExecutionContextEarlyErrors(n)
 		parsed.addControlContextEarlyErrors(n)
 		parsed.addDestructuringEarlyErrors(n)
+	}
+}
+
+func (parsed *parseResult) addJavaScriptDiagnosticRange(start, length int, code int32) {
+	parsed.diagnosticCodes = append(parsed.diagnosticCodes, code)
+	parsed.diagnosticStarts = append(parsed.diagnosticStarts, int32(start))
+	parsed.diagnosticLengths = append(parsed.diagnosticLengths, int32(length))
+}
+
+func (parsed *parseResult) addRestrictedLineTerminatorErrors() {
+	scan := scanner.NewScanner()
+	scan.SetText(parsed.source)
+	previous := ast.KindUnknown
+	previousEnd := 0
+	for {
+		kind := scan.Scan()
+		start := scan.TokenStart()
+		separated := previous != ast.KindUnknown && previousEnd <= start &&
+			strings.ContainsAny(parsed.source[previousEnd:start], "\r\n\u2028\u2029")
+		if separated && (previous == ast.KindThrowKeyword || kind == ast.KindEqualsGreaterThanToken) {
+			parsed.addJavaScriptDiagnosticRange(start, scan.TokenEnd()-start, 90095)
+		}
+		if kind == ast.KindEndOfFile { return }
+		previous = kind
+		previousEnd = scan.TokenEnd()
 	}
 }
 

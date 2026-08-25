@@ -1,3 +1,25 @@
+## 2026-08-25: scanner-level restricted line terminators add 8 passes
+
+- The TypeScript parser recovers from a line terminator after `throw` or before arrow `=>` without
+  retaining the corresponding ThrowStatement/ArrowFunction node, so AST-local early-error checks
+  could never fire. The JavaScript bridge now uses the upstream TypeScript scanner's token ranges
+  to enforce those two ECMAScript `[no LineTerminator here]` restrictions. Scanner trivia handling
+  keeps comments, strings, templates, and regular expressions out of ad-hoc source matching.
+- The complete parse-negative corpus in
+  `test262-results-negative-parse-current-v18-2026-08-25.jsonl` has 8,207 passes, 9 failures, and
+  204 policy skips. Against v17, exactly 8 failures become passes, all 8,199 existing passes remain
+  passes, and no result regresses. Across the three current parser commits, the corpus moved from
+  8,179/37 to 8,207/9.
+- A separate complete `Array.prototype.reduce` investigation is retained in
+  `test262-results-array-reduce-current-v1-2026-08-25.jsonl` through v3. Borrowed calls with an
+  explicit initial value currently pass the callback itself as the initial accumulator; role-based
+  argument indexing produced 64 gains but exposed 12 no-initial regressions. The deeper invariant
+  is that `fng-jsl-call` checks pending exceptions only after a whole expanded macro: a throwing
+  `length` getter can therefore be overwritten by the later empty-reduce `%Throw`. The experiment
+  was fully removed rather than preserving gains with a knowingly wrong overload. The proper fix
+  is per-operation abrupt-exit collection in JSL lowering, published to the frontend catch target.
+- The bounded gate is green at 48/48. The active 30% full Test262 goal remains incomplete.
+
 ## 2026-08-25: restricted identifiers and switch/loop grammar add 11 passes
 
 - JavaScript bridge static semantics now reject `yield` as an identifier reference or label in
