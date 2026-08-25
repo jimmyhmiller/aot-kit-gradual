@@ -2720,3 +2720,15 @@ and use `call-dynamic-with-receiver`, matching `map`, `filter`, `forEach`, `some
   34 failed->failed, and no regression. The 40 deeper failures are now observable runtime work.
 - `coil test`: 48/48 green. The goal remains 30% on the authoritative full suite; this commit is
   incremental progress, not completion.
+# 2026-08-25: for-of declaration patterns use the binding support already implemented (+96)
+
+- `fe-array-binding-pattern-valid?` no longer rejects declaration-pattern defaults, rest,
+  elisions, nested arrays, or nested objects that `fng-bind-pattern!` already executes through
+  JSL-owned iterator, default, rest, and property operations. This removes stale frontend policy;
+  it does not add or open-code JavaScript meaning in the validator.
+- Complete `language/statements/for-of/dstr` results are persisted in
+  `test262-results-for-of-dstr-bindings-v1-2026-08-25.jsonl`: 193 passed, 890 failed, 12 refused
+  across 1,095 variants. Against authoritative full v4 for the exact variants: 96
+  `frontend-code-1001 -> passed`, 97 passed->passed, and no regression.
+- `coil test`: 48/48 green. The next related gap is assignment destructuring such as
+  `for ([a, b] of xs)`, which still needs a structural assignment-pattern lowering path.
