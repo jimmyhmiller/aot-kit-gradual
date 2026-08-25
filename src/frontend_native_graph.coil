@@ -2496,7 +2496,8 @@
                       (al-get [FePrototypeMethod]
                               (.prototype-methods frontend)
                               (load index))]
-                (if (= name (ts-text ast (.name-node method)))
+                (if (and (= (.kind method) 0)
+                         (= name (ts-text ast (.name-node method))))
                     (if (= (load answer) -1)
                         (set! answer (.target method))
                         (set! answer -2))
@@ -2519,7 +2520,8 @@
                               (.prototype-methods frontend)
                               (load index))
                     target (.target method)]
-                (if (= name (ts-text ast (.name-node method)))
+                (if (and (= (.kind method) 0)
+                         (= name (ts-text ast (.name-node method))))
                     ;; Function payload zero is reserved by the runtime, so graph Fun nodes
                     ;; and boxed function values use source id + 1. Target summaries must use
                     ;; that same identity; otherwise polymorphic dispatch selects the method
@@ -2556,9 +2558,10 @@
                 ; Identity comparison against a boxed Fun constant only means something for a
                 ; capture-free target; a capturing method's runtime value is a per-construction
                 ; closure object and dispatches through the finite target summary instead.
-                (if (and (= name (ts-text ast (.name-node method)))
-                         (and (>= target 0)
-                              (= (fng-capture-count frontend target) 0)))
+                (if (and (= (.kind method) 0)
+                         (= name (ts-text ast (.name-node method)))
+                         (>= target 0)
+                         (= (fng-capture-count frontend target) 0))
                     (let [(mut scan) 0
                           (mut seen) false]
                       (loop (if (or (>= (load scan) (al-len [i64] (load out))) (load seen))
@@ -2675,13 +2678,25 @@
                                   (al-get [i64]
                                           (load (load (field context functions)))
                                           (.target method))
+                                key
+                                  (n-string-const!
+                                    (jss-from-utf8! (ts-text ast (.name-node method))))
                                 stored
-                                  (fng-jsl-call3 context "SetNamedProperty"
-                                                 object
-                                                 (fng-const
-                                                   (shape-name-intern!
-                                                     (ts-text ast (.name-node method))))
-                                                 target)]
+                                  (cond (= (.kind method) 1)
+                                          (fng-jsl-call3 context "DefineGetterProperty"
+                                                         object key
+                                                         (fng-box-dynamic-argument! target))
+                                        (= (.kind method) 2)
+                                          (fng-jsl-call3 context "DefineSetterProperty"
+                                                         object key
+                                                         (fng-box-dynamic-argument! target))
+                                        :else
+                                          (fng-jsl-call3 context "SetNamedProperty"
+                                                         object
+                                                         (fng-const
+                                                           (shape-name-intern!
+                                                             (ts-text ast (.name-node method))))
+                                                         target))]
                             0)
                           0)
                       (set! index (+ (load index) 1)))))
@@ -4676,20 +4691,22 @@
     (loop (if (or (< (load current) 0)
                   (or (<= (load fuel) 0) (>= (load answer) 0)))
               (break)
-              (let [(mut index) 0]
-                (loop (if (or (>= (load index)
-                                  (al-len [FePrototypeMethod]
-                                          (.prototype-methods frontend)))
-                              (>= (load answer) 0))
-                          (break)
-                          (let [method (al-get [FePrototypeMethod]
-                                               (.prototype-methods frontend)
-                                               (load index))]
-                            (if (and (= (.constructor method) (load current))
-                                     (= name (ts-text ast (.name-node method))))
-                                (set! answer (.target method))
-                                0)
-                            (set! index (+ (load index) 1)))))
+              (do
+                (let [(mut index) 0]
+                  (loop (if (or (>= (load index)
+                                    (al-len [FePrototypeMethod]
+                                            (.prototype-methods frontend)))
+                                (>= (load answer) 0))
+                            (break)
+                            (let [method (al-get [FePrototypeMethod]
+                                                 (.prototype-methods frontend)
+                                                 (load index))]
+                              (if (and (= (.kind method) 0)
+                                       (= (.constructor method) (load current))
+                                       (= name (ts-text ast (.name-node method))))
+                                  (set! answer (.target method))
+                                  0)
+                              (set! index (+ (load index) 1))))))
                 (if (< (load answer) 0)
                     (set! current (fng-prototype-parent frontend (load current)))
                     0)

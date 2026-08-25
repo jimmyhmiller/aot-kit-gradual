@@ -1,3 +1,15 @@
+## 2026-08-25: class accessors reach DSL-owned property semantics
+
+- Class validation and prototype indexing now admit getter/setter members. Prototype metadata
+  records data/getter/setter kind; accessor publication delegates to the existing
+  `DefineGetterProperty`/`DefineSetterProperty` DSL operations, while closed-world ordinary method
+  dispatch explicitly excludes accessor entries.
+- Replayed all 1,016 source files whose authoritative full-run failure named `get method()` or
+  `static get method()`. The retained result is `test262-results-class-accessors-v2-2026-08-25.jsonl`:
+  1,888 variants now reach execution and 144 reach deeper generator/rest refusals instead of
+  failing at accessor validation. No variant in this all-failing cohort passes yet, so this is an
+  enabling checkpoint rather than a pass-rate gain. The active 30% goal remains incomplete.
+
 ## 2026-08-25: authoritative full suite reaches 20.63 percent
 
 - Ran the complete current Test262 corpus after the parser/static-semantics checkpoints. The
