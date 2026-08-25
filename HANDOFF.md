@@ -1,3 +1,24 @@
+## 2026-08-25: stable Math identity and DSL-owned object branding add 60 passes
+
+- Ordinary reads of the intrinsic `Math` namespace previously lowered to `NO-NODE`; only direct
+  recognized Math calls existed structurally. `MathObjectValue` now gives the namespace a stable,
+  object-tagged `%BuiltinObject` identity, while frontend lowering only routes identifier and
+  generic property access to that identity. Property reads and writes remain JSL `GetProperty` and
+  `SetProperty` operations.
+- Borrowed `Object.prototype.toString.call(value)` is now recognized structurally alongside the
+  existing borrowed Object prototype methods. The new `lib/object/to-string.jsl`
+  `ObjectPrototypeToString` operation owns primitive, callable, Array, Math, and ordinary-object
+  branding; the Math result is derived from stable DSL identity rather than frontend syntax.
+- The exact former Array-map corruption now passes in both modes in
+  `test262-results-math-object-v2-2026-08-25.jsonl`. The complete authoritative-baseline cohort of
+  `NO-NODE` failures whose source references Math is retained in
+  `test262-results-math-no-node-cohort-v1-2026-08-25.jsonl`: 60 failed variants become passes and
+  161 remain failures, with zero regressions. The gains include both modes of Math receivers for
+  `every`, `filter`, `forEach`, `indexOf`, `lastIndexOf`, `map`, `reduce`, `reduceRight`, and
+  `some`.
+- `coil test` is green at 48/48. The active 30% full Test262 goal remains incomplete; these 60
+  targeted gains are not presented as a new authoritative full-suite percentage.
+
 ## 2026-08-25: literal computed and static public fields add 20 passes
 
 - Public class fields now accept computed string/numeric literal names. The frontend preserves the
