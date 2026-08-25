@@ -1,3 +1,17 @@
+## 2026-08-25: assignment destructuring is validated recursively
+
+- Added assignment-pattern validation only at assignment and `for-in`/`for-of` target sites.
+  Array/object rest targets must be simple and final, array rest rejects a trailing comma/elision,
+  nested patterns recurse, strict reserved targets include computed-key references, and shorthand
+  properties distinguish identifier references from property names. Loop declarations reject
+  initializers in `for-of`/`for-in` heads.
+- The retained complete assignment/for-of/for-in destructuring result is
+  `test262-results-destructuring-early-errors-v3-2026-08-25.jsonl`: 277 passed, 1,004 positive
+  execution failures, 503 refusals, and no policy skips among 1,784 variants. All 134 failures from
+  these directories in the current complete negative-parse run now pass. The final strict-target
+  tranche added 12 with no pass lost across the complete cohort. The active 30% goal remains
+  incomplete.
+
 ## 2026-08-25: object methods share function-like early errors
 
 - Added one method-declaration static-semantics pass for forbidden `super()` in parameters and

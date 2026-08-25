@@ -136,6 +136,7 @@ func (parsed *parseResult) addJavaScriptModeDiagnostics() {
 		parsed.addClassElementEarlyErrors(n)
 		parsed.addPrivateNameEarlyErrors(n)
 		parsed.addObjectMethodEarlyErrors(n)
+		parsed.addDestructuringEarlyErrors(n)
 	}
 }
 
@@ -631,6 +632,121 @@ func (parsed *parseResult) addObjectMethodEarlyErrors(node *ast.Node) {
 	if method.Body != nil && method.Body.Kind == ast.KindBlock {
 		for _, lexical := range directLexicalNames(method.Body.AsBlock().Statements.Nodes) {
 			if parameterNames[lexical.text] { parsed.addJavaScriptDiagnostic(lexical.node, 90035) }
+		}
+	}
+}
+
+func strictReservedIdentifier(name string) bool {
+	switch name {
+	case "eval", "arguments", "yield", "implements", "interface", "let", "package",
+		"private", "protected", "public", "static":
+		return true
+	default:
+		return false
+	}
+}
+
+func invalidStrictReference(node *ast.Node) bool {
+	if node == nil { return false }
+	if node.Kind == ast.KindIdentifier { return strictReservedIdentifier(node.Text()) }
+	if node.Kind == ast.KindParenthesizedExpression {
+		return invalidStrictReference(node.AsParenthesizedExpression().Expression)
+	}
+	return node.Kind == ast.KindYieldExpression
+}
+
+func invalidStrictTargetReference(node *ast.Node) bool {
+	if node == nil { return false }
+	if node.Kind == ast.KindIdentifier { return strictReservedIdentifier(node.Text()) }
+	switch node.Kind {
+	case ast.KindParenthesizedExpression:
+		return invalidStrictTargetReference(node.AsParenthesizedExpression().Expression)
+	case ast.KindPropertyAccessExpression:
+		return invalidStrictTargetReference(node.AsPropertyAccessExpression().Expression)
+	case ast.KindElementAccessExpression:
+		access := node.AsElementAccessExpression()
+		return invalidStrictTargetReference(access.Expression) || invalidStrictReference(access.ArgumentExpression)
+	default:
+		return node.Kind == ast.KindYieldExpression
+	}
+}
+
+func validAssignmentElement(node *ast.Node, strict bool) bool {
+	if node == nil { return true }
+	if strict && invalidStrictTargetReference(node) { return false }
+	if node.Kind == ast.KindBinaryExpression &&
+		node.AsBinaryExpression().OperatorToken.Kind == ast.KindEqualsToken {
+		binary := node.AsBinaryExpression()
+		return validAssignmentElement(binary.Left, strict) && (!strict || !invalidStrictReference(binary.Right))
+	}
+	if node.Kind == ast.KindArrayLiteralExpression || node.Kind == ast.KindObjectLiteralExpression {
+		return validAssignmentPattern(node, strict)
+	}
+	return isSimpleAssignmentTarget(node, strict)
+}
+
+func validAssignmentPattern(node *ast.Node, strict bool) bool {
+	if node == nil { return false }
+	if node.Kind == ast.KindArrayLiteralExpression {
+		list := node.AsArrayLiteralExpression().Elements
+		elements := list.Nodes
+		for index, element := range elements {
+			if element.Kind == ast.KindOmittedExpression { continue }
+			if element.Kind == ast.KindSpreadElement {
+				target := element.AsSpreadElement().Expression
+				if index != len(elements)-1 || list.HasTrailingComma() ||
+					!isSimpleAssignmentTarget(target, strict) || strict && invalidStrictTargetReference(target) { return false }
+				continue
+			}
+			if !validAssignmentElement(element, strict) { return false }
+		}
+		return true
+	}
+	if node.Kind == ast.KindObjectLiteralExpression {
+		properties := node.AsObjectLiteralExpression().Properties.Nodes
+		for index, property := range properties {
+			switch property.Kind {
+			case ast.KindSpreadAssignment:
+				target := property.AsSpreadAssignment().Expression
+				if index != len(properties)-1 || !isSimpleAssignmentTarget(target, strict) ||
+					strict && invalidStrictTargetReference(target) { return false }
+			case ast.KindShorthandPropertyAssignment:
+				data := property.AsShorthandPropertyAssignment()
+				if data.Name() == nil || data.Name().Kind != ast.KindIdentifier ||
+					strict && strictReservedIdentifier(data.Name().Text()) ||
+					strict && invalidStrictReference(data.ObjectAssignmentInitializer) { return false }
+			case ast.KindPropertyAssignment:
+				if !validAssignmentElement(property.AsPropertyAssignment().Initializer, strict) { return false }
+			default:
+				return false
+			}
+		}
+		return true
+	}
+	return false
+}
+
+func (parsed *parseResult) addDestructuringEarlyErrors(node *ast.Node) {
+	strict := parsed.isStrictScript()
+	if node.Kind == ast.KindBinaryExpression {
+		binary := node.AsBinaryExpression()
+		if binary.OperatorToken.Kind == ast.KindEqualsToken && isAssignmentPattern(binary.Left) &&
+			!validAssignmentPattern(binary.Left, strict) {
+			parsed.addJavaScriptDiagnostic(binary.Left, 90036)
+		}
+		return
+	}
+	if node.Kind != ast.KindForInStatement && node.Kind != ast.KindForOfStatement { return }
+	initializer := node.AsForInOrOfStatement().Initializer
+	if initializer == nil { return }
+	if initializer.Kind == ast.KindArrayLiteralExpression || initializer.Kind == ast.KindObjectLiteralExpression {
+		if !validAssignmentPattern(initializer, strict) { parsed.addJavaScriptDiagnostic(initializer, 90036) }
+		return
+	}
+	if initializer.Kind != ast.KindVariableDeclarationList { return }
+	for _, declaration := range initializer.AsVariableDeclarationList().Declarations.Nodes {
+		if declaration.AsVariableDeclaration().Initializer != nil {
+			parsed.addJavaScriptDiagnostic(declaration, 90037)
 		}
 	}
 }
