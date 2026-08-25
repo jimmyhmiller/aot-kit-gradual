@@ -2372,3 +2372,16 @@ Fixed `MSEL-MEMORY-ORDER` on `ArrayResize`: the selector seeded anti-dependencie
   default mode now fails selection at `CProj.1` node 19813, while strict mode reaches a remaining
   opaque runtime failure. The exact retained result is
   `test262-results-object-gopd-callable-2026-08-24.jsonl`; neither variant is claimed passing.
+# 2026-08-25: JSL loops enter after their initializers
+
+`jl-loop` captured its control entry before lowering initializers, although an initializer may move
+control through DSL calls and dynamic guards. The loop then bypassed the initializer's exit Region
+while consuming its Phi as data, leaving a reachable value with a CFG sink that instruction
+selection correctly refused. Capture now occurs after every initializer. A native `reduceRight`
+witness pins the invariant.
+
+- `coil test`: 48/48 green.
+- `reduceRight` Test262 cohort: 2 -> 32 passing; selection failures 362 -> 4 across 517 variants.
+- Result: `test262-results-array-reduceright-entry-fix-2026-08-25.jsonl`.
+- `coil test --suite full` currently stops before execution on the pre-existing five-argument
+  `n-call-receiver!` call in `tests/b10-receiver-contract-test.coil`; the API now requires six.

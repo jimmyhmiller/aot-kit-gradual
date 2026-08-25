@@ -957,7 +957,10 @@
 (defn jl-loop [(x (ptr rd/Sexp))] (-> i64)
   (let [binds (rd/sexp-nth x 1)
         nb (rd/sexp-count binds)
-        entry (jl-ctrl)
+        ;; Initialisers can move control through calls and dynamic guards. Capture the loop entry
+        ;; only after all of them have run; wiring the Loop to the pre-initialiser control strands
+        ;; their exit Region as a value-only CFG sink.
+        (mut entry) (jl-ctrl)
         buf (primitive/alloc-stack (array i64 16))
         inits (cast (ptr i64) buf)
         pbuf (primitive/alloc-stack (array i64 16))
@@ -968,6 +971,7 @@
             (do (set! (index inits (load k)) (jl-expr (rd/sexp-nth (rd/sexp-nth binds (load k)) 1)))
                 (set! k (+ (load k) 1))
                 0)))
+    (set! entry (jl-ctrl))
     ; NEITHER THE LOOP NOR ITS PHIS IS PEEPHOLED UNDER CONSTRUCTION, and this is not caution — it is
     ; the difference between a working loop and a corrupt graph. A node whose back edge is still the
     ; NO-NODE placeholder is not yet structurally meaningful, but GVN cannot tell: two bindings that
@@ -979,7 +983,7 @@
     ; `fng-if-expression` in the frontend builds every phi this way for the same reason.
     (let [lp (n-new (Loop))]
       (n-add-def! lp NO-NODE)
-      (n-add-def! lp entry)
+      (n-add-def! lp (load entry))
       (n-add-def! lp NO-NODE)          ; the back edge, filled in below
       (set! k 0)
       (loop (if (>= (load k) nb) (break)
