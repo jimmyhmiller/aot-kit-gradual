@@ -1,3 +1,24 @@
+## 2026-08-25: ordinary class definitions and construction reach native execution
+
+- Added stable bridge kinds and semantic class-member enumeration for class declarations,
+  expressions, constructors, and properties. The frontend indexes an ordinary class as its
+  constructor function, supports explicit and synthesized empty constructor bodies, binds class
+  declarations through the existing callable namespace, and roots class methods through explicit
+  constructor/prototype metadata edges. Runtime constructor/prototype operations remain in the
+  existing JSL-backed object path; no JavaScript operation was open-coded in the frontend.
+- Added an explicit validation boundary around the landed slice. Heritage, fields, static blocks,
+  private elements, decorators, and other unsupported class elements are recoverable frontend
+  refusals instead of entering graph construction. Fixing the default-class self-body resolution
+  cycle reduced class-cohort SIGSEGV outcomes from 9,832 in the first experiment to one.
+- The retained complete statement/expression class cohort is
+  `test262-results-class-slice-safe-2026-08-25.jsonl`: 36 passed, 9,885 failed, 134 refused, and
+  3,363 policy-skipped across 10,055 executed variants. The prior full-suite baseline had no class
+  family among its reported passing leaders; these 36 exact passes are the first measured class
+  checkpoint, not a claim of complete class semantics.
+- Instance method metadata is indexed and reported by the new `frontend_callable_metadata` profile,
+  but methods are not yet observable on the published class prototype in the Test262 harness. That
+  is the next class subproblem. The active 30% goal remains incomplete.
+
 ## 2026-08-25: authoritative full-suite baseline after binding-pattern work
 
 - Completed all 93,209 generated Test262 variants and retained every result in

@@ -278,6 +278,10 @@ func stableKindCode(kind ast.Kind) int32 {
 	case ast.KindShorthandPropertyAssignment: return 305
 	case ast.KindGetAccessor: return 311
 	case ast.KindSetAccessor: return 312
+	case ast.KindClassDeclaration: return 313
+	case ast.KindClassExpression: return 314
+	case ast.KindConstructor: return 315
+	case ast.KindPropertyDeclaration: return 316
 	case ast.KindSourceFile: return 307
 	default: return 0
 	}
@@ -469,6 +473,15 @@ func roleNode(n *ast.Node, role int32, index int32) *ast.Node {
 	case 2: // body
 		if index == 0 {
 			if n.Kind == ast.KindCatchClause { return n.AsCatchClause().Block }
+			if n.Kind == ast.KindClassDeclaration || n.Kind == ast.KindClassExpression {
+				for _, member := range n.ClassLikeData().Members.Nodes {
+					if member.Kind == ast.KindConstructor { return member.AsConstructorDeclaration().Body }
+				}
+				// The class node itself is an empty structural body for a synthesized default
+				// constructor. The Coil statement dispatcher treats the declaration as a no-op,
+				// then emits the ordinary undefined fallthrough return.
+				return n
+			}
 			return n.Body()
 		}
 	case 3: // type
@@ -541,6 +554,15 @@ func roleNode(n *ast.Node, role int32, index int32) *ast.Node {
 		if n.Kind == ast.KindNewExpression && n.AsNewExpression().Arguments != nil { arguments = n.AsNewExpression().Arguments.Nodes }
 		if int(index) < len(arguments) { return arguments[index] }
 	case 15: // parameter
+		if n.Kind == ast.KindClassDeclaration || n.Kind == ast.KindClassExpression {
+			for _, member := range n.ClassLikeData().Members.Nodes {
+				if member.Kind == ast.KindConstructor {
+					parameters := member.Parameters()
+					if int(index) < len(parameters) { return parameters[index] }
+				}
+			}
+			return nil
+		}
 		if ast.IsFunctionLike(n) { parameters := n.Parameters(); if int(index) < len(parameters) { return parameters[index] } }
 	case 16: // object / receiver
 		if index != 0 { return nil }
@@ -555,6 +577,9 @@ func roleNode(n *ast.Node, role int32, index int32) *ast.Node {
 		var elements []*ast.Node
 		if n.Kind == ast.KindArrayLiteralExpression { elements = n.AsArrayLiteralExpression().Elements.Nodes }
 		if n.Kind == ast.KindObjectLiteralExpression { elements = n.AsObjectLiteralExpression().Properties.Nodes }
+		if n.Kind == ast.KindClassDeclaration || n.Kind == ast.KindClassExpression {
+			elements = n.ClassLikeData().Members.Nodes
+		}
 		if int(index) < len(elements) { return elements[index] }
 	case 20: // true expression
 		if n.Kind == ast.KindConditionalExpression && index == 0 { return n.AsConditionalExpression().WhenTrue }

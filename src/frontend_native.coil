@@ -51,8 +51,12 @@
 (defn fe-function-expression-kind? [(kind i64)] (-> bool)
   (or (= kind TSK-FUNCTION-EXPRESSION)
       (or (= kind TSK-ARROW-FUNCTION)
-          (or (= kind TSK-METHOD-DECLARATION)
-              (or (= kind TSK-GET-ACCESSOR) (= kind TSK-SET-ACCESSOR))))))
+          (or (= kind TSK-CLASS-EXPRESSION)
+              (or (= kind TSK-METHOD-DECLARATION)
+                  (or (= kind TSK-GET-ACCESSOR) (= kind TSK-SET-ACCESSOR)))))))
+
+(defn fe-function-declaration-kind? [(kind i64)] (-> bool)
+  (or (= kind TSK-FUNCTION-DECLARATION) (= kind TSK-CLASS-DECLARATION)))
 
 (defn fe-object-property-value-node [(ast (ref TsAst)) (property i64)] (-> i64)
   (if (or (= (ts-kind ast property) TSK-METHOD-DECLARATION)
@@ -373,7 +377,27 @@
                          (targets (mut (ArrayList FeTarget)))] (-> i64)
   (let [ast (field frontend ast)
         kind (ts-kind ast node)]
-    (cond (and (= kind TSK-CALL)
+    (cond (or (= kind TSK-CLASS-DECLARATION) (= kind TSK-CLASS-EXPRESSION))
+            ;; Land one honest ordinary-class slice. Heritage, fields, static blocks, private
+            ;; elements, and decorators must not fall through into constructor lowering as if
+            ;; they were methods. Direct class children make that boundary structural.
+            (let [(mut index) 0]
+              (loop (if (or (>= (load index) (ts-child-count ast node))
+                            (!= (load (field frontend status)) FE-OK))
+                        (break)
+                        (let [child (ts-child ast node (load index))
+                              child-kind (ts-kind ast child)]
+                          (if (or (= child-kind TSK-IDENTIFIER)
+                                  (or (= child-kind TSK-CONSTRUCTOR-DECLARATION)
+                                      (= child-kind TSK-METHOD-DECLARATION)))
+                              (if (!= child-kind TSK-IDENTIFIER)
+                                  (fe-validate-node! (mut frontend) child (mut targets))
+                                  0)
+                              (fe-fail! (mut frontend)
+                                        FE-CODE-UNSUPPORTED-SYNTAX child 0))
+                          (set! index (+ (load index) 1)))))
+              0)
+          (and (= kind TSK-CALL)
                (let [callee (ts-child ast node 0)]
                  (and (= (ts-kind ast callee) TSK-PROPERTY-ACCESS)
                       (and (= (ts-text ast (ts-child ast callee 0)) "Math")
@@ -852,6 +876,42 @@
 (defn fe-index-prototype-method! [(frontend (mut NativeFrontend)) (node i64)] (-> i64)
   (let [ast (field frontend ast)
         kind (ts-kind ast node)]
+    ;; Class instance methods feed the same constructor/prototype metadata as the historical
+    ;; `Ctor.prototype.method = function` spelling. This indexes structure only; runtime property
+    ;; publication remains in the existing constructor-prototype path.
+    (if (or (= kind TSK-CLASS-DECLARATION) (= kind TSK-CLASS-EXPRESSION))
+        (let [constructor-index (fe-function-for-node frontend node)
+              (mut member-index) 0]
+          (if (>= constructor-index 0)
+              (loop (let [member (ts-role ast node TS-ROLE-MEMBER (load member-index))]
+                      (if (= member -1)
+                        (break)
+                        (let [
+                              member-kind (ts-kind ast member)]
+                          (if (= member-kind TSK-METHOD-DECLARATION)
+                              (let [target-index (fe-function-for-node frontend member)
+                                    name (ts-role ast member TS-ROLE-NAME 0)]
+                                (if (and (>= target-index 0) (!= name -1))
+                                    (let [target-fn (al-get [FeFunction]
+                                                            (.functions frontend)
+                                                            target-index)
+                                          constructor-fn (al-get [FeFunction]
+                                                                 (.functions frontend)
+                                                                 constructor-index)
+                                          target (.id target-fn)
+                                          constructor (.id constructor-fn)]
+                                      (set! (.receiver-type-node
+                                              (index (load (field (field frontend functions) data))
+                                                     target-index))
+                                            FE-RECEIVER-DYNAMIC)
+                                      (al-push! [FePrototypeMethod]
+                                                (mut (.prototype-methods frontend))
+                                                (fe-prototype-method-make constructor name target)))
+                                    0))
+                              0)
+                          (set! member-index (+ (load member-index) 1))))))
+              0))
+        0)
     (if (= (ts-kind ast node) TSK-BINARY)
         (let [operator-node (ts-role ast node TS-ROLE-OPERATOR 0)
               left (ts-role ast node TS-ROLE-LEFT 0)
@@ -897,7 +957,7 @@
                     0))
               0))
         0)
-    (if (or (= kind TSK-FUNCTION-DECLARATION) (fe-function-expression-kind? kind))
+    (if (or (fe-function-declaration-kind? kind) (fe-function-expression-kind? kind))
         0
         (let [(mut index) 0]
           (loop (if (>= (load index) (ts-child-count ast node))
@@ -918,7 +978,7 @@
   (let [ast (field frontend ast)
         kind (ts-kind ast node)
         (mut child-enclosing) enclosing]
-    (if (or (= kind TSK-FUNCTION-DECLARATION) (fe-function-expression-kind? kind))
+    (if (or (fe-function-declaration-kind? kind) (fe-function-expression-kind? kind))
         (let [function-index (fe-function-for-node frontend node)]
           (if (>= function-index 0)
               (let [fn (al-get [FeFunction] (.functions frontend) function-index)]
@@ -1127,7 +1187,7 @@
     (if (= kind TSK-THIS)
         true
         ; Arrows inherit `this`, so they remain transparent to the enclosing receiver scan.
-        (if (or (= kind TSK-FUNCTION-DECLARATION)
+        (if (or (fe-function-declaration-kind? kind)
                 (and (fe-function-expression-kind? kind) (!= kind TSK-ARROW-FUNCTION)))
             false
             (let [(mut index) 0
@@ -1263,7 +1323,7 @@
   (let [ast (field frontend ast)
         kind (ts-kind ast node)
         (mut child-parent) parent]
-    (if (or (= kind TSK-FUNCTION-DECLARATION) (fe-function-expression-kind? kind))
+    (if (or (fe-function-declaration-kind? kind) (fe-function-expression-kind? kind))
         (let [id (al-len [FeFunction] (.functions frontend))]
           (fe-find-function-parts! (mut frontend) node id parent)
           (set! child-parent id))
@@ -1381,8 +1441,7 @@
     (loop (if (or (>= (load index) (al-len [FeFunction] (.functions frontend))) (!= (load answer) -1))
               (break)
               (let [fn (al-get [FeFunction] (.functions frontend) (load index))]
-                (if (and (= (ts-kind (field frontend ast) (.node fn))
-                            TSK-FUNCTION-DECLARATION)
+                (if (and (fe-function-declaration-kind? (ts-kind (field frontend ast) (.node fn)))
                          (= name (ts-text (field frontend ast) (.name-node fn))))
                     (set! answer (.id fn))
                     0)
@@ -1407,8 +1466,7 @@
                             (break)
                             (let [fn (al-get [FeFunction] (.functions frontend) (load index))]
                               (if (and (= (.parent fn) (load scope))
-                                       (and (= (ts-kind (field frontend ast) (.node fn))
-                                               TSK-FUNCTION-DECLARATION)
+                                       (and (fe-function-declaration-kind? (ts-kind (field frontend ast) (.node fn)))
                                             (= name
                                                (ts-text (field frontend ast) (.name-node fn)))))
                                   (set! answer (.id fn))
@@ -1581,7 +1639,7 @@
           ;; nested declaration bodies with the PARENT's bindings and report their parameters as
           ;; unbound names. Sibling calls keep resolving through the fe-find-function-name
           ;; fallback, which is how declaration hoisting is already approximated at top level.
-          (or (fe-function-expression-kind? kind) (= kind TSK-FUNCTION-DECLARATION))
+          (or (fe-function-expression-kind? kind) (fe-function-declaration-kind? kind))
             (let [function-index (fe-function-for-node frontend node)
                   fn (al-get [FeFunction] (load (field frontend functions)) function-index)
                   saved (al-len [FeBinding] (load bindings))
@@ -1609,11 +1667,13 @@
                                         (mut bindings)
                                         (fe-binding-make name (load (field symbol id)) depth)))
                           (store! index (+ (load index) 1)))))
-              (fe-resolve-node! (mut frontend)
-                                (mut bindings)
-                                (load (field fn body-node))
-                                function-id
-                                (+ depth 1))
+              (if (= (load (field fn body-node)) (load (field fn node)))
+                  0
+                  (fe-resolve-node! (mut frontend)
+                                    (mut bindings)
+                                    (load (field fn body-node))
+                                    function-id
+                                    (+ depth 1)))
               (store! (field bindings len) saved)
               0)
           (= kind TSK-VARIABLE-DECLARATION)
@@ -1784,7 +1844,12 @@
                     (fe-resolve-node! (mut frontend) (mut bindings) initializer owner 0)
                     0)
                 (set! index (+ (load index) 1)))))
-    (fe-resolve-node! (mut frontend) (mut bindings) (.body-node fn) owner 0)
+    ;; A class without an explicit constructor uses its own declaration node as the structural
+    ;; empty body. Resolving that node as another function would recurse back into this same
+    ;; FeFunction forever; there are no constructor expressions to resolve in this case.
+    (if (= (.body-node fn) (.node fn))
+        0
+        (fe-resolve-node! (mut frontend) (mut bindings) (.body-node fn) owner 0))
     (al-free! [FeBinding] (mut bindings))
     0))
 
@@ -2040,7 +2105,7 @@
                                     (store! method-index (+ (load method-index) 1)))))))
                 :else 0))
         0)
-    (if (or (= kind TSK-FUNCTION-DECLARATION) (fe-function-expression-kind? kind))
+    (if (or (fe-function-declaration-kind? kind) (fe-function-expression-kind? kind))
         ;; CREATING a nested closure is a capture site: before the creator can store a
         ;; grandparent's cell into the child's environment it must thread that cell through
         ;; its OWN environment. Copy the child's captures up (the copier already excludes

@@ -1489,7 +1489,7 @@
                 (if (and (>= target 0) (not (al-get [bool] (load reachable) target)))
                     (al-push! [i64] (mut pending) target)
                     0)
-                (if (= kind TSK-FUNCTION-DECLARATION)
+                (if (fe-function-declaration-kind? kind)
                     0
                     (if (fe-function-expression-kind? kind)
                         (let [nested (fng-function-node-index frontend node)]
@@ -1513,6 +1513,32 @@
                     (do
                       (al-set! [bool] (mut reachable) index true)
                       (let [fn (al-get [FeFunction] (.functions frontend) index)]
+                        ;; Class methods have no executable right-hand-side expression to make
+                        ;; them reachable. Their constructor/prototype metadata is the structural
+                        ;; edge: once a constructor is live, every method it publishes must have a
+                        ;; graph function available for prototype materialization.
+                        (let [(mut method-index) 0]
+                          (loop (if (>= (load method-index)
+                                        (al-len [FePrototypeMethod]
+                                                (.prototype-methods frontend)))
+                                    (break)
+                                    (let [method
+                                            (al-get [FePrototypeMethod]
+                                                    (.prototype-methods frontend)
+                                                    (load method-index))
+                                          target-index
+                                            (if (and (= (.constructor method) (.id fn))
+                                                     (and (>= (.target method) 0)
+                                                          (< (.target method) count)))
+                                                (al-get [i64] (load id-to-index) (.target method))
+                                                -1)]
+                                      (if (and (>= target-index 0)
+                                               (not (al-get [bool]
+                                                            (load reachable)
+                                                            target-index)))
+                                          (al-push! [i64] (mut pending) target-index)
+                                          0)
+                                      (set! method-index (+ (load method-index) 1))))))
                         (al-clear! [i64] (mut stack))
                         ;; Default-parameter initializers execute as part of the call and may
                         ;; materialize callbacks not present in the function body.
@@ -1537,7 +1563,7 @@
                                              (not (al-get [bool] (load reachable) target)))
                                         (al-push! [i64] (mut pending) target)
                                         0)
-                                    (if (or (= kind TSK-FUNCTION-DECLARATION)
+                                    (if (or (fe-function-declaration-kind? kind)
                                             (fe-function-expression-kind? kind))
                                         (let [nested (fng-function-node-index frontend node)]
                                           (if (and (>= nested 0) (!= nested index))
@@ -2624,7 +2650,18 @@
                       ; deliberately absent and such a lookup traps in the callee's unbox instead.
                       (if (and (fng-constructor-descends-from?
                                  frontend constructor (.constructor method))
-                               (= (fng-capture-count frontend (.target method)) 0))
+                               (or (= (fng-capture-count frontend (.target method)) 0)
+                                   (let [owner-index
+                                           (fng-function-index frontend (.constructor method))]
+                                     (and (>= owner-index 0)
+                                          (let [owner-fn
+                                                  (al-get [FeFunction]
+                                                          (.functions frontend)
+                                                          owner-index)]
+                                            (or (= (ts-kind ast (.node owner-fn))
+                                                   TSK-CLASS-DECLARATION)
+                                                (= (ts-kind ast (.node owner-fn))
+                                                   TSK-CLASS-EXPRESSION)))))))
                           (let [target-index
                                   (fng-function-index frontend (.target method))
                                 target-function
@@ -6954,7 +6991,7 @@
                 ; their function object/prototype here would embed a parent function's
                 ; allocation directly in the synthetic top-level graph.
                 (if (and (al-get [bool] (load reachable-functions) (load index))
-                         (and (= (ts-kind ast (.node fn)) TSK-FUNCTION-DECLARATION)
+                         (and (fe-function-declaration-kind? (ts-kind ast (.node fn)))
                          (and (!= (.id fn) (.owner context))
                               (= (.parent fn) -1))))
                     (let [object
@@ -8595,7 +8632,7 @@
           ;; A nested function declaration contributes no statement effect here — its body is
           ;; compiled as its own graph function. It MUST report fall-through: the default `false`
           ;; means "control diverged" and silently dropped every statement after the declaration.
-          (= kind TSK-FUNCTION-DECLARATION) true
+          (fe-function-declaration-kind? kind) true
           ;; Same reasoning as the expression dispatch, and the note above is the evidence: a
           ;; default of `false` says "control diverged", so an unrecognised statement does not
           ;; merely fail to compile -- it silently deletes every statement after it. `for (const v
@@ -8772,7 +8809,7 @@
               (let [fn (al-get [FeFunction] (.functions frontend) (load index))
                     fn-id (.id fn)]
                 (if (and (= (.parent fn) owner)
-                         (and (= (ts-kind ast (.node fn)) TSK-FUNCTION-DECLARATION)
+                         (and (fe-function-declaration-kind? (ts-kind ast (.node fn)))
                               (or (> (fng-capture-count frontend fn-id) 0)
                                   (fng-symbol-cell? context fn-id))))
                     (do
@@ -8810,7 +8847,7 @@
               (let [fn (al-get [FeFunction] (.functions frontend) (load index))
                     fn-id (.id fn)]
                 (if (and (= (.parent fn) owner)
-                         (and (= (ts-kind ast (.node fn)) TSK-FUNCTION-DECLARATION)
+                         (and (fe-function-declaration-kind? (ts-kind ast (.node fn)))
                               (or (> (fng-capture-count frontend fn-id) 0)
                                   (fng-symbol-cell? context fn-id))))
                     (let [closure (fng-closure-expression context (.node fn))]
@@ -9043,14 +9080,18 @@
                                             (mut saved-capture-values))
       (if top-level (fng-top-level-initialize! context (mut reachable-functions)) 0)
       (let [body-node (.body-node fn)
-            expression-body (!= (ts-kind (field frontend ast) body-node) TSK-BLOCK)
+            default-class-body (= body-node (.node fn))
+            expression-body (and (not default-class-body)
+                                 (!= (ts-kind (field frontend ast) body-node) TSK-BLOCK))
             falls-through
+              (if default-class-body
+                  true
               (if expression-body
                   (let [expected (fng-type-tag frontend (.result-node fn))]
                     (fng-add-return! context
                                      (fng-expression-expected context body-node expected))
                     false)
-                  (fng-statement context body-node))]
+                  (fng-statement context body-node)))]
         (if (and (not top-level) falls-through)
             (fng-add-return! context (fng-undefined))
             0)
@@ -9266,6 +9307,10 @@
     (fmt (stderr) "AOTK_PROFILE phase=frontend_build_shape nodes={d} live={d} peeps={d} window_calls={d} window_scans={d}\n"
          (n-count) (g-live-count) (g-profile-peeps)
          (load (fng-window-calls-cell)) (load (fng-window-scans-cell)))
+    (fmt (stderr) "AOTK_PROFILE phase=frontend_callable_metadata functions={d} prototype_methods={d} prototype_parents={d}\n"
+         (al-len [FeFunction] (.functions frontend))
+         (al-len [FePrototypeMethod] (.prototype-methods frontend))
+         (al-len [FePrototypeParent] (.prototype-parents frontend)))
     (fmt (stderr) "AOTK_PROFILE phase=jsl_dynamic_calls target_calls={d} target_scans={d} jsl_scans={d} max_calls={d} max_scans={d} param_scans={d} lower_ns={d} lower_calls={d} lower_nodes={d}\n"
          (jl-profile-target-calls) (jl-profile-target-scans) (jl-profile-jsl-scans)
          (jl-profile-max-calls) (jl-profile-max-scans) (jl-profile-param-scans)
