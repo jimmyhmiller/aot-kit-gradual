@@ -1,3 +1,22 @@
+## 2026-08-25: ECMAScript assignment targets are checked structurally
+
+- Added a JavaScript-mode `AssignmentTargetType` early-error pass at assignment, update, and
+  `for-in`/`for-of` target sites. Identifiers and non-optional property/element accesses are simple
+  targets; destructuring patterns are accepted only where the grammar permits them; strict-mode
+  `eval` and `arguments`, optional chains, and all other expression forms are rejected. Annex
+  call-target compatibility remains limited to sloppy non-logical assignments instead of leaking
+  into `&&=`, `||=`, or `??=`.
+- The complete focused assignment-target directory is retained in
+  `test262-results-negative-parse-assignment-target-final-2026-08-25.jsonl`: 615 passed, 6 failed,
+  and 6 module-policy skips. Only two negative cases remain, both context-sensitive `yield`; the
+  other four failures are positive execution witnesses for properties of call results.
+- The complete negative-parse corpus is retained in
+  `test262-results-negative-parse-assignment-target-checkpoint-2026-08-25.jsonl`: 3,389 passed,
+  5,061 failed, no refusals, and 205 module-policy skips. This is an exact gain of 583 passing
+  variants over the dynamic-import checkpoint. Holding the authoritative full baseline's other
+  outcomes fixed projects 12,723 passes among 90,377 non-skipped variants, or 14.08%. The active
+  30% goal remains incomplete.
+
 ## 2026-08-25: dynamic import early errors are checked structurally
 
 - Added JavaScript-mode AST early errors for dynamic import grammar: bare `import`, unsupported

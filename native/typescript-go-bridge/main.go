@@ -119,6 +119,7 @@ func (parsed *parseResult) addJavaScriptModeDiagnostics() {
 			parsed.addJavaScriptDiagnostic(forbidden, 90001)
 		}
 		parsed.addDynamicImportEarlyErrors(n)
+		parsed.addAssignmentTargetEarlyErrors(n)
 	}
 }
 
@@ -154,6 +155,77 @@ func containsImportCall(node *ast.Node) bool {
 		return false
 	})
 	return found
+}
+
+func (parsed *parseResult) isStrictScript() bool {
+	start := scanner.SkipTrivia(parsed.source, 0)
+	rest := parsed.source[start:]
+	return strings.HasPrefix(rest, "\"use strict\"") || strings.HasPrefix(rest, "'use strict'")
+}
+
+func isSimpleAssignmentTarget(node *ast.Node, strict bool) bool {
+	if node == nil { return false }
+	switch node.Kind {
+	case ast.KindParenthesizedExpression:
+		return isSimpleAssignmentTarget(node.AsParenthesizedExpression().Expression, strict)
+	case ast.KindIdentifier:
+		name := node.Text()
+		return !strict || name != "eval" && name != "arguments"
+	case ast.KindPropertyAccessExpression, ast.KindElementAccessExpression:
+		return !ast.IsOptionalChain(node)
+	default:
+		return false
+	}
+}
+
+func isCallAssignmentTarget(node *ast.Node) bool {
+	if node == nil { return false }
+	if node.Kind == ast.KindParenthesizedExpression {
+		return isCallAssignmentTarget(node.AsParenthesizedExpression().Expression)
+	}
+	return node.Kind == ast.KindCallExpression && !ast.IsOptionalChain(node)
+}
+
+func isAssignmentPattern(node *ast.Node) bool {
+	return node != nil && (node.Kind == ast.KindArrayLiteralExpression ||
+		node.Kind == ast.KindObjectLiteralExpression)
+}
+
+func (parsed *parseResult) addAssignmentTargetEarlyErrors(node *ast.Node) {
+	strict := parsed.isStrictScript()
+	if node.Kind == ast.KindBinaryExpression {
+		binary := node.AsBinaryExpression()
+		operator := binary.OperatorToken.Kind
+		if ast.IsAssignmentOperator(operator) {
+			left := binary.Left
+			valid := isSimpleAssignmentTarget(left, strict) ||
+				operator == ast.KindEqualsToken && isAssignmentPattern(left) ||
+				!strict && !ast.IsLogicalOrCoalescingAssignmentOperator(operator) &&
+					isCallAssignmentTarget(left)
+			if !valid { parsed.addJavaScriptDiagnostic(left, 90003) }
+		}
+	}
+	if node.Kind == ast.KindPostfixUnaryExpression {
+		postfix := node.AsPostfixUnaryExpression()
+		if !isSimpleAssignmentTarget(postfix.Operand, strict) {
+			parsed.addJavaScriptDiagnostic(postfix.Operand, 90003)
+		}
+	}
+	if node.Kind == ast.KindPrefixUnaryExpression {
+		prefix := node.AsPrefixUnaryExpression()
+		if (prefix.Operator == ast.KindPlusPlusToken || prefix.Operator == ast.KindMinusMinusToken) &&
+			!isSimpleAssignmentTarget(prefix.Operand, strict) {
+			parsed.addJavaScriptDiagnostic(prefix.Operand, 90003)
+		}
+	}
+	if node.Kind == ast.KindForInStatement || node.Kind == ast.KindForOfStatement {
+		initializer := node.Initializer()
+		if initializer != nil && initializer.Kind != ast.KindVariableDeclarationList &&
+			!isSimpleAssignmentTarget(initializer, strict) && !isAssignmentPattern(initializer) &&
+			!(!strict && isCallAssignmentTarget(initializer)) {
+			parsed.addJavaScriptDiagnostic(initializer, 90003)
+		}
+	}
 }
 
 func (parsed *parseResult) addDynamicImportEarlyErrors(node *ast.Node) {
