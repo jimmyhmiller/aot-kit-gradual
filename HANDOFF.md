@@ -1972,3 +1972,14 @@ Fixed `MSEL-MEMORY-ORDER` on `ArrayResize`: the selector seeded anti-dependencie
 - Strengthened the native bind witness from an ignored receiver to `this.base`; the captured JSL
   closure now forwards a boxed bound object into a shaped source-function load and agrees with
   Node at `12`.
+## 2026-08-24: core built-in method publication starts with a real callable
+
+- `String.prototype.indexOf` now loads from the intrinsic prototype as its actual receiver-aware
+  JSL closure rather than an opaque metadata-only stand-in. The frontend still refuses `.call`
+  whose receiver is a dynamic local alias, so aliased invocation is not claimed by this slice.
+- Both DSL-owned publication sites define `length` and `name` with the runtime's spec-correct
+  non-writable, non-enumerable, configurable attribute mask. Object static method identities now
+  carry names as well as lengths.
+- Added a native differential witness that checks both complete descriptors. This is the first
+  member of the systematic Array/String prototype publication strike; the full Test262 pass-rate
+  goal remains open.
