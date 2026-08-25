@@ -1,3 +1,25 @@
+## 2026-08-25: missing JavaScript early errors add 9 passes
+
+- The TypeScript parser accepts several JavaScript productions whose ECMAScript static semantics
+  require a SyntaxError. The JavaScript bridge now diagnoses multiple lexical declarations in a
+  `for-in`/`for-of` head, duplicate top-level lexical names, duplicate data-property definitions
+  of `__proto__`, and cover-initialized names in object literals. These are parser/static-semantics
+  checks only; no JavaScript runtime operation moved out of `lib/` or was open-coded.
+- Object-literal recovery diagnostics run only when the upstream parser has not already diagnosed
+  the source. This matters because its recovered AST represents malformed computed shorthand like
+  `{ [a = 0] }` similarly to a cover-initialized name; adding a second synthetic diagnostic changed
+  the bridge result for two already-recognized negative tests.
+- The complete parse-negative corpus is retained in
+  `test262-results-negative-parse-current-v16-2026-08-25.jsonl`: 8,188 pass, 28 fail, and 204 are
+  policy-skipped. Against v13, exactly 9 failures become passes, 8,179 passes remain passes, 28
+  failures remain failures, and no pass regresses. The gains are two variants each for multiple
+  lexical `for-in` bindings, duplicate `__proto__`, cover-initialized names, and duplicate script
+  class bindings, plus one strict `let` lexical-name collision.
+- Rebuilding `native/typescript-go-bridge/main.go` explicitly with
+  `tools/build-typescript-go-bridge.sh` is required before Test262 measurement; otherwise the runner
+  can link the previous archive while rebuilding the Coil harness. The bounded gate is green at
+  48/48. The active 30% full Test262 goal remains incomplete.
+
 ## 2026-08-25: empty class elements add 8 passes
 
 - Class child validation rejected the standard empty class element (`;`) as unsupported syntax.

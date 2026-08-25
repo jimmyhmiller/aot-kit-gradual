@@ -139,6 +139,7 @@ func (parsed *parseResult) addJavaScriptModeDiagnostics() {
 		parsed.addClassElementEarlyErrors(n)
 		parsed.addPrivateNameEarlyErrors(n)
 		parsed.addObjectMethodEarlyErrors(n)
+		parsed.addObjectLiteralEarlyErrors(n)
 		parsed.addFunctionExpressionEarlyErrors(n)
 		parsed.addAsyncArrowEarlyErrors(n)
 		parsed.addLexicalDeclarationEarlyErrors(n)
@@ -803,6 +804,23 @@ func (parsed *parseResult) addObjectMethodEarlyErrors(node *ast.Node) {
 		for _, lexical := range directLexicalNames(method.Body.AsBlock().Statements.Nodes) {
 			if parameterNames[lexical.text] { parsed.addJavaScriptDiagnostic(lexical.node, 90035) }
 		}
+	}
+}
+
+func (parsed *parseResult) addObjectLiteralEarlyErrors(node *ast.Node) {
+	if node.Kind != ast.KindObjectLiteralExpression || len(parsed.diagnosticCodes) != 0 { return }
+	protoSeen := false
+	for _, property := range node.AsObjectLiteralExpression().Properties.Nodes {
+		if property.Kind == ast.KindShorthandPropertyAssignment &&
+			property.Name().Kind == ast.KindIdentifier &&
+			property.AsShorthandPropertyAssignment().ObjectAssignmentInitializer != nil {
+			parsed.addJavaScriptDiagnostic(property, 90087)
+		}
+		if property.Kind != ast.KindPropertyAssignment { continue }
+		name := ast.GetNameOfDeclaration(property)
+		if name == nil || name.Text() != "__proto__" { continue }
+		if protoSeen { parsed.addJavaScriptDiagnostic(name, 90088) }
+		protoSeen = true
 	}
 }
 
@@ -1483,6 +1501,7 @@ func appendVarDeclaredNames(node *ast.Node, names []declaredName) []declaredName
 
 func blockScopeStatements(node *ast.Node) []*ast.Node {
 	if node.Kind == ast.KindBlock { return node.AsBlock().Statements.Nodes }
+	if node.Kind == ast.KindSourceFile { return node.AsSourceFile().Statements.Nodes }
 	if node.Kind != ast.KindCaseBlock { return nil }
 	var statements []*ast.Node
 	for _, clause := range node.AsCaseBlock().Clauses.Nodes {
@@ -1492,7 +1511,7 @@ func blockScopeStatements(node *ast.Node) []*ast.Node {
 }
 
 func (parsed *parseResult) addBlockRedeclarationEarlyErrors(node *ast.Node) {
-	if node.Kind != ast.KindBlock && node.Kind != ast.KindCaseBlock { return }
+	if node.Kind != ast.KindBlock && node.Kind != ast.KindCaseBlock && node.Kind != ast.KindSourceFile { return }
 	statements := blockScopeStatements(node)
 	lexical := directLexicalNames(statements)
 	var vars []declaredName
@@ -1528,6 +1547,10 @@ func (parsed *parseResult) addLoopLexicalEarlyErrors(node *ast.Node) {
 	}
 	if initializer == nil || initializer.Kind != ast.KindVariableDeclarationList ||
 		initializer.Flags&ast.NodeFlagsBlockScoped == 0 { return }
+	if (node.Kind == ast.KindForInStatement || node.Kind == ast.KindForOfStatement) &&
+		len(initializer.AsVariableDeclarationList().Declarations.Nodes) != 1 {
+		parsed.addJavaScriptDiagnostic(initializer, 90089)
+	}
 	var bound []declaredName
 	for _, declaration := range initializer.AsVariableDeclarationList().Declarations.Nodes {
 		bound = appendDeclarationNames(declaration, bound)
