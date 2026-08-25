@@ -1971,6 +1971,7 @@ func roleNode(n *ast.Node, role int32, index int32) *ast.Node {
 		switch n.Kind {
 		case ast.KindVariableDeclaration: return n.AsVariableDeclaration().Initializer
 		case ast.KindParameter: return n.AsParameterDeclaration().Initializer
+		case ast.KindBindingElement: return n.AsBindingElement().Initializer
 		case ast.KindPropertyAssignment: return n.AsPropertyAssignment().Initializer
 		case ast.KindForStatement: return n.AsForStatement().Initializer
 		case ast.KindForInStatement, ast.KindForOfStatement: return n.AsForInOrOfStatement().Initializer

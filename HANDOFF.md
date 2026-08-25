@@ -2648,3 +2648,14 @@ and use `call-dynamic-with-receiver`, matching `map`, `filter`, `forEach`, `some
 - `reduce`: 128 passing across 517 variants.
 - Results: `test262-results-array-reduceright-dsl-runtime-fix-2026-08-25.jsonl` and
   `test262-results-array-reduce-dsl-runtime-fix-2026-08-25.jsonl`.
+# 2026-08-25: Binding-element defaults now survive object-pattern lowering
+
+- Added the TypeScript bridge role for `BindingElement.initializer` and structural lazy default
+  lowering through the DSL-owned `IsUndefinedValue` operation. Object patterns now pass the whole
+  BindingElement to the binder instead of stripping it to its name, matching the existing array
+  pattern path and preserving defaults for recursive bindings.
+- The complete arrow-function destructuring cohort moved from 136/454 to 156/454 passing, with
+  refusals unchanged at 16. Results are retained in
+  `test262-results-arrow-dstr-defaults-v3-2026-08-25.jsonl`; the net gain is 20 variants.
+- The bounded gate remains 48/48 green. The remaining cohort is dominated by 204 native status-5
+  failures, now the next shared execution target rather than being hidden as missing defaults.

@@ -7841,6 +7841,53 @@
 ;; Binding patterns are syntax structure. Array extraction deliberately goes through the same JSL
 ;; iterator protocol as source `for-of`; the frontend only walks the pattern and publishes each
 ;; resulting value into its lexical symbol.
+(defn fng-binding-default-value [(context FngContext) (binding i64) (incoming i64)] (-> i64)
+  (let [frontend (load (field context frontend))
+        ast (field frontend ast)
+        initializer (ts-role ast binding TS-ROLE-INITIALIZER 0)
+        name (ts-role ast binding TS-ROLE-NAME 0)]
+    (if (or (= initializer -1) (= initializer name))
+        incoming
+        (let [condition (fng-jsl-call1 context "IsUndefinedValue"
+                                       (fng-box-dynamic-argument! incoming))
+              saved-ctrl (load (load (field context ctrl)))
+              (mut symbols) (al-new [i64] (malloc-allocator))
+              (mut active) (al-new [i64] (malloc-allocator))
+              (mut snapshots) (al-new [i64] (malloc-allocator))
+              (mut answer) incoming]
+          (fng-assigned! frontend initializer (mut symbols))
+          (fng-record-dynamic-alias! context JS-PROPERTY-ALIAS)
+          (fng-active-memory! context (mut active))
+          (fng-control-aliases! context (mut active))
+          (let [saved-start (fng-snapshot! context (mut symbols) (mut active) (mut snapshots))
+                arms (n-if-arms! (fng-peep (n-new2 (If) saved-ctrl condition)))]
+            (set! (load (field context ctrl)) (arms-t arms))
+            (let [default-value (fng-box-dynamic-argument!
+                                  (fng-expression context initializer))
+                  default-ctrl (load (load (field context ctrl)))
+                  default-start (fng-snapshot! context (mut symbols) (mut active) (mut snapshots))]
+              (fng-restore-snapshot! context (mut symbols) (mut active) (mut snapshots) saved-start)
+              (set! (load (field context ctrl)) (arms-f arms))
+              (let [incoming-ctrl (load (load (field context ctrl)))
+                    incoming-start (fng-snapshot! context (mut symbols) (mut active) (mut snapshots))]
+                (if (fng-merge-snapshots! context
+                                          default-ctrl default-start
+                                          incoming-ctrl incoming-start
+                                          (mut symbols) (mut active) (mut snapshots))
+                    (cond (= default-ctrl NO-NODE) (store! answer incoming)
+                          (= incoming-ctrl NO-NODE) (store! answer default-value)
+                          :else
+                            (let [phi (n-new (Phi (t-dyn)))]
+                              (n-add-def! phi (load (load (field context ctrl))))
+                              (n-add-def! phi default-value)
+                              (n-add-def! phi incoming)
+                              (store! answer (fng-peep phi))))
+                    0))))
+          (al-free! [i64] (mut symbols))
+          (al-free! [i64] (mut active))
+          (al-free! [i64] (mut snapshots))
+          (load answer)))))
+
 (defn fng-bind-pattern! [(context FngContext) (pattern i64) (value i64)] (-> i64)
   (let [frontend (load (field context frontend)) ast (field frontend ast) kind (ts-kind ast pattern)]
     (if (= kind TSK-IDENTIFIER)
@@ -7848,7 +7895,9 @@
           (fng-set-symbol! context symbol value)
           (fng-set-symbol-type! context symbol FNG-DYNAMIC))
         (if (= kind TSK-BINDING-ELEMENT)
-            (fng-bind-pattern! context (ts-role ast pattern TS-ROLE-NAME 0) value)
+            (fng-bind-pattern! context
+                               (ts-role ast pattern TS-ROLE-NAME 0)
+                               (fng-binding-default-value context pattern value))
             (if (= kind TSK-ARRAY-BINDING-PATTERN)
                 (let [iterator (fng-jsl-call1 context "GetIterator" (n-box! value))
                       (mut i) 0]
@@ -7889,7 +7938,7 @@
                                           extracted (fng-jsl-call2 context "GetProperty" object key)
                                           recorded (fng-jsl-call2 context "ArrayOfAppend1"
                                                                   excluded (n-box! key))]
-                                      (fng-bind-pattern! context name extracted)))
+                                      (fng-bind-pattern! context element extracted)))
                                 (set! i (+ (load i) 1))))))
                     0)))))
   value)
