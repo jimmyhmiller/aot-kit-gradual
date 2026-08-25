@@ -2383,5 +2383,5 @@ witness pins the invariant.
 - `coil test`: 48/48 green.
 - `reduceRight` Test262 cohort: 2 -> 32 passing; selection failures 362 -> 4 across 517 variants.
 - Result: `test262-results-array-reduceright-entry-fix-2026-08-25.jsonl`.
-- `coil test --suite full` currently stops before execution on the pre-existing five-argument
-  `n-call-receiver!` call in `tests/b10-receiver-contract-test.coil`; the API now requires six.
+- The exhaustive suite exposed a stale five-argument `n-call-receiver!` verifier test; its explicit
+  zero `argc` now matches the six-argument API without changing the malformed-receiver assertion.
