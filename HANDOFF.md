@@ -1894,3 +1894,12 @@ Fixed `MSEL-MEMORY-ORDER` on `ArrayResize`: the selector seeded anti-dependencie
 - The investigation also isolated the next ABI defect: a bound tagged object receiver reaches a
   source function whose shaped `this` load expects a raw pointer. Callable rest parameters are
   also required before `bind` can support arbitrary bound and invocation argument counts.
+# 2026-08-24: source receiver prologues accept boxed dynamic receivers
+
+- Receiver-aware source functions now normalize Parm 1 with `Unbox`; this is identity for the raw
+  pointer exact callers already supplied and removes tags from JSL/dynamic-call receivers.
+- Field lowering recognizes that normalized `Unbox` as ordinary `this`, avoiding the old lexical-
+  this path's second unbox. Actual lexical captures remain environment `Load` nodes.
+- Strengthened the native bind witness from an ignored receiver to `this.base`; the captured JSL
+  closure now forwards a boxed bound object into a shaped source-function load and agrees with
+  Node at `12`.

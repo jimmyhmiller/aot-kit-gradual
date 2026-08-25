@@ -5745,7 +5745,8 @@
         lexical-this
           (and (= (ts-kind ast object-node) TSK-THIS)
                (and (not (op-is? raw-object Parm [_]))
-                    (not (op-is? raw-object Cast [_]))))
+                    (and (not (op-is? raw-object Cast [_]))
+                         (not (op-is? raw-object Unbox [_])))))
         object
           ;; The dyn test is STRUCTURAL (fng-tagged-dynamic-value?), not a seed-type read: a
           ;; fresh Load's type is not computed until inference runs, and `w.inner` — a field
@@ -8809,7 +8810,20 @@
                            (!= (.receiver-type-node fn) -1))
                       1
                       0)]
-            (if (= receiver-count 1) (set! receiver (n-parm! fun 1)) 0)
+            (if (= receiver-count 1)
+                (let [parameter (n-parm! fun 1)
+                      owner (fe-type-index-for-node frontend (.receiver-type-node fn))]
+                  ; Receiver-aware source functions consume one uniform JavaScript ABI. Exact
+                  ; callers may already supply a raw shaped pointer; dynamic/JSL callers supply a
+                  ; tagged object. Clearing the tag is identity on the former and required for the
+                  ; latter before any fixed-slot `this.x` load.
+                  (set! receiver
+                        (n-unbox! parameter
+                                  (if (>= owner 0)
+                                      (t-obj-shape
+                                        (al-get [i64] (load shapes) owner))
+                                      (t-obj)))))
+                0)
             (set! index 0)
             (loop (if (>= (load index) (.parameter-count fn))
                       (break)
