@@ -7832,11 +7832,12 @@
 ;; Binding patterns are syntax structure. Array extraction deliberately goes through the same JSL
 ;; iterator protocol as source `for-of`; the frontend only walks the pattern and publishes each
 ;; resulting value into its lexical symbol.
-(defn fng-binding-default-value [(context FngContext) (binding i64) (incoming i64)] (-> i64)
+(defn fng-default-value [(context FngContext)
+                         (initializer i64)
+                         (name i64)
+                         (incoming i64)] (-> i64)
   (let [frontend (load (field context frontend))
-        ast (field frontend ast)
-        initializer (ts-role ast binding TS-ROLE-INITIALIZER 0)
-        name (ts-role ast binding TS-ROLE-NAME 0)]
+        ast (field frontend ast)]
     (if (or (= initializer -1) (= initializer name))
         incoming
         (let [condition (fng-jsl-call1 context "IsUndefinedValue"
@@ -7878,6 +7879,14 @@
           (al-free! [i64] (mut active))
           (al-free! [i64] (mut snapshots))
           (load answer)))))
+
+(defn fng-binding-default-value [(context FngContext) (binding i64) (incoming i64)] (-> i64)
+  (let [frontend (load (field context frontend))
+        ast (field frontend ast)]
+    (fng-default-value context
+                       (ts-role ast binding TS-ROLE-INITIALIZER 0)
+                       (ts-role ast binding TS-ROLE-NAME 0)
+                       incoming)))
 
 (defn fng-bind-pattern! [(context FngContext) (pattern i64) (value i64)] (-> i64)
   (let [frontend (load (field context frontend)) ast (field frontend ast) kind (ts-kind ast pattern)]
@@ -7932,6 +7941,40 @@
                                       (fng-bind-pattern! context element extracted)))
                                 (set! i (+ (load i) 1))))))
                     0)))))
+  value)
+
+;; Assignment patterns bind no names; they only preserve grammar structure around ordinary
+;; lvalue writes. Array iterator/default/rest behavior remains in JSL, shared with declarations.
+(defn fng-assign-pattern! [(context FngContext) (pattern i64) (value i64)] (-> i64)
+  (let [frontend (load (field context frontend))
+        ast (field frontend ast)
+        kind (ts-kind ast pattern)]
+    (if (= kind TSK-ARRAY-LITERAL)
+        (let [iterator (fng-jsl-call1 context "GetIterator"
+                                      (fng-box-dynamic-argument! value))
+              (mut i) 0]
+          (loop (if (>= (load i) (ts-child-count ast pattern))
+                    (break)
+                    (let [element (ts-child ast pattern (load i))]
+                      (if (and (= (ts-kind ast element) 0)
+                               (= (slice-len (ts-text ast element)) 0))
+                          (let [ignored (fng-jsl-call1 context "ArrayIteratorNext" iterator)] 0)
+                          (if (= (ts-kind ast element) TSK-SPREAD-ELEMENT)
+                              (fng-assign-pattern!
+                                context
+                                (ts-role ast element TS-ROLE-EXPRESSION 0)
+                                (fng-jsl-call1 context "IteratorRestArray" iterator))
+                              (let [step (fng-jsl-call1 context "ArrayIteratorNext" iterator)
+                                    incoming (fng-jsl-call1 context "IteratorValue" step)]
+                                (fng-assign-pattern! context element incoming))))
+                      (set! i (+ (load i) 1))))))
+        (if (and (= kind TSK-BINARY)
+                 (= (ts-text ast (ts-role ast pattern TS-ROLE-OPERATOR 0)) "="))
+            (let [target (ts-role ast pattern TS-ROLE-LEFT 0)
+                  initializer (ts-role ast pattern TS-ROLE-RIGHT 0)]
+              (fng-assign-pattern! context target
+                                   (fng-default-value context initializer target value)))
+            (fng-lvalue-write context (fng-lvalue context pattern) value))))
   value)
 
 (defn fng-loop [(context FngContext)
@@ -8083,7 +8126,9 @@
                   (fng-bind-pattern! context
                                      (ts-role ast binding-node TS-ROLE-NAME 0)
                                      value)
-                  (fng-lvalue-write context (fng-lvalue context binding-node) value))))
+                  (if (= (ts-kind ast binding-node) TSK-ARRAY-LITERAL)
+                      (fng-assign-pattern! context binding-node value)
+                      (fng-lvalue-write context (fng-lvalue context binding-node) value)))))
         (let [body-continues (fng-statement context body-node)
               reaches-increment (fng-merge-target! context target-index FNG-JUMP-CONTINUE body-continues)]
           ;; A classic `for (let i = ...; ...; i++)` creates the next iteration environment

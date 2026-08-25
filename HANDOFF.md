@@ -2732,3 +2732,16 @@ and use `call-dynamic-with-receiver`, matching `map`, `filter`, `forEach`, `some
   `frontend-code-1001 -> passed`, 97 passed->passed, and no regression.
 - `coil test`: 48/48 green. The next related gap is assignment destructuring such as
   `for ([a, b] of xs)`, which still needs a structural assignment-pattern lowering path.
+# 2026-08-25: for-of array assignment patterns reach execution (+2, 119 deeper)
+
+- Indexing now admits recursively valid array assignment patterns in `for ... of`/`for ... in`.
+  Graph lowering distinguishes holes, rest, defaults, nested arrays, and ordinary lvalue leaves;
+  all iterator consumption and rest/default value operations reuse JSL.
+- Complete `language/statements/for-of/dstr` results are persisted in
+  `test262-results-for-of-dstr-assignment-v2-2026-08-25.jsonl`: 195 passed, 878 failed, 22 refused
+  across 1,095 variants. Against the prior binding checkpoint: 2 frontend failures became passes,
+  119 frontend failures reached native execution, 10 reached their nested unsupported `yield`,
+  193 existing passes stayed green, and no pass regressed.
+- A direct `for ([a, b] of [[...]])` witness exposed a separate selection defect: an effect-only
+  iterator-result branch leaves `PropStoreKey` pinned to a `CProj` absent from the machine CFG.
+  That witness is not checked in as green; the persisted cohort is the evidence for this step.
