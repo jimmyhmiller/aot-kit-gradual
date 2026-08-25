@@ -1,3 +1,14 @@
+## 2026-08-25: current complete negative-parse corpus reaches 7,619 passes
+
+- Rebuilt the retained negative-only corpus from the authoritative Test262 checkout and ran all
+  8,216 available variants after the RegExp, object-method, and destructuring checkpoints. The
+  retained result is `test262-results-negative-parse-current-v3-2026-08-25.jsonl`: 7,619 passed,
+  597 failed, no refusals, and 204 module-policy skips in 2.839 seconds.
+- This is 317 more passes than the preceding complete run, including 83 gains outside the focused
+  directories. The largest remaining families are async-generator expressions (46), class
+  statements (44), variable statements (33), and continue/break/return/labeled control-flow
+  contexts (88 combined). The active 30% full-suite goal remains incomplete.
+
 ## 2026-08-25: assignment destructuring is validated recursively
 
 - Added assignment-pattern validation only at assignment and `for-in`/`for-of` target sites.
