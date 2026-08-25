@@ -485,6 +485,7 @@ func roleNode(n *ast.Node, role int32, index int32) *ast.Node {
 	case 5: // expression / operand
 		if index != 0 { return nil }
 		switch n.Kind {
+		case ast.KindComputedPropertyName: return n.AsComputedPropertyName().Expression
 		case ast.KindParenthesizedExpression: return n.AsParenthesizedExpression().Expression
 		case ast.KindExpressionStatement: return n.AsExpressionStatement().Expression
 		case ast.KindReturnStatement: return n.AsReturnStatement().Expression

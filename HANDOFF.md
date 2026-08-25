@@ -1,3 +1,13 @@
+## 2026-08-25: computed binding keys use a semantic bridge role
+
+- Extended the TypeScript-Go bridge's existing `EXPRESSION` role to
+  `ComputedPropertyName.Expression`. Object binding lowering now requests that semantic role instead
+  of assuming child zero, which is punctuation in this AST shape and previously produced
+  `NO-NODE` at the `ToPropertyKey` DSL boundary.
+- The object-rest native differential witness now uses a computed string-literal exclusion and
+  agrees with Node. A computed local-identifier key still exposes a separate object-declaration
+  name-resolution issue and is not claimed by this checkpoint.
+
 ## 2026-08-25: object binding rest copies enumerable own properties in JSL
 
 - Added DSL `ObjectRest` / `ObjectRestKeyExcluded`, implementing `CopyDataProperties` over the
