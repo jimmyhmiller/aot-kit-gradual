@@ -1,3 +1,19 @@
+## 2026-08-25: RegExp literal grammar and named groups are checked statically
+
+- Added pattern-level named capture/reference analysis with Unicode identifier decoding, forward
+  references, unresolved-reference checks, duplicate names that can participate together, and
+  alternative-aware duplicate handling. Added separate Unicode identity-escape validation.
+- Added a linear RegExp grammar pass for atom/quantifier placement, quantified assertions,
+  Unicode control/decimal/code-point escapes, class-range endpoints, malformed braces, inline
+  modifier shape, and raw line/paragraph separators. These checks operate on literal pattern text
+  and flags, independent of Test262 metadata or paths.
+- The retained complete literal directory result is
+  `test262-results-regexp-literals-v3-2026-08-25.jsonl`: 374 passed and 102 positive
+  runtime/frontend failures among 476 variants, with no refusals or skips. All 178 negative-parse
+  failures from the formal-parameter checkpoint now pass: 108 named-group and 70 general literal
+  variants. The final grammar pass added 68 with no pass lost across the complete cohort. The
+  active 30% goal remains incomplete.
+
 ## 2026-08-25: Unicode property escapes enforce ECMAScript grammar
 
 - Added RegExp Unicode-property validation for exact binary property names, general-category

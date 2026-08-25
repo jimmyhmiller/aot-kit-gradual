@@ -14,6 +14,7 @@ import (
 	"strings"
 	"sync"
 	"unicode"
+	"unicode/utf8"
 	"unsafe"
 
 	"github.com/microsoft/typescript-go/internal/ast"
@@ -127,6 +128,9 @@ func (parsed *parseResult) addJavaScriptModeDiagnostics() {
 		parsed.addEmbeddedStatementEarlyErrors(n)
 		parsed.addRegExpFlagEarlyErrors(n)
 		parsed.addRegExpPropertyEarlyErrors(n)
+		parsed.addRegExpNamedGroupEarlyErrors(n)
+		parsed.addRegExpIdentityEscapeEarlyErrors(n)
+		parsed.addRegExpGrammarEarlyErrors(n)
 		parsed.addFormalParameterEarlyErrors(n)
 		parsed.addClassElementEarlyErrors(n)
 		parsed.addPrivateNameEarlyErrors(n)
@@ -244,6 +248,248 @@ func (parsed *parseResult) addRegExpPropertyEarlyErrors(node *ast.Node) {
 	pattern, flags, ok := regexpParts(parsed, node)
 	if ok && invalidRegExpPropertyEscape(pattern, flags) {
 		parsed.addJavaScriptDiagnostic(node, 90024)
+	}
+}
+
+func regexpIdentifierEscape(text string, at int) (rune, int, bool) {
+	if at+2 > len(text) || text[at] != '\\' || text[at+1] != 'u' { return 0, at, false }
+	start, digits := at+2, 4
+	if start < len(text) && text[start] == '{' {
+		start++
+		close := strings.IndexByte(text[start:], '}')
+		if close < 1 { return 0, at, false }
+		digits = close
+	}
+	end := start + digits
+	if end > len(text) { return 0, at, false }
+	value, error := strconv.ParseUint(text[start:end], 16, 32)
+	if error != nil || value > unicode.MaxRune { return 0, at, false }
+	if at+2 < len(text) && text[at+2] == '{' { end++ }
+	return rune(value), end, true
+}
+
+func regexpIdentifierStart(character rune) bool {
+	return character == '$' || character == '_' || unicode.IsLetter(character) ||
+		unicode.In(character, unicode.Nl)
+}
+
+func regexpIdentifierContinue(character rune) bool {
+	return regexpIdentifierStart(character) || character == 0x200c || character == 0x200d ||
+		unicode.In(character, unicode.Mn, unicode.Mc, unicode.Nd, unicode.Pc)
+}
+
+func validRegExpIdentifierName(raw string) (string, bool) {
+	if raw == "" { return "", false }
+	runes := make([]rune, 0, len(raw))
+	for index := 0; index < len(raw); {
+		var character rune
+		if raw[index] == '\\' {
+			decoded, end, ok := regexpIdentifierEscape(raw, index)
+			if !ok { return "", false }
+			character, index = decoded, end
+		} else {
+			decoded, width := utf8.DecodeRuneInString(raw[index:])
+			if decoded == utf8.RuneError && width == 1 { return "", false }
+			character, index = decoded, index+width
+		}
+		if len(runes) == 0 && !regexpIdentifierStart(character) { return "", false }
+		if len(runes) != 0 && !regexpIdentifierContinue(character) { return "", false }
+		runes = append(runes, character)
+	}
+	return string(runes), true
+}
+
+func invalidRegExpNamedGroups(pattern, flags string) bool {
+	unicodeMode := strings.Contains(flags, "u") || strings.Contains(flags, "v")
+	hasNamedGroup := strings.Contains(pattern, "(?<")
+	groups := make(map[string]int)
+	var references []string
+	inClass, escaped := false, false
+	for index := 0; index < len(pattern); index++ {
+		if escaped { escaped = false; continue }
+		if pattern[index] == '[' { inClass = true; continue }
+		if pattern[index] == ']' && inClass { inClass = false; continue }
+		if inClass { if pattern[index] == '\\' { escaped = true }; continue }
+		if pattern[index] == '\\' {
+			if index+1 >= len(pattern) { continue }
+			if pattern[index+1] != 'k' { escaped = true; continue }
+			if index+2 >= len(pattern) || pattern[index+2] != '<' {
+				if unicodeMode || hasNamedGroup { return true }
+				index++
+				continue
+			}
+			close := strings.IndexByte(pattern[index+3:], '>')
+			if close < 0 { return true }
+			close += index + 3
+			name, ok := validRegExpIdentifierName(pattern[index+3:close])
+			if !ok { return true }
+			references = append(references, name)
+			index = close
+			continue
+		}
+		if index+2 >= len(pattern) || pattern[index] != '(' || pattern[index+1] != '?' ||
+			pattern[index+2] != '<' { continue }
+		if index+3 < len(pattern) && (pattern[index+3] == '=' || pattern[index+3] == '!') { continue }
+		close := strings.IndexByte(pattern[index+3:], '>')
+		if close < 0 { return true }
+		close += index + 3
+		name, ok := validRegExpIdentifierName(pattern[index+3:close])
+		if !ok { return true }
+		if previous, exists := groups[name]; exists && !strings.Contains(pattern[previous:index], "|") {
+			return true
+		}
+		groups[name] = index
+		index = close
+	}
+	for _, reference := range references { if _, ok := groups[reference]; !ok { return true } }
+	return false
+}
+
+func (parsed *parseResult) addRegExpNamedGroupEarlyErrors(node *ast.Node) {
+	pattern, flags, ok := regexpParts(parsed, node)
+	if ok && invalidRegExpNamedGroups(pattern, flags) {
+		parsed.addJavaScriptDiagnostic(node, 90025)
+	}
+}
+
+func invalidRegExpIdentityEscape(pattern, flags string) bool {
+	if !strings.Contains(flags, "u") && !strings.Contains(flags, "v") { return false }
+	vMode, inClass := strings.Contains(flags, "v"), false
+	for index := 0; index < len(pattern); index++ {
+		if pattern[index] == '[' { inClass = true; continue }
+		if pattern[index] == ']' && inClass { inClass = false; continue }
+		if pattern[index] != '\\' || index+1 >= len(pattern) { continue }
+		next := pattern[index+1]
+		if next == '\\' { index++; continue }
+		if next >= 'A' && next <= 'Z' || next >= 'a' && next <= 'z' {
+			if strings.ContainsRune("bBdfnrsStvwWcuxpPk", rune(next)) ||
+				(vMode && inClass && next == 'q') { index++; continue }
+			return true
+		}
+		index++
+	}
+	return false
+}
+
+func (parsed *parseResult) addRegExpIdentityEscapeEarlyErrors(node *ast.Node) {
+	pattern, flags, ok := regexpParts(parsed, node)
+	if ok && invalidRegExpIdentityEscape(pattern, flags) {
+		parsed.addJavaScriptDiagnostic(node, 90026)
+	}
+}
+
+func regexpBracedQuantifier(pattern string, at int) (int, bool) {
+	if at >= len(pattern) || pattern[at] != '{' { return at, false }
+	close := strings.IndexByte(pattern[at+1:], '}')
+	if close < 0 { return at, false }
+	close += at + 1
+	content := pattern[at+1:close]
+	parts := strings.Split(content, ",")
+	if len(parts) > 2 || parts[0] == "" { return at, false }
+	for index, part := range parts {
+		if index == 1 && part == "" { continue }
+		if part == "" { return at, false }
+		for _, character := range part { if character < '0' || character > '9' { return at, false } }
+	}
+	return close, true
+}
+
+func invalidRegExpGrammar(pattern, flags string) bool {
+	unicodeMode := strings.Contains(flags, "u") || strings.Contains(flags, "v")
+	inClass, escaped, canQuantify := false, false, false
+	captures := 0
+	var assertionStack []bool
+	for index := 0; index < len(pattern); index++ {
+		character := pattern[index]
+		if character == 0xE2 && index+2 < len(pattern) && pattern[index+1] == 0x80 &&
+			(pattern[index+2] == 0xA8 || pattern[index+2] == 0xA9) { return true }
+		if escaped { escaped = false; canQuantify = true; continue }
+		if character == '\\' {
+			if index+1 >= len(pattern) { return true }
+			next := pattern[index+1]
+			if unicodeMode && next == 'c' && (index+2 >= len(pattern) ||
+				!((pattern[index+2] >= 'A' && pattern[index+2] <= 'Z') ||
+					(pattern[index+2] >= 'a' && pattern[index+2] <= 'z'))) { return true }
+			if unicodeMode && next >= '1' && next <= '9' {
+				value, end := 0, index+1
+				for end < len(pattern) && pattern[end] >= '0' && pattern[end] <= '9' {
+					value = value*10 + int(pattern[end]-'0'); end++
+				}
+				if value > captures { return true }
+			}
+			if unicodeMode && next == '0' && index+2 < len(pattern) &&
+				pattern[index+2] >= '0' && pattern[index+2] <= '9' { return true }
+			if unicodeMode && next == 'u' && index+2 < len(pattern) && pattern[index+2] == '{' {
+				close := strings.IndexByte(pattern[index+3:], '}')
+				if close < 0 { return true }
+				close += index + 3
+				value, error := strconv.ParseUint(pattern[index+3:close], 16, 32)
+				if error != nil || value > unicode.MaxRune { return true }
+			}
+			if inClass && strings.ContainsRune("dDsSwWpP", rune(next)) &&
+				((index > 0 && pattern[index-1] == '-') ||
+					(index+2 < len(pattern) && pattern[index+2] == '-')) { return true }
+			escaped = true
+			continue
+		}
+		if inClass {
+			if character == ']' { inClass = false; canQuantify = true }
+			continue
+		}
+		if character == '[' { inClass = true; canQuantify = false; continue }
+		if character == '(' {
+			assertion := index+2 < len(pattern) && pattern[index+1] == '?' &&
+				(pattern[index+2] == '=' || pattern[index+2] == '!' ||
+					(index+3 < len(pattern) && pattern[index+2] == '<' &&
+						(pattern[index+3] == '=' || pattern[index+3] == '!')))
+			assertionStack = append(assertionStack, assertion)
+			if index+1 >= len(pattern) || pattern[index+1] != '?' ||
+				(index+3 < len(pattern) && pattern[index+2] == '<' &&
+					pattern[index+3] != '=' && pattern[index+3] != '!') { captures++ }
+			canQuantify = false
+			continue
+		}
+		if character == ')' {
+			assertion := false
+			if len(assertionStack) != 0 {
+				assertion = assertionStack[len(assertionStack)-1]
+				assertionStack = assertionStack[:len(assertionStack)-1]
+			}
+			if assertion && index+1 < len(pattern) {
+				next := pattern[index+1]
+				_, braced := regexpBracedQuantifier(pattern, index+1)
+				lookbehind := index > 2 && strings.Contains(pattern[:index], "(?<")
+				if next == '*' || next == '+' || next == '?' || braced {
+					if unicodeMode || lookbehind { return true }
+				}
+			}
+			canQuantify = true
+			continue
+		}
+		if character == '|' { canQuantify = false; continue }
+		if character == '*' || character == '+' || character == '?' {
+			if !canQuantify { return true }
+			continue
+		}
+		if character == '{' {
+			close, quantifier := regexpBracedQuantifier(pattern, index)
+			if quantifier {
+				if !canQuantify { return true }
+				index = close
+				continue
+			}
+			if unicodeMode { return true }
+		}
+		if character == '}' && unicodeMode { return true }
+		canQuantify = character != '^' && character != '$'
+	}
+	return inClass || len(assertionStack) != 0
+}
+
+func (parsed *parseResult) addRegExpGrammarEarlyErrors(node *ast.Node) {
+	pattern, flags, ok := regexpParts(parsed, node)
+	if ok && invalidRegExpGrammar(pattern, flags) {
+		parsed.addJavaScriptDiagnostic(node, 90027)
 	}
 }
 
