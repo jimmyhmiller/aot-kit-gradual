@@ -123,6 +123,7 @@ func (parsed *parseResult) addJavaScriptModeDiagnostics() {
 		parsed.addBindingRestEarlyErrors(n)
 		parsed.addPrivateDeleteEarlyErrors(n)
 		parsed.addBlockRedeclarationEarlyErrors(n)
+		parsed.addEmbeddedStatementEarlyErrors(n)
 	}
 }
 
@@ -360,6 +361,58 @@ func (parsed *parseResult) addBlockRedeclarationEarlyErrors(node *ast.Node) {
 	for _, name := range vars {
 		if seen[name.text] != nil {
 			parsed.addJavaScriptDiagnostic(name.node, 90006)
+		}
+	}
+}
+
+func labelledFunction(statement *ast.Node) *ast.Node {
+	labelled := false
+	for statement != nil && statement.Kind == ast.KindLabeledStatement {
+		labelled = true
+		statement = statement.AsLabeledStatement().Statement
+	}
+	if labelled && statement != nil && statement.Kind == ast.KindFunctionDeclaration {
+		return statement
+	}
+	return nil
+}
+
+func invalidEmbeddedStatement(statement *ast.Node, strict bool, annexIf bool) *ast.Node {
+	if statement == nil { return nil }
+	if function := labelledFunction(statement); function != nil { return function }
+	switch statement.Kind {
+	case ast.KindClassDeclaration:
+		return statement
+	case ast.KindVariableStatement:
+		if statement.AsVariableStatement().DeclarationList.Flags&ast.NodeFlagsBlockScoped != 0 {
+			return statement
+		}
+	case ast.KindFunctionDeclaration:
+		function := statement.AsFunctionDeclaration()
+		ordinary := function.AsteriskToken == nil &&
+			!ast.HasSyntacticModifier(statement, ast.ModifierFlagsAsync)
+		if !ordinary || strict || !annexIf { return statement }
+	}
+	return nil
+}
+
+func (parsed *parseResult) addEmbeddedStatementEarlyErrors(node *ast.Node) {
+	strict := parsed.isStrictScript()
+	if node.Kind == ast.KindIfStatement {
+		statement := node.AsIfStatement()
+		if invalid := invalidEmbeddedStatement(statement.ThenStatement, strict, true); invalid != nil {
+			parsed.addJavaScriptDiagnostic(invalid, 90007)
+		}
+		if invalid := invalidEmbeddedStatement(statement.ElseStatement, strict, true); invalid != nil {
+			parsed.addJavaScriptDiagnostic(invalid, 90007)
+		}
+		return
+	}
+	switch node.Kind {
+	case ast.KindDoStatement, ast.KindWhileStatement, ast.KindForStatement,
+		ast.KindForInStatement, ast.KindForOfStatement, ast.KindWithStatement:
+		if invalid := invalidEmbeddedStatement(node.Statement(), strict, false); invalid != nil {
+			parsed.addJavaScriptDiagnostic(invalid, 90007)
 		}
 	}
 }

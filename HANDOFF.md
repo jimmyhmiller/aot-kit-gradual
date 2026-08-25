@@ -1,3 +1,16 @@
+## 2026-08-25: embedded statements enforce declaration grammar
+
+- Added structural early errors for declarations used directly as `if`, loop, and `with` bodies.
+  Class and lexical declarations are never embedded statements; async/generator declarations are
+  rejected; ordinary functions retain only the Annex-B sloppy-`if` exception; and label chains
+  ending in functions are rejected in embedded positions.
+- The complete negative-parse corpus is retained in
+  `test262-results-negative-parse-embedded-statements-checkpoint-2026-08-25.jsonl`: 5,460 passed,
+  2,990 failed, no refusals, and 205 module-policy skips. Exactly 265 variants moved to passing from
+  the redeclaration checkpoint, with no lost pass.
+- Holding the authoritative full baseline's other outcomes fixed now projects 14,794 passes among
+  90,377 non-skipped variants, or 16.37%. The active 30% goal remains incomplete.
+
 ## 2026-08-25: block and switch redeclarations use scope-level name analysis
 
 - Added ECMAScript-style block/case-block redeclaration checks. The pass collects direct
