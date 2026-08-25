@@ -547,6 +547,7 @@ func roleNode(n *ast.Node, role int32, index int32) *ast.Node {
 		if n.Kind == ast.KindElementAccessExpression { return n.AsElementAccessExpression().Expression }
 	case 17: // property name
 		if n.Kind == ast.KindPropertyAccessExpression && index == 0 { return n.AsPropertyAccessExpression().Name() }
+		if n.Kind == ast.KindBindingElement && index == 0 { return n.AsBindingElement().PropertyName }
 	case 18: // element/index expression
 		if n.Kind == ast.KindElementAccessExpression && index == 0 { return n.AsElementAccessExpression().ArgumentExpression }
 	case 19: // array/object element

@@ -121,6 +121,9 @@
   [(ast TsAst)
    (functions (ArrayList FeFunction))
    (symbols (ArrayList FeSymbol))
+   ;; One symbol-list index per formal ABI slot. Pattern leaves may add more symbols between
+   ;; formals, so FeFunction.parameter-start indexes this table rather than `.symbols` directly.
+   (parameter-symbols (ArrayList i64))
    (resolutions (ArrayList FeResolution))
    (resolution-symbols (ArrayList i64))
    (captures (ArrayList FeCapture))
@@ -201,6 +204,7 @@
     (set! (.ast frontend) (ts-open source))
     (set! (.functions frontend) (al-new [FeFunction] a))
     (set! (.symbols frontend) (al-new [FeSymbol] a))
+    (set! (.parameter-symbols frontend) (al-new [i64] a))
     (set! (.resolutions frontend) (al-new [FeResolution] a))
     (set! (.resolution-symbols frontend) (al-new [i64] a))
     (set! (.captures frontend) (al-new [FeCapture] a))
@@ -1146,6 +1150,40 @@
          (and (= (slice-get t 0) 46)
               (and (= (slice-get t 1) 46) (= (slice-get t 2) 46))))))
 
+(defn fe-parameter-symbol [(frontend (ptr NativeFrontend))
+                           (fn FeFunction)
+                           (ordinal i64)] (-> FeSymbol)
+  (al-get [FeSymbol]
+          (.symbols frontend)
+          (al-get [i64] (.parameter-symbols frontend) (+ (.parameter-start fn) ordinal))))
+
+;; A pattern formal keeps one synthetic symbol for its incoming ABI value and ordinary symbols for
+;; every lexical leaf. The latter are what name resolution and capture analysis bind.
+(defn fe-index-parameter-leaves! [(frontend (mut NativeFrontend))
+                                  (parameter i64)
+                                  (name i64)
+                                  (owner i64)
+                                  (type-node i64)] (-> i64)
+  (let [ast (field frontend ast) kind (ts-kind ast name)]
+    (if (= kind TSK-IDENTIFIER)
+        (let [sid (al-len [FeSymbol] (.symbols frontend))]
+          (al-push! [FeSymbol] (mut (.symbols frontend))
+                    (fe-symbol-make sid parameter name owner FE-ROLE-PARAMETER type-node)))
+        (if (= kind TSK-BINDING-ELEMENT)
+            (let [nested (ts-role ast name TS-ROLE-NAME 0)]
+              (if (!= nested -1)
+                  (fe-index-parameter-leaves! (mut frontend) parameter nested owner type-node)
+                  0))
+            (if (or (= kind TSK-ARRAY-BINDING-PATTERN) (= kind TSK-OBJECT-BINDING-PATTERN))
+                (let [(mut i) 0]
+                  (loop (if (>= (load i) (ts-child-count ast name)) (break)
+                          (do
+                            (fe-index-parameter-leaves! (mut frontend) parameter
+                                                        (ts-child ast name (load i)) owner type-node)
+                            (set! i (+ (load i) 1))))))
+                0))))
+  0)
+
 (defn fe-find-function-parts! [(frontend (mut NativeFrontend)) (node i64) (id i64) (parent i64)] (-> i64)
   (let [ast (field frontend ast)
         ;; Function metadata comes from semantic roles, never child position. Arrow functions add
@@ -1156,7 +1194,7 @@
         (mut result) (ts-role ast node TS-ROLE-TYPE 0)
         (mut receiver-type) -1
         (mut rest) false
-        (mut parameter-start) (al-len [FeSymbol] (.symbols frontend))
+        (mut parameter-start) (al-len [i64] (.parameter-symbols frontend))
         (mut parameter-count) 0
         (mut index) 0]
     (loop (if (>= (load index) (ts-child-count ast node))
@@ -1171,10 +1209,16 @@
                                (or (= (ts-kind ast parameter-name) TSK-THIS)
                                    (= (ts-text ast parameter-name) "this")))
                           (set! receiver-type type-node)
-                          (let [sid (al-len [FeSymbol] (.symbols frontend))]
+                          (let [symbol-index (al-len [FeSymbol] (.symbols frontend))
+                                sid symbol-index]
                             (al-push! [FeSymbol]
                                       (mut (.symbols frontend))
                                       (fe-symbol-make sid child parameter-name id FE-ROLE-PARAMETER type-node))
+                            (al-push! [i64] (mut (.parameter-symbols frontend)) symbol-index)
+                            (if (or (= (ts-kind ast parameter-name) TSK-ARRAY-BINDING-PATTERN)
+                                    (= (ts-kind ast parameter-name) TSK-OBJECT-BINDING-PATTERN))
+                                (fe-index-parameter-leaves! (mut frontend) child parameter-name id type-node)
+                                0)
                             (set! parameter-count (+ (load parameter-count) 1)))))
                     0)
                 (set! index (+ (load index) 1)))))
@@ -1506,7 +1550,6 @@
                   fn (al-get [FeFunction] (load (field frontend functions)) function-index)
                   saved (al-len [FeBinding] (load bindings))
                   function-id (load (field fn id))
-                  parameter-start (load (field fn parameter-start))
                   parameter-count (load (field fn parameter-count))
                   (mut index) 0]
               ;; A named expression's name exists only in its own body.
@@ -1517,15 +1560,15 @@
                   0)
               (loop (if (>= (load index) parameter-count)
                         (break)
-                        (let [symbol
-                                (al-get [FeSymbol]
-                                        (load (field frontend symbols))
-                                        (+ parameter-start (load index)))]
-                          (al-push! [FeBinding]
-                                    (mut bindings)
-                                    (fe-binding-make (load (field symbol name-node))
-                                                     (load (field symbol id))
-                                                     depth))
+                        (let [symbol (fe-parameter-symbol frontend fn (load index))
+                              name (load (field symbol name-node))]
+                          (if (or (= (ts-kind ast name) TSK-ARRAY-BINDING-PATTERN)
+                                  (= (ts-kind ast name) TSK-OBJECT-BINDING-PATTERN))
+                              (fe-resolve-binding-pattern! (mut frontend) (mut bindings)
+                                                           name function-id depth)
+                              (al-push! [FeBinding]
+                                        (mut bindings)
+                                        (fe-binding-make name (load (field symbol id)) depth)))
                           (store! index (+ (load index) 1)))))
               (fe-resolve-node! (mut frontend)
                                 (mut bindings)
@@ -1645,7 +1688,6 @@
         fn (al-get [FeFunction] (.functions frontend) function-index)
         owner (.id fn)
         (mut bindings) (al-new [FeBinding] (malloc-allocator))
-        start (.parameter-start fn)
         count (.parameter-count fn)
         (mut index) 0]
     ;; Source-file `var` bindings are hoisted and shared. The graph builder materializes them as
@@ -1682,17 +1724,21 @@
     (set! index 0)
     (loop (if (>= (load index) count)
               (break)
-              (let [symbol (al-get [FeSymbol] (.symbols frontend) (+ start (load index)))]
-                (al-push! [FeBinding]
-                          (mut bindings)
-                          (fe-binding-make (.name-node symbol) (.id symbol) 0))
+              (let [symbol (fe-parameter-symbol frontend fn (load index))
+                    name (.name-node symbol)]
+                (if (or (= (ts-kind ast name) TSK-ARRAY-BINDING-PATTERN)
+                        (= (ts-kind ast name) TSK-OBJECT-BINDING-PATTERN))
+                    (fe-resolve-binding-pattern! (mut frontend) (mut bindings) name owner 0)
+                    (al-push! [FeBinding]
+                              (mut bindings)
+                              (fe-binding-make name (.id symbol) 0)))
                 (set! index (+ (load index) 1)))))
     ;; Parameter initializers are executable expressions outside the body child. Resolve them once
     ;; all formal bindings exist; lowering still evaluates them sequentially at function entry.
     (set! index 0)
     (loop (if (>= (load index) count)
               (break)
-              (let [symbol (al-get [FeSymbol] (.symbols frontend) (+ start (load index)))
+              (let [symbol (fe-parameter-symbol frontend fn (load index))
                     initializer (ts-role ast (.node symbol) TS-ROLE-INITIALIZER 0)]
                 (if (!= initializer -1)
                     (fe-resolve-node! (mut frontend) (mut bindings) initializer owner 0)
@@ -2132,6 +2178,7 @@
 (defn fe-native-free! [(frontend (mut NativeFrontend))] (-> i64)
   (al-free! [FeFunction] (mut (.functions frontend)))
   (al-free! [FeSymbol] (mut (.symbols frontend)))
+  (al-free! [i64] (mut (.parameter-symbols frontend)))
   (al-free! [FeResolution] (mut (.resolutions frontend)))
   (al-free! [i64] (mut (.resolution-symbols frontend)))
   (al-free! [FeCapture] (mut (.captures frontend)))

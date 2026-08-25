@@ -621,10 +621,7 @@
           (or (>= ordinal (.parameter-count fn))
               (and (.rest fn) (>= ordinal (- (.parameter-count fn) 1)))))
       FNG-DYNAMIC
-      (let [symbol
-              (al-get [FeSymbol]
-                      (.symbols frontend)
-                      (+ (.parameter-start fn) ordinal))]
+      (let [symbol (fe-parameter-symbol frontend fn ordinal)]
         (fng-type-tag frontend (.type-node symbol)))))
 
 ;; Normalize already-evaluated actuals for one exact target. The compiler owns the statically
@@ -1522,10 +1519,7 @@
                         (let [(mut parameter) 0]
                           (loop (if (>= (load parameter) (.parameter-count fn))
                                     (break)
-                                    (let [symbol
-                                            (al-get [FeSymbol]
-                                                    (.symbols frontend)
-                                                    (+ (.parameter-start fn) (load parameter)))]
+                                    (let [symbol (fe-parameter-symbol frontend fn (load parameter))]
                                       (al-push! [i64] (mut stack) (.node symbol))
                                       (set! parameter (+ (load parameter) 1))))))
                         (al-push! [i64] (mut stack) (.body-node fn))
@@ -6863,9 +6857,7 @@
                               (ordinal i64)] (-> i64)
   (let [frontend (load (field context frontend))
         ast (field frontend ast)
-        symbol (al-get [FeSymbol]
-                       (.symbols frontend)
-                       (+ (.parameter-start fn) ordinal))
+        symbol (fe-parameter-symbol frontend fn ordinal)
         symbol-id (.id symbol)
         parameter-type (fng-parameter-type frontend fn ordinal)
         initializer (ts-role ast (.node symbol) TS-ROLE-INITIALIZER 0)]
@@ -7805,7 +7797,25 @@
                                 element (fng-jsl-call1 context "IteratorValue" step)]
                             (fng-bind-pattern! context (ts-child ast pattern (load i)) element)
                             (set! i (+ (load i) 1))))))
-                0))))
+                (if (= kind TSK-OBJECT-BINDING-PATTERN)
+                    (let [boxed (fng-box-dynamic-argument! value)
+                          object (if (= (ts-child-count ast pattern) 0)
+                                     (fng-jsl-call1 context "ObjectCoercible" boxed)
+                                     (fng-jsl-call1 context "ToObjectValue" boxed))
+                          (mut i) 0]
+                      (loop (if (>= (load i) (ts-child-count ast pattern)) (break)
+                              (let [element (ts-child ast pattern (load i))
+                                    name (ts-role ast element TS-ROLE-NAME 0)
+                                    property (ts-role ast element TS-ROLE-PROPERTY 0)
+                                    key-node (if (= property -1) name property)
+                                    key (if (= (ts-kind ast key-node) TSK-COMPUTED-PROPERTY-NAME)
+                                            (fng-expression context (ts-child ast key-node 0))
+                                            (n-string-const!
+                                              (jss-from-utf8! (ts-text ast key-node))))
+                                    extracted (fng-jsl-call2 context "GetProperty" object key)]
+                                (fng-bind-pattern! context name extracted)
+                                (set! i (+ (load i) 1))))))
+                    0)))))
   value)
 
 (defn fng-loop [(context FngContext)
@@ -8959,10 +8969,7 @@
             (loop (if (>= (load index) (.parameter-count fn))
                       (break)
                       (do
-                        (let [parameter-symbol
-                                (al-get [FeSymbol]
-                                        (.symbols frontend)
-                                        (+ (.parameter-start fn) (load index)))
+                        (let [parameter-symbol (fe-parameter-symbol frontend fn (load index))
                               symbol-id (.id parameter-symbol)]
                           (if (fng-symbol-cell? context symbol-id)
                               ;; Clear the binding first, for the reason the non-top-level copy
@@ -8982,10 +8989,7 @@
             (loop (if (>= (load index) (.parameter-count fn))
                       (break)
                       (do
-                        (let [parameter-symbol
-                                (al-get [FeSymbol]
-                                        (.symbols frontend)
-                                        (+ (.parameter-start fn) (load index)))
+                        (let [parameter-symbol (fe-parameter-symbol frontend fn (load index))
                               symbol-id (.id parameter-symbol)]
                           (fng-set-symbol-type! context
                                                 symbol-id
@@ -9008,6 +9012,13 @@
                                 0)
                               0))
                         (fng-default-parameter! context fn (load index))
+                        (let [parameter-symbol (fe-parameter-symbol frontend fn (load index))
+                              name (.name-node parameter-symbol)]
+                          (if (or (= (ts-kind (field frontend ast) name) TSK-ARRAY-BINDING-PATTERN)
+                                  (= (ts-kind (field frontend ast) name) TSK-OBJECT-BINDING-PATTERN))
+                              (fng-bind-pattern! context name
+                                                 (fng-symbol-node context (.id parameter-symbol)))
+                              0))
                         (set! index (+ (load index) 1)))))))
       (fng-initialize-locals! context)
       (fng-materialize-nested-declarations! context
@@ -9167,10 +9178,7 @@
     (set! index 0)
     (loop (if (>= (load index) (.parameter-count main))
               (break)
-              (let [symbol
-                      (al-get [FeSymbol]
-                              (.symbols frontend)
-                              (+ (.parameter-start main) (load index)))]
+              (let [symbol (fe-parameter-symbol frontend main (load index))]
                 (al-set! [i64]
                          (mut values)
                          (.id symbol)
@@ -9307,9 +9315,7 @@
     ; compiler inlined al-get and dead-code-eliminated the unused load.
     (let [answer
             (if (> (.parameter-count main) 0)
-                (let [first (al-get [FeSymbol]
-                                    (.symbols frontend)
-                                    (.parameter-start main))]
+                (let [first (fe-parameter-symbol frontend main 0)]
                   (al-get [i64] (load values) (.id first)))
                 NO-NODE)]
       (al-free! [i64] (mut values))

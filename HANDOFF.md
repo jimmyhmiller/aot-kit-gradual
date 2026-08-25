@@ -1,3 +1,25 @@
+## 2026-08-25: formal parameter patterns have distinct ABI slots and lexical leaves
+
+- Added a parameter-symbol index to the native frontend. Each formal still occupies exactly one
+  JavaScript ABI slot and one synthetic incoming symbol, while every identifier inside a binding
+  pattern receives its own lexical symbol for resolution, capture analysis, and storage. Pattern
+  leaves can no longer shift later argument ordinals or alias one another.
+- Function entry now applies the existing default-parameter operation to the incoming formal first,
+  then walks array/object binding structure. Object coercion and property extraction delegate to
+  DSL `ObjectCoercible`, `ToObjectValue`, and `GetProperty`; the bridge exposes a binding element's
+  distinct property-name role so `{x: y}` reads `x` and binds `y`.
+- Added a native differential witness combining shorthand, renamed, and nested object parameter
+  bindings. Exact Test262 witnesses for null/undefined coercibility and renamed property binding
+  pass in both default and strict modes.
+- The complete `language/expressions/object` cohort is retained in
+  `test262-results-2026-08-25T06-18-51-389Z.jsonl`: 1,518 variants completed in 112.101 seconds with
+  194 passed, 1,222 failed, 102 refused, and 387 policy-skipped. Against the accessor checkpoint,
+  56 moved failed-to-passed and 6 moved passed-to-failed, a net gain of 50.
+- The six losses are defaulted empty-pattern cases whose previous passes skipped BindingInitialization
+  entirely. Performing the required coercibility operation exposes a scheduler SIGSEGV in their
+  large harness graphs; the missing semantics are not restored to preserve misleading passes.
+- Gate: `coil test` passed 48/48.
+
 ## 2026-08-25: object-literal accessors execute through DSL descriptor semantics
 
 - Added TypeScript bridge/indexing support for object-literal getter and setter declarations. The
