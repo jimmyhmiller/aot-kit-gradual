@@ -170,6 +170,30 @@ func classElementContains(node *ast.Node, argumentsName bool, superCall bool, su
 	return found
 }
 
+func containsReservedBinding(node *ast.Node, target string, stopAtOrdinaryFunction bool) bool {
+	if node == nil { return false }
+	switch node.Kind {
+	case ast.KindVariableDeclaration, ast.KindParameter, ast.KindBindingElement,
+		ast.KindFunctionDeclaration, ast.KindFunctionExpression,
+		ast.KindClassDeclaration, ast.KindClassExpression:
+		for _, name := range appendBoundNames(node.Name(), nil) {
+			if name.text == target { return true }
+		}
+	}
+	if stopAtOrdinaryFunction && (node.Kind == ast.KindFunctionDeclaration ||
+		node.Kind == ast.KindFunctionExpression) &&
+		node.ModifierFlags()&ast.ModifierFlagsAsync == 0 { return false }
+	found := false
+	node.ForEachChild(func(child *ast.Node) bool {
+		if containsReservedBinding(child, target, stopAtOrdinaryFunction) {
+			found = true
+			return true
+		}
+		return false
+	})
+	return found
+}
+
 // JavaScript class early errors are static semantics over a complete class body.
 // Keep them here rather than in individual member checks so duplicate-name rules
 // have one source-order view of the declaration set.
@@ -200,6 +224,13 @@ func (parsed *parseResult) addClassElementEarlyErrors(node *ast.Node) {
 			member.Kind == ast.KindSetAccessor {
 			if classElementContains(member.Body(), false, true, false) {
 				parsed.addJavaScriptDiagnostic(member, 90017)
+			}
+			if containsReservedBinding(member.Body(), "yield", false) {
+				parsed.addJavaScriptDiagnostic(member, 90021)
+			}
+			if member.ModifierFlags()&ast.ModifierFlagsAsync != 0 &&
+				containsReservedBinding(member.Body(), "await", true) {
+				parsed.addJavaScriptDiagnostic(member, 90022)
 			}
 		}
 		if classElementContains(member, false, false, true) {

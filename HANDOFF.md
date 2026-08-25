@@ -1,3 +1,16 @@
+## 2026-08-25: class methods propagate reserved binding contexts
+
+- Reused the bridge's recursive `BoundNames` expansion to reject `await` bindings in async class
+  methods and `yield` bindings in strict class method code. The check operates only at declaration
+  binding sites, decodes escaped identifier spelling through the AST, preserves async boundaries,
+  and does not mistake property names or references for bindings.
+- The retained complete class-element result is
+  `test262-results-class-elements-reserved-bindings-v7-2026-08-25.jsonl`: 1,264 passed, 3,200
+  failed, no refusals, and 717 policy-skipped among 4,464 executed variants. Exactly 80 variants
+  moved failed-to-passed from the special-method checkpoint and no passing variant was lost.
+- The three class static-semantics commits now convert 544 of the earlier 700 class-element
+  negative failures. The active 30% goal remains incomplete.
+
 ## 2026-08-25: class field and special-method contexts enforce lexical restrictions
 
 - Added boundary-aware class-element traversal for field-initializer `ContainsArguments`, illegal
