@@ -112,6 +112,26 @@ int main(int argc, char **argv) {
     "strict with and parenthesized identifier delete rejected");
   aot_ts_parse_delete(strict_parse);
 
+  const char *optional_tag = "const a = {}; a?.fn`hello`;";
+  AotTsParse optional_tag_parse = aot_ts_parse_ex(optional_tag,
+    (int32_t)strlen(optional_tag), "optional-tag.js", 15, AOT_TS_SCRIPT_JS);
+  require(aot_ts_diagnostic_count(optional_tag_parse) > 0,
+    "optional chain cannot be a tagged-template tag");
+  aot_ts_parse_delete(optional_tag_parse);
+
+  const char *mixed_coalesce = "0 ?? 0 || true;";
+  AotTsParse mixed_coalesce_parse = aot_ts_parse_ex(mixed_coalesce,
+    (int32_t)strlen(mixed_coalesce), "coalesce.js", 11, AOT_TS_SCRIPT_JS);
+  require(aot_ts_diagnostic_count(mixed_coalesce_parse) > 0,
+    "unparenthesized coalesce and logical operators rejected");
+  aot_ts_parse_delete(mixed_coalesce_parse);
+  const char *grouped_coalesce = "(0 ?? 0) || true;";
+  AotTsParse grouped_coalesce_parse = aot_ts_parse_ex(grouped_coalesce,
+    (int32_t)strlen(grouped_coalesce), "grouped.js", 10, AOT_TS_SCRIPT_JS);
+  require(aot_ts_diagnostic_count(grouped_coalesce_parse) == 0,
+    "parenthesized coalesce and logical operators accepted");
+  aot_ts_parse_delete(grouped_coalesce_parse);
+
   const char *operators = "var x=1,o={}; x += 2; ++x; x--; typeof x; delete o.x; void (x += 3); o?.x; o?.[x]; x?.(); `plain`; `a${x}b`; (a) => { return a; }; true; null;";
   AotTsParse operator_parse = aot_ts_parse_ex(operators, (int32_t)strlen(operators), "operators.js", 12, AOT_TS_SCRIPT_JS);
   require(find_operator(operator_parse, "PlusEquals") >= 0, "assignment operator API");

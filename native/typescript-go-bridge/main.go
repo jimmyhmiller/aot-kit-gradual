@@ -141,6 +141,8 @@ func (parsed *parseResult) addJavaScriptModeDiagnostics() {
 		parsed.addLexicalDeclarationEarlyErrors(n)
 		parsed.addStrictBindingEarlyErrors(n)
 		parsed.addStrictStatementEarlyErrors(n)
+		parsed.addOptionalTaggedTemplateEarlyErrors(n)
+		parsed.addCoalesceEarlyErrors(n)
 		parsed.addControlContextEarlyErrors(n)
 		parsed.addDestructuringEarlyErrors(n)
 	}
@@ -1524,6 +1526,39 @@ func isParenthesizedIdentifierReference(node *ast.Node) bool {
 		node = node.AsParenthesizedExpression().Expression
 	}
 	return node != nil && node.Kind == ast.KindIdentifier
+}
+
+func (parsed *parseResult) addOptionalTaggedTemplateEarlyErrors(node *ast.Node) {
+	if node.Kind != ast.KindTaggedTemplateExpression { return }
+	tagged := node.AsTaggedTemplateExpression()
+	if tagged.QuestionDotToken != nil || ast.IsOptionalChain(tagged.Tag) {
+		parsed.addJavaScriptDiagnostic(node, 90068)
+	}
+}
+
+func logicalAndOr(node *ast.Node) bool {
+	if node == nil || node.Kind != ast.KindBinaryExpression { return false }
+	operator := node.AsBinaryExpression().OperatorToken.Kind
+	return operator == ast.KindAmpersandAmpersandToken || operator == ast.KindBarBarToken
+}
+
+func coalesceExpression(node *ast.Node) bool {
+	return node != nil && node.Kind == ast.KindBinaryExpression &&
+		node.AsBinaryExpression().OperatorToken.Kind == ast.KindQuestionQuestionToken
+}
+
+func (parsed *parseResult) addCoalesceEarlyErrors(node *ast.Node) {
+	if node.Kind != ast.KindBinaryExpression { return }
+	binary := node.AsBinaryExpression()
+	operator := binary.OperatorToken.Kind
+	invalid := operator == ast.KindQuestionQuestionToken &&
+		(logicalAndOr(binary.Left) || logicalAndOr(binary.Right))
+	invalid = invalid ||
+		(operator == ast.KindAmpersandAmpersandToken || operator == ast.KindBarBarToken) &&
+		(coalesceExpression(binary.Left) || coalesceExpression(binary.Right))
+	if invalid {
+		parsed.addJavaScriptDiagnostic(node, 90069)
+	}
 }
 
 func simpleParameterList(node *ast.Node) bool {

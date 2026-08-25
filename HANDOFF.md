@@ -2794,3 +2794,16 @@ and use `call-dynamic-with-receiver`, matching `map`, `filter`, `forEach`, `some
 - `coil test`: 48 passed, 0 failed.
 - `coil test --suite frontier`: expected two open bugs remain
   (`for-await-has-no-bridge-kind`, `shortest-round-trip-digits`).
+# 2026-08-25: optional tagged templates and mixed coalescing are early errors (+24 Test262)
+
+- JavaScript-mode parser diagnostics now reject a tagged template whose tag is an optional-chain
+  node or whose tagged-template node carries a direct `?.` token. Parentheses remain explicit in
+  the upstream AST, so valid parenthesized tags are not conflated with an optional chain.
+- Unparenthesized mixing of `??` with `&&` or `||` is rejected in either AST associativity. The
+  check examines only direct binary children, preserving valid explicitly parenthesized mixtures;
+  the bounded ABI gate includes a valid grouped control.
+- Exact targeted result is
+  `test262-results-optional-tag-coalesce-v2-2026-08-25.jsonl`: 24 passed, 0 failed,
+  0 refused, 0 skipped. All 24 variants were failures in the saved negative-parse frontier.
+- These are syntax-directed early errors in the parser bridge, not runtime JavaScript semantics;
+  no operation belongs in `lib/**/*.jsl` for programs rejected before evaluation.
