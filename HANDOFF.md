@@ -1,3 +1,15 @@
+## 2026-08-25: numeric ordinary-object keys no longer use Array storage
+
+- Element lowering previously selected `%ArrayLoad`/`%ArrayStore` whenever the key was numeric,
+  regardless of the receiver. Ordinary objects such as `{0: 0}` therefore read and wrote packed
+  Array storage instead of their JavaScript property table. The frontend now chooses that
+  representation only for a receiver proven to be an Array; every other receiver delegates to
+  DSL `GetProperty`/`SetProperty`, including `ToPropertyKey` canonicalization.
+- The direct retained witness moved from two failures to two passes for `{0: 0}[0]`. A separate
+  generic `Array.prototype.reduce` witness still exposes incorrect accumulator transport after the
+  property read, so reducer conformance is not claimed by this checkpoint. The active 30% full
+  Test262 goal remains incomplete.
+
 ## 2026-08-25: control-context validation adds 88 negative-parse passes
 
 - Added ancestor-based early errors for `return`, `break`, `continue`, and active labels. Function
