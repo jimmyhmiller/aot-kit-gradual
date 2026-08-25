@@ -1762,6 +1762,8 @@ func stableKindCode(kind ast.Kind) int32 {
 	case ast.KindClassExpression: return 314
 	case ast.KindConstructor: return 315
 	case ast.KindPropertyDeclaration: return 316
+	case ast.KindSpreadElement: return 317
+	case ast.KindSpreadAssignment: return 318
 	case ast.KindSourceFile: return 307
 	default: return 0
 	}

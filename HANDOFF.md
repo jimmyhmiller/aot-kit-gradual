@@ -2708,3 +2708,15 @@ and use `call-dynamic-with-receiver`, matching `map`, `filter`, `forEach`, `some
 - The complete arrow destructuring cohort moved from 156/454 to 294/454 passing, a gain of 138
   variants in `test262-results-arrow-dstr-call-env-v5-2026-08-25.jsonl`. The previously dominant
   204 status-5 traps largely became passes or honest iterator/getter semantic failures.
+# 2026-08-25: array spread is structurally represented and DSL-owned (+4 direct passes)
+
+- The TypeScript bridge now gives `SpreadElement` and `SpreadAssignment` stable kinds instead of
+  collapsing both into bridge kind 0. Array literals lower source-order grammar only; the new JSL
+  operations `ArrayLiteralAppend`, `ArrayLiteralElide`, and `ArrayLiteralSpread` own live-length
+  growth, holes, `GetIterator`, iterator stepping, completion, and value extraction.
+- Complete `language/expressions/array` measurement is persisted in
+  `test262-results-array-spread-v2-2026-08-25.jsonl`: 30 passed, 74 failed, 0 refused across 104
+  variants. Against the pre-fix v1 run: 26 passed->passed, 4 refused->passed, 40 refused->failed,
+  34 failed->failed, and no regression. The 40 deeper failures are now observable runtime work.
+- `coil test`: 48/48 green. The goal remains 30% on the authoritative full suite; this commit is
+  incremental progress, not completion.
