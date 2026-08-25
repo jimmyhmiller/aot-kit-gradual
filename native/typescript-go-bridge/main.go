@@ -127,6 +127,7 @@ func (parsed *parseResult) addJavaScriptModeDiagnostics() {
 		parsed.addRegExpFlagEarlyErrors(n)
 		parsed.addFormalParameterEarlyErrors(n)
 		parsed.addClassElementEarlyErrors(n)
+		parsed.addPrivateNameEarlyErrors(n)
 	}
 }
 
@@ -194,6 +195,62 @@ func containsReservedBinding(node *ast.Node, target string, stopAtOrdinaryFuncti
 	return found
 }
 
+func copyPrivateEnvironment(outer map[string]bool) map[string]bool {
+	result := make(map[string]bool, len(outer))
+	for name := range outer { result[name] = true }
+	return result
+}
+
+func invalidPrivateName(node *ast.Node, environment map[string]bool) *ast.Node {
+	if node == nil { return nil }
+	if node.Kind == ast.KindPrivateIdentifier {
+		if !environment[node.Text()] { return node }
+		return nil
+	}
+	if node.Kind == ast.KindBindingElement {
+		property := node.AsBindingElement().PropertyName
+		if property != nil && property.Kind == ast.KindPrivateIdentifier { return property }
+	}
+	if node.Kind == ast.KindClassDeclaration || node.Kind == ast.KindClassExpression {
+		data := node.ClassLikeData()
+		// Class heritage is evaluated before the class's private environment exists.
+		if data.HeritageClauses != nil {
+			for _, clause := range data.HeritageClauses.Nodes {
+				if invalid := invalidPrivateName(clause, environment); invalid != nil { return invalid }
+			}
+		}
+		classEnvironment := copyPrivateEnvironment(environment)
+		for _, member := range data.Members.Nodes {
+			name := ast.GetNameOfDeclaration(member)
+			if name != nil && name.Kind == ast.KindPrivateIdentifier { classEnvironment[name.Text()] = true }
+		}
+		for _, member := range data.Members.Nodes {
+			declarationName := ast.GetNameOfDeclaration(member)
+			var invalid *ast.Node
+			member.ForEachChild(func(child *ast.Node) bool {
+				if child == declarationName && child.Kind == ast.KindPrivateIdentifier { return false }
+				invalid = invalidPrivateName(child, classEnvironment)
+				return invalid != nil
+			})
+			if invalid != nil { return invalid }
+		}
+		return nil
+	}
+	var invalid *ast.Node
+	node.ForEachChild(func(child *ast.Node) bool {
+		invalid = invalidPrivateName(child, environment)
+		return invalid != nil
+	})
+	return invalid
+}
+
+func (parsed *parseResult) addPrivateNameEarlyErrors(node *ast.Node) {
+	if node.Kind != ast.KindSourceFile { return }
+	if invalid := invalidPrivateName(node, make(map[string]bool)); invalid != nil {
+		parsed.addJavaScriptDiagnostic(invalid, 90023)
+	}
+}
+
 // JavaScript class early errors are static semantics over a complete class body.
 // Keep them here rather than in individual member checks so duplicate-name rules
 // have one source-order view of the declaration set.
@@ -207,6 +264,9 @@ func (parsed *parseResult) addClassElementEarlyErrors(node *ast.Node) {
 		if member.Kind == ast.KindConstructor {
 			constructors++
 			if constructors > 1 { parsed.addJavaScriptDiagnostic(member, 90010) }
+			if member.ModifierFlags()&ast.ModifierFlagsAsync != 0 {
+				parsed.addJavaScriptDiagnostic(member, 90020)
+			}
 			if !hasHeritage && classElementContains(member.AsConstructorDeclaration().Body, false, true, false) {
 				parsed.addJavaScriptDiagnostic(member, 90014)
 			}

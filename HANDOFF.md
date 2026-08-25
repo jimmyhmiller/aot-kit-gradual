@@ -1,3 +1,19 @@
+## 2026-08-25: class private environments close the negative-element family
+
+- Added one source-level `AllPrivateNamesValid` traversal. Class heritage is checked against the
+  outer private environment; the body sees that environment extended with every private bound name
+  declared by the class; nested functions inherit it; and nested classes establish the same staged
+  heritage/body boundary recursively. Private declaration names are not mistaken for uses, while a
+  private identifier in an object binding property is rejected by grammar.
+- The retained complete class-element result is
+  `test262-results-class-elements-private-environments-v8-2026-08-25.jsonl`: 1,420 passed, 3,044
+  failed, no refusals, and 717 policy-skipped among 4,464 executed variants. Exactly 156 variants
+  moved failed-to-passed from the reserved-binding checkpoint, with no pass lost.
+- All 700 class-element negative failures from the formal-parameter checkpoint now pass. The four
+  class static-semantics commits converted those 700 failures without weakening tests or consulting
+  Test262 paths; remaining class-directory failures are positive runtime/frontend support work.
+  The active 30% goal remains incomplete.
+
 ## 2026-08-25: class methods propagate reserved binding contexts
 
 - Reused the bridge's recursive `BoundNames` expansion to reject `await` bindings in async class
