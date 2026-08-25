@@ -144,6 +144,32 @@ func classElementStaticName(node *ast.Node) (string, bool) {
 	}
 }
 
+func classElementContains(node *ast.Node, argumentsName bool, superCall bool, superPrivate bool) bool {
+	if node == nil { return false }
+	if argumentsName && node.Kind == ast.KindIdentifier && node.Text() == "arguments" { return true }
+	if superCall && node.Kind == ast.KindCallExpression &&
+		node.AsCallExpression().Expression.Kind == ast.KindSuperKeyword { return true }
+	if superPrivate && node.Kind == ast.KindPropertyAccessExpression {
+		access := node.AsPropertyAccessExpression()
+		if access.Expression.Kind == ast.KindSuperKeyword && access.Name().Kind == ast.KindPrivateIdentifier {
+			return true
+		}
+	}
+	// Arrow functions inherit arguments and super from their surrounding class-field or method
+	// context. Ordinary functions and nested classes establish a new static-semantics boundary.
+	if node.Kind == ast.KindFunctionDeclaration || node.Kind == ast.KindFunctionExpression ||
+		node.Kind == ast.KindClassDeclaration || node.Kind == ast.KindClassExpression { return false }
+	found := false
+	node.ForEachChild(func(child *ast.Node) bool {
+		if classElementContains(child, argumentsName, superCall, superPrivate) {
+			found = true
+			return true
+		}
+		return false
+	})
+	return found
+}
+
 // JavaScript class early errors are static semantics over a complete class body.
 // Keep them here rather than in individual member checks so duplicate-name rules
 // have one source-order view of the declaration set.
@@ -151,15 +177,51 @@ func (parsed *parseResult) addClassElementEarlyErrors(node *ast.Node) {
 	if node.Kind != ast.KindClassDeclaration && node.Kind != ast.KindClassExpression { return }
 	constructors := 0
 	privateKinds := make(map[string]uint8)
+	hasHeritage := node.ClassLikeData().HeritageClauses != nil &&
+		len(node.ClassLikeData().HeritageClauses.Nodes) != 0
 	for _, member := range node.ClassLikeData().Members.Nodes {
 		if member.Kind == ast.KindConstructor {
 			constructors++
 			if constructors > 1 { parsed.addJavaScriptDiagnostic(member, 90010) }
+			if !hasHeritage && classElementContains(member.AsConstructorDeclaration().Body, false, true, false) {
+				parsed.addJavaScriptDiagnostic(member, 90014)
+			}
+		}
+		if member.Kind == ast.KindPropertyDeclaration {
+			initializer := member.AsPropertyDeclaration().Initializer
+			if classElementContains(initializer, true, false, false) {
+				parsed.addJavaScriptDiagnostic(initializer, 90015)
+			}
+			if classElementContains(initializer, false, true, false) {
+				parsed.addJavaScriptDiagnostic(initializer, 90016)
+			}
+		}
+		if member.Kind == ast.KindMethodDeclaration || member.Kind == ast.KindGetAccessor ||
+			member.Kind == ast.KindSetAccessor {
+			if classElementContains(member.Body(), false, true, false) {
+				parsed.addJavaScriptDiagnostic(member, 90017)
+			}
+		}
+		if classElementContains(member, false, false, true) {
+			parsed.addJavaScriptDiagnostic(member, 90018)
 		}
 
 		name, named := classElementStaticName(member)
 		if !named { continue }
 		isStatic := ast.HasStaticModifier(member)
+		isMethod := member.Kind == ast.KindMethodDeclaration || member.Kind == ast.KindGetAccessor ||
+			member.Kind == ast.KindSetAccessor
+		if isStatic && isMethod && name == "prototype" {
+			parsed.addJavaScriptDiagnostic(member, 90019)
+		}
+		if !isStatic && name == "constructor" && isMethod {
+			special := member.Kind == ast.KindGetAccessor || member.Kind == ast.KindSetAccessor
+			if member.Kind == ast.KindMethodDeclaration {
+				special = member.AsMethodDeclaration().AsteriskToken != nil ||
+					member.ModifierFlags()&ast.ModifierFlagsAsync != 0
+			}
+			if special { parsed.addJavaScriptDiagnostic(member, 90020) }
+		}
 		if member.Kind == ast.KindPropertyDeclaration {
 			if name == "constructor" || isStatic && name == "prototype" {
 				parsed.addJavaScriptDiagnostic(member, 90011)

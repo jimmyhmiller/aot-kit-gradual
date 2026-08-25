@@ -1,3 +1,19 @@
+## 2026-08-25: class field and special-method contexts enforce lexical restrictions
+
+- Added boundary-aware class-element traversal for field-initializer `ContainsArguments`, illegal
+  `super()` in fields and non-constructor methods, `super()` in a base-class constructor, and
+  `super.#private`. Arrow functions retain the surrounding lexical context; ordinary functions and
+  nested classes stop the traversal. Static methods named `prototype` and async, generator, getter,
+  or setter methods named `constructor` are also diagnosed from member structure.
+- The retained complete class-element result is
+  `test262-results-class-elements-special-methods-v6-2026-08-25.jsonl`: 1,184 passed, 3,280 failed,
+  no refusals, and 717 policy-skipped among 4,464 executed variants. This is 364 new passes over the
+  preceding 820-pass class checkpoint, with zero passing variants lost across all 5,181 records.
+- Together the two class static-semantics checkpoints convert 464 of the formal-parameter
+  checkpoint's 700 class-element negative failures. The remaining negative cases concentrate in
+  context-sensitive `await`/`yield`, private-name environments, and direct-eval context. The active
+  30% goal remains incomplete.
+
 ## 2026-08-25: class bodies enforce declaration-set early errors
 
 - Added one class-body static-semantics pass for duplicate constructors, duplicate private bound
