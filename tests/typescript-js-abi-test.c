@@ -145,6 +145,19 @@ int main(int argc, char **argv) {
     "strict eval shorthand identifier accepted");
   aot_ts_parse_delete(strict_shorthand_valid_parse);
 
+  const char *loop_early_errors = "for (let [x, x] of []) {} for (const y in {}) { var y; }";
+  AotTsParse loop_early_parse = aot_ts_parse_ex(loop_early_errors,
+    (int32_t)strlen(loop_early_errors), "loop-errors.js", 14, AOT_TS_SCRIPT_JS);
+  require(aot_ts_diagnostic_count(loop_early_parse) >= 2,
+    "loop duplicate bindings and body var collisions rejected");
+  aot_ts_parse_delete(loop_early_parse);
+  const char *loop_shadow_valid = "for (let x = 0; x < 1; x++) { function f() { var x; } }";
+  AotTsParse loop_shadow_parse = aot_ts_parse_ex(loop_shadow_valid,
+    (int32_t)strlen(loop_shadow_valid), "loop-valid.js", 13, AOT_TS_SCRIPT_JS);
+  require(aot_ts_diagnostic_count(loop_shadow_parse) == 0,
+    "loop binding may be shadowed inside nested function");
+  aot_ts_parse_delete(loop_shadow_parse);
+
   const char *operators = "var x=1,o={}; x += 2; ++x; x--; typeof x; delete o.x; void (x += 3); o?.x; o?.[x]; x?.(); `plain`; `a${x}b`; (a) => { return a; }; true; null;";
   AotTsParse operator_parse = aot_ts_parse_ex(operators, (int32_t)strlen(operators), "operators.js", 12, AOT_TS_SCRIPT_JS);
   require(find_operator(operator_parse, "PlusEquals") >= 0, "assignment operator API");

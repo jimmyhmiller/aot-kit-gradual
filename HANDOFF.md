@@ -2817,3 +2817,13 @@ and use `call-dynamic-with-receiver`, matching `map`, `filter`, `forEach`, `some
 - Exact targeted result is
   `test262-results-strict-object-shorthand-v1-2026-08-25.jsonl`: 9 passed, 0 failed,
   0 refused, 0 skipped. All nine variants failed in the saved negative-parse frontier.
+# 2026-08-25: lexical loop heads enforce BoundNames/VarDeclaredNames (+22 Test262)
+
+- `for`, `for-in`, and `for-of` lexical heads now compose the bridge's existing recursive
+  `BoundNames` and `VarDeclaredNames` helpers. Duplicate head bindings and a head binding colliding
+  with a `var` declared by the loop body are parser early errors.
+- `VarDeclaredNames` stops at nested function/class boundaries, so legitimate shadowing in a nested
+  function remains accepted; the bounded ABI gate pins that control alongside both invalid forms.
+- Exact targeted result is
+  `test262-results-loop-lexical-early-errors-v2-2026-08-25.jsonl`: 22 passed, 0 failed,
+  0 refused, 0 skipped. All 22 variants failed in the saved negative-parse frontier.

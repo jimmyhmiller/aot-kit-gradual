@@ -125,6 +125,7 @@ func (parsed *parseResult) addJavaScriptModeDiagnostics() {
 		parsed.addBindingRestEarlyErrors(n)
 		parsed.addPrivateDeleteEarlyErrors(n)
 		parsed.addBlockRedeclarationEarlyErrors(n)
+		parsed.addLoopLexicalEarlyErrors(n)
 		parsed.addEmbeddedStatementEarlyErrors(n)
 		parsed.addRegExpFlagEarlyErrors(n)
 		parsed.addRegExpPropertyEarlyErrors(n)
@@ -1374,6 +1375,34 @@ func (parsed *parseResult) addBlockRedeclarationEarlyErrors(node *ast.Node) {
 		if seen[name.text] != nil {
 			parsed.addJavaScriptDiagnostic(name.node, 90006)
 		}
+	}
+}
+
+func (parsed *parseResult) addLoopLexicalEarlyErrors(node *ast.Node) {
+	var initializer, statement *ast.Node
+	switch node.Kind {
+	case ast.KindForStatement:
+		loop := node.AsForStatement()
+		initializer, statement = loop.Initializer, loop.Statement
+	case ast.KindForInStatement, ast.KindForOfStatement:
+		loop := node.AsForInOrOfStatement()
+		initializer, statement = loop.Initializer, loop.Statement
+	default:
+		return
+	}
+	if initializer == nil || initializer.Kind != ast.KindVariableDeclarationList ||
+		initializer.Flags&ast.NodeFlagsBlockScoped == 0 { return }
+	var bound []declaredName
+	for _, declaration := range initializer.AsVariableDeclarationList().Declarations.Nodes {
+		bound = appendDeclarationNames(declaration, bound)
+	}
+	seen := make(map[string]bool)
+	for _, name := range bound {
+		if seen[name.text] { parsed.addJavaScriptDiagnostic(name.node, 90071) }
+		seen[name.text] = true
+	}
+	for _, name := range appendVarDeclaredNames(statement, nil) {
+		if seen[name.text] { parsed.addJavaScriptDiagnostic(name.node, 90072) }
 	}
 }
 
