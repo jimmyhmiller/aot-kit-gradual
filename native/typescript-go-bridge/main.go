@@ -166,13 +166,25 @@ func (parsed *parseResult) addRestrictedLineTerminatorErrors() {
 	scan.SetText(parsed.source)
 	previous := ast.KindUnknown
 	previousEnd := 0
+	pendingAsyncStart := -1
+	pendingAsyncLength := 0
 	for {
 		kind := scan.Scan()
 		start := scan.TokenStart()
+		if pendingAsyncStart >= 0 {
+			if kind != ast.KindOpenParenToken && kind != ast.KindEqualsGreaterThanToken {
+				parsed.addJavaScriptDiagnosticRange(pendingAsyncStart, pendingAsyncLength, 90099)
+			}
+			pendingAsyncStart = -1
+		}
 		separated := previous != ast.KindUnknown && previousEnd <= start &&
 			strings.ContainsAny(parsed.source[previousEnd:start], "\r\n\u2028\u2029")
 		if separated && (previous == ast.KindThrowKeyword || kind == ast.KindEqualsGreaterThanToken) {
 			parsed.addJavaScriptDiagnosticRange(start, scan.TokenEnd()-start, 90095)
+		}
+		if previous == ast.KindAsyncKeyword && kind == ast.KindAsyncKeyword {
+			pendingAsyncStart = start
+			pendingAsyncLength = scan.TokenEnd()-start
 		}
 		if kind == ast.KindEndOfFile { return }
 		previous = kind
@@ -669,6 +681,28 @@ func containsYieldExpression(node *ast.Node) bool {
 	return found
 }
 
+func generatorFunction(node *ast.Node) bool {
+	if node == nil { return false }
+	switch node.Kind {
+	case ast.KindFunctionDeclaration:
+		return node.AsFunctionDeclaration().AsteriskToken != nil
+	case ast.KindFunctionExpression:
+		return node.AsFunctionExpression().AsteriskToken != nil
+	case ast.KindMethodDeclaration:
+		return node.AsMethodDeclaration().AsteriskToken != nil
+	}
+	return false
+}
+
+func inGeneratorContext(node *ast.Node) bool {
+	for current := node.Parent; current != nil; current = current.Parent {
+		if current.Kind == ast.KindArrowFunction { continue }
+		if ast.IsFunctionLike(current) { return generatorFunction(current) }
+		if current.Kind == ast.KindClassStaticBlockDeclaration { return false }
+	}
+	return false
+}
+
 func containsAwaitExpression(node *ast.Node) bool {
 	if node == nil { return false }
 	if node.Kind == ast.KindAwaitExpression { return true }
@@ -1146,7 +1180,9 @@ func (parsed *parseResult) addClassElementEarlyErrors(node *ast.Node) {
 		if member.Kind == ast.KindClassStaticBlockDeclaration {
 			body := member.AsClassStaticBlockDeclaration().Body
 			if staticBlockContainsArguments(body) { parsed.addJavaScriptDiagnostic(body, 90075) }
-			if containsAwaitExpression(body) { parsed.addJavaScriptDiagnostic(body, 90076) }
+			if containsAwaitExpression(body) || containsIdentifierReference(body, "await") {
+				parsed.addJavaScriptDiagnostic(body, 90076)
+			}
 			if containsYieldExpression(body) || containsIdentifierReference(body, "yield") {
 				parsed.addJavaScriptDiagnostic(body, 90077)
 			}
@@ -1837,6 +1873,10 @@ func (parsed *parseResult) addFormalParameterEarlyErrors(node *ast.Node) {
 		if containsYieldExpression(parameter) || strict && containsIdentifierReference(parameter, "yield") {
 			parsed.addJavaScriptDiagnostic(parameter, 90082)
 		}
+		if node.Kind == ast.KindArrowFunction && inGeneratorContext(node) &&
+			containsIdentifierReference(parameter, "yield") {
+			parsed.addJavaScriptDiagnostic(parameter, 90096)
+		}
 		if data.DotDotDotToken != nil {
 			if data.Initializer != nil || i != len(parameters)-1 ||
 				i == len(parameters)-1 && node.ParameterList().HasTrailingComma() {
@@ -1913,6 +1953,17 @@ func (parsed *parseResult) addScriptGoalEarlyErrors(node *ast.Node) {
 
 func (parsed *parseResult) addRestrictedGrammarEarlyErrors(node *ast.Node) {
 	switch node.Kind {
+	case ast.KindYieldExpression:
+		if !inGeneratorContext(node) { parsed.addJavaScriptDiagnostic(node, 90097) }
+	case ast.KindBinaryExpression:
+		binary := node.AsBinaryExpression()
+		if binary.OperatorToken.Kind == ast.KindInKeyword &&
+			binary.Left.Kind == ast.KindBinaryExpression {
+			left := binary.Left.AsBinaryExpression()
+			if left.OperatorToken.Kind == ast.KindInKeyword && left.Left.Kind == ast.KindPrivateIdentifier {
+				parsed.addJavaScriptDiagnostic(node, 90098)
+			}
+		}
 	case ast.KindSwitchStatement:
 		defaults := 0
 		for _, clause := range node.AsSwitchStatement().CaseBlock.AsCaseBlock().Clauses.Nodes {

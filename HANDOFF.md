@@ -1,3 +1,19 @@
+## 2026-08-25: the runnable parse-negative corpus is green
+
+- JavaScript static semantics now carry generator context through nested arrow parameters, reject
+  `YieldExpression` outside generators, reject `await` identifier references inside class static
+  blocks, and reject a private identifier on the left of a nested `in` chain. The scanner also
+  resolves the ambiguous consecutive-`async` recovery: `async async()` and `async async =>` remain
+  valid continuations, while a second `async` with neither continuation is diagnosed.
+- `test262-results-negative-parse-current-v20-2026-08-25.jsonl` is the complete retained corpus:
+  all 8,216 runnable variants pass, 0 fail, and 204 module-policy variants remain skipped. V19
+  contributed seven AST-context gains and v20 the final two scanner-context gains, with no
+  regression. Against v13, the current parser work converts all 37 failures to passes while all
+  8,179 existing passes remain passes.
+- These are parser/static-semantics checks in the TypeScript bridge. They do not implement any
+  JavaScript runtime operation in the frontend and do not alter DSL ownership. The bounded gate is
+  green at 48/48. The active 30% full Test262 goal remains incomplete.
+
 ## 2026-08-25: scanner-level restricted line terminators add 8 passes
 
 - The TypeScript parser recovers from a line terminator after `throw` or before arrow `=>` without
