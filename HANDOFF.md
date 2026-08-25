@@ -1,3 +1,20 @@
+## 2026-08-25: callable unbox preserves bare functions and closure environments
+
+- The closure-environment ABI checkpoint narrowed every `Unbox(t-fun)` to `JSV-CLOSURE`. That
+  fixed materialized closures but made ordinary bare-function callbacks trap: the authoritative
+  `test262-results-current-full-v3-2026-08-25.jsonl` run had 17,183 passes (20.45%), with 1,385
+  prior passes becoming failures while 1,231 prior failures became passes.
+- `Unbox(t-fun)` now selects the callable-union representation. Both native encoders remove the
+  shared 48-bit callable payload without narrowing it to either concrete tag; the preceding
+  callable cast or ABI contract establishes that the value is a function or closure. Exact-tag
+  unboxes remain checked. The implementation is compiler representation logic only; JavaScript
+  operations remain wholly DSL-owned.
+- Replaying all 1,387 regressed variants retained in
+  `test262-results-callable-union-regressions-v3-2026-08-25.jsonl` recovers 1,366 passes, with 21
+  deeper failures remaining. The complete arrow-function destructuring cohort improves from
+  294/454 to 304/454 in `test262-results-arrow-dstr-callable-union-v6-2026-08-25.jsonl`. The bounded
+  gate is 48/48. The active 30% full-suite goal remains incomplete.
+
 ## 2026-08-25: numeric ordinary-object keys no longer use Array storage
 
 - Element lowering previously selected `%ArrayLoad`/`%ArrayStore` whenever the key was numeric,
