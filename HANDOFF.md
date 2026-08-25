@@ -1983,3 +1983,6 @@ Fixed `MSEL-MEMORY-ORDER` on `ArrayResize`: the selector seeded anti-dependencie
 - Added a native differential witness that checks both complete descriptors. This is the first
   member of the systematic Array/String prototype publication strike; the full Test262 pass-rate
   goal remains open.
+- The first exact Test262 property-helper probe exposed that `SetProperty` ignored the writable bit
+  on data descriptors. It now leaves non-writable properties unchanged and stores only when bit 1
+  is present; the native method witness also attempts and rejects mutation of `length`.
