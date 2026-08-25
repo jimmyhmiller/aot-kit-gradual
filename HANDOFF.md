@@ -1,3 +1,19 @@
+## 2026-08-25: checked unboxes stay below their guards
+
+- Fixed a backend GCM correctness bug exposed by the assembled
+  `Object/getOwnPropertyDescriptor/length.js` Test262 helper. An explicit `Unbox` could float from
+  its guarded `Cast` into an earlier block and trap on a value whose type-test arm was false.
+- `Unbox` and `ArrayUnbox` ideal nodes now use the existing control-anchor mechanism. Anchor lookup
+  follows their value chain through `Cast`; backend-inserted `MI-JSUNBOX` conversions with
+  `NO-NODE` remain movable. This is deliberately not an opcode-wide pin, which caused unrelated
+  def/use placement failures in large helper graphs.
+- Added a native machine regression: a boxed integer takes the guarded arm and unboxes to 7, while
+  a boxed string takes the false arm and returns 0 without executing the checked unbox.
+- The exact Test262 witness no longer traps in `isEnumerable`'s speculative numeric unbox. It now
+  advances to a distinct call-boundary bug: function 3 passes a raw object pointer as argument 1
+  to function 1, whose parameter expects a boxed object. The observed call site is object offset
+  `0x5ed90`; this follow-on failure is not claimed as passing.
+
 ## 2026-08-24: large Test262 helpers clear CFG selection and AArch64 call reach
 
 - Selection now recognizes a folded guard with one explicit `CProj` side exit and one direct
