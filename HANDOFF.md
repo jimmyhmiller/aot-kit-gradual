@@ -2385,3 +2385,15 @@ witness pins the invariant.
 - Result: `test262-results-array-reduceright-entry-fix-2026-08-25.jsonl`.
 - The exhaustive suite exposed a stale five-argument `n-call-receiver!` verifier test; its explicit
   zero `argc` now matches the six-argument API without changing the malformed-receiver assertion.
+# 2026-08-25: reducers preserve receivers and use the JavaScript callback ABI
+
+The four reducer DSL macros were the outliers among Array callback methods: they wrapped an already
+coercible receiver through `ObjectFromValue`, losing representation-specific indexed storage, and
+invoked callbacks through the old `(call callback ...)` form. They now retain `ObjectCoercible(src)`
+and use `call-dynamic-with-receiver`, matching `map`, `filter`, `forEach`, `some`, and `every`.
+
+- Six focused array/object/direct/generic witnesses pass in both default and strict variants.
+- `reduceRight`: 32 -> 136 passing across 517 variants (+104).
+- `reduce`: 128 passing across 517 variants.
+- Results: `test262-results-array-reduceright-dsl-runtime-fix-2026-08-25.jsonl` and
+  `test262-results-array-reduce-dsl-runtime-fix-2026-08-25.jsonl`.
