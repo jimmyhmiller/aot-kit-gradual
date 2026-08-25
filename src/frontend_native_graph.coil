@@ -103,6 +103,7 @@
    (cell-shape i64)
    (cell-alias i64)
    (receiver i64)
+   (argc i64)
    (owner i64)
    (fun i64)
    (top-level bool)])
@@ -129,6 +130,7 @@
                    (cell-shape i64)
                    (cell-alias i64)
                    (receiver i64)
+                   (argc i64)
                    (owner i64)
                    (fun i64)
                    (top-level bool)] (-> FngContext)
@@ -176,6 +178,8 @@
               cell-alias
               :receiver
               receiver
+              :argc
+              argc
               :owner
               owner
               :fun
@@ -1240,7 +1244,9 @@
       (match (n-op memory)
         (Store [stored-alias] (= stored-alias alias))
         (PropStore [_] (= alias JS-PROPERTY-ALIAS))
+        (PropStoreKey [_] (= alias JS-PROPERTY-ALIAS))
         (PropDelete [_] (= alias JS-PROPERTY-ALIAS))
+        (PropDeleteKey [] (= alias JS-PROPERTY-ALIAS))
         (SetProto [] (= alias JS-PROPERTY-ALIAS))
         (ArrayStore [] (= alias JS-PROPERTY-ALIAS))
         (ArrayResize [] (= alias JS-PROPERTY-ALIAS))
@@ -1272,7 +1278,8 @@
   (if (= memory NO-NODE)
       false
       (match (n-op memory)
-        (Store [_] true) (PropStore [_] true) (PropDelete [_] true) (SetProto [] true)
+        (Store [_] true) (PropStore [_] true) (PropStoreKey [_] true)
+        (PropDelete [_] true) (PropDeleteKey [] true) (SetProto [] true)
         (ArrayStore [] true) (ArrayResize [] true) (ArrayCopy [] true) (MemMerge [] true)
         (Proj [_] (or (op-is? (n-in memory 0) New [_]) (ty-mem? (n-ty memory))))
         (Phi [declared] (ty-mem? declared))
@@ -4824,6 +4831,7 @@
 (defn fng-method-chain! [(context FngContext)
                          (loaded i64)
                          (receiver i64)
+                         (argc i64)
                          (args (ptr (ArrayList i64)))
                          (candidates (ptr (ArrayList i64)))] (-> i64)
   (let [frontend (load (field context frontend))
@@ -4879,6 +4887,7 @@
                                              fun-node
                                              (fng-undefined)
                                              receiver
+                                             (fng-const argc)
                                              (al-slice [i64] (load call-args)))]
                   (set! (load (field context ctrl)) (call-end call))
                   (set! (load (field context memory)) NO-NODE)
@@ -5186,6 +5195,7 @@
           (and (not construct) (!= (ts-role ast node TS-ROLE-OPERATOR 0) -1))
         conditional-optional (and optional-call (< function-index 0))
         argument-start (if explicit-call 2 (if optional-call 2 1))
+        source-argc (- (ts-child-count ast node) argument-start)
         (mut index) argument-start
         (mut optional-symbols) (al-new [i64] (malloc-allocator))
         (mut optional-active) (al-new [i64] (malloc-allocator))
@@ -5301,7 +5311,8 @@
         0)
     (if chain-dispatch
         (let [chain-answer
-                (fng-method-chain! context target receiver (mut args) (mut chain-candidates))]
+                (fng-method-chain! context target receiver source-argc
+                                   (mut args) (mut chain-candidates))]
           (al-free! [i64] (mut args))
           (al-free! [i64] (mut call-captures))
           (al-free! [i64] (mut chain-candidates))
@@ -5334,6 +5345,7 @@
                                          callable-target
                                          call-env
                                          (if (= receiver NO-NODE) (fng-undefined) receiver)
+                                         (fng-const source-argc)
                                          (al-slice [i64] (load args)))]
               (if (and (< function-index 0)
                        (and (not conditional-optional) (not direct-value-callee)))
@@ -5710,6 +5722,7 @@
                  (and (!= parent NO-NODE)
                       (match (n-op parent) (New [shape] (= shape SHAPE-ROOT)) (_ false))))))
         (ArrayMark [] (fng-shape-root-object? (n-in value 1)))
+        (Box [_] (fng-shape-root-object? (n-in value 1)))
         (Cast [_] (fng-shape-root-object? (n-in value 1)))
         (_ false))))
 
@@ -6289,7 +6302,14 @@
                       (if (= symbol FE-INTRINSIC-FUNCTION)
                           (fng-jsl-call0 context "FunctionConstructorValue")
                           (fng-builtin-constructor-value context symbol))
-                    (= symbol FE-INTRINSIC-UNBOUND) (fng-unbound-reference context node)
+                    (= symbol FE-INTRINSIC-UNBOUND)
+                      (if (and (not (load (field context top-level)))
+                               (= (ts-text ast node) "arguments"))
+                          (fng-jsl-call1
+                            context "NewArgumentsObject"
+                            (jsl-normalize-int-representation!
+                              (load (field context argc))))
+                          (fng-unbound-reference context node))
                     (< symbol 0) NO-NODE
                     :else
                       (let [stored (fng-symbol-node context symbol)
@@ -8762,6 +8782,7 @@
         (mut saved-capture-symbols) (al-new [i64] (malloc-allocator))
         (mut saved-capture-values) (al-new [i64] (malloc-allocator))
         (mut receiver) NO-NODE
+        (mut argc) NO-NODE
         (mut index) 0]
     (if top-level
         0
@@ -8802,9 +8823,8 @@
                       0)
                     0))
               0)
-          ; The receiver slot is reserved for EVERY callable — a function that never reads `this`
-          ; simply leaves parameter 1 dead — so a value call needs no knowledge of its target's
-          ; receiver-awareness: [env, receiver, arguments...] is the whole convention.
+          ; Every callable reserves environment 0, receiver 1, and actual argc 2. A function that
+          ; does not read one simply leaves that parameter dead.
           (let [receiver-count
                   (if (and (not (.arrow fn))
                            (!= (.receiver-type-node fn) -1))
@@ -8824,6 +8844,7 @@
                                         (al-get [i64] (load shapes) owner))
                                       (t-obj)))))
                 0)
+            (set! argc (n-parm! fun 2))
             (set! index 0)
             (loop (if (>= (load index) (.parameter-count fn))
                       (break)
@@ -8832,7 +8853,7 @@
                                       (.symbols frontend)
                                       (+ (.parameter-start fn) (load index)))]
                         (let [parameter
-                                (n-parm! fun (+ 2 (load index)))
+                                (n-parm! fun (+ 3 (load index)))
                               declared (fng-parameter-type frontend fn (load index))]
                           ;; A declared `number` parameter already has a tagged-number ABI at every
                           ;; statically typed call boundary. Publish its machine value directly;
@@ -8875,6 +8896,7 @@
                          cell-shape
                          cell-alias
                          (load receiver)
+                         (load argc)
                          fun-id
                          fun
                          top-level)]

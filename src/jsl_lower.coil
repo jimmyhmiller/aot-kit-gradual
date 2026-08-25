@@ -636,6 +636,7 @@
             cs (n-call-receiver! (jl-ctrl) callee
                                  (if direct (n-box! callee) callee)
                                  (n-box! (jl-const (t-undef)))
+                                 (jl-const (t-int-con n))
                                  (slice-new [i64] p (+ n 1)))
             end (call-end cs)]
       (if direct 0 (do (n-set-op! (call-value cs) (Call CALL-ABI-DYNAMIC-RECEIVER)) 0))
@@ -740,9 +741,8 @@
                        (jl-expr (rd/sexp-nth x 2)))
           n (- (rd/sexp-count x) 3)
           max-params (if dynamic (jl-frontend-max-params targets) (+ n 2))
-          ;; Parameter indices now include the hidden environment (0) and the receiver (1), so
-          ;; the widest explicit-argument count is two less than the widest parameter index + 1.
-          call-n (if (and dynamic (> (- max-params 2) n)) (- max-params 2) n)
+          ;; Parameter indices include hidden environment (0), receiver (1), and actual argc (2).
+          call-n (if (and dynamic (> (- max-params 3) n)) (- max-params 3) n)
           buf (primitive/alloc-stack (array i64 17))
           p (cast (ptr i64) buf)
           (mut i) 0]
@@ -776,6 +776,7 @@
             ;; The callee value doubles as the hidden environment: a closure is its own
             ;; environment object, and a bare function ignores the slot entirely.
             (let [cs (n-call-receiver! (jl-ctrl) callee callee receiver
+                                     (jl-const (t-int-con n))
                                      (slice-new [i64] p (+ call-n 1)))
                 end (call-end cs)]
               (if dynamic (n-set-op! (call-value cs) (Call CALL-ABI-DYNAMIC-RECEIVER)) 0)
@@ -1378,7 +1379,7 @@
           0)
       (loop (if (>= (load k) np) (break)
               (do (jl-bind! (jsl-param-name d (load k))
-                            (n-parm! fun (+ (load k) (if (jsl-callable? d) 2 0))))
+                            (n-parm! fun (+ (load k) (if (jsl-callable? d) 3 0))))
                   (set! k (+ (load k) 1))
                   0)))
       ; THE HEAP IS ESTABLISHED BEFORE THE BODY, not on first use, and the difference is a real bug
@@ -1637,3 +1638,11 @@
       (if (and (>= d 0) (jsl-decl-uses-memory? d))
           (n-new1 (Arg (t-mem-alias JS-PROPERTY-ALIAS (t-undef))) ctrl)
           NO-NODE))))
+
+;; A raw ABI word whose contract is integer but whose Parm seed is deliberately untyped needs a
+;; structural integer producer before `%Box` can choose the integer representation. Keep that
+;; representation operation at the JSL lowering boundary rather than open-coding it in a frontend.
+(defn jsl-normalize-int-representation! [(value i64)] (-> i64)
+  (n-peephole
+    (n-new3 (BitOr) NO-NODE value
+            (n-peephole (n-new1 (Const (t-int-con 0)) (g-start))))))

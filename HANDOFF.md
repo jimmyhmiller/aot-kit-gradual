@@ -1,3 +1,19 @@
+## 2026-08-24: source calls transport actual argc and expose `arguments.length`
+
+- Extended the uniform JavaScript receiver ABI with hidden actual argc at Parm 2; declared source
+  and callable-JSL parameters now begin at Parm 3. Call sites capture argc before fixed-arity
+  normalization, so omitted arguments remain distinguishable from explicit `undefined`.
+- Added DSL-owned `NewArgumentsObject`, which publishes `length` through the ordinary property
+  model. The frontend recognizes only the structural `arguments` binding. Raw Parm representation
+  normalization lives at the JSL lowering boundary, not as open-coded JavaScript semantics.
+- Keyed property stores and deletes now participate in frontend property-memory alias tracking.
+  Permanent backend witnesses prove both a single argc value and distinct values across repeated
+  receiver calls; native differential coverage proves independently compiled arities 0, 1, 2,
+  and 3 agree with Node.
+- Gate: `coil test` passed 48/48. Frontier remained intentionally red at 0/2. Repeated calls that
+  each materialize and read an arguments object in one source program still fail and are not
+  claimed by this strike; the complete property-helper cohort has not yet been rerun.
+
 ## 2026-08-24: Test262 property-helper publication reaches the argc frontier
 
 - Published callable JSL wrappers for `Array.prototype.join`, `Array.prototype.push`, and
