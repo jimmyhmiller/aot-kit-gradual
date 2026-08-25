@@ -2827,3 +2827,12 @@ and use `call-dynamic-with-receiver`, matching `map`, `filter`, `forEach`, `some
 - Exact targeted result is
   `test262-results-loop-lexical-early-errors-v2-2026-08-25.jsonl`: 22 passed, 0 failed,
   0 refused, 0 skipped. All 22 variants failed in the saved negative-parse frontier.
+# 2026-08-25: catch parameters enforce duplicate and lexical-name early errors (+6 Test262)
+
+- Catch clauses now reject duplicate names in `BoundNames(CatchParameter)` and intersections with
+  `LexicallyDeclaredNames(CatchBlock)`, including direct function declarations.
+- The check intentionally does not compare against `VarDeclaredNames`; `catch (x) { var x; }`
+  remains valid and is pinned as a bounded ABI control.
+- Exact targeted result is `test262-results-catch-early-errors-v1-2026-08-25.jsonl`:
+  6 passed, 0 failed, 0 refused, 0 skipped. All six variants failed in the saved negative-parse
+  frontier.

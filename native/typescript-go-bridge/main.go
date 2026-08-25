@@ -126,6 +126,7 @@ func (parsed *parseResult) addJavaScriptModeDiagnostics() {
 		parsed.addPrivateDeleteEarlyErrors(n)
 		parsed.addBlockRedeclarationEarlyErrors(n)
 		parsed.addLoopLexicalEarlyErrors(n)
+		parsed.addCatchClauseEarlyErrors(n)
 		parsed.addEmbeddedStatementEarlyErrors(n)
 		parsed.addRegExpFlagEarlyErrors(n)
 		parsed.addRegExpPropertyEarlyErrors(n)
@@ -1403,6 +1404,22 @@ func (parsed *parseResult) addLoopLexicalEarlyErrors(node *ast.Node) {
 	}
 	for _, name := range appendVarDeclaredNames(statement, nil) {
 		if seen[name.text] { parsed.addJavaScriptDiagnostic(name.node, 90072) }
+	}
+}
+
+func (parsed *parseResult) addCatchClauseEarlyErrors(node *ast.Node) {
+	if node.Kind != ast.KindCatchClause { return }
+	clause := node.AsCatchClause()
+	if clause.VariableDeclaration == nil { return }
+	bound := appendBoundNames(clause.VariableDeclaration.Name(), nil)
+	seen := make(map[string]bool)
+	for _, name := range bound {
+		if seen[name.text] { parsed.addJavaScriptDiagnostic(name.node, 90073) }
+		seen[name.text] = true
+	}
+	if clause.Block == nil { return }
+	for _, name := range directLexicalNames(clause.Block.AsBlock().Statements.Nodes) {
+		if seen[name.text] { parsed.addJavaScriptDiagnostic(name.node, 90074) }
 	}
 }
 

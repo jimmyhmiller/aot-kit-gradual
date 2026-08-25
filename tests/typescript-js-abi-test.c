@@ -158,6 +158,19 @@ int main(int argc, char **argv) {
     "loop binding may be shadowed inside nested function");
   aot_ts_parse_delete(loop_shadow_parse);
 
+  const char *catch_early_errors = "try {} catch ([x, x]) {} try {} catch (y) { let y; }";
+  AotTsParse catch_early_parse = aot_ts_parse_ex(catch_early_errors,
+    (int32_t)strlen(catch_early_errors), "catch-errors.js", 15, AOT_TS_SCRIPT_JS);
+  require(aot_ts_diagnostic_count(catch_early_parse) >= 2,
+    "catch duplicate bindings and lexical collisions rejected");
+  aot_ts_parse_delete(catch_early_parse);
+  const char *catch_var_valid = "try {} catch (x) { var x; }";
+  AotTsParse catch_var_parse = aot_ts_parse_ex(catch_var_valid,
+    (int32_t)strlen(catch_var_valid), "catch-valid.js", 14, AOT_TS_SCRIPT_JS);
+  require(aot_ts_diagnostic_count(catch_var_parse) == 0,
+    "catch parameter may be redeclared by var");
+  aot_ts_parse_delete(catch_var_parse);
+
   const char *operators = "var x=1,o={}; x += 2; ++x; x--; typeof x; delete o.x; void (x += 3); o?.x; o?.[x]; x?.(); `plain`; `a${x}b`; (a) => { return a; }; true; null;";
   AotTsParse operator_parse = aot_ts_parse_ex(operators, (int32_t)strlen(operators), "operators.js", 12, AOT_TS_SCRIPT_JS);
   require(find_operator(operator_parse, "PlusEquals") >= 0, "assignment operator API");
