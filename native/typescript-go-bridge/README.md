@@ -10,7 +10,8 @@ Build and execute the Coil integration check with:
 tools/typescript-go-bridge-gate.sh
 ```
 
-`build-typescript-go-bridge.sh` copies `main.go` into the upstream checkout because
+`build-typescript-go-bridge.sh` copies the production bridge sources (`main.go` and the generated
+Unicode property table) into the upstream checkout because
 the native compiler currently exposes its parser and checker implementation as Go
 `internal` packages. It builds a C archive instead of a dynamic library so Coil's
 metaprogram compiler does not load the Go runtime and the resulting executable is

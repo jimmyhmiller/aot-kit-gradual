@@ -1,3 +1,19 @@
+## 2026-08-25: Unicode property escapes enforce ECMAScript grammar
+
+- Added RegExp Unicode-property validation for exact binary property names, general-category
+  aliases, script/script-extension values, malformed braces and property/value forms, class-range
+  endpoints, and Unicode `v` properties-of-strings restrictions. Doubled-backslash forms are
+  handled as Unicode quantifier grammar rather than misclassified as property escapes.
+- Added `native/typescript-go-bridge/unicode_properties.go`, generated from Unicode 16.0.0
+  `PropertyValueAliases.txt`, so all 336 canonical long and short script values are accepted even
+  when the host Go toolchain carries an older Unicode table. The bridge build copies this explicit
+  production input alongside `main.go`; it deliberately does not copy the separate probe program.
+- The retained complete property-escape directory result is
+  `test262-results-regexp-property-escapes-v4-2026-08-25.jsonl`: all 326 negative-parse variants
+  pass, up from zero in the formal-parameter checkpoint. The other 880 variants remain positive
+  runtime/frontend RegExp work, with no refusals or policy skips. The active 30% goal remains
+  incomplete.
+
 ## 2026-08-25: class private environments close the negative-element family
 
 - Added one source-level `AllPrivateNamesValid` traversal. Class heritage is checked against the

@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"unicode"
 	"unsafe"
 
 	"github.com/microsoft/typescript-go/internal/ast"
@@ -125,9 +126,124 @@ func (parsed *parseResult) addJavaScriptModeDiagnostics() {
 		parsed.addBlockRedeclarationEarlyErrors(n)
 		parsed.addEmbeddedStatementEarlyErrors(n)
 		parsed.addRegExpFlagEarlyErrors(n)
+		parsed.addRegExpPropertyEarlyErrors(n)
 		parsed.addFormalParameterEarlyErrors(n)
 		parsed.addClassElementEarlyErrors(n)
 		parsed.addPrivateNameEarlyErrors(n)
+	}
+}
+
+var ecmaBinaryProperties = map[string]bool{
+	"ASCII": true, "ASCII_Hex_Digit": true, "Alphabetic": true, "Any": true,
+	"Assigned": true, "Bidi_Control": true, "Bidi_Mirrored": true,
+	"Case_Ignorable": true, "Cased": true, "Changes_When_Casefolded": true,
+	"Changes_When_Casemapped": true, "Changes_When_Lowercased": true,
+	"Changes_When_NFKC_Casefolded": true, "Changes_When_Titlecased": true,
+	"Changes_When_Uppercased": true, "Dash": true, "Default_Ignorable_Code_Point": true,
+	"Deprecated": true, "Diacritic": true, "Emoji": true, "Emoji_Component": true,
+	"Emoji_Modifier": true, "Emoji_Modifier_Base": true, "Emoji_Presentation": true,
+	"Extended_Pictographic": true, "Extender": true, "Grapheme_Base": true,
+	"Grapheme_Extend": true, "Hex_Digit": true, "ID_Continue": true, "ID_Start": true,
+	"IDS_Binary_Operator": true, "IDS_Trinary_Operator": true, "Ideographic": true,
+	"Join_Control": true, "Logical_Order_Exception": true, "Lowercase": true, "Math": true,
+	"Noncharacter_Code_Point": true, "Pattern_Syntax": true, "Pattern_White_Space": true,
+	"Quotation_Mark": true, "Radical": true, "Regional_Indicator": true,
+	"Sentence_Terminal": true, "Soft_Dotted": true, "Terminal_Punctuation": true,
+	"Unified_Ideograph": true, "Uppercase": true, "Variation_Selector": true,
+	"White_Space": true, "XID_Continue": true, "XID_Start": true,
+}
+
+var ecmaGeneralCategories = map[string]bool{
+	"C": true, "Other": true, "Cc": true, "Control": true, "Cf": true, "Format": true,
+	"Cn": true, "Unassigned": true, "Co": true, "Private_Use": true, "Cs": true,
+	"Surrogate": true, "L": true, "Letter": true, "LC": true, "Cased_Letter": true,
+	"Ll": true, "Lowercase_Letter": true, "Lm": true, "Modifier_Letter": true,
+	"Lo": true, "Other_Letter": true, "Lt": true, "Titlecase_Letter": true,
+	"Lu": true, "Uppercase_Letter": true, "M": true, "Mark": true,
+	"Combining_Mark": true, "Mc": true, "Spacing_Mark": true, "Me": true,
+	"Enclosing_Mark": true, "Mn": true, "Nonspacing_Mark": true, "N": true,
+	"Number": true, "Nd": true, "Decimal_Number": true, "digit": true, "Nl": true,
+	"Letter_Number": true, "No": true, "Other_Number": true, "P": true,
+	"Punctuation": true, "punct": true, "Pc": true, "Connector_Punctuation": true,
+	"Pd": true, "Dash_Punctuation": true, "Pe": true, "Close_Punctuation": true,
+	"Pf": true, "Final_Punctuation": true, "Pi": true, "Initial_Punctuation": true,
+	"Po": true, "Other_Punctuation": true, "Ps": true, "Open_Punctuation": true,
+	"S": true, "Symbol": true, "Sc": true, "Currency_Symbol": true, "Sk": true,
+	"Modifier_Symbol": true, "Sm": true, "Math_Symbol": true, "So": true,
+	"Other_Symbol": true, "Z": true, "Separator": true, "Zl": true,
+	"Line_Separator": true, "Zp": true, "Paragraph_Separator": true, "Zs": true,
+	"Space_Separator": true,
+}
+
+var ecmaStringProperties = map[string]bool{
+	"Basic_Emoji": true, "Emoji_Keycap_Sequence": true, "RGI_Emoji": true,
+	"RGI_Emoji_Flag_Sequence": true, "RGI_Emoji_Modifier_Sequence": true,
+	"RGI_Emoji_Tag_Sequence": true, "RGI_Emoji_ZWJ_Sequence": true,
+}
+
+func validUnicodeProperty(expression string, vMode bool, negated bool, complementedClass bool) bool {
+	if expression == "" { return false }
+	if ecmaStringProperties[expression] {
+		return vMode && !negated && !complementedClass
+	}
+	parts := strings.Split(expression, "=")
+	if len(parts) == 1 { return ecmaBinaryProperties[expression] || ecmaGeneralCategories[expression] }
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" { return false }
+	switch parts[0] {
+	case "General_Category", "gc":
+		return ecmaGeneralCategories[parts[1]]
+	case "Script", "sc", "Script_Extensions", "scx":
+		return ecmaScriptValues[parts[1]] || unicode.Scripts[parts[1]] != nil
+	default:
+		return false
+	}
+}
+
+func invalidRegExpPropertyEscape(pattern, flags string) bool {
+	unicodeMode := strings.Contains(flags, "u") || strings.Contains(flags, "v")
+	vMode := strings.Contains(flags, "v")
+	inClass, complementedClass, escaped := false, false, false
+	for index := 0; index < len(pattern); index++ {
+		character := pattern[index]
+		if escaped { escaped = false; continue }
+		if character == '[' {
+			inClass = true
+			complementedClass = index+1 < len(pattern) && pattern[index+1] == '^'
+			continue
+		}
+		if character == ']' { inClass = false; complementedClass = false; continue }
+		if character != '\\' { continue }
+		if index+1 >= len(pattern) { break }
+		next := pattern[index+1]
+		if unicodeMode && next == '\\' && index+3 < len(pattern) &&
+			(pattern[index+2] == 'p' || pattern[index+2] == 'P') && pattern[index+3] == '{' {
+			close := strings.IndexByte(pattern[index+4:], '}')
+			if close < 0 { return true }
+			quantifier := pattern[index+4:index+4+close]
+			for _, character := range quantifier {
+				if character < '0' || character > '9' { return true }
+			}
+		}
+		if next != 'p' && next != 'P' { escaped = true; continue }
+		if !unicodeMode { index++; continue }
+		if index+2 >= len(pattern) || pattern[index+2] != '{' { return true }
+		close := strings.IndexByte(pattern[index+3:], '}')
+		if close < 0 { return true }
+		close += index + 3
+		expression := pattern[index+3:close]
+		if !validUnicodeProperty(expression, vMode, next == 'P', complementedClass) { return true }
+		if inClass && ((index > 0 && pattern[index-1] == '-') ||
+			(close+1 < len(pattern) && pattern[close+1] == '-' &&
+				(close+2 >= len(pattern) || pattern[close+2] != ']'))) { return true }
+		index = close
+	}
+	return false
+}
+
+func (parsed *parseResult) addRegExpPropertyEarlyErrors(node *ast.Node) {
+	pattern, flags, ok := regexpParts(parsed, node)
+	if ok && invalidRegExpPropertyEscape(pattern, flags) {
+		parsed.addJavaScriptDiagnostic(node, 90024)
 	}
 }
 

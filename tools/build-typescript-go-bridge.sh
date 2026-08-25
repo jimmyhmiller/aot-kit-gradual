@@ -19,7 +19,7 @@ if [[ ! -f "$checkout/go.mod" ||
 fi
 
 mkdir -p "$checkout/cmd/aotcapi"
-cp "$bridge/main.go" "$checkout/cmd/aotcapi/main.go"
+cp "$bridge/main.go" "$bridge/unicode_properties.go" "$checkout/cmd/aotcapi/"
 
 (
   cd "$checkout"
