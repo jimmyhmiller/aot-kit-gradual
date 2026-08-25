@@ -1,3 +1,15 @@
+## 2026-08-25: empty class elements add 8 passes
+
+- Class child validation rejected the standard empty class element (`;`) as unsupported syntax.
+  It now admits and structurally ignores semicolon children while continuing to validate every
+  constructor, method, accessor, and field. There is no JavaScript operation to delegate for an
+  empty element, so this change belongs entirely in frontend structure and adds no DSL semantics.
+- A native differential witness pins multiple empty elements around a constructor and method. The
+  complete union of retained class-expression and class-statement refusal files is preserved in
+  `test262-results-empty-class-elements-v1-2026-08-25.jsonl`: 8 authoritative failures become
+  passes and 450 clear the refusal but still fail downstream at execution. No pass regresses.
+  `coil test` is green at 48/48. The active 30% full Test262 goal remains incomplete.
+
 ## 2026-08-25: stable JSON namespace identity adds 62 passes
 
 - `JSON` was resolved as an intrinsic for direct `parse` and `stringify` calls but had no value
