@@ -1,3 +1,22 @@
+## 2026-08-25: canonical escaped object keys add 258 passes
+
+- The TypeScript bridge now exposes canonical identifier-name text separately from raw source
+  ranges. Upstream `Node.Text()` decodes escapes such as `bre\\u0061k` to the JavaScript property
+  key `break`; raw `ts-text` remains unchanged for source diagnostics and syntax inspection.
+- Static object shapes and dynamic DSL property publication now consume the same canonical key.
+  The frontend still owns only representation: object creation continues to call
+  `SetNamedProperty`/the existing property DSL, and no JavaScript property semantics were
+  open-coded.
+- `test262-results-object-expression-canonical-names-v2-2026-08-25.jsonl` covers all 1,818 variants
+  in `language/expressions/object`: 556 pass, 1,165 fail, 97 refuse, and 224 policy-skip. Against the
+  retained v1 artifact, exactly 258 failures become passes and no pass regresses: 172 ordinary
+  escaped-IdentifierName variants and 86 covered-IdentifierName variants.
+- The bounded native witness compiles and executes `bre\\u0061k` as `break`, and `coil test` is
+  green at 48/48. The Node differential oracle cannot be used for that one bounded source because
+  its TypeScript-annotation stripper damages escaped names before `:`; the complete Test262 run is
+  the differential evidence. The rough cumulative post-baseline gain is now +931. The active 30%
+  goal remains incomplete until a fresh authoritative full run proves it.
+
 ## 2026-08-25: per-operation abrupt exits and role-based reduce calls add 70 passes
 
 - Expanded JSL now records pending-exception exits immediately after nested JavaScript calls and

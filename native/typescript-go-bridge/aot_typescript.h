@@ -44,6 +44,7 @@ int32_t aot_ts_node_kind_name(AotTsParse parse, AotTsNode node, char *destinatio
 int32_t aot_ts_node_operator_name(AotTsParse parse, AotTsNode node, char *destination, int32_t capacity);
 int32_t aot_ts_node_literal_kind(AotTsParse parse, AotTsNode node);
 int32_t aot_ts_node_literal_text(AotTsParse parse, AotTsNode node, char *destination, int32_t capacity);
+int32_t aot_ts_node_name_text(AotTsParse parse, AotTsNode node, char *destination, int32_t capacity);
 uint64_t aot_ts_node_numeric_bits(AotTsParse parse, AotTsNode node);
 int32_t aot_ts_node_regexp_pattern(AotTsParse parse, AotTsNode node, char *destination, int32_t capacity);
 int32_t aot_ts_node_regexp_flags(AotTsParse parse, AotTsNode node, char *destination, int32_t capacity);

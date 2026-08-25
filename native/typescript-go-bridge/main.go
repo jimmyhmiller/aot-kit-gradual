@@ -2282,6 +2282,15 @@ func aot_ts_node_literal_text(raw C.uintptr_t, id C.int32_t, destination *C.char
 	return copyString(n.LiteralLikeData().Text, destination, capacity)
 }
 
+//export aot_ts_node_name_text
+func aot_ts_node_name_text(raw C.uintptr_t, id C.int32_t, destination *C.char, capacity C.int32_t) C.int32_t {
+	n := node(result(raw), id)
+	if n == nil || (n.Kind != ast.KindIdentifier && n.Kind != ast.KindPrivateIdentifier) { return -1 }
+	// Node.Text is the parser's canonical IdentifierName, unlike the source range: escapes such as
+	// `bre\u0061k` have already been decoded to the property key JavaScript observes.
+	return copyString(n.Text(), destination, capacity)
+}
+
 //export aot_ts_node_numeric_bits
 func aot_ts_node_numeric_bits(raw C.uintptr_t, id C.int32_t) C.uint64_t {
 	n := node(result(raw), id)
