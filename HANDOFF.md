@@ -1,3 +1,23 @@
+## 2026-08-25: classic for loops preserve omitted clauses
+
+- Classic `for` lowering indexed the compact AST child list as initializer, condition, increment,
+  and body. Omitted clauses collapse that list, so `for (;;) { ... }` sent its block body to
+  expression lowering as the condition (`bridge kind 242`). The TypeScript bridge now exposes the
+  incrementor role, and both labeled and unlabeled lowering obtain all four clauses by role;
+  omitted conditions become constant true and omitted initializers remain normal completion.
+- Replayed the complete prior bridge-kind-242 cohort in
+  `test262-results-classic-for-roles-v1-2026-08-25.jsonl`: all 499 variants clear the refusal, 78
+  pass, and 421 reach deeper execution failures. The bounded gate is 48/48. JavaScript operations
+  remain DSL-owned; this change only preserves syntax structure. The active 30% goal remains
+  incomplete.
+
+## 2026-08-25: authoritative full suite reaches 22.30 percent
+
+- The complete retained `test262-results-current-full-v4-2026-08-25.jsonl` run has 18,743 passed,
+  57,026 failed, 8,275 refused, and 6,542 policy skips among 84,044 executed variants. This is
+  22.30%, up 1,560 passes from v3 and 1,406 from the prior 20.63% checkpoint. Reaching 30% requires
+  6,471 additional passes. Execution took 1,627.451 seconds; total time was 1,634.851 seconds.
+
 ## 2026-08-25: callable unbox preserves bare functions and closure environments
 
 - The closure-environment ABI checkpoint narrowed every `Unbox(t-fun)` to `JSV-CLOSURE`. That
