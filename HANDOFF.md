@@ -1,3 +1,16 @@
+## 2026-08-25: binding-pattern expressions participate in lexical resolution
+
+- Added a structural resolution walk for computed property names and binding-element initializers.
+  It runs before the pattern's leaves enter the active binding stack and is used by both ordinary
+  declarations and formal parameters. This fixes computed local-identifier keys reaching graph
+  lowering as unresolved `NO-NODE`; evaluation and key conversion remain frontend structure plus
+  DSL `ToPropertyKey` semantics.
+- The object-rest differential witness now excludes a property through a computed local identifier
+  and agrees with Node. The complete 806-variant destructuring cohort is retained in
+  `test262-results-binding-expression-resolution-dstr-2026-08-25.jsonl` and remains 84 passed,
+  686 failed, 36 refused, and 158 policy-skipped; this structural fix neither gains nor regresses a
+  case in that method-only cohort.
+
 ## 2026-08-25: computed binding keys use a semantic bridge role
 
 - Extended the TypeScript-Go bridge's existing `EXPRESSION` role to

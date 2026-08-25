@@ -1532,6 +1532,39 @@
                 0))))
   0)
 
+;; A binding pattern contains executable expressions which are not bindings: computed property
+;; names and defaults. Resolve those in the lexical environment that exists before this pattern's
+;; leaves are introduced. Evaluation and JavaScript meaning remain graph/JSL work; this pass only
+;; records which existing symbol each identifier denotes.
+(defn fe-resolve-binding-expressions! [(frontend (mut NativeFrontend))
+                                       (bindings (mut (ArrayList FeBinding)))
+                                       (node i64)
+                                       (owner i64)
+                                       (depth i64)] (-> i64)
+  (let [ast (field frontend ast) kind (ts-kind ast node)]
+    (if (= kind TSK-BINDING-ELEMENT)
+        (let [property (ts-role ast node TS-ROLE-PROPERTY 0)
+              initializer (ts-role ast node TS-ROLE-INITIALIZER 0)
+              name (ts-role ast node TS-ROLE-NAME 0)]
+          (if (and (!= property -1) (= (ts-kind ast property) TSK-COMPUTED-PROPERTY-NAME))
+              (fe-resolve-node! (mut frontend) (mut bindings)
+                                (ts-role ast property TS-ROLE-EXPRESSION 0) owner depth)
+              0)
+          (if (and (!= initializer -1) (!= initializer name))
+              (fe-resolve-node! (mut frontend) (mut bindings) initializer owner depth)
+              0)
+          (if (!= name -1)
+              (fe-resolve-binding-expressions! (mut frontend) (mut bindings) name owner depth)
+              0))
+        (if (or (= kind TSK-ARRAY-BINDING-PATTERN) (= kind TSK-OBJECT-BINDING-PATTERN))
+            (let [(mut i) 0]
+              (loop (if (>= (load i) (ts-child-count ast node)) (break)
+                      (do (fe-resolve-binding-expressions! (mut frontend) (mut bindings)
+                                                           (ts-child ast node (load i)) owner depth)
+                          (set! i (+ (load i) 1))))))
+            0)))
+  0)
+
 (defn fe-resolve-node! [(frontend (mut NativeFrontend))
                         (bindings (mut (ArrayList FeBinding)))
                         (node i64)
@@ -1567,8 +1600,11 @@
                               name (load (field symbol name-node))]
                           (if (or (= (ts-kind ast name) TSK-ARRAY-BINDING-PATTERN)
                                   (= (ts-kind ast name) TSK-OBJECT-BINDING-PATTERN))
-                              (fe-resolve-binding-pattern! (mut frontend) (mut bindings)
-                                                           name function-id depth)
+                              (do
+                                (fe-resolve-binding-expressions! (mut frontend) (mut bindings)
+                                                                 name function-id depth)
+                                (fe-resolve-binding-pattern! (mut frontend) (mut bindings)
+                                                             name function-id depth))
                               (al-push! [FeBinding]
                                         (mut bindings)
                                         (fe-binding-make name (load (field symbol id)) depth)))
@@ -1588,6 +1624,7 @@
               (if (and (!= value -1) (!= value name))
                   (fe-resolve-node! (mut frontend) (mut bindings) value owner depth)
                   0)
+              (fe-resolve-binding-expressions! (mut frontend) (mut bindings) name owner depth)
               (fe-resolve-binding-pattern! (mut frontend) (mut bindings) name owner depth)
               0)
           ;; The ITERABLE is evaluated in the enclosing scope and the binding is visible only
