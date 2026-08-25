@@ -18,6 +18,18 @@
 (extern fgets :cc c [(ptr i8) i32 (ptr u8)] (-> (ptr i8)))
 (extern fflush :cc c [(ptr u8)] (-> i32))
 
+(defn t262-native-parse-negative [(path (slice u8))] (-> i64)
+  (let [a (malloc-allocator)
+        source (t262-native-read a path)]
+    (if (= (slice-len source) 0)
+        (do (fmt (stderr) "test262-native: cannot read empty parse-negative source\n") 66)
+        (let [(mut ast) (ts-open-file source path TS-SCRIPT-JS)
+              rejected (> (ts-diagnostic-count ast) 0)]
+          (ts-close! (mut ast))
+          (if rejected
+              (do (fmt (stdout) "PASS\n") 0)
+              (do (fmt (stdout) "RUNTIME-FAILED 0\n") 1))))))
+
 (defn t262-native-server [] (-> i64)
   (let [input (fdopen 0 (cast (ptr i8) (slice-data "r")))
         buffer (primitive/alloc-stack (array i8 4096))
@@ -41,8 +53,17 @@
               (if (> (load length) 0)
                   (do
                     (fmt (stderr) "AOTK_CASE_BEGIN index={d}\n" (load index))
-                    (let [status (t262-native-one
-                                   (slice-new [u8] (cast (ptr u8) buffer) (load length)))]
+                    (let [parse-negative (= (load (index (cast (ptr i8) buffer) 0))
+                                             (cast i8 33))
+                          path (slice-new [u8]
+                                          (cast (ptr u8)
+                                                (if parse-negative
+                                                    (+ (cast i64 buffer) 1)
+                                                    (cast i64 buffer)))
+                                          (- (load length) (if parse-negative 1 0)))
+                          status (if parse-negative
+                                     (t262-native-parse-negative path)
+                                     (t262-native-one path))]
                       ;; stdout ordering guarantees the result line above is visible before this
                       ;; completion marker even though diagnostics use a separate stderr pipe.
                       (fmt (stdout) "AOTK_CASE_END index={d} status={d}\n"

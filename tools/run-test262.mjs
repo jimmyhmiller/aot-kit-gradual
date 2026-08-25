@@ -152,7 +152,9 @@ function unsupportedReason(metadata, source) {
   const flags = new Set(metadata.flags || []);
   if (flags.has("module")) return "module variant";
   if (flags.has("async")) return "async completion";
-  if (metadata.negative) return `negative ${metadata.negative.phase || "unknown"} phase`;
+  if (metadata.negative && metadata.negative.phase !== "parse") {
+    return `negative ${metadata.negative.phase || "unknown"} phase`;
+  }
   if (/\$262\b/.test(source)) return "$262 host object";
   return "";
 }
@@ -195,6 +197,10 @@ function assemble(source, metadata, strict) {
   if (strict) pieces.push('"use strict";\n');
   pieces.push(source, "\nreturn 0;\n}\n");
   return pieces.join("");
+}
+
+function assembleParseNegative(source, strict) {
+  return `${strict ? '"use strict";\n' : ""}${source}\n`;
 }
 
 function assertionKey(source, includes) {
@@ -259,8 +265,9 @@ if (start > 0) files.splice(0, start);
 if (limit > 0) files.length = Math.min(files.length, limit);
 
 console.error(
-  "Test262 scope: synchronous script tests executed in the current function-body entry ABI; " +
-    "module/async/negative phases and full top-level Script semantics are not implemented.",
+  "Test262 scope: synchronous script tests and parser-diagnosed negative parse tests; " +
+    "modules, async completion, negative runtime phases, ECMAScript early-error checking, " +
+    "and full top-level Script semantics are not implemented.",
 );
 const totals = { passed: 0, failed: 0, refused: 0, skipped: 0 };
 const categories = {};
@@ -326,7 +333,8 @@ for (let index = 0; index < files.length; index++) {
   }
   for (const variant of variants(metadata)) {
     if (completed.has(resultKey({ path, variant: variant.name }))) continue;
-    work.push({ index, path, source, metadata, variant });
+    work.push({ index, path, source, metadata, variant,
+      parseNegative: metadata.negative?.phase === "parse" });
   }
 }
 
@@ -639,7 +647,7 @@ function nativeServer() {
       } catch {}
     }, 20);
   };
-  const run = (assembled) => new Promise((resolveRun) => {
+  const run = (assembled, parseNegative = false) => new Promise((resolveRun) => {
     if (!child) start();
     const startedNs = process.hrtime.bigint();
     current = { resolve: resolveRun, startedNs, peakRssKb: 0, timer: null };
@@ -653,7 +661,7 @@ function nativeServer() {
         if (error.code !== "ESRCH") throw error;
       }
     }, timeoutMs);
-    child.stdin.write(`${assembled}\n`);
+    child.stdin.write(`${parseNegative ? "!" : ""}${assembled}\n`);
   });
   const close = () => {
     if (child) child.stdin.end();
@@ -666,10 +674,12 @@ async function runServerOne(server, task) {
   const { index, path, source, metadata, variant } = task;
   const assembled = join(temporary, `${index}-${variant.name}-${basename(path)}`);
   const assemblyStarted = performance.now();
-  writeFileSync(assembled, assemble(source, metadata, variant.strict));
+  writeFileSync(assembled, task.parseNegative
+    ? assembleParseNegative(source, variant.strict)
+    : assemble(source, metadata, variant.strict));
   const assemblyMs = performance.now() - assemblyStarted;
   const started = performance.now();
-  const run = await server.run(assembled);
+  const run = await server.run(assembled, task.parseNegative);
   const durationMs = performance.now() - started;
   finishOne(task, assembled, run, assemblyMs, durationMs);
 }
@@ -686,7 +696,11 @@ if (batchSize === 1) {
   }
   units = [];
   for (const group of groups.values()) {
-    for (let i = 0; i < group.length; i += batchSize) units.push(group.slice(i, i + batchSize));
+    if (group[0].parseNegative) {
+      for (const task of group) units.push([task]);
+    } else {
+      for (let i = 0; i < group.length; i += batchSize) units.push(group.slice(i, i + batchSize));
+    }
   }
 }
 let next = 0;

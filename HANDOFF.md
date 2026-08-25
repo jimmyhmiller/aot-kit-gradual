@@ -1,3 +1,20 @@
+## 2026-08-25: negative parse tests execute against the real frontend parser
+
+- Negative parse metadata is no longer blanket-skipped. The runner assembles the original source
+  without harness or function wrapping, prepends only the strict directive for strict variants,
+  and sends it through a marked request on the existing persistent native worker. The worker opens
+  it in JavaScript mode through the same TypeScript-Go bridge used by compilation and reports PASS
+  only when that parser emits a diagnostic. No path, expected filename, or test answer is baked in.
+- The complete retained negative-parse cohort is
+  `test262-results-negative-parse-2026-08-25.jsonl`: 2,372 passed, 6,078 failed, no refusals, and
+  205 module-policy skips; all 8,450 executable variants completed in 3.530 seconds after build.
+  The failures are primarily ECMAScript static-semantics/early-error rules that TypeScript-Go's
+  parser accepts and that a dedicated frontend early-error pass must diagnose.
+- Relative to the authoritative full baseline, this converts the former 4,453 one-record policy
+  skips into 8,450 actual variant outcomes. Holding other outcomes fixed gives 11,706 passes out of
+  90,377 non-skipped variants, 12.95%; the next full run is required to combine this with the class
+  checkpoint and establish the new authoritative rate. The active 30% goal remains incomplete.
+
 ## 2026-08-25: ordinary class definitions and construction reach native execution
 
 - Added stable bridge kinds and semantic class-member enumeration for class declarations,
