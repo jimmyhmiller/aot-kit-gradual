@@ -458,21 +458,32 @@
   (let [fun (n-in node 0)
         slot (n-parm-index node)
         (mut at) 0
-        (mut found) false]
+        (mut found) false
+        (mut all-fp) true]
     ;; Machine CFG discovery already retains every live ideal Call in node order. Scanning that
     ;; compact list preserves the exact query while avoiding one whole-graph pass per Parm.
-    (loop (if (or (>= (load at) (al-len [i64] (.ideal-calls (machine-unit))))
-                  (load found))
+    (loop (if (>= (load at) (al-len [i64] (.ideal-calls (machine-unit))))
               (break)
               (do
                 (let [call (al-get [i64] (.ideal-calls (machine-unit)) (load at))]
                   (if (and (> (n-nins call) (+ slot 2)) (= (n-in call 1) fun))
                     (let [actual (n-in call (+ slot 2))]
-                      (if (be-float-only? (n-ty actual)) (set! found true) 0))
+                      (do
+                        (set! found true)
+                        (if (not (be-float-only? (n-ty actual))) (set! all-fp false) 0)
+                        0))
                     0))
                 (set! at (+ (load at) 1))
                 0)))
-    (load found)))
+    ;; A parameter whose declared lattice admits tagged JavaScript values must preserve that ABI
+    ;; even if one exact caller happens to pass a float. JavaScript-callable JSL adapters are reused
+    ;; by heterogeneous dynamic sites; choosing FP from ANY caller made FunctionCall2 unbox later
+    ;; function-valued arguments as doubles. Only an untagged parameter with uniformly FP actuals
+    ;; may use an FPR.
+    (let [kinds (ty-kinds (n-ty node))]
+      (and (!= (& kinds VK-NUM) 0)
+           (and (= (& kinds (^ VK-NUM -1)) 0)
+                (and (load found) (load all-fp)))))))
 
 (defn be-fp-grow! [] (-> i64)
   (let [u (machine-unit)
@@ -2900,18 +2911,28 @@
 (defn ms-if-target [(bid i64) (arm i64)] (-> i64)
   (let [n (mu-block-succ-count bid)
         (mut i) 0
-        (mut found) -1]
-    (loop (if (or (>= (load i) n) (>= (load found) 0))
+        (mut found) -1
+        (mut fallthrough) -1
+        (mut fallthrough-count) 0]
+    (loop (if (>= (load i) n)
               (break)
               (do
                 (let [target (mu-block-succ-target bid (load i))
                       ctrl (mu-block-control target)]
                   (if (match (n-op ctrl) (CProj [label] (= label arm)) (_ false))
                       (set! found target)
-                      0))
+                      (if (not (op-is? ctrl CProj [_]))
+                          (do (set! fallthrough target)
+                              (set! fallthrough-count (+ (load fallthrough-count) 1))
+                              0)
+                          0)))
                 (set! i (+ (load i) 1))
                 0)))
-    (load found)))
+    (if (>= (load found) 0)
+        (load found)
+        (if (and (= n 2) (= (load fallthrough-count) 1))
+            (load fallthrough)
+            -1))))
 
 (defn ms-function-fp-return? [(owner i64)] (-> bool)
   (let [count (mu-function-return-count owner)
@@ -3139,7 +3160,16 @@
                     (loop (if (>= (load out) (n-nouts ctrl))
                               (break)
                               (do
-                                (n-print-flat (stderr) (n-out ctrl (load out)))
+                                (let [next (n-out ctrl (load out))
+                                      (mut nested) 0]
+                                  (n-print-flat (stderr) next)
+                                  (loop (if (>= (load nested) (n-nouts next))
+                                            (break)
+                                            (do
+                                              (n-print-flat (stderr)
+                                                            (n-out next (load nested)))
+                                              (set! nested (+ (load nested) 1))
+                                              0))))
                                 (set! out (+ (load out) 1)))))
                     0)
                   0)

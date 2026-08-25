@@ -1,3 +1,27 @@
+## 2026-08-24: large Test262 helpers clear CFG selection and AArch64 call reach
+
+- Selection now recognizes a folded guard with one explicit `CProj` side exit and one direct
+  non-projection fallthrough. A refinement-only projection with no CFG successor remains in the
+  current block so its pinned effects are scheduled without inventing a terminator. This clears
+  the default-mode `CProj.0` failure in the exact
+  `Object/getOwnPropertyDescriptor/length.js` helper case.
+- AArch64 polymorphic dispatch no longer uses `ADR` to reach generated function bodies. `ADR` has
+  a signed +/-1 MiB range, and the full Test262 helper produces about 1.42 MiB of code; the wrapped
+  target landed in the original read-only Mach-O mapping and faulted on instruction fetch. The
+  encoder now materializes a fixed-width signed delta from a local `ADR` anchor and adds it to the
+  anchor, so copied in-memory images remain position independent at any code size.
+- Native child failures now report their wait status and whether any output was observed. The
+  exact case progressed from selection failure, through bad-address status 10, to a later status 5
+  trap. Both default and strict variants reach runtime; neither is claimed as passing.
+- The remaining trap is inside `isEnumerable`: declared argument 1 (`name`, native Parm 4) arrives
+  carrying a function-tagged value and is eventually numerically unboxed. The uniform call layout
+  saves arguments before polymorphic dispatch and dispatch only clobbers x12-x17, so the next
+  investigation is the pre-call value/allocator path for that argument rather than the new
+  range-safe address materialization.
+- Retained exact result snapshots are
+  `test262-results-object-gopd-refinement-collapse-2026-08-24.jsonl` and
+  `test262-results-object-gopd-range-safe-2026-08-24.jsonl`.
+
 ## 2026-08-24: property-helper captured statics are real callables
 
 - Published zero-capture JSL callable adapters for `Object.getOwnPropertyNames` and

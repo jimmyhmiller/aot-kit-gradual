@@ -419,6 +419,24 @@
                 0)))
     0))
 
+(defn be-mov-imm-fixed! [(rd i64) (v i64)] (-> i64)
+  (be-u32! (a64-movz rd (& v 65535) 0))
+  (be-u32! (a64-movk rd (& (>> v 16) 65535) 1))
+  (be-u32! (a64-movk rd (& (>> v 32) 65535) 2))
+  (be-u32! (a64-movk rd (& (>> v 48) 65535) 3))
+  0)
+
+;; Materialize a code address without ADR's signed +/-1 MiB limit. The generated Mach-O object is
+;; copied to an arbitrary mmap base by the Darwin in-memory loader, so absolute section addresses
+;; and page-base assumptions are both wrong. ADR self plus a fixed-width signed delta is invariant
+;; under that copy and keeps instruction sizing independent of the final layout.
+(defn be-relative-code-address! [(rd i64) (scratch i64) (target i64)] (-> i64)
+  (let [here (be-code-len)]
+    (be-u32! (a64-adr rd 0))
+    (be-mov-imm-fixed! scratch (- target here))
+    (be-u32! (a64-add-reg rd rd scratch))
+    0))
+
 (defn be-mov-words [(v i64)] (-> i64)
   (let [(mut words) 1
         (mut hw) 1]
@@ -486,7 +504,7 @@
                           (set! words
                                 (+ (load words)
                                    (+ (be-mov-words symbol)
-                                      (+ 4 (be-mov-words (be-poly-return-code (load owner)))))))
+                                      (+ 9 (be-mov-words (be-poly-return-code (load owner)))))))
                           0)
                       (set! owner (+ (load owner) 1))))))
         (loop (if (>= (load fidx) 63)
@@ -498,7 +516,7 @@
                           (set! words
                                 (+ (load words)
                                    (+ (be-mov-words (load fidx))
-                                      (+ 4 (be-mov-words code))))))
+                                      (+ 9 (be-mov-words code))))))
                         0)
                     (set! fidx (+ (load fidx) 1))))))
     (load words)))
@@ -1208,7 +1226,7 @@
                                                           (be-u32! (a64-cmp-reg 16 15))
                                                           (if (< target-off 0)
                                                               (be-u32! (a64-brk))
-                                                              (be-u32! (a64-adr 17 (- target-off (be-code-len)))))
+                                                              (be-relative-code-address! 17 15 target-off))
                                                           (be-u32! (a64-csel 13 17 13 0))
                                                           (be-mov-imm! 15 (be-poly-return-code (load owner-i)))
                                                           (be-u32! (a64-csel 12 15 12 0))
@@ -1232,7 +1250,7 @@
                                                     (be-u32! (a64-cmp-reg 16 15))
                                                     (if (< target-off 0)
                                                         (be-u32! (a64-brk))
-                                                        (be-u32! (a64-adr 17 (- target-off (be-code-len)))))
+                                                        (be-relative-code-address! 17 15 target-off))
                                                     (be-u32! (a64-csel 13 17 13 0))
                                                     (let [return-code
                                                             (if (< target-owner 0)

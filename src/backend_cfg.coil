@@ -43,6 +43,8 @@
   (let [len (n-nouts ctrl)
         (mut i) 0
         (mut found) NO-NODE
+        (mut found-if) NO-NODE
+        (mut if-count) 0
         (mut count) 0]
     (loop (if (>= (load i) len)
               (break)
@@ -51,8 +53,42 @@
                   (if (and (not (n-dead? u))
                            (and (be-cfg-control? (n-op u)) (> (n-nins u) 0)))
                       (if (be-has-input? u ctrl)
-                          (do (set! found u) (set! count (+ (load count) 1)) 0)
+                          (do
+                            (set! found u)
+                            (set! count (+ (load count) 1))
+                            (if (op-is? u If [])
+                                (do (set! found-if u)
+                                    (set! if-count (+ (load if-count) 1))
+                                    0)
+                                0)
+                            0)
                           0)
+                      0))
+                (set! i (+ (load i) 1))
+                0)))
+    ;; A folded guard can retain one explicit exceptional CProj while its normal arm is rewired
+    ;; directly to the guard's input control. Follow the If first; mu-walk-block! reconnects the
+    ;; unique direct consumer as the missing arm's fallthrough.
+    (if (= (load count) 1)
+        (load found)
+        (if (and (= (load count) 2) (= (load if-count) 1))
+            (load found-if)
+            NO-NODE))))
+
+(defn be-ctrl-succ-except [(ctrl i64) (skip i64)] (-> i64)
+  (let [len (n-nouts ctrl)
+        (mut i) 0
+        (mut found) NO-NODE
+        (mut count) 0]
+    (loop (if (>= (load i) len)
+              (break)
+              (do
+                (let [u (n-out ctrl (load i))]
+                  (if (and (!= u skip)
+                           (and (not (n-dead? u))
+                                (and (be-cfg-control? (n-op u))
+                                     (and (> (n-nins u) 0) (be-has-input? u ctrl)))))
+                      (do (set! found u) (set! count (+ (load count) 1)) 0)
                       0))
                 (set! i (+ (load i) 1))
                 0)))
@@ -151,26 +187,47 @@
                             (al-set! [i64] (field u ctrl-block) (load ctrl) bid)
                             (match (n-op (load ctrl))
                               (Return [] (do (mu-note-return! owner (load ctrl)) (set! done true)))
-                              (If [] (let [a (be-if-arm (load ctrl) 0)
-                                        b (be-if-arm (load ctrl) 1)]
-                                    (if (!= a NO-NODE)
+                              (If [] (let [a-arm (be-if-arm (load ctrl) 0)
+                                        b-arm (be-if-arm (load ctrl) 1)
+                                        fallthrough
+                                          (if (or (= a-arm NO-NODE) (= b-arm NO-NODE))
+                                              (be-ctrl-succ-except (n-in (load ctrl) 0)
+                                                                   (load ctrl))
+                                              NO-NODE)
+                                        a (if (= a-arm NO-NODE) fallthrough a-arm)
+                                        b (if (= b-arm NO-NODE) fallthrough b-arm)
+                                        a-incoming
+                                          (if (= a-arm NO-NODE) (n-in (load ctrl) 0) a-arm)
+                                        b-incoming
+                                          (if (= b-arm NO-NODE) (n-in (load ctrl) 0) b-arm)]
+                                    (if (and (!= a-arm NO-NODE)
+                                             (and (!= fallthrough NO-NODE)
+                                                  (= (be-ctrl-succ a-arm) NO-NODE)))
+                                        (al-set! [i64] (field u ctrl-block) a-arm bid)
+                                        (if (and (!= a NO-NODE)
+                                                 (or (!= a-arm NO-NODE) (!= b-arm NO-NODE)))
                                         (do
                                           (mu-walk-block! owner a)
                                           (mu-add-edge! owner
                                                         bid
                                                         (al-get (.ctrl-block u) a)
-                                                        0)
+                                                        (mu-target-slot a a-incoming))
                                           0)
-                                        0)
-                                    (if (!= b NO-NODE)
+                                        0))
+                                    (if (and (!= b-arm NO-NODE)
+                                             (and (!= fallthrough NO-NODE)
+                                                  (= (be-ctrl-succ b-arm) NO-NODE)))
+                                        (al-set! [i64] (field u ctrl-block) b-arm bid)
+                                        (if (and (!= b NO-NODE)
+                                                 (or (!= a-arm NO-NODE) (!= b-arm NO-NODE)))
                                         (do
                                           (mu-walk-block! owner b)
                                           (mu-add-edge! owner
                                                         bid
                                                         (al-get (.ctrl-block u) b)
-                                                        0)
+                                                        (mu-target-slot b b-incoming))
                                           0)
-                                        0)
+                                        0))
                                     (set! done true)))
                               (_ (let [next (be-ctrl-succ (load ctrl))]
                                       (if (= next NO-NODE)
