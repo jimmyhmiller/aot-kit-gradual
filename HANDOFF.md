@@ -16,8 +16,14 @@
   161 remain failures, with zero regressions. The gains include both modes of Math receivers for
   `every`, `filter`, `forEach`, `indexOf`, `lastIndexOf`, `map`, `reduce`, `reduceRight`, and
   `some`.
+- The complete adjacent authoritative-baseline cohort containing a direct borrowed
+  `Object.prototype.toString.call(...)` is retained in
+  `test262-results-object-prototype-tostring-v1-2026-08-25.jsonl`: 48 of 546 prior nonpasses now
+  pass. Fourteen overlap the Math cohort, so the two exhaustive targeted cohorts prove 94 unique
+  failed-to-passed transitions for this implementation, not 108.
 - `coil test` is green at 48/48. The active 30% full Test262 goal remains incomplete; these 60
-  targeted gains are not presented as a new authoritative full-suite percentage.
+  Math-cohort gains and 94 unique combined targeted gains are not presented as a new authoritative
+  full-suite percentage.
 
 ## 2026-08-25: literal computed and static public fields add 20 passes
 
