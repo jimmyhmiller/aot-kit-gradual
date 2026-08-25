@@ -276,6 +276,8 @@ func stableKindCode(kind ast.Kind) int32 {
 	case ast.KindPropertyAssignment: return 303
 	case ast.KindMethodDeclaration: return 304
 	case ast.KindShorthandPropertyAssignment: return 305
+	case ast.KindGetAccessor: return 311
+	case ast.KindSetAccessor: return 312
 	case ast.KindSourceFile: return 307
 	default: return 0
 	}

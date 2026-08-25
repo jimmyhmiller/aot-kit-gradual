@@ -2374,11 +2374,14 @@
                                                     (shape-field-alias shape (+ (load i) 1))))
                                 (set! i (+ (load i) 1))
                                 0)))
-                    (set! (load (field context memory)) (fng-preserve-active-memory context (fng-merge stores)))
-                    (let [answer (n-materialized-closure! target object (al-slice [i64] (load captures)))]
+                    (let [initialized (fng-merge stores)
+                          published (fng-preserve-active-memory context initialized)]
+                      (set! (load (field context memory)) published)
+                    (let [answer (n-materialized-closure! target object published
+                                                          (al-slice [i64] (load captures)))]
                       (al-free! [i64] (mut incoming))
                       (al-free! [i64] (mut stores))
-                      answer)))))]
+                      answer))))))]
       (al-free! [i64] (mut captures))
       closure)))
 
@@ -5529,7 +5532,9 @@
               (let [property (ts-child ast node (load index))]
                 (if (or (or (= (ts-kind ast property) TSK-PROPERTY-ASSIGNMENT)
                             (or (= (ts-kind ast property) TSK-METHOD-DECLARATION)
-                                (= (ts-kind ast property) TSK-SHORTHAND-PROPERTY-ASSIGNMENT)))
+                                (or (= (ts-kind ast property) TSK-SHORTHAND-PROPERTY-ASSIGNMENT)
+                                    (or (= (ts-kind ast property) TSK-GET-ACCESSOR)
+                                        (= (ts-kind ast property) TSK-SET-ACCESSOR)))))
                         (and allow-spread (fng-object-spread-element? ast property)))
                     0
                     (fng-unsupported-syntax! "object literal element"
@@ -5672,19 +5677,34 @@
                       (let [name-node (ts-child ast property 0)
                             value-node (fe-object-property-value-node ast property)
                             computed (= (ts-kind ast name-node) TSK-COMPUTED-PROPERTY-NAME)
-                            key (if computed (fng-expression context (ts-child ast name-node 0)) NO-NODE)
+                            key (if computed
+                                    (fng-expression context (ts-child ast name-node 0))
+                                    (n-string-const!
+                                      (jss-from-utf8! (fng-nonindex-key-text ast name-node))))
                             value (fng-expression context value-node)
+                            accessor-value
+                              (if (or (= (ts-kind ast property) TSK-GET-ACCESSOR)
+                                      (= (ts-kind ast property) TSK-SET-ACCESSOR))
+                                  (fng-box-dynamic-argument! value)
+                                  value)
                             probe (if (= value NO-NODE)
                                       (panic-corrupt (ts-text ast name-node))
                                       0)
                             stored
-                              (if computed
-                                  (fng-jsl-call3 context "SetProperty" object key value)
-                                  (fng-jsl-call3 context "SetNamedProperty" object
-                                                 (fng-const
-                                                   (shape-name-intern!
-                                                     (fng-nonindex-key-text ast name-node)))
-                                                 value))]
+                              (cond (= (ts-kind ast property) TSK-GET-ACCESSOR)
+                                      (fng-jsl-call3 context "DefineGetterProperty"
+                                                     object key accessor-value)
+                                    (= (ts-kind ast property) TSK-SET-ACCESSOR)
+                                      (fng-jsl-call3 context "DefineSetterProperty"
+                                                     object key accessor-value)
+                                    computed
+                                      (fng-jsl-call3 context "SetProperty" object key value)
+                                    :else
+                                      (fng-jsl-call3 context "SetNamedProperty" object
+                                                     (fng-const
+                                                       (shape-name-intern!
+                                                         (fng-nonindex-key-text ast name-node)))
+                                                     value))]
                         0)))
                 (set! index (+ (load index) 1)))))
     object))

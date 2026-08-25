@@ -1,3 +1,23 @@
+## 2026-08-25: object-literal accessors execute through DSL descriptor semantics
+
+- Added TypeScript bridge/indexing support for object-literal getter and setter declarations. The
+  frontend builds callable values and routes definitions through new DSL-owned
+  `DefineGetterProperty` / `DefineSetterProperty` operations; ordinary `GetProperty` and
+  `SetProperty` remain the only implementation of invocation semantics.
+- Fixed the generic materialized-closure publication contract exposed by captured accessors. A
+  closure now carries an explicit memory dependency covering its initialized environment and all
+  preserved active capture state. Verification checks that dependency and selection schedules it
+  before exposing the environment pointer. Previously exact source calls masked the race by
+  threading logical captures directly, while a DSL polymorphic call could read a zero
+  `__closure_target` and trap.
+- Added a native differential witness combining a captured getter, captured setter mutation, and
+  receiver property reads. It agrees with Node for `main(7) == 25`.
+- The complete `language/expressions/object` cohort is retained in
+  `test262-results-2026-08-25T06-01-15-992Z.jsonl`: 1,518 variants completed in 107.464 seconds with
+  144 passed, 1,272 failed, 102 refused, and 387 policy-skipped. Against the prior retained cohort,
+  50 moved refused-to-passed, 37 moved refused-to-failed, and no passing variant regressed.
+- Gate: `coil test` passed 48/48.
+
 ## 2026-08-25: Function callable values cross one unambiguous tagged ABI
 
 - Removed the numeric collision between dynamic-receiver calls and captured-callable layouts by
