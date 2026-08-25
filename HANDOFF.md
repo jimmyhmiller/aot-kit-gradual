@@ -2659,3 +2659,15 @@ and use `call-dynamic-with-receiver`, matching `map`, `filter`, `forEach`, `some
   `test262-results-arrow-dstr-defaults-v3-2026-08-25.jsonl`; the net gain is 20 variants.
 - The bounded gate remains 48/48 green. The remaining cohort is dominated by 204 native status-5
   failures, now the next shared execution target rather than being hidden as missing defaults.
+# 2026-08-25: Generic closure calls now pass the materialized environment ABI
+
+- A materialized closure is tagged `JSV-CLOSURE`, but callable entry unboxed hidden slot 0 as an
+  object and then as a bare `JSV-FUNCTION`. Both are wrong: the closure tag's payload is the
+  environment object. Callable entry now validates/strips the closure tag and casts that payload
+  to the statically known environment shape before loading captured cells.
+- This is compiler structure, not JavaScript meaning: no operation moved out of `lib/`. Selection
+  maps the sole `Unbox(t-fun)` environment seam to `JSV-CLOSURE`, so both AArch64 and x86-64 use
+  their existing checked-unbox instruction.
+- The complete arrow destructuring cohort moved from 156/454 to 294/454 passing, a gain of 138
+  variants in `test262-results-arrow-dstr-call-env-v5-2026-08-25.jsonl`. The previously dominant
+  204 status-5 traps largely became passes or honest iterator/getter semantic failures.
