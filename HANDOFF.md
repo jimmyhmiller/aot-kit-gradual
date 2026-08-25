@@ -1,3 +1,20 @@
+## 2026-08-25: authoritative full-suite baseline after binding-pattern work
+
+- Completed all 93,209 generated Test262 variants and retained every result in
+  `test262-results-current-full-2026-08-25.jsonl` plus its machine-readable `.summary.json`.
+  Outcomes are 9,334 passed, 53,774 failed, 18,819 refused, and 11,282 policy-skipped. Among the
+  81,927 non-skipped variants, 11.39% pass; reaching the active 30% goal requires 24,579 passes,
+  or 15,245 more than this baseline.
+- The run took 1,701.370 seconds: 7.576 seconds of one-time build and 1,693.794 seconds executing
+  the corpus. This supersedes the 2026-08-24 full-run baseline of 7,663 passes and 22,799 refusals.
+- Current top mutually exclusive failure categories are pipeline execution (37,263), bridge kind
+  zero (16,440), frontend unsupported syntax/code 1001 (10,742), selection (894), AArch64 encoding
+  (630), and SIGSEGV (1,807). Class declarations and expressions account for 9,691 bridge-kind-zero
+  refusals, making ordinary class support the next structural target. The implementation trace
+  confirms existing constructor/prototype machinery can be reused, but class binding, constructor
+  synthesis, method publication, resolution, and source-order execution must be added together;
+  merely assigning bridge enum values would only turn refusals into later failures.
+
 ## 2026-08-25: binding-pattern expressions participate in lexical resolution
 
 - Added a structural resolution walk for computed property names and binding-element initializers.

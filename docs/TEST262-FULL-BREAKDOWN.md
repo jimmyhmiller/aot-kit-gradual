@@ -1,5 +1,28 @@
 # Full Test262 Breakdown
 
+## Current authoritative baseline: 2026-08-25
+
+The retained current run supersedes the detailed 2026-08-24 baseline below. It completed the same
+93,209 generated variants with 9,334 passed, 53,774 failed, 18,819 refused, and 11,282
+policy-skipped. Among 81,927 non-skipped variants, the pass rate is 11.39%. The active 30% target is
+24,579 passing variants, so this baseline is 15,245 passes short.
+
+Timing was 7.576 seconds of one-time build and 1,693.794 seconds of execution, 1,701.370 seconds
+total. The largest current mutually exclusive categories are pipeline execution (37,263), frontend
+bridge kind zero (16,440), frontend code 1001 (10,742), async policy skips (5,523), negative-parse
+policy skips (4,453), SIGSEGV (1,807), bridge kind 214 (1,091), graph `NO-NODE` argument zero
+(996), selection (894), module policy skips (843), and AArch64 encoding (630).
+
+The next structural target is ordinary classes: `language/statements/class` has 5,130 refusals and
+`language/expressions/class` has 4,561, nearly all in bridge kind zero. The current raw records and
+machine summary are:
+
+- `test262-results-current-full-2026-08-25.jsonl`
+- `test262-results-current-full-2026-08-25.jsonl.summary.json`
+
+The sections below remain the complete analysis of the prior run and are retained for comparison;
+their counts must not be treated as current.
+
 Run date: 2026-08-24
 
 This is the complete runner-policy corpus, not a sample: all 93,209 generated variants. The runner still policy-skips modules, async completion, negative parse/runtime phases, and tests requiring `$262`.
