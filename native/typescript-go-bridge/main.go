@@ -140,6 +140,7 @@ func (parsed *parseResult) addJavaScriptModeDiagnostics() {
 		parsed.addAsyncArrowEarlyErrors(n)
 		parsed.addLexicalDeclarationEarlyErrors(n)
 		parsed.addStrictBindingEarlyErrors(n)
+		parsed.addStrictStatementEarlyErrors(n)
 		parsed.addControlContextEarlyErrors(n)
 		parsed.addDestructuringEarlyErrors(n)
 	}
@@ -1505,6 +1506,24 @@ func (parsed *parseResult) strictAt(node *ast.Node) bool {
 		if ast.IsFunctionLike(current) && functionHasUseStrict(current) { return true }
 	}
 	return false
+}
+
+func (parsed *parseResult) addStrictStatementEarlyErrors(node *ast.Node) {
+	if !parsed.strictAt(node) { return }
+	if node.Kind == ast.KindWithStatement {
+		parsed.addJavaScriptDiagnostic(node, 90066)
+	}
+	if node.Kind == ast.KindDeleteExpression &&
+		isParenthesizedIdentifierReference(node.AsDeleteExpression().Expression) {
+		parsed.addJavaScriptDiagnostic(node, 90067)
+	}
+}
+
+func isParenthesizedIdentifierReference(node *ast.Node) bool {
+	for node != nil && node.Kind == ast.KindParenthesizedExpression {
+		node = node.AsParenthesizedExpression().Expression
+	}
+	return node != nil && node.Kind == ast.KindIdentifier
 }
 
 func simpleParameterList(node *ast.Node) bool {

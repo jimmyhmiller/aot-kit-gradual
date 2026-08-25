@@ -105,6 +105,13 @@ int main(int argc, char **argv) {
   require(aot_ts_script_kind(js) == AOT_TS_SCRIPT_JS && aot_ts_script_kind(ts) == AOT_TS_SCRIPT_TS, "mode retained");
   aot_ts_parse_delete(js); aot_ts_parse_delete(ts);
 
+  const char *strict_early_errors = "\"use strict\"; with ({}) {} delete ((identifier));";
+  AotTsParse strict_parse = aot_ts_parse_ex(strict_early_errors,
+    (int32_t)strlen(strict_early_errors), "strict.js", 9, AOT_TS_SCRIPT_JS);
+  require(aot_ts_diagnostic_count(strict_parse) >= 2,
+    "strict with and parenthesized identifier delete rejected");
+  aot_ts_parse_delete(strict_parse);
+
   const char *operators = "var x=1,o={}; x += 2; ++x; x--; typeof x; delete o.x; void (x += 3); o?.x; o?.[x]; x?.(); `plain`; `a${x}b`; (a) => { return a; }; true; null;";
   AotTsParse operator_parse = aot_ts_parse_ex(operators, (int32_t)strlen(operators), "operators.js", 12, AOT_TS_SCRIPT_JS);
   require(find_operator(operator_parse, "PlusEquals") >= 0, "assignment operator API");

@@ -2781,3 +2781,16 @@ and use `call-dynamic-with-receiver`, matching `map`, `filter`, `forEach`, `some
 - A direct `for ([a, b] of [[...]])` witness exposed a separate selection defect: an effect-only
   iterator-result branch leaves `PropStoreKey` pinned to a `CProj` absent from the machine CFG.
   That witness is not checked in as green; the persisted cohort is the evidence for this step.
+# 2026-08-25: strict `with` and identifier deletion are parser early errors (+9 Test262)
+
+- The JavaScript-mode TypeScript bridge now diagnoses `with` statements in strict code and strict
+  `delete IdentifierReference`, including arbitrarily parenthesized identifier references. These
+  are syntax-directed early errors, so they belong in the parser bridge rather than `lib/**/*.jsl`:
+  no JavaScript operation is evaluated when either source form is validly rejected.
+- `tests/typescript-js-abi-test.c` pins both diagnostics in the bounded bridge gate.
+- Exact targeted result is
+  `test262-results-strict-with-delete-v4-2026-08-25.jsonl`: 9 passed, 0 failed, 0 refused,
+  0 skipped. The same nine variants were failures before this change.
+- `coil test`: 48 passed, 0 failed.
+- `coil test --suite frontier`: expected two open bugs remain
+  (`for-await-has-no-bridge-kind`, `shortest-round-trip-digits`).
