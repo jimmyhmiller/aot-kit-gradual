@@ -1689,12 +1689,18 @@ func (parsed *parseResult) addFormalParameterEarlyErrors(node *ast.Node) {
 	parameters := node.Parameters()
 	strict := parsed.strictAt(node)
 	simple := simpleParameterList(node)
+	if node.Kind == ast.KindGetAccessor && len(parameters) != 0 {
+		parsed.addJavaScriptDiagnostic(node, 90081)
+	}
 	if !simple && functionHasUseStrict(node) {
 		parsed.addJavaScriptDiagnostic(node, 90009)
 	}
 	seen := make(map[string]*ast.Node)
 	for i, parameter := range parameters {
 		data := parameter.AsParameterDeclaration()
+		if containsYieldExpression(parameter) || strict && containsIdentifierReference(parameter, "yield") {
+			parsed.addJavaScriptDiagnostic(parameter, 90082)
+		}
 		if data.DotDotDotToken != nil {
 			if data.Initializer != nil || i != len(parameters)-1 ||
 				i == len(parameters)-1 && node.ParameterList().HasTrailingComma() {

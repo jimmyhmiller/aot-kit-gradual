@@ -2872,3 +2872,13 @@ and use `call-dynamic-with-receiver`, matching `map`, `filter`, `forEach`, `some
   `test262-results-negative-parse-current-v10-2026-08-25.jsonl`: 8,135 passed, 81 failed,
   0 refused, 204 skipped among 8,216 variants. Relative to v9: 112 failed-to-passed,
   8,023 passed-to-passed, 81 failed-to-failed, 204 skipped-to-skipped, zero regressions.
+# 2026-08-25: formal parameters enforce getter arity and yield context (+18 Test262)
+
+- Getter definitions now reject every non-empty formal parameter list, including defaulted
+  parameters that the upstream parser had accepted during recovery.
+- Every function-like parameter is rejected when it contains a `YieldExpression`; strict parameter
+  expressions also reject `yield` represented as an IdentifierReference. Sloppy
+  `var yield; function f(x = yield) {}` remains accepted and is pinned as a bounded control.
+- Full negative-parse result `test262-results-negative-parse-current-v11-2026-08-25.jsonl`:
+  8,153 passed, 63 failed, 0 refused, 204 skipped. Relative to v10: 18 failed-to-passed,
+  8,135 passed-to-passed, 63 failed-to-failed, 204 skipped-to-skipped, zero regressions.

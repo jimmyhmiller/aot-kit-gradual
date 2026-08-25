@@ -218,6 +218,19 @@ int main(int argc, char **argv) {
     "sloppy eval assignment remains accepted");
   aot_ts_parse_delete(sloppy_eval_parse);
 
+  const char *formal_early_errors = "class C { get x(value = 1) {} m(value = yield) {} }";
+  AotTsParse formal_early_parse = aot_ts_parse_ex(formal_early_errors,
+    (int32_t)strlen(formal_early_errors), "formal-errors.js", 16, AOT_TS_SCRIPT_JS);
+  require(aot_ts_diagnostic_count(formal_early_parse) >= 2,
+    "getter arity and strict yield parameter references rejected");
+  aot_ts_parse_delete(formal_early_parse);
+  const char *sloppy_yield_parameter = "var yield = 1; function f(value = yield) {}";
+  AotTsParse sloppy_yield_parameter_parse = aot_ts_parse_ex(sloppy_yield_parameter,
+    (int32_t)strlen(sloppy_yield_parameter), "sloppy-yield.js", 15, AOT_TS_SCRIPT_JS);
+  require(aot_ts_diagnostic_count(sloppy_yield_parameter_parse) == 0,
+    "sloppy yield parameter reference remains accepted");
+  aot_ts_parse_delete(sloppy_yield_parameter_parse);
+
   const char *operators = "var x=1,o={}; x += 2; ++x; x--; typeof x; delete o.x; void (x += 3); o?.x; o?.[x]; x?.(); `plain`; `a${x}b`; (a) => { return a; }; true; null;";
   AotTsParse operator_parse = aot_ts_parse_ex(operators, (int32_t)strlen(operators), "operators.js", 12, AOT_TS_SCRIPT_JS);
   require(find_operator(operator_parse, "PlusEquals") >= 0, "assignment operator API");
