@@ -116,10 +116,90 @@ func (parsed *parseResult) addJavaScriptModeDiagnostics() {
 			}
 		}
 		if forbidden != nil {
-			start := scanner.SkipTrivia(parsed.source, forbidden.Pos())
-			parsed.diagnosticCodes = append(parsed.diagnosticCodes, 90001)
-			parsed.diagnosticStarts = append(parsed.diagnosticStarts, int32(start))
-			parsed.diagnosticLengths = append(parsed.diagnosticLengths, int32(forbidden.End()-start))
+			parsed.addJavaScriptDiagnostic(forbidden, 90001)
+		}
+		parsed.addDynamicImportEarlyErrors(n)
+	}
+}
+
+func (parsed *parseResult) addJavaScriptDiagnostic(node *ast.Node, code int32) {
+	start := scanner.SkipTrivia(parsed.source, node.Pos())
+	parsed.diagnosticCodes = append(parsed.diagnosticCodes, code)
+	parsed.diagnosticStarts = append(parsed.diagnosticStarts, int32(start))
+	parsed.diagnosticLengths = append(parsed.diagnosticLengths, int32(node.End()-start))
+}
+
+func isImportMeta(node *ast.Node) bool {
+	return node != nil && node.Kind == ast.KindMetaProperty &&
+		node.AsMetaProperty().KeywordToken == ast.KindImportKeyword
+}
+
+func importMetaName(node *ast.Node) string {
+	if !isImportMeta(node) { return "" }
+	return node.AsMetaProperty().Name().Text()
+}
+
+func isAnyImportCall(node *ast.Node) bool {
+	if node == nil || node.Kind != ast.KindCallExpression { return false }
+	expression := node.AsCallExpression().Expression
+	return expression.Kind == ast.KindImportKeyword || isImportMeta(expression)
+}
+
+func containsImportCall(node *ast.Node) bool {
+	if node == nil { return false }
+	if isAnyImportCall(node) { return true }
+	found := false
+	node.ForEachChild(func(child *ast.Node) bool {
+		if containsImportCall(child) { found = true; return true }
+		return false
+	})
+	return found
+}
+
+func (parsed *parseResult) addDynamicImportEarlyErrors(node *ast.Node) {
+	if node.Kind == ast.KindImportKeyword {
+		parent := node.Parent
+		valid := parent != nil &&
+			(parent.Kind == ast.KindCallExpression && parent.AsCallExpression().Expression == node ||
+				isImportMeta(parent))
+		if !valid { parsed.addJavaScriptDiagnostic(node, 90002) }
+	}
+	if isImportMeta(node) {
+		parent := node.Parent
+		name := importMetaName(node)
+		callName := name == "defer" || name == "source"
+		valid := name == "meta" || callName && parent != nil &&
+			parent.Kind == ast.KindCallExpression && parent.AsCallExpression().Expression == node
+		if !valid {
+			parsed.addJavaScriptDiagnostic(node, 90002)
+		}
+	}
+	if isAnyImportCall(node) {
+		arguments := node.AsCallExpression().Arguments.Nodes
+		invalid := len(arguments) < 1 || len(arguments) > 2
+		for _, argument := range arguments {
+			if argument.Kind == ast.KindSpreadElement { invalid = true }
+		}
+		if invalid { parsed.addJavaScriptDiagnostic(node, 90002) }
+	}
+	if node.Kind == ast.KindNewExpression && containsImportCall(node.AsNewExpression().Expression) {
+		parsed.addJavaScriptDiagnostic(node, 90002)
+	}
+	if node.Kind == ast.KindBinaryExpression {
+		binary := node.AsBinaryExpression()
+		if ast.IsAssignmentOperator(binary.OperatorToken.Kind) && containsImportCall(binary.Left) {
+			parsed.addJavaScriptDiagnostic(binary.Left, 90002)
+		}
+	}
+	if node.Kind == ast.KindPostfixUnaryExpression &&
+		containsImportCall(node.AsPostfixUnaryExpression().Operand) {
+		parsed.addJavaScriptDiagnostic(node, 90002)
+	}
+	if node.Kind == ast.KindPrefixUnaryExpression {
+		prefix := node.AsPrefixUnaryExpression()
+		if (prefix.Operator == ast.KindPlusPlusToken || prefix.Operator == ast.KindMinusMinusToken) &&
+			containsImportCall(prefix.Operand) {
+			parsed.addJavaScriptDiagnostic(node, 90002)
 		}
 	}
 }

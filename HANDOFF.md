@@ -1,3 +1,21 @@
+## 2026-08-25: dynamic import early errors are checked structurally
+
+- Added JavaScript-mode AST early errors for dynamic import grammar: bare `import`, unsupported
+  `import.NAME` forms, invalid argument counts, spread arguments, construction with `new`, and use
+  as assignment or update targets. Checks use TypeScript-Go node kinds, parent links, call
+  expressions, argument nodes, and assignment operators; no Test262 paths or expected outcomes are
+  consulted.
+- The complete retained dynamic-import negative cohort is
+  `test262-results-negative-parse-dynamic-import-complete-2026-08-25.jsonl`: 716 passed and one
+  failed across 717 variants. The only remaining failure is `yield` used as the import-options
+  expression, which belongs to the general context-sensitive yield early-error pass.
+- The complete negative-parse corpus was rerun and retained in
+  `test262-results-negative-parse-dynamic-import-checkpoint-2026-08-25.jsonl`: 2,806 passed, 5,644
+  failed, no refusals, and 205 module-policy skips. Against the parser-only checkpoint, exactly 434
+  variants moved failed-to-passed and no pass was lost. Holding the previous full-run outcomes
+  fixed projects 12,140 passes among 90,377 non-skipped variants, or 13.43%; a full run is still
+  required to combine all post-baseline changes authoritatively.
+
 ## 2026-08-25: negative parse tests execute against the real frontend parser
 
 - Negative parse metadata is no longer blanket-skipped. The runner assembles the original source
