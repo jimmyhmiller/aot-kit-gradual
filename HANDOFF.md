@@ -1,3 +1,15 @@
+## 2026-08-25: deleting a private reference is an early error
+
+- Added the ECMAScript early error for `delete` applied to a private-reference property access.
+  Parentheses are unwrapped structurally, and the property name must be an AST private identifier;
+  the check is independent of class shape, member spelling, and Test262 path.
+- The complete negative-parse corpus is retained in
+  `test262-results-negative-parse-private-delete-checkpoint-2026-08-25.jsonl`: 4,877 passed, 3,573
+  failed, no refusals, and 205 module-policy skips. Exactly 384 variants moved to passing from the
+  binding-rest checkpoint, with no lost pass.
+- Holding the authoritative full baseline's other outcomes fixed now projects 14,211 passes among
+  90,377 non-skipped variants, or 15.72%. The active 30% goal remains incomplete.
+
 ## 2026-08-25: binding rest grammar is checked once for every syntax context
 
 - Added JavaScript-mode early errors for the two universal binding-rest invariants: a rest element

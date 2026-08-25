@@ -121,6 +121,7 @@ func (parsed *parseResult) addJavaScriptModeDiagnostics() {
 		parsed.addDynamicImportEarlyErrors(n)
 		parsed.addAssignmentTargetEarlyErrors(n)
 		parsed.addBindingRestEarlyErrors(n)
+		parsed.addPrivateDeleteEarlyErrors(n)
 	}
 }
 
@@ -244,6 +245,22 @@ func (parsed *parseResult) addBindingRestEarlyErrors(node *ast.Node) {
 	elements := parent.AsBindingPattern().Elements.Nodes
 	if len(elements) > 0 && elements[len(elements)-1] != node {
 		parsed.addJavaScriptDiagnostic(node, 90004)
+	}
+}
+
+func unwrapParenthesized(node *ast.Node) *ast.Node {
+	for node != nil && node.Kind == ast.KindParenthesizedExpression {
+		node = node.AsParenthesizedExpression().Expression
+	}
+	return node
+}
+
+func (parsed *parseResult) addPrivateDeleteEarlyErrors(node *ast.Node) {
+	if node.Kind != ast.KindDeleteExpression { return }
+	target := unwrapParenthesized(node.AsDeleteExpression().Expression)
+	if target != nil && target.Kind == ast.KindPropertyAccessExpression &&
+		target.Name() != nil && target.Name().Kind == ast.KindPrivateIdentifier {
+		parsed.addJavaScriptDiagnostic(target, 90005)
 	}
 }
 
