@@ -1975,6 +1975,7 @@ func roleNode(n *ast.Node, role int32, index int32) *ast.Node {
 		case ast.KindParameter: return n.AsParameterDeclaration().Initializer
 		case ast.KindBindingElement: return n.AsBindingElement().Initializer
 		case ast.KindPropertyAssignment: return n.AsPropertyAssignment().Initializer
+		case ast.KindPropertyDeclaration: return n.AsPropertyDeclaration().Initializer
 		case ast.KindForStatement: return n.AsForStatement().Initializer
 		case ast.KindForInStatement, ast.KindForOfStatement: return n.AsForInOrOfStatement().Initializer
 		}
@@ -2090,13 +2091,15 @@ func roleNode(n *ast.Node, role int32, index int32) *ast.Node {
 		if n.Kind == ast.KindCatchClause && index == 0 { return n.AsCatchClause().VariableDeclaration }
 	case 28: // classic for-loop incrementor
 		if n.Kind == ast.KindForStatement && index == 0 { return n.AsForStatement().Incrementor }
+	case 29: // static class element marker
+		if index == 0 && ast.HasStaticModifier(n) { return n }
 	}
 	return nil
 }
 
 //export aot_ts_node_role
 func aot_ts_node_role(raw C.uintptr_t, id C.int32_t, role C.int32_t, index C.int32_t) C.int32_t {
-	parsed := result(raw); n := node(parsed, id); if n == nil || role < 1 || role > 28 { return -1 }
+	parsed := result(raw); n := node(parsed, id); if n == nil || role < 1 || role > 29 { return -1 }
 	target := roleNode(n, int32(role), int32(index)); if target == nil { return -1 }
 	targetID, ok := parsed.nodeIDs[target]; if !ok { return -1 }
 	return C.int32_t(targetID)

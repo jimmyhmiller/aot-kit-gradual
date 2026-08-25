@@ -1,3 +1,22 @@
+## 2026-08-25: public instance fields initialize through the JavaScript DSL
+
+- Class declarations and expressions now admit the deliberately bounded public-instance-field
+  subset: identifier, string, and numeric names with optional initializers. The frontend only
+  preserves class-member structure and initialization order. `DefineField` in
+  `lib/abstract/property.jsl` owns the JavaScript operation, including `ToPropertyKey` and
+  `%DefinePropertyValue`, so inherited setters are not invoked. Static, computed, private, and
+  derived-class fields remain explicit unsupported boundaries rather than acquiring partial
+  semantics.
+- A native differential witness pins field initialization before the constructor body. Across the
+  complete class-expression and class-statement subtrees, 46 prior failures become passes, 2,495
+  prior passes remain passes, and no pass regresses. The retained artifacts are
+  `test262-results-class-expressions-fields-v1-2026-08-25.jsonl` (22 gains) and
+  `test262-results-class-statements-fields-v1-2026-08-25.jsonl` (24 gains).
+- The broader admission also exposes downstream work rather than hiding it: 212 prior frontend
+  refusals now reach execution or later compiler phases, including 141 `SIGSEGV` results and nine
+  graph/selection failures across the two cohorts. The active 30% full Test262 goal remains
+  incomplete.
+
 ## 2026-08-25: classic for loops preserve omitted clauses
 
 - Classic `for` lowering indexed the compact AST child list as initializer, condition, increment,
