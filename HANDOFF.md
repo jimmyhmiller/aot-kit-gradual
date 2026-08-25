@@ -1,3 +1,20 @@
+## 2026-08-25: restricted identifiers and switch/loop grammar add 11 passes
+
+- JavaScript bridge static semantics now reject `yield` as an identifier reference or label in
+  strict code, `async` as the expression left side of a `for-of` head, and a second default clause
+  in one switch statement. These checks operate on parser structure and execution context only;
+  they do not implement JavaScript operations outside the DSL.
+- The complete parse-negative corpus in
+  `test262-results-negative-parse-current-v17-2026-08-25.jsonl` has 8,199 passes, 17 failures, and
+  204 policy skips. Against v16, exactly 11 failures become passes, all 8,188 existing passes remain
+  passes, and no result regresses. The gains are seven strict-`yield` variants, two `async` for-of
+  variants, and two duplicate-switch-default variants.
+- Restricted-line-break checks for `throw` and arrow syntax were investigated but not retained:
+  the upstream parser does not construct the corresponding statement/function nodes after those
+  grammar errors, so node-local checks were unreachable and produced zero transitions. Those
+  cases require scanner-level recovery rather than pretend AST coverage. The bounded gate remains
+  green at 48/48. The active 30% full Test262 goal remains incomplete.
+
 ## 2026-08-25: missing JavaScript early errors add 9 passes
 
 - The TypeScript parser accepts several JavaScript productions whose ECMAScript static semantics

@@ -122,6 +122,7 @@ func (parsed *parseResult) addJavaScriptModeDiagnostics() {
 		}
 		parsed.addDynamicImportEarlyErrors(n)
 		parsed.addScriptGoalEarlyErrors(n)
+		parsed.addRestrictedGrammarEarlyErrors(n)
 		parsed.addAssignmentTargetEarlyErrors(n)
 		parsed.addBindingRestEarlyErrors(n)
 		parsed.addPrivateDeleteEarlyErrors(n)
@@ -1719,6 +1720,12 @@ func (parsed *parseResult) strictAt(node *ast.Node) bool {
 
 func (parsed *parseResult) addStrictStatementEarlyErrors(node *ast.Node) {
 	if !parsed.strictAt(node) { return }
+	if node.Kind == ast.KindIdentifier && node.Text() == "yield" && identifierIsReference(node) {
+		parsed.addJavaScriptDiagnostic(node, 90092)
+	}
+	if node.Kind == ast.KindLabeledStatement && node.AsLabeledStatement().Label.Text() == "yield" {
+		parsed.addJavaScriptDiagnostic(node.AsLabeledStatement().Label, 90092)
+	}
 	if node.Kind == ast.KindWithStatement {
 		parsed.addJavaScriptDiagnostic(node, 90066)
 	}
@@ -1875,6 +1882,24 @@ func (parsed *parseResult) addScriptGoalEarlyErrors(node *ast.Node) {
 	if node.Kind == ast.KindImportDeclaration || node.Kind == ast.KindExportAssignment ||
 		node.Kind == ast.KindExportDeclaration || isImportMeta(node) {
 		parsed.addJavaScriptDiagnostic(node, 90086)
+	}
+}
+
+func (parsed *parseResult) addRestrictedGrammarEarlyErrors(node *ast.Node) {
+	switch node.Kind {
+	case ast.KindSwitchStatement:
+		defaults := 0
+		for _, clause := range node.AsSwitchStatement().CaseBlock.AsCaseBlock().Clauses.Nodes {
+			if clause.Kind == ast.KindDefaultClause {
+				defaults++
+				if defaults > 1 { parsed.addJavaScriptDiagnostic(clause, 90093) }
+			}
+		}
+	case ast.KindForOfStatement:
+		initializer := node.AsForInOrOfStatement().Initializer
+		if initializer != nil && initializer.Kind == ast.KindIdentifier && initializer.Text() == "async" {
+			parsed.addJavaScriptDiagnostic(initializer, 90094)
+		}
 	}
 }
 
