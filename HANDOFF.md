@@ -1,3 +1,14 @@
+## 2026-08-25: declaration and ordinary-function early errors add 45 passes
+
+- Generalized the function-expression static-semantics pass to function declarations and ordinary
+  functions. Async/generator contextual bindings, formal/body lexical collisions, and forbidden
+  `super` references now share one implementation across declaration and expression forms;
+  ordinary functions receive the `super` checks without acquiring async/generator restrictions.
+- The retained complete negative corpus result is
+  `test262-results-negative-parse-current-v8-2026-08-25.jsonl`: 7,935 passed, 281 failed, no
+  refusals, and 204 policy skips among 8,216 variants in 3.685 seconds. This checkpoint adds 45
+  passes. The active 30% full-suite goal remains incomplete.
+
 ## 2026-08-25: strict binding semantics add 119 negative-parse passes
 
 - Added one strict-context binding pass over variable declarations, parameters, binding elements,

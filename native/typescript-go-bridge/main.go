@@ -671,17 +671,20 @@ func containsSuperReference(node *ast.Node) bool {
 }
 
 func (parsed *parseResult) addFunctionExpressionEarlyErrors(node *ast.Node) {
-	if node.Kind != ast.KindFunctionExpression { return }
-	function := node.AsFunctionExpression()
-	generator := function.AsteriskToken != nil
+	if node.Kind != ast.KindFunctionExpression && node.Kind != ast.KindFunctionDeclaration { return }
+	generator := false
+	if node.Kind == ast.KindFunctionExpression {
+		generator = node.AsFunctionExpression().AsteriskToken != nil
+	} else {
+		generator = node.AsFunctionDeclaration().AsteriskToken != nil
+	}
 	async := node.ModifierFlags()&ast.ModifierFlagsAsync != 0
-	if !generator && !async { return }
-	if function.Name() != nil {
-		name := function.Name().Text()
-		if generator && name == "yield" { parsed.addJavaScriptDiagnostic(function.Name(), 90045) }
-		if async && name == "await" { parsed.addJavaScriptDiagnostic(function.Name(), 90046) }
+	if node.Name() != nil {
+		name := node.Name().Text()
+		if generator && name == "yield" { parsed.addJavaScriptDiagnostic(node.Name(), 90045) }
+		if async && name == "await" { parsed.addJavaScriptDiagnostic(node.Name(), 90046) }
 		if parsed.isStrictScript() && (name == "eval" || name == "arguments") {
-			parsed.addJavaScriptDiagnostic(function.Name(), 90047)
+			parsed.addJavaScriptDiagnostic(node.Name(), 90047)
 		}
 	}
 	parameterNames := make(map[string]bool)
@@ -695,15 +698,16 @@ func (parsed *parseResult) addFunctionExpressionEarlyErrors(node *ast.Node) {
 			parsed.addJavaScriptDiagnostic(parameter, 90050)
 		}
 	}
-	if containsSuperReference(function.Body) { parsed.addJavaScriptDiagnostic(function.Body, 90051) }
-	if generator && containsReservedBinding(function.Body, "yield", false) {
-		parsed.addJavaScriptDiagnostic(function.Body, 90052)
+	body := node.Body()
+	if containsSuperReference(body) { parsed.addJavaScriptDiagnostic(body, 90051) }
+	if generator && containsReservedBinding(body, "yield", false) {
+		parsed.addJavaScriptDiagnostic(body, 90052)
 	}
-	if async && containsReservedBinding(function.Body, "await", true) {
-		parsed.addJavaScriptDiagnostic(function.Body, 90053)
+	if async && containsReservedBinding(body, "await", true) {
+		parsed.addJavaScriptDiagnostic(body, 90053)
 	}
-	if function.Body != nil && function.Body.Kind == ast.KindBlock {
-		for _, lexical := range directLexicalNames(function.Body.AsBlock().Statements.Nodes) {
+	if body != nil && body.Kind == ast.KindBlock {
+		for _, lexical := range directLexicalNames(body.AsBlock().Statements.Nodes) {
 			if parameterNames[lexical.text] { parsed.addJavaScriptDiagnostic(lexical.node, 90054) }
 		}
 	}
