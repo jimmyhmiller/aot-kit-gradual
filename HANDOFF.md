@@ -2807,3 +2807,13 @@ and use `call-dynamic-with-receiver`, matching `map`, `filter`, `forEach`, `some
   0 refused, 0 skipped. All 24 variants were failures in the saved negative-parse frontier.
 - These are syntax-directed early errors in the parser bridge, not runtime JavaScript semantics;
   no operation belongs in `lib/**/*.jsl` for programs rejected before evaluation.
+# 2026-08-25: strict object shorthand rejects reserved IdentifierReferences (+9 Test262)
+
+- `ShorthandPropertyAssignment` now receives the strict IdentifierReference early error for
+  `yield` and future-reserved words. This deliberately uses a narrower predicate than strict
+  bindings: `{eval}` and `{arguments}` remain valid references even though binding those names in
+  strict code is forbidden.
+- The bounded ABI gate pins both the rejected `({interface})` form and accepted `({eval})` control.
+- Exact targeted result is
+  `test262-results-strict-object-shorthand-v1-2026-08-25.jsonl`: 9 passed, 0 failed,
+  0 refused, 0 skipped. All nine variants failed in the saved negative-parse frontier.

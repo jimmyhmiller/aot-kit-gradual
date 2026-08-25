@@ -132,6 +132,19 @@ int main(int argc, char **argv) {
     "parenthesized coalesce and logical operators accepted");
   aot_ts_parse_delete(grouped_coalesce_parse);
 
+  const char *strict_shorthand = "var interface = 1; function f() { \"use strict\"; ({interface}); }";
+  AotTsParse strict_shorthand_parse = aot_ts_parse_ex(strict_shorthand,
+    (int32_t)strlen(strict_shorthand), "shorthand.js", 12, AOT_TS_SCRIPT_JS);
+  require(aot_ts_diagnostic_count(strict_shorthand_parse) > 0,
+    "strict reserved shorthand identifier rejected");
+  aot_ts_parse_delete(strict_shorthand_parse);
+  const char *strict_shorthand_valid = "var eval = 1; function f() { \"use strict\"; ({eval}); }";
+  AotTsParse strict_shorthand_valid_parse = aot_ts_parse_ex(strict_shorthand_valid,
+    (int32_t)strlen(strict_shorthand_valid), "shorthand-valid.js", 18, AOT_TS_SCRIPT_JS);
+  require(aot_ts_diagnostic_count(strict_shorthand_valid_parse) == 0,
+    "strict eval shorthand identifier accepted");
+  aot_ts_parse_delete(strict_shorthand_valid_parse);
+
   const char *operators = "var x=1,o={}; x += 2; ++x; x--; typeof x; delete o.x; void (x += 3); o?.x; o?.[x]; x?.(); `plain`; `a${x}b`; (a) => { return a; }; true; null;";
   AotTsParse operator_parse = aot_ts_parse_ex(operators, (int32_t)strlen(operators), "operators.js", 12, AOT_TS_SCRIPT_JS);
   require(find_operator(operator_parse, "PlusEquals") >= 0, "assignment operator API");

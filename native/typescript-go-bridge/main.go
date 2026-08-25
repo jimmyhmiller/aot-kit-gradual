@@ -784,6 +784,10 @@ func strictReservedIdentifier(name string) bool {
 	}
 }
 
+func strictIdentifierReferenceReserved(name string) bool {
+	return name != "eval" && name != "arguments" && strictReservedIdentifier(name)
+}
+
 func (parsed *parseResult) addStrictBindingEarlyErrors(node *ast.Node) {
 	if !parsed.strictAt(node) { return }
 	switch node.Kind {
@@ -803,6 +807,11 @@ func (parsed *parseResult) addStrictBindingEarlyErrors(node *ast.Node) {
 					parsed.addJavaScriptDiagnostic(name.node, 90062)
 				}
 			}
+		}
+	case ast.KindShorthandPropertyAssignment:
+		name := node.AsShorthandPropertyAssignment().Name()
+		if name != nil && strictIdentifierReferenceReserved(name.Text()) {
+			parsed.addJavaScriptDiagnostic(name, 90070)
 		}
 	}
 }
