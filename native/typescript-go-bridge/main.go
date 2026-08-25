@@ -131,6 +131,7 @@ func (parsed *parseResult) addJavaScriptModeDiagnostics() {
 		parsed.addRegExpNamedGroupEarlyErrors(n)
 		parsed.addRegExpIdentityEscapeEarlyErrors(n)
 		parsed.addRegExpGrammarEarlyErrors(n)
+		parsed.addRegExpUnicodeSetEarlyErrors(n)
 		parsed.addFormalParameterEarlyErrors(n)
 		parsed.addClassElementEarlyErrors(n)
 		parsed.addPrivateNameEarlyErrors(n)
@@ -490,6 +491,33 @@ func (parsed *parseResult) addRegExpGrammarEarlyErrors(node *ast.Node) {
 	pattern, flags, ok := regexpParts(parsed, node)
 	if ok && invalidRegExpGrammar(pattern, flags) {
 		parsed.addJavaScriptDiagnostic(node, 90027)
+	}
+}
+
+func invalidRegExpUnicodeSetSyntax(pattern, flags string) bool {
+	if !strings.Contains(flags, "v") { return false }
+	depth, escaped := 0, false
+	for index := 0; index < len(pattern); index++ {
+		character := pattern[index]
+		if escaped { escaped = false; continue }
+		if character == '\\' { escaped = true; continue }
+		if character == '[' { depth++; continue }
+		if character == ']' {
+			if depth > 0 { depth-- }
+			continue
+		}
+		if depth == 0 { continue }
+		if strings.ContainsRune("(){}/|-", rune(character)) { return true }
+		if index+1 < len(pattern) && pattern[index+1] == character &&
+			strings.ContainsRune("!#$%&*+,.::;<=>?@^`~", rune(character)) { return true }
+	}
+	return depth != 0
+}
+
+func (parsed *parseResult) addRegExpUnicodeSetEarlyErrors(node *ast.Node) {
+	pattern, flags, ok := regexpParts(parsed, node)
+	if ok && invalidRegExpUnicodeSetSyntax(pattern, flags) {
+		parsed.addJavaScriptDiagnostic(node, 90028)
 	}
 }
 

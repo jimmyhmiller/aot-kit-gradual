@@ -1,3 +1,13 @@
+## 2026-08-25: Unicode-set reserved punctuators are validated
+
+- Added a `v`-mode character-class scanner with nested-class depth, escaped-character handling,
+  the eight reserved single punctuators, and the reserved doubled punctuator set. This implements
+  the Unicode-set grammar change directly from pattern structure.
+- The retained complete `RegExp.prototype.unicodeSets` result is
+  `test262-results-regexp-unicode-sets-v2-2026-08-25.jsonl`: 58 passed, 14 positive runtime/API
+  failures, two existing refusals, and one policy skip among 74 variants. All 56 previously failing
+  negative-parse variants now pass. The active 30% goal remains incomplete.
+
 ## 2026-08-25: RegExp literal grammar and named groups are checked statically
 
 - Added pattern-level named capture/reference analysis with Unicode identifier decoding, forward
