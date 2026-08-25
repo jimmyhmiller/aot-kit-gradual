@@ -1,3 +1,24 @@
+## 2026-08-25: Function callable values cross one unambiguous tagged ABI
+
+- Removed the numeric collision between dynamic-receiver calls and captured-callable layouts by
+  moving `CALL-ABI-CAPTURE-BASE` above both receiver ABI tags. Backend call selection now boxes
+  JavaScript receiver/captured slots only when their source representation is genuinely raw.
+- JSL declarations now enforce `dyn` as the tagged JavaScript-value ABI at both builtin and public
+  call boundaries. String-producing ideal nodes and string unboxes explicitly report their raw
+  managed-pointer representation, and deferred `Box(Phi)` distribution is restricted to inferred
+  boxes so an explicit representation contract is not silently erased.
+- Existing bounded native witnesses for direct `.bind` and
+  `Function.prototype.call.bind(Object.prototype.hasOwnProperty)` remain green. The complete
+  `built-ins/Function` cohort retained in
+  `test262-results-2026-08-25T05-33-12-288Z.jsonl` completed 867 variants in 18.899 seconds: 56
+  passed, 766 failed, 45 refused, and 13 policy-skipped. Against identical variants in the retained
+  full baseline, 50 changed failed-to-passed and 26 changed passed-to-failed, a net gain of 24.
+- The 26 losses are invalid/dynamic `Function` constructor and related call/apply cases. Their old
+  passes depended on raw arguments accidentally throwing along the expected path; tagged arguments
+  now expose the real missing dynamic-source compilation semantics. They are honest failures and
+  are not papered over to preserve a misleading count.
+- Gate: `coil test` passed 48/48. Frontier remained intentionally red at its two open bugs.
+
 ## 2026-08-25: checked unboxes stay below their guards
 
 - Fixed a backend GCM correctness bug exposed by the assembled

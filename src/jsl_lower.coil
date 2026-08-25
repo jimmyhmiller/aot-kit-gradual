@@ -1264,6 +1264,13 @@
         (jl-macro-expand x callee nargs owa)
         (jl-builtin-call x callee nargs))))
 
+(defn jl-call-argument [(callee i64) (index i64) (value i64)] (-> i64)
+  ;; `dyn` is the tagged JavaScript-value ABI. The other JSL annotations name raw machine
+  ;; representations consumed by their primitives. `n-box!` is representation-aware: an already
+  ;; tagged argument remains unchanged, while raw strings, objects, arrays, and numbers acquire
+  ;; exactly their structural JavaScript tag.
+  (if (= (jsl-param-ty callee index) (t-dyn)) (n-box! value) value))
+
 (defn jl-builtin-call [(x (ptr rd/Sexp)) (callee i64) (nargs i64)] (-> i64)
   (block :call
   (let [buf (primitive/alloc-stack (array i64 10))
@@ -1271,7 +1278,9 @@
         uses-mem (jsl-decl-uses-memory? callee)
         (mut i) 0]
     (loop (if (>= (load i) nargs) (break)
-            (do (store! (index p (load i)) (jl-expr (rd/sexp-nth x (+ (load i) 1))))
+            (do (store! (index p (load i))
+                        (jl-call-argument callee (load i)
+                                          (jl-expr (rd/sexp-nth x (+ (load i) 1)))))
                 (store! i (+ (load i) 1))
                 0)))
     (if (jl-diverged?) (return-from :call NO-NODE) 0)
@@ -1626,7 +1635,8 @@
           (mut i) 0
           (mut answer) (zeroed CallSite)]
       (loop (if (>= (load i) n) (break)
-              (do (set! (index p (load i)) (slice-get args (load i)))
+              (do (set! (index p (load i))
+                        (jl-call-argument d (load i) (slice-get args (load i))))
                   (set! i (+ (load i) 1))
                   0)))
       (if uses-mem (set! (index p n) memory) 0)

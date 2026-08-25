@@ -414,20 +414,13 @@
 
 (defn be-box-input-already-tagged? [(node i64)] (-> bool)
   ;; A raw managed pointer remains raw regardless of the liveness class assigned to values that
-  ;; eventually cross a dynamic boundary. Treating MLK-BOXED as proof here let Box(object) become
-  ;; the identity; its low canonical address then looked like an untagged IEEE double to every
-  ;; TypeTest, so ordinary objects took the numeric ToPrimitive fast path.
+  ;; eventually cross a dynamic boundary.
   (if (= (n-rep-of node 32) REP-RAW-PTR)
       false
   (if (op-is? node Box [_])
       true
   (if (op-is? node Call [_])
       (= (be-call-return-kind node) MLK-BOXED)
-      ;; A value spanning representation classes -- `int|flt|str` out of a Phi, say -- has no raw
-      ;; form to have been produced in, so whatever produced it produced a tagged word and boxing
-      ;; it again is the identity. Without this the box has no tag to emit, `be-js-tag-for-value`
-      ;; answers -1, and a program that merely joins a number with a string in one variable does
-      ;; not compile.
       (or (be-kinds-must-be-tagged? (n-ty node))
           (= (ml-kind-for-node node) MLK-BOXED))))))
 
@@ -2629,7 +2622,26 @@
                                                     ; Reloading them from the materialized closure
                                                     ; object can race its field initialization in
                                                     ; local scheduling and read allocator zeros.
-                                                    arg (ms-select-value-at! owner source call-bid)]
+                                                    selected (ms-select-value-at! owner source call-bid)
+                                                    js-value-slot
+                                                      (or (and (or (= abi CALL-ABI-RECEIVER)
+                                                                   (= abi CALL-ABI-DYNAMIC-RECEIVER))
+                                                               (or (= (load i) 1) (>= (load i) 3)))
+                                                          (and (>= abi CALL-ABI-CAPTURE-BASE)
+                                                               (>= (load i) capturec)))
+                                                    tag (if (and js-value-slot
+                                                                 (not (be-box-input-already-tagged?
+                                                                        source)))
+                                                            (be-js-tag-for-value source)
+                                                            -1)
+                                                    arg
+                                                      (if (!= tag -1)
+                                                          (let [boxed (ms-new-vreg!)]
+                                                            (ms-emit! owner call-bid
+                                                                      (mi-new MI-JSBOX boxed selected
+                                                                              -1 tag NO-NODE))
+                                                            boxed)
+                                                          selected)]
                                                 (if (< arg 0)
                                                     (set! ok false)
                                                     (set! (index args (load i)) arg)))
