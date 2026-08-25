@@ -137,6 +137,7 @@ func (parsed *parseResult) addJavaScriptModeDiagnostics() {
 		parsed.addPrivateNameEarlyErrors(n)
 		parsed.addObjectMethodEarlyErrors(n)
 		parsed.addFunctionExpressionEarlyErrors(n)
+		parsed.addAsyncArrowEarlyErrors(n)
 		parsed.addLexicalDeclarationEarlyErrors(n)
 		parsed.addDestructuringEarlyErrors(n)
 	}
@@ -617,6 +618,36 @@ func containsAwaitExpression(node *ast.Node) bool {
 	return found
 }
 
+func identifierIsReference(node *ast.Node) bool {
+	if node == nil || node.Kind != ast.KindIdentifier || node.Parent == nil { return false }
+	parent := node.Parent
+	if ast.GetNameOfDeclaration(parent) == node { return false }
+	switch parent.Kind {
+	case ast.KindPropertyAccessExpression:
+		return parent.AsPropertyAccessExpression().Expression == node
+	case ast.KindLabeledStatement:
+		return parent.AsLabeledStatement().Label != node
+	case ast.KindBreakStatement:
+		return parent.AsBreakStatement().Label != node
+	case ast.KindContinueStatement:
+		return parent.AsContinueStatement().Label != node
+	}
+	return true
+}
+
+func containsIdentifierReference(node *ast.Node, target string) bool {
+	if node == nil { return false }
+	if node.Kind == ast.KindIdentifier && node.Text() == target && identifierIsReference(node) { return true }
+	if node.Kind == ast.KindFunctionDeclaration || node.Kind == ast.KindFunctionExpression ||
+		node.Kind == ast.KindClassDeclaration || node.Kind == ast.KindClassExpression { return false }
+	found := false
+	node.ForEachChild(func(child *ast.Node) bool {
+		if containsIdentifierReference(child, target) { found = true; return true }
+		return false
+	})
+	return found
+}
+
 func containsSuperReference(node *ast.Node) bool {
 	if node == nil { return false }
 	if node.Kind == ast.KindCallExpression && node.AsCallExpression().Expression.Kind == ast.KindSuperKeyword {
@@ -673,6 +704,28 @@ func (parsed *parseResult) addFunctionExpressionEarlyErrors(node *ast.Node) {
 	if function.Body != nil && function.Body.Kind == ast.KindBlock {
 		for _, lexical := range directLexicalNames(function.Body.AsBlock().Statements.Nodes) {
 			if parameterNames[lexical.text] { parsed.addJavaScriptDiagnostic(lexical.node, 90054) }
+		}
+	}
+}
+
+func (parsed *parseResult) addAsyncArrowEarlyErrors(node *ast.Node) {
+	if node.Kind != ast.KindArrowFunction || node.ModifierFlags()&ast.ModifierFlagsAsync == 0 { return }
+	parameterNames := make(map[string]bool)
+	for _, parameter := range node.Parameters() {
+		for _, name := range appendBoundNames(parameter.Name(), nil) { parameterNames[name.text] = true }
+		if containsSuperReference(parameter) { parsed.addJavaScriptDiagnostic(parameter, 90057) }
+		if containsReservedBinding(parameter, "await", true) || containsAwaitExpression(parameter) {
+			parsed.addJavaScriptDiagnostic(parameter, 90058)
+		}
+	}
+	body := node.Body()
+	if containsSuperReference(body) { parsed.addJavaScriptDiagnostic(body, 90059) }
+	if containsReservedBinding(body, "await", true) || containsIdentifierReference(body, "await") {
+		parsed.addJavaScriptDiagnostic(body, 90060)
+	}
+	if body != nil && body.Kind == ast.KindBlock {
+		for _, lexical := range directLexicalNames(body.AsBlock().Statements.Nodes) {
+			if parameterNames[lexical.text] { parsed.addJavaScriptDiagnostic(lexical.node, 90061) }
 		}
 	}
 }
