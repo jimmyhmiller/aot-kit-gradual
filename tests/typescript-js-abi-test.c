@@ -199,6 +199,25 @@ int main(int argc, char **argv) {
     "matching private getter and setter pair accepted");
   aot_ts_parse_delete(private_accessor_valid_parse);
 
+  const char *strict_directive_assignment = "\"first\"; \"use strict\"; eval = 1;";
+  AotTsParse strict_directive_parse = aot_ts_parse_ex(strict_directive_assignment,
+    (int32_t)strlen(strict_directive_assignment), "strict-directive.js", 19, AOT_TS_SCRIPT_JS);
+  require(aot_ts_diagnostic_count(strict_directive_parse) > 0,
+    "strict script directive prologue governs assignment targets");
+  aot_ts_parse_delete(strict_directive_parse);
+  const char *nested_strict_assignment = "function f() { \"use strict\"; eval = 1; }";
+  AotTsParse nested_strict_parse = aot_ts_parse_ex(nested_strict_assignment,
+    (int32_t)strlen(nested_strict_assignment), "nested-strict.js", 16, AOT_TS_SCRIPT_JS);
+  require(aot_ts_diagnostic_count(nested_strict_parse) > 0,
+    "nested strict directive governs assignment targets");
+  aot_ts_parse_delete(nested_strict_parse);
+  const char *sloppy_eval_assignment = "eval = 1;";
+  AotTsParse sloppy_eval_parse = aot_ts_parse_ex(sloppy_eval_assignment,
+    (int32_t)strlen(sloppy_eval_assignment), "sloppy.js", 9, AOT_TS_SCRIPT_JS);
+  require(aot_ts_diagnostic_count(sloppy_eval_parse) == 0,
+    "sloppy eval assignment remains accepted");
+  aot_ts_parse_delete(sloppy_eval_parse);
+
   const char *operators = "var x=1,o={}; x += 2; ++x; x--; typeof x; delete o.x; void (x += 3); o?.x; o?.[x]; x?.(); `plain`; `a${x}b`; (a) => { return a; }; true; null;";
   AotTsParse operator_parse = aot_ts_parse_ex(operators, (int32_t)strlen(operators), "operators.js", 12, AOT_TS_SCRIPT_JS);
   require(find_operator(operator_parse, "PlusEquals") >= 0, "assignment operator API");

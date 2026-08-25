@@ -989,7 +989,7 @@ func validAssignmentPattern(node *ast.Node, strict bool) bool {
 }
 
 func (parsed *parseResult) addDestructuringEarlyErrors(node *ast.Node) {
-	strict := parsed.isStrictScript()
+	strict := parsed.strictAt(node)
 	if node.Kind == ast.KindBinaryExpression {
 		binary := node.AsBinaryExpression()
 		if binary.OperatorToken.Kind == ast.KindEqualsToken && isAssignmentPattern(binary.Left) &&
@@ -1221,10 +1221,19 @@ func containsImportCall(node *ast.Node) bool {
 	return found
 }
 
+func statementsHaveUseStrict(statements []*ast.Node) bool {
+	for _, statement := range statements {
+		if statement.Kind != ast.KindExpressionStatement { return false }
+		expression := statement.AsExpressionStatement().Expression
+		if expression.Kind != ast.KindStringLiteral { return false }
+		if expression.Text() == "use strict" { return true }
+	}
+	return false
+}
+
 func (parsed *parseResult) isStrictScript() bool {
-	start := scanner.SkipTrivia(parsed.source, 0)
-	rest := parsed.source[start:]
-	return strings.HasPrefix(rest, "\"use strict\"") || strings.HasPrefix(rest, "'use strict'")
+	return parsed.file != nil && parsed.file.Statements != nil &&
+		statementsHaveUseStrict(parsed.file.Statements.Nodes)
 }
 
 func isSimpleAssignmentTarget(node *ast.Node, strict bool) bool {
@@ -1256,7 +1265,7 @@ func isAssignmentPattern(node *ast.Node) bool {
 }
 
 func (parsed *parseResult) addAssignmentTargetEarlyErrors(node *ast.Node) {
-	strict := parsed.isStrictScript()
+	strict := parsed.strictAt(node)
 	if node.Kind == ast.KindBinaryExpression {
 		binary := node.AsBinaryExpression()
 		operator := binary.OperatorToken.Kind
@@ -1591,13 +1600,7 @@ func functionHasUseStrict(node *ast.Node) bool {
 	if node == nil || !ast.IsFunctionLike(node) { return false }
 	body := node.Body()
 	if body == nil || body.Kind != ast.KindBlock { return false }
-	for _, statement := range body.AsBlock().Statements.Nodes {
-		if statement.Kind != ast.KindExpressionStatement { return false }
-		expression := statement.AsExpressionStatement().Expression
-		if expression.Kind != ast.KindStringLiteral { return false }
-		if expression.Text() == "use strict" { return true }
-	}
-	return false
+	return statementsHaveUseStrict(body.AsBlock().Statements.Nodes)
 }
 
 func (parsed *parseResult) strictAt(node *ast.Node) bool {

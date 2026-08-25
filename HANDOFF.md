@@ -2859,3 +2859,16 @@ and use `call-dynamic-with-receiver`, matching `map`, `filter`, `forEach`, `some
 - Exact targeted result is `test262-results-private-accessor-staticness-v1-2026-08-25.jsonl`:
   8 passed, 0 failed, 0 refused, 0 skipped. All eight variants failed in the saved negative-parse
   frontier.
+# 2026-08-25: strictness follows AST directive prologues and lexical context
+
+- Script strictness now scans the complete AST Directive Prologue, so preceding string directives
+  no longer hide a later `"use strict"`. Function strictness shares the same helper.
+- Assignment-target and destructuring early errors now query `strictAt(node)` rather than only
+  top-level script strictness. Nested strict functions/accessors therefore reject strict assignment
+  targets while sloppy `eval = 1` remains accepted; bounded ABI controls pin all three cases.
+- Focused result `test262-results-strict-directive-assignment-v1-2026-08-25.jsonl` is 3 passed,
+  0 failed, 0 refused, 0 skipped.
+- The authoritative saved negative-parse rerun is
+  `test262-results-negative-parse-current-v10-2026-08-25.jsonl`: 8,135 passed, 81 failed,
+  0 refused, 204 skipped among 8,216 variants. Relative to v9: 112 failed-to-passed,
+  8,023 passed-to-passed, 81 failed-to-failed, 204 skipped-to-skipped, zero regressions.
