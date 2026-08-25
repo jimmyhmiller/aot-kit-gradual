@@ -1,3 +1,20 @@
+## 2026-08-25: literal computed and static public fields add 20 passes
+
+- Public class fields now accept computed string/numeric literal names. The frontend preserves the
+  key expression structurally and delegates key coercion and own-property definition to the JSL
+  `DefineField` operation. Dynamic computed names remain refused because their keys must be
+  evaluated once at class definition and retained for each construction.
+- Static public fields with absent or primitive-literal initializers are initialized exactly once
+  at class declaration/expression evaluation on the constructor value, again through
+  `DefineField`. Callable and other effectful static initializers remain explicit refusals while
+  callable-value reachability is unresolved; static members are excluded from instance
+  initialization.
+- The retained targeted artifact
+  `test262-results-class-computed-literal-fields-v2-2026-08-25.jsonl` has 20 passes among 52
+  variants. Against the prior complete class artifacts, exactly 20 failures become passes, 32
+  remain failures, and no pass regresses. The bounded gate is 48/48. The active 30% full Test262
+  goal remains incomplete.
+
 ## 2026-08-25: public instance fields initialize through the JavaScript DSL
 
 - Class declarations and expressions now admit the deliberately bounded public-instance-field

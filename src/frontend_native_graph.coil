@@ -6807,7 +6807,12 @@
                 (fng-dynamic-object context node)
                 (fng-object context node (if (= expected FNG-DYNAMIC) inferred expected))))
           (= kind TSK-ARRAY-LITERAL) (fng-array-literal context node)
-          (fe-function-expression-kind? kind) (fng-closure-expression context node)
+          (fe-function-expression-kind? kind)
+            (let [constructor (fng-closure-expression context node)]
+              (if (= kind TSK-CLASS-EXPRESSION)
+                  (fng-initialize-static-class-fields! context node constructor)
+                  0)
+              constructor)
           (= kind TSK-PROPERTY-ACCESS)
             (if (!= (ts-role ast node TS-ROLE-OPERATOR 0) -1)
                 (fng-optional-field-load context node)
@@ -8740,7 +8745,13 @@
           ;; A nested function declaration contributes no statement effect here — its body is
           ;; compiled as its own graph function. It MUST report fall-through: the default `false`
           ;; means "control diverged" and silently dropped every statement after the declaration.
-          (fe-function-declaration-kind? kind) true
+          (fe-function-declaration-kind? kind)
+            (if (= kind TSK-CLASS-DECLARATION)
+                (do
+                  (fng-initialize-static-class-fields!
+                    context node (fng-closure-expression context node))
+                  true)
+                true)
           ;; Same reasoning as the expression dispatch, and the note above is the evidence: a
           ;; default of `false` says "control diverged", so an unrecognised statement does not
           ;; merely fail to compile -- it silently deletes every statement after it. `for (const v
@@ -8974,17 +8985,56 @@
             (if (= member -1)
                 (break)
                 (do
-                  (if (= (ts-kind ast member) TSK-PROPERTY-DECLARATION)
+                  (if (and (= (ts-kind ast member) TSK-PROPERTY-DECLARATION)
+                           (= (ts-role ast member TS-ROLE-STATIC 0) -1))
                       (let [name (ts-role ast member TS-ROLE-NAME 0)
                             initializer (ts-role ast member TS-ROLE-INITIALIZER 0)
                             value (if (= initializer -1)
                                       (fng-undefined)
                                       (fng-expression context initializer))
+                            key
+                              (if (= (ts-kind ast name) TSK-COMPUTED-PROPERTY-NAME)
+                                  (fng-expression
+                                    context (ts-role ast name TS-ROLE-EXPRESSION 0))
+                                  (n-string-const!
+                                    (jss-from-utf8! (ts-text ast name))))
                             defined
                               (fng-jsl-call3 context "DefineField"
                                              (fng-box-dynamic-argument! receiver)
-                                             (n-string-const!
-                                               (jss-from-utf8! (ts-text ast name)))
+                                             key
+                                             (fng-box-dynamic-argument! value))]
+                        0)
+                      0)
+                  (set! index (+ (load index) 1))))))
+    0))
+
+(defn fng-initialize-static-class-fields! [(context FngContext)
+                                            (class-node i64)
+                                            (constructor i64)] (-> i64)
+  (let [frontend (load (field context frontend))
+        ast (field frontend ast)
+        (mut index) 0]
+    (loop (let [member (ts-role ast class-node TS-ROLE-MEMBER (load index))]
+            (if (= member -1)
+                (break)
+                (do
+                  (if (and (= (ts-kind ast member) TSK-PROPERTY-DECLARATION)
+                           (!= (ts-role ast member TS-ROLE-STATIC 0) -1))
+                      (let [name (ts-role ast member TS-ROLE-NAME 0)
+                            initializer (ts-role ast member TS-ROLE-INITIALIZER 0)
+                            value (if (= initializer -1)
+                                      (fng-undefined)
+                                      (fng-expression context initializer))
+                            key
+                              (if (= (ts-kind ast name) TSK-COMPUTED-PROPERTY-NAME)
+                                  (fng-expression
+                                    context (ts-role ast name TS-ROLE-EXPRESSION 0))
+                                  (n-string-const!
+                                    (jss-from-utf8! (ts-text ast name))))
+                            defined
+                              (fng-jsl-call3 context "DefineField"
+                                             (fng-box-dynamic-argument! constructor)
+                                             key
                                              (fng-box-dynamic-argument! value))]
                         0)
                       0)
