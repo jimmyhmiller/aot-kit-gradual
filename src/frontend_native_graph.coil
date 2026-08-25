@@ -3894,6 +3894,25 @@
     (set! (load (field context ctrl)) (arms-f arms))
     0))
 
+(defn fng-publish-jsl-abrupts! [(context FngContext) (base i64)] (-> i64)
+  (let [normal-ctrl (load (load (field context ctrl)))
+        normal-memory (load (load (field context memory)))
+        (mut index) base]
+    (loop (if (>= (load index) (jl-abrupt-count))
+              (break)
+              (do
+                (set! (load (field context ctrl)) (jl-abrupt-ctrl (load index)))
+                (if (!= (jl-abrupt-mem (load index)) NO-NODE)
+                    (set! (load (field context memory))
+                          (jl-abrupt-mem (load index)))
+                    0)
+                (fng-abrupt-exception! context (jl-abrupt-dependency (load index)))
+                (set! index (+ (load index) 1)))))
+    (set! (load (field context ctrl)) normal-ctrl)
+    (set! (load (field context memory)) normal-memory)
+    (jl-abrupt-drop! base)
+    0))
+
 (defn fng-lowered-window-can-throw? [(start i64)] (-> bool)
   ;; Declaration-level can-throw is necessarily conservative. Macro guards often fold while they
   ;; lower (`number + number` removes ToPrimitive's object arm), and retaining a pending-exception
@@ -4030,6 +4049,7 @@
       (set! (index mp 0) (fng-current-memory context JS-PROPERTY-ALIAS))
       (if calls-back (jl-set-outer-mem! (fng-callback-outer-memory context)) 0)
       (let [lowered-start (n-count)
+            abrupt-base (jl-abrupt-count)
             owner-entry (if (.top-level context)
                             (g-start)
                             (n-fun-entry (.fun context)))
@@ -4054,8 +4074,17 @@
                                     (call-end call)))
                       0)
                     0)))
-            (set! v (jsl-inline! (load (field context ctrl)) mp owner-entry name args)))
+            (let [saved-collect (jl-collect-abrupts?)]
+              ;; Only frontend expansion has an exception target to publish into. Nested JSL
+              ;; macros inherit this mode; standalone builtin construction deliberately does not.
+              ;; Source `throw` already publishes its one structurally abrupt edge after
+              ;; `ThrowValue` returns. Collecting `%Throw` inside that definition would publish the
+              ;; same edge twice, with the second attempt starting from NO-NODE control.
+              (jl-set-collect-abrupts! (!= name "ThrowValue"))
+              (set! v (jsl-inline! (load (field context ctrl)) mp owner-entry name args))
+              (jl-set-collect-abrupts! saved-collect)))
         (jl-set-outer-mem! NO-NODE)
+        (fng-publish-jsl-abrupts! context abrupt-base)
         (if calls-back
             ;; The callback may have written any alias the caller can reach, so nothing recorded
             ;; before the call still describes them. Clearing the cell first is what re-anchors
@@ -4515,10 +4544,14 @@
         borrowed
           (and (= (ts-kind ast callee) TSK-PROPERTY-ACCESS)
                (= (ts-text ast (ts-child ast callee 1)) "call"))
-        source-node (if borrowed (ts-child ast node 1) (ts-child ast callee 0))
+        source-node (if borrowed
+                        (ts-role ast node TS-ROLE-ARGUMENT 0)
+                        (ts-role ast callee TS-ROLE-OBJECT 0))
         literal (= (ts-kind ast source-node) TSK-ARRAY-LITERAL)
         literal-count (if literal (ts-child-count ast source-node) 0)
-        callback-node (ts-child ast node (if borrowed 2 1))
+        callback-node (ts-role ast node TS-ROLE-ARGUMENT (if borrowed 1 0))
+        initial-node (ts-role ast node TS-ROLE-ARGUMENT (if borrowed 2 1))
+        has-initial (!= initial-node -1)
         callback-symbol (fe-resolution-symbol frontend callback-node)
         callback-index (fng-function-index frontend callback-symbol)
         callback-parameters
@@ -4564,9 +4597,9 @@
                            (al-get [i64] (load literal-values) 5)
                            (al-get [i64] (load literal-values) 6)
                            (al-get [i64] (load literal-values) 7))
-          (and value-specialized (= name "reduce") (> (ts-child-count ast node) 2))
+          (and value-specialized (= name "reduce") has-initial)
             (let [(mut accumulator)
-                    (n-box! (fng-expression context (ts-child ast node 2)))
+                    (n-box! (fng-expression context initial-node))
                   (mut index) 0]
               (loop (if (>= (load index) literal-count)
                         (break)
@@ -4586,14 +4619,14 @@
           (= name "every") (fng-jsl-call2 context "ArrayEvery" array callback)
           (= name "flatMap") (fng-jsl-call2 context "ArrayFlatMap" array callback)
           (= name "reduce")
-            (if (> (ts-child-count ast node) 2)
+            (if has-initial
                 (fng-jsl-call3 context "ArrayReduceInitial" array callback
-                               (n-box! (fng-expression context (ts-child ast node 2))))
+                               (n-box! (fng-expression context initial-node)))
                 (fng-jsl-call2 context "ArrayReduce" array callback))
           :else
-            (if (> (ts-child-count ast node) 2)
+            (if has-initial
                 (fng-jsl-call3 context "ArrayReduceRightInitial" array callback
-                               (n-box! (fng-expression context (ts-child ast node 2))))
+                               (n-box! (fng-expression context initial-node)))
                 (fng-jsl-call2 context "ArrayReduceRight" array callback)))]
       (al-free! [i64] (mut literal-values))
       answer)))

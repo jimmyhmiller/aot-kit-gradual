@@ -52,6 +52,7 @@
 ;; the value offset as `control-index * nbind` silently reads another loop's values the moment two
 ;; loops disagree about their arity.
 (defstruct JslLoop [(nbind i64) (base i64) (vbase i64) (memphi i64)])
+(defstruct JslAbrupt [(ctrl i64) (dependency i64) (mem i64)])
 
 (defstruct JslLower
   [(binds  (ArrayList JslBind))
@@ -61,6 +62,8 @@
    (rvals  (ArrayList i64))   ; nbind values per `recur`, in the same order
    (rmem   (ArrayList i64))   ; and the heap each `recur` left, one per recur
    (callback-calls (ArrayList i64)) ; dynamic JS calls emitted by callback macros
+   (abrupts (ArrayList JslAbrupt)) ; exceptional exits captured while inlining into frontend CFG
+   (collect-abrupts bool)
    (ctrl   i64)               ; the control the next effectful form hangs off, or JL-DIVERGED
    (mem    i64)               ; the current JS property memory, or NO-NODE before it is needed
    (outer  i64)               ; the CALLER's other memory (cells, closure environments), or NO-NODE
@@ -92,6 +95,8 @@
           (set! (.rvals p) (al-new [i64] (malloc-allocator)))
           (set! (.rmem p) (al-new [i64] (malloc-allocator)))
           (set! (.callback-calls p) (al-new [i64] (malloc-allocator)))
+          (set! (.abrupts p) (al-new [JslAbrupt] (malloc-allocator)))
+          (set! (.collect-abrupts p) false)
           (set! (.ctrl p) NO-NODE)
           (set! (.mem p) NO-NODE)
           (set! (.outer p) NO-NODE)
@@ -150,6 +155,8 @@
     (al-clear! [i64] (field p rvals))
     (al-clear! [i64] (field p rmem))
     (al-clear! [i64] (field p callback-calls))
+    (al-clear! [JslAbrupt] (field p abrupts))
+    (set! (.collect-abrupts p) false)
     (set! (.ctrl p) NO-NODE)
     (set! (.mem p) NO-NODE)
     (set! (.outer p) NO-NODE)
@@ -183,6 +190,10 @@
 (defn jl-ctrl [] (-> i64) (.ctrl (jl)))
 (defn jl-set-ctrl! [(n i64)] (-> i64) (set! (.ctrl (jl)) n) 0)
 (defn jl-diverged? [] (-> bool) (= (jl-ctrl) JL-DIVERGED))
+(defn jl-collect-abrupts? [] (-> bool) (.collect-abrupts (jl)))
+(defn jl-set-collect-abrupts! [(enabled bool)] (-> i64)
+  (set! (.collect-abrupts (jl)) enabled)
+  0)
 
 ;; THE HEAP THIS DEFINITION WAS GIVEN. A heap-using builtin's call has an implicit trailing memory
 ;; argument. The callee sees that effect as its function-entry `OPTAG-ARG`, and its caller takes the
@@ -236,6 +247,37 @@
   (loop (if (<= (jl-exit-count) depth) (break)
           (do (al-pop! [i64] (field (jl) exits)) 0)))
   0)
+
+(defn jl-abrupt-count [] (-> i64) (al-len [JslAbrupt] (.abrupts (jl))))
+(defn jl-abrupt-p [(i i64)] (-> (ptr JslAbrupt))
+  (al-elem [JslAbrupt] (field (jl) abrupts) i))
+(defn jl-abrupt-ctrl [(i i64)] (-> i64) (.ctrl (jl-abrupt-p i)))
+(defn jl-abrupt-dependency [(i i64)] (-> i64) (.dependency (jl-abrupt-p i)))
+(defn jl-abrupt-mem [(i i64)] (-> i64) (.mem (jl-abrupt-p i)))
+(defn jl-abrupt-drop! [(depth i64)] (-> i64)
+  (loop (if (<= (jl-abrupt-count) depth) (break)
+          (do (al-pop! [JslAbrupt] (field (jl) abrupts)) 0)))
+  0)
+
+(defn jl-capture-abrupt! [(ctrl i64) (dependency i64)] (-> i64)
+  (let [(mut abrupt) (zeroed JslAbrupt)]
+    (set! (.ctrl (mut abrupt)) ctrl)
+    (set! (.dependency (mut abrupt)) dependency)
+    ;; Capture the whole caller-visible heap at THIS control point. Reconstructing non-property
+    ;; aliases later, after the macro's normal path has finished lowering, makes values created on
+    ;; that later path dependencies of this earlier exception edge.
+    (set! (.mem (mut abrupt)) (jl-call-mem))
+    (al-push! [JslAbrupt] (field (jl) abrupts) (load abrupt))))
+
+(defn jl-check-pending! [(dependency i64)] (-> i64)
+  (if (not (.collect-abrupts (jl))) 0
+    (let [condition
+            (n-peephole
+              (n-new3 (JsBuiltin 101) (jl-ctrl) dependency (jl-const (t-int-con 0))))
+          arms (n-if-arms! (n-peephole (n-new2 (If) (jl-ctrl) condition)))]
+      (jl-capture-abrupt! (arms-t arms) condition)
+      (jl-set-ctrl! (arms-f arms))
+      0)))
 
 (defn jl-loop-depth [] (-> i64) (al-len [JslLoop] (.loops (jl))))
 (defn jl-loop-p [(i i64)] (-> (ptr JslLoop)) (al-elem [JslLoop] (field (jl) loops) i))
@@ -394,7 +436,13 @@
   ;; exception ABI can propagate it, but the operation itself must remain in the branch that chose
   ;; it; otherwise scheduling can hoist an untaken error path and throw unconditionally.
   (if (= id JSP-THROW)
-      (n-peephole (n-new2 (JsThrow) (jl-ctrl) a))
+      (let [raised (n-peephole (n-new2 (JsThrow) (jl-ctrl) a))]
+        (if (.collect-abrupts (jl))
+            (do (jl-capture-abrupt! (jl-ctrl) raised)
+                (jl-set-ctrl! JL-DIVERGED)
+                0)
+            0)
+        raised)
   ;; THE STRING ATOMS ARE CONTROL-PINNED, for the reason a `New` is. `%StringNew` creates an
   ;; identity and `%StringSetUnit` mutates one, so neither may float: the evaluator executes a
   ;; control-pinned node once per arrival at its block and caches the result, while a floating
@@ -659,7 +707,9 @@
         ;; A JavaScript call expression always yields a tagged language value even when the
         ;; closed-world callee uses an unboxed native return register. `Box(Call)` is the existing
         ;; representation boundary; selection removes it when the target already returns `dyn`.
-        (n-box! (call-value cs))))))
+        (let [value (n-box! (call-value cs))]
+          (jl-check-pending! value)
+          value)))))
 
 (defn jl-jsl-function? [(node i64)] (-> bool)
   (let [(mut i) 0 (mut found) false]
@@ -795,7 +845,9 @@
               (if dynamic (n-set-op! (call-value cs) (Call CALL-ABI-DYNAMIC-RECEIVER)) 0)
               (jl-set-ctrl! end)
               (jl-set-mem! (n-new1 (Arg (t-mem-alias JS-PROPERTY-ALIAS (t-undef))) end))
-              (n-box! (call-value cs))))))))
+              (let [value (n-box! (call-value cs))]
+                (jl-check-pending! value)
+                value)))))))
 
 (defn jl-js-call-with-receiver [(x (ptr rd/Sexp))] (-> i64)
   (jl-js-call-receiver-core x false))
@@ -1312,10 +1364,12 @@
       ;; The `Cast` is an assertion of the type the declaration already states, so it adds no claim
       ;; the callee was not making. It is pinned to the `CallEnd`, which is where the value exists.
       (let [ret (jsl-decl-ret callee)
-            v (call-value cs)]
-        (if (or (= ret TY-NO-ID) (= ret (t-dyn)))
-            v
-            (n-peephole (n-new2 (Cast ret) end v))))))))
+            raw (call-value cs)
+            value (if (or (= ret TY-NO-ID) (= ret (t-dyn)))
+                      raw
+                      (n-peephole (n-new2 (Cast ret) end raw)))]
+        (jl-check-pending! value)
+        value)))))
 
 ;; Inline only calls introduced by JSL's JavaScript-callback form. This deliberately excludes
 ;; ordinary source calls: callback macros expose hot per-element calls, while global inlining can
@@ -1377,7 +1431,12 @@
   (let [fun (jsl-decl-fun d)
         before (n-count)
         started (node-profile-now)
-        p (jl)]
+        p (jl)
+        saved-collect (.collect-abrupts p)]
+    ;; A standalone function has its own pending-exception ABI and no frontend target into which
+    ;; deferred abrupt paths could be published. This remains false even when demand lowering was
+    ;; triggered from inside a frontend expansion that is collecting its own nested macro exits.
+    (set! (.collect-abrupts p) false)
     (jl-unpin-binds!)
     (al-clear! [JslBind] (field p binds))
     (set! (.decl p) d)
@@ -1450,6 +1509,7 @@
         (set! (.profile-lower-calls p) (+ (.profile-lower-calls p) 1))
         (set! (.profile-lower-nodes p) (+ (.profile-lower-nodes p) (- (n-count) before)))
         (set! (.profile-lower-ns p) (+ (.profile-lower-ns p) (- (node-profile-now) started)))
+        (set! (.collect-abrupts p) saved-collect)
         result))))
 
 ;; Lower every checked declaration into the CURRENT graph. The caller owns `graph-reset!` and
@@ -1588,6 +1648,7 @@
           saved-ctrl (jl-ctrl)
           saved-mem (jl-mem-raw)
           saved-anchor (.anchor (jl))
+          saved-collect (.collect-abrupts (jl))
           uses-mem (jsl-decl-uses-memory? d)
           depth (jl-depth)
           (mut k) 0]
@@ -1613,6 +1674,7 @@
         (jl-set-mem! saved-mem)
         (set! (.anchor (jl)) saved-anchor)
         (set! (.decl (jl)) saved-decl)
+        (set! (.collect-abrupts (jl)) saved-collect)
         (jl-set-frame! saved-frame)
         ;; The result outlives the bindings that built it, so it is pinned across the drop.
         (jl-keep! v)

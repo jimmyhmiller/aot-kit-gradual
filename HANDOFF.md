@@ -1,3 +1,28 @@
+## 2026-08-25: per-operation abrupt exits and role-based reduce calls add 70 passes
+
+- Expanded JSL now records pending-exception exits immediately after nested JavaScript calls and
+  builtins, including the complete caller-visible memory at that control point. The frontend
+  publishes those recorded controls into its existing catch/propagation targets. This prevents a
+  later operation in the same macro from overwriting the first abrupt completion, while keeping
+  the operation and its throw conditions entirely in `lib/**/*.jsl`.
+- Abrupt collection is explicitly a frontend-expansion mode. Nested macros inherit it, standalone
+  DSL function construction forces it off and restores the caller mode, and `ThrowValue` remains
+  excluded because source `throw` already owns and publishes that structurally abrupt edge. This
+  avoids both malformed standalone returns and duplicate publication from `NO-NODE` control.
+- Generic `reduce` and `reduceRight` calls now identify receiver, callback, and optional initial
+  value with `TS-ROLE-ARGUMENT` rather than outer-child positions. This is frontend structure only;
+  all reducer behavior still goes through `ArrayReduce*` and `ArrayReduceRight*` in the DSL.
+- `test262-results-array-reduce-final-v1-2026-08-25.jsonl` is the complete 517-variant reduce
+  cohort: 216 pass, 295 fail, and 6 refuse. Against the retained pre-change artifact, exactly 70
+  failures become passes and no pass regresses. The symmetric reduceRight cohort is retained as
+  `test262-results-array-reduce-right-final-v1-2026-08-25.jsonl`: 220 pass, 293 fail, and 4 refuse;
+  no pre-change reduceRight artifact exists, so no unsupported delta is claimed.
+- Two focused native witnesses pass: borrowed explicit-initial routing and preservation of a
+  throwing `length` getter across the no-initial reducer path. `coil test` is green at 48/48. The
+  broad native module still contains its known open failures and is not the bounded gate. The rough
+  cumulative post-baseline gain is now +673, but the active 30% goal remains incomplete until a
+  fresh authoritative full Test262 run proves it.
+
 ## 2026-08-25: the runnable parse-negative corpus is green
 
 - JavaScript static semantics now carry generator context through nested arrow parameters, reject
