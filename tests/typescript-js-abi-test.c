@@ -245,6 +245,19 @@ int main(int argc, char **argv) {
     "function new.target and derived-constructor super forms accepted");
   aot_ts_parse_delete(valid_execution_parse);
 
+  const char *script_goal_errors = "import x from './x.js'; export default x; import.meta;";
+  AotTsParse script_goal_parse = aot_ts_parse_ex(script_goal_errors,
+    (int32_t)strlen(script_goal_errors), "script-goal.js", 14, AOT_TS_SCRIPT_JS);
+  require(aot_ts_diagnostic_count(script_goal_parse) >= 3,
+    "module-only forms rejected under Script goal");
+  aot_ts_parse_delete(script_goal_parse);
+  const char *dynamic_import_valid = "import('./x.js');";
+  AotTsParse dynamic_import_parse = aot_ts_parse_ex(dynamic_import_valid,
+    (int32_t)strlen(dynamic_import_valid), "dynamic-import.js", 17, AOT_TS_SCRIPT_JS);
+  require(aot_ts_diagnostic_count(dynamic_import_parse) == 0,
+    "dynamic import remains valid under Script goal");
+  aot_ts_parse_delete(dynamic_import_parse);
+
   const char *operators = "var x=1,o={}; x += 2; ++x; x--; typeof x; delete o.x; void (x += 3); o?.x; o?.[x]; x?.(); `plain`; `a${x}b`; (a) => { return a; }; true; null;";
   AotTsParse operator_parse = aot_ts_parse_ex(operators, (int32_t)strlen(operators), "operators.js", 12, AOT_TS_SCRIPT_JS);
   require(find_operator(operator_parse, "PlusEquals") >= 0, "assignment operator API");

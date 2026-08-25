@@ -2896,3 +2896,12 @@ and use `call-dynamic-with-receiver`, matching `map`, `filter`, `forEach`, `some
 - Full negative-parse result `test262-results-negative-parse-current-v12-2026-08-25.jsonl`:
   8,167 passed, 49 failed, 0 refused, 204 skipped. Relative to v11: 14 failed-to-passed,
   8,153 passed-to-passed, 49 failed-to-failed, 204 skipped-to-skipped, zero regressions.
+# 2026-08-25: Script goal rejects module-only syntax (+12 Test262)
+
+- JavaScript Script mode now rejects static import declarations, export declarations/assignments,
+  and `import.meta`. Dynamic `import()` remains valid and is pinned as a bounded control.
+- This also rejects the remaining malformed import-defer declarations under the actual Script goal;
+  upstream already rejected the other malformed defer productions independently.
+- Full negative-parse result `test262-results-negative-parse-current-v13-2026-08-25.jsonl`:
+  8,179 passed, 37 failed, 0 refused, 204 skipped. Relative to v12: 12 failed-to-passed,
+  8,167 passed-to-passed, 37 failed-to-failed, 204 skipped-to-skipped, zero regressions.

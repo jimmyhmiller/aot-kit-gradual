@@ -121,6 +121,7 @@ func (parsed *parseResult) addJavaScriptModeDiagnostics() {
 			parsed.addJavaScriptDiagnostic(forbidden, 90001)
 		}
 		parsed.addDynamicImportEarlyErrors(n)
+		parsed.addScriptGoalEarlyErrors(n)
 		parsed.addAssignmentTargetEarlyErrors(n)
 		parsed.addBindingRestEarlyErrors(n)
 		parsed.addPrivateDeleteEarlyErrors(n)
@@ -1844,6 +1845,13 @@ func (parsed *parseResult) addDynamicImportEarlyErrors(node *ast.Node) {
 			containsImportCall(prefix.Operand) {
 			parsed.addJavaScriptDiagnostic(node, 90002)
 		}
+	}
+}
+
+func (parsed *parseResult) addScriptGoalEarlyErrors(node *ast.Node) {
+	if node.Kind == ast.KindImportDeclaration || node.Kind == ast.KindExportAssignment ||
+		node.Kind == ast.KindExportDeclaration || isImportMeta(node) {
+		parsed.addJavaScriptDiagnostic(node, 90086)
 	}
 }
 
