@@ -1,3 +1,16 @@
+## 2026-08-25: lexical declaration grammar adds 49 negative-parse passes
+
+- Added structural lexical-declaration checks for required `const` initializers outside
+  `for-in`/`for-of` heads, forbidden `let` bound names, and lexical declarations in labeled
+  statement position. Strict assignment targets now consistently use the existing complete
+  strict-reserved identifier predicate.
+- The retained focused `const/syntax` and `let/syntax` result is
+  `test262-results-lexical-declaration-syntax-2026-08-25.jsonl`: 90 passed and 20 unrelated
+  positive runtime/compiler failures among 110 variants. The retained complete negative corpus
+  result is `test262-results-negative-parse-current-v5-2026-08-25.jsonl`: 7,751 passed, 465
+  failed, no refusals, and 204 policy skips among 8,216 variants in 3.050 seconds. This checkpoint
+  adds 49 passes. The active 30% full-suite goal remains incomplete.
+
 ## 2026-08-25: function-expression early errors add 83 negative-parse passes
 
 - Added shared static semantics for async and generator function expressions: contextual

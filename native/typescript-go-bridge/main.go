@@ -137,6 +137,7 @@ func (parsed *parseResult) addJavaScriptModeDiagnostics() {
 		parsed.addPrivateNameEarlyErrors(n)
 		parsed.addObjectMethodEarlyErrors(n)
 		parsed.addFunctionExpressionEarlyErrors(n)
+		parsed.addLexicalDeclarationEarlyErrors(n)
 		parsed.addDestructuringEarlyErrors(n)
 	}
 }
@@ -826,6 +827,21 @@ func (parsed *parseResult) addDestructuringEarlyErrors(node *ast.Node) {
 	}
 }
 
+func (parsed *parseResult) addLexicalDeclarationEarlyErrors(node *ast.Node) {
+	if node.Kind != ast.KindVariableDeclarationList || node.Flags&ast.NodeFlagsBlockScoped == 0 { return }
+	parent := node.Parent
+	loopHead := parent != nil && (parent.Kind == ast.KindForInStatement || parent.Kind == ast.KindForOfStatement)
+	for _, declaration := range node.AsVariableDeclarationList().Declarations.Nodes {
+		data := declaration.AsVariableDeclaration()
+		if node.Flags&ast.NodeFlagsConst != 0 && data.Initializer == nil && !loopHead {
+			parsed.addJavaScriptDiagnostic(declaration, 90055)
+		}
+		for _, name := range appendBoundNames(data.Name(), nil) {
+			if name.text == "let" { parsed.addJavaScriptDiagnostic(name.node, 90056) }
+		}
+	}
+}
+
 func copyPrivateEnvironment(outer map[string]bool) map[string]bool {
 	result := make(map[string]bool, len(outer))
 	for name := range outer { result[name] = true }
@@ -1014,7 +1030,7 @@ func isSimpleAssignmentTarget(node *ast.Node, strict bool) bool {
 		return isSimpleAssignmentTarget(node.AsParenthesizedExpression().Expression, strict)
 	case ast.KindIdentifier:
 		name := node.Text()
-		return !strict || name != "eval" && name != "arguments"
+		return !strict || !strictReservedIdentifier(name)
 	case ast.KindPropertyAccessExpression, ast.KindElementAccessExpression:
 		return !ast.IsOptionalChain(node)
 	default:
@@ -1238,6 +1254,12 @@ func invalidEmbeddedStatement(statement *ast.Node, strict bool, annexIf bool) *a
 
 func (parsed *parseResult) addEmbeddedStatementEarlyErrors(node *ast.Node) {
 	strict := parsed.isStrictScript()
+	if node.Kind == ast.KindLabeledStatement {
+		if invalid := invalidEmbeddedStatement(node.AsLabeledStatement().Statement, strict, false); invalid != nil {
+			parsed.addJavaScriptDiagnostic(invalid, 90007)
+		}
+		return
+	}
 	if node.Kind == ast.KindIfStatement {
 		statement := node.AsIfStatement()
 		if invalid := invalidEmbeddedStatement(statement.ThenStatement, strict, true); invalid != nil {
