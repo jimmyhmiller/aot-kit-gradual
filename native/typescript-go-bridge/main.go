@@ -124,6 +124,7 @@ func (parsed *parseResult) addJavaScriptModeDiagnostics() {
 		parsed.addPrivateDeleteEarlyErrors(n)
 		parsed.addBlockRedeclarationEarlyErrors(n)
 		parsed.addEmbeddedStatementEarlyErrors(n)
+		parsed.addRegExpFlagEarlyErrors(n)
 	}
 }
 
@@ -414,6 +415,66 @@ func (parsed *parseResult) addEmbeddedStatementEarlyErrors(node *ast.Node) {
 		if invalid := invalidEmbeddedStatement(node.Statement(), strict, false); invalid != nil {
 			parsed.addJavaScriptDiagnostic(invalid, 90007)
 		}
+	}
+}
+
+func validRegExpLiteralFlags(flags string) bool {
+	seen := make(map[byte]bool)
+	for i := 0; i < len(flags); i++ {
+		flag := flags[i]
+		if !strings.ContainsRune("dgimsuvy", rune(flag)) || seen[flag] { return false }
+		seen[flag] = true
+	}
+	return !(seen['u'] && seen['v'])
+}
+
+func validRegExpModifierFlags(header string) bool {
+	minus := strings.IndexByte(header, '-')
+	if minus != strings.LastIndexByte(header, '-') { return false }
+	add, remove := header, ""
+	if minus >= 0 { add, remove = header[:minus], header[minus+1:] }
+	if add == "" && remove == "" { return false }
+	seenAdd, seenRemove := make(map[byte]bool), make(map[byte]bool)
+	for i := 0; i < len(add); i++ {
+		flag := add[i]
+		if !strings.ContainsRune("ims", rune(flag)) || seenAdd[flag] { return false }
+		seenAdd[flag] = true
+	}
+	for i := 0; i < len(remove); i++ {
+		flag := remove[i]
+		if !strings.ContainsRune("ims", rune(flag)) || seenRemove[flag] || seenAdd[flag] { return false }
+		seenRemove[flag] = true
+	}
+	return true
+}
+
+func invalidRegExpModifier(pattern string) bool {
+	inClass, escaped := false, false
+	for i := 0; i+2 < len(pattern); i++ {
+		if escaped { escaped = false; continue }
+		if pattern[i] == '\\' { escaped = true; continue }
+		if pattern[i] == '[' { inClass = true; continue }
+		if pattern[i] == ']' { inClass = false; continue }
+		if inClass || pattern[i] != '(' || pattern[i+1] != '?' { continue }
+		next := pattern[i+2]
+		if next == ':' || next == '=' || next == '!' || next == '<' { continue }
+		colon := strings.IndexByte(pattern[i+2:], ':')
+		if colon < 0 { continue }
+		colon += i + 2
+		if close := strings.IndexByte(pattern[i+2:], ')'); close >= 0 && i+2+close < colon { continue }
+		if !validRegExpModifierFlags(pattern[i+2:colon]) { return true }
+	}
+	return false
+}
+
+func (parsed *parseResult) addRegExpFlagEarlyErrors(node *ast.Node) {
+	if node.Kind != ast.KindRegularExpressionLiteral { return }
+	literal := node.Text()
+	delimiter := strings.LastIndexByte(literal, '/')
+	if delimiter <= 0 { return }
+	if !validRegExpLiteralFlags(literal[delimiter+1:]) ||
+		invalidRegExpModifier(literal[1:delimiter]) {
+		parsed.addJavaScriptDiagnostic(node, 90008)
 	}
 }
 

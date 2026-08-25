@@ -1,3 +1,17 @@
+## 2026-08-25: RegExp literal and inline modifier flags are validated
+
+- Added RegExp flag grammar checks at JavaScript parse time. Trailing literal flags are limited to
+  unique `dgimsuvy` code points with mutually exclusive `u`/`v`. Inline modifier groups accept
+  only the `(?ims-ims:...)` form, require at least one flag, reject duplicates and overlap between
+  add/remove sets, and do not confuse lookarounds, named groups, or noncapturing groups with
+  modifiers.
+- The complete negative-parse corpus is retained in
+  `test262-results-negative-parse-regexp-flags-checkpoint-2026-08-25.jsonl`: 5,626 passed, 2,824
+  failed, no refusals, and 205 module-policy skips. Exactly 166 variants moved to passing from the
+  embedded-statement checkpoint, with no lost pass.
+- Holding the authoritative full baseline's other outcomes fixed now projects 14,960 passes among
+  90,377 non-skipped variants, or 16.55%. The active 30% goal remains incomplete.
+
 ## 2026-08-25: embedded statements enforce declaration grammar
 
 - Added structural early errors for declarations used directly as `if`, loop, and `with` bodies.
