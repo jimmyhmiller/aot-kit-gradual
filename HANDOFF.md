@@ -1,3 +1,23 @@
+## 2026-08-25: object binding rest copies enumerable own properties in JSL
+
+- Added DSL `ObjectRest` / `ObjectRestKeyExcluded`, implementing `CopyDataProperties` over the
+  runtime's stable own-key view. It creates an ordinary object, skips syntax-excluded keys and
+  non-enumerable properties, invokes getters through ordinary `GetProperty`, and defines copied
+  values as writable, enumerable, configurable data properties.
+- The frontend evaluates and canonicalizes each binding key once, uses it for extraction, and
+  appends its tagged value to a DSL Array passed to `ObjectRest`; `...rest` recognition remains
+  structural. Ordinary variable declarations now route object patterns through the same recursive
+  binder already used by formal parameters instead of treating the pattern as a scalar name.
+- Added a native differential witness for renamed exclusions, getter invocation exactly once,
+  copied values, and absent excluded keys. It agrees with Node.
+- The complete `language/expressions/object/dstr` cohort is retained in
+  `test262-results-object-rest-dstr-2026-08-25.jsonl`: 806 variants completed in 19.646 seconds with
+  84 passed, 686 failed, 36 refused, and 158 policy-skipped. Against the array-rest checkpoint,
+  4 moved failed-to-passed, all 80 prior passes stayed passing, and every refused/skipped variant
+  was unchanged. Both modes now pass ordinary data copying and non-enumerable omission. The getter
+  Test262 cases still fail in the unrelated `propertyHelper` descriptor path even though the
+  standalone getter witness passes.
+
 ## 2026-08-25: array binding rest drains its iterator in JSL
 
 - Added DSL `IteratorRestArray`, which owns the complete rest-binding operation: repeated iterator
