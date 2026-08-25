@@ -171,6 +171,21 @@ int main(int argc, char **argv) {
     "catch parameter may be redeclared by var");
   aot_ts_parse_delete(catch_var_parse);
 
+  const char *static_block_errors = "class C { static { let await; super(); yield; "
+    "(class { [arguments]() {} }); } }";
+  AotTsParse static_block_parse = aot_ts_parse_ex(static_block_errors,
+    (int32_t)strlen(static_block_errors), "static-block.js", 15, AOT_TS_SCRIPT_JS);
+  require(aot_ts_diagnostic_count(static_block_parse) >= 4,
+    "class static block context early errors rejected");
+  aot_ts_parse_delete(static_block_parse);
+  const char *static_block_valid = "class C { static { function f() { return arguments; } "
+    "async function g() { await 0; } class D { m() { return arguments; } } } }";
+  AotTsParse static_block_valid_parse = aot_ts_parse_ex(static_block_valid,
+    (int32_t)strlen(static_block_valid), "static-block-valid.js", 21, AOT_TS_SCRIPT_JS);
+  require(aot_ts_diagnostic_count(static_block_valid_parse) == 0,
+    "class static block context stops at nested function bodies");
+  aot_ts_parse_delete(static_block_valid_parse);
+
   const char *operators = "var x=1,o={}; x += 2; ++x; x--; typeof x; delete o.x; void (x += 3); o?.x; o?.[x]; x?.(); `plain`; `a${x}b`; (a) => { return a; }; true; null;";
   AotTsParse operator_parse = aot_ts_parse_ex(operators, (int32_t)strlen(operators), "operators.js", 12, AOT_TS_SCRIPT_JS);
   require(find_operator(operator_parse, "PlusEquals") >= 0, "assignment operator API");

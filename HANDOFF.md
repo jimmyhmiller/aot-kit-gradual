@@ -2836,3 +2836,17 @@ and use `call-dynamic-with-receiver`, matching `map`, `filter`, `forEach`, `some
 - Exact targeted result is `test262-results-catch-early-errors-v1-2026-08-25.jsonl`:
   6 passed, 0 failed, 0 refused, 0 skipped. All six variants failed in the saved negative-parse
   frontier.
+# 2026-08-25: class static blocks enforce their isolated syntax context (+26 Test262)
+
+- Class static blocks now reject `arguments`, direct `await`, direct `yield`, direct `super()`, and
+  bindings named `await`. The traversal stops at ordinary function bodies and nested static-block
+  boundaries while retaining arrow-function context where required.
+- TypeScript represents the prohibited static-block `yield` as either `YieldExpression` or an
+  IdentifierReference depending on the enclosing grammar context; both structural forms are
+  covered.
+- `ContainsArguments` traverses nested-class heritage and computed names because those evaluate in
+  the enclosing context, but does not enter nested class method bodies. Bounded controls pin valid
+  `arguments` and `await` uses inside nested ordinary functions/methods.
+- Exact targeted result is `test262-results-static-block-context-v2-2026-08-25.jsonl`:
+  26 passed, 0 failed, 0 refused, 0 skipped. All 26 variants failed in the saved negative-parse
+  frontier.

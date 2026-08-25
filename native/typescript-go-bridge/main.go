@@ -573,6 +573,34 @@ func classElementContains(node *ast.Node, argumentsName bool, superCall bool, su
 	return found
 }
 
+func staticBlockContainsArguments(node *ast.Node) bool {
+	if node == nil { return false }
+	if node.Kind == ast.KindIdentifier && node.Text() == "arguments" && identifierIsReference(node) {
+		return true
+	}
+	if node.Kind == ast.KindFunctionDeclaration || node.Kind == ast.KindFunctionExpression { return false }
+	if node.Kind == ast.KindClassDeclaration || node.Kind == ast.KindClassExpression {
+		data := node.ClassLikeData()
+		if data.HeritageClauses != nil {
+			for _, heritage := range data.HeritageClauses.Nodes {
+				if staticBlockContainsArguments(heritage) { return true }
+			}
+		}
+		for _, member := range data.Members.Nodes {
+			name := ast.GetNameOfDeclaration(member)
+			if name != nil && name.Kind == ast.KindComputedPropertyName &&
+				staticBlockContainsArguments(name.AsComputedPropertyName().Expression) { return true }
+		}
+		return false
+	}
+	found := false
+	node.ForEachChild(func(child *ast.Node) bool {
+		if staticBlockContainsArguments(child) { found = true; return true }
+		return false
+	})
+	return found
+}
+
 func containsReservedBinding(node *ast.Node, target string, stopAtOrdinaryFunction bool) bool {
 	if node == nil { return false }
 	switch node.Kind {
@@ -1066,6 +1094,16 @@ func (parsed *parseResult) addClassElementEarlyErrors(node *ast.Node) {
 	hasHeritage := node.ClassLikeData().HeritageClauses != nil &&
 		len(node.ClassLikeData().HeritageClauses.Nodes) != 0
 	for _, member := range node.ClassLikeData().Members.Nodes {
+		if member.Kind == ast.KindClassStaticBlockDeclaration {
+			body := member.AsClassStaticBlockDeclaration().Body
+			if staticBlockContainsArguments(body) { parsed.addJavaScriptDiagnostic(body, 90075) }
+			if containsAwaitExpression(body) { parsed.addJavaScriptDiagnostic(body, 90076) }
+			if containsYieldExpression(body) || containsIdentifierReference(body, "yield") {
+				parsed.addJavaScriptDiagnostic(body, 90077)
+			}
+			if classElementContains(body, false, true, false) { parsed.addJavaScriptDiagnostic(body, 90078) }
+			if containsReservedBinding(body, "await", true) { parsed.addJavaScriptDiagnostic(body, 90079) }
+		}
 		if member.Kind == ast.KindConstructor {
 			constructors++
 			if constructors > 1 { parsed.addJavaScriptDiagnostic(member, 90010) }
