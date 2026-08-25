@@ -126,6 +126,60 @@ func (parsed *parseResult) addJavaScriptModeDiagnostics() {
 		parsed.addEmbeddedStatementEarlyErrors(n)
 		parsed.addRegExpFlagEarlyErrors(n)
 		parsed.addFormalParameterEarlyErrors(n)
+		parsed.addClassElementEarlyErrors(n)
+	}
+}
+
+func classElementStaticName(node *ast.Node) (string, bool) {
+	name := ast.GetNameOfDeclaration(node)
+	if name == nil { return "", false }
+	if name.Kind == ast.KindComputedPropertyName {
+		name = name.AsComputedPropertyName().Expression
+	}
+	switch name.Kind {
+	case ast.KindIdentifier, ast.KindPrivateIdentifier, ast.KindStringLiteral, ast.KindNumericLiteral:
+		return name.Text(), true
+	default:
+		return "", false
+	}
+}
+
+// JavaScript class early errors are static semantics over a complete class body.
+// Keep them here rather than in individual member checks so duplicate-name rules
+// have one source-order view of the declaration set.
+func (parsed *parseResult) addClassElementEarlyErrors(node *ast.Node) {
+	if node.Kind != ast.KindClassDeclaration && node.Kind != ast.KindClassExpression { return }
+	constructors := 0
+	privateKinds := make(map[string]uint8)
+	for _, member := range node.ClassLikeData().Members.Nodes {
+		if member.Kind == ast.KindConstructor {
+			constructors++
+			if constructors > 1 { parsed.addJavaScriptDiagnostic(member, 90010) }
+		}
+
+		name, named := classElementStaticName(member)
+		if !named { continue }
+		isStatic := ast.HasStaticModifier(member)
+		if member.Kind == ast.KindPropertyDeclaration {
+			if name == "constructor" || isStatic && name == "prototype" {
+				parsed.addJavaScriptDiagnostic(member, 90011)
+			}
+		}
+
+		declarationName := ast.GetNameOfDeclaration(member)
+		if declarationName == nil || declarationName.Kind != ast.KindPrivateIdentifier { continue }
+		if name == "#constructor" || name == "constructor" {
+			parsed.addJavaScriptDiagnostic(member, 90012)
+		}
+		var kind uint8 = 4
+		if member.Kind == ast.KindGetAccessor { kind = 1 }
+		if member.Kind == ast.KindSetAccessor { kind = 2 }
+		previous := privateKinds[name]
+		if previous != 0 && previous|kind != 3 {
+			parsed.addJavaScriptDiagnostic(member, 90013)
+		} else {
+			privateKinds[name] = previous | kind
+		}
 	}
 }
 

@@ -1,3 +1,19 @@
+## 2026-08-25: class bodies enforce declaration-set early errors
+
+- Added one class-body static-semantics pass for duplicate constructors, duplicate private bound
+  names (while permitting one getter/setter pair), forbidden private `#constructor`, and forbidden
+  public field names `constructor` and static `prototype`. The checks inspect AST declarations and
+  never consult Test262 paths or expected outcomes.
+- Across both complete class-element directories, the retained result is
+  `test262-results-class-elements-early-errors-v4-2026-08-25.jsonl`: 820 passed, 3,644 failed, no
+  refusals, and 717 policy-skipped among 4,464 executed variants. Against the formal-parameter
+  checkpoint's 1,392 comparable negative variants, exactly 100 moved failed-to-passed and no pass
+  was lost; 600 class-element negative variants remain open.
+- `native/typescript-go-bridge/main.go` is not an input dependency of the cached bridge archive.
+  Measuring this change required explicitly running `tools/build-typescript-go-bridge.sh` before
+  rebuilding the Test262 worker; the stale `v2` and `v3` artifacts are not valid patch measurements.
+  The active 30% goal remains incomplete.
+
 ## 2026-08-25: formal parameters share one static-semantics pass
 
 - Added function-level formal-parameter early errors across declarations, expressions, arrows,
