@@ -139,6 +139,7 @@ func (parsed *parseResult) addJavaScriptModeDiagnostics() {
 		parsed.addFunctionExpressionEarlyErrors(n)
 		parsed.addAsyncArrowEarlyErrors(n)
 		parsed.addLexicalDeclarationEarlyErrors(n)
+		parsed.addStrictBindingEarlyErrors(n)
 		parsed.addDestructuringEarlyErrors(n)
 	}
 }
@@ -772,6 +773,29 @@ func strictReservedIdentifier(name string) bool {
 		return true
 	default:
 		return false
+	}
+}
+
+func (parsed *parseResult) addStrictBindingEarlyErrors(node *ast.Node) {
+	if !parsed.strictAt(node) { return }
+	switch node.Kind {
+	case ast.KindVariableDeclaration, ast.KindParameter, ast.KindBindingElement,
+		ast.KindFunctionDeclaration, ast.KindFunctionExpression,
+		ast.KindClassDeclaration, ast.KindClassExpression:
+		for _, name := range appendBoundNames(node.Name(), nil) {
+			if strictReservedIdentifier(name.text) {
+				parsed.addJavaScriptDiagnostic(name.node, 90062)
+			}
+		}
+	case ast.KindCatchClause:
+		binding := node.AsCatchClause().VariableDeclaration
+		if binding != nil {
+			for _, name := range appendBoundNames(binding.Name(), nil) {
+				if strictReservedIdentifier(name.text) {
+					parsed.addJavaScriptDiagnostic(name.node, 90062)
+				}
+			}
+		}
 	}
 }
 

@@ -1,3 +1,15 @@
+## 2026-08-25: strict binding semantics add 119 negative-parse passes
+
+- Added one strict-context binding pass over variable declarations, parameters, binding elements,
+  function/class names, and catch bindings. It reuses `strictAt`, recursive `BoundNames`, and the
+  existing strict-reserved identifier set, so directive-prologue, class-implied strictness, and
+  nested function contexts share one rule.
+- The retained complete negative corpus result is
+  `test262-results-negative-parse-current-v7-2026-08-25.jsonl`: 7,890 passed, 326 failed, no
+  refusals, and 204 policy skips among 8,216 variants in 3.613 seconds. This checkpoint adds 119
+  passes across variable, class, function, arrow, generator, catch, reserved-word, and directive
+  families. The active 30% full-suite goal remains incomplete.
+
 ## 2026-08-25: class accessors reach DSL-owned property semantics
 
 - Class validation and prototype indexing now admit getter/setter members. Prototype metadata
