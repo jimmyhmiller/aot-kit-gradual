@@ -1,3 +1,16 @@
+## 2026-08-24: property-helper captured statics are real callables
+
+- Published zero-capture JSL callable adapters for `Object.getOwnPropertyNames` and
+  `Array.isArray`. Their bodies delegate to the existing DSL operations; the frontend only selects
+  the callable value for exact intrinsic property access. Direct-call semantics remain unchanged.
+- Permanent native differential witnesses capture each static in a local alias and call it.
+  `getOwnPropertyNames` preserves own-key order and array contents; `isArray` distinguishes an
+  array from an ordinary object.
+- The exact `Object.getOwnPropertyDescriptor/length.js` helper case progressed again. Strict mode
+  reaches native runtime; default mode now exposes a selection terminator at `CProj.0` node 17320.
+  Retained results are in
+  `test262-results-object-gopd-array-is-array-2026-08-24.jsonl`; neither variant passes yet.
+
 ## 2026-08-24: zero-capture callable values clear selection and retain runtime codes
 
 - Zero-capture JSL `closure` expressions now lower to the callable's bare `Fun`; captured callables
