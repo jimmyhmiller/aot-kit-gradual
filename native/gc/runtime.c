@@ -962,8 +962,12 @@ AotJsValue aot_js_string(uintptr_t a, int64_t b,
 #endif
     return (AotJsValue)aot_js_strict_equal((AotJsValue)a, (AotJsValue)b);
   }
-  if (operation == AOT_JS_VALUE_TRUTHY)
-    return (AotJsValue)aot_js_truthy((AotJsValue)a);
+  if (operation == AOT_JS_VALUE_TRUTHY) {
+    AotJsValue value = (AotJsValue)a;
+    JsStringRec *string = js_string_lookup((uintptr_t)value);
+    if (string) return (AotJsValue)(string->length != 0);
+    return (AotJsValue)aot_js_truthy(value);
+  }
   if (operation == 200) {
 #ifdef AOT_B14_SWALLOW_THROW
     return (AotJsValue)a;

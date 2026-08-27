@@ -1,3 +1,13 @@
+## 2026-08-27: logical signed-zero values now survive truthiness selection
+
+- `If` selection now sends every predicate not proven to be a raw machine number through the JavaScript value-truthiness primitive. The old `n-ty == dyn` test misclassified tagged numeric merges such as `-0` because ideal type is not machine representation.
+- Native value truthiness now resolves raw or tagged managed strings through the canonical string registry before applying the generic tagged-value rule. Empty-string Test262 cases remain open; this is retained as representation support rather than claimed as a transition.
+- The bounded native witness pins `undefined || string`, empty-string `&&`/`||`, and signed-zero result preservation. `coil test` is green at 52/52.
+- Complete logical-AND plus logical-OR cohorts report 48 passed / 20 failed / 0 refused across 68 variants, up from 44/68. Each directory moved from 22/34 to 24/34. The four failed-to-passed transitions are the default and strict signed-zero cases `S11.11.1_A3_T2.js` and `S11.11.2_A3_T2.js`; no prior passes regressed.
+- Empty-string cases `S11.11.1_A3_T3.js` and `S11.11.2_A3_T3.js` remain red in both variants. The selected Script value still behaves as the empty left operand; this is the next focused logical-value defect.
+- Authoritative output: `results/test262-logical-cohorts-representation-truthiness-2026-08-27.jsonl` and its summary. Focused transition evidence: `results/test262-logical-truthiness-witnesses-2026-08-27.jsonl` and its summary.
+- `coil test --suite frontier` remains intentionally red at exactly the two recorded bugs: `for-await-has-no-bridge-kind` and `shortest-round-trip-digits`.
+
 ## 2026-08-27: logical value merges preserve the JavaScript tagged boundary
 
 - `&&` and `||` used to merge raw operand representations directly into a `dyn` Phi. `verifyProp || name` therefore selected an untagged string pointer when the left operand was `undefined`, even though the source-level result was an ordinary JavaScript String.
