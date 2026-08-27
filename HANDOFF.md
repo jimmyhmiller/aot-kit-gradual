@@ -1,3 +1,20 @@
+## 2026-08-27: polymorphic non-callables no longer dereference a null closure
+
+- The propertyHelper signal-11 failure was reduced to ARM64 callable dispatch, not JavaScript
+  semantics or Test262 harness behavior. The crash trace identified callable 24 at generated
+  instruction `ldr x16, [x16, #8]` with `x16 == 0`.
+- Polymorphic dispatch intentionally materializes callable ID zero for non-callable values so the
+  resolver owns the invalid-call path. The encoder incorrectly fell through from that zeroing into
+  the closure-only environment dereference. It now branches around closure decoding, and all
+  affected branch distances and fixed encoded-word accounting move together.
+- `backend-call-test.coil` pins the exact encoded ARM64 guard: non-callables branch over the
+  closure payload load while closures retain that load.
+- The exact assembled propertyHelper descriptor witness that reproducibly died with signal 11 now
+  reports `PASS` and leaves the native crash log empty after rebuilding `test262-native`.
+  No Test262 harness or DSL semantics were changed by this backend safety fix.
+- `coil test` is green at 52/52. Final `coil test --suite frontier` remains exactly the two
+  expected red bugs: `for-await-has-no-bridge-kind` and `shortest-round-trip-digits`.
+
 ## 2026-08-27: Array join now preserves its accumulator and owns separator coercion
 
 - Reduced the property-helper string symptom to a standalone upstream-style witness. Before this

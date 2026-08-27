@@ -91,6 +91,25 @@
                 0)))
     (load found)))
 
+(defn encoded_polymorphic_noncall_path_skips_closure_load? [] (-> bool)
+  (let [(mut at) 0
+        (mut found) false]
+    (loop
+      (if (or (load found) (> (+ (load at) 20) (be-code-len)))
+          (break)
+          (do
+            (if (and (= (be-code-u32 (load at)) (a64-cmp-reg 17 14))
+                     (= (be-code-u32 (+ (load at) 4)) (a64-bcond 0 3))
+                     (= (be-code-u32 (+ (load at) 8)) (a64-add-reg 16 31 31))
+                     (= (be-code-u32 (+ (load at) 12))
+                        (a64-b (+ 8 (be-mov-words JSV-OBJECT))))
+                     (= (be-code-u32 (+ (load at) 16)) (a64-and-reg 16 16 13))
+                     (= (be-code-u32 (+ (load at) 20)) (a64-ldr 16 16 8)))
+                (set! found true)
+                0)
+            (set! at (+ (load at) 4)))))
+    (load found)))
+
 (deftest boxing_a_call_result_ignores_the_top_level_pseudo_function
   (graph-reset! 419)
   (let [callee (n-fun-open! 0)
@@ -581,3 +600,21 @@
                                        (mu-function-code-size source))))
                   (assert (= (be-code-u32 offset) (a64-adr 17 0))))
                 (set! relocation (+ (load relocation) 1)))))))))
+
+(deftest polymorphic_noncallable_values_skip_the_closure_environment_load
+  (graph-reset! 427)
+  (let [left (n-fun-open! 1)
+        lx (n-parm! left 0)
+        right (n-fun-open! 2)
+        rx (n-parm! right 0)]
+    (n-fun-close! left (n-new2 (Return) (n-fun-entry left) lx))
+    (n-fun-close! right (n-new2 (Return) (n-fun-entry right) rx))
+    (let [callee (n-new1 (Arg (t-fun-set 6)) (g-start))
+          site (n-call1! (g-start) callee (cc 42))]
+      (n-add-def! (g-stop) (n-new2 (Return) (call-end site) (call-value site)))
+      (g-analyze!)
+      (assert (= (g-verify) 0))
+      (compile-machine!)
+      ;; A non-callable is represented by callable id zero for the resolver. It must branch around
+      ;; the closure-only payload dereference instead of loading through that intentional null.
+      (assert (encoded_polymorphic_noncall_path_skips_closure_load?)))))
