@@ -1,3 +1,32 @@
+## 2026-08-27: Array join now preserves its accumulator and owns separator coercion
+
+- Reduced the property-helper string symptom to a standalone upstream-style witness. Before this
+  change, `["first", "second"].join("; ")` returned only `"second"`; after an intermediate recurrence
+  correction it returned `"firstsecond"`. The root cause was `ArrayJoinSeen` testing `i == 0` inside
+  an open JSL loop: the test folded against the initializer before the back edge was established, so
+  every iteration took the first-element arm.
+- Rewrote the DSL algorithm to handle empty/first elements before opening the loop and carry a raw
+  `str` accumulator from index 1 onward. Every back-edge now unconditionally depends on the prior
+  accumulator and concatenates the separator.
+- `ArrayJoin` now owns separator ToString conversion. The frontend passes only the structurally boxed
+  source argument (or default comma); `ToStringValueSeen` exposes one raw `str` contract and unboxes
+  the recursive array builtin result at its actual tagged call boundary. No JavaScript semantics were
+  added to C or the Test262 harness.
+- Strengthened the existing native differential witness to compare a dynamically joined string with
+  equal and unequal literals. The focused Test262 witnesses for value equality and `.length` are 4/4
+  passing. Evidence: `/tmp/aotk-arrayjoin-inline-piece-minimal-2026-08-27.jsonl`.
+- The complete `Array.prototype.join` directory is persisted at 10 passed / 34 failed / 2 refused
+  across 46 variants in `results/test262-array-join-after-consistent-accumulator-2026-08-27.jsonl`.
+  Available partial full-suite baselines do not contain this directory, so no historical transition
+  count is claimed.
+- The broader property-helper/function-length probes remain 0/12 and are a separate large-graph
+  execution issue; scripts containing the inert complete helper pass, while executing descriptor
+  paths in the combined graph can signal 11.
+- `coil test` is green at 52/52. Frontier remains exactly the expected two red bugs. The exhaustive
+  suite cannot compile because of pre-existing unrelated errors: unbound `JSV-RESERVED-0` in
+  `tests/backend-test.coil:260`, and an 18-argument parse of `agrees-with-node?` in
+  `tests/native-execution-test.coil:1172`.
+
 ## 2026-08-27: String equality representation boundary diagnosed; broad macro boxing rejected
 
 The completed function-symbol/global-binding work remains in pushed commits `b6ca7a6` and `81df66b`.
