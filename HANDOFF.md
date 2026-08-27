@@ -1,3 +1,11 @@
+## 2026-08-27: Omitted arguments are materialized at call sites, not rebound in callees
+
+- Replaced callee-side `NormalizeParameterValue` rebinding with the DSL-owned zero-argument `OmittedArgumentValue`; exact and generic call sites now materialize every native formal slot while preserving the real source `argc` separately.
+- This keeps valid incoming `Parm` values untouched and fixes the multi-parameter corruption that made Test262's `verifyProperty(obj, name, desc, options)` observe its object argument as a non-object.
+- Bounded gate: `coil test` is green (`52 passed`). Frontier remains exactly the two expected open bugs: `for-await-has-no-bridge-kind` and `shortest-round-trip-digits`.
+- Authoritative transition against `results/test262-function-expressions-default-parameter-symbols-final-2026-08-27.jsonl`: all 99 common variants now pass (`69 passed->passed`, `26 failed->passed`, `4 refused->passed`, zero regressions).
+- Broader function-expression cohort: `results/test262-function-expressions-after-callsite-omission-2026-08-27.jsonl` records `328 passed / 152 failed / 4 refused` across 484 variants. The remaining focused `name`/`length-dflt` failures now reach own-property descriptor assertions rather than trapping on corrupted parameters.
+
 ## 2026-08-27: default-parameter values and ordered parameter bindings
 
 - Added DSL-owned `NormalizeParameterValue(value, argc, ordinal)`: omitted native ABI parameter slots now become JavaScript `undefined` before default initialization instead of exposing uninitialized machine values.

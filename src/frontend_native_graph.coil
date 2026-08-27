@@ -693,7 +693,7 @@
                           (fng-call-argument frontend fn (load ordinal)
                             (if (< (load ordinal) source-count)
                                 (al-get [i64] (load args) (load ordinal))
-                                (fng-undefined))))
+                                (fng-jsl-call0 context "OmittedArgumentValue"))))
                 (set! ordinal (+ (load ordinal) 1)))))
     (if (.rest fn)
         (let [rest-array (fng-jsl-call0 context "NewArray")]
@@ -715,6 +715,29 @@
                           (al-get [i64] (load normalized) (load ordinal)))
                 (set! ordinal (+ (load ordinal) 1)))))
     (al-free! [i64] (mut normalized))
+    0))
+
+;; A generic call can reach any frontend callable after a value has crossed mutable storage. The
+;; native ABI therefore needs slots through the largest closed-world formal list even though
+;; JavaScript's source argc remains unchanged. Surplus slots are not arguments: callees beyond argc
+;; observe the DSL-owned omitted value, and shorter callees ignore them.
+(defn fng-pad-dynamic-call-arguments! [(context FngContext)
+                                       (args (mut (ArrayList i64)))] (-> i64)
+  (let [frontend (load (field context frontend))
+        (mut function-index) 0
+        (mut required) (al-len [i64] (load args))]
+    (loop (if (>= (load function-index) (al-len [FeFunction] (.functions frontend)))
+              (break)
+              (let [fn (al-get [FeFunction] (.functions frontend) (load function-index))]
+                (if (> (.parameter-count fn) (load required))
+                    (set! required (.parameter-count fn))
+                    0)
+                (set! function-index (+ (load function-index) 1)))))
+    (loop (if (>= (al-len [i64] (load args)) (load required))
+              (break)
+              (al-push! [i64]
+                        (mut args)
+                        (fng-jsl-call0 context "OmittedArgumentValue"))))
     0))
 
 ;; The expected type an ARGUMENT expression is lowered under, which is only ever a structural shape.
@@ -5663,6 +5686,12 @@
                 (fng-normalize-call-arguments! context target-fn (mut args)))
               0))
         0)
+    ;; Unknown callable identity still has a closed-world native ABI. Materialize every potentially
+    ;; read formal slot without changing source-argc; this is the same invariant exact calls obtain
+    ;; from fng-normalize-call-arguments!, applied conservatively across dynamic targets.
+    (if (and (< argument-function-index 0) (not direct-value-callee))
+        (fng-pad-dynamic-call-arguments! context (mut args))
+        0)
     (if chain-dispatch
         (let [chain-answer
                 (fng-method-chain! context target receiver source-argc
@@ -9793,20 +9822,6 @@
                                 (fng-set-symbol! context symbol-id incoming)
                                 0)
                               0))
-                        (if (= (fng-parameter-type frontend fn (load index)) FNG-DYNAMIC)
-                            (let [parameter-symbol
-                                    (fe-parameter-symbol frontend fn (load index))
-                                  parameter-symbol-id (.id parameter-symbol)
-                                  incoming (fng-symbol-node context parameter-symbol-id)
-                                  normalized
-                                    (fng-jsl-call3 context
-                                                   "NormalizeParameterValue"
-                                                   incoming
-                                                   (load argc)
-                                                   (fng-const (load index)))]
-                              (fng-set-symbol! context parameter-symbol-id normalized)
-                              0)
-                            0)
                         (fng-default-parameter! context fn (load index))
                         (let [parameter-symbol (fe-parameter-symbol frontend fn (load index))
                               name (.name-node parameter-symbol)]
