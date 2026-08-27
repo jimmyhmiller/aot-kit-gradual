@@ -3528,8 +3528,12 @@
                            (fng-undefined)))
         callback (if (> (ts-child-count ast node) 2)
                      (fng-callback-value context (ts-child ast node 2)) NO-NODE)
+        this-arg (n-box! (if (> (ts-child-count ast node) 3)
+                            (fng-expression context (ts-child ast node 3))
+                            (fng-undefined)))
         copied (fng-jsl-call1 context "ArrayFrom" source)]
-    (if (= callback NO-NODE) copied (fng-jsl-call2 context "ArrayMap" copied callback))))
+    (if (= callback NO-NODE) copied
+        (fng-jsl-call3 context "ArrayMap" copied callback this-arg))))
 
 (defn fng-object-enumeration-name [(context FngContext) (node i64)] (-> (slice u8))
   (let [frontend (load (field context frontend)) ast (field frontend ast)
@@ -4768,11 +4772,18 @@
         value-specialized
           (and literal
                (or (and (= literal-count 8)
-                        (and (= name "filter") (< callback-parameters 3)))
+                        (and (= name "filter")
+                             (and (not has-initial) (< callback-parameters 3))))
                    (and (= name "reduce") (< callback-parameters 4))))
         (mut literal-values) (al-new [i64] (malloc-allocator))
         array (if value-specialized NO-NODE (fng-expression context source-node))
-        callback (fng-callback-value context callback-node)]
+        callback (fng-callback-value context callback-node)
+        callback-this
+          (if (or (= name "reduce") (= name "reduceRight"))
+              (n-box! (fng-undefined))
+              (n-box! (if has-initial
+                          (fng-expression context initial-node)
+                          (fng-undefined))))]
     ;; Preserve array-literal evaluation order even when the allocation itself is proven
     ;; unobservable to this closed callback signature.
     (if value-specialized
@@ -4790,8 +4801,9 @@
                   (mut index) 0]
               (loop (if (>= (load index) literal-count)
                         (break)
-                        (do (store! out (fng-jsl-call4 context "ArrayMapAt" array callback
-                                                       (load out) (fng-const (load index))))
+                        (do (store! out (fng-jsl-call5 context "ArrayMapAt" array callback
+                                                       (load out) (fng-const (load index))
+                                                       callback-this))
                             (store! index (+ (load index) 1)))))
               (load out))
           (and value-specialized (= name "filter"))
@@ -4817,14 +4829,14 @@
                                                    (load accumulator) (fng-const (load index))))
                             (store! index (+ (load index) 1)))))
               (load accumulator))
-          (= name "map") (fng-jsl-call2 context "ArrayMap" array callback)
-          (= name "filter") (fng-jsl-call2 context "ArrayFilter" array callback)
-          (= name "forEach") (fng-jsl-call2 context "ArrayForEach" array callback)
-          (= name "find") (fng-jsl-call2 context "ArrayFind" array callback)
-          (= name "findIndex") (fng-jsl-call2 context "ArrayFindIndex" array callback)
-          (= name "some") (fng-jsl-call2 context "ArraySome" array callback)
-          (= name "every") (fng-jsl-call2 context "ArrayEvery" array callback)
-          (= name "flatMap") (fng-jsl-call2 context "ArrayFlatMap" array callback)
+          (= name "map") (fng-jsl-call3 context "ArrayMap" array callback callback-this)
+          (= name "filter") (fng-jsl-call3 context "ArrayFilter" array callback callback-this)
+          (= name "forEach") (fng-jsl-call3 context "ArrayForEach" array callback callback-this)
+          (= name "find") (fng-jsl-call3 context "ArrayFind" array callback callback-this)
+          (= name "findIndex") (fng-jsl-call3 context "ArrayFindIndex" array callback callback-this)
+          (= name "some") (fng-jsl-call3 context "ArraySome" array callback callback-this)
+          (= name "every") (fng-jsl-call3 context "ArrayEvery" array callback callback-this)
+          (= name "flatMap") (fng-jsl-call3 context "ArrayFlatMap" array callback callback-this)
           (= name "reduce")
             (if has-initial
                 (fng-jsl-call3 context "ArrayReduceInitial" array callback
@@ -9514,16 +9526,11 @@
             (if (= receiver-count 1)
                 (let [parameter (n-parm! fun 1)
                       owner (fe-type-index-for-node frontend (.receiver-type-node fn))]
-                  ; Receiver-aware source functions consume one uniform JavaScript ABI. Exact
-                  ; callers may already supply a raw shaped pointer; dynamic/JSL callers supply a
-                  ; tagged object. Clearing the tag is identity on the former and required for the
-                  ; latter before any fixed-slot `this.x` load.
-                  (set! receiver
-                        (n-unbox! parameter
-                                  (if (>= owner 0)
-                                      (t-obj-shape
-                                        (al-get [i64] (load shapes) owner))
-                                      (t-obj)))))
+                  ;; Keep the incoming JavaScript value tagged until OrdinaryCallBindThis has
+                  ;; applied strict/sloppy receiver semantics. Fixed-layout receivers are unboxed
+                  ;; once after that operation; dynamic and primitive strict receivers remain
+                  ;; ordinary tagged values.
+                  (set! receiver parameter))
                 0)
             (set! argc (n-parm! fun 2))
             (set! index 0)
@@ -9554,7 +9561,7 @@
                                        (n-unbox! parameter (t-flt))
                                        parameter)))
                         (set! index (+ (load index) 1))))))))
-    (let [context
+    (let [entry-context
             (fng-context frontend
                          values
                          value-types
@@ -9577,6 +9584,55 @@
                          cell-shape
                          cell-alias
                          (load receiver)
+                         (load argc)
+                         fun-id
+                         fun
+                         script-entry
+                         host-entry)
+          bound-receiver
+            (if (and (not script-entry)
+                     (and (not (.arrow fn)) (!= (load receiver) NO-NODE)))
+                ;; Strictness is immutable indexed function structure. A strict function retains
+                ;; its receiver directly; only the sloppy path reaches the DSL operation, so no
+                ;; impossible primitive-wrapper heap branch is built for strict functions.
+                (if (.strict fn)
+                    (load receiver)
+                    (fng-jsl-call1 entry-context
+                                   "OrdinaryCallBindThisSloppy"
+                                   (load receiver)))
+                (load receiver))
+          receiver-owner
+            (if (and (not script-entry) (>= (.receiver-type-node fn) 0))
+                (fe-type-index-for-node frontend (.receiver-type-node fn))
+                -1)
+          normalized-receiver
+            (if (and (>= receiver-owner 0) (!= bound-receiver NO-NODE))
+                (n-unbox! bound-receiver
+                          (t-obj-shape (al-get [i64] (load shapes) receiver-owner)))
+                bound-receiver)
+          context
+            (fng-context frontend
+                         values
+                         value-types
+                         functions
+                         prototypes
+                         shapes
+                         aliases
+                         effects
+                         dynamic-aliases
+                         type-count
+                         ctrl
+                         memory
+                         first-return
+                         targets
+                         target-symbols
+                         target-active
+                         jumps
+                         jump-values
+                         exception-dependency
+                         cell-shape
+                         cell-alias
+                         normalized-receiver
                          (load argc)
                          fun-id
                          fun
