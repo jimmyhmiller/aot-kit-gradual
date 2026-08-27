@@ -1,3 +1,32 @@
+## 2026-08-27: typed-array numeric keys and one-byte stores are DSL-owned
+
+- `TypedArrayIndex` now parses canonical nonnegative decimal property keys in a JSL `builtin`.
+  The call boundary is intentional: inlining its control-flow loop into generic property access
+  reproduced the known non-entry JSL control-flow corruption. No frontend or Test262 harness
+  behavior was added; `GetProperty`, `SetProperty`, and `HasProperty` remain ordinary DSL callers.
+- The parser normalizes raw/tagged string representation at its boundary, rejects empty strings,
+  leading zeroes, nondigits, and values above the signed internal-index range, and never requires
+  compiler intern tables at execution time.
+- `TypedArraySet` boxes the raw SSA right-hand side before `ToInt32`, stores the low byte in the
+  shared ArrayBuffer backing array, and returns the tagged assigned value. Int8 reads sign-extend;
+  Uint8 reads remain unsigned; absent backing slots read as zero.
+- `one_byte_typed_array_views_are_dsl_owned` pins zero initialization at indices 0 and 3, shared
+  backing-buffer writes, Uint8 wrapping, Int8 signed reads, accessors, identity, and
+  `ArrayBuffer.isView` in the bounded native gate.
+- The exact final 44-variant Int8Array/Uint8Array constructor measurement is 8 passed / 25 failed /
+  11 refused, with no lost pass. The equivalent inlined algorithm reached 8 / 36 / 0 but caused
+  unrelated invalid execution, so that better-looking result was rejected. Retained result:
+  `results/test262-int8-uint8-builtin-index-final-2026-08-27.jsonl`.
+- Broad ArrayBuffer measurement exposed a compiler sensitivity rather than a semantic failure.
+  The inlined loop produced 46 pass / 340 fail / 4 refuse / 1 skip and regressed both variants of
+  `prototype/byteLength/prop-desc.js`; the final builtin boundary restores strict to pass but
+  default currently selects-refuses. The focused result is retained at
+  `results/test262-arraybuffer-byteLength-prop-desc-builtin-final-2026-08-27.jsonl`. This remaining
+  passed-to-refused transition is explicit and is the next selector target; it was not hidden by
+  changing the harness or weakening a test.
+- `coil test` is green 52/52. `coil test --suite frontier` remains exactly the expected two red
+  bugs: `for-await-has-no-bridge-kind` and `shortest-round-trip-digits`.
+
 ## 2026-08-27: ArrayBuffer foundation is stable; Int8Array/Uint8Array globals are live
 
 - Added DSL-owned fixed-length `ArrayBuffer` semantics and ordinary-object internal slots in
