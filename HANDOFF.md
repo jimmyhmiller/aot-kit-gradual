@@ -1,3 +1,24 @@
+## 2026-08-27: descendant self captures and parameter environments stop corrupting graphs
+
+- Resolver capture classification now distinguishes a named expression's private function-ID
+  binding from declaration/call-target identities. Descendants record that lexical capture, and
+  runtime capture filtering owns it relative to the named expression itself rather than its
+  parent. Ordinary nested functions can now retain and return the exact self callable.
+- Private self publication at function entry now precedes default-parameter evaluation, matching
+  the named-expression environment's creation order. Parameter-created descendants therefore
+  capture an initialized cell rather than `NO-NODE`.
+- Default parameter expressions are resolved before body `var` bindings enter scope. The resolver
+  then rebuilds the body stack as hoisted locals followed by parameters, preserving body
+  var/parameter shadowing while keeping body-only declarations invisible to parameter closures.
+- The full `language/expressions/function` directory moved from 52 passed / 43 failed / 4 refused
+  to 59 passed / 36 failed / 4 refused. The retained comparison shows seven failed-to-passed
+  transitions and zero regressions: four `scope-name-var-*` variants, two
+  `scope-paramsbody-var-open` variants, and `arguments-with-arguments-lex`. Evidence:
+  `results/test262-function-expressions-after-parameter-env-order-2026-08-27.jsonl`.
+- Focused evidence is 4/4 for descendant private-self captures and 4/4 for the open/closed
+  parameter/body environment witnesses. `coil test` is green at 52/52; the final frontier remains
+  exactly `for-await-has-no-bridge-kind` and `shortest-round-trip-digits`.
+
 ## 2026-08-27: named-expression self bindings are private, immutable, and first-class
 
 - Resolution now creates a private binding only for explicitly named function/class expressions;

@@ -1865,8 +1865,10 @@
               true
               (let [fn (al-get [FeFunction] (.functions frontend) function-index)
                     parent (.parent fn)]
-                (and (!= parent -1)
-                     (fe-scope-inside? frontend capturer parent)))))
+                (if (fe-named-expression-id? frontend symbol)
+                    (fe-scope-inside? frontend capturer symbol)
+                    (and (!= parent -1)
+                         (fe-scope-inside? frontend capturer parent))))))
         (if (= (fe-symbol-role frontend symbol) FE-ROLE-GLOBAL)
             false
             (and (not (fng-static-global-symbol? frontend symbol))
@@ -5518,7 +5520,7 @@
               (if (or (> (fng-capture-count frontend (.id fn)) 0)
                       (and (!= (.name-node fn) -1)
                            (and (fe-named-expression-kind? (ts-kind ast (.node fn)))
-                                (fe-uses-resolved-symbol? frontend (.body-node fn) (.id fn)))))
+                                (fe-uses-resolved-symbol? frontend (.node fn) (.id fn)))))
                   (fng-box-dynamic-argument! (fng-expression context callee-node))
                   (fng-undefined))
               (if direct-value-callee (n-box! target) target))
@@ -9675,6 +9677,24 @@
                          fun
                          script-entry
                          host-entry)]
+      ;; A named function/class expression owns a private immutable lexical binding containing
+      ;; the callable being invoked. Publish it BEFORE default parameter evaluation: parameter
+      ;; initializers may create descendants that capture the private name. Parameter 0 is the
+      ;; uniform callable/environment ABI slot. Save this graph-local binding with ordinary
+      ;; captures because `values` is shared while each function graph is built.
+      (if (and (not script-entry)
+               (and (!= (.name-node fn) -1)
+                    (and (fe-named-expression-kind?
+                           (ts-kind (field frontend ast) (.node fn)))
+                         (fe-uses-resolved-symbol? frontend (.node fn) fun-id))))
+          (let [prior (al-get [i64] (load values) fun-id)
+                callable (n-parm! fun 0)]
+            (al-push! [i64] (mut saved-capture-symbols) fun-id)
+            (al-push! [i64] (mut saved-capture-values) prior)
+            (al-set! [i64] (mut values) fun-id NO-NODE)
+            (fng-set-symbol! context fun-id callable)
+            0)
+          0)
       (if script-entry
           ;; MAIN'S PARAMETERS NEED THE SAME CELLS. The loop below materializes a cell for every
           ;; parameter a nested closure captures, and it was skipped entirely for the top level --
@@ -9744,24 +9764,6 @@
                                                  (fng-symbol-node context (.id parameter-symbol)))
                               0))
                         (set! index (+ (load index) 1)))))))
-      ;; A named function/class expression owns a private immutable lexical binding containing
-      ;; the callable being invoked. Parameter 0 is the uniform callable/environment ABI slot;
-      ;; publish it as the binding value so first-class self reads and descendant captures observe
-      ;; the same object identity as the caller. Save it with ordinary captures because `values`
-      ;; is shared while each function graph is built.
-      (if (and (not script-entry)
-               (and (!= (.name-node fn) -1)
-                    (and (fe-named-expression-kind?
-                           (ts-kind (field frontend ast) (.node fn)))
-                         (fe-uses-resolved-symbol? frontend (.body-node fn) fun-id))))
-          (let [prior (al-get [i64] (load values) fun-id)
-                callable (n-parm! fun 0)]
-            (al-push! [i64] (mut saved-capture-symbols) fun-id)
-            (al-push! [i64] (mut saved-capture-values) prior)
-            (al-set! [i64] (mut values) fun-id NO-NODE)
-            (fng-set-symbol! context fun-id callable)
-            0)
-          0)
       ;; Install the host completion boundary before Script declaration instantiation. A
       ;; multi-Script program evaluates its real Script records from top-level initialization, so
       ;; installing this afterward misses exceptions escaping those records. This target observes

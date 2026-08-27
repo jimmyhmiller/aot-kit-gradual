@@ -862,6 +862,21 @@
                 (set! index (+ (load index) 1)))))
     (load answer)))
 
+(defn fe-named-expression-id? [(frontend (ptr NativeFrontend)) (id i64)] (-> bool)
+  (let [(mut index) 0 (mut answer) false]
+    (loop (if (or (>= (load index) (al-len [FeFunction] (.functions frontend)))
+                  (load answer))
+              (break)
+              (let [fn (al-get [FeFunction] (.functions frontend) (load index))]
+                (if (and (= (.id fn) id)
+                         (and (!= (.name-node fn) -1)
+                              (fe-named-expression-kind?
+                                (ts-kind (field frontend ast) (.node fn)))))
+                    (set! answer true)
+                    0)
+                (set! index (+ (load index) 1)))))
+    (load answer)))
+
 (defn fe-symbol-owner [(frontend (ptr NativeFrontend)) (symbol-id i64)] (-> i64)
   (let [(mut index) 0
         (mut answer) -1]
@@ -1740,9 +1755,11 @@
               (break)
               (do (al-push! [i64] (mut (.resolution-symbols frontend)) -1) 0)))
     (al-set! [i64] (mut (.resolution-symbols frontend)) node (load answer))
-    (if (and (and (>= (load answer) 0)
-                  (>= (load answer) (al-len [FeFunction] (.functions frontend))))
-             (!= (fe-symbol-owner frontend (load answer)) owner))
+    (if (and (>= (load answer) 0)
+             (or (and (>= (load answer) (al-len [FeFunction] (.functions frontend)))
+                      (!= (fe-symbol-owner frontend (load answer)) owner))
+                 (and (!= (load answer) owner)
+                      (fe-named-expression-id? frontend (load answer)))))
         (fe-record-capture! (mut frontend) owner (load answer))
         0)
     (load answer)))
@@ -1980,6 +1997,7 @@
         owner (.id fn)
         (mut bindings) (al-new [FeBinding] (malloc-allocator))
         count (.parameter-count fn)
+        (mut parameter-base) 0
         (mut index) 0]
     ;; Source-file `var` bindings are hoisted and shared. The graph builder materializes them as
     ;; main-owned closure cells, so every function resolves the same symbol identity.
@@ -2003,24 +2021,7 @@
                   (mut bindings)
                   (fe-binding-make (.name-node fn) owner 0))
         0)
-    ;; `var` hoisting inside the function: every local this function owns is visible from the top
-    ;; of the body, including from nested functions declared before the `var` statement appears
-    ;; (NavierStokes declares FluidField's state vars BELOW the nested helpers that write them).
-    ;; Parameters are pushed afterwards, so a parameter of the same name shadows the local, which
-    ;; is JavaScript's `var x` merging with parameter `x`.
-    (set! index 0)
-    (loop (if (>= (load index) (al-len [FeSymbol] (.symbols frontend)))
-              (break)
-              (let [symbol (al-get [FeSymbol] (.symbols frontend) (load index))]
-                (if (and (= (.role symbol) FE-ROLE-LOCAL)
-                         (= (.owner symbol) owner))
-                    (al-push! [FeBinding]
-                              (mut bindings)
-                              (fe-binding-make (.name-node symbol)
-                                               (.id symbol)
-                                               0))
-                    0)
-                (set! index (+ (load index) 1)))))
+    (store! parameter-base (al-len [FeBinding] (load bindings)))
     (set! index 0)
     (loop (if (>= (load index) count)
               (break)
@@ -2043,6 +2044,33 @@
                 (if (!= initializer -1)
                     (fe-resolve-node! (mut frontend) (mut bindings) initializer owner 0)
                     0)
+                (set! index (+ (load index) 1)))))
+    ;; Parameter expressions run before the body VariableEnvironment exists. Rebuild the body
+    ;; stack after resolving them: hoisted locals first, then parameters, preserving the existing
+    ;; var/parameter merge approximation while keeping body-only names invisible to defaults.
+    (store! (field bindings len) (load parameter-base))
+    (set! index 0)
+    (loop (if (>= (load index) (al-len [FeSymbol] (.symbols frontend)))
+              (break)
+              (let [symbol (al-get [FeSymbol] (.symbols frontend) (load index))]
+                (if (and (= (.role symbol) FE-ROLE-LOCAL)
+                         (= (.owner symbol) owner))
+                    (al-push! [FeBinding]
+                              (mut bindings)
+                              (fe-binding-make (.name-node symbol) (.id symbol) 0))
+                    0)
+                (set! index (+ (load index) 1)))))
+    (set! index 0)
+    (loop (if (>= (load index) count)
+              (break)
+              (let [symbol (fe-parameter-symbol frontend fn (load index))
+                    name (.name-node symbol)]
+                (if (or (= (ts-kind ast name) TSK-ARRAY-BINDING-PATTERN)
+                        (= (ts-kind ast name) TSK-OBJECT-BINDING-PATTERN))
+                    (fe-resolve-binding-pattern! (mut frontend) (mut bindings) name owner 0)
+                    (al-push! [FeBinding]
+                              (mut bindings)
+                              (fe-binding-make name (.id symbol) 0)))
                 (set! index (+ (load index) 1)))))
     ;; A class without an explicit constructor uses its own declaration node as the structural
     ;; empty body. Resolving that node as another function would recurse back into this same
