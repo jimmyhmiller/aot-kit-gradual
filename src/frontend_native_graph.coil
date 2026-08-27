@@ -111,6 +111,7 @@
    (cell-alias i64)
    (receiver i64)
    (argc i64)
+   (arguments (ptr i64))
    (owner i64)
    (fun i64)
    (top-level bool)
@@ -139,6 +140,7 @@
                    (cell-alias i64)
                    (receiver i64)
                    (argc i64)
+                   (arguments (ptr i64))
                    (owner i64)
                    (fun i64)
                    (top-level bool)
@@ -189,6 +191,8 @@
               receiver
               :argc
               argc
+              :arguments
+              arguments
               :owner
               owner
               :fun
@@ -2512,17 +2516,60 @@
                     (.cell-shape context)
                     function-id))
 
+(defn fng-function-length [(frontend (ptr NativeFrontend)) (function-index i64)] (-> i64)
+  ;; SetFunctionLength counts formal parameters only through the first initializer and excludes a
+  ;; rest parameter. This is syntax structure; publication of the JavaScript property is DSL-owned.
+  (let [fn (al-get [FeFunction] (.functions frontend) function-index)
+        ast (field frontend ast)
+        (mut ordinal) 0
+        (mut length) 0
+        (mut done) false]
+    (loop (if (or (load done) (>= (load ordinal) (.parameter-count fn)))
+              (break)
+              (let [symbol (fe-parameter-symbol frontend fn (load ordinal))
+                    parameter (.node symbol)]
+                (if (or (fe-rest-parameter? ast parameter)
+                        (!= (ts-role ast parameter TS-ROLE-INITIALIZER 0) -1))
+                    (set! done true)
+                    (set! length (+ (load length) 1)))
+                (set! ordinal (+ (load ordinal) 1)))))
+    (load length)))
+
+(defn fng-arguments-object [(context FngContext)] (-> i64)
+  (let [slot (load (field context arguments))]
+    (if (= (load slot) NO-NODE)
+        (let [frontend (load (field context frontend))
+              function-index (fng-function-index frontend (.owner context))
+              fn (al-get [FeFunction] (.functions frontend) function-index)
+              argc (jsl-normalize-int-representation! (.argc context))
+              object (fng-jsl-call1 context "NewArgumentsObject" argc)
+              (mut ordinal) 0]
+          (loop (if (>= (load ordinal) (.parameter-count fn))
+                    (break)
+                    (do
+                      (fng-jsl-call4 context
+                                     "InitializeArgumentsElement"
+                                     object
+                                     (fng-const (load ordinal))
+                                     argc
+                                     (n-parm! (.fun context) (+ 3 (load ordinal))))
+                      (set! ordinal (+ (load ordinal) 1)))))
+          (set! slot object))
+        0)
+    (load slot)))
+
 (defn fng-initialize-function-name! [(context FngContext)
                                      (function-index i64)
                                      (function i64)] (-> i64)
-  ;; Source structure determines the inferred name; JavaScript-visible definition and descriptor
-  ;; attributes remain entirely in the DSL.
-  (fng-jsl-call2 context
-                 "InitializeOrdinaryFunctionName"
-                 function
-                 (n-string-const!
-                   (jss-from-utf8!
-                     (fe-function-name (load (field context frontend)) function-index)))))
+  ;; Source structure determines length and inferred name; JavaScript-visible definition and
+  ;; descriptor attributes remain entirely in the DSL.
+  (let [frontend (load (field context frontend))]
+    (fng-jsl-call3 context
+                   "InitializeOrdinaryFunctionMetadata"
+                   function
+                   (fng-const (fng-function-length frontend function-index))
+                   (n-string-const!
+                     (jss-from-utf8! (fe-function-name frontend function-index))))))
 
 (defn fng-closure-expression [(context FngContext) (node i64)] (-> i64)
   (let [frontend (load (field context frontend))
@@ -6809,10 +6856,7 @@
                     (= symbol FE-INTRINSIC-UNBOUND)
                       (if (and (not (load (field context top-level)))
                                (= (ts-text ast node) "arguments"))
-                          (fng-jsl-call1
-                            context "NewArgumentsObject"
-                            (jsl-normalize-int-representation!
-                              (load (field context argc))))
+                          (fng-arguments-object context)
                           (fng-jsl-call1 context
                                         "GetGlobalBinding"
                                         (n-string-const!
@@ -9580,6 +9624,7 @@
         (mut host-target) -1
         (mut receiver) NO-NODE
         (mut argc) NO-NODE
+        (mut arguments) NO-NODE
         (mut index) 0]
     (if script-entry
         0
@@ -9691,6 +9736,7 @@
                          cell-alias
                          (load receiver)
                          (load argc)
+                         (mut arguments)
                          fun-id
                          fun
                          script-entry
@@ -9740,6 +9786,7 @@
                          cell-alias
                          normalized-receiver
                          (load argc)
+                         (mut arguments)
                          fun-id
                          fun
                          script-entry
