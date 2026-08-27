@@ -1,0 +1,126 @@
+;; Fixed-length one-byte typed-array views. A view is an ordinary object with [[ViewedArrayBuffer]]
+;; in InternalTarget, [[ArrayLength]] in InternalIndex, and its element kind in InternalKind.
+;; Kinds 200 and 201 are Int8Array and Uint8Array. Numeric-indexed exotic behavior is routed once
+;; through GetProperty/SetProperty in abstract/property.jsl; the frontend remains syntax-only.
+
+(macro IsTypedArray :params [(value dyn)] :ret bool
+  (if (%IsObject value)
+      (let [(kind (%InternalKind value))]
+        (if (%Eq kind 200) true (%Eq kind 201)))
+      false))
+
+(macro TypedArrayIndex :params [(propertyKey dyn)] :ret int
+  (let [(integer (%ToInteger propertyKey))]
+    (if (%IsInt integer)
+        (let [(index (%UnboxInt integer))]
+          (if (%Lt index 0)
+              -1
+              (if (StringEquals (ToStringValue (%Box index)) propertyKey) index -1)))
+        -1)))
+
+(macro TypedArrayGet :params [(array dyn) (index int)] :ret dyn
+  (let [(length (%InternalIndex array))]
+    (if (%Le length index)
+        (%Box undefined)
+        (let [(buffer (%InternalTarget array))
+              (bytes (%InternalTarget buffer))
+              (stored (%ArrayLoad bytes index))
+              (byte (if (%IsUndefined stored) 0 (%UnboxInt stored)))]
+          (if (%Eq (%InternalKind array) 200)
+              (%Box (if (%Le 128 byte) (%Sub byte 256) byte))
+              (%Box byte))))))
+
+(macro TypedArraySet :transitioning true
+  :params [(array dyn) (index int) (value dyn)] :ret dyn
+  (let [(length (%InternalIndex array))]
+    (if (%Le length index)
+        value
+        (let [(integer (%ToInteger value))
+              (number (if (%IsInt integer) (%UnboxInt integer) 0))
+              (byte (%BitAnd number 255))
+              (buffer (%InternalTarget array))
+              (bytes (%InternalTarget buffer))
+              (stored (%ArrayStore bytes index (%Box byte)))]
+          value))))
+
+(macro NewTypedArray :transitioning true
+  :params [(buffer dyn) (length int) (constructorKind int)] :ret dyn
+  (let [(array (%Box (%NewObject)))
+        (elementKind (if (%Eq constructorKind 26) 200 201))
+        (initialized (%InternalInit array buffer elementKind))
+        (lengthInitialized (%InternalSetIndex array length))
+        (prototype (SetObjectPrototype array (BuiltinPrototypeValue constructorKind)))]
+    array))
+
+(macro ConstructTypedArray :transitioning true
+  :params [(constructorKind int) (source dyn)] :ret dyn
+  (let [(initialized (TypedArrayConstructorValue constructorKind))]
+    (if (IsArrayBuffer source)
+        (NewTypedArray source (%InternalIndex source) constructorKind)
+        (let [(length (if (%IsUndefined source) 0 (ToArrayBufferLength source)))
+              (buffer (NewArrayBuffer length))]
+          (NewTypedArray buffer length constructorKind)))))
+
+(callable TypedArrayBufferGetter0 :transitioning true :params [] :ret dyn
+  (if (IsTypedArray this)
+      (%InternalTarget this)
+      (ThrowTypeError "TypedArray.prototype.buffer called on incompatible receiver")))
+
+(callable TypedArrayByteLengthGetter0 :transitioning true :params [] :ret dyn
+  (if (IsTypedArray this)
+      (%Box (%InternalIndex this))
+      (ThrowTypeError "TypedArray.prototype.byteLength called on incompatible receiver")))
+
+(callable TypedArrayByteOffsetGetter0 :transitioning true :params [] :ret dyn
+  (if (IsTypedArray this)
+      (%Box 0)
+      (ThrowTypeError "TypedArray.prototype.byteOffset called on incompatible receiver")))
+
+(callable TypedArrayLengthGetter0 :transitioning true :params [] :ret dyn
+  (if (IsTypedArray this)
+      (%Box (%InternalIndex this))
+      (ThrowTypeError "TypedArray.prototype.length called on incompatible receiver")))
+
+(macro TypedArrayName :params [(constructorKind int)] :ret dyn
+  (if (%Eq constructorKind 26) "Int8Array" "Uint8Array"))
+
+(builtin TypedArrayConstructorValue :transitioning true
+  :params [(constructorKind int)] :ret dyn
+  (let [(constructor (BuiltinConstructorValue constructorKind))
+        (prototype (BuiltinPrototypeValue constructorKind))
+        (lengthStored (%DefinePropertyValue constructor (ToPropertyKey "length") (%Box 3)))
+        (lengthMarked (%SetPropertyAttributes constructor (ToPropertyKey "length") 4))
+        (prototypeMarked (%SetPropertyAttributes constructor (ToPropertyKey "prototype") 0))
+        (bytesPerElement
+          (%DefinePropertyValue constructor (ToPropertyKey "BYTES_PER_ELEMENT") (%Box 1)))
+        (bytesPerElementMarked
+          (%SetPropertyAttributes constructor (ToPropertyKey "BYTES_PER_ELEMENT") 0))
+        (prototypeBytesPerElement
+          (%DefinePropertyValue prototype (ToPropertyKey "BYTES_PER_ELEMENT") (%Box 1)))
+        (prototypeBytesPerElementMarked
+          (%SetPropertyAttributes prototype (ToPropertyKey "BYTES_PER_ELEMENT") 0))
+        (bufferGetter (%Box (closure TypedArrayBufferGetter0)))
+        (bufferInstalled
+          (InstallBuiltinGetter prototype (ToPropertyKey "buffer") bufferGetter
+                                (%Box "get buffer")))
+        (byteLengthGetter (%Box (closure TypedArrayByteLengthGetter0)))
+        (byteLengthInstalled
+          (InstallBuiltinGetter prototype (ToPropertyKey "byteLength") byteLengthGetter
+                                (%Box "get byteLength")))
+        (byteOffsetGetter (%Box (closure TypedArrayByteOffsetGetter0)))
+        (byteOffsetInstalled
+          (InstallBuiltinGetter prototype (ToPropertyKey "byteOffset") byteOffsetGetter
+                                (%Box "get byteOffset")))
+        (lengthGetter (%Box (closure TypedArrayLengthGetter0)))
+        (lengthInstalled
+          (InstallBuiltinGetter prototype (ToPropertyKey "length") lengthGetter
+                                (%Box "get length")))
+        (symbolConstructor (SymbolConstructorValue))
+        (toStringTagKey (GetProperty symbolConstructor "toStringTag"))
+        (toStringTag (%DefinePropertyValue prototype toStringTagKey
+                                          (TypedArrayName constructorKind)))
+        (toStringTagMarked (%SetPropertyAttributes prototype toStringTagKey 4))]
+    constructor))
+
+(macro ThrowTypedArrayCall :transitioning true :params [] :ret dyn
+  (ThrowTypeError "Constructor TypedArray requires 'new'"))

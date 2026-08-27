@@ -1,3 +1,26 @@
+## 2026-08-27: ArrayBuffer foundation is stable; Int8Array/Uint8Array globals are live
+
+- Added DSL-owned fixed-length `ArrayBuffer` semantics and ordinary-object internal slots in
+  `lib/array-buffer/core.jsl`: construction and call rejection, length validation, `byteLength`,
+  `resizable`, `maxByteLength`, `detached`, `ArrayBuffer.isView`, species, and toStringTag. The
+  frontend only recognizes syntax/global structure and delegates all visible behavior to JSL.
+- The complete 391-variant ArrayBuffer cohort is retained at
+  `results/test262-arraybuffer-int8-uint8-final-2026-08-27.jsonl`: 48 pass, 338 fail, 4 refuse,
+  and 1 policy skip. This preserves the prior 48-pass fixed-accessor checkpoint exactly; the
+  earlier foundation moved 20 variants from failed to passed with zero regressions.
+- Added the first DSL-owned fixed-length `Int8Array` and `Uint8Array` constructor values, brands,
+  backing-buffer identity, accessors, one-byte conversion, and numeric-index routing. In the same
+  retained run each complete 22-variant constructor directory is 4 pass / 18 fail; constructor
+  visibility and incompatible-receiver cases now pass.
+- The next concrete typed-array defect is zero initialization of later sparse backing slots:
+  `new Uint8Array(4)[0]` is zero, while index 3 currently reads `undefined`. Low-level array-store
+  loops and `ArrayFill` do not materialize those opaque sparse slots reliably; the clean next fix
+  is an internal element-presence/zero-filled byte-storage operation, not a frontend special case.
+- Growing the JSL seed crossed the multi-script graph test's hard-coded function range at 128 and
+  collided with `OrdinaryToPrimitiveNumber`. The structural witness now reserves 512 and 1024;
+  verifier experiments were fully reverted. `coil test` is green 52/52. The frontier remains the
+  expected two red bugs: `for-await-has-no-bridge-kind` and `shortest-round-trip-digits`.
+
 ## 2026-08-27: Symbol callability is executable; nested callable bind remains open
 
 - Fixed AArch64 in-memory publication for polymorphic calls. The runtime target table already

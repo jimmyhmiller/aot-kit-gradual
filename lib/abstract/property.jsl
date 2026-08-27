@@ -107,9 +107,8 @@
 (callable ObjectPropertyIsEnumerable1 :transitioning true :params [(key dyn)] :ret dyn
   (%Box (PropertyIsEnumerable this key)))
 
-(macro GetProperty :transitioning true :params [(object dyn) (key dyn)] :ret dyn
-  (let [(propertyKey (ToPropertyKey key))
-        (attributes (%PropertyAttributes object propertyKey))]
+(macro OrdinaryGetProperty :transitioning true :params [(object dyn) (propertyKey dyn)] :ret dyn
+  (let [(attributes (%PropertyAttributes object propertyKey))]
     ;; `-1` means no property was found. Its low bits are all set, so testing the accessor bit
     ;; alone mistakes every missing property for an accessor. Reads still happen to answer
     ;; undefined, but writes become silent no-ops because the nonexistent setter is undefined.
@@ -151,9 +150,18 @@
                   (call-dynamic-with-receiver getter object)
                   (%Box undefined)))))))
 
-(macro SetProperty :transitioning true :params [(object dyn) (key dyn) (value dyn)] :ret dyn
-  (let [(propertyKey (ToPropertyKey key))
-        (attributes (%PropertyAttributes object propertyKey))]
+(macro GetProperty :transitioning true :params [(object dyn) (key dyn)] :ret dyn
+  (let [(propertyKey (ToPropertyKey key))]
+    (if (IsTypedArray object)
+        (let [(index (TypedArrayIndex propertyKey))]
+          (if (%Lt index 0)
+              (OrdinaryGetProperty object propertyKey)
+              (TypedArrayGet object index)))
+        (OrdinaryGetProperty object propertyKey))))
+
+(macro OrdinarySetProperty :transitioning true
+  :params [(object dyn) (propertyKey dyn) (value dyn)] :ret dyn
+  (let [(attributes (%PropertyAttributes object propertyKey))]
     (if (%Lt attributes 0)
         (let [(ignored (%PropStoreKey object propertyKey (%Box value)))] value)
         (if (%Eq (%BitAnd attributes 8) 0)
@@ -165,6 +173,15 @@
                   (let [(ignored (call-dynamic-with-receiver setter object (%Box value)))] value)
                   value))))))
 
+(macro SetProperty :transitioning true :params [(object dyn) (key dyn) (value dyn)] :ret dyn
+  (let [(propertyKey (ToPropertyKey key))]
+    (if (IsTypedArray object)
+        (let [(index (TypedArrayIndex propertyKey))]
+          (if (%Lt index 0)
+              (OrdinarySetProperty object propertyKey value)
+              (TypedArraySet object index value)))
+        (OrdinarySetProperty object propertyKey value))))
+
 ;; https://tc39.es/ecma262/#sec-define-field. Public instance fields define an own data property;
 ;; they do not invoke an inherited setter, so constructor lowering must not use SetProperty.
 (macro DefineField :params [(object dyn) (key dyn) (value dyn)] :ret dyn
@@ -173,7 +190,13 @@
     value))
 
 (macro HasProperty :params [(object dyn) (key dyn)] :ret bool
-  (%PropHasKey object (ToPropertyKey key)))
+  (let [(propertyKey (ToPropertyKey key))]
+    (if (IsTypedArray object)
+        (let [(index (TypedArrayIndex propertyKey))]
+          (if (%Lt index 0)
+              (%PropHasKey object propertyKey)
+              (%Lt index (%InternalIndex object))))
+        (%PropHasKey object propertyKey))))
 
 (macro DeleteProperty :params [(object dyn) (key dyn)] :ret bool
   (let [(propertyKey (ToPropertyKey key))]
