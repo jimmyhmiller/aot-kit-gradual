@@ -1,3 +1,28 @@
+## 2026-08-27: standalone JSL calls now publish abrupt returns
+
+- `jl-lower-decl!` now collects abrupt edges owned by a standalone DSL declaration and publishes
+  each one as a descriptor-104 exceptional `Return` on that declaration's `Fun`. A callback result
+  is never consumed as an ordinary value after the pending flag becomes true; the caller receives
+  the existing pending-exception ABI and checks it before touching the placeholder result.
+- This is shared lowering infrastructure, not an Array or Test262 special case. JavaScript meaning
+  remains in `lib/`; no harness behavior changed. The bounded native witness includes a throwing
+  `flatMap` callback caught by source `try`/`catch`, and `coil test` is green at 52/52.
+- Production Test262 compilation still exposes a separate signal-5 failure for the same `flatMap`
+  shape. The callback is correctly published and dispatched (`id=12`, record/owner 109), `%Throw`
+  sets pending to 1, and descriptor 101 reads tagged true. No later array operation executes, but
+  descriptor 102 (`ExceptionTake`) is not reached before the trap. `map`, `every`, and a direct
+  call with the same callback pass. Inline function, inline arrow, and variable-held callbacks all
+  fail; empty, constant, and value-using catch bodies all fail. Seed serialization is excluded:
+  `--no-seed-artifact` behaves identically.
+- Authoritative traces are retained locally in
+  `results/test262-abrupt-flatmap-array-trace-2026-08-27.jsonl` and
+  `results/test262-callback-abrupt-family-2026-08-27.jsonl`. A proposed change replacing the merged
+  throw dependency Phi with a neutral value produced zero transitions and was reverted. The next
+  investigation should identify the exact generated `brk` after the pending-true branch; LLDB
+  attached only to the compiler parent and could not follow the execution grandchild.
+- The persistent 40,000-pass goal remains active. The frontier is expected to remain exactly the
+  two recorded bugs, `for-await-has-no-bridge-kind` and `shortest-round-trip-digits`.
+
 ## 2026-08-27: empty-string logical values confirmed after native cache invalidation
 
 - Complete logical-AND plus logical-OR cohorts now report 52 passed / 16 failed / 0 refused across 68 variants. Each directory is 26/34, up from 24/34 at `bc8eaa7` and 22/34 before tagged logical arms.

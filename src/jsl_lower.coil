@@ -1533,11 +1533,13 @@
         before (n-count)
         started (node-profile-now)
         p (jl)
-        saved-collect (.collect-abrupts p)]
-    ;; A standalone function has its own pending-exception ABI and no frontend target into which
-    ;; deferred abrupt paths could be published. This remains false even when demand lowering was
-    ;; triggered from inside a frontend expansion that is collecting its own nested macro exits.
-    (set! (.collect-abrupts p) false)
+        saved-collect (.collect-abrupts p)
+        abrupt-base (jl-abrupt-count)]
+    ;; A standalone definition owns the abrupt paths produced by calls in its body. Collect them
+    ;; here even when demand lowering was entered from a frontend macro expansion: the declaration
+    ;; publishes them as exceptional Returns on its own Fun below, rather than leaking them into
+    ;; the source function that happened to trigger lowering.
+    (set! (.collect-abrupts p) true)
     (jl-unpin-binds!)
     (al-clear! [JslBind] (field p binds))
     (set! (.decl p) d)
@@ -1595,6 +1597,28 @@
                   (n-new2 (Return) (jl-ctrl) v)
                   (n-new3 (Return) (jl-ctrl) v (jl-mem-raw)))]
       (n-fun-close! fun ret)
+      ;; A callback or transitive JSL call reports an abrupt completion through the process-local
+      ;; pending flag. Its result register is deliberately meaningless in that state, so no normal
+      ;; operation may consume it. `jl-check-pending!` split each such call and captured the true
+      ;; edge with the heap visible at that exact point; publish those edges as the same descriptor-
+      ;; 104 exceptional Returns source functions use. The caller checks the flag before touching
+      ;; the returned placeholder, while return-kind inference ignores these marked arms.
+      (let [(mut abrupt) abrupt-base]
+        (loop (if (>= (load abrupt) (jl-abrupt-count)) (break)
+                (let [ctrl (jl-abrupt-ctrl (load abrupt))
+                      dependency (jl-abrupt-dependency (load abrupt))
+                      memory (jl-abrupt-mem (load abrupt))
+                      marked
+                        (n-peephole
+                          (n-new3 (JsBuiltin 104) ctrl dependency
+                                  (n-new1 (Const (t-int-con 0)) (g-start))))
+                      exceptional
+                        (if (= memory NO-NODE)
+                            (n-new2 (Return) ctrl marked)
+                            (n-new3 (Return) ctrl marked memory))]
+                  (n-fun-add-return! fun exceptional)
+                  (set! abrupt (+ (load abrupt) 1))))))
+      (jl-abrupt-drop! abrupt-base)
       (jl-set-outer-mem! NO-NODE)
       (if (jsl-decl-cold? d) (n-mark-cold! (n-fun-entry fun)) 0)
       ; A failure recorded DURING lowering (a loop that cannot iterate or cannot exit) has to be
