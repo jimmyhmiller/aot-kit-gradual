@@ -547,3 +547,37 @@
              (compile-machine!)
              (assert (= (mu-function-count) 2))
              (assert (= (native0) 42)))))
+
+(deftest polymorphic_dispatch_retains_every_internal_code_address_relocation
+  (graph-reset! 425)
+  (let [left (n-fun-open! 1)
+        lx (n-parm! left 0)
+        right (n-fun-open! 2)
+        rx (n-parm! right 0)]
+    (n-fun-close! left (n-new2 (Return) (n-fun-entry left) lx))
+    (n-fun-close! right (n-new2 (Return) (n-fun-entry right) rx))
+    (let [callee (n-new1 (Arg (t-fun-set 6)) (g-start))
+          site (n-call1! (g-start) callee (cc 42))]
+      (n-add-def! (g-stop) (n-new2 (Return) (call-end site) (call-value site)))
+      (g-analyze!)
+      (assert (= (g-verify) 0))
+      (compile-machine!)
+      (assert (= (mu-function-count) 3))
+      ;; Function id zero is reserved from runtime dispatch; ids one and two are both materialized.
+      (assert (= (mu-internal-address-reloc-count) 2))
+      (let [(mut relocation) 0]
+        (loop
+          (if (>= (load relocation) (mu-internal-address-reloc-count))
+              (break)
+              (do
+                (let [source (mu-internal-address-reloc-source (load relocation))
+                      offset (mu-internal-address-reloc-offset (load relocation))
+                      target (mu-internal-address-reloc-target (load relocation))]
+                  (assert (= source 0))
+                  (assert (>= target 1))
+                  (assert (< target (mu-function-count)))
+                  (assert (>= offset (mu-function-code-start source)))
+                  (assert (< offset (+ (mu-function-code-start source)
+                                       (mu-function-code-size source))))
+                  (assert (= (be-code-u32 offset) (a64-adr 17 0))))
+                (set! relocation (+ (load relocation) 1)))))))))

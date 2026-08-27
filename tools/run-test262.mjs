@@ -1,5 +1,24 @@
 #!/usr/bin/env node
 
+if (process.argv.includes("--help")) {
+  process.stdout.write(`Usage: node tools/run-test262.mjs [options] [test-path]\n\n` +
+    `  --test262 PATH   Test262 checkout root (required unless ./test262 exists)\n` +
+    `  --jobs N         Persistent compiler worker count\n` +
+    `  --limit N        Maximum source files before variant expansion\n` +
+    `  --no-build       Reuse the existing native compiler build\n` +
+    `  --profile        Retain compiler phase profiles\n` +
+    `  --no-seed-artifact  Rebuild immutable JSL compiler state in every process\n` +
+    `  --quick          Do not retain per-variant results\n` +
+    `  --results PATH   JSONL result path\n` +
+    `  --resume         Resume from the result path\n`);
+  process.exit(0);
+}
+
+if (process.argv.includes("--test262-dir")) {
+  process.stderr.write("run-test262: unknown option --test262-dir; use --test262 PATH\n");
+  process.exit(2);
+}
+
 import { spawn, spawnSync } from "node:child_process";
 import {
   appendFileSync,
@@ -11,7 +30,7 @@ import {
   statSync,
   writeFileSync,
 } from "node:fs";
-import { tmpdir } from "node:os";
+import { availableParallelism, tmpdir } from "node:os";
 import { basename, join, resolve } from "node:path";
 import process from "node:process";
 import * as yaml from "js-yaml";
@@ -41,6 +60,9 @@ const flagNames = new Set([
   "--resume",
   "--es5-only",
   "--profile",
+  "--seed-artifact",
+  "--no-seed-artifact",
+  "--verbose",
 ]);
 const hasFlag = (name) => argv.includes(name);
 const paths = [];
@@ -59,15 +81,19 @@ const root = resolve(option("--test262", process.env.TEST262_ROOT || "test262"))
 const native = resolve(option("--native", ".coil/build/test262-native"));
 const limit = Number(option("--limit", "0"));
 const start = Number(option("--start", "0"));
-const jobs = Math.max(1, Number(option("--jobs", "1")));
+const jobs = Math.max(1, Number(option("--jobs", String(Math.min(16, availableParallelism())))));
 const timeoutMs = Math.max(1, Number(option("--timeout-ms", "30000")));
 const memoryMb = Math.max(1, Number(option("--memory-mb", "2048")));
+// Bulk compilation remains explicit until its compiler-owned dispatcher is status-equivalent to
+// singleton Script execution. Units are structurally separate, but equivalence is non-negotiable.
 const batchSize = Math.max(1, Number(option("--batch-size", "1")));
 const quiet = hasFlag("--quiet");
 const quick = hasFlag("--quick");
 const resume = hasFlag("--resume");
 const es5Only = hasFlag("--es5-only");
 const profile = hasFlag("--profile");
+const useSeedArtifact = !hasFlag("--no-seed-artifact");
+const verbose = hasFlag("--verbose");
 const explicitResults = option("--results");
 const defaultResults = resolve(
   `test262-results-${new Date().toISOString().replace(/[:.]/g, "-")}.jsonl`,
@@ -79,7 +105,7 @@ if (paths.length === 0) {
   console.error(
     "usage: node tools/run-test262.mjs --test262 DIR [--start N] [--limit N] " +
       "[--jobs N] [--timeout-ms N] [--memory-mb N] [--results FILE] [--resume] [--quiet] " +
-      "[--quick] [--es5-only] TEST_OR_DIRECTORY...",
+      "[--quick] [--es5-only] [--verbose] TEST_OR_DIRECTORY...",
   );
   process.exit(64);
 }
@@ -95,6 +121,13 @@ if (results) console.error(`test262 results: ${results}`);
 
 if (!hasFlag("--no-build")) {
   const buildStarted = performance.now();
+  const bridgeBuild = spawnSync("tools/build-typescript-go-bridge.sh", [],
+    { cwd: process.cwd(), encoding: "utf8" });
+  if (bridgeBuild.status !== 0) {
+    process.stderr.write(bridgeBuild.stdout || "");
+    process.stderr.write(bridgeBuild.stderr || "");
+    process.exit(bridgeBuild.status || 1);
+  }
   const build = spawnSync(
     "coil",
     ["build", "tools/test262-native.coil", "-o", native, "--meta-opt=1", "--quiet"],
@@ -109,28 +142,31 @@ if (!hasFlag("--no-build")) {
 }
 
 const executionStarted = performance.now();
+// A profiled native compilation can exceed 64 KiB before reaching backend/cache timing lines.
+// Keep a bounded per-request buffer, but large enough to retain the completion-side diagnostics
+// that make persisted Test262 results useful for performance and failure analysis.
+const nativeOutputLimit = 1024 * 1024;
 
-const localHarness = resolve("tests/test262/harness");
-const sta = readFileSync(join(localHarness, "sta.js"), "utf8");
-const assertion = readFileSync(join(localHarness, "assert.js"), "utf8");
-const assertionMarker = (text) => {
-  const at = assertion.indexOf(text);
-  if (at < 0) throw new Error(`local assert.js is missing marker: ${text}`);
-  return at;
-};
-const assertionParts = {
-  base: assertion.slice(assertionMarker("function assert("), assertionMarker("assert._isSameValue")),
-  sameHelper: assertion.slice(assertionMarker("assert._isSameValue"), assertionMarker("assert.sameValue")),
-  sameValue: assertion.slice(assertionMarker("assert.sameValue"), assertionMarker("assert.notSameValue")),
-  notSameValue: assertion.slice(assertionMarker("assert.notSameValue"), assertionMarker("assert.throws")),
-  throws: assertion.slice(assertionMarker("assert.throws"), assertionMarker("function compareArray")),
-  compareArray: assertion.slice(assertionMarker("function compareArray")),
-};
+const sta = readFileSync(join(root, "harness", "sta.js"), "utf8");
+const assertion = readFileSync(join(root, "harness", "assert.js"), "utf8");
 const temporary = mkdtempSync(join(tmpdir(), "aotk-test262-"));
+const seedArtifact = join(temporary, "jsl-seed.mfts");
 const cleanupTemporary = () => rmSync(temporary, { recursive: true, force: true });
 process.on("exit", cleanupTemporary);
 process.on("SIGINT", () => process.exit(130));
 process.on("SIGTERM", () => process.exit(143));
+
+if (useSeedArtifact) {
+  const seedStarted = performance.now();
+  const seed = spawnSync(native, ["--build-seed", seedArtifact],
+    { cwd: process.cwd(), encoding: "utf8" });
+  if (seed.status !== 0) {
+    process.stderr.write(seed.stdout || "");
+    process.stderr.write(seed.stderr || "");
+    process.exit(seed.status || 1);
+  }
+  buildMs += performance.now() - seedStarted;
+}
 
 function collect(path, out) {
   const absolute = resolve(path);
@@ -148,12 +184,29 @@ function record(source, path) {
   return parsed && typeof parsed === "object" ? parsed : {};
 }
 
+const runtimeNegativeKinds = new Map([
+  ["EvalError", 1], ["RangeError", 2], ["ReferenceError", 3], ["SyntaxError", 4],
+  ["TypeError", 5], ["URIError", 6], ["Test262Error", 7], ["Error", 8],
+]);
+
 function unsupportedReason(metadata, source) {
   const flags = new Set(metadata.flags || []);
-  if (flags.has("module")) return "module variant";
+  if (flags.has("module") &&
+      metadata.negative?.phase !== "parse" && metadata.negative?.phase !== "early") {
+    return "module variant";
+  }
   if (flags.has("async")) return "async completion";
-  if (metadata.negative && metadata.negative.phase !== "parse") {
-    return `negative ${metadata.negative.phase || "unknown"} phase`;
+  if (metadata.negative) {
+    const phase = metadata.negative.phase || "unknown";
+    if (phase === "runtime") {
+      if (!runtimeNegativeKinds.has(metadata.negative.type)) {
+        return `negative runtime ${metadata.negative.type || "unknown"} type`;
+      }
+    } else if (phase !== "parse" && phase !== "early") {
+      return `negative ${phase} phase`;
+    } else if (metadata.negative.type !== "SyntaxError") {
+      return `negative ${phase} ${metadata.negative.type || "unknown"} type`;
+    }
   }
   if (/\$262\b/.test(source)) return "$262 host object";
   return "";
@@ -161,6 +214,7 @@ function unsupportedReason(metadata, source) {
 
 function variants(metadata) {
   const flags = new Set(metadata.flags || []);
+  if (flags.has("module")) return [{ name: "module", strict: false }];
   if (flags.has("raw") || flags.has("noStrict")) return [{ name: "default", strict: false }];
   if (flags.has("onlyStrict")) return [{ name: "strict", strict: true }];
   return [
@@ -169,91 +223,28 @@ function variants(metadata) {
   ];
 }
 
-function assemble(source, metadata, strict) {
+function scriptRecords(source, metadata, strict) {
   const flags = new Set(metadata.flags || []);
-  const pieces = [];
+  if (flags.has("raw")) return [Buffer.from(source, "utf8")];
   const includes = (metadata.includes || []).map((include) =>
-    readFileSync(join(root, "harness", include), "utf8")
+    readFileSync(join(root, "harness", include))
   );
-  if (!flags.has("raw")) {
-    pieces.push(sta, "\n");
-    // The native frontend is closed-world. Do not compile the comparatively large assertion
-    // library for old-style tests that use only direct Test262Error checks; load it whenever the
-    // test or one of its requested includes can reference `assert`.
-    const assertionUsers = [source, ...includes].join("\n");
-    if (/\bassert\b/.test(assertionUsers)) {
-      pieces.push(assertionParts.base);
-      const same = /\bassert\.(?:sameValue|notSameValue|compareArray)\b/.test(assertionUsers);
-      if (same) pieces.push(assertionParts.sameHelper);
-      if (/\bassert\.sameValue\b/.test(assertionUsers)) pieces.push(assertionParts.sameValue);
-      if (/\bassert\.notSameValue\b/.test(assertionUsers)) pieces.push(assertionParts.notSameValue);
-      if (/\bassert\.throws\b/.test(assertionUsers)) pieces.push(assertionParts.throws);
-      if (/\bassert\.compareArray\b/.test(assertionUsers)) pieces.push(assertionParts.compareArray);
-      pieces.push("\n");
-    }
-  }
-  for (const include of includes) pieces.push(include, "\n");
-  pieces.push("function main(n) {\n");
-  if (strict) pieces.push('"use strict";\n');
-  pieces.push(source, "\nreturn 0;\n}\n");
-  return pieces.join("");
-}
-
-function assembleParseNegative(source, strict) {
-  return `${strict ? '"use strict";\n' : ""}${source}\n`;
-}
-
-function assertionKey(source, includes) {
-  const users = [source, ...includes].join("\n");
-  if (!/\bassert\b/.test(users)) return "";
   return [
-    "base",
-    /\bassert\.(?:sameValue|notSameValue|compareArray)\b/.test(users) ? "helper" : "",
-    /\bassert\.sameValue\b/.test(users) ? "same" : "",
-    /\bassert\.notSameValue\b/.test(users) ? "notSame" : "",
-    /\bassert\.throws\b/.test(users) ? "throws" : "",
-    /\bassert\.compareArray\b/.test(users) ? "compare" : "",
-  ].filter(Boolean).join(",");
+    Buffer.from(assertion, "utf8"),
+    Buffer.from(sta, "utf8"),
+    ...includes,
+    Buffer.from(`${strict ? '"use strict";\n' : ""}${source}`, "utf8"),
+  ];
 }
 
-function batchSignature(task) {
-  const flags = new Set(task.metadata.flags || []);
-  const includeNames = task.metadata.includes || [];
-  const includes = includeNames.map((include) => readFileSync(join(root, "harness", include), "utf8"));
-  return JSON.stringify({ raw: flags.has("raw"), strict: task.variant.strict, includeNames,
-    assertions: assertionKey(task.source, includes) });
+function writeScriptUnit(path, source, metadata, strict) {
+  const records = scriptRecords(source, metadata, strict);
+  writeFileSync(path, Buffer.concat(records));
+  writeFileSync(`${path}.lengths`, `${records.map((record) => record.length).join("\n")}\n`);
 }
 
-function assembleBatch(tasks) {
-  const first = tasks[0];
-  const flags = new Set(first.metadata.flags || []);
-  const includes = (first.metadata.includes || []).map((include) =>
-    readFileSync(join(root, "harness", include), "utf8")
-  );
-  const pieces = [];
-  if (!flags.has("raw")) {
-    pieces.push(sta, "\n");
-    const key = assertionKey(first.source, includes).split(",");
-    if (key.includes("base")) pieces.push(assertionParts.base);
-    if (key.includes("helper")) pieces.push(assertionParts.sameHelper);
-    if (key.includes("same")) pieces.push(assertionParts.sameValue);
-    if (key.includes("notSame")) pieces.push(assertionParts.notSameValue);
-    if (key.includes("throws")) pieces.push(assertionParts.throws);
-    if (key.includes("compare")) pieces.push(assertionParts.compareArray);
-    if (key.length > 0) pieces.push("\n");
-  }
-  for (const include of includes) pieces.push(include, "\n");
-  for (let i = 0; i < tasks.length; i++) {
-    pieces.push(`function __aotk_test_${i}(n) {\n`);
-    if (tasks[i].variant.strict) pieces.push('"use strict";\n');
-    pieces.push(tasks[i].source, "\nreturn 0;\n}\n");
-  }
-  pieces.push("function main(n) {\n");
-  for (let i = 0; i < tasks.length - 1; i++) {
-    pieces.push(`if (n === ${i}) return __aotk_test_${i}(n);\n`);
-  }
-  pieces.push(`return __aotk_test_${tasks.length - 1}(n);\n}\n`);
-  return pieces.join("");
+function assemblePreExecutionNegative(source, strict) {
+  return strict ? `"use strict";\n${source}` : source;
 }
 
 let files = [];
@@ -265,8 +256,9 @@ if (start > 0) files.splice(0, start);
 if (limit > 0) files.length = Math.min(files.length, limit);
 
 console.error(
-  "Test262 scope: synchronous script tests and parser-diagnosed negative parse tests; " +
-    "modules, async completion, negative runtime phases, ECMAScript early-error checking, " +
+  "Test262 scope: synchronous script tests, runtime negatives for standard Error constructors, " +
+    "and parser/static-semantics diagnosed parse and early negatives; modules, async completion, " +
+    "negative resolution phases, complete ECMAScript early errors, " +
     "and full top-level Script semantics are not implemented.",
 );
 const totals = { passed: 0, failed: 0, refused: 0, skipped: 0 };
@@ -274,6 +266,11 @@ const categories = {};
 const completed = new Set();
 const resultKey = (result) => `${result.path}\0${result.variant}`;
 function categoryFor(status, detail = "") {
+  const requestSignal = detail.match(/^native-harness: request child signal (\d+)$/);
+  if (requestSignal) {
+    const names = { 6: "SIGABRT", 10: "SIGBUS", 11: "SIGSEGV" };
+    return names[Number(requestSignal[1])] || `SIGNAL-${requestSignal[1]}`;
+  }
   const code = detail.match(/frontend status=\d+ code=(\d+)/);
   if (code) return `frontend-code-${code[1]}`;
   const phase = detail.match(/^native-harness: ([a-z0-9-]+)/i);
@@ -308,7 +305,7 @@ function report(result) {
   result.category ||= categoryFor(result.status, result.detail);
   categories[result.category] = (categories[result.category] || 0) + 1;
   if (results) appendFileSync(results, `${JSON.stringify(result)}\n`);
-  if (!quiet || result.status === "failed") {
+  if (!quiet) {
     const detail = result.detail ? ` (${result.detail})` : "";
     console.log(`${result.status.toUpperCase()} ${result.path} [${result.variant}]${detail}`);
   }
@@ -334,17 +331,25 @@ for (let index = 0; index < files.length; index++) {
   for (const variant of variants(metadata)) {
     if (completed.has(resultKey({ path, variant: variant.name }))) continue;
     work.push({ index, path, source, metadata, variant,
-      parseNegative: metadata.negative?.phase === "parse" });
+      preExecutionNegative: metadata.negative?.phase === "parse" ||
+        metadata.negative?.phase === "early",
+      preExecutionModule: new Set(metadata.flags || []).has("module"),
+      runtimeNegativeKind: metadata.negative?.phase === "runtime"
+        ? runtimeNegativeKinds.get(metadata.negative.type) : 0 });
   }
 }
 
-function runNative(assembled, count = 0) {
+function runNative(assembled, count = 0, requestPrefix = null) {
   return new Promise((resolveRun) => {
     const spawnStartedNs = process.hrtime.bigint();
     const detached = process.platform !== "win32";
     const command = process.platform === "linux" ? "prlimit" : native;
-    const nativeArgs = [...(profile ? ["--profile"] : []), assembled,
-      ...(count > 0 ? [String(count)] : [])];
+    const nativeArgs = [...(profile ? ["--profile"] : []),
+      ...(useSeedArtifact && requestPrefix !== "!" && requestPrefix !== "^"
+        ? ["--seed", seedArtifact] : []),
+      ...(requestPrefix === null
+        ? [assembled, ...(count > 0 ? [String(count)] : [])]
+        : ["--request", `${requestPrefix}${assembled}`])];
     const args = process.platform === "linux"
       ? [`--as=${memoryMb * 1024 * 1024}`, "--", native, ...nativeArgs]
       : nativeArgs;
@@ -372,7 +377,9 @@ function runNative(assembled, count = 0) {
       }
     }, timeoutMs);
     const append = (current, chunk) =>
-      current.length >= 65536 ? current : (current + chunk.toString()).slice(0, 65536);
+      current.length >= nativeOutputLimit
+        ? current
+        : (current + chunk.toString()).slice(0, nativeOutputLimit);
     child.stdout.on("data", (chunk) => { stdout = append(stdout, chunk); });
     child.stderr.on("data", (chunk) => {
       stderr = append(stderr, chunk);
@@ -444,6 +451,15 @@ function batchRuntimeThrowDiagnostic(stderr, index) {
   return runtimeThrowDiagnostic(next < 0 ? tail : tail.slice(0, next));
 }
 
+function batchExecutionDiagnostic(stderr, index) {
+  const marker = `AOTK_BATCH_EXEC index=${index}\n`;
+  const at = stderr.indexOf(marker);
+  if (at < 0) return "";
+  const tail = stderr.slice(at + marker.length);
+  const next = tail.indexOf("AOTK_BATCH_EXEC index=");
+  return nativeDiagnostic(next < 0 ? tail : tail.slice(0, next));
+}
+
 const diagnosticKinds = ["unknown", "assert", "sameValue", "notSameValue",
   "throws-non-function", "throws-non-object", "throws-wrong-constructor",
   "throws-missing", "compareArray", "uncaught-exception"];
@@ -473,7 +489,7 @@ function decodeRuntimeDiagnostic(codeText) {
 
 function runtimeFailure(codeText) {
   const diagnostic = decodeRuntimeDiagnostic(codeText);
-  if (!diagnostic) return { detail: "RUNTIME-FAILED" };
+  if (!diagnostic) return { detail: `RUNTIME-FAILED ${codeText}` };
   const shown = (type, value) => value === undefined ? type : `${type}(${value})`;
   return { detail: `runtime ${diagnostic.failureKind} at assertion #${diagnostic.assertionSite}: ` +
       `actual=${shown(diagnostic.actualType, diagnostic.actualValue)} ` +
@@ -481,94 +497,45 @@ function runtimeFailure(codeText) {
     diagnostic };
 }
 
-function finishOne(task, assembled, run, assemblyMs, durationMs) {
+function finishOne(task, assembled, run, assemblyMs, durationMs, compileBatchSize = 1) {
   const { path, variant } = task;
   const timings = timingFields(run, assemblyMs, durationMs);
   rmSync(assembled, { force: true });
+  rmSync(`${assembled}.lengths`, { force: true });
   for (const suffix of [".o", ".err", ""]) {
     rmSync(`/tmp/aotk-native-${run.pid}${suffix}`, { force: true });
   }
   if (run.status === 0 && run.stdout.trim().endsWith("PASS")) {
     report({ path, variant: variant.name, status: "passed", durationMs: Math.round(durationMs),
+      compileBatchSize,
+      ...(profile && run.stderr ? { stderr: run.stderr } : {}),
       ...timings });
   } else if (
-    (run.status === 2 && run.stdout.trim().endsWith("REFUSED")) ||
-    run.stderr.includes("frontend: unsupported")
+    run.status === 2 && run.stdout.trim().endsWith("REFUSED")
   ) {
     const lines = run.stderr.trim().split("\n");
     const phaseDetail = nativeDiagnostic(run.stderr);
     const detail = phaseDetail ||
       lines.find((line) => line.startsWith("test262-native: frontend")) ||
       lines.find((line) => line.startsWith("frontend: unsupported")) || lines.at(-1);
-    report({ path, variant: variant.name, status: "refused", detail,
+    report({ path, variant: variant.name, status: "refused", detail, compileBatchSize,
+      ...(profile && run.stderr ? { stderr: run.stderr } : {}),
       durationMs: Math.round(durationMs), ...timings });
-    if (run.stderr && !quiet) process.stderr.write(run.stderr);
+    if (run.stderr && verbose) process.stderr.write(run.stderr);
   } else {
     const stderrLines = run.stderr.trim().split("\n");
     const runtimeCode = run.stdout.trim().match(/RUNTIME-FAILED\s+(-?\d+)$/)?.[1];
     const runtime = runtimeCode === undefined ? null : runtimeFailure(runtimeCode);
-    const detail = stderrLines.find((line) => line.startsWith("graph corruption:")) ||
-      nativeDiagnostic(run.stderr) || runtimeThrowDiagnostic(run.stderr) || run.signal ||
-      runtime?.detail || run.stdout.trim() || `exit ${run.status}`;
-    report({ path, variant: variant.name, status: "failed", detail,
+    const detail = run.signal === "TIMEOUT" ? "TIMEOUT" :
+      stderrLines.find((line) => line.startsWith("graph corruption:")) ||
+        runtimeThrowDiagnostic(run.stderr) || nativeDiagnostic(run.stderr) || run.signal ||
+        runtime?.detail || run.stdout.trim() || `exit ${run.status}`;
+    report({ path, variant: variant.name, status: "failed", detail, compileBatchSize,
       ...(runtime?.diagnostic ? { diagnostic: runtime.diagnostic } : {}),
+      ...(profile && run.stderr ? { stderr: run.stderr } : {}),
       durationMs: Math.round(durationMs), ...timings });
-    if (run.stderr && !quiet) process.stderr.write(run.stderr);
+    if (run.stderr && verbose) process.stderr.write(run.stderr);
   }
-}
-
-async function runOne(task) {
-  const { index, path, source, metadata, variant } = task;
-  const assembled = join(temporary, `${index}-${variant.name}-${basename(path)}`);
-  const assemblyStarted = performance.now();
-  writeFileSync(assembled, assemble(source, metadata, variant.strict));
-  const assemblyMs = performance.now() - assemblyStarted;
-  const started = performance.now();
-  const run = await runNative(assembled);
-  const durationMs = performance.now() - started;
-  finishOne(task, assembled, run, assemblyMs, durationMs);
-}
-
-async function runBatch(tasks) {
-  if (tasks.length === 1) return runOne(tasks[0]);
-  const assembled = join(temporary, `batch-${tasks[0].index}-${tasks.length}.js`);
-  const assemblyStarted = performance.now();
-  writeFileSync(assembled, assembleBatch(tasks));
-  const assemblyMs = performance.now() - assemblyStarted;
-  const started = performance.now();
-  const run = await runNative(assembled, tasks.length);
-  const durationMs = performance.now() - started;
-  const timings = timingFields(run, assemblyMs, durationMs);
-  rmSync(assembled, { force: true });
-  for (const suffix of [".o", ".err", ""]) rmSync(`/tmp/aotk-native-${run.pid}${suffix}`, { force: true });
-  const outcomes = new Map(
-    [...run.stdout.matchAll(/^BATCH (\d+) (PASS|RUNTIME-FAILED)(?: (-?\d+))?$/gm)]
-      .map((m) => [Number(m[1]), { status: m[2], code: m[3] }]),
-  );
-  if (run.status === 0 && outcomes.size === tasks.length) {
-    for (let i = 0; i < tasks.length; i++) {
-      if (outcomes.get(i).status !== "PASS") {
-        const share = timings.compileMs / tasks.length;
-        const runtime = outcomes.get(i).code === undefined ? null : runtimeFailure(outcomes.get(i).code);
-        report({ path: tasks[i].path, variant: tasks[i].variant.name, status: "failed",
-          detail: batchRuntimeThrowDiagnostic(run.stderr, i) || runtime?.detail || "RUNTIME-FAILED",
-          ...(runtime?.diagnostic ? { diagnostic: runtime.diagnostic } : {}),
-          durationMs: Math.round(durationMs), ...timings,
-          compileMs: share, batchCompileMs: timings.compileMs, batchSize: tasks.length });
-      } else {
-        const share = timings.compileMs / tasks.length;
-        report({ path: tasks[i].path, variant: tasks[i].variant.name, status: "passed",
-          durationMs: Math.round(durationMs), ...timings, compileMs: share,
-          batchCompileMs: timings.compileMs, batchSize: tasks.length });
-      }
-    }
-    return;
-  }
-  // One unsupported/corrupt member can reject a closed-world graph. Bisect until each member has
-  // its ordinary standalone status; no refusal or failure is inherited from a neighbor.
-  const middle = Math.floor(tasks.length / 2);
-  await runBatch(tasks.slice(0, middle));
-  await runBatch(tasks.slice(middle));
 }
 
 function nativeServer() {
@@ -577,15 +544,20 @@ function nativeServer() {
   let stderr = "";
   let stdout = "";
   let stdoutBuffer = "";
+  let stderrBuffer = "";
   let monitor = null;
   const appendOutput = (currentOutput, chunk) =>
-    currentOutput.length >= 65536
+    currentOutput.length >= nativeOutputLimit
       ? currentOutput
-      : (currentOutput + chunk.toString()).slice(0, 65536);
+      : (currentOutput + chunk.toString()).slice(0, nativeOutputLimit);
 
   const stopMonitor = () => {
     if (monitor) clearInterval(monitor);
     monitor = null;
+  };
+  const maybeSettle = () => {
+    if (!current || current.markerStatus === undefined || !current.stdoutComplete) return;
+    settle(current.markerStatus, null);
   };
   const settle = (status, signal) => {
     if (!current) return;
@@ -594,11 +566,13 @@ function nativeServer() {
     clearTimeout(request.timer);
     // CASE_END is written after the ordinary PASS/REFUSED/etc line on the same stdout stream.
     const cleanStdout = stdout.replace(/^AOTK_CASE_END .*$/gm, "").trimEnd();
-    const run = { pid: child?.pid, status, signal, stdout: cleanStdout, stderr,
+    const run = { pid: child?.pid, status, signal: request.forcedSignal || signal,
+      stdout: cleanStdout, stderr,
       spawnStartedNs: request.startedNs, readyReceivedNs: request.readyReceivedNs,
       peakRssKb: request.peakRssKb };
     stdout = "";
     stderr = "";
+    stderrBuffer = "";
     setTimeout(() => request.resolve(run), 0);
   };
   const start = () => {
@@ -611,6 +585,7 @@ function nativeServer() {
     child = spawn(command, args, { cwd: process.cwd(), detached, stdio: ["pipe", "pipe", "pipe"],
       env: { ...process.env, AOT_TRACE_THROW: "1" } });
     stdoutBuffer = "";
+    stderrBuffer = "";
     child.stdout.on("data", (chunk) => {
       const text = chunk.toString();
       stdout += text;
@@ -619,14 +594,35 @@ function nativeServer() {
       while ((newline = stdoutBuffer.indexOf("\n")) >= 0) {
         const line = stdoutBuffer.slice(0, newline);
         stdoutBuffer = stdoutBuffer.slice(newline + 1);
-        const end = line.match(/^AOTK_CASE_END index=\d+ status=(\d+)$/);
-        if (end) settle(Number(end[1]), null);
+        if (/^(?:PASS|REFUSED|LINK-FAILED|RUNTIME-FAILED(?: -?\d+)?)$/.test(line)) {
+          current.stdoutComplete = true;
+        } else if (/^BATCH \d+ (?:PASS|REFUSED|RUNTIME-FAILED(?: -?\d+)?)$/.test(line)) {
+          current.stdoutResults++;
+          if (current.stdoutResults >= current.expectedResults) current.stdoutComplete = true;
+        } else if (/^BATCH-(?:COMPILE|LINK)-FAILED$/.test(line)) {
+          current.stdoutComplete = true;
+        }
+        maybeSettle();
       }
     });
     child.stderr.on("data", (chunk) => {
-      stderr = appendOutput(stderr, chunk);
+      const text = chunk.toString();
+      stderr = appendOutput(stderr, text);
+      stderrBuffer += text;
       if (current && current.readyReceivedNs === undefined && stderr.includes("AOTK_READY")) {
         current.readyReceivedNs = process.hrtime.bigint();
+      }
+      let newline;
+      while ((newline = stderrBuffer.indexOf("\n")) >= 0) {
+        const line = stderrBuffer.slice(0, newline);
+        stderrBuffer = stderrBuffer.slice(newline + 1);
+        const end = line.match(/^AOTK_CASE_END index=\d+ status=(\d+)$/);
+        if (end && current) {
+          current.markerStatus = Number(end[1]);
+          maybeSettle();
+        }
+        const requestChild = line.match(/^AOTK_REQUEST_CHILD pid=(\d+)$/);
+        if (requestChild && current) current.requestPid = Number(requestChild[1]);
       }
     });
     child.on("error", (error) => {
@@ -647,82 +643,206 @@ function nativeServer() {
       } catch {}
     }, 20);
   };
-  const run = (assembled, parseNegative = false) => new Promise((resolveRun) => {
+  const request = (line, expectedResults) => new Promise((resolveRun) => {
     if (!child) start();
     const startedNs = process.hrtime.bigint();
-    current = { resolve: resolveRun, startedNs, peakRssKb: 0, timer: null };
+    current = { resolve: resolveRun, startedNs, peakRssKb: 0, timer: null, requestPid: null,
+      expectedResults, stdoutResults: 0, stdoutComplete: false, markerStatus: undefined };
     current.timer = setTimeout(() => {
       if (!child) return;
       current.forcedSignal = "TIMEOUT";
       try {
-        if (process.platform !== "win32") process.kill(-child.pid, "SIGKILL");
+        if (process.platform !== "win32" && current.requestPid)
+          process.kill(-current.requestPid, "SIGKILL");
+        else if (process.platform !== "win32") process.kill(-child.pid, "SIGKILL");
         else child.kill("SIGKILL");
       } catch (error) {
         if (error.code !== "ESRCH") throw error;
       }
     }, timeoutMs);
-    child.stdin.write(`${parseNegative ? "!" : ""}${assembled}\n`);
+    child.stdin.write(`${line}\n`);
   });
+  const run = (assembled, preExecutionNegative = false, multiScript = false,
+    runtimeNegativeKind = 0, preExecutionModule = false) => {
+    const prefix = runtimeNegativeKind ? `?${runtimeNegativeKind}:` :
+      preExecutionNegative ? (preExecutionModule ? "^" : "!") : multiScript ? "@" : "";
+    return request(`${prefix}${assembled}`, 1);
+  };
+  const runBatch = (manifest, count) => request(`#${manifest}`, count);
   const close = () => {
     if (child) child.stdin.end();
     stopMonitor();
   };
-  return { run, close };
+  return { run, runBatch, close };
 }
 
 async function runServerOne(server, task) {
   const { index, path, source, metadata, variant } = task;
   const assembled = join(temporary, `${index}-${variant.name}-${basename(path)}`);
   const assemblyStarted = performance.now();
-  writeFileSync(assembled, task.parseNegative
-    ? assembleParseNegative(source, variant.strict)
-    : assemble(source, metadata, variant.strict));
+  try {
+    if (task.preExecutionNegative) {
+      writeFileSync(assembled, assemblePreExecutionNegative(source, variant.strict));
+    } else {
+      writeScriptUnit(assembled, source, metadata, variant.strict);
+    }
+  } catch (error) {
+    rmSync(assembled, { force: true });
+    rmSync(`${assembled}.lengths`, { force: true });
+    const missingInclude = error?.code === "ENOENT" && String(error.path || "").includes("/harness/");
+    report({ path, variant: variant.name, status: "failed",
+      category: missingInclude ? "harness-missing-include" : "source-assembly-failure",
+      detail: missingInclude
+        ? `missing Test262 harness include: ${basename(error.path)}`
+        : `source assembly failed: ${error.message}`,
+      durationMs: Math.round(performance.now() - assemblyStarted) });
+    return;
+  }
   const assemblyMs = performance.now() - assemblyStarted;
   const started = performance.now();
-  const run = await server.run(assembled, task.parseNegative);
+  const run = await server.run(assembled, task.preExecutionNegative, !task.preExecutionNegative,
+    task.runtimeNegativeKind || 0, task.preExecutionModule);
   const durationMs = performance.now() - started;
   finishOne(task, assembled, run, assemblyMs, durationMs);
 }
 
-const expectedCompleted = completed.size + work.length;
-const negativeUnits = work.filter((task) => task.parseNegative).map((task) => [task]);
-let positiveUnits;
-if (batchSize === 1) {
-  positiveUnits = work.filter((task) => !task.parseNegative).map((task) => [task]);
-} else {
-  const groups = new Map();
-  for (const task of work.filter((candidate) => !candidate.parseNegative)) {
-    const key = batchSignature(task);
-    if (!groups.has(key)) groups.set(key, []);
-    groups.get(key).push(task);
+const oneShotCompiler = {
+  run(assembled, preExecutionNegative = false, multiScript = false,
+    runtimeNegativeKind = 0, preExecutionModule = false) {
+    const prefix = runtimeNegativeKind ? `?${runtimeNegativeKind}:` :
+      preExecutionNegative ? (preExecutionModule ? "^" : "!") : multiScript ? "@" : "";
+    return runNative(assembled, 0, prefix);
+  },
+  runBatch(manifest) {
+    return runNative(manifest, 0, "#");
+  },
+};
+
+function batchStderr(stderr, index) {
+  const first = stderr.indexOf("AOTK_BATCH_EXEC index=");
+  const compile = first < 0 ? stderr : stderr.slice(0, first);
+  const marker = `AOTK_BATCH_EXEC index=${index}\n`;
+  const at = stderr.indexOf(marker);
+  if (at < 0) return compile;
+  const tail = stderr.slice(at + marker.length);
+  const next = tail.indexOf("AOTK_BATCH_EXEC index=");
+  return compile + marker + (next < 0 ? tail : tail.slice(0, next));
+}
+
+async function runServerBatch(server, tasks) {
+  const retrySingletonsInFreshWorker = async () => {
+    for (const task of tasks) await runServerOne(oneShotCompiler, task);
+  };
+  if (tasks.length === 1) {
+    await runServerOne(server, tasks[0]);
+    return;
   }
-  positiveUnits = [];
-  for (const group of groups.values()) {
-    for (let i = 0; i < group.length; i += batchSize) {
-      positiveUnits.push(group.slice(i, i + batchSize));
+  const assembledUnits = [];
+  const assemblyTimes = [];
+  for (const task of tasks) {
+    const assembled = join(temporary, `${task.index}-${task.variant.name}-${basename(task.path)}`);
+    const started = performance.now();
+    try {
+      writeScriptUnit(assembled, task.source, task.metadata, task.variant.strict);
+    } catch (error) {
+      for (const prior of assembledUnits) {
+        rmSync(prior, { force: true });
+        rmSync(`${prior}.lengths`, { force: true });
+      }
+      await retrySingletonsInFreshWorker();
+      return;
     }
+    assembledUnits.push(assembled);
+    assemblyTimes.push(performance.now() - started);
+  }
+  const manifest = join(temporary, `batch-${tasks[0].index}-${tasks.length}.manifest`);
+  writeFileSync(manifest, tasks.map((task, index) =>
+    `${task.runtimeNegativeKind || 0}\t${assembledUnits[index]}\n`).join(""));
+  const started = performance.now();
+  const run = await server.runBatch(manifest, tasks.length);
+  const durationMs = performance.now() - started;
+  rmSync(manifest, { force: true });
+  if (run.stdout.includes("BATCH-COMPILE-FAILED") ||
+      run.stdout.includes("BATCH-LINK-FAILED")) {
+    for (const assembled of assembledUnits) {
+      rmSync(assembled, { force: true });
+      rmSync(`${assembled}.lengths`, { force: true });
+    }
+    await retrySingletonsInFreshWorker();
+    return;
+  }
+  const outcomes = new Map();
+  for (const line of run.stdout.trim().split("\n")) {
+    const match = line.match(/^BATCH (\d+) (PASS|REFUSED|RUNTIME-FAILED(?: -?\d+)?)$/);
+    if (match) outcomes.set(Number(match[1]), match[2]);
+  }
+  // A compiler/server failure is a batch failure, not a JavaScript result for every member.
+  // Runtime crashes are confined to children and still produce one BATCH row, so an incomplete
+  // outcome set unambiguously means attribution requires singleton retries.
+  if (run.signal || outcomes.size !== tasks.length) {
+    for (const assembled of assembledUnits) {
+      rmSync(assembled, { force: true });
+      rmSync(`${assembled}.lengths`, { force: true });
+    }
+    await retrySingletonsInFreshWorker();
+    return;
+  }
+  for (let index = 0; index < tasks.length; index++) {
+    const outcome = outcomes.get(index);
+    const itemRun = { ...run,
+        status: outcome === "PASS" ? 0 : outcome === "REFUSED" ? 2 : 1,
+      signal: outcome ? null : (run.signal || "MISSING-BATCH-RESULT"),
+      stdout: outcome || "",
+      stderr: batchStderr(run.stderr, index) };
+    finishOne(tasks[index], assembledUnits[index], itemRun, assemblyTimes[index],
+      durationMs / tasks.length, tasks.length);
   }
 }
 
-async function runUnits(units, throughServer) {
+const expectedCompleted = completed.size + work.length;
+const progressStarted = performance.now();
+const progressInitial = completed.size;
+const progressTimer = quiet ? setInterval(() => {
+  const elapsedSeconds = (performance.now() - progressStarted) / 1000;
+  const finished = completed.size - progressInitial;
+  const remaining = expectedCompleted - completed.size;
+  const rate = finished / Math.max(elapsedSeconds, 0.001);
+  const etaSeconds = rate > 0 ? remaining / rate : 0;
+  console.error(
+    `test262 progress: ${completed.size}/${expectedCompleted} ` +
+      `(${(completed.size * 100 / expectedCompleted).toFixed(1)}%) ` +
+      `elapsed=${elapsedSeconds.toFixed(0)}s rate=${rate.toFixed(1)}/s ` +
+      `eta=${etaSeconds.toFixed(0)}s`,
+  );
+}, 60000) : null;
+if (progressTimer) progressTimer.unref();
+const negativeUnits = work.filter((task) => task.preExecutionNegative).map((task) => [task]);
+// Every Script compilation begins in a freshly exec'd process. A long-lived compiler retains
+// mutable compiler and TypeScript runtime state, and both same-process restoration and a
+// post-seed fork supervisor failed broad equivalence. Keep the clean process boundary.
+const positiveTasks = work.filter((task) => !task.preExecutionNegative);
+const positiveUnits = [];
+for (let index = 0; index < positiveTasks.length; index += batchSize) {
+  positiveUnits.push(positiveTasks.slice(index, index + batchSize));
+}
+
+async function runUnits(units) {
   let next = 0;
   async function worker() {
-    const server = throughServer ? nativeServer() : null;
     while (next < units.length) {
       const unit = units[next++];
-      if (server) await runServerOne(server, unit[0]);
-      else await runBatch(unit);
+      if (unit.length === 1) await runServerOne(oneShotCompiler, unit[0]);
+      else await runServerBatch(oneShotCompiler, unit);
     }
-    if (server) server.close();
   }
   await Promise.all(Array.from({ length: Math.min(jobs, units.length) }, worker));
 }
 
-// Parse-negative mode is a protocol operation (`!path`) implemented by the persistent server,
-// not by the one-shot native CLI. Keep it in an explicit phase so batch size cannot change
-// semantics and server lifecycle cannot interfere with positive compilation batches.
-await runUnits(negativeUnits, true);
-await runUnits(positiveUnits, batchSize === 1);
+// Pre-execution-negative mode covers Test262 parse and early SyntaxError phases: both must reject
+// before execution. Keep it in an explicit phase so completion policy cannot leak into positives.
+await runUnits(negativeUnits);
+await runUnits(positiveUnits);
+if (progressTimer) clearInterval(progressTimer);
 
 if (completed.size !== expectedCompleted) {
   throw new Error(

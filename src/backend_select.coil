@@ -46,7 +46,8 @@
         JSV-BOOLEAN VK-INT
         JSV-INTEGER VK-FLT
         0 VK-STR
-        JSV-STRING VK-OBJ
+        JSV-STRING VK-SYM
+        JSV-SYMBOL VK-OBJ
         JSV-OBJECT VK-FUN
         JSV-FUNCTION -1))
 
@@ -210,9 +211,15 @@
         -1)))
 
 (defn be-function-return-kind [(owner i64)] (-> i64)
-  (be-function-return-kind-fuel owner 32))
+  (let [fun (mu-function-ideal owner)]
+    (if (and (!= fun NO-NODE) (n-fun-abi-declared? fun))
+        (ml-kind-for-type (n-fun-abi-return-type fun))
+        (be-function-return-kind-fuel owner 32))))
 
 (defn be-function-fp-return? [(owner i64)] (-> bool)
+  (let [fun (mu-function-ideal owner)]
+  (if (and (!= fun NO-NODE) (n-fun-abi-declared? fun))
+      (= (ty-kinds (n-fun-abi-return-type fun)) VK-FLT)
   (let [count (mu-function-return-count owner)
         (mut index) 0
         (mut found) false]
@@ -226,7 +233,7 @@
                     (set! found true)
                     0)
                 (set! index (+ (load index) 1)))))
-    (load found)))
+    (load found)))))
 
 (defn be-call-return-kind-fuel [(call i64) (fuel i64)] (-> i64)
   (let [direct (infer-direct-callee-fun call)
@@ -247,7 +254,9 @@
                 (if (and (!= fun NO-NODE)
                          (and (op-is? fun Fun [_])
                               (infer-call-reaches-fun? call fun)))
-                    (let [kind (be-function-return-kind-fuel (load owner) fuel)]
+                    (let [kind (if (n-fun-abi-declared? fun)
+                                   (be-function-return-kind (load owner))
+                                   (be-function-return-kind-fuel (load owner) fuel))]
                       (set! saw true)
                       (if (< kind 0)
                           (set! consistent false)
@@ -303,8 +312,8 @@
                                   (if (> fuel 0)
                                       (be-call-return-tag-fuel value (- fuel 1))
                                       -1)]
-                            (if (>= tag 0)
-                                (if (< (load answer) 0)
+                            (if (!= tag -1)
+                                (if (= (load answer) -1)
                                     (set! answer tag)
                                     (if (!= (load answer) tag)
                                         (set! consistent false)
@@ -316,9 +325,9 @@
                           ;; value classifier, which makes the same decision used when boxing the
                           ;; return at the call boundary.
                           (let [tag (be-js-tag-for-value value)]
-                            (if (< tag 0)
+                            (if (= tag -1)
                                 (set! consistent false)
-                                (if (< (load answer) 0)
+                                (if (= (load answer) -1)
                                     (set! answer tag)
                                     (if (!= (load answer) tag)
                                         (set! consistent false)
@@ -326,11 +335,23 @@
                     0)
                 (set! i (+ (load i) 1)))))
     (if (load consistent)
-        (if (and (< (load answer) 0) (load exceptional)) JSV-UNDEFINED (load answer))
+        (if (and (= (load answer) -1) (load exceptional)) JSV-UNDEFINED (load answer))
         -1)))
 
 (defn be-function-return-tag [(owner i64)] (-> i64)
   (be-function-return-tag-fuel owner 32))
+
+;; Runtime polymorphic dispatch must know how to normalize the selected function's native result.
+;; Keep the compact code independent of either encoder so separately compiled call sites and
+;; linked targets agree: -4 is already boxed, -3 is an f64 in the FP return register, otherwise the
+;; value is a scalar payload to tag with this JavaScript tag.
+(defn be-function-dispatch-return-code [(owner i64)] (-> i64)
+  (let [kind (be-function-return-kind owner)]
+    (if (= kind MLK-BOXED)
+        -4
+        (if (and (= kind MLK-SCALAR) (be-function-fp-return? owner))
+            -3
+            (be-function-return-tag owner)))))
 
 (defn be-call-return-tag-fuel [(call i64) (fuel i64)] (-> i64)
   (let [funcs (mu-function-count)
@@ -344,11 +365,17 @@
                 (if (and (!= fun NO-NODE)
                          (and (op-is? fun Fun [_])
                               (infer-call-reaches-fun? call fun)))
-                    (let [tag (be-function-return-tag-fuel (load owner) fuel)]
+                    (let [declared-tag
+                            (if (n-fun-abi-declared? fun)
+                                (be-js-tag-for-type (n-fun-abi-return-type fun))
+                                -1)
+                          tag (if (!= declared-tag -1)
+                                  declared-tag
+                                  (be-function-return-tag-fuel (load owner) fuel))]
                       (set! saw true)
-                      (if (< tag 0)
+                      (if (= tag -1)
                           (set! consistent false)
-                          (if (< (load answer) 0)
+                          (if (= (load answer) -1)
                               (set! answer tag)
                               (if (!= (load answer) tag) (set! consistent false) 0))))
                     0)
@@ -614,6 +641,9 @@
 
 (defn graph-parm-position-fp? [(fun i64) (position i64)] (-> bool)
   (block :done
+    (if (and (n-fun-abi-declared? fun) (< position (n-fun-abi-param-count fun)))
+        (return-from :done (= (ty-kinds (n-fun-abi-param-type fun position)) VK-FLT))
+        0)
     ;; Prefer a surviving Parm. If optimization removed that parameter, recover its ABI class from
     ;; a closed-world call argument: dead parameters still occupy their declared register slot.
     (let [(mut i) 0]
@@ -1325,16 +1355,16 @@
                               raw-value)]
                     (if (or (< ptr 0) (< value 0))
                         (set! ok false)
-                        (let [at
-                                (ms-emit! owner
+                    (let [at
+                            (ms-emit! owner
                                           bid
                                           (mi-new MI-STORE
                                                   -1
                                                   ptr
                                                   value
-                                                  (be-field-off alias)
-                                                  node))]
-                          (ms-add-memory-deps! at node 1 1))))))
+                                            (be-field-off alias)
+                                            node))]
+                      (ms-add-memory-deps! at node 1 1))))))
             (Proj [slot] (if (op-is? (n-in node 0) New [_])
                   (if (< (ms-select-value-at! owner (n-in node 0) bid) 0) (set! ok false) 0)
                   0))
@@ -2082,6 +2112,13 @@
                                           (ms-immediate! owner bid 0) JSSOP-NORMALIZE)))))
             (JsBuiltin [descriptor] (let [left (ms-select-value-at! owner (n-in node 1) bid)
                       right (ms-select-value-at! owner (n-in node 2) bid)]
+                  (if (and (be-profiling?) (>= descriptor 101))
+                      (do
+                        (fmt (stderr)
+                             "AOTK_PROFILE phase=exception_transport owner={d} node={d} descriptor={d} block={d} ctrl={d}\n"
+                             owner node descriptor bid (n-in node 0))
+                        0)
+                      0)
                   (if (or (< left 0) (< right 0))
                       0
                       (set! vr
@@ -2098,6 +2135,11 @@
                                           (ms-immediate! owner throw-bid 0)
                                           (ms-immediate! owner throw-bid 0) 200)))))
             (Fun [index] (let [fresh (ms-new-vreg!)]
+                  (ms-emit! owner
+                            (ms-entry-block owner)
+                            (mi-new MI-MOVI fresh -1 -1 index node))
+                  (set! vr fresh)))
+            (CallableId [index] (let [fresh (ms-new-vreg!)]
                   (ms-emit! owner
                             (ms-entry-block owner)
                             (mi-new MI-MOVI fresh -1 -1 index node))
@@ -2632,12 +2674,25 @@
                                                     ; object can race its field initialization in
                                                     ; local scheduling and read allocator zeros.
                                                     selected (ms-select-value-at! owner source call-bid)
+                                                    declared-js-value-slot
+                                                      (and (not polymorphic)
+                                                           (let [target-fun
+                                                                   (mu-function-ideal target)]
+                                                             (and (!= target-fun NO-NODE)
+                                                                  (and (n-fun-abi-declared? target-fun)
+                                                                       (and (< (load i)
+                                                                               (n-fun-abi-param-count
+                                                                                 target-fun))
+                                                                            (= (n-fun-abi-param-type
+                                                                                 target-fun (load i))
+                                                                               (t-dyn)))))))
                                                     js-value-slot
-                                                      (or (and (or (= abi CALL-ABI-RECEIVER)
-                                                                   (= abi CALL-ABI-DYNAMIC-RECEIVER))
-                                                               (or (= (load i) 1) (>= (load i) 3)))
-                                                          (and (>= abi CALL-ABI-CAPTURE-BASE)
-                                                               (>= (load i) capturec)))
+                                                      (or declared-js-value-slot
+                                                          (or (and (or (= abi CALL-ABI-RECEIVER)
+                                                                       (= abi CALL-ABI-DYNAMIC-RECEIVER))
+                                                                   (or (= (load i) 1) (>= (load i) 3)))
+                                                              (and (>= abi CALL-ABI-CAPTURE-BASE)
+                                                                   (>= (load i) capturec))))
                                                     tag (if (and js-value-slot
                                                                  (not (be-box-input-already-tagged?
                                                                         source)))
@@ -3074,8 +3129,7 @@
                                                                 (be-function-fp-return? towner))))
                                                     (be-node-fp-value? node))))
                                     boxed-return
-                                      (and (be-function-return-mixed? owner)
-                                           (= return-kind MLK-BOXED))
+                                      (= return-kind MLK-BOXED)
                                     value
                                       (if (< normalized 0)
                                           normalized
@@ -3099,7 +3153,15 @@
                                                           boxed)))
                                                   normalized)))]
                                 (if (< value 0)
-                                    (ms-fail! MSEL-UNSUPPORTED term)
+                                    (do
+                                      (fmt (stderr)
+                                           "native-harness: selection return value miss owner={d} term={d} value_node={d} raw={d} normalized={d} owner_return_kind={d} value_return_kind={d} value_rep={d}\n"
+                                           owner term node raw normalized return-kind
+                                           (if (op-is? node Call [_])
+                                               (be-call-return-kind node)
+                                               -1)
+                                           (n-rep-of node 32))
+                                      (ms-fail! MSEL-UNSUPPORTED term))
                                     (if (or kernel-fp-return boxed-return)
                                         (do (ms-vset! owner term value) value)
                                         value)))))
@@ -3213,6 +3275,19 @@
                           raw-pred))
                     yes (ms-if-target bid 0)
                     no (ms-if-target bid 1)]
+                (if (and (be-profiling?)
+                         (and (op-is? pred-node Unbox [_])
+                              (match (n-op (n-in pred-node 1))
+                                (JsBuiltin [descriptor] (= descriptor 101))
+                                (_ false))))
+                    (do
+                      (fmt (stderr)
+                           "AOTK_PROFILE phase=exception_branch owner={d} term={d} block={d} pred={d} yes={d} no={d} yes_ctrl={d} no_ctrl={d}\n"
+                           owner term bid pred yes no
+                           (if (>= yes 0) (mu-block-control yes) NO-NODE)
+                           (if (>= no 0) (mu-block-control no) NO-NODE))
+                      0)
+                    0)
                 (if (or (< pred 0) (or (< yes 0) (< no 0)))
                     (do
                       (if (be-profiling?)
@@ -4215,6 +4290,29 @@
           (fmt (stderr) "AOTK_PROFILE phase=selection_emit_preselect ns={d}\n" (load preselect-ns))
           (fmt (stderr) "AOTK_PROFILE phase=selection_emit_copies ns={d}\n" (load copies-ns))
           (fmt (stderr) "AOTK_PROFILE phase=selection_emit_terminators ns={d}\n" (load terminators-ns))
+          (let [(mut function) 0]
+            (loop (if (>= (load function) funcs)
+                      (break)
+                      (do
+                        (let [blocks (mu-function-block-count (load function))
+                              (mut rpo) 0
+                              (mut instructions) 0]
+                          (loop (if (>= (load rpo) blocks)
+                                    (break)
+                                    (do
+                                      (set! instructions
+                                            (+ (load instructions)
+                                               (mu-block-inst-count
+                                                 (mu-function-block
+                                                   (load function) (load rpo)))))
+                                      (set! rpo (+ (load rpo) 1)))))
+                          (fmt (stderr)
+                               "AOTK_PROFILE phase=machine_function owner={d} ideal={d} blocks={d} insts={d}\n"
+                               (load function)
+                               (mu-function-ideal (load function))
+                               blocks
+                               (load instructions)))
+                        (set! function (+ (load function) 1))))))
           0)
         0)
     (set! profile-start (ms-profile-note! "selection_emit" (load profile-start)))
@@ -4311,66 +4409,63 @@
   (if (and (be-verification?) (not (ms-verify!)))
       false
       (let [u (machine-unit)
-            blocks (mu-block-count)
-            (mut bid) 0]
+            funcs (mu-function-count)
+            (mut owner) 0]
         (al-clear! [MInst] (field u packed-insts))
-        (loop (if (>= (load bid) blocks)
+        ;; Function text is the unit of publication and separate compilation. Preserve the same
+        ;; function/RPO order used by selection and packing; raw block ids are discovery order and
+        ;; may interleave blocks from different functions.
+        (loop (if (>= (load owner) funcs)
                   (break)
                   (do
-                    (let [b (mu-block (load bid))
-                          owner (.owner b)
-                          first (.inst-first b)
-                          count (.inst-count b)
-                          scheduled-first (al-len [MInst] (.packed-insts u))
-                          (mut i) 0]
-                      (set! (.inst-first b) scheduled-first)
-                      (al-push! [MInst]
-                                (field u packed-insts)
-                                (ms-lowered-inst owner (load bid) MI-LABEL -1 -1 -1 (load bid) NO-NODE))
-                      (loop (if (>= (load i) count)
+                    (let [nblocks (mu-function-block-count (load owner))
+                          (mut rpo) 0]
+                      (loop (if (>= (load rpo) nblocks)
                                 (break)
                                 (do
-                                  (let [m (be-inst (+ first (load i)))
-                                        op (.op m)]
-                                    (case op MI-CBR
-                                          (do
-                                            (al-push! [MInst]
-                                                      (field u packed-insts)
-                                                      (ms-lowered-inst owner
-                                                                       (load bid)
-                                                                       MI-CBZ
-                                                                       -1
-                                                                       (load (field m a))
-                                                                       -1
-                                                                       (load (field m imm))
-                                                                       (load (field m node))))
-                                            (al-push! [MInst]
-                                                      (field u packed-insts)
-                                                      (ms-lowered-inst owner
-                                                                       (load bid)
-                                                                       MI-B
-                                                                       -1
-                                                                       -1
-                                                                       -1
-                                                                       (load (field m b))
-                                                                       (load (field m node))))
-                                            0)
-                                            MI-JMP
-                                          (al-push! [MInst]
-                                                    (field u packed-insts)
-                                                    (ms-lowered-inst owner
-                                                                     (load bid)
-                                                                     MI-B
-                                                                     -1
-                                                                     -1
-                                                                     -1
-                                                                     (load (field m imm))
-                                                                     (load (field m node))))
-                                            (al-push! [MInst] (field u packed-insts) (load m))))
-                                  (set! i (+ (load i) 1))
-                                  0)))
-                      (set! (.inst-count b) (- (al-len [MInst] (.packed-insts u)) scheduled-first)))
-                    (set! bid (+ (load bid) 1))
+                                  (let [bid (mu-function-block (load owner) (load rpo))
+                                        b (mu-block bid)
+                                        first (.inst-first b)
+                                        count (.inst-count b)
+                                        scheduled-first (al-len [MInst] (.packed-insts u))
+                                        (mut i) 0]
+                                    (set! (.inst-first b) scheduled-first)
+                                    (al-push! [MInst]
+                                              (field u packed-insts)
+                                              (ms-lowered-inst (load owner) bid MI-LABEL -1 -1 -1 bid NO-NODE))
+                                    (loop (if (>= (load i) count)
+                                              (break)
+                                              (do
+                                                (let [m (be-inst (+ first (load i)))
+                                                      op (.op m)]
+                                                  (case op MI-CBR
+                                                        (do
+                                                          (al-push! [MInst]
+                                                                    (field u packed-insts)
+                                                                    (ms-lowered-inst (load owner) bid MI-CBZ -1
+                                                                      (load (field m a)) -1
+                                                                      (load (field m imm))
+                                                                      (load (field m node))))
+                                                          (al-push! [MInst]
+                                                                    (field u packed-insts)
+                                                                    (ms-lowered-inst (load owner) bid MI-B -1 -1 -1
+                                                                      (load (field m b))
+                                                                      (load (field m node))))
+                                                          0)
+                                                        MI-JMP
+                                                          (al-push! [MInst]
+                                                                    (field u packed-insts)
+                                                                    (ms-lowered-inst (load owner) bid MI-B -1 -1 -1
+                                                                      (load (field m imm))
+                                                                      (load (field m node))))
+                                                        (al-push! [MInst] (field u packed-insts) (load m))))
+                                                (set! i (+ (load i) 1))
+                                                0)))
+                                    (set! (.inst-count b)
+                                          (- (al-len [MInst] (.packed-insts u)) scheduled-first)))
+                                  (set! rpo (+ (load rpo) 1))
+                                  0))))
+                    (set! owner (+ (load owner) 1))
                     0)))
         (al-clear! [MInst] (field (backend) ins))
         (let [n (al-len [MInst] (.packed-insts u))
@@ -5605,6 +5700,13 @@
                 (set! current (n-in (load current) 1))
                 (set! fuel (- (load fuel) 1))
                 0)))
+    (if (match (n-op (load current))
+          (Closure [captures] (= (n-nins (load current)) (+ captures 3)))
+          (_ false))
+        ;; A materialized Closure selects to its environment object pointer, not to the nonmoving
+        ;; Fun identity described by its lattice type. It must therefore remain a moving-GC root
+        ;; across safepoints just like the New that allocated that environment.
+        MLK-RAW-MANAGED
     (if (op-is? (load current) Call [_])
         ;; Call nodes deliberately retain the open `dyn` lattice type, but their native return ABI
         ;; is a closed-world property of the target set. Publish that representation to liveness
@@ -5635,7 +5737,7 @@
         MLK-RAW-MANAGED
         (if (op-is? (load current) Box [_])
         MLK-BOXED
-        (ml-kind-for-type (n-ty (load current)))))))))
+        (ml-kind-for-type (n-ty (load current))))))))))
 
 (defn ml-raw-nullable-value? [(node i64) (fuel i64)] (-> bool)
   (if (or (<= fuel 0) (or (= node NO-NODE) (n-dead? node)))
@@ -5661,6 +5763,7 @@
           false)))
 
 (defn ml-kind-for-parm-representation [(parm i64)] (-> i64)
+  (block :declared-abi
   ;; Selection normally built this compact index with the CFG. Direct unit queries can reach this
   ;; helper earlier, so populate it lazily rather than silently treating an empty cache as no calls.
   (if (= (al-len [i64] (.ideal-calls (machine-unit))) 0) (mu-cache-ideal-calls!) 0)
@@ -5672,6 +5775,9 @@
         (mut call-index) 0
         (mut answer) -1
         (mut consistent) true]
+    (if (and (n-fun-abi-declared? fun) (< idx (n-fun-abi-param-count fun)))
+        (return-from :declared-abi (ml-kind-for-type (n-fun-abi-param-type fun idx)))
+        0)
     (loop (if (or (>= (load call-index) lim) (not (load consistent)))
               (break)
               (do
@@ -5693,7 +5799,7 @@
                 0)))
     (if (and (load consistent) (>= (load answer) 0))
         (load answer)
-        (ml-kind-for-type (n-ty parm)))))
+        (ml-kind-for-type (n-ty parm))))))
 
 (defn ml-kind-for-node [(node i64)] (-> i64)
   (let [u (machine-unit)
@@ -6684,6 +6790,7 @@
         blocks (mu-block-count)
         (mut at) 0
         (mut bid) 0
+        (mut owner) 0
         (mut max-block) 0
         (mut pairs) 0
         (mut profile-start) (ms-profile-now)]
@@ -6708,11 +6815,21 @@
                 0)))
     ; Local scheduling must not silently become block layout. Preserve the already-published block
     ; order and change only instruction order within each range.
-    (loop (if (or (>= (load bid) blocks) (!= (ms-schedule-result) MSCHED-OK))
+    (loop (if (or (>= (load owner) (mu-function-count))
+                  (!= (ms-schedule-result) MSCHED-OK))
               (break)
               (do
-                (ms-schedule-block! (load bid) seed)
-                (set! bid (+ (load bid) 1))
+                (let [nblocks (mu-function-block-count (load owner))
+                      (mut rpo) 0]
+                  (loop (if (or (>= (load rpo) nblocks)
+                                (!= (ms-schedule-result) MSCHED-OK))
+                            (break)
+                            (do
+                              (ms-schedule-block!
+                                (mu-function-block (load owner) (load rpo)) seed)
+                              (set! rpo (+ (load rpo) 1))
+                              0))))
+                (set! owner (+ (load owner) 1))
                 0)))
     (set! profile-start (ms-profile-note! "schedule_build" (load profile-start)))
     (if (!= (ms-schedule-result) MSCHED-OK)
@@ -6729,6 +6846,10 @@
                                   (al-get (.schedule-work u) (load i)))
                         (set! i (+ (load i) 1))
                         0))))
+          ;; Local scheduling publishes block-local order. Canonicalize the resulting whole unit
+          ;; once more so function text remains contiguous even when graph-discovery block ids are
+          ;; interleaved across owners. Liveness and allocation consume the rebuilt block ranges.
+          (ms-pack-instructions!)
           ;; `schedule-order` is what `before` reads, and until here it still describes the order
           ;; this pass was called to CHANGE. Verifying against it asks the new schedule to preserve
           ;; the relative order of the very instructions that were just moved, which the block that

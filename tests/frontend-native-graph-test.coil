@@ -24,9 +24,11 @@
 (import "jsstring" :use *)
 (import "node" :use *)
 (import "ty" :use *)
+(import "jsl" :use *)
 (import "coil.io" :use *)
 (import "coil.alloc" :use * :as alloc)
 (import "coil.arraylist" :use *)
+(import "coil.slice" :use *)
 (import "coil.fmt" :use *)
 
 ;; The rendered graph for one TypeScript program. 6201 is the seed the smoke programs used; it
@@ -80,6 +82,42 @@ n7: Return <- n0 n5 n6 : [ctrl,num,mem#-9223372036854775808 undefined]
 (extern sys_icache_invalidate :cc c [(ptr u8) i64] (-> void))
 (extern aot_mmap_anon_flags :cc c [] (-> i32))
 (extern aot_host_is_x86_64 :cc c [] (-> i32))
+
+(deftest source_function_identity_is_independent_of_graph_namespace
+  (let [(mut first) (fe-native-new "function main(n) { return n + 1; }")
+        (mut second) (fe-native-new "function main(n) { return n + 1; }")
+        (mut first-unit) 0
+        (mut first-local) 0
+        (mut first-jsl-unit) 0
+        (mut first-jsl-local) 0]
+    (assert (= (fe-native-index! (mut first)) FE-OK))
+    (frontend-native-build-dispatched-script-at! (mut first) 7001 true 64)
+    (let [fun (n-find-fun-index 65)]
+      (assert (!= fun NO-NODE))
+      (assert (= (n-fun-identity-kind fun) FUN-IDENTITY-SOURCE))
+      (set! first-unit (n-fun-identity-unit fun))
+      (set! first-local (n-fun-identity-local fun)))
+    (let [decl (jsl-find "JsAdd") fun (n-find-fun-index (jsl-decl-fidx decl))]
+      (assert (>= decl 0))
+      (assert (!= fun NO-NODE))
+      (assert (= (n-fun-identity-kind fun) FUN-IDENTITY-JSL))
+      (set! first-jsl-unit (n-fun-identity-unit fun))
+      (set! first-jsl-local (n-fun-identity-local fun)))
+    (fe-native-free! (mut first))
+    (assert (= (fe-native-index! (mut second)) FE-OK))
+    (frontend-native-build-dispatched-script-at! (mut second) 7002 true 192)
+    (let [fun (n-find-fun-index 193)]
+      (assert (!= fun NO-NODE))
+      (assert (= (n-fun-identity-kind fun) FUN-IDENTITY-SOURCE))
+      (assert (= (n-fun-identity-unit fun) (load first-unit)))
+      (assert (= (n-fun-identity-local fun) (load first-local))))
+    (let [decl (jsl-find "JsAdd") fun (n-find-fun-index (jsl-decl-fidx decl))]
+      (assert (>= decl 0))
+      (assert (!= fun NO-NODE))
+      (assert (= (n-fun-identity-kind fun) FUN-IDENTITY-JSL))
+      (assert (= (n-fun-identity-unit fun) (load first-jsl-unit)))
+      (assert (= (n-fun-identity-local fun) (load first-jsl-local))))
+    (fe-native-free! (mut second))))
 
 ;; JAVASCRIPT SOURCE TO EXECUTED MACHINE CODE, in one process, with no toolchain.
 ;;
@@ -156,6 +194,52 @@ n7: Return <- n0 n5 n6 : [ctrl,num,mem#-9223372036854775808 undefined]
     (fe-native-free! (mut fe)))
   0)
 
+(deftest independent_script_entries_can_share_a_compiler_dispatcher_without_javascript_wrappers
+  (js-reset-world!)
+  (let [(mut left) (fe-native-new "var left = 41; left = left + 1;")
+        (mut right) (fe-native-new "var right = 6; right = right + 1;")
+        (mut entries) (al-new [i64] (malloc-allocator))]
+    (assert (= (fe-native-index! (mut left)) FE-OK))
+    (assert (= (fe-native-index! (mut right)) FE-OK))
+    ;; Each frontend is an independently parsed and indexed Script. Disjoint source-function
+    ;; bases prove the graph namespace preserves that boundary while sharing compiler work.
+    (frontend-native-begin-script-unit-at! (mut left) 6202 true 64)
+    (frontend-native-append-script-unit-at! (mut right) 6203 true 128)
+    (al-push! [i64] (mut entries) 65)
+    (al-push! [i64] (mut entries) 129)
+    (frontend-native-build-indexed-dispatcher! (al-slice [i64] (load entries)))
+    (frontend-native-finish-appended-units!)
+    (assert (= (g-verify) 0))
+    (let [(mut node) 0
+          (mut saw-left-fun) false
+          (mut saw-right-fun) false
+          (mut host-calls) 0]
+      (loop (if (>= (load node) (n-count))
+                (break)
+                (do
+                  (if (and (not (n-dead? (load node)))
+                           (op-is? (load node) Fun [_]))
+                      (do
+                        (if (= (n-fun-index (load node)) 65)
+                            (set! saw-left-fun true)
+                            0)
+                        (if (= (n-fun-index (load node)) 129)
+                            (set! saw-right-fun true)
+                            0))
+                      0)
+                  (if (and (not (n-dead? (load node)))
+                           (op-is? (load node) Call [_]))
+                      (set! host-calls (+ (load host-calls) 1))
+                      0)
+                  (set! node (+ (load node) 1)))))
+      (assert (load saw-left-fun))
+      (assert (load saw-right-fun))
+      (assert (>= (load host-calls) 2)))
+    (assert (be-select-machine-program!))
+    (al-free! [i64] (mut entries))
+    (fe-native-free! (mut left))
+    (fe-native-free! (mut right))))
+
 (deftest catch_only_try_indexes_but_finally_is_still_refused
   (js-reset-world!)
   (let [(mut fe) (fe-native-new "function main(n) { try { return n; } catch (error) { return 0; } }")]
@@ -168,4 +252,25 @@ n7: Return <- n0 n5 n6 : [ctrl,num,mem#-9223372036854775808 undefined]
     (assert (!= (fe-native-index! (mut fe)) FE-OK))
     (assert (= (load (field fe error-role)) TS-ROLE-FINALLY))
     (fe-native-free! (mut fe)))
+  0)
+
+(deftest independent_script_records_share_a_node_space_without_sharing_directive_prologues
+  (let [harness "var harness = function() { return this; };"
+        test "\"use strict\"; var test = function() { return this; };"
+        source "var harness = function() { return this; };\"use strict\"; var test = function() { return this; };"
+        raw-lengths (primitive/alloc-stack (array i32 2))]
+    (store! (index raw-lengths 0) (cast i32 (slice-len harness)))
+    (store! (index raw-lengths 1) (cast i32 (slice-len test)))
+    (let [lengths (slice-new [i32] (cast (ptr i32) (index raw-lengths 0)) 2)
+          (mut ast) (ts-open-scripts source lengths TS-SCRIPT-JS)
+          root (ts-root ast)]
+      (assert (= (ts-script-count ast) 2))
+      (assert (not (ts-script-strict-at? ast 0)))
+      (assert (ts-script-strict-at? ast 1))
+      (assert (= (ts-node-script ast (ts-child ast root 0)) 0))
+      (assert (= (ts-node-script ast (ts-child ast root 1)) 1))
+      (assert (= (ts-node-script ast (ts-child ast (ts-child ast root 0) 0)) 0))
+      (assert (= (ts-node-script ast (ts-child ast (ts-child ast root 1) 0)) 1))
+      (assert (= (ts-text ast (ts-child ast root 1)) "\"use strict\";"))
+      (ts-close! (mut ast))))
   0)

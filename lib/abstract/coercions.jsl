@@ -21,7 +21,9 @@
 ;; that is already tagged is the identity, and where the analysis has proven `v` is a number the
 ;; whole test folds away and this is `%ToString` again.
 (macro ToStringValue :params [(v dyn)] :ret dyn
-  (if (%IsArray (%Box v))
+  (if (%IsSymbol (%Box v))
+      (ThrowTypeError "Cannot convert a Symbol value to a string")
+      (if (%IsArray (%Box v))
       (ArrayToStringValue (%Box v) (%NewArray))
       (if (%IsObject (%Box v))
           (let [(kind (%InternalKind (%Box v)))]
@@ -30,7 +32,7 @@
                 (if (%Eq kind 101)
                     (%ToString (%InternalTarget (%Box v)))
                     (%ToString v))))
-          (%ToString v))))
+          (%ToString v)))))
 
 ;; The same conversion CONTINUING an array walk already in progress, so the cycle stack it is
 ;; already carrying is the one an inner array is checked against. `ArrayJoinSeen` is the only
@@ -53,11 +55,13 @@
 (macro IsPrimitiveValue :params [(v dyn)] :ret bool
   (if (IsNumber v)
       true
+      (if (%IsSymbol v)
+          true
       (if (%IsString v)
           true
           (if (%IsUndefined v)
               true
-              (if (%IsNull v) true (%IsBool v))))))
+              (if (%IsNull v) true (%IsBool v)))))))
 
 ;; https://tc39.es/ecma262/#sec-ordinarytoprimitive with hint Number. Wrapper slots return their
 ;; primitive values. Otherwise valueOf runs first, then toString, each with the object as receiver;
@@ -103,9 +107,11 @@
               (OrdinaryToPrimitiveNumber (%Box v))))))
 
 (macro ToNumberValue :params [(v dyn)] :ret dyn
-  (if (IsNumber v)
+  (if (%IsSymbol v)
+      (ThrowTypeError "Cannot convert a Symbol value to a number")
+      (if (IsNumber v)
       v
-      (%ToNumber (ToPrimitiveNumber (%Box v)))))
+      (%ToNumber (ToPrimitiveNumber (%Box v))))))
 
 ;; https://tc39.es/ecma262/#sec-number-constructor and #sec-boolean-constructor. Wrapper state is
 ;; an internal slot, never an observable property. Kinds 100 and 101 are deliberately outside the
@@ -128,6 +134,12 @@
         (constructor (SetProperty object "constructor" (BuiltinConstructorValue 18)))]
     object))
 
+(macro NewSymbolObject :params [(v dyn)] :ret dyn
+  (let [(object (%Box (%NewObject)))
+        (initialized (%InternalInit object (%Box v) 103))
+        (prototype (SetObjectPrototype object (BuiltinPrototypeValue 22)))]
+    object))
+
 ;; https://tc39.es/ecma262/#sec-object-value. ToObject is JavaScript meaning, including the
 ;; identity result for existing objects and distinct wrapper allocation for primitive values.
 (macro ObjectFromValue :params [(v dyn)] :ret dyn
@@ -140,7 +152,9 @@
                 (NewNumberObject value)
                 (if (%IsBool value)
                     (NewBooleanObject value)
-                    (if (%IsString value) (NewStringObject value) value)))))))
+                    (if (%IsString value)
+                        (NewStringObject value)
+                        (if (%IsSymbol value) (NewSymbolObject value) value))))))))
 
 ;; https://tc39.es/ecma262/#sec-parseint-string-radix
 (macro ParseIntValue :params [(s dyn) (radix dyn)] :ret dyn (%ParseInt s radix))

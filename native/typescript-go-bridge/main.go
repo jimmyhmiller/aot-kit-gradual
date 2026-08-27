@@ -37,6 +37,10 @@ type parseResult struct {
 	diagnosticCodes []int32
 	diagnosticStarts []int32
 	diagnosticLengths []int32
+	nodeOffsets map[*ast.Node]int32
+	nodeScripts map[*ast.Node]int32
+	scriptRoots []int32
+	scriptStrict []bool
 }
 
 var parses = struct {
@@ -49,6 +53,7 @@ const (
 	scriptKindAuto = 0
 	scriptKindJS = 1
 	scriptKindTS = 2
+	scriptKindJSModule = 3
 )
 
 //export aot_ts_parse
@@ -68,9 +73,13 @@ func aot_ts_parse_ex(source *C.char, sourceLength C.int32_t, filename *C.char, f
 	}
 	name = tspath.GetNormalizedAbsolutePath(name, "/")
 	kind := core.ScriptKindUnknown
+	forceModule := false
 	switch requestedKind {
 	case scriptKindJS:
 		kind = core.ScriptKindJS
+	case scriptKindJSModule:
+		kind = core.ScriptKindJS
+		forceModule = true
 	case scriptKindTS:
 		kind = core.ScriptKindTS
 	case scriptKindAuto:
@@ -81,6 +90,7 @@ func aot_ts_parse_ex(source *C.char, sourceLength C.int32_t, filename *C.char, f
 	file := parser.ParseSourceFile(ast.SourceFileParseOptions{
 		FileName: name,
 		Path:     tspath.Path(name),
+		ExternalModuleIndicatorOptions: ast.ExternalModuleIndicatorOptions{Force: forceModule},
 	}, text, kind)
 	parsed := &parseResult{file: file, source: text, nodeIDs: make(map[*ast.Node]int32), scriptKind:int32(requestedKind)}
 	if requestedKind == scriptKindAuto {
@@ -101,8 +111,139 @@ func aot_ts_parse_ex(source *C.char, sourceLength C.int32_t, filename *C.char, f
 	return C.uintptr_t(handle)
 }
 
+//export aot_ts_parse_scripts
+func aot_ts_parse_scripts(source *C.char, sourceLength C.int32_t, rawLengths *C.int32_t, scriptCount C.int32_t, requestedKind C.int32_t) C.uintptr_t {
+	if source == nil || sourceLength < 0 || rawLengths == nil || scriptCount <= 0 { return 0 }
+	lengths := unsafe.Slice(rawLengths, int(scriptCount))
+	total := int32(0)
+	for _, length := range lengths {
+		if length < 0 || total > int32(sourceLength)-int32(length) { return 0 }
+		total += int32(length)
+	}
+	if total != int32(sourceLength) { return 0 }
+
+	combined := &parseResult{
+		source: C.GoStringN(source, C.int(sourceLength)),
+		nodeIDs: make(map[*ast.Node]int32),
+		nodeOffsets: make(map[*ast.Node]int32),
+		nodeScripts: make(map[*ast.Node]int32),
+		scriptKind: int32(requestedKind),
+	}
+	var statements []int32
+	byteOffset := int32(0)
+	for scriptIndex, length := range lengths {
+		part := (*C.char)(unsafe.Add(unsafe.Pointer(source), uintptr(byteOffset)))
+		name := []byte("/script-" + strconv.Itoa(scriptIndex) + ".js")
+		handle := aot_ts_parse_ex(part, length, (*C.char)(unsafe.Pointer(&name[0])), C.int32_t(len(name)), requestedKind)
+		parsed := result(handle)
+		if parsed == nil {
+			for _, root := range combined.scriptRoots { _ = root }
+			return 0
+		}
+		nodeBase := int32(len(combined.nodes))
+		if scriptIndex == 0 { combined.file = parsed.file }
+		for index, n := range parsed.nodes {
+			combined.nodes = append(combined.nodes, n)
+			combined.nodeIDs[n] = nodeBase + int32(index)
+			combined.nodeOffsets[n] = byteOffset
+			combined.nodeScripts[n] = int32(scriptIndex)
+			children := make([]int32, len(parsed.children[index]))
+			for childIndex, child := range parsed.children[index] { children[childIndex] = nodeBase + child }
+			combined.children = append(combined.children, children)
+		}
+		combined.scriptRoots = append(combined.scriptRoots, nodeBase)
+		combined.scriptStrict = append(combined.scriptStrict,
+			statementsHaveUseStrict(parsed.file.Statements.Nodes))
+		for _, statement := range parsed.file.Statements.Nodes {
+			statements = append(statements, combined.nodeIDs[statement])
+		}
+		for index, code := range parsed.diagnosticCodes {
+			combined.diagnosticCodes = append(combined.diagnosticCodes, code)
+			combined.diagnosticStarts = append(combined.diagnosticStarts, byteOffset+parsed.diagnosticStarts[index])
+			combined.diagnosticLengths = append(combined.diagnosticLengths, parsed.diagnosticLengths[index])
+		}
+		aot_ts_parse_delete(handle)
+		byteOffset += int32(length)
+	}
+	// The first SourceFile is the virtual compilation-unit root. Its children are the statements
+	// from each independently parsed Script in evaluation order, never nested SourceFile nodes.
+	combined.children[0] = statements
+	parses.Lock()
+	handle := parses.next
+	parses.next++
+	parses.items[handle] = combined
+	parses.Unlock()
+	return C.uintptr_t(handle)
+}
+
+//export aot_ts_script_is_strict
+func aot_ts_script_is_strict(raw C.uintptr_t) C.int32_t {
+	parsed := result(raw)
+	if parsed == nil || parsed.file == nil { return -1 }
+	if len(parsed.scriptStrict) > 0 && parsed.scriptStrict[0] { return 1 }
+	if statementsHaveUseStrict(parsed.file.Statements.Nodes) { return 1 }
+	return 0
+}
+
+//export aot_ts_script_is_strict_at
+func aot_ts_script_is_strict_at(raw C.uintptr_t, scriptIndex C.int32_t) C.int32_t {
+	parsed := result(raw); if parsed == nil || scriptIndex < 0 { return -1 }
+	if len(parsed.scriptStrict) == 0 {
+		if scriptIndex != 0 { return -1 }
+		if statementsHaveUseStrict(parsed.file.Statements.Nodes) { return 1 }
+		return 0
+	}
+	if int(scriptIndex) >= len(parsed.scriptStrict) { return -1 }
+	if parsed.scriptStrict[scriptIndex] { return 1 }
+	return 0
+}
+
+//export aot_ts_script_count
+func aot_ts_script_count(raw C.uintptr_t) C.int32_t {
+	parsed := result(raw); if parsed == nil { return -1 }
+	if len(parsed.scriptRoots) == 0 { return 1 }
+	return C.int32_t(len(parsed.scriptRoots))
+}
+
+//export aot_ts_script_root
+func aot_ts_script_root(raw C.uintptr_t, scriptIndex C.int32_t) C.int32_t {
+	parsed := result(raw); if parsed == nil || scriptIndex < 0 { return -1 }
+	if len(parsed.scriptRoots) == 0 {
+		if scriptIndex == 0 { return 0 }
+		return -1
+	}
+	if int(scriptIndex) >= len(parsed.scriptRoots) { return -1 }
+	return C.int32_t(parsed.scriptRoots[scriptIndex])
+}
+
+//export aot_ts_node_script
+func aot_ts_node_script(raw C.uintptr_t, id C.int32_t) C.int32_t {
+	parsed := result(raw); n := node(parsed, id); if n == nil { return -1 }
+	if len(parsed.nodeScripts) == 0 { return 0 }
+	return C.int32_t(parsed.nodeScripts[n])
+}
+
+//export aot_ts_node_binding_class
+func aot_ts_node_binding_class(raw C.uintptr_t, id C.int32_t) C.int32_t {
+	n := node(result(raw), id); if n == nil { return 0 }
+	switch n.Kind {
+	case ast.KindFunctionDeclaration:
+		return 1
+	case ast.KindClassDeclaration:
+		return 2
+	}
+	for current := n; current != nil && current.Kind != ast.KindSourceFile; current = current.Parent {
+		if current.Kind == ast.KindVariableDeclarationList {
+			if current.Flags&ast.NodeFlagsBlockScoped != 0 { return 2 }
+			return 1
+		}
+	}
+	return 0
+}
+
 func (parsed *parseResult) addJavaScriptModeDiagnostics() {
 	if len(parsed.diagnosticCodes) == 0 { parsed.addRestrictedLineTerminatorErrors() }
+	parsed.addModuleTableEarlyErrors()
 	for _, n := range parsed.nodes {
 		var forbidden *ast.Node
 		switch n.Kind {
@@ -123,6 +264,7 @@ func (parsed *parseResult) addJavaScriptModeDiagnostics() {
 		}
 		parsed.addDynamicImportEarlyErrors(n)
 		parsed.addScriptGoalEarlyErrors(n)
+		parsed.addModuleGoalEarlyErrors(n)
 		parsed.addRestrictedGrammarEarlyErrors(n)
 		parsed.addAssignmentTargetEarlyErrors(n)
 		parsed.addBindingRestEarlyErrors(n)
@@ -1393,8 +1535,267 @@ func statementsHaveUseStrict(statements []*ast.Node) bool {
 }
 
 func (parsed *parseResult) isStrictScript() bool {
-	return parsed.file != nil && parsed.file.Statements != nil &&
+	return parsed.scriptKind == scriptKindJSModule || parsed.file != nil && parsed.file.Statements != nil &&
 		statementsHaveUseStrict(parsed.file.Statements.Nodes)
+}
+
+func (parsed *parseResult) isModuleGoal() bool {
+	return parsed.scriptKind == scriptKindJSModule
+}
+
+func hexDigit(byteValue byte) (int, bool) {
+	switch {
+	case byteValue >= '0' && byteValue <= '9': return int(byteValue - '0'), true
+	case byteValue >= 'a' && byteValue <= 'f': return int(byteValue-'a') + 10, true
+	case byteValue >= 'A' && byteValue <= 'F': return int(byteValue-'A') + 10, true
+	default: return 0, false
+	}
+}
+
+func unicodeEscapeAt(text string, at int) (int, int, bool) {
+	if at+6 > len(text) || text[at] != '\\' || text[at+1] != 'u' || text[at+2] == '{' {
+		return 0, at, false
+	}
+	value := 0
+	for index := at + 2; index < at+6; index++ {
+		digit, ok := hexDigit(text[index]); if !ok { return 0, at, false }
+		value = value*16 + digit
+	}
+	return value, at + 6, true
+}
+
+func hasUnpairedSurrogateEscape(text string) bool {
+	for index := 0; index < len(text); index++ {
+		value, next, ok := unicodeEscapeAt(text, index); if !ok { continue }
+		if value >= 0xD800 && value <= 0xDBFF {
+			low, afterLow, paired := unicodeEscapeAt(text, next)
+			if !paired || low < 0xDC00 || low > 0xDFFF { return true }
+			index = afterLow - 1
+			continue
+		}
+		if value >= 0xDC00 && value <= 0xDFFF { return true }
+		index = next - 1
+	}
+	return false
+}
+
+func (parsed *parseResult) rawNode(node *ast.Node) string {
+	if node == nil { return "" }
+	start := scanner.SkipTrivia(parsed.source, node.Pos())
+	if start < 0 || start > node.End() || node.End() > len(parsed.source) { return "" }
+	return parsed.source[start:node.End()]
+}
+
+func (parsed *parseResult) checkModuleExportName(node *ast.Node) {
+	if node != nil && node.Kind == ast.KindStringLiteral &&
+		hasUnpairedSurrogateEscape(parsed.rawNode(node)) {
+		parsed.addJavaScriptDiagnostic(node, 90114)
+	}
+}
+
+func (parsed *parseResult) addModuleTableEarlyErrors() {
+	if !parsed.isModuleGoal() || parsed.file == nil || parsed.file.Statements == nil { return }
+	locals := make(map[string]bool)
+	imports := make(map[string]bool)
+	exports := make(map[string]bool)
+	var localExports []declaredName
+	addLocal := func(name declaredName) { locals[name.text] = true }
+	addImport := func(name *ast.Node) {
+		if name == nil { return }
+		text := name.Text()
+		if imports[text] { parsed.addJavaScriptDiagnostic(name, 90107) }
+		imports[text] = true
+		locals[text] = true
+		if text == "eval" || text == "arguments" || text == "await" {
+			parsed.addJavaScriptDiagnostic(name, 90108)
+		}
+	}
+	addExport := func(name *ast.Node) {
+		if name == nil { return }
+		text := name.Text()
+		if exports[text] { parsed.addJavaScriptDiagnostic(name, 90109) }
+		exports[text] = true
+	}
+	for _, statement := range parsed.file.Statements.Nodes {
+		switch statement.Kind {
+		case ast.KindVariableStatement:
+			for _, declaration := range statement.AsVariableStatement().DeclarationList.AsVariableDeclarationList().Declarations.Nodes {
+				for _, name := range appendBoundNames(declaration.Name(), nil) { addLocal(name) }
+			}
+		case ast.KindFunctionDeclaration, ast.KindClassDeclaration:
+			for _, name := range appendBoundNames(statement.Name(), nil) { addLocal(name) }
+		case ast.KindImportDeclaration:
+			clauseNode := statement.AsImportDeclaration().ImportClause
+			if clauseNode == nil { continue }
+			clause := clauseNode.AsImportClause()
+			addImport(clauseNode.Name())
+			bindings := clause.NamedBindings
+			if bindings == nil { continue }
+			if bindings.Kind == ast.KindNamespaceImport {
+				addImport(bindings.Name())
+			} else if bindings.Kind == ast.KindNamedImports {
+				for _, specifier := range bindings.AsNamedImports().Elements.Nodes {
+					addImport(specifier.Name())
+				}
+			}
+		}
+	}
+	for _, statement := range parsed.file.Statements.Nodes {
+		if statement.Kind == ast.KindExportAssignment {
+			if exports["default"] { parsed.addJavaScriptDiagnostic(statement, 90109) }
+			exports["default"] = true
+			assignment := statement.AsExportAssignment()
+			if assignment.Expression != nil && assignment.Expression.Kind == ast.KindBinaryExpression &&
+				assignment.Expression.AsBinaryExpression().OperatorToken.Kind == ast.KindCommaToken {
+				parsed.addJavaScriptDiagnostic(assignment.Expression, 90111)
+			}
+			start := scanner.SkipTrivia(parsed.source, statement.Pos())
+			expressionStart := len(parsed.source)
+			if assignment.Expression != nil { expressionStart = assignment.Expression.Pos() }
+			if start >= 0 && start <= expressionStart && expressionStart <= len(parsed.source) &&
+				strings.Contains(parsed.source[start:expressionStart], "\\") {
+				parsed.addJavaScriptDiagnostic(statement, 90112)
+			}
+			continue
+		}
+		if statement.Kind == ast.KindExportDeclaration {
+			declaration := statement.AsExportDeclaration()
+			clause := declaration.ExportClause
+			if clause == nil { continue }
+			if clause.Kind == ast.KindNamedExports {
+				for _, specifier := range clause.AsNamedExports().Elements.Nodes {
+				exportSpecifier := specifier.AsExportSpecifier()
+				parsed.checkModuleExportName(exportSpecifier.PropertyName)
+				parsed.checkModuleExportName(specifier.Name())
+					addExport(specifier.Name())
+					if declaration.ModuleSpecifier == nil {
+						local := exportSpecifier.PropertyName
+						if local == nil { local = specifier.Name() }
+						if local.Kind == ast.KindStringLiteral {
+							parsed.addJavaScriptDiagnostic(local, 90115)
+						}
+						localExports = append(localExports, declaredName{text: local.Text(), node: local})
+					}
+				}
+			} else if clause.Kind == ast.KindNamespaceExport {
+				addExport(clause.Name())
+			}
+			continue
+		}
+		if statement.ModifierFlags()&ast.ModifierFlagsExport == 0 { continue }
+		if statement.ModifierFlags()&ast.ModifierFlagsDefault != 0 {
+			if statement.Kind == ast.KindVariableStatement {
+				parsed.addJavaScriptDiagnostic(statement, 90113)
+			}
+			if exports["default"] { parsed.addJavaScriptDiagnostic(statement, 90109) }
+			exports["default"] = true
+		} else {
+			switch statement.Kind {
+			case ast.KindVariableStatement:
+				for _, declaration := range statement.AsVariableStatement().DeclarationList.AsVariableDeclarationList().Declarations.Nodes {
+					for _, name := range appendBoundNames(declaration.Name(), nil) { addExport(name.node) }
+				}
+			case ast.KindFunctionDeclaration, ast.KindClassDeclaration:
+				addExport(statement.Name())
+			}
+		}
+	}
+	for _, binding := range localExports {
+		if !locals[binding.text] { parsed.addJavaScriptDiagnostic(binding.node, 90110) }
+	}
+}
+
+// Await grammar parameters do not propagate into an ordinary function or a class field
+// initializer. Stop at nested function/class boundaries: those establish their own parameters and
+// are checked when the outer node walk reaches them.
+func containsModuleAwaitUse(node *ast.Node) bool {
+	if node == nil { return false }
+	if node.Kind == ast.KindAwaitExpression ||
+		node.Kind == ast.KindIdentifier && node.Text() == "await" && identifierIsReference(node) {
+		return true
+	}
+	if ast.IsFunctionLike(node) || node.Kind == ast.KindClassDeclaration ||
+		node.Kind == ast.KindClassExpression { return false }
+	found := false
+	node.ForEachChild(func(child *ast.Node) bool {
+		if containsModuleAwaitUse(child) { found = true; return true }
+		return false
+	})
+	return found
+}
+
+func hasFunctionAncestor(node *ast.Node) bool {
+	for current := node.Parent; current != nil && current.Kind != ast.KindSourceFile; current = current.Parent {
+		if ast.IsFunctionLike(current) { return true }
+	}
+	return false
+}
+
+func (parsed *parseResult) addModuleGoalEarlyErrors(node *ast.Node) {
+	if !parsed.isModuleGoal() { return }
+	if isImportMeta(node) {
+		meta := node.AsMetaProperty()
+		start := scanner.SkipTrivia(parsed.source, meta.Name().Pos())
+		rawName := ""
+		if start >= 0 && start <= meta.Name().End() && meta.Name().End() <= len(parsed.source) {
+			rawName = parsed.source[start:meta.Name().End()]
+		}
+		if rawName != "meta" { parsed.addJavaScriptDiagnostic(node, 90116) }
+	}
+	if node.Kind == ast.KindImportSpecifier {
+		parsed.checkModuleExportName(node.AsImportSpecifier().PropertyName)
+	}
+	if node.Kind == ast.KindImportAttributes {
+		seen := make(map[string]bool)
+		for _, attribute := range node.AsImportAttributes().Attributes.Nodes {
+			name := attribute.Name()
+			key := name.Text()
+			if seen[key] { parsed.addJavaScriptDiagnostic(name, 90117) }
+			seen[key] = true
+		}
+	}
+	topLevelModuleDeclaration := node.Kind == ast.KindImportDeclaration ||
+		node.Kind == ast.KindExportDeclaration || node.Kind == ast.KindExportAssignment ||
+		(node.ModifierFlags()&ast.ModifierFlagsExport != 0 &&
+			(node.Kind == ast.KindVariableStatement || node.Kind == ast.KindFunctionDeclaration ||
+				node.Kind == ast.KindClassDeclaration))
+	if topLevelModuleDeclaration && (node.Parent == nil || node.Parent.Kind != ast.KindSourceFile) {
+		parsed.addJavaScriptDiagnostic(node, 90106)
+	}
+	switch node.Kind {
+	case ast.KindVariableDeclaration, ast.KindParameter, ast.KindBindingElement,
+		ast.KindFunctionDeclaration, ast.KindFunctionExpression,
+		ast.KindClassDeclaration, ast.KindClassExpression:
+		for _, name := range appendBoundNames(node.Name(), nil) {
+			if name.text == "await" { parsed.addJavaScriptDiagnostic(name.node, 90100) }
+		}
+	}
+	if ast.IsFunctionLike(node) && node.ModifierFlags()&ast.ModifierFlagsAsync == 0 {
+		for _, parameter := range node.Parameters() {
+			if containsModuleAwaitUse(parameter) {
+				parsed.addJavaScriptDiagnostic(parameter, 90101)
+			}
+		}
+		if containsModuleAwaitUse(node.Body()) { parsed.addJavaScriptDiagnostic(node.Body(), 90102) }
+	}
+	if node.Kind == ast.KindPropertyDeclaration {
+		initializer := node.AsPropertyDeclaration().Initializer
+		if containsModuleAwaitUse(initializer) { parsed.addJavaScriptDiagnostic(initializer, 90103) }
+	}
+	if node.Kind == ast.KindIdentifier && node.Text() == "yield" &&
+		identifierIsReference(node) && !hasFunctionAncestor(node) {
+		parsed.addJavaScriptDiagnostic(node, 90104)
+	}
+	if node.Kind == ast.KindVariableStatement &&
+		node.ModifierFlags()&ast.ModifierFlagsExport != 0 {
+		seen := make(map[string]bool)
+		for _, declaration := range node.AsVariableStatement().DeclarationList.AsVariableDeclarationList().Declarations.Nodes {
+			for _, name := range appendBoundNames(declaration.Name(), nil) {
+				if seen[name.text] { parsed.addJavaScriptDiagnostic(name.node, 90105) }
+				seen[name.text] = true
+			}
+		}
+	}
 }
 
 func isSimpleAssignmentTarget(node *ast.Node, strict bool) bool {
@@ -1945,6 +2346,7 @@ func (parsed *parseResult) addDynamicImportEarlyErrors(node *ast.Node) {
 }
 
 func (parsed *parseResult) addScriptGoalEarlyErrors(node *ast.Node) {
+	if parsed.isModuleGoal() { return }
 	if node.Kind == ast.KindImportDeclaration || node.Kind == ast.KindExportAssignment ||
 		node.Kind == ast.KindExportDeclaration || isImportMeta(node) {
 		parsed.addJavaScriptDiagnostic(node, 90086)
@@ -2152,16 +2554,28 @@ func aot_ts_node_start(raw C.uintptr_t, id C.int32_t) C.int32_t {
 	if n == nil {
 		return -1
 	}
-	return C.int32_t(scanner.SkipTrivia(parsed.source, n.Pos()))
+	offset := int32(0)
+	if parsed.nodeOffsets != nil { offset = parsed.nodeOffsets[n] }
+	text := parsed.source
+	if offset > 0 || len(parsed.scriptRoots) > 0 {
+		end := len(text)
+		if script := parsed.nodeScripts[n]; int(script)+1 < len(parsed.scriptRoots) {
+			next := node(parsed, C.int32_t(parsed.scriptRoots[script+1]))
+			end = int(parsed.nodeOffsets[next])
+		}
+		text = text[int(offset):end]
+	}
+	return C.int32_t(offset) + C.int32_t(scanner.SkipTrivia(text, n.Pos()))
 }
 
 //export aot_ts_node_end
 func aot_ts_node_end(raw C.uintptr_t, id C.int32_t) C.int32_t {
-	n := node(result(raw), id)
+	parsed := result(raw); n := node(parsed, id)
 	if n == nil {
 		return -1
 	}
-	return C.int32_t(n.End())
+	offset := int32(0); if parsed.nodeOffsets != nil { offset = parsed.nodeOffsets[n] }
+	return C.int32_t(offset) + C.int32_t(n.End())
 }
 
 //export aot_ts_node_child_count
@@ -2302,7 +2716,14 @@ func aot_ts_node_numeric_bits(raw C.uintptr_t, id C.int32_t) C.uint64_t {
 
 func regexpParts(parsed *parseResult, n *ast.Node) (string, string, bool) {
 	if parsed == nil || n == nil || n.Kind != ast.KindRegularExpressionLiteral { return "", "", false }
-	raw := parsed.source[scanner.SkipTrivia(parsed.source, n.Pos()):n.End()]
+	offset := int32(0); if parsed.nodeOffsets != nil { offset = parsed.nodeOffsets[n] }
+	end := len(parsed.source)
+	if script := parsed.nodeScripts[n]; int(script)+1 < len(parsed.scriptRoots) {
+		next := node(parsed, C.int32_t(parsed.scriptRoots[script+1]))
+		end = int(parsed.nodeOffsets[next])
+	}
+	local := parsed.source[int(offset):end]
+	raw := local[scanner.SkipTrivia(local, n.Pos()):n.End()]
 	if len(raw) < 2 || raw[0] != '/' { return "", "", false }
 	inClass, escaped, closing := false, false, -1
 	for index := 1; index < len(raw); index++ {

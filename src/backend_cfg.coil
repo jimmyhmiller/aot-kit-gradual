@@ -102,8 +102,14 @@
               (break)
               (do
                 (let [u (n-out iff (load i))]
+                  ;; Folding can rewire an arm's control continuation directly to the If's input
+                  ;; while leaving memory Args rooted at its old projection. Such a projection is
+                  ;; not a machine-CFG arm: walking it creates a reachable block with no
+                  ;; terminator. Treat only projections with a control successor as explicit arms;
+                  ;; mu-walk-block! recovers the rewired arm through the direct fallthrough.
                   (if (and (not (n-dead? u))
-                           (match (n-op u) (CProj [label] (= label slot)) (_ false)))
+                           (and (match (n-op u) (CProj [label] (= label slot)) (_ false))
+                                (!= (be-ctrl-succ u) NO-NODE)))
                       (set! found u)
                       0))
                 (set! i (+ (load i) 1))
@@ -258,7 +264,19 @@
                   -1
                   (match (n-op ideal) (Fun [index] index) (Start [] 0)
                     (_ (do (panic-corrupt "machine function root must be Start or Fun") 0)))))
-    (mu-walk-block! id entry)
+    (al-push! [i64] (field u identity-kinds)
+              (if (and (!= ideal NO-NODE) (op-is? ideal Fun [_]))
+                  (n-fun-identity-kind ideal) FUN-IDENTITY-EPHEMERAL))
+    (al-push! [i64] (field u identity-units)
+              (if (and (!= ideal NO-NODE) (op-is? ideal Fun [_]))
+                  (n-fun-identity-unit ideal) 0))
+    (al-push! [i64] (field u identity-locals)
+              (if (and (!= ideal NO-NODE) (op-is? ideal Fun [_]))
+                  (n-fun-identity-local ideal) 0))
+    (if (and (!= ideal NO-NODE)
+             (and (op-is? ideal Fun [_]) (n-fun-imported? ideal)))
+        (mu-function-mark-imported! id)
+        (mu-walk-block! id entry))
     (let [f (mu-function id)]
       (set! (.block-first f) first)
       (set! (.block-count f) (- (mu-block-count) first)))
@@ -474,11 +492,13 @@
                               0))))
                 (let [funrec (mu-function (load fidx))
                       entry (.entry funrec)
-                      entry-block (al-get (.ctrl-block u) entry)
                       first (al-len [i64] (.block-order u))]
-                  (if (< entry-block 0)
-                      (set! ok false)
-                      (mu-rpo-visit! (load fidx) entry-block))
+                  (if (.imported funrec)
+                      0
+                      (let [entry-block (al-get (.ctrl-block u) entry)]
+                        (if (< entry-block 0)
+                            (set! ok false)
+                            (mu-rpo-visit! (load fidx) entry-block))))
                   (let [n (al-len [i64] (.rpo-post u))
                         (mut i) n]
                     (loop (if (<= (load i) 0)
@@ -530,6 +550,8 @@
                 0)))
     (loop (if (or (>= (load fidx) funcs) (not (load ok)))
               (break)
+              (if (mu-function-imported? (load fidx))
+                  (set! fidx (+ (load fidx) 1))
               (let [count (mu-function-block-count (load fidx))
                     entry (mu-function-block (load fidx) 0)
                     (mut changed) true
@@ -580,7 +602,7 @@
                             (set! i (+ (load i) 1))
                             0)))
                 (set! fidx (+ (load fidx) 1))
-                0)))
+                0))))
     (load ok)))
 
 (defn mu-dominates? [(ancestor i64) (descendant i64)] (-> bool)
@@ -633,25 +655,32 @@
                                 (if (= n 0)
                                     (break)
                                     (let [current (al-get (.rpo-post u) (- n 1))
-                                          (mut eid) 0]
+                                          (mut pred-index) 0]
                                       (al-pop! [i64] (field u rpo-post))
-                                      (loop (if (>= (load eid) edges)
+                                      ;; Adjacency was built before loop discovery. Walking this
+                                      ;; block's predecessor slice is the same natural-loop walk;
+                                      ;; scanning every edge for every visited block made the pass
+                                      ;; O(backedges * loop-blocks * all-edges).
+                                      (loop (if (>= (load pred-index)
+                                                    (mu-block-pred-count current))
                                                 (break)
                                                 (do
-                                                  (let [pred-edge (mu-edge (load eid))]
-                                                    (if (and (= (.target pred-edge) current)
-                                                             (= (.owner pred-edge)
-                                                                (.owner back)))
-                                                        (let [pred (.source pred-edge)]
-                                                          (if (= (al-get (.rpo-seen u) pred) 0)
-                                                              (do
-                                                                (al-set! [i64] (field u rpo-seen) pred 1)
-                                                                (if (= pred header)
-                                                                    0
-                                                                    (al-push! [i64] (field u rpo-post) pred)))
-                                                              0))
+                                                  (let [pred
+                                                          (mu-block-pred-source
+                                                            current
+                                                            (load pred-index))]
+                                                    (if (= (mu-block-owner pred) (.owner back))
+                                                        (if (= (al-get (.rpo-seen u) pred) 0)
+                                                            (do
+                                                              (al-set! [i64] (field u rpo-seen) pred 1)
+                                                              (if (= pred header)
+                                                                  0
+                                                                  (al-push! [i64]
+                                                                            (field u rpo-post)
+                                                                            pred)))
+                                                            0)
                                                         0))
-                                                  (set! eid (+ (load eid) 1))
+                                                  (set! pred-index (+ (load pred-index) 1))
                                                   0)))))))
                         (let [(mut b) 0]
                           (loop (if (>= (load b) blocks)
@@ -844,10 +873,14 @@
                 (let [f (mu-function (load fidx))
                       n (.block-count f)
                       (mut pos) 0]
-                  (let [entry-block (al-get (.ctrl-block u) (.entry f))]
-                    (if (or (= n 0) (!= (mu-function-block (load fidx) 0) entry-block))
-                        (do (mu-fail-verify! MCFG-RPO (load fidx)) 0)
-                        0))
+                  (if (mu-function-imported? (load fidx))
+                      (if (!= n 0)
+                          (do (mu-fail-verify! MCFG-RPO (load fidx)) 0)
+                          0)
+                      (let [entry-block (al-get (.ctrl-block u) (.entry f))]
+                        (if (or (= n 0) (!= (mu-function-block (load fidx) 0) entry-block))
+                            (do (mu-fail-verify! MCFG-RPO (load fidx)) 0)
+                            0)))
                   (loop (if (or (>= (load pos) n) (!= (mu-verify-result) MCFG-OK))
                             (break)
                             (do
@@ -884,27 +917,29 @@
     (loop (if (or (>= (load fidx) funcs) (!= (mu-verify-result) MCFG-OK))
               (break)
               (do
-                (let [count (mu-function-block-count (load fidx))
-                      entry (mu-function-block (load fidx) 0)
-                      (mut i) 0]
-                  (if (!= (mu-block-idom entry) entry)
-                      (do (mu-fail-verify! MCFG-IDOM entry) 0)
-                      0)
-                  (set! i 1)
-                  (loop (if (or (>= (load i) count) (!= (mu-verify-result) MCFG-OK))
-                            (break)
-                            (do
-                              (let [bid (mu-function-block (load fidx) (load i))
-                                    parent (mu-block-idom bid)]
-                                (if (or (< parent 0)
-                                        (or (>= parent blocks)
-                                            (or (!= (mu-block-owner parent) (load fidx))
-                                                (>= (mu-block-layout-index parent)
-                                                    (mu-block-layout-index bid)))))
-                                    (do (mu-fail-verify! MCFG-IDOM bid) 0)
-                                    0))
-                              (set! i (+ (load i) 1))
-                              0))))
+                (if (mu-function-imported? (load fidx))
+                    0
+                    (let [count (mu-function-block-count (load fidx))
+                          entry (mu-function-block (load fidx) 0)
+                          (mut i) 0]
+                      (if (!= (mu-block-idom entry) entry)
+                          (do (mu-fail-verify! MCFG-IDOM entry) 0)
+                          0)
+                      (set! i 1)
+                      (loop (if (or (>= (load i) count) (!= (mu-verify-result) MCFG-OK))
+                                (break)
+                                (do
+                                  (let [bid (mu-function-block (load fidx) (load i))
+                                        parent (mu-block-idom bid)]
+                                    (if (or (< parent 0)
+                                            (or (>= parent blocks)
+                                                (or (!= (mu-block-owner parent) (load fidx))
+                                                    (>= (mu-block-layout-index parent)
+                                                        (mu-block-layout-index bid)))))
+                                        (do (mu-fail-verify! MCFG-IDOM bid) 0)
+                                        0))
+                                  (set! i (+ (load i) 1))
+                                  0)))))
                 (set! fidx (+ (load fidx) 1))
                 0)))
     (= (mu-verify-result) MCFG-OK)))

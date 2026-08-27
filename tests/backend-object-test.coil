@@ -4,16 +4,20 @@
 (import "ty" :use *)
 (import "node" :use *)
 (import "backend_core" :use *)
+(import "backend_cfg" :use *)
 (import "backend_select" :use *)
 (import "backend_liveness" :use *)
 (import "backend_schedule" :use *)
 (import "backend_allocate" :use *)
 (import "backend_aarch64" :use *)
 (import "backend_macho" :use *)
+(import "backend_function_text" :use *)
 (import "verify" :use *)
 (import "corpus" :use *)
 (import "shape" :use *)
 (import "coil.assert" :use *)
+(import "coil.alloc" :use *)
+(import "coil.arraylist" :use *)
 (import "coil.io" :use *)
 (import "coil.fmt" :use *)
 
@@ -28,14 +32,18 @@
 
 (defn object-call-program! [] (-> i64)
   (graph-reset! 1001)
-  (let [inc (n-fun-open! 0)
-        x (n-parm! inc 0)
+  (let [inc (n-fun-open-identity! 0 FUN-IDENTITY-SOURCE 123456 0)
+        (mut types) (al-new [i64] (malloc-allocator))]
+    (al-push! [i64] (mut types) (t-int))
+    (n-fun-declare-abi! inc (al-slice [i64] (load types)) (t-int))
+    (al-free! [i64] (mut types))
+    (let [x (n-parm! inc 0)
         body (n-new2 (Return) (n-fun-entry inc) (ob (Add) x (oc 1)))]
-    (n-fun-close! inc body)
-    (let [site (n-call1! (g-start) inc (oc 41))
-          ret (n-new2 (Return) (call-end site) (call-value site))]
-      (n-add-def! (g-stop) ret)
-      (g-analyze!) 0)))
+      (n-fun-close! inc body)
+      (let [site (n-call1! (g-start) inc (oc 41))
+            ret (n-new2 (Return) (call-end site) (call-value site))]
+        (n-add-def! (g-stop) ret)
+        (g-analyze!) 0))))
 
 (defn object-compile! [] (-> i64)
   (assert (be-select-machine-program!))
@@ -73,6 +81,151 @@
                       (be-code-len)))
           (store! owner (+ (load owner) 1)) 0))))
   (assert (mobj-verify-model!)))
+
+(deftest encoder_retains_relocatable_internal_call_sites
+  (object-call-program!)
+  (object-compile!)
+  (assert (= (mu-internal-call-reloc-count) 1))
+  (let [source-owner (mu-internal-call-reloc-source 0)
+        site (mu-internal-call-reloc-offset 0)
+        target-owner (mu-internal-call-reloc-target 0)
+        target (mu-function-code-start target-owner)]
+    (assert (>= source-owner 0))
+    (assert (< source-owner (mu-function-count)))
+    (assert (>= site 0))
+    (assert (< site (be-code-len)))
+    (assert (>= site (mu-function-code-start source-owner)))
+    (assert (< site (+ (mu-function-code-start source-owner)
+                       (mu-function-code-size source-owner))))
+    (assert (>= target-owner 0))
+    (assert (< target-owner (mu-function-count)))
+    (assert (= (be-code-u32 site) (a64-bl (/ (- target site) 4))))))
+
+(deftest pure_function_text_extracts_relative_calls_and_stackmap_sites
+  (object-call-program!)
+  (object-compile!)
+  (assert (mft-extract! 0))
+  (assert (= (mft-byte-count) (mu-function-code-size 0)))
+  (assert (= (mft-reloc-count) 1))
+  (assert (= (mft-reloc-kind 0) MFT-RELOC-CALL))
+  (assert (>= (mft-reloc-offset 0) 0))
+  (assert (< (mft-reloc-offset 0) (mft-byte-count)))
+  (assert (= (mft-reloc-target 0) (mu-function-symbol 1)))
+  (assert (= (mft-reloc-target-kind 0) FUN-IDENTITY-SOURCE))
+  (assert (= (mft-reloc-target-unit 0) 123456))
+  (assert (= (mft-reloc-target-local 0) 0))
+  (assert (= (mft-site-count) 1))
+  (assert (> (mft-site-offset 0) (mft-reloc-offset 0)))
+  (assert (= (mft-site-root-count 0) 0)))
+
+(deftest runtime_function_text_retains_external_branch_relocation
+  (corpus-build! CX-OBJECT-RET)
+  (object-compile-runtime!)
+  (assert (mft-extract! 0))
+  (assert (= (mft-reloc-count) 6))
+  (assert (= (mft-reloc-kind 0) MFT-RELOC-EXTERNAL))
+  (assert (= (mft-reloc-target 0) MI-NEW))
+  (assert (>= (mft-reloc-offset 0) 0))
+  (assert (< (mft-reloc-offset 0) (mft-byte-count)))
+  (assert (= (mft-reloc-kind 1) MFT-RELOC-SHAPE-SIZE))
+  (assert (= (mft-reloc-kind 2) MFT-RELOC-SHAPE-ID))
+  (assert (= (mft-reloc-kind 3) MFT-RELOC-SHAPE-SIZE))
+  (assert (= (mft-reloc-kind 4) MFT-RELOC-SHAPE-SIZE))
+  (assert (= (mft-reloc-kind 5) MFT-RELOC-SHAPE-ID))
+  (assert (= (mft-reloc-target 1) (mft-reloc-target 2)))
+  (assert (= (mft-reloc-target 2) (mft-reloc-target 3)))
+  (assert (= (mft-reloc-target 3) (mft-reloc-target 4)))
+  (assert (= (mft-reloc-target 4) (mft-reloc-target 5)))
+  (assert (= (mft-reloc-aux 1) (shape-size 1)))
+  (assert (= (mft-reloc-target-kind 1) (shape-field-count 1)))
+  (assert (= (mft-reloc-target-unit 1) (mobj-shape-bitmap 1)))
+  (assert (= (mft-reloc-target-local 1) (mobj-shape-boxed-bitmap 1))))
+
+(deftest retained_allocation_relinks_from_its_catalog_after_compiler_shapes_are_gone
+  (corpus-build! CX-OBJECT-RET)
+  (object-compile-runtime!)
+  (let [size (shape-size 1)
+        fields (shape-field-count 1)
+        refs (mobj-shape-bitmap 1)
+        boxed (mobj-shape-boxed-bitmap 1)]
+    (assert (mfts-snapshot!))
+    (shape-reset!)
+    (assert (= (shape-count) 1))
+    (assert (mfti-build!))
+    (assert (= (mfti-layout-u32 0) 1280593729))
+    (assert (= (mfti-layout-u32 8) 2))
+    (assert (= (mfti-layout-size) 80))
+    ; Header is 16 bytes; root record is 32 bytes; retained record starts at 48.
+    (assert (= (mfti-layout-u32 48) 1))
+    (assert (= (mfti-layout-u32 52) size))
+    (assert (= (mfti-layout-u32 56) 8))
+    (assert (= (mfti-layout-u32 60) fields))
+    (assert (= (mfti-layout-u64 64) refs))
+    (assert (= (mfti-layout-u64 72) boxed))))
+
+(deftest cacheability_requires_semantic_owner_and_resolved_dependencies
+  (object-call-program!)
+  (object-compile!)
+  (assert (mft-extract! 0))
+  (assert (= (mft-cache-reason) MFT-UNCACHEABLE-IDENTITY))
+  (assert (mft-extract! 1))
+  (assert (mft-cacheable?)))
+
+(deftest declared_function_abi_does_not_follow_current_callers
+  (graph-reset! 1003)
+  (let [fun (n-fun-open-identity! 0 FUN-IDENTITY-SOURCE 7654321 0)
+        (mut types) (al-new [i64] (malloc-allocator))]
+    (al-push! [i64] (mut types) (t-dyn))
+    (n-fun-declare-abi! fun (al-slice [i64] (load types)) (t-dyn))
+    (al-free! [i64] (mut types))
+    (let [parm (n-parm! fun 0)
+          body (n-new2 (Return) (n-fun-entry fun) parm)]
+      (n-fun-close! fun body)
+      (let [integer-call (n-call1! (g-start) fun (oc 7))
+            null-call (n-call1! (call-end integer-call) fun
+                                (n-new1 (Const (t-null)) (g-start)))
+            ret (n-new2 (Return) (call-end null-call) (call-value null-call))]
+      (n-add-def! (g-stop) ret))
+      (g-analyze!)
+      (if (= (g-verify) 0) 0
+          (do (fmt (stderr) "declared ABI graph failed verify={d}/{d}\n"
+                   (g-verify-code) (g-verify-node))
+              0))
+      (let [selected (be-select-machine-program!)]
+        (if selected 0
+            (do (fmt (stderr) "declared ABI selection failed be={d}/{d} mu={d}/{d} ms={d}/{d}\n"
+                     (be-result) (be-result-node) (mu-verify-result) (mu-verify-item)
+                     (ms-result) (ms-result-item))
+                0))
+        (assert selected))
+      (let [owner (mu-find-function fun)]
+        (assert (>= owner 0))
+        (assert (= (ml-kind-for-parm-representation parm) MLK-BOXED))
+        (assert (= (be-function-return-kind owner) MLK-BOXED))))))
+
+(deftest function_text_store_owns_every_function_record
+  (object-call-program!)
+  (object-compile!)
+  (assert (mfts-snapshot!))
+  (assert (= (mfts-count) (mu-function-count)))
+  (let [(mut owner) 0 (mut bytes) 0]
+    (loop (if (>= (load owner) (mfts-count)) (break)
+              (do
+                (assert (= (mfts-symbol (load owner)) (mu-function-symbol (load owner))))
+                (assert (= (mfts-byte-count (load owner))
+                           (mu-function-code-size (load owner))))
+                (set! bytes (+ (load bytes) (mfts-byte-count (load owner))))
+                (set! owner (+ (load owner) 1)))))
+    (assert (= (load bytes) (be-code-len))))
+  (assert (= (mfts-reloc-count 0) 1))
+  (assert (= (mfts-site-count 0) 1))
+  (assert (= (mfts-reloc-target-abi-arity-at 0 0) 1))
+  (assert (= (mfts-reloc-target-abi-return-kind-at 0 0) MLK-SCALAR))
+  (assert (= (mfts-identity-kind 1) FUN-IDENTITY-SOURCE))
+  (assert (= (mfts-identity-unit 1) 123456))
+  (assert (= (mfts-identity-local 1) 0))
+  (assert (= (mfts-abi-arity 1) 1))
+  (assert (= (mfts-abi-return-kind 1) MLK-SCALAR)))
 
 (deftest invalid_function_range_is_named_and_object_publication_is_atomic
   (object-call-program!)
@@ -121,7 +274,7 @@
   (object-publish!)
   (let [stackoff (mobj-u32 232)]
     ; First site instruction index follows the header and function records, then pc/owner.
-    (mobj-corrupt-byte! (+ (+ (+ stackoff 24) (* (mu-function-count) 32)) 8) 255)
+    (mobj-corrupt-byte! (+ (+ (+ stackoff 24) (* (mu-function-count) 40)) 8) 255)
     (assert (not (mobj-verify-bytes!)))
     (assert (= (mobj-result) MOBJ-STACKMAP)))
   (object-call-program!)
@@ -219,7 +372,7 @@
     (object-publish!)
     (let [root-v (ms-vget 0 root) stackoff (mobj-u32 232)
           sites (mobj-u32 (+ stackoff 8)) roots (mobj-u32 (+ stackoff 12))
-          rootbase (+ (+ (+ stackoff 24) (* (mu-function-count) 32)) (* sites 24))
+          rootbase (+ (+ (+ stackoff 24) (* (mu-function-count) 40)) (* sites 24))
           (mut which) 0 (mut found) false]
       (assert (= sites 2))
       (assert (> roots 0))
@@ -235,3 +388,148 @@
             (store! which (+ (load which) 1)) 0)))
       (assert (load found))
       (assert (mobj-verify-bytes!)))))
+
+(deftest retained_function_linker_repatches_internal_calls_by_identity
+  (object-call-program!)
+  (object-compile!)
+  (assert (mfts-snapshot!))
+  (assert (mfti-build!))
+  (assert (= (mfti-byte-count) (be-code-len)))
+  (let [site (+ (mfti-function-start 0) (mfts-reloc-offset-at 0 0))
+        target (mfti-function-start 1)]
+    (assert (= (mfts-reloc-kind-at 0 0) MFT-RELOC-CALL))
+    (assert (= (mfti-u32 site) (a64-bl (/ (- target site) 4)))))
+  (assert (= (mfti-site-count) 1))
+  (assert (= (mfti-site-owner 0) 0))
+  (assert (= (mfti-site-offset 0)
+             (+ (mfti-function-start 0) (mft-site-offset 0))))
+  (assert (= (mfti-site-root-count 0) 0))
+  (assert (= (mfti-root-count) 0))
+  (assert (= (mfti-function-frame-size 0) (mu-function-frame-size 0)))
+  (assert (= (mfti-function-callee-mask 0) (mu-function-callee-mask 0)))
+  (assert (= (mfti-function-callee-count 0) (mu-function-callee-count 0)))
+  (assert (= (mfti-stackmap-size) (mobj-stackmap-size)))
+  (assert (= (mfti-layout-size) (mobj-layout-size)))
+  (assert (= (mfti-stackmap-u32 0) 1398034241))
+  (assert (= (mfti-stackmap-u32 8) (mfti-site-count)))
+  (assert (= (mfti-stackmap-u32 16) (mfts-count)))
+  (assert (= (mfti-external-count) 0)))
+
+(deftest retained_archive_suffix_is_fully_removed_at_the_request_boundary
+  (object-call-program!)
+  (object-compile!)
+  (assert (mfts-snapshot!))
+  (let [prefix (mfts-count)
+        first-bytes (mfts-byte-count 0)]
+    (assert (> prefix 0))
+    (assert (mfts-append-snapshot!))
+    (assert (= (mfts-count) (* prefix 2)))
+    (assert (mfts-truncate-records! prefix))
+    (assert (= (mfts-count) prefix))
+    (assert (= (mfts-byte-count 0) first-bytes))
+    (assert (mfti-build!))))
+
+(deftest fresh_caller_links_to_retained_body_without_recompiling_that_body
+  ;; First compilation supplies the immutable semantic definition.
+  (object-call-program!)
+  (object-compile!)
+  (assert (mfts-snapshot!))
+  (let [prefix (mfts-count)]
+    (assert (= prefix 2))
+    ;; Second compilation declares the same function identity and ABI but deliberately has no body.
+    (graph-reset! 1004)
+    (let [inc (n-fun-open-identity! 0 FUN-IDENTITY-SOURCE 123456 0)
+          (mut types) (al-new [i64] (malloc-allocator))]
+      (al-push! [i64] (mut types) (t-int))
+      (n-fun-declare-abi! inc (al-slice [i64] (load types)) (t-int))
+      (al-free! [i64] (mut types))
+      (n-fun-mark-imported! inc)
+      (let [site (n-call1! (g-start) inc (oc 9))
+            ret (n-new2 (Return) (call-end site) (call-value site))]
+        (n-add-def! (g-stop) ret))
+      (g-analyze!)
+      (assert (= (g-verify) 0))
+      (object-compile!)
+      (let [import-owner (mu-find-function inc)]
+        (assert (>= import-owner 0))
+        (assert (mu-function-imported? import-owner))
+        (assert (= (mu-function-block-count import-owner) 0)))
+      (assert (mfts-append-snapshot!))
+      ;; Only the fresh caller is appended; the imported owner contributes no duplicate text.
+      (assert (= (mfts-count) (+ prefix 1)))
+      (assert (mfti-build!))
+      (assert (= (mfts-reloc-kind-at prefix 0) MFT-RELOC-CALL))
+      (assert (mfts-truncate-records! prefix)))))
+
+(deftest retained_archive_compaction_keeps_only_cacheable_semantic_kind
+  (object-call-program!)
+  (object-compile!)
+  (assert (mfts-snapshot!))
+  (assert (= (mfts-retain-cacheable-kind! FUN-IDENTITY-SOURCE) 1))
+  (assert (= (mfts-count) 1))
+  (assert (= (mfts-identity-kind 0) FUN-IDENTITY-SOURCE))
+  (assert (= (mfts-identity-unit 0) 123456))
+  (assert (mfts-cacheable? 0))
+  (assert (mfti-build!)))
+
+(deftest retained_jsl_archive_keeps_the_complete_abi_checked_dependency_closure
+  (graph-reset! 1005)
+  (let [callee (n-fun-open-identity! 0 FUN-IDENTITY-JSL 777 0)
+        (mut callee-types) (al-new [i64] (malloc-allocator))]
+    (al-push! [i64] (mut callee-types) (t-int))
+    (n-fun-declare-abi! callee (al-slice [i64] (load callee-types)) (t-int))
+    (al-free! [i64] (mut callee-types))
+    (let [x (n-parm! callee 0)
+          body (n-new2 (Return) (n-fun-entry callee) (ob (Add) x (oc 1)))]
+      (n-fun-close! callee body))
+    (let [caller (n-fun-open-identity! 0 FUN-IDENTITY-JSL 777 1)
+          (mut caller-types) (al-new [i64] (malloc-allocator))]
+      (al-push! [i64] (mut caller-types) (t-int))
+      (n-fun-declare-abi! caller (al-slice [i64] (load caller-types)) (t-int))
+      (al-free! [i64] (mut caller-types))
+      (let [x (n-parm! caller 0)
+            site (n-call1! (n-fun-entry caller) callee x)
+            body (n-new2 (Return) (call-end site) (call-value site))]
+        (n-fun-close! caller body))
+      (let [site (n-call1! (g-start) caller (oc 41))
+            ret (n-new2 (Return) (call-end site) (call-value site))]
+        (n-add-def! (g-stop) ret)))
+    (g-analyze!)
+    (object-compile!)
+    (assert (mfts-snapshot!))
+    (assert (= (mfts-retain-cacheable-jsl!) 2))
+    (assert (= (mfts-count) 2))
+    (assert (= (mfts-identity-kind 0) FUN-IDENTITY-JSL))
+    (assert (= (mfts-identity-kind 1) FUN-IDENTITY-JSL))
+    (assert (mfti-build!))))
+
+(deftest retained_jsl_caller_cannot_link_after_its_exact_dependency_is_removed
+  (graph-reset! 1006)
+  (let [caller (n-fun-open-identity! 0 FUN-IDENTITY-JSL 778 0)
+        callee (n-fun-open-identity! 0 FUN-IDENTITY-JSL 778 1)
+        (mut callee-types) (al-new [i64] (malloc-allocator))]
+    (al-push! [i64] (mut callee-types) (t-int))
+    (n-fun-declare-abi! callee (al-slice [i64] (load callee-types)) (t-int))
+    (al-free! [i64] (mut callee-types))
+    (let [x (n-parm! callee 0)
+          body (n-new2 (Return) (n-fun-entry callee) (ob (Add) x (oc 1)))]
+      (n-fun-close! callee body))
+    (let [(mut caller-types) (al-new [i64] (malloc-allocator))]
+      (al-push! [i64] (mut caller-types) (t-int))
+      (n-fun-declare-abi! caller (al-slice [i64] (load caller-types)) (t-int))
+      (al-free! [i64] (mut caller-types)))
+    (let [x (n-parm! caller 0)
+          nested (n-call1! (n-fun-entry caller) callee x)
+          body (n-new2 (Return) (call-end nested) (call-value nested))]
+      (n-fun-close! caller body))
+    (let [site (n-call1! (g-start) caller (oc 41))
+          ret (n-new2 (Return) (call-end site) (call-value site))]
+      (n-add-def! (g-stop) ret))
+    (g-analyze!)
+    (object-compile!)
+    (assert (mfts-snapshot!))
+    (assert (= (mfts-retain-cacheable-jsl!) 2))
+    (assert (= (mfts-identity-local 0) 0))
+    (assert (= (mfts-identity-local 1) 1))
+    (assert (mfts-truncate-records! 1))
+    (assert (not (mfti-build!)))))

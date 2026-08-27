@@ -41,6 +41,7 @@
 (const FNG-LVALUE-FIELD i64 1)
 (const FNG-LVALUE-ELEMENT i64 2)
 (const FNG-LVALUE-PROPERTYKEY i64 3)
+(const FNG-LVALUE-UNRESOLVABLE i64 4)
 (const FNG-ARRAY i64 -6)
 (const FNG-STRING i64 -7)
 (const FNG-INTRINSIC-STRING i64 -8)
@@ -54,6 +55,7 @@
 (const FNG-ITERATOR i64 -16)
 (const FNG-INTRINSIC-BOOLEAN i64 -17)
 (const FNG-INTRINSIC-FUNCTION i64 -18)
+(const FNG-INTRINSIC-SYMBOL i64 -19)
 (const FNG-JUMP-BREAK i64 0)
 (const FNG-JUMP-CONTINUE i64 1)
 (const FNG-JUMP-THROW i64 2)
@@ -62,6 +64,8 @@
 (const FNG-EXCEPTION-TAKE-DESCRIPTOR i64 102)
 (const FNG-EXCEPTION-UNCAUGHT-DESCRIPTOR i64 103)
 (const FNG-EXCEPTION-RETURN-DESCRIPTOR i64 104)
+(const FNG-EXPECTED-EXCEPTION-MISSING-DESCRIPTOR i64 105)
+(const FNG-EXPECTED-EXCEPTION-MISMATCH-DESCRIPTOR i64 106)
 
 (defstruct FngLValue
   [(kind i64) (symbol i64) (object i64) (key i64) (alias i64) (shape i64)])
@@ -106,7 +110,8 @@
    (argc i64)
    (owner i64)
    (fun i64)
-   (top-level bool)])
+   (top-level bool)
+   (host-entry bool)])
 
 (defn fng-context [(frontend (ptr NativeFrontend))
                    (values (ptr (ArrayList i64)))
@@ -133,7 +138,8 @@
                    (argc i64)
                    (owner i64)
                    (fun i64)
-                   (top-level bool)] (-> FngContext)
+                   (top-level bool)
+                   (host-entry bool)] (-> FngContext)
   (FngContext :frontend
               frontend
               :values
@@ -185,13 +191,24 @@
               :fun
               fun
               :top-level
-              top-level))
+              top-level
+              :host-entry
+              host-entry))
 
 (defn fng-optimize-ptr [] (-> (ptr bool))
   (let [enabled (primitive/alloc-static bool)] enabled))
 
 (defn fng-reuse-jsl-index-ptr [] (-> (ptr bool))
   (primitive/alloc-static bool))
+
+;; Zero is ordinary host completion. Nonzero values are an opt-in host policy for runners which
+;; need to classify an uncaught Script completion without wrapping or modifying source text.
+(defn fng-expected-uncaught-kind-ptr [] (-> (ptr i64))
+  (primitive/alloc-static i64))
+
+(defn frontend-native-expected-uncaught-kind! [(kind i64)] (-> i64)
+  (set! (fng-expected-uncaught-kind-ptr) kind)
+  0)
 
 (defn fng-jsl-index-ready-ptr [] (-> (ptr bool))
   (primitive/alloc-static bool))
@@ -212,6 +229,12 @@
 (defn frontend-native-reuse-jsl-index! [(enabled bool)] (-> i64)
   (set! (fng-reuse-jsl-index-ptr) enabled)
   (if (not enabled) (set! (fng-jsl-index-ready-ptr) false) 0)
+  0)
+
+;; A separate-compilation seed has already read and checked this process's immutable declaration
+;; table. Expose that fact without exposing the frontend's storage cell to harness code.
+(defn frontend-native-jsl-index-ready! [] (-> i64)
+  (set! (fng-jsl-index-ready-ptr) true)
   0)
 
 (defn fng-numeric-string-add-ptr [] (-> (ptr bool))
@@ -319,6 +342,16 @@
 
 (defn fng-undefined [] (-> i64)
   (n-new1 (Const (t-undef)) (g-start)))
+
+(defn fng-this-value [(context FngContext)] (-> i64)
+  (let [frontend (load (field context frontend))
+        receiver (load (field context receiver))]
+    ;; `main` is the native representation of Script evaluation, not an ordinary ECMAScript
+    ;; function call. A strict directive in the script changes its statements' strictness but does
+    ;; not change Script-level this: both variants observe the stable DSL global object.
+    (if (or (= (.owner context) (fe-main-id frontend)) (= receiver NO-NODE))
+        (fng-jsl-call0 context "GlobalObjectValue")
+        receiver)))
 
 (defn fng-string-literal [(ast TsAst) (node i64)] (-> i64)
   (let [(mut bytes) (al-new [u8] (malloc-allocator))
@@ -872,7 +905,12 @@
           (load ok))))))
 
 (defn fng-call-returns-machine-number? [(value i64)] (-> bool)
-  (fng-call-returns-machine-number-fuel? value 8))
+  (let [callee (n-in value 1)
+        fun (if (op-is? callee Closure [_]) (n-in callee 0) callee)]
+    (if (and (op-is? fun Fun [_]) (n-fun-abi-declared? fun))
+        (let [kinds (ty-kinds (n-fun-abi-return-type fun))]
+          (or (= kinds VK-INT) (or (= kinds VK-FLT) (= kinds VK-NUM))))
+        (fng-call-returns-machine-number-fuel? value 8))))
 
 ;; A loop-carried local may be assigned values of BOTH machine representations: NavierStokes'
 ;; `lastX` in lin_solve enters the loop as a tagged ArrayLoad and comes back around as a raw
@@ -1436,7 +1474,18 @@
               (if (= (fe-function-name frontend (load index)) "main")
                   (set! answer (load index))
                   (set! index (+ (load index) 1)))))
-    (load answer)))
+    (if (>= (load answer) 0)
+        (load answer)
+        (let [(mut fallback) 0 (mut found) -1]
+          (loop (if (or (>= (load fallback) (al-len [FeFunction] (.functions frontend)))
+                        (>= (load found) 0))
+                    (break)
+                    (let [fn (al-get [FeFunction] (.functions frontend) (load fallback))]
+                      (if (= (.node fn) (ts-root (field frontend ast)))
+                          (set! found (load fallback))
+                          0)
+                      (set! fallback (+ (load fallback) 1)))))
+          (load found)))))
 
 (defn fng-function-index [(frontend (ptr NativeFrontend)) (id i64)] (-> i64)
   (let [(mut index) 0
@@ -1445,6 +1494,20 @@
               (break)
               (let [fn (al-get [FeFunction] (.functions frontend) (load index))]
                 (if (= (.id fn) id) (set! answer (load index)) 0)
+                (set! index (+ (load index) 1)))))
+    (load answer)))
+
+(defn fng-function-target-index [(frontend (ptr NativeFrontend))
+                                 (functions (ptr (ArrayList i64)))
+                                 (target i64)] (-> i64)
+  (let [(mut index) 0 (mut answer) -1]
+    (loop (if (or (>= (load index) (al-len [FeFunction] (.functions frontend)))
+                  (>= (load answer) 0))
+              (break)
+              (let [fn (al-get [FeFunction] (.functions frontend) (load index))]
+                (if (= (al-get [i64] (load functions) (.id fn)) target)
+                    (set! answer (load index))
+                    0)
                 (set! index (+ (load index) 1)))))
     (load answer)))
 
@@ -1507,7 +1570,16 @@
                     (al-push! [i64] (mut pending) target)
                     0)
                 (if (fe-function-declaration-kind? kind)
-                    0
+                    ;; A top-level Script function declaration is materialized by
+                    ;; GlobalDeclarationInstantiation and is observable as a global-object
+                    ;; property even without an exact lexical reference in this compilation
+                    ;; unit. Root the declaration itself, but do not walk its body here; the
+                    ;; ordinary pending queue does that once.
+                    (let [declared (fng-function-node-index frontend node)]
+                      (if (and (>= declared 0)
+                               (not (al-get [bool] (load reachable) declared)))
+                          (al-push! [i64] (mut pending) declared)
+                          0))
                     (if (fe-function-expression-kind? kind)
                         (let [nested (fng-function-node-index frontend node)]
                           (if (and (>= nested 0)
@@ -1712,19 +1784,49 @@
                 (set! index (+ (load index) 1)))))
     (load found)))
 
-;; A script global whose storage is the runtime property side table under the script owner id.
-;; Only globals some function actually references need shared runtime storage; a global used
-;; exclusively by the top level keeps ordinary SSA flow, and a provably constant one keeps the
-;; value installed by fng-initialize-static-globals!.
+;; Every global lexical binding lives in the Realm's declarative environment. Keeping an
+;; uncaptured or apparently constant Script global in compiler SSA is unsound across independent
+;; Script records: an earlier function and `typeof` must observe whether and when a later record
+;; creates the binding. Object bindings are routed separately through GlobalObjectValue.
 (defn fng-script-global-symbol? [(frontend (ptr NativeFrontend)) (symbol-id i64)] (-> bool)
   (and (>= symbol-id (al-len [FeFunction] (.functions frontend)))
        (and (= (fe-symbol-role frontend symbol-id) FE-ROLE-GLOBAL)
-            (and (fng-raw-captured-symbol? frontend symbol-id)
-                 (not (fng-static-global-symbol? frontend symbol-id))))))
+            (not (fng-global-object-symbol? frontend symbol-id)))))
+
+(defn fng-frontend-symbol-declaration-node [(frontend (ptr NativeFrontend)) (symbol-id i64)] (-> i64)
+  (let [(mut index) 0 (mut answer) -1]
+    (loop (if (or (>= (load index) (al-len [FeSymbol] (.symbols frontend)))
+                  (>= (load answer) 0))
+              (break)
+              (let [symbol (al-get [FeSymbol] (.symbols frontend) (load index))]
+                (if (= (.id symbol) symbol-id) (set! answer (.node symbol)) 0)
+                (set! index (+ (load index) 1)))))
+    (load answer)))
+
+(defn fng-global-object-symbol? [(frontend (ptr NativeFrontend)) (symbol-id i64)] (-> bool)
+  (let [ast (field frontend ast)]
+    (if (< symbol-id (al-len [FeFunction] (.functions frontend)))
+        (let [function-index (fng-function-index frontend symbol-id)]
+          (if (< function-index 0)
+              false
+              (let [fn (al-get [FeFunction] (.functions frontend) function-index)]
+                (and (= (.parent fn) -1)
+                     (fe-function-declaration-kind? (ts-kind ast (.node fn)))))))
+        (let [declaration (fng-frontend-symbol-declaration-node frontend symbol-id)]
+          (and (= (fe-symbol-role frontend symbol-id) FE-ROLE-GLOBAL)
+               (and (>= declaration 0)
+                    (= (ts-node-binding-class ast declaration) TS-BINDING-OBJECT)))))))
 
 (defn fng-script-global-name [(frontend (ptr NativeFrontend)) (symbol-id i64)] (-> i64)
   (let [(mut index) 0
-        (mut name-node) -1]
+        (mut name-node)
+          (if (< symbol-id (al-len [FeFunction] (.functions frontend)))
+              (let [function-index (fng-function-index frontend symbol-id)]
+                (if (< function-index 0)
+                    -1
+                    (let [fn (al-get [FeFunction] (.functions frontend) function-index)]
+                      (.name-node fn))))
+              -1)]
     (loop (if (or (>= (load index) (al-len [FeSymbol] (.symbols frontend)))
                   (!= (load name-node) -1))
               (break)
@@ -1892,83 +1994,98 @@
 (defn fng-symbol-storage [(context FngContext) (symbol i64)] (-> i64)
   (al-get [i64] (load (load (field context values))) symbol))
 
-;; Script globals read and write the runtime property side table under the script owner id.
-;; Every function reaches that table without any hidden parameter, the collector already
-;; relocates its values, and the JS-PROPERTY-ALIAS memory edge orders these accesses against
-;; calls exactly like every other dynamic property access.
+;; Lexical Script globals live in the declarative half of the Realm global environment. The DSL
+;; owns its stable identity and observable binding operations; the frontend only routes bindings
+;; classified structurally as global lexical declarations.
 (defn fng-script-global-load [(context FngContext) (symbol i64)] (-> i64)
   (let [frontend (load (field context frontend))
         name-id (fng-script-global-name frontend symbol)]
-    (fng-record-dynamic-alias! context JS-PROPERTY-ALIAS)
-    (n-peephole
-      (n-new3 (PropLoad name-id)
-              (load (load (field context ctrl)))
-              (fng-current-memory context JS-PROPERTY-ALIAS)
-              (fng-const (fng-script-owner-id frontend))))))
+    (fng-jsl-call1 context "GetGlobalBinding"
+                   (n-string-const! (jss-from-utf8! (shape-name-bytes name-id))))))
 
 (defn fng-script-global-store! [(context FngContext) (symbol i64) (node i64)] (-> i64)
   (let [frontend (load (field context frontend))
         name-id (fng-script-global-name frontend symbol)]
-    (fng-record-dynamic-alias! context JS-PROPERTY-ALIAS)
-    (let [stored
-            (n-peephole
-              (n-new4 (PropStore name-id)
-                      (load (load (field context ctrl)))
-                      (fng-current-memory context JS-PROPERTY-ALIAS)
-                      (fng-const (fng-script-owner-id frontend))
-                      (fng-box-dynamic-argument! node)))]
-      (set! (load (field context memory)) (fng-preserve-active-memory context stored))
-      node)))
+    (fng-jsl-call2 context
+                   "SetGlobalDeclarativeBinding"
+                   (n-string-const! (jss-from-utf8! (shape-name-bytes name-id)))
+                   node)))
+
+(defn fng-global-object-load [(context FngContext) (symbol i64)] (-> i64)
+  (let [frontend (load (field context frontend))]
+    (fng-jsl-call1 context
+                   "GetGlobalBinding"
+                   (n-string-const!
+                     (jss-from-utf8!
+                       (shape-name-bytes (fng-script-global-name frontend symbol)))))))
+
+(defn fng-global-object-store! [(context FngContext) (symbol i64) (node i64)] (-> i64)
+  (let [frontend (load (field context frontend))]
+    (fng-jsl-call3 context
+                   "SetProperty"
+                   (fng-jsl-call0 context "GlobalObjectValue")
+                   (n-string-const!
+                     (jss-from-utf8!
+                       (shape-name-bytes (fng-script-global-name frontend symbol))))
+                   node)))
 
 (defn fng-symbol-node [(context FngContext) (symbol i64)] (-> i64)
-  (if (fng-script-global-symbol? (load (field context frontend)) symbol)
-      (fng-script-global-load context symbol)
-      (if (or (load (fng-capture-by-value-ptr))
-              (not (fng-symbol-cell? context symbol)))
-          (fng-symbol-storage context symbol)
-          (let [cell (fng-symbol-storage context symbol)
-                alias (.cell-alias context)
-                cast-node
-                  (n-new2 (Cast (t-obj-shape (.cell-shape context)))
-                          (load (load (field context ctrl)))
-                          cell)]
-            (n-load! (fng-current-memory context alias) cast-node alias)))))
+  (let [frontend (load (field context frontend))]
+    (if (fng-global-object-symbol? frontend symbol)
+        (fng-global-object-load context symbol)
+        (if (fng-script-global-symbol? frontend symbol)
+            (fng-script-global-load context symbol)
+            (if (or (load (fng-capture-by-value-ptr))
+                    (not (fng-symbol-cell? context symbol)))
+                (fng-symbol-storage context symbol)
+                (let [cell (fng-symbol-storage context symbol)
+                      alias (.cell-alias context)
+                      cast-node
+                        (n-new2 (Cast (t-obj-shape (.cell-shape context)))
+                                (load (load (field context ctrl)))
+                                cell)]
+                  (n-load! (fng-current-memory context alias) cast-node alias)))))))
 
 (defn fng-set-symbol! [(context FngContext) (symbol i64) (node i64)] (-> i64)
-  (if (fng-script-global-symbol? (load (field context frontend)) symbol)
-      (fng-script-global-store! context symbol node)
-  (if (or (load (fng-capture-by-value-ptr))
-          (not (fng-symbol-cell? context symbol)))
-      (al-set! [i64] (mut (load (field context values))) symbol node)
-      (let [cell (fng-symbol-storage context symbol)
-            alias (.cell-alias context)]
-        (if (= cell NO-NODE)
-            (let [incoming (primitive/alloc-stack (array i64 1))]
-              (set! (index incoming 0) (fng-current-memory context alias))
-              (let [nw
-                      (n-new-obj! (load (load (field context ctrl)))
-                                  (.cell-shape context)
-                                  (slice-new [i64] (cast (ptr i64) incoming) 1))
-                    object (n-obj-ptr nw)
-                    stored
-                      (n-store! (n-obj-mem nw 0)
-                                object
-                                (fng-box-dynamic-argument! node)
-                                alias)]
-                (al-set! [i64] (mut (load (field context values))) symbol object)
-                (set! (load (field context memory)) (fng-preserve-active-memory context stored))
-                node))
-            (let [cast-node
-                    (n-new2 (Cast (t-obj-shape (.cell-shape context)))
-                            (load (load (field context ctrl)))
-                            cell)
-                  stored
-                    (n-store! (fng-current-memory context alias)
-                              cast-node
-                              (fng-box-dynamic-argument! node)
-                              alias)]
-              (set! (load (field context memory)) (fng-preserve-active-memory context stored))
-              node))))))
+  (let [frontend (load (field context frontend))]
+    (if (fng-global-object-symbol? frontend symbol)
+        (fng-global-object-store! context symbol node)
+        (if (fng-script-global-symbol? frontend symbol)
+            (fng-script-global-store! context symbol node)
+            (if (or (load (fng-capture-by-value-ptr))
+                    (not (fng-symbol-cell? context symbol)))
+                (al-set! [i64] (mut (load (field context values))) symbol node)
+                (let [cell (fng-symbol-storage context symbol)
+                      alias (.cell-alias context)]
+                  (if (= cell NO-NODE)
+                      (let [incoming (primitive/alloc-stack (array i64 1))]
+                        (set! (index incoming 0) (fng-current-memory context alias))
+                        (let [nw
+                                (n-new-obj! (load (load (field context ctrl)))
+                                            (.cell-shape context)
+                                            (slice-new [i64] (cast (ptr i64) incoming) 1))
+                              object (n-obj-ptr nw)
+                              stored
+                                (n-store! (n-obj-mem nw 0)
+                                          object
+                                          (fng-box-dynamic-argument! node)
+                                          alias)]
+                          (al-set! [i64] (mut (load (field context values))) symbol object)
+                          (set! (load (field context memory))
+                                (fng-preserve-active-memory context stored))
+                          node))
+                      (let [cast-node
+                              (n-new2 (Cast (t-obj-shape (.cell-shape context)))
+                                      (load (load (field context ctrl)))
+                                      cell)
+                            stored
+                              (n-store! (fng-current-memory context alias)
+                                        cast-node
+                                        (fng-box-dynamic-argument! node)
+                                        alias)]
+                        (set! (load (field context memory))
+                              (fng-preserve-active-memory context stored))
+                        node))))))))
 
 (defn fng-symbol-type [(context FngContext) (symbol i64)] (-> i64)
   (al-get [i64] (load (load (field context value-types))) symbol))
@@ -2008,6 +2125,7 @@
         (= symbol FE-INTRINSIC-PARSEFLOAT) FNG-INTRINSIC-PARSEFLOAT
         (= symbol FE-INTRINSIC-BOOLEAN) FNG-INTRINSIC-BOOLEAN
         (= symbol FE-INTRINSIC-FUNCTION) FNG-INTRINSIC-FUNCTION
+        (= symbol FE-INTRINSIC-SYMBOL) FNG-INTRINSIC-SYMBOL
         :else FNG-DYNAMIC))
 
 (defn fng-declared-symbol-type [(frontend (ptr NativeFrontend)) (symbol-id i64)] (-> i64)
@@ -2350,6 +2468,18 @@
                     (.cell-shape context)
                     function-id))
 
+(defn fng-initialize-function-name! [(context FngContext)
+                                     (function-index i64)
+                                     (function i64)] (-> i64)
+  ;; Source structure determines the inferred name; JavaScript-visible definition and descriptor
+  ;; attributes remain entirely in the DSL.
+  (fng-jsl-call2 context
+                 "InitializeOrdinaryFunctionName"
+                 function
+                 (n-string-const!
+                   (jss-from-utf8!
+                     (fe-function-name (load (field context frontend)) function-index)))))
+
 (defn fng-closure-expression [(context FngContext) (node i64)] (-> i64)
   (let [frontend (load (field context frontend))
         function-index (fng-function-node-index frontend node)
@@ -2370,7 +2500,7 @@
     (if (fng-lexical-this? frontend function-id)
         (al-push! [i64]
                   (mut captures)
-                  (fng-box-dynamic-argument! (.receiver context)))
+                  (fng-box-dynamic-argument! (fng-this-value context)))
         0)
     (let [closure
             (if (= (al-len [i64] (load captures)) 0)
@@ -2398,7 +2528,7 @@
                               (mut stores)
                               (n-store! (n-obj-mem nw 0)
                                         object
-                                        (fng-const (+ function-id 1))
+                                        (fng-const (n-fun-index target))
                                         (shape-field-alias shape 0)))
                     (set! i 0)
                     (loop (if (>= (load i) (al-len [i64] (load captures)))
@@ -2421,7 +2551,7 @@
                       (al-free! [i64] (mut stores))
                       answer))))))]
       (al-free! [i64] (mut captures))
-      closure)))
+      (fng-initialize-function-name! context function-index closure))))
 
 (defn fng-empty-object [(context FngContext) (owner i64)] (-> i64)
   (let [frontend (load (field context frontend))
@@ -2523,8 +2653,9 @@
                 (set! index (+ (load index) 1)))))
     (if (= (load answer) -2) -1 (load answer))))
 
-(defn fng-prototype-method-targets [(frontend (ptr NativeFrontend)) (name-node i64)] (-> i64)
-  (let [ast (field frontend ast)
+(defn fng-prototype-method-targets [(context FngContext) (name-node i64)] (-> i64)
+  (let [frontend (load (field context frontend))
+        ast (field frontend ast)
         name (ts-text ast name-node)
         (mut index) 0
         (mut targets) 0
@@ -2547,11 +2678,23 @@
                     ;; longer restrict the set: every callable reserves the same single hidden
                     ;; environment slot, so mixed capture-free and capturing targets share one
                     ;; call descriptor.
-                    (let [runtime-target (+ target 1)]
-                      (if (or (< target 0) (>= runtime-target 63))
+                    (let [target-node
+                            (if (and (>= target 0)
+                                     (< target
+                                        (al-len [i64]
+                                          (load (load (field context functions))))))
+                                (al-get [i64]
+                                        (load (load (field context functions)))
+                                        target)
+                                NO-NODE)
+                          runtime-target
+                            (if (= target-node NO-NODE) -1 (n-fun-index target-node))]
+                      (if (or (< runtime-target 1) (>= runtime-target 63))
                           (set! valid false)
                           0)
-                      (set! targets (| (load targets) (<< 1 runtime-target))))
+                      (if (>= runtime-target 1)
+                          (set! targets (| (load targets) (<< 1 runtime-target)))
+                          0))
                     0)
                 (set! index (+ (load index) 1)))))
     (if (load valid) (load targets) 0)))
@@ -3871,7 +4014,7 @@
         marked
           (fng-exception-runtime context FNG-EXCEPTION-RETURN-DESCRIPTOR value)
         ret (n-new3 (Return) ctrl marked memory)]
-    (if (.top-level context)
+    (if (.host-entry context)
         (n-add-def! (g-stop) ret)
         (let [first (load (field context first-return))]
           (if (= (load first) NO-NODE)
@@ -3897,11 +4040,44 @@
           (set! (load (field context ctrl)) NO-NODE)
           0))))
 
+(defn fng-finish-expected-uncaught! [(context FngContext) (dependency i64)] (-> i64)
+  ;; This runs once after every escaping Script throw has merged. The target has already been
+  ;; popped, so an exception raised by ordinary constructor/name property access follows the
+  ;; normal uncaught path instead of recursively entering this host classifier.
+  (let [expected-kind (load (fng-expected-uncaught-kind-ptr))
+        thrown (fng-exception-runtime context FNG-EXCEPTION-TAKE-DESCRIPTOR dependency)
+        expected-name
+          (fng-jsl-call1 context
+                         "BuiltinConstructorName"
+                         (fng-const (if (= expected-kind 8) 0 expected-kind)))
+        matches (fng-jsl-call2 context
+                               "ThrownConstructorNameMatches"
+                               thrown
+                               expected-name)
+        arms (n-if-arms!
+               (fng-peep (n-new2 (If) (load (load (field context ctrl))) matches)))]
+    (set! (load (field context ctrl)) (arms-t arms))
+    (fng-add-return! context (fng-const 0))
+    (set! (load (field context ctrl)) (arms-f arms))
+    ;; The thrown value has already been consumed for JavaScript-visible matching. A mismatch is a
+    ;; host protocol failure, not a new JavaScript throw, so report it without manufacturing state.
+    (fng-add-exception-return!
+      context
+      (fng-exception-runtime
+        context FNG-EXPECTED-EXCEPTION-MISMATCH-DESCRIPTOR thrown))
+    (set! (load (field context ctrl)) NO-NODE)
+    0))
+
 (defn fng-check-pending-exception! [(context FngContext) (dependency i64)] (-> i64)
-  (let [condition
+  (let [tagged-condition
           ;; The runtime ignores this operand, but its data edge keeps the raise/call before the
           ;; pending read and keeps an otherwise value-less `%Throw` alive through scheduling.
           (fng-exception-runtime context FNG-EXCEPTION-PENDING-DESCRIPTOR dependency)
+        ;; Exception status is runtime transport, not a JavaScript conditional expression. The
+        ;; descriptor returns the ordinary tagged boolean ABI; ideal If consumes a machine bool.
+        ;; Feeding the tagged word directly made both tagged false and tagged true nonzero, so
+        ;; every checked operation entered its exception arm.
+        condition (n-unbox! tagged-condition (t-bool))
         arms
           (n-if-arms!
             (fng-peep
@@ -4067,7 +4243,7 @@
       (if calls-back (jl-set-outer-mem! (fng-callback-outer-memory context)) 0)
       (let [lowered-start (n-count)
             abrupt-base (jl-abrupt-count)
-            owner-entry (if (.top-level context)
+            owner-entry (if (.host-entry context)
                             (g-start)
                             (n-fun-entry (.fun context)))
             (mut v) NO-NODE]
@@ -4711,25 +4887,28 @@
                 (set! index (+ (load index) 1)))))
     (load answer)))
 
-(defn fng-widest-function-target [(frontend (ptr NativeFrontend)) (targets i64)] (-> i64)
-  (let [(mut index) 0
+(defn fng-widest-function-target [(context FngContext) (targets i64)] (-> i64)
+  (let [frontend (load (field context frontend))
+        (mut index) 0
         (mut answer) -1
         (mut widest) -1]
-    (loop (if (>= (load index) 63)
+    (loop (if (>= (load index) (al-len [FeFunction] (.functions frontend)))
               (break)
-              (do
-                (if (!= (& targets (<< 1 (load index))) 0)
-                    (let [source-target (- (load index) 1)
-                          function-index (fng-function-index frontend source-target)]
-                      (if (>= function-index 0)
-                          (let [fn (al-get [FeFunction]
-                                           (.functions frontend)
-                                           function-index)
-                                count (.parameter-count fn)]
-                            (if (> count (load widest))
-                                (do (set! answer source-target) (set! widest count))
-                                0))
-                          0))
+              (let [fn (al-get [FeFunction] (.functions frontend) (load index))
+                    target-node
+                      (al-get [i64]
+                              (load (load (field context functions)))
+                              (.id fn))
+                    runtime-target
+                      (if (= target-node NO-NODE) -1 (n-fun-index target-node))]
+                (if (and (>= runtime-target 1)
+                         (and (< runtime-target 63)
+                              (!= (& targets (<< 1 runtime-target)) 0)))
+                    (if (> (.parameter-count fn) (load widest))
+                        (do
+                          (set! answer (.id fn))
+                          (set! widest (.parameter-count fn)))
+                        0)
                     0)
                 (set! index (+ (load index) 1)))))
     (load answer)))
@@ -5168,7 +5347,7 @@
                 statically))
         method-targets
           (if receiver-call
-              (fng-prototype-method-targets frontend (ts-child ast callee-node 1))
+              (fng-prototype-method-targets context (ts-child ast callee-node 1))
               0)
         ;; When the name's method set cannot ride the finite target summary, dispatch through a
         ;; graph-level identity chain over the unbounded candidate list instead of one generic
@@ -5191,7 +5370,7 @@
               function-index
               (if (> method-targets 0)
                   (fng-function-index frontend
-                                      (fng-widest-function-target frontend method-targets))
+                                      (fng-widest-function-target context method-targets))
                   -1))
         fn
           (if (>= function-index 0)
@@ -5239,7 +5418,11 @@
                             (if (load (fng-duplicate-receiver-ptr))
                                 (fng-expression context receiver-source)
                                 first)))
-                      (fng-undefined))
+      (if (and (>= function-index 0)
+               (and (not (.strict fn))
+                    (fe-uses-implicit-this? ast (.body-node fn))))
+          (fng-this-value context)
+          (fng-undefined)))
                   NO-NODE)))
         receiver
           (if (and (not construct) (!= raw-receiver NO-NODE))
@@ -5308,7 +5491,8 @@
           (if (or (>= argument-function-index 0) (not direct-value-callee))
               argument-function-index
               (let [target-fun (if (op-is? target Closure [_]) (n-in target 0) target)]
-                (fng-function-index frontend (- (n-fun-index target-fun) 1))))
+                (fng-function-target-index
+                  frontend (load (field context functions)) target-fun)))
         argument-fn
           (if (>= argument-function-index 0)
               (al-get [FeFunction] (.functions frontend) argument-function-index)
@@ -5424,7 +5608,9 @@
         ;; OPTAG-FUN reserves callable identity zero as invalid, so its aux is FeFunction.id + 1.
         ;; A Closure's function identity is its input 0.
         (let [target-fun (if (op-is? target Closure [_]) (n-in target 0) target)
-              target-function-index (fng-function-index frontend (- (n-fun-index target-fun) 1))]
+              target-function-index
+                (fng-function-target-index
+                  frontend (load (field context functions)) target-fun)]
           (if (>= target-function-index 0)
               (let [target-fn
                       (al-get [FeFunction]
@@ -5567,6 +5753,13 @@
                       (n-string-const! (jss-from-utf8! "NaN"))
                       (fng-jsl-call1 context "ToStringValue"
                                      (fng-expression context argument)))))
+          (= intrinsic FNG-INTRINSIC-SYMBOL)
+            (if (= (ts-kind ast node) TSK-NEW-EXPRESSION)
+                (fng-jsl-call0 context "ThrowSymbolConstruct")
+                (fng-jsl-call1 context "CallSymbol"
+                               (if (> argc 0)
+                                   (n-box! (fng-expression context (ts-child ast node 1)))
+                                   (n-box! (fng-undefined)))))
           (= intrinsic FNG-INTRINSIC-PARSEINT)
             (fng-jsl-call2 context "ParseIntValue"
                            (fng-expression context (ts-child ast node 1))
@@ -5596,7 +5789,9 @@
     (if (or (= intrinsic FNG-INTRINSIC-OBJECT)
             (or (= intrinsic FNG-INTRINSIC-ARRAY)
             (or (= intrinsic FNG-INTRINSIC-STRING)
-                (or (= intrinsic FNG-INTRINSIC-PARSEINT) (= intrinsic FNG-INTRINSIC-ISNAN)))))
+                (or (= intrinsic FNG-INTRINSIC-PARSEINT)
+                    (or (= intrinsic FNG-INTRINSIC-ISNAN)
+                        (= intrinsic FNG-INTRINSIC-SYMBOL))))))
         (fng-intrinsic-call context node intrinsic)
         (fng-user-call context node)))))
 
@@ -5960,8 +6155,9 @@
                       (or (= symbol FE-INTRINSIC-NUMBER)
                           (or (= symbol FE-INTRINSIC-BOOLEAN)
                               (or (= symbol FE-INTRINSIC-FUNCTION)
-                                  (or (= symbol FE-INTRINSIC-MATH)
-                                      (= symbol FE-INTRINSIC-JSON))))))))]
+                                  (or (= symbol FE-INTRINSIC-SYMBOL)
+                                      (or (= symbol FE-INTRINSIC-MATH)
+                                          (= symbol FE-INTRINSIC-JSON)))))))))]
     ;; Built-in constructors are opaque tagged identities with their observable own properties in
     ;; the DSL property heap. They have no static object layout to load from; syntax resolution is
     ;; used only to choose that representation path, while generic GetProperty owns the operation.
@@ -6046,16 +6242,33 @@
     ;; the runtime PropertyKey primitive then performs only representation-level lookup.
     (fng-jsl-call2 context "GetProperty" string key)))
 
+(defn fng-reference-strict? [(context FngContext) (node i64)] (-> bool)
+  (let [frontend (load (field context frontend))
+        ast (field frontend ast)]
+    (if (load (field context top-level))
+        (ts-script-strict-at? ast (ts-node-script ast node))
+        (let [index (fng-function-index frontend (.owner context))]
+          (if (< index 0)
+              false
+              (let [fn (al-get [FeFunction] (.functions frontend) index)] (.strict fn)))))))
+
 (defn fng-lvalue [(context FngContext) (node i64)] (-> FngLValue)
   (let [frontend (load (field context frontend))
         ast (field frontend ast)
         kind (ts-kind ast node)
         (mut value) (zeroed FngLValue)]
     (if (= kind TSK-IDENTIFIER)
-        (do
-          (set! (.kind value) FNG-LVALUE-LOCAL)
-          (set! (.symbol value) (fe-resolution-symbol frontend node))
-          0)
+        (let [symbol (fe-resolution-symbol frontend node)]
+          (if (= symbol FE-INTRINSIC-UNBOUND)
+              (do
+                (set! (.kind value) FNG-LVALUE-UNRESOLVABLE)
+                (set! (.key value) (n-string-const! (jss-from-utf8! (ts-text ast node))))
+                (set! (.object value) (fng-bool (fng-reference-strict? context node)))
+                0)
+              (do
+                (set! (.kind value) FNG-LVALUE-LOCAL)
+                (set! (.symbol value) symbol)
+                0)))
         (if (= kind TSK-PROPERTY-ACCESS)
             (let [object-node (ts-child ast node 0)
                   name-node (ts-child ast node 1)
@@ -6153,6 +6366,8 @@
 (defn fng-lvalue-read [(context FngContext) (value FngLValue)] (-> i64)
   (if (= (.kind value) FNG-LVALUE-LOCAL)
       (fng-symbol-node context (.symbol value))
+      (if (= (.kind value) FNG-LVALUE-UNRESOLVABLE)
+          (fng-jsl-call1 context "GetGlobalBinding" (.key value))
       (if (= (.kind value) FNG-LVALUE-FIELD)
           (if (= (.shape value) -1)
               (fng-jsl-call2 context "GetNamedProperty"
@@ -6170,7 +6385,7 @@
                              (.key value))
               (fng-jsl-call2 context "GetProperty"
                              (.object value)
-                             (.key value))))))
+                             (.key value)))))))
 
 (defn fng-element-load-value [(context FngContext)
                               (object-node i64)
@@ -6242,6 +6457,9 @@
 (defn fng-lvalue-write [(context FngContext) (target FngLValue) (new-value i64)] (-> i64)
   (if (= (.kind target) FNG-LVALUE-LOCAL)
       (do (fng-set-symbol! context (.symbol target) new-value) new-value)
+      (if (= (.kind target) FNG-LVALUE-UNRESOLVABLE)
+          (fng-jsl-call3 context "SetUnresolvableBinding"
+                         (.key target) new-value (.object target))
       (if (= (.kind target) FNG-LVALUE-FIELD)
           (if (= (.shape target) -1)
               (fng-jsl-call3 context "SetNamedProperty"
@@ -6287,7 +6505,7 @@
               (fng-jsl-call3 context "SetProperty"
                              (.object target)
                              (.key target)
-                             new-value)))))
+                             new-value))))))
 
 (defn fng-update-local [(context FngContext) (node i64) (prefix bool)] (-> i64)
   (let [frontend (load (field context frontend))
@@ -6426,6 +6644,8 @@
                     (= symbol FE-INTRINSIC-MATH) (fng-jsl-call0 context "MathObjectValue")
                     (= symbol FE-INTRINSIC-JSON) (fng-jsl-call0 context "JSONObjectValue")
                     (= symbol FE-INTRINSIC-ERROR) (fng-error-constructor-value context node)
+                    (= symbol FE-INTRINSIC-SYMBOL)
+                      (fng-jsl-call0 context "SymbolConstructorValue")
                     (or (= symbol FE-INTRINSIC-OBJECT)
                         (or (= symbol FE-INTRINSIC-ARRAY)
                             (or (= symbol FE-INTRINSIC-STRING)
@@ -6442,7 +6662,10 @@
                             context "NewArgumentsObject"
                             (jsl-normalize-int-representation!
                               (load (field context argc))))
-                          (fng-unbound-reference context node))
+                          (fng-jsl-call1 context
+                                        "GetGlobalBinding"
+                                        (n-string-const!
+                                          (jss-from-utf8! (ts-text ast node)))))
                     (< symbol 0) NO-NODE
                     :else
                       (let [stored (fng-symbol-node context symbol)
@@ -6462,7 +6685,11 @@
                                       stored)
                                   stored)]
                         value)))
-          (= kind TSK-THIS) (load (field context receiver))
+          (= kind TSK-THIS)
+            ;; The synthetic entry function represents Script evaluation and has no receiver ABI
+            ;; value. Materialize its `this` through the semantic library. Real functions and
+            ;; lexical arrows retain the receiver/capture selected by frontend structure.
+            (fng-this-value context)
           (= kind TSK-NUMERIC-LITERAL)
             (fng-numeric-literal ast node)
           (= kind TSK-STRING-LITERAL) (fng-string-literal ast node)
@@ -6540,9 +6767,23 @@
                                  (fng-expression context name-node))))
           (= kind TSK-TYPEOF-EXPRESSION)
             (let [source (ts-role ast node TS-ROLE-EXPRESSION 0)
-                  expected (fng-infer context source FNG-DYNAMIC)
-                  value (fng-expression context source)]
-              (fng-jsl-call1 context "TypeOfValue"
+                  source-symbol (if (= (ts-kind ast source) TSK-IDENTIFIER)
+                                    (fe-resolution-symbol frontend source)
+                                    -1)
+                  global-identifier
+                    (and (= (ts-kind ast source) TSK-IDENTIFIER)
+                         (or (= source-symbol FE-INTRINSIC-UNBOUND)
+                             (and (>= source-symbol 0)
+                                  (or (fng-global-object-symbol? frontend source-symbol)
+                                      (= (fe-symbol-role frontend source-symbol)
+                                         FE-ROLE-GLOBAL)))))]
+              (if global-identifier
+                  (fng-jsl-call1 context
+                                 "TypeOfGlobalBinding"
+                                 (n-string-const! (jss-from-utf8! (ts-text ast source))))
+                  (let [expected (fng-infer context source FNG-DYNAMIC)
+                        value (fng-expression context source)]
+                    (fng-jsl-call1 context "TypeOfValue"
                 ;; `typeof` observes an ordinary expression value. Callback specialization is
                 ;; only for APIs that invoke a statically known callback; applying it here could
                 ;; replace a parameter with an unrelated function sharing its symbol id.
@@ -6556,7 +6797,7 @@
                              (or (= expected FNG-DYNAMIC)
                                  (or (= expected FNG-NUMBER) (= expected FNG-ARRAY)))))
                     value
-                    (n-box! value))))
+                    (n-box! value))))))
           (= kind TSK-CONDITIONAL-EXPRESSION)
             (let [condition-node (ts-role ast node TS-ROLE-CONDITION 0)
                   then-node (ts-role ast node TS-ROLE-WHEN-TRUE 0)
@@ -6936,7 +7177,7 @@
   (fng-ensure-memory! context)
   (let [ctrl (load (load (field context ctrl)))
         memory (load (load (field context memory)))]
-    (if (.top-level context)
+    (if (.host-entry context)
         (let [ret
                 (if (= memory NO-NODE)
                     (n-new2 (Return) ctrl value)
@@ -7034,70 +7275,75 @@
   (let [frontend (load (field context frontend))
         ast (field frontend ast)
         root (ts-root ast)
-        (mut index) 0]
-    ; Script-level `var` bindings exist as undefined before any initializer runs. This is
-    ; observable when an early function/prototype closure captures a global declared later.
-    (loop (if (>= (load index) (al-len [FeSymbol] (.symbols frontend)))
+        (mut script-index) 0
+        (mut index) 0
+        (mut continues) true]
+    ;; GlobalDeclarationInstantiation and evaluation happen once per Script record, in order.
+    ;; Indexing may know about later records, but their bindings and function objects must not be
+    ;; observable while an earlier harness/include Script executes.
+    (loop (if (or (>= (load script-index) (ts-script-count ast))
+                  (not (load continues)))
               (break)
-              (let [symbol (al-get [FeSymbol] (.symbols frontend) (load index))]
-                (if (and (= (.role symbol) FE-ROLE-GLOBAL)
-                         (= (fng-symbol-storage context (.id symbol)) NO-NODE))
-                    (do
-                      (fng-set-symbol! context (.id symbol) (fng-undefined))
-                      (fng-set-symbol-type! context (.id symbol) FNG-VOID))
-                    0)
-                (set! index (+ (load index) 1)))))
-    (set! index 0)
-    ; JavaScript function declarations are objects as well as call targets. Materialize one stable
-    ; object per declaration before executing top-level initializers, and publish its real
-    ; `prototype` property so constructor static fields and inheritance helpers use ordinary
-    ; dynamic property semantics.
-    (loop (if (>= (load index) (al-len [FeFunction] (.functions frontend)))
-              (break)
-              (let [fn (al-get [FeFunction] (.functions frontend) (load index))]
-                ; Nested declarations belong to their lexical invocation. Publishing
-                ; their function object/prototype here would embed a parent function's
-                ; allocation directly in the synthetic top-level graph.
-                (if (and (al-get [bool] (load reachable-functions) (load index))
-                         (and (fe-function-declaration-kind? (ts-kind ast (.node fn)))
-                         (and (!= (.id fn) (.owner context))
-                              (= (.parent fn) -1))))
-                    (let [object
-                            (al-get [i64]
-                                    (load (load (field context functions)))
-                                    (.id fn))]
-                      ; Publish identity before prototype materialization: a prototype method may
-                      ; capture its own constructor. A top-level non-capturing declaration's Fun
-                      ; id is also its JavaScript object identity; the runtime property side table
-                      ; canonicalizes boxed and raw function ids to this same owner.
-                      (fng-set-symbol! context (.source-id fn) object)
-                      (let [prototype (fng-constructor-prototype! context (.id fn))
-                          stored
-                            (n-peephole
-                              (n-new4 (PropStore (shape-name-intern! "prototype"))
-                                      (load (load (field context ctrl)))
-                                      (fng-current-memory context JS-PROPERTY-ALIAS)
-                                      object
-                                      (n-box! prototype)))]
-                        (set! (load (field context memory)) (fng-preserve-active-memory context stored))))
-                    0)
-                (set! index (+ (load index) 1)))))
-    (set! index 0)
-    (loop (if (>= (load index) (ts-child-count ast root))
-              (break)
-              (let [statement (ts-child ast root (load index))
-                    kind (ts-kind ast statement)
-                    expression (if (= kind TSK-EXPRESSION-STATEMENT) (ts-child ast statement 0) -1)]
-                ;; Prototype metadata gives the closed-world call machinery precise targets, but
-                ;; it is not JavaScript execution. Every source assignment still runs here, in
-                ;; source order, through the ordinary lvalue/SetProperty path. Skipping every
-                ;; `.prototype` assignment made method publication appear to work only because
-                ;; materialization duplicated function-valued entries; data properties vanished
-                ;; completely and writes before first use acquired the wrong observable timing.
-                (if (or (= kind TSK-VARIABLE-STATEMENT) (= kind TSK-EXPRESSION-STATEMENT))
-                    (fng-statement context statement)
-                    false)
-                (set! index (+ (load index) 1)))))
+              (do
+                (set! index 0)
+                ;; This record's `var` bindings exist as undefined before any initializer in this
+                ;; record runs. A prior record's existing binding is deliberately not reset.
+                (loop (if (>= (load index) (al-len [FeSymbol] (.symbols frontend)))
+                          (break)
+                          (let [symbol (al-get [FeSymbol] (.symbols frontend) (load index))]
+                            (if (and (= (.role symbol) FE-ROLE-GLOBAL)
+                                     (and (= (ts-node-script ast (.node symbol))
+                                             (load script-index))
+                                          (= (fng-symbol-storage context (.id symbol)) NO-NODE)))
+                                (do
+                                  (fng-set-symbol! context (.id symbol) (fng-undefined))
+                                  (fng-set-symbol-type! context (.id symbol) FNG-VOID))
+                                0)
+                            (set! index (+ (load index) 1)))))
+                (set! index 0)
+                ;; Function declarations are instantiated before this record's statements, never
+                ;; before statements belonging to an earlier Script record.
+                (loop (if (>= (load index) (al-len [FeFunction] (.functions frontend)))
+                          (break)
+                          (let [fn (al-get [FeFunction] (.functions frontend) (load index))]
+                            (if (and (= (ts-node-script ast (.node fn)) (load script-index))
+                                     (and (al-get [bool] (load reachable-functions) (load index))
+                                     (and (fe-function-declaration-kind? (ts-kind ast (.node fn)))
+                                     (and (!= (.id fn) (.owner context))
+                                          (= (.parent fn) -1)))))
+                                (let [object
+                                        (al-get [i64]
+                                                (load (load (field context functions)))
+                                                (.id fn))]
+                                  (fng-initialize-function-name! context (load index) object)
+                                  (fng-set-symbol! context (.source-id fn) object)
+                                  (let [prototype (fng-constructor-prototype! context (.id fn))
+                                        stored
+                                          (n-peephole
+                                            (n-new4 (PropStore (shape-name-intern! "prototype"))
+                                                    (load (load (field context ctrl)))
+                                                    (fng-current-memory context JS-PROPERTY-ALIAS)
+                                                    object
+                                                    (n-box! prototype)))]
+                                    (set! (load (field context memory))
+                                          (fng-preserve-active-memory context stored))))
+                                0)
+                            (set! index (+ (load index) 1)))))
+                (set! index 0)
+                (loop (if (or (>= (load index) (ts-child-count ast root))
+                              (not (load continues)))
+                          (break)
+                          (let [statement (ts-child ast root (load index))]
+                            ;; Every source statement is evaluated in record order. Declaration
+                            ;; statements are already no-ops in `fng-statement` after their
+                            ;; instantiation above; abrupt completion prevents this and every
+                            ;; subsequent Script record from executing.
+                            (if (and (= (ts-node-script ast statement) (load script-index))
+                                     (!= (ts-kind ast statement) TSK-END-OF-FILE))
+                                (set! continues (fng-statement context statement))
+                                0)
+                            (set! index (+ (load index) 1)))))
+                (set! script-index (+ (load script-index) 1)))))
     0))
 
 (defn fng-static-global-value [(frontend (ptr NativeFrontend))
@@ -7171,6 +7417,15 @@
                 (set! index (+ (load index) 1)))))
     0))
 
+(defn fng-ssa-carried-symbol? [(frontend (ptr NativeFrontend)) (symbol i64)] (-> bool)
+  ;; Script globals are runtime property state, not frontend SSA state. JS-PROPERTY-ALIAS already
+  ;; crosses every branch, loop and exception snapshot; adding these symbols as carried values
+  ;; calls back into the DSL while bookkeeping a snapshot, then abandons the successful control
+  ;; arm when the other snapshot is restored. Only true lexical bindings belong in value phis.
+  (and (>= symbol 0)
+       (and (not (fng-global-object-symbol? frontend symbol))
+            (not (fng-script-global-symbol? frontend symbol)))))
+
 (defn fng-assigned! [(frontend (ptr NativeFrontend))
                      (node i64)
                      (assigned (mut (ArrayList i64)))] (-> i64)
@@ -7193,7 +7448,10 @@
                                                                (= operator ">>>="))))))))))))
                    (= (ts-kind ast left) TSK-IDENTIFIER))
               (let [symbol (fe-resolution-symbol frontend left)]
-                (if (fng-list-has assigned symbol) 0 (al-push! [i64] (mut assigned) symbol)))
+                (if (and (fng-ssa-carried-symbol? frontend symbol)
+                         (not (fng-list-has assigned symbol)))
+                    (al-push! [i64] (mut assigned) symbol)
+                    0))
               0))
         0)
     (if (or (= kind TSK-PREFIX-UNARY) (= kind TSK-POSTFIX-UNARY))
@@ -7207,7 +7465,10 @@
                            (or (= postfix-op "++") (= postfix-op "--"))))
                    (= (ts-kind ast operand) TSK-IDENTIFIER))
               (let [symbol (fe-resolution-symbol frontend operand)]
-                (if (fng-list-has assigned symbol) 0 (al-push! [i64] (mut assigned) symbol)))
+                (if (and (fng-ssa-carried-symbol? frontend symbol)
+                         (not (fng-list-has assigned symbol)))
+                    (al-push! [i64] (mut assigned) symbol)
+                    0))
               0))
         0)
     (let [(mut index) 0]
@@ -7257,6 +7518,7 @@
                         (can-continue bool)
                         (symbols (ptr (ArrayList i64)))] (-> i64)
   (let [targets (load (field context targets))
+        frontend (load (field context frontend))
         target-symbols (load (field context target-symbols))
         target-active (load (field context target-active))
         jumps (load (field context jumps))
@@ -7267,10 +7529,15 @@
         (mut index) 0]
     (loop (if (>= (load index) (al-len [i64] (load symbols)))
               (break)
-              (do
-                (al-push! [i64]
-                          (mut target-symbols)
-                          (al-get [i64] (load symbols) (load index)))
+              (let [symbol (al-get [i64] (load symbols) (load index))]
+                ;; Realm globals are state in JS-PROPERTY-ALIAS, which the active-memory slice
+                ;; below already captures. Snapshotting them as values calls back into their DSL
+                ;; lookup while that same DSL call is capturing an exception edge, recursing
+                ;; without bound.
+                (if (or (fng-global-object-symbol? frontend symbol)
+                        (fng-script-global-symbol? frontend symbol))
+                    0
+                    (al-push! [i64] (mut target-symbols) symbol))
                 (set! index (+ (load index) 1)))))
     (fng-active-memory! context (mut active))
     (set! index 0)
@@ -7288,7 +7555,7 @@
                                  can-break
                                  can-continue
                                  symbol-start
-                                 (al-len [i64] (load symbols))
+                                 (- (al-len [i64] (load target-symbols)) symbol-start)
                                  active-start
                                  (al-len [i64] (load active))
                                  (al-len [FngJump] (load jumps))
@@ -9103,11 +9370,15 @@
                              (cell-shape i64)
                              (cell-alias i64)
                              (function-index i64)
-                             (top-level bool)] (-> i64)
+                             (script-entry bool)
+                             (host-entry bool)] (-> i64)
   (let [fn (al-get [FeFunction] (.functions frontend) function-index)
         fun-id (.id fn)
-        fun (if top-level NO-NODE (al-get [i64] (load functions) fun-id))
-        (mut ctrl) (if top-level (g-start) (n-fun-entry fun))
+        ;; Script semantics and host publication are independent properties. Today the sole Script
+        ;; entry is also the host Start; compilation batches will open additional Script entries as
+        ;; internal Fun roots and reach them through a compiler-generated host dispatcher.
+        fun (if host-entry NO-NODE (al-get [i64] (load functions) fun-id))
+        (mut ctrl) (if host-entry (g-start) (n-fun-entry fun))
         (mut memory) NO-NODE
         (mut first-return) NO-NODE
         (mut targets) (al-new [FngTarget] (malloc-allocator))
@@ -9119,10 +9390,13 @@
         (mut dynamic-aliases) (al-new [i64] (malloc-allocator))
         (mut saved-capture-symbols) (al-new [i64] (malloc-allocator))
         (mut saved-capture-values) (al-new [i64] (malloc-allocator))
+        (mut host-symbols) (al-new [i64] (malloc-allocator))
+        (mut host-active) (al-new [i64] (malloc-allocator))
+        (mut host-target) -1
         (mut receiver) NO-NODE
         (mut argc) NO-NODE
         (mut index) 0]
-    (if top-level
+    (if script-entry
         0
         ;; The uniform callable ABI: parameter 0 is the hidden closure environment (dead for a
         ;; capture-free function, but the slot is always reserved so every generic call places
@@ -9239,8 +9513,9 @@
                          (load argc)
                          fun-id
                          fun
-                         top-level)]
-      (if top-level
+                         script-entry
+                         host-entry)]
+      (if script-entry
           ;; MAIN'S PARAMETERS NEED THE SAME CELLS. The loop below materializes a cell for every
           ;; parameter a nested closure captures, and it was skipped entirely for the top level --
           ;; so `main`'s parameters stayed bare `Arg` nodes in `values[]`. `fng-closure-expression`
@@ -9309,12 +9584,29 @@
                                                  (fng-symbol-node context (.id parameter-symbol)))
                               0))
                         (set! index (+ (load index) 1)))))))
+      ;; Install the host completion boundary before Script declaration instantiation. A
+      ;; multi-Script program evaluates its real Script records from top-level initialization, so
+      ;; installing this afterward misses exceptions escaping those records. This target observes
+      ;; the entry completion only; it neither wraps nor rewrites any Script or harness source.
+      (if (and script-entry (> (load (fng-expected-uncaught-kind-ptr)) 0))
+          (do
+            (fng-record-dynamic-alias! context JS-PROPERTY-ALIAS)
+            (fng-active-memory! context (mut host-active))
+            (fng-control-aliases! context (mut host-active))
+            (set! host-target
+                  (fng-push-target! context
+                                    FNG-EXCEPTION-TARGET-LABEL
+                                    false
+                                    false
+                                    (mut host-symbols)))
+            0)
+          0)
       (fng-initialize-locals! context)
       (fng-materialize-nested-declarations! context
                                             (mut saved-capture-symbols)
                                             (mut saved-capture-values))
-      (if top-level (fng-top-level-initialize! context (mut reachable-functions)) 0)
-      (if (and (not top-level)
+      (if script-entry (fng-top-level-initialize! context (mut reachable-functions)) 0)
+      (if (and (not script-entry)
                (or (= (ts-kind (field frontend ast) (.node fn)) TSK-CLASS-DECLARATION)
                    (= (ts-kind (field frontend ast) (.node fn)) TSK-CLASS-EXPRESSION)))
           (fng-initialize-class-fields! context (.node fn))
@@ -9331,13 +9623,44 @@
                     (fng-add-return! context
                                      (fng-expression-expected context body-node expected))
                     false)
-                  (fng-statement context body-node)))]
-        (if (and (not top-level) falls-through)
+                  (fng-statement context body-node)))
+            normal-ctrl (load (load (field context ctrl)))
+            normal-memory (load (load (field context memory)))
+            has-host-exception
+              (if (>= (load host-target) 0)
+                  (fng-merge-target! context (load host-target) FNG-JUMP-THROW false)
+                  false)]
+        (if (>= (load host-target) 0) (fng-pop-target! context (load host-target)) 0)
+        (if has-host-exception
+            (fng-finish-expected-uncaught!
+              context (load (load (field context exception-dependency))))
+            0)
+        (set! (load (field context ctrl)) normal-ctrl)
+        (set! (load (field context memory)) normal-memory)
+        ;; A synthetic Script entry has no source-level return statement. Publish normal Script
+        ;; completion as the host ABI's zero result only after every top-level statement has run;
+        ;; throws have already diverted control through the ordinary exception path and cleared
+        ;; context control. The live control value is authoritative here: compound statement
+        ;; lowering can retain a normal arm even when its summary boolean is conservative.
+        (if (and script-entry
+                 (and (!= (load (load (field context ctrl))) NO-NODE)
+                      (= (.node fn) (ts-root (field frontend ast)))))
+            (if (> (load (fng-expected-uncaught-kind-ptr)) 0)
+                (do
+                  (fng-add-exception-return!
+                    context
+                    (fng-exception-runtime
+                      context FNG-EXPECTED-EXCEPTION-MISSING-DESCRIPTOR (fng-const 0)))
+                  (set! (load (field context ctrl)) NO-NODE)
+                  0)
+                (fng-add-return! context (fng-const 0)))
+            0)
+        (if (and (not script-entry) falls-through)
             (fng-add-return! context (fng-undefined))
             0)
         ; An empty JavaScript function still returns undefined. Keep the graph callable even when
         ; an empty/nested body contributed no statement node to the fallthrough calculation.
-        (if (and (not top-level) (= (load first-return) NO-NODE))
+        (if (and (not script-entry) (= (load first-return) NO-NODE))
             (fng-add-return! context (fng-undefined))
             0)))
     (set! index 0)
@@ -9357,33 +9680,88 @@
     (al-free! [i64] (mut dynamic-aliases))
     (al-free! [i64] (mut saved-capture-symbols))
     (al-free! [i64] (mut saved-capture-values))
+    (al-free! [i64] (mut host-symbols))
+    (al-free! [i64] (mut host-active))
     0))
 
-(defn frontend-native-build-mode! [(frontend (mut NativeFrontend)) (seed i64) (optimize bool) (analyze bool)] (-> i64)
-  (graph-reset! seed)
+(defn fng-byte-fingerprint [(text (slice u8))] (-> i64)
+  (let [(mut hash) 1469598103934665603 (mut index) 0]
+    (loop (if (>= (load index) (slice-len text)) (break)
+              (do
+                (set! hash (hash-step (load hash)
+                                      (cast i64 (load (index (slice-data text) (load index))))))
+                (set! index (+ (load index) 1)))))
+    (hash-step (load hash) (slice-len text))))
+
+;; Semantic source identity is independent of graph fidx allocation. The unit is the exact original
+;; Script record, not the concatenated parser input; the local is callable order inside that record,
+;; not FeFunction's unit-global id. This is the identity separate compilation can safely retain.
+(defn fng-source-function-unit [(frontend (ptr NativeFrontend)) (function-index i64)] (-> i64)
+  (let [ast (field frontend ast)
+        fn (al-get [FeFunction] (.functions frontend) function-index)
+        script (ts-node-script ast (.node fn))]
+    (fng-byte-fingerprint (ts-text ast (ts-script-root ast script)))))
+
+(defn fng-source-function-local [(frontend (ptr NativeFrontend)) (function-index i64)] (-> i64)
+  (let [ast (field frontend ast)
+        fn (al-get [FeFunction] (.functions frontend) function-index)
+        script (ts-node-script ast (.node fn))
+        (mut index) 0 (mut local) 0]
+    (loop (if (>= (load index) function-index) (break)
+              (do
+                (let [prior (al-get [FeFunction] (.functions frontend) (load index))]
+                  (if (= (ts-node-script ast (.node prior)) script)
+                      (set! local (+ (load local) 1)) 0))
+                (set! index (+ (load index) 1)))))
+    (load local)))
+
+(defn fng-declare-source-abi! [(fun i64) (parameter-count i64) (script-entry bool)] (-> i64)
+  (let [(mut types) (al-new [i64] (malloc-allocator)) (mut index) 0]
+    (if script-entry
+        0
+        (do (al-push! [i64] (mut types) (t-dyn))
+            (al-push! [i64] (mut types) (t-dyn))
+            (al-push! [i64] (mut types) (t-int))
+            (loop (if (>= (load index) parameter-count) (break)
+                      (do (al-push! [i64] (mut types) (t-dyn))
+                          (set! index (+ (load index) 1)))))))
+    (n-fun-declare-abi! fun (al-slice [i64] (load types)) (t-dyn))
+    (al-free! [i64] (mut types))
+    0))
+
+(defn frontend-native-build-mode! [(frontend (mut NativeFrontend)) (seed i64) (optimize bool)
+                                   (analyze bool) (internal-script bool) (emit-dispatch bool)
+                                   (source-function-base i64)
+                                   (jsl-function-base i64)
+                                   (initialize-state bool)] (-> i64)
+  (if initialize-state (graph-reset! seed) 0)
   (g-rep-strict! 1)
-  (shape-reset!)
-  (jss-reset!)
+  (if initialize-state (shape-reset!) 0)
+  (if initialize-state (jss-reset!) 0)
   ;; The JSL runtime library is READ and CHECKED here but nothing is lowered. `jsl-require!` pulls a
   ;; definition and its callees the first time the frontend emits a call to it, so a program that
   ;; uses no library builtin gets exactly the graph it got before this existed — which is what the
   ;; exact-`g-render` migration oracle in tests/frontend-exact-graph-test.mjs compares.
   (let [reuse (load (fng-reuse-jsl-index-ptr))
         ready (load (fng-jsl-index-ready-ptr))
-        status (if (and reuse ready)
+        status (if (not initialize-state)
+                   ;; Appended units share the checked declarations and any graph-level JSL
+                   ;; functions already lowered by earlier units in this compilation batch.
                    (jsl-reuse-checked!)
-                   (do
-                     (jsl-reset!)
-                     (let [loaded (jsl-load-index! "lib/index")]
-                       (if (and reuse (= loaded JSL-OK))
-                           (set! (fng-jsl-index-ready-ptr) true)
-                           0)
-                       loaded)))]
+                   (if (and reuse ready)
+                       (jsl-reuse-checked!)
+                       (do
+                         (jsl-reset!)
+                         (let [loaded (jsl-load-index! "lib/index")]
+                           (if (and reuse (= loaded JSL-OK))
+                               (set! (fng-jsl-index-ready-ptr) true)
+                               0)
+                           loaded))))]
   (if (!= status JSL-OK)
       (do (panic-corrupt "frontend: the JSL runtime library did not load") 0)
       0)
   )
-  (jl-reset!)
+  (if initialize-state (jl-reset!) 0)
   (set! (fng-window-calls-cell) 0)
   (set! (fng-window-scans-cell) 0)
   (set! (fng-profile-memory-alias-calls-ptr) 0)
@@ -9461,15 +9839,41 @@
     ;; `fe-prioritize-prototype-functions!` has already moved dynamically published prototype
     ;; methods into the low summary namespace; all later functions are reached through exact
     ;; Fun/Closure identity and therefore do not consume a summary bit.
-    (jsl-set-fidx-base! (+ function-count 1))
+    ;; Frontend ids remain local to one independently indexed unit. Fun-node identities live in
+    ;; the shared graph namespace and therefore receive the unit's reserved source-function base.
+    ;; Single-unit callers derive the JSL range as before. A multi-unit owner reserves every
+    ;; source range first and supplies one shared base above their maximum, so lazily lowered JSL
+    ;; functions cannot collide with a later Script unit.
+    (jsl-set-fidx-base! (if (> jsl-function-base 0)
+                            jsl-function-base
+                            (+ (+ source-function-base function-count) 1)))
     (set! index 0)
     (loop (if (>= (load index) function-count)
               (break)
               (let [fn (al-get [FeFunction] (.functions frontend) (load index))]
-                (if (and (!= (.id fn) main-id)
+                (if (and (or internal-script (!= (.id fn) main-id))
                          (al-get [bool] (load reachable-functions) (load index)))
-                    (al-set! [i64] (mut functions) (.id fn)
-                             (n-fun-open! (+ (.id fn) 1)))
+                    (let [script-entry (and internal-script (= (.id fn) main-id))
+                          unit (fng-source-function-unit frontend (load index))
+                          local (fng-source-function-local frontend (load index))
+                      fun
+                            (n-fun-open-identity!
+                              (+ (+ source-function-base (.id fn)) 1)
+                              FUN-IDENTITY-SOURCE
+                              ;; `unit` is local to one parsed AST and restarts at zero for every
+                              ;; independent batch member. Ranged multi-unit compilation supplies a
+                              ;; shared JSL base and reserves a source range, so only there does that
+                              ;; range become the outer identity namespace. Ordinary graph namespace
+                              ;; changes must leave source identity stable.
+                              (if (> jsl-function-base 0)
+                                  (+ source-function-base unit)
+                                  unit)
+                              local)]
+                      (if internal-script
+                          (fng-declare-source-abi! fun (.parameter-count fn)
+                                                   script-entry)
+                          0)
+                      (al-set! [i64] (mut functions) (.id fn) fun))
                     0)
                 (set! index (+ (load index) 1)))))
     ;; Main Args are created immediately after the function roots.
@@ -9504,6 +9908,7 @@
                                              (load cell-shape)
                                              (load cell-alias)
                                              (load index)
+                                             false
                                              false)
                       ; Prototype allocations are ordinary runtime values owned by
                       ; the function control that created them. Do not leak one
@@ -9542,7 +9947,17 @@
                            (load cell-shape)
                            (load cell-alias)
                            main-index
-                           true)
+                           true
+                           (not internal-script))
+    ;; Compiler structure, never JavaScript source: an independently compiled Script entry is an
+    ;; internal function with Script semantics. The sole host Start dispatches to it and publishes
+    ;; its completion. A future batch dispatcher selects among several such entries by index.
+    (if emit-dispatch
+        (let [entry (al-get [i64] (load functions) main-id)
+              site (n-call! (g-start) entry (slice-new [i64] (cast (ptr i64) 0) 0))]
+          (n-add-def! (g-stop) (n-new2 (Return) (call-end site) (call-value site)))
+          0)
+        0)
     (fng-distribute-deferred-phi-boxes!)
     (fmt (stderr) "AOTK_PROFILE phase=frontend_build_shape nodes={d} live={d} peeps={d} window_calls={d} window_scans={d}\n"
          (n-count) (g-live-count) (g-profile-peeps)
@@ -9586,10 +10001,16 @@
                            (- (fng-profile-now) eliminate-phase))
                       (if (> eliminated 0) (fng-analyze-fresh!) 0))) 0)))
         0)
-    (let [phase (fng-profile-now)]
-    (fng-discard-unused!)
-      (fmt (stderr) "AOTK_TIMING phase=frontend_discard_unused ns={d}\n"
-           (- (fng-profile-now) phase)))
+    ;; Appended Script units are intentionally uncalled until the compiler-owned dispatcher is
+    ;; emitted. Per-unit dead-use cleanup here can erase their exception-only behavior before that
+    ;; call edge exists. Whole-image finalization performs the same cleanup after dispatch.
+    (if analyze
+        (let [phase (fng-profile-now)]
+          (fng-discard-unused!)
+          (fmt (stderr) "AOTK_TIMING phase=frontend_discard_unused ns={d}\n"
+               (- (fng-profile-now) phase))
+          0)
+        0)
     ;; A LOOP NOBODY READS SURVIVES EVERY FOLD. `n-kill!` refuses a node that still has users, and
     ;; each node in a loop's Phi cycle has one -- the next node round the cycle -- so a definition
     ;; from `lib/` whose result goes unread stays live, reachable from no root, and `v-pass-leaks`
@@ -9631,4 +10052,124 @@
       answer)))
 
 (defn frontend-native-build! [(frontend (mut NativeFrontend)) (seed i64) (optimize bool)] (-> i64)
-  (frontend-native-build-mode! (mut frontend) seed optimize true))
+  (frontend-native-build-mode! (mut frontend) seed optimize true false false 0 0 true))
+
+(defn frontend-native-build-dispatched-script! [(frontend (mut NativeFrontend))
+                                                 (seed i64)
+                                                 (optimize bool)] (-> i64)
+  (frontend-native-build-mode! (mut frontend) seed optimize true true true 0 0 true))
+
+(defn frontend-native-build-dispatched-script-at! [(frontend (mut NativeFrontend))
+                                                    (seed i64)
+                                                    (optimize bool)
+                                                    (source-function-base i64)] (-> i64)
+  (frontend-native-build-mode!
+    (mut frontend) seed optimize true true true source-function-base 0 true))
+
+(defn frontend-native-begin-script-unit-at! [(frontend (mut NativeFrontend))
+                                             (seed i64)
+                                             (optimize bool)
+                                             (source-function-base i64)] (-> i64)
+  (frontend-native-build-mode!
+    (mut frontend) seed optimize false true false source-function-base 0 true))
+
+(defn frontend-native-append-script-unit-at! [(frontend (mut NativeFrontend))
+                                              (seed i64)
+                                              (optimize bool)
+                                              (source-function-base i64)] (-> i64)
+  (frontend-native-build-mode!
+    (mut frontend) seed optimize false true false source-function-base 0 false))
+
+(defn frontend-native-begin-script-unit-ranged-at!
+  [(frontend (mut NativeFrontend)) (seed i64) (optimize bool)
+   (source-function-base i64) (jsl-function-base i64)] (-> i64)
+  (frontend-native-build-mode!
+    (mut frontend) seed optimize false true false
+    source-function-base jsl-function-base true))
+
+(defn frontend-native-append-script-unit-ranged-at!
+  [(frontend (mut NativeFrontend)) (seed i64) (optimize bool)
+   (source-function-base i64) (jsl-function-base i64)] (-> i64)
+  (frontend-native-build-mode!
+    (mut frontend) seed optimize false true false
+    source-function-base jsl-function-base false))
+
+(defn fng-fun-with-index [(fidx i64)] (-> i64)
+  (let [(mut node) 0 (mut answer) NO-NODE]
+    (loop (if (or (>= (load node) (n-count)) (!= (load answer) NO-NODE))
+              (break)
+              (do
+                (if (and (not (n-dead? (load node)))
+                         (and (op-is? (load node) Fun [_])
+                              (= (n-fun-index (load node)) fidx)))
+                    (set! answer (load node))
+                    0)
+                (set! node (+ (load node) 1)))))
+    (load answer)))
+
+;; Build host selection in compiler IR. `entries` contains graph-level Fun identities for
+;; independently compiled Script units. Exactly one branch executes, selected by the host integer;
+;; JavaScript source and Realm state do not participate in dispatch.
+(defn frontend-native-build-indexed-dispatcher! [(entries (slice i64))] (-> i64)
+  (let [count (slice-len entries)
+        selector (n-new1 (Arg (t-int)) (g-start))
+        (mut ctrl) (g-start)
+        (mut index) 0
+        (mut controls) (al-new [i64] (malloc-allocator))
+        (mut values) (al-new [i64] (malloc-allocator))]
+    (if (= count 0)
+        (panic-corrupt "frontend batch dispatcher requires at least one Script entry")
+        0)
+    (loop (if (>= (load index) count)
+              (break)
+              (let [last (= (+ (load index) 1) count)
+                    selected
+                      (if last
+                          (load ctrl)
+                          (let [arms (n-host-index-arms! (load ctrl) selector (load index))]
+                            (set! ctrl (arms-f arms))
+                            (arms-t arms)))
+                    fun (fng-fun-with-index (slice-get entries (load index)))]
+                (if (= fun NO-NODE)
+                    (panic-corrupt "frontend batch dispatcher cannot find Script entry")
+                    0)
+                (let [site (n-call! selected fun (slice-new [i64] (cast (ptr i64) 0) 0))]
+                  ;; A synthetic Script entry already owns the complete host completion boundary:
+                  ;; it converts normal completion to status zero and escaping throws to the
+                  ;; uncaught/expected-negative status. Rechecking the JavaScript pending slot here
+                  ;; treats that raw host status as a tagged value and misclassifies normal returns.
+                  (al-push! [i64] (mut controls) (call-end site))
+                  ;; Script entries use the dynamic callable ABI, so their integer host status is
+                  ;; boxed at the call boundary. The dispatcher is native structure and returns the
+                  ;; unboxed status, exactly as the singleton Start return normalization does.
+                  (al-push! [i64] (mut values) (n-unbox! (call-value site) (t-int))))
+                (set! index (+ (load index) 1)))))
+    (let [region (n-new (Region))]
+      (n-add-def! region NO-NODE)
+      (set! index 0)
+      (loop (if (>= (load index) count)
+                (break)
+                (do
+                  (n-add-def! region (al-get [i64] (load controls) (load index)))
+                  (set! index (+ (load index) 1)))))
+      (let [value (n-new (Phi (t-int)))]
+        (n-add-def! value region)
+        (set! index 0)
+        (loop (if (>= (load index) count)
+                  (break)
+                  (do
+                    (n-add-def! value (al-get [i64] (load values) (load index)))
+                    (set! index (+ (load index) 1)))))
+        (n-add-def! (g-stop) (n-new2 (Return) region value))))
+    (al-free! [i64] (mut controls))
+    (al-free! [i64] (mut values))
+    0))
+
+(defn frontend-native-finish-appended-units! [] (-> i64)
+  (fng-distribute-deferred-phi-boxes!)
+  (fng-discard-memory-scaffolding!)
+  (fng-analyze-fresh!)
+  (fng-discard-unused!)
+  (g-kill-uncalled-functions!)
+  (g-sweep-unreachable!)
+  0)

@@ -82,6 +82,8 @@
    (profile-lower-ns i64)
    (profile-lower-calls i64)
    (profile-lower-nodes i64)
+   (identity-unit i64)
+   (identity-valid bool)
    (inited bool)])
 
 (defn jl [] (-> (ptr JslLower))
@@ -115,6 +117,8 @@
           (set! (.profile-lower-ns p) 0)
           (set! (.profile-lower-calls p) 0)
           (set! (.profile-lower-nodes p) 0)
+          (set! (.identity-unit p) 0)
+          (set! (.identity-valid p) false)
           0))
     p))
 
@@ -175,7 +179,108 @@
     (set! (.profile-lower-ns p) 0)
     (set! (.profile-lower-calls p) 0)
     (set! (.profile-lower-nodes p) 0)
+    (set! (.identity-unit p) 0)
+    (set! (.identity-valid p) false)
     0))
+
+(defn jl-identity-hash-slice! [(hash (ptr i64)) (tag i64) (text (slice u8))] (-> i64)
+  (set! hash (hash-step (load hash) tag))
+  (set! hash (hash-step (load hash) (slice-len text)))
+  (let [(mut index) 0]
+    (loop (if (>= (load index) (slice-len text)) (break)
+              (do
+                (set! hash (hash-step (load hash)
+                                      (cast i64 (load (index (slice-data text) (load index))))))
+                (set! index (+ (load index) 1))))))
+  0)
+
+;; Hash the checked reader tree, including exact IEEE bits for floating literals. Macros are part
+;; of the same library fingerprint because their bodies are inlined into otherwise unchanged
+;; declarations. Ordered child hashing distinguishes lists/vectors and preserves tree shape.
+(defn jl-identity-hash-sexp! [(x (ptr rd/Sexp)) (hash (ptr i64))] (-> i64)
+  (match (load (field x kind))
+    (rd/KInt [v] (set! hash (hash-step (hash-step (load hash) 1) v)))
+    (rd/KFloat [bits] (set! hash (hash-step (hash-step (load hash) 2) bits)))
+    (rd/KSym [s] (jl-identity-hash-slice! hash 3 s))
+    (rd/KKw [s] (jl-identity-hash-slice! hash 4 s))
+    (rd/KStr [s] (jl-identity-hash-slice! hash 5 s))
+    (rd/KCStr [s] (jl-identity-hash-slice! hash 6 s))
+    (rd/KList [items]
+      (let [(mut index) 0]
+        (set! hash (hash-step (hash-step (load hash) 7) (rd/sexp-count x)))
+        (loop (if (>= (load index) (rd/sexp-count x)) (break)
+                  (do (jl-identity-hash-sexp! (rd/sexp-nth x (load index)) hash)
+                      (set! index (+ (load index) 1)))))))
+    (rd/KVec [items]
+      (let [(mut index) 0]
+        (set! hash (hash-step (hash-step (load hash) 8) (rd/sexp-count x)))
+        (loop (if (>= (load index) (rd/sexp-count x)) (break)
+                  (do (jl-identity-hash-sexp! (rd/sexp-nth x (load index)) hash)
+                      (set! index (+ (load index) 1)))))))
+    (rd/KView [items off len]
+      (let [(mut index) 0]
+        (set! hash (hash-step (hash-step (load hash) 9) (rd/sexp-count x)))
+        (loop (if (>= (load index) (rd/sexp-count x)) (break)
+                  (do (jl-identity-hash-sexp! (rd/sexp-nth x (load index)) hash)
+                      (set! index (+ (load index) 1))))))))
+  0)
+
+(defn jl-library-identity-unit [] (-> i64)
+  (let [lower (jl)]
+    (if (.identity-valid lower) (.identity-unit lower)
+        (let [(mut hash) 1469598103934665603 (mut decl) 0]
+          (set! hash (hash-step (load hash) (jsl-decl-count)))
+          (loop (if (>= (load decl) (jsl-decl-count)) (break)
+                    (do
+                      (jl-identity-hash-slice! (mut hash) 10 (jsl-decl-name (load decl)))
+                      (jl-identity-hash-slice! (mut hash) 11 (jsl-decl-label (load decl)))
+                      (set! hash (hash-step (load hash) (jsl-decl-kind (load decl))))
+                      (set! hash (hash-step (load hash) (jsl-decl-ret (load decl))))
+                      (set! hash (hash-step (load hash) (jsl-decl-nparams (load decl))))
+                      (set! hash (hash-step (load hash) (jsl-decl-ncaptures (load decl))))
+                      (set! hash (hash-step (load hash)
+                                            (if (jsl-decl-transitioning? (load decl)) 1 0)))
+                      (let [(mut parameter) 0]
+                        (loop (if (>= (load parameter) (jsl-decl-nparams (load decl))) (break)
+                                  (do
+                                    (jl-identity-hash-slice!
+                                      (mut hash) 12
+                                      (jsl-param-name (load decl) (load parameter)))
+                                    (set! hash
+                                          (hash-step (load hash)
+                                                     (jsl-param-ty (load decl) (load parameter))))
+                                    (set! parameter (+ (load parameter) 1))))))
+                      (let [(mut capture) 0]
+                        (loop (if (>= (load capture) (jsl-decl-ncaptures (load decl))) (break)
+                                  (do
+                                    (jl-identity-hash-slice!
+                                      (mut hash) 13
+                                      (jsl-capture-name (load decl) (load capture)))
+                                    (set! capture (+ (load capture) 1))))))
+                      (jl-identity-hash-sexp! (jsl-decl-body (load decl)) (mut hash))
+                      (set! decl (+ (load decl) 1)))))
+          (set! (.identity-unit lower) (load hash))
+          (set! (.identity-valid lower) true)
+          (load hash)))))
+
+(defn jl-open-function! [(d i64)] (-> i64)
+  (let [fun (n-fun-open-identity! (jsl-decl-fidx d) FUN-IDENTITY-JSL
+                                  (jl-library-identity-unit) d)
+        callable (jsl-callable? d)
+        (mut types) (al-new [i64] (malloc-allocator))
+        (mut index) 0]
+    (if callable
+        (do (al-push! [i64] (mut types) (t-dyn))
+            (al-push! [i64] (mut types) (t-dyn))
+            (al-push! [i64] (mut types) (t-int)))
+        0)
+    (loop (if (>= (load index) (jsl-decl-nparams d)) (break)
+              (do (al-push! [i64] (mut types) (jsl-param-ty d (load index)))
+                  (set! index (+ (load index) 1)))))
+    (n-fun-declare-abi! fun (al-slice [i64] (load types))
+                        (let [ret (jsl-decl-ret d)] (if (= ret TY-NO-ID) (t-dyn) ret)))
+    (al-free! [i64] (mut types))
+    fun))
 
 (defn jl-profile-target-calls [] (-> i64) (.profile-target-calls (jl)))
 (defn jl-profile-target-scans [] (-> i64) (.profile-target-scans (jl)))
@@ -271,9 +376,14 @@
 
 (defn jl-check-pending! [(dependency i64)] (-> i64)
   (if (not (.collect-abrupts (jl))) 0
-    (let [condition
+    (let [tagged-condition
             (n-peephole
               (n-new3 (JsBuiltin 101) (jl-ctrl) dependency (jl-const (t-int-con 0))))
+          ;; Descriptor 101 returns the ordinary tagged JavaScript boolean ABI. `If` consumes a
+          ;; machine boolean; tagged false is itself nonzero and therefore cannot be used as the
+          ;; predicate directly. This is the same transport boundary as
+          ;; `fng-check-pending-exception!`.
+          condition (n-unbox! tagged-condition (t-bool))
           arms (n-if-arms! (n-peephole (n-new2 (If) (jl-ctrl) condition)))]
       (jl-capture-abrupt! (arms-t arms) condition)
       (jl-set-ctrl! (arms-f arms))
@@ -646,7 +756,7 @@
           object (n-obj-ptr nw)]
       (al-push! [i64] (mut stores)
                 (n-store! (n-obj-mem nw 0) object
-                          (jl-const (t-int-con (jsl-decl-fidx target)))
+                          (n-callable-id! fun)
                           (shape-field-alias shape 0)))
       (set! i 0)
       (loop (if (>= (load i) n) (break)
@@ -799,9 +909,7 @@
                   (n-new2 (Cast (t-fun-set targets))
                           (jl-ctrl) raw-callee))
                 raw-callee)
-          receiver (if (and dynamic (= targets 0))
-                       raw-callee
-                       (jl-expr (rd/sexp-nth x 2)))
+          receiver (jl-expr (rd/sexp-nth x 2))
           n (- (rd/sexp-count x) 3)
           max-params (if dynamic (jl-frontend-max-params targets) (+ n 2))
           ;; Parameter indices include hidden environment (0), receiver (1), and actual argc (2).
@@ -809,12 +917,10 @@
           buf (primitive/alloc-stack (array i64 17))
           p (cast (ptr i64) buf)
           (mut i) 0]
-      (if (and dynamic (= targets 0))
-          0
-          (loop (if (>= (load i) n) (break)
-                  (do (store! (index p (load i)) (jl-expr (rd/sexp-nth x (+ (load i) 3))))
-                      (store! i (+ (load i) 1))
-                      0))))
+      (loop (if (>= (load i) n) (break)
+              (do (store! (index p (load i)) (jl-expr (rd/sexp-nth x (+ (load i) 3))))
+                  (store! i (+ (load i) 1))
+                  0)))
       ;; JavaScript permits missing arguments. The specialized native ABI does not, so dynamic
       ;; calls materialize tagged `undefined` through the largest closed-world target arity; targets
       ;; with fewer parameters simply ignore the surplus registers, as JavaScript requires.
@@ -826,28 +932,23 @@
                       0)))
           0)
       (if (jl-diverged?) (return-from :done NO-NODE) 0)
-      (if (and dynamic (= targets 0))
-          ; No JavaScript function exists in this closed program, so a surrounding `%IsFunction`
-          ; guard makes this arm uninhabited. Use an inert value and emit no zero-target call; an
-          ; artificial throw would itself be a live control effect in every library-only graph.
-          ;; A dynamic callee parameter is already a tagged JavaScript value. Keeping that value is
-          ;; sufficient for library-only validation and avoids manufacturing pinned tag constants
-          ;; for an arm which target discovery has proved uninhabited.
-          raw-callee
-          (do
-            (store! (index p call-n) (jl-call-mem))
-            ;; The callee value doubles as the hidden environment: a closure is its own
-            ;; environment object, and a bare function ignores the slot entirely.
-            (let [cs (n-call-receiver! (jl-ctrl) callee callee receiver
-                                     (jl-const (t-int-con n))
-                                     (slice-new [i64] p (+ call-n 1)))
-                end (call-end cs)]
-              (if dynamic (n-set-op! (call-value cs) (Call CALL-ABI-DYNAMIC-RECEIVER)) 0)
-              (jl-set-ctrl! end)
-              (jl-set-mem! (n-new1 (Arg (t-mem-alias JS-PROPERTY-ALIAS (t-undef))) end))
-              (let [value (n-box! (call-value cs))]
-                (jl-check-pending! value)
-                value)))))))
+      ;; An empty frontend target set means only that this immutable library graph contains no
+      ;; Script functions yet. It does not make a call through a callable parameter unreachable:
+      ;; retained DSL functions can receive Script callables after import. Target discovery may
+      ;; refine and pad a call, but the call itself is always part of the operation's semantics.
+      (store! (index p call-n) (jl-call-mem))
+      ;; The callee value doubles as the hidden environment: a closure is its own environment
+      ;; object, and a bare function ignores the slot entirely.
+      (let [cs (n-call-receiver! (jl-ctrl) callee callee receiver
+                               (jl-const (t-int-con n))
+                               (slice-new [i64] p (+ call-n 1)))
+          end (call-end cs)]
+        (if dynamic (n-set-op! (call-value cs) (Call CALL-ABI-DYNAMIC-RECEIVER)) 0)
+        (jl-set-ctrl! end)
+        (jl-set-mem! (n-new1 (Arg (t-mem-alias JS-PROPERTY-ALIAS (t-undef))) end))
+        (let [value (n-box! (call-value cs))]
+          (jl-check-pending! value)
+          value)))))
 
 (defn jl-js-call-with-receiver [(x (ptr rd/Sexp))] (-> i64)
   (jl-js-call-receiver-core x false))
@@ -1422,7 +1523,7 @@
   (let [n (jsl-decl-count) (mut i) 0]
     (loop (if (>= (load i) n) (break)
             (do (if (jsl-macro? (load i)) 0
-                    (jsl-decl-set-fun! (load i) (n-fun-open! (jsl-decl-fidx (load i)))))
+                    (jsl-decl-set-fun! (load i) (jl-open-function! (load i))))
                 (set! i (+ (load i) 1))
                 0)))
     0))
@@ -1452,6 +1553,8 @@
             (if (> (jsl-decl-ncaptures d) 0)
                 (let [entry (n-fun-entry fun)
                       shape (jl-callable-env-shape d)
+                      ;; Dynamic dispatch retags the closure payload as an object for hidden
+                      ;; environment parameter 0; the shape describes the raw pointer and fields.
                       env (n-unbox! (n-parm! fun 0) (t-obj-shape shape))
                       (mut capture) 0]
                   (loop (if (>= (load capture) (jsl-decl-ncaptures d)) (break)
@@ -1529,6 +1632,34 @@
                       0)))
         (load err)))))
 
+;; Lower the complete checked library as one immutable separately-compilable artifact. Closure
+;; targets use integer-valued CallableId nodes, whose retained relocations preserve semantic Fun
+;; identity without leaking graph-local indexes into machine text.
+(defn jsl-lower-static-library! [] (-> i64)
+  (if (not (jsl-ok?)) (jsl-err)
+    (do
+      (jl-reset!)
+      (let [n (jsl-decl-count) (mut i) 0]
+        ;; Open the complete function set first so forward and recursive JSL calls resolve.
+        (loop (if (>= (load i) n) (break)
+                  (do
+                    (if (jsl-macro? (load i))
+                        0
+                        (jsl-decl-set-fun! (load i) (jl-open-function! (load i))))
+                    (set! i (+ (load i) 1))
+                    0)))
+        (set! i 0)
+        (let [(mut err) JSL-OK]
+          (loop (if (or (>= (load i) n) (!= (load err) JSL-OK))
+                    (break)
+                    (do
+                      (if (jsl-macro? (load i))
+                          0
+                          (set! err (jl-lower-decl! (load i))))
+                      (set! i (+ (load i) 1))
+                      0)))
+          (load err))))))
+
 ; ============================================================================
 ; On-demand lowering
 ; ============================================================================
@@ -1582,9 +1713,25 @@
   ;; still has to be lowered, or the expansion would reference a Fun that was never opened.
   (if (jsl-macro? d) (jl-require-body! (jsl-decl-body d))
     (if (!= (jsl-decl-fun d) NO-NODE) JSL-OK
-      (do (jsl-decl-set-fun! d (n-fun-open! (jsl-decl-fidx d)))
-          (let [err (jl-require-body! (jsl-decl-body d))]
-            (if (!= err JSL-OK) err (jl-lower-decl! d)))))))
+      (let [existing (n-find-fun-index (jsl-decl-fidx d))]
+        ;; Appended frontend units reset declaration-local JSL metadata but intentionally retain
+        ;; one graph and one reserved JSL function-id range. The graph is therefore the durable
+        ;; visited set across units. Reopening an existing id creates a second body in the same
+        ;; machine function, making otherwise independent Script units one giant optimization
+        ;; problem. Rebind to the existing body; calls from this unit still contribute ordinary
+        ;; call edges and parameter types during whole-image analysis.
+        (if (!= existing NO-NODE)
+            (do
+              (jsl-decl-set-fun! d existing)
+              JSL-OK)
+            (do
+              (let [fun (jl-open-function! d)]
+                (jsl-decl-set-fun! d fun)
+                (if (n-import-catalog-contains? FUN-IDENTITY-JSL
+                                                (jl-library-identity-unit) d)
+                    (do (n-fun-mark-imported! fun) JSL-OK)
+                    (let [err (jl-require-body! (jsl-decl-body d))]
+                      (if (!= err JSL-OK) err (jl-lower-decl! d)))))))))))
 
 ;; Lower everything a definition CALLS, without lowering the definition itself. That is exactly what
 ;; an inlined body needs: its own nodes go straight into the caller's graph, but a builtin it calls

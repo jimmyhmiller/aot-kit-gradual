@@ -1,0 +1,2022 @@
+;; Relocatable per-function AArch64 text and GC metadata extraction.
+(module backend_function_text)
+
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :use * :as alloc)
+(import "coil.arraylist" :use *)
+(import "coil.io" :use *)
+(import "coil.fs" :use *)
+(import "coil.slice" :use *)
+(import "coil.fmt" :use *)
+(import "ty" :use *)
+(import "node" :use *)
+(import "shape" :use *)
+(import "backend_core" :use *)
+(import "backend_select" :use *)
+(import "backend_liveness" :use *)
+(import "backend_allocate" :use *)
+(import "backend_aarch64" :use *)
+(import "backend_macho" :use *)
+
+(const MFT-RELOC-CALL i64 0)
+(const MFT-RELOC-ADDRESS i64 1)
+(const MFT-RELOC-EXTERNAL i64 2)
+(const MFT-RELOC-SHAPE-ID i64 3)
+(const MFT-RELOC-SHAPE-SIZE i64 4)
+(const MFT-RELOC-CALLABLE-ID i64 5)
+(const MFT-CACHEABLE i64 0)
+(const MFT-UNCACHEABLE-IDENTITY i64 1)
+(const MFT-UNCACHEABLE-TARGET i64 2)
+(const MFT-UNCACHEABLE-SHAPE i64 3)
+(const MFT-UNCACHEABLE-ABI i64 4)
+(const MFT-DEPENDENCY-CLOSED i64 0)
+(const MFT-DEPENDENCY-KIND i64 1)
+(const MFT-DEPENDENCY-ABI i64 2)
+(const MFT-DEPENDENCY-MISSING i64 3)
+
+(defstruct MachineFunctionText
+  [(bytes (ArrayList u8))
+   (reloc-kind (ArrayList i64))
+   (reloc-offset (ArrayList i64))
+   (reloc-target (ArrayList i64))
+   (reloc-target-kind (ArrayList i64))
+   (reloc-target-unit (ArrayList i64))
+   (reloc-target-local (ArrayList i64))
+   (reloc-target-abi-arity (ArrayList i64))
+   (reloc-target-abi-hash (ArrayList i64))
+   (reloc-target-abi-return-kind (ArrayList i64))
+   (reloc-aux (ArrayList i64))
+   (site-offset (ArrayList i64))
+   (site-inst (ArrayList i64))
+   (site-op (ArrayList i64))
+   (site-root-first (ArrayList i64))
+   (site-root-count (ArrayList i64))
+   (root-kind (ArrayList i64))
+   (root-vreg (ArrayList i64))
+   (root-reg (ArrayList i64))
+   (root-spill (ArrayList i64))
+   (owner i64)
+   (symbol i64)
+   (identity-kind i64)
+   (identity-unit i64)
+   (identity-local i64)
+   (abi-arity i64)
+   (abi-hash i64)
+   (abi-return-kind i64)
+   (frame-size i64)
+   (callee-mask i64)
+   (callee-count i64)
+   (inited bool)])
+
+;; An owned snapshot of every function in one encoded machine unit. Offsets index flattened
+;; payload arrays, so a later image assembler can retain many records without keeping machine IR
+;; alive. `symbols` are link identities within this compilation only; they are deliberately not
+;; exposed as cache keys because source/JSL numeric ids are not stable across compilations yet.
+(defstruct MachineFunctionTextStore
+  [(symbols (ArrayList i64))
+   (identity-kinds (ArrayList i64))
+   (identity-units (ArrayList i64))
+   (identity-locals (ArrayList i64))
+   (abi-arities (ArrayList i64))
+   (abi-hashes (ArrayList i64))
+   (abi-return-kinds (ArrayList i64))
+   (dispatch-return-codes (ArrayList i64))
+   (cache-reasons (ArrayList i64))
+   (frame-sizes (ArrayList i64))
+   (callee-masks (ArrayList i64))
+   (callee-counts (ArrayList i64))
+   (byte-firsts (ArrayList i64))
+   (byte-counts (ArrayList i64))
+   (bytes (ArrayList u8))
+   (reloc-firsts (ArrayList i64))
+   (reloc-counts (ArrayList i64))
+   (reloc-kind (ArrayList i64))
+   (reloc-offset (ArrayList i64))
+   (reloc-target (ArrayList i64))
+   (reloc-target-kind (ArrayList i64))
+   (reloc-target-unit (ArrayList i64))
+   (reloc-target-local (ArrayList i64))
+   (reloc-target-abi-arity (ArrayList i64))
+   (reloc-target-abi-hash (ArrayList i64))
+   (reloc-target-abi-return-kind (ArrayList i64))
+   (reloc-aux (ArrayList i64))
+   (site-firsts (ArrayList i64))
+   (site-counts (ArrayList i64))
+   (site-offset (ArrayList i64))
+   (site-inst (ArrayList i64))
+   (site-op (ArrayList i64))
+   (site-root-first (ArrayList i64))
+   (site-root-count (ArrayList i64))
+   (root-kind (ArrayList i64))
+   (root-vreg (ArrayList i64))
+   (root-reg (ArrayList i64))
+   (root-spill (ArrayList i64))
+   (inited bool)])
+
+(defstruct MachineFunctionImage
+  [(bytes (ArrayList u8))
+   (entry-start i64)
+   (starts (ArrayList i64))
+   (sizes (ArrayList i64))
+   (symbols (ArrayList i64))
+   (dispatch-return-codes (ArrayList i64))
+   (frame-sizes (ArrayList i64))
+   (callee-masks (ArrayList i64))
+   (callee-counts (ArrayList i64))
+   (site-owners (ArrayList i64))
+   (site-offsets (ArrayList i64))
+   (site-insts (ArrayList i64))
+   (site-ops (ArrayList i64))
+   (site-root-firsts (ArrayList i64))
+   (site-root-counts (ArrayList i64))
+   (root-kinds (ArrayList i64))
+   (root-vregs (ArrayList i64))
+   (root-regs (ArrayList i64))
+   (root-spills (ArrayList i64))
+   (external-sites (ArrayList i64))
+   (external-ops (ArrayList i64))
+   (external-aux (ArrayList i64))
+   (stackmap (ArrayList u8))
+   (layouts (ArrayList u8))
+   (inited bool)])
+
+(defn mft [] (-> (ptr MachineFunctionText))
+  (let [r (primitive/alloc-static MachineFunctionText)]
+    (if (.inited r)
+        0
+        (do
+          (set! (.bytes r) (al-new [u8] (malloc-allocator)))
+          (set! (.reloc-kind r) (al-new [i64] (malloc-allocator)))
+          (set! (.reloc-offset r) (al-new [i64] (malloc-allocator)))
+          (set! (.reloc-target r) (al-new [i64] (malloc-allocator)))
+          (set! (.reloc-target-kind r) (al-new [i64] (malloc-allocator)))
+          (set! (.reloc-target-unit r) (al-new [i64] (malloc-allocator)))
+          (set! (.reloc-target-local r) (al-new [i64] (malloc-allocator)))
+          (set! (.reloc-target-abi-arity r) (al-new [i64] (malloc-allocator)))
+          (set! (.reloc-target-abi-hash r) (al-new [i64] (malloc-allocator)))
+          (set! (.reloc-target-abi-return-kind r) (al-new [i64] (malloc-allocator)))
+          (set! (.reloc-aux r) (al-new [i64] (malloc-allocator)))
+          (set! (.site-offset r) (al-new [i64] (malloc-allocator)))
+          (set! (.site-inst r) (al-new [i64] (malloc-allocator)))
+          (set! (.site-op r) (al-new [i64] (malloc-allocator)))
+          (set! (.site-root-first r) (al-new [i64] (malloc-allocator)))
+          (set! (.site-root-count r) (al-new [i64] (malloc-allocator)))
+          (set! (.root-kind r) (al-new [i64] (malloc-allocator)))
+          (set! (.root-vreg r) (al-new [i64] (malloc-allocator)))
+          (set! (.root-reg r) (al-new [i64] (malloc-allocator)))
+          (set! (.root-spill r) (al-new [i64] (malloc-allocator)))
+          (set! (.inited r) true)
+          0))
+    r))
+
+(defn mfts [] (-> (ptr MachineFunctionTextStore))
+  (let [s (primitive/alloc-static MachineFunctionTextStore)
+        a (malloc-allocator)]
+    (if (.inited s) 0
+        (do
+          (set! (.symbols s) (al-new [i64] a))
+          (set! (.identity-kinds s) (al-new [i64] a))
+          (set! (.identity-units s) (al-new [i64] a))
+          (set! (.identity-locals s) (al-new [i64] a))
+          (set! (.abi-arities s) (al-new [i64] a))
+          (set! (.abi-hashes s) (al-new [i64] a))
+          (set! (.abi-return-kinds s) (al-new [i64] a))
+          (set! (.dispatch-return-codes s) (al-new [i64] a))
+          (set! (.cache-reasons s) (al-new [i64] a))
+          (set! (.frame-sizes s) (al-new [i64] a))
+          (set! (.callee-masks s) (al-new [i64] a))
+          (set! (.callee-counts s) (al-new [i64] a))
+          (set! (.byte-firsts s) (al-new [i64] a))
+          (set! (.byte-counts s) (al-new [i64] a))
+          (set! (.bytes s) (al-new [u8] a))
+          (set! (.reloc-firsts s) (al-new [i64] a))
+          (set! (.reloc-counts s) (al-new [i64] a))
+          (set! (.reloc-kind s) (al-new [i64] a))
+          (set! (.reloc-offset s) (al-new [i64] a))
+          (set! (.reloc-target s) (al-new [i64] a))
+          (set! (.reloc-target-kind s) (al-new [i64] a))
+          (set! (.reloc-target-unit s) (al-new [i64] a))
+          (set! (.reloc-target-local s) (al-new [i64] a))
+          (set! (.reloc-target-abi-arity s) (al-new [i64] a))
+          (set! (.reloc-target-abi-hash s) (al-new [i64] a))
+          (set! (.reloc-target-abi-return-kind s) (al-new [i64] a))
+          (set! (.reloc-aux s) (al-new [i64] a))
+          (set! (.site-firsts s) (al-new [i64] a))
+          (set! (.site-counts s) (al-new [i64] a))
+          (set! (.site-offset s) (al-new [i64] a))
+          (set! (.site-inst s) (al-new [i64] a))
+          (set! (.site-op s) (al-new [i64] a))
+          (set! (.site-root-first s) (al-new [i64] a))
+          (set! (.site-root-count s) (al-new [i64] a))
+          (set! (.root-kind s) (al-new [i64] a))
+          (set! (.root-vreg s) (al-new [i64] a))
+          (set! (.root-reg s) (al-new [i64] a))
+          (set! (.root-spill s) (al-new [i64] a))
+          (set! (.inited s) true)))
+    s))
+
+(defn mfti [] (-> (ptr MachineFunctionImage))
+  (let [image (primitive/alloc-static MachineFunctionImage)
+        a (malloc-allocator)]
+    (if (.inited image) 0
+        (do
+          (set! (.bytes image) (al-new [u8] a))
+          (set! (.entry-start image) -1)
+          (set! (.starts image) (al-new [i64] a))
+          (set! (.sizes image) (al-new [i64] a))
+          (set! (.symbols image) (al-new [i64] a))
+          (set! (.dispatch-return-codes image) (al-new [i64] a))
+          (set! (.frame-sizes image) (al-new [i64] a))
+          (set! (.callee-masks image) (al-new [i64] a))
+          (set! (.callee-counts image) (al-new [i64] a))
+          (set! (.site-owners image) (al-new [i64] a))
+          (set! (.site-offsets image) (al-new [i64] a))
+          (set! (.site-insts image) (al-new [i64] a))
+          (set! (.site-ops image) (al-new [i64] a))
+          (set! (.site-root-firsts image) (al-new [i64] a))
+          (set! (.site-root-counts image) (al-new [i64] a))
+          (set! (.root-kinds image) (al-new [i64] a))
+          (set! (.root-vregs image) (al-new [i64] a))
+          (set! (.root-regs image) (al-new [i64] a))
+          (set! (.root-spills image) (al-new [i64] a))
+          (set! (.external-sites image) (al-new [i64] a))
+          (set! (.external-ops image) (al-new [i64] a))
+          (set! (.external-aux image) (al-new [i64] a))
+          (set! (.stackmap image) (al-new [u8] a))
+          (set! (.layouts image) (al-new [u8] a))
+          (set! (.inited image) true)))
+    image))
+
+(defn mfts-clear! [] (-> i64)
+  (let [s (mfts)]
+    (al-clear! [i64] (field s symbols))
+    (al-clear! [i64] (field s identity-kinds))
+    (al-clear! [i64] (field s identity-units))
+    (al-clear! [i64] (field s identity-locals))
+    (al-clear! [i64] (field s abi-arities))
+    (al-clear! [i64] (field s abi-hashes))
+    (al-clear! [i64] (field s abi-return-kinds))
+    (al-clear! [i64] (field s dispatch-return-codes))
+    (al-clear! [i64] (field s cache-reasons))
+    (al-clear! [i64] (field s frame-sizes))
+    (al-clear! [i64] (field s callee-masks))
+    (al-clear! [i64] (field s callee-counts))
+    (al-clear! [i64] (field s byte-firsts))
+    (al-clear! [i64] (field s byte-counts))
+    (al-clear! [u8] (field s bytes))
+    (al-clear! [i64] (field s reloc-firsts))
+    (al-clear! [i64] (field s reloc-counts))
+    (al-clear! [i64] (field s reloc-kind))
+    (al-clear! [i64] (field s reloc-offset))
+    (al-clear! [i64] (field s reloc-target))
+    (al-clear! [i64] (field s reloc-target-kind))
+    (al-clear! [i64] (field s reloc-target-unit))
+    (al-clear! [i64] (field s reloc-target-local))
+    (al-clear! [i64] (field s reloc-target-abi-arity))
+    (al-clear! [i64] (field s reloc-target-abi-hash))
+    (al-clear! [i64] (field s reloc-target-abi-return-kind))
+    (al-clear! [i64] (field s reloc-aux))
+    (al-clear! [i64] (field s site-firsts))
+    (al-clear! [i64] (field s site-counts))
+    (al-clear! [i64] (field s site-offset))
+    (al-clear! [i64] (field s site-inst))
+    (al-clear! [i64] (field s site-op))
+    (al-clear! [i64] (field s site-root-first))
+    (al-clear! [i64] (field s site-root-count))
+    (al-clear! [i64] (field s root-kind))
+    (al-clear! [i64] (field s root-vreg))
+    (al-clear! [i64] (field s root-reg))
+    (al-clear! [i64] (field s root-spill))
+    0))
+
+(defn mft-clear! [] (-> i64)
+  (let [r (mft)]
+    (al-clear! [u8] (field r bytes))
+    (al-clear! [i64] (field r reloc-kind))
+    (al-clear! [i64] (field r reloc-offset))
+    (al-clear! [i64] (field r reloc-target))
+    (al-clear! [i64] (field r reloc-target-kind))
+    (al-clear! [i64] (field r reloc-target-unit))
+    (al-clear! [i64] (field r reloc-target-local))
+    (al-clear! [i64] (field r reloc-target-abi-arity))
+    (al-clear! [i64] (field r reloc-target-abi-hash))
+    (al-clear! [i64] (field r reloc-target-abi-return-kind))
+    (al-clear! [i64] (field r reloc-aux))
+    (al-clear! [i64] (field r site-offset))
+    (al-clear! [i64] (field r site-inst))
+    (al-clear! [i64] (field r site-op))
+    (al-clear! [i64] (field r site-root-first))
+    (al-clear! [i64] (field r site-root-count))
+    (al-clear! [i64] (field r root-kind))
+    (al-clear! [i64] (field r root-vreg))
+    (al-clear! [i64] (field r root-reg))
+    (al-clear! [i64] (field r root-spill))
+    (set! (.owner r) -1)
+    (set! (.symbol r) -1)
+    (set! (.identity-kind r) FUN-IDENTITY-EPHEMERAL)
+    (set! (.identity-unit r) 0)
+    (set! (.identity-local r) 0)
+    (set! (.abi-arity r) -1)
+    (set! (.abi-hash r) 0)
+    (set! (.abi-return-kind r) -1)
+    (set! (.frame-size r) 0)
+    (set! (.callee-mask r) 0)
+    (set! (.callee-count r) 0)
+    0))
+
+(defn mft-note-reloc-aux! [(kind i64) (offset i64) (target i64) (aux i64)] (-> i64)
+  (let [r (mft)]
+    (al-push! [i64] (field r reloc-kind) kind)
+    (al-push! [i64] (field r reloc-offset) offset)
+    (al-push! [i64] (field r reloc-target) target)
+    (al-push! [i64] (field r reloc-target-kind) FUN-IDENTITY-EPHEMERAL)
+    (al-push! [i64] (field r reloc-target-unit) 0)
+    (al-push! [i64] (field r reloc-target-local) 0)
+    (al-push! [i64] (field r reloc-target-abi-arity) -1)
+    (al-push! [i64] (field r reloc-target-abi-hash) 0)
+    (al-push! [i64] (field r reloc-target-abi-return-kind) -1)
+    (al-push! [i64] (field r reloc-aux) aux)
+    0))
+(defn mft-note-internal-reloc! [(kind i64) (offset i64) (target-owner i64)] (-> i64)
+  (mft-note-reloc-aux! kind offset (mu-function-symbol target-owner) 0)
+  (let [r (mft) index (- (al-len [i64] (.reloc-kind r)) 1)]
+    (al-set! [i64] (field r reloc-target-kind) index
+             (mu-function-identity-kind target-owner))
+    (al-set! [i64] (field r reloc-target-unit) index
+             (mu-function-identity-unit target-owner))
+    (al-set! [i64] (field r reloc-target-local) index
+             (mu-function-identity-local target-owner))
+    (let [fun (mu-function-ideal target-owner)]
+      (if (and (!= fun NO-NODE) (n-fun-abi-declared? fun))
+          (do (al-set! [i64] (field r reloc-target-abi-arity) index
+                       (n-fun-abi-param-count fun))
+              (al-set! [i64] (field r reloc-target-abi-hash) index (mft-abi-hash fun))
+              (al-set! [i64] (field r reloc-target-abi-return-kind) index
+                       (be-function-return-kind target-owner)))
+          0)))
+  0)
+
+(defn mft-owner-for-ideal-fun [(fun i64)] (-> i64)
+  (let [(mut owner) 0 (mut found) -1]
+    (loop (if (or (>= (load owner) (mu-function-count)) (>= (load found) 0))
+              (break)
+              (do (if (= (mu-function-ideal (load owner)) fun)
+                      (set! found (load owner))
+                      0)
+                  (set! owner (+ (load owner) 1)))))
+    (load found)))
+(defn mft-note-reloc! [(kind i64) (offset i64) (target i64)] (-> i64)
+  (mft-note-reloc-aux! kind offset target 0))
+
+;; Shape relocations use the relocation record as a kind-tagged runtime layout record. Identity
+;; and ABI fields are otherwise meaningless for these kinds, so they own field count and GC
+;; bitmaps here; snapshot, compaction, and truncation already preserve every field atomically.
+(defn mft-note-shape-reloc! [(kind i64) (offset i64) (shape i64)] (-> i64)
+  (mft-note-reloc-aux! kind offset (shape-layout-fingerprint shape) (shape-size shape))
+  (let [r (mft) index (- (al-len [i64] (.reloc-kind r)) 1)]
+    (al-set! [i64] (field r reloc-target-kind) index (shape-field-count shape))
+    (al-set! [i64] (field r reloc-target-unit) index (mobj-shape-bitmap shape))
+    (al-set! [i64] (field r reloc-target-local) index (mobj-shape-boxed-bitmap shape)))
+  0)
+
+;; Extract one complete function-text record. Internal targets remain machine owners for now;
+;; external targets retain their operation and operation-specific immediate until image assembly
+;; resolves the runtime symbol table.
+(defn mft-abi-hash [(fun i64)] (-> i64)
+  (let [arity (n-fun-abi-param-count fun)
+        (mut hash) (+ 1469598103934665603 arity)
+        (mut index) 0]
+    (loop (if (>= (load index) arity) (break)
+              (do
+                (let [ty (n-fun-abi-param-type fun (load index))
+                      class (ml-kind-for-type ty)
+                      fp (if (= (ty-kinds ty) VK-FLT) 1 0)]
+                  (set! hash (^ (* (load hash) 1099511628211) (+ (* class 2) fp))))
+                (set! index (+ (load index) 1)))))
+    (load hash)))
+
+(defn mft-function-block-rpo [(owner i64) (bid i64)] (-> i64)
+  (let [count (mu-function-block-count owner) (mut rpo) 0 (mut found) -1]
+    (loop (if (or (>= (load rpo) count) (>= (load found) 0))
+              (break)
+              (do
+                (if (= (mu-function-block owner (load rpo)) bid)
+                    (set! found (load rpo))
+                    0)
+                (set! rpo (+ (load rpo) 1)))))
+    (load found)))
+
+(defn mft-profile-fragmented-owner! [(phase (slice u8))] (-> i64)
+  (if (not (be-profiling?)) 0
+    (let [funcs (mu-function-count)
+          (mut closed) (al-new [i64] (malloc-allocator))
+          (mut owner) -1
+          (mut at) 0
+          (mut reported) false]
+      (loop (if (>= (al-len [i64] (load closed)) funcs) (break)
+                (al-push! [i64] (mut closed) 0)))
+      (loop (if (or (>= (load at) (be-inst-count)) (load reported))
+                (break)
+                (do
+                  (let [next (ms-inst-owner (load at))
+                        block (ms-inst-block (load at))
+                        block-owner (if (and (>= block 0) (< block (mu-block-count)))
+                                        (mu-block-owner block)
+                                        -1)]
+                    (if (!= next block-owner)
+                        (do
+                          (fmt (stderr)
+                               "AOTK_PROFILE phase={s}_owner_mismatch inst={d} owner={d} block={d} block_owner={d} op={d} node={d}\n"
+                               phase (load at) next block block-owner
+                               (ms-inst-op (load at)) (ms-inst-node (load at)))
+                          (set! reported true))
+                        0)
+                    (if (and (not (load reported)) (!= next (load owner)))
+                        (do
+                          (if (and (>= (load owner) 0) (< (load owner) funcs))
+                              (al-set! [i64] (mut closed) (load owner) 1)
+                              0)
+                          (if (and (>= next 0)
+                                   (and (< next funcs) (= (al-get [i64] (load closed) next) 1)))
+                              (do
+                                (fmt (stderr)
+                                     "AOTK_PROFILE phase={s}_fragmented owner={d} inst={d} block={d}\n"
+                                     phase next (load at) (ms-inst-block (load at)))
+                                (set! reported true))
+                              0)
+                          (set! owner next))
+                        0))
+                  (set! at (+ (load at) 1)))))
+      0)))
+
+(defn mft-extract-mode! [(owner i64) (prepare bool)] (-> bool)
+  (mft-clear!)
+  (if prepare
+      (do (mobj-build-index!) (mobj-build-roots!) 0)
+      0)
+  (if (or (< owner 0) (>= owner (mu-function-count)))
+      false
+      (let [r (mft)
+            start (mu-function-code-start owner)
+            size (mu-function-code-size owner)
+            valid (and (>= start 0) (> size 0))
+            (mut i) 0]
+        (if (not valid)
+            false
+            (do
+              (set! (.owner r) owner)
+              (set! (.symbol r) (mu-function-symbol owner))
+              (set! (.identity-kind r) (mu-function-identity-kind owner))
+              (set! (.identity-unit r) (mu-function-identity-unit owner))
+              (set! (.identity-local r) (mu-function-identity-local owner))
+              (let [fun (mu-function-ideal owner)]
+                (if (and (!= fun NO-NODE) (n-fun-abi-declared? fun))
+                    (do (set! (.abi-arity r) (n-fun-abi-param-count fun))
+                        (set! (.abi-hash r) (mft-abi-hash fun))
+                        (set! (.abi-return-kind r) (be-function-return-kind owner)))
+                    0))
+              (set! (.frame-size r) (mu-function-frame-size owner))
+              (set! (.callee-mask r) (mu-function-callee-mask owner))
+              (set! (.callee-count r) (mu-function-callee-count owner))
+              (set! i 0)
+              (loop (if (>= (load i) size)
+                        (break)
+                        (do
+                          (al-push! [u8] (field r bytes) (cast u8 (be-code-byte (+ start (load i)))))
+                          (set! i (+ (load i) 1)))))
+              (set! i 0)
+              (loop (if (>= (load i) (mu-internal-call-reloc-count))
+                        (break)
+                        (do
+                          (if (= (mu-internal-call-reloc-source (load i)) owner)
+                              (mft-note-internal-reloc!
+                                MFT-RELOC-CALL
+                                (- (mu-internal-call-reloc-offset (load i)) start)
+                                (mu-internal-call-reloc-target (load i)))
+                              0)
+                          (set! i (+ (load i) 1)))))
+              (set! i 0)
+              (loop (if (>= (load i) (mu-internal-address-reloc-count))
+                        (break)
+                        (do
+                          (if (= (mu-internal-address-reloc-source (load i)) owner)
+                              (mft-note-internal-reloc!
+                                MFT-RELOC-ADDRESS
+                                (- (mu-internal-address-reloc-offset (load i)) start)
+                                (mu-internal-address-reloc-target (load i)))
+                              0)
+                          (set! i (+ (load i) 1)))))
+              (set! i 0)
+              (loop (if (>= (load i) (mobj-external-reloc-count))
+                        (break)
+                        (do
+                          (let [at (mobj-external-reloc-inst (load i))
+                                op (ms-inst-op at)]
+                            (if (= (ms-inst-owner at) owner)
+                                (let [site
+                                        (case op
+                                          MI-NEW (mobj-new-branch-pc at)
+                                          MI-JSPROP (mobj-jsprop-branch-pc at)
+                                          MI-JSARRAY (mobj-jsarray-branch-pc at)
+                                          MI-JSSTRING (mobj-jsstring-branch-pc at)
+                                          MI-CALL (mobj-dispatch-resolver-branch-pc at)
+                                          -1)]
+                                  (if (>= site 0)
+                                      (mft-note-reloc-aux!
+                                        MFT-RELOC-EXTERNAL (- site start) op
+                                        (load (field (be-inst at) imm)))
+                                      0))
+                                0))
+                          (set! i (+ (load i) 1)))))
+              (set! i 0)
+              ;; A Fun materialization is a callable symbol, not an integer constant. AArch64
+              ;; reserves a fixed-width four-word move so image assembly can replace the
+              ;; compilation-local symbol using the target's semantic function identity.
+              (loop (if (>= (load i) (be-inst-count))
+                        (break)
+                        (do
+                          (let [at (load i) m (be-inst at)]
+                            (if (and (= (ms-inst-owner at) owner)
+                                     (and (= (.op m) MI-MOVI)
+                                          (and (!= (.node m) NO-NODE)
+                                               (match (n-op (.node m))
+                                                 (Fun [_] true)
+                                                 (CallableId [_] true)
+                                                 (_ false)))))
+                                (let [target-fun
+                                        (match (n-op (.node m))
+                                          (Fun [_] (.node m))
+                                          (CallableId [index] (n-find-fun-index index))
+                                          (_ NO-NODE))
+                                      target-owner (mft-owner-for-ideal-fun target-fun)]
+                                  (if (< target-owner 0)
+                                      0
+                                      (mft-note-internal-reloc!
+                                        MFT-RELOC-CALLABLE-ID
+                                        (- (.first m) start)
+                                        target-owner)))
+                                0))
+                          (set! i (+ (load i) 1)))))
+              (set! i 0)
+              ;; Runtime MI-NEW is a fixed 39-word sequence. Retained text owns semantic
+              ;; relocations for every embedded shape-dependent immediate; the original numeric
+              ;; shape id is never a cache key.
+              (loop (if (>= (load i) (be-inst-count))
+                        (break)
+                        (do
+                          (if (and (= (ms-inst-owner (load i)) owner)
+                                   (= (ms-inst-op (load i)) MI-NEW))
+                              (let [inst-start (load (field (be-inst (load i)) first))
+                                    shape (load (field (be-inst (load i)) imm))]
+                                (mft-note-shape-reloc! MFT-RELOC-SHAPE-SIZE
+                                  (- (+ inst-start 8) start) shape)
+                                (mft-note-shape-reloc! MFT-RELOC-SHAPE-ID
+                                  (- (+ inst-start 52) start) shape)
+                                (mft-note-shape-reloc! MFT-RELOC-SHAPE-SIZE
+                                  (- (+ inst-start 88) start) shape)
+                                (mft-note-shape-reloc! MFT-RELOC-SHAPE-SIZE
+                                  (- (+ inst-start 116) start) shape)
+                                (mft-note-shape-reloc! MFT-RELOC-SHAPE-ID
+                                  (- (+ inst-start 132) start) shape))
+                              0)
+                          (set! i (+ (load i) 1)))))
+              (set! i 0)
+              (loop (if (>= (load i) (be-inst-count))
+                        (break)
+                        (do
+                          (if (and (= (ms-inst-owner (load i)) owner)
+                                   (ml-safepoint? (load i)))
+                              (let [first (al-len [i64] (.root-kind r))
+                                    root-start (mobj-roots-lower-bound (load i))
+                                    (mut root) root-start]
+                                (loop (if (or (>= (load root) (mobj-root-count))
+                                              (!= (mobj-root-site (load root)) (load i)))
+                                          (break)
+                                          (do
+                                            (let [vreg (mobj-root-vreg (load root))]
+                                              (al-push! [i64] (field r root-kind)
+                                                        (ml-value-kind vreg))
+                                              (al-push! [i64] (field r root-vreg) vreg)
+                                              (al-push! [i64] (field r root-reg) (mra-reg vreg))
+                                              (al-push! [i64] (field r root-spill) (mra-spill vreg)))
+                                            (set! root (+ (load root) 1)))))
+                                (al-push! [i64] (field r site-offset)
+                                          (- (mobj-safepoint-pc (load i)) start))
+                                (al-push! [i64] (field r site-inst) (load i))
+                                (al-push! [i64] (field r site-op) (ms-inst-op (load i)))
+                                (al-push! [i64] (field r site-root-first) first)
+                                (al-push! [i64] (field r site-root-count)
+                                          (- (al-len [i64] (.root-kind r)) first)))
+                              0)
+                          (set! i (+ (load i) 1)))))
+              true)))))
+
+(defn mft-extract! [(owner i64)] (-> bool)
+  (mft-extract-mode! owner true))
+
+(defn mft-byte-count [] (-> i64) (al-len [u8] (.bytes (mft))))
+(defn mft-symbol [] (-> i64) (.symbol (mft)))
+(defn mft-reloc-count [] (-> i64) (al-len [i64] (.reloc-kind (mft))))
+(defn mft-reloc-kind [(i i64)] (-> i64) (al-get [i64] (.reloc-kind (mft)) i))
+(defn mft-reloc-offset [(i i64)] (-> i64) (al-get [i64] (.reloc-offset (mft)) i))
+(defn mft-reloc-target [(i i64)] (-> i64) (al-get [i64] (.reloc-target (mft)) i))
+(defn mft-reloc-target-kind [(i i64)] (-> i64)
+  (al-get [i64] (.reloc-target-kind (mft)) i))
+(defn mft-reloc-target-unit [(i i64)] (-> i64)
+  (al-get [i64] (.reloc-target-unit (mft)) i))
+(defn mft-reloc-target-local [(i i64)] (-> i64)
+  (al-get [i64] (.reloc-target-local (mft)) i))
+(defn mft-reloc-aux [(i i64)] (-> i64) (al-get [i64] (.reloc-aux (mft)) i))
+(defn mft-site-count [] (-> i64) (al-len [i64] (.site-offset (mft))))
+(defn mft-site-offset [(i i64)] (-> i64) (al-get [i64] (.site-offset (mft)) i))
+(defn mft-site-root-count [(i i64)] (-> i64)
+  (al-get [i64] (.site-root-count (mft)) i))
+
+;; The cache admits only records whose complete dependency surface can be resolved semantically.
+;; Whole-program specialization still prevents reuse until shared functions are compiled behind
+;; explicit separate-compilation boundaries; shape operands themselves are now relocatable.
+(defn mft-cache-reason [] (-> i64)
+  (let [r (mft) (mut reason) MFT-CACHEABLE (mut index) 0]
+    (if (= (.identity-kind r) FUN-IDENTITY-EPHEMERAL)
+        (set! reason MFT-UNCACHEABLE-IDENTITY) 0)
+    (if (and (= (load reason) MFT-CACHEABLE) (< (.abi-arity r) 0))
+        (set! reason MFT-UNCACHEABLE-ABI) 0)
+    (loop (if (or (!= (load reason) MFT-CACHEABLE)
+                  (>= (load index) (al-len [i64] (.reloc-kind r))))
+              (break)
+              (do
+                (if (and (or (= (al-get [i64] (.reloc-kind r) (load index)) MFT-RELOC-CALL)
+                             (or (= (al-get [i64] (.reloc-kind r) (load index)) MFT-RELOC-ADDRESS)
+                                 (= (al-get [i64] (.reloc-kind r) (load index))
+                                    MFT-RELOC-CALLABLE-ID)))
+                         (= (al-get [i64] (.reloc-target-kind r) (load index))
+                            FUN-IDENTITY-EPHEMERAL))
+                    (set! reason MFT-UNCACHEABLE-TARGET) 0)
+                (set! index (+ (load index) 1)))))
+    (load reason)))
+(defn mft-cacheable? [] (-> bool) (= (mft-cache-reason) MFT-CACHEABLE))
+
+(defn mfts-snapshot-mode! [(replace bool)] (-> bool)
+  (block :snapshot
+  (if replace (mfts-clear!) 0)
+  ;; Object indexes and GC roots describe the whole freshly encoded machine unit. Build each once
+  ;; for the snapshot rather than once per function record.
+  (mobj-build-index!)
+  (mobj-build-roots!)
+  (let [s (mfts) (mut owner) 0]
+    (loop (if (>= (load owner) (mu-function-count)) (break)
+              (if (mu-function-imported? (load owner))
+                  (set! owner (+ (load owner) 1))
+              (if (not (mft-extract-mode! (load owner) false))
+                  (return-from :snapshot false)
+                  (let [r (mft) byte-first (al-len [u8] (.bytes s))
+                        reloc-first (al-len [i64] (.reloc-kind s))
+                        site-first (al-len [i64] (.site-offset s))
+                        root-first (al-len [i64] (.root-kind s))
+                        (mut i) 0]
+                    (al-push! [i64] (field s symbols) (.symbol r))
+                    (al-push! [i64] (field s identity-kinds) (.identity-kind r))
+                    (al-push! [i64] (field s identity-units) (.identity-unit r))
+                    (al-push! [i64] (field s identity-locals) (.identity-local r))
+                    (al-push! [i64] (field s abi-arities) (.abi-arity r))
+                    (al-push! [i64] (field s abi-hashes) (.abi-hash r))
+                    (al-push! [i64] (field s abi-return-kinds) (.abi-return-kind r))
+                    (al-push! [i64] (field s dispatch-return-codes)
+                              (be-function-dispatch-return-code (load owner)))
+                    (al-push! [i64] (field s cache-reasons) (mft-cache-reason))
+                    (al-push! [i64] (field s frame-sizes) (.frame-size r))
+                    (al-push! [i64] (field s callee-masks) (.callee-mask r))
+                    (al-push! [i64] (field s callee-counts) (.callee-count r))
+                    (al-push! [i64] (field s byte-firsts) byte-first)
+                    (al-push! [i64] (field s byte-counts) (al-len [u8] (.bytes r)))
+                    (loop (if (>= (load i) (al-len [u8] (.bytes r))) (break)
+                              (do (al-push! [u8] (field s bytes) (al-get [u8] (.bytes r) (load i)))
+                                  (set! i (+ (load i) 1)))))
+                    (al-push! [i64] (field s reloc-firsts) reloc-first)
+                    (al-push! [i64] (field s reloc-counts) (al-len [i64] (.reloc-kind r)))
+                    (set! i 0)
+                    (loop (if (>= (load i) (al-len [i64] (.reloc-kind r))) (break)
+                              (do
+                                (al-push! [i64] (field s reloc-kind) (al-get [i64] (.reloc-kind r) (load i)))
+                                (al-push! [i64] (field s reloc-offset) (al-get [i64] (.reloc-offset r) (load i)))
+                                (al-push! [i64] (field s reloc-target) (al-get [i64] (.reloc-target r) (load i)))
+                                (al-push! [i64] (field s reloc-target-kind)
+                                          (al-get [i64] (.reloc-target-kind r) (load i)))
+                                (al-push! [i64] (field s reloc-target-unit)
+                                          (al-get [i64] (.reloc-target-unit r) (load i)))
+                                (al-push! [i64] (field s reloc-target-local)
+                                          (al-get [i64] (.reloc-target-local r) (load i)))
+                                (al-push! [i64] (field s reloc-target-abi-arity)
+                                          (al-get [i64] (.reloc-target-abi-arity r) (load i)))
+                                (al-push! [i64] (field s reloc-target-abi-hash)
+                                          (al-get [i64] (.reloc-target-abi-hash r) (load i)))
+                                (al-push! [i64] (field s reloc-target-abi-return-kind)
+                                          (al-get [i64] (.reloc-target-abi-return-kind r) (load i)))
+                                (al-push! [i64] (field s reloc-aux) (al-get [i64] (.reloc-aux r) (load i)))
+                                (set! i (+ (load i) 1)))))
+                    (al-push! [i64] (field s site-firsts) site-first)
+                    (al-push! [i64] (field s site-counts) (al-len [i64] (.site-offset r)))
+                    (set! i 0)
+                    (loop (if (>= (load i) (al-len [i64] (.site-offset r))) (break)
+                              (do
+                                (al-push! [i64] (field s site-offset) (al-get [i64] (.site-offset r) (load i)))
+                                (al-push! [i64] (field s site-inst) (al-get [i64] (.site-inst r) (load i)))
+                                (al-push! [i64] (field s site-op) (al-get [i64] (.site-op r) (load i)))
+                                (al-push! [i64] (field s site-root-first)
+                                          (+ root-first (al-get [i64] (.site-root-first r) (load i))))
+                                (al-push! [i64] (field s site-root-count)
+                                          (al-get [i64] (.site-root-count r) (load i)))
+                                (set! i (+ (load i) 1)))))
+                    (set! i 0)
+                    (loop (if (>= (load i) (al-len [i64] (.root-kind r))) (break)
+                              (do
+                                (al-push! [i64] (field s root-kind) (al-get [i64] (.root-kind r) (load i)))
+                                (al-push! [i64] (field s root-vreg) (al-get [i64] (.root-vreg r) (load i)))
+                                (al-push! [i64] (field s root-reg) (al-get [i64] (.root-reg r) (load i)))
+                                (al-push! [i64] (field s root-spill) (al-get [i64] (.root-spill r) (load i)))
+                                (set! i (+ (load i) 1)))))
+                    (set! owner (+ (load owner) 1)))))))
+    true)))
+
+;; Replacing remains the default for every ordinary compiler client. The persistent Test262 worker
+;; uses append only after it has deliberately retained an immutable cache prefix and compiled a
+;; fresh graph whose imported functions resolve into that prefix.
+(defn mfts-snapshot! [] (-> bool) (mfts-snapshot-mode! true))
+(defn mfts-append-snapshot! [] (-> bool) (mfts-snapshot-mode! false))
+
+(defn mfts-pop-i64-to! [(xs (mut (ArrayList i64))) (count i64)] (-> i64)
+  (loop (if (<= (al-len [i64] (load xs)) count) (break)
+            (do (al-pop! [i64] (mut xs)) 0)))
+  0)
+(defn mfts-pop-u8-to! [(xs (mut (ArrayList u8))) (count i64)] (-> i64)
+  (loop (if (<= (al-len [u8] (load xs)) count) (break)
+            (do (al-pop! [u8] (mut xs)) 0)))
+  0)
+
+(defn mfts-truncate-records! [(count i64)] (-> bool)
+  ;; Remove a per-request suffix from every parallel table. Payload limits are captured before the
+  ;; record tables shrink; roots are indexed by sites rather than directly by function records.
+  (if (or (< count 0) (> count (mfts-count))) false
+    (let [s (mfts)
+          byte-end (if (= count 0) 0
+                       (+ (al-get [i64] (.byte-firsts s) (- count 1))
+                          (al-get [i64] (.byte-counts s) (- count 1))))
+          reloc-end (if (= count 0) 0
+                        (+ (al-get [i64] (.reloc-firsts s) (- count 1))
+                           (al-get [i64] (.reloc-counts s) (- count 1))))
+          site-end (if (= count 0) 0
+                       (+ (al-get [i64] (.site-firsts s) (- count 1))
+                          (al-get [i64] (.site-counts s) (- count 1))))
+          root-end (if (= site-end 0) 0
+                       (+ (al-get [i64] (.site-root-first s) (- site-end 1))
+                          (al-get [i64] (.site-root-count s) (- site-end 1))))]
+      (mfts-pop-u8-to! (field s bytes) byte-end)
+      (mfts-pop-i64-to! (field s reloc-kind) reloc-end)
+      (mfts-pop-i64-to! (field s reloc-offset) reloc-end)
+      (mfts-pop-i64-to! (field s reloc-target) reloc-end)
+      (mfts-pop-i64-to! (field s reloc-target-kind) reloc-end)
+      (mfts-pop-i64-to! (field s reloc-target-unit) reloc-end)
+      (mfts-pop-i64-to! (field s reloc-target-local) reloc-end)
+      (mfts-pop-i64-to! (field s reloc-target-abi-arity) reloc-end)
+      (mfts-pop-i64-to! (field s reloc-target-abi-hash) reloc-end)
+      (mfts-pop-i64-to! (field s reloc-target-abi-return-kind) reloc-end)
+      (mfts-pop-i64-to! (field s reloc-aux) reloc-end)
+      (mfts-pop-i64-to! (field s site-offset) site-end)
+      (mfts-pop-i64-to! (field s site-inst) site-end)
+      (mfts-pop-i64-to! (field s site-op) site-end)
+      (mfts-pop-i64-to! (field s site-root-first) site-end)
+      (mfts-pop-i64-to! (field s site-root-count) site-end)
+      (mfts-pop-i64-to! (field s root-kind) root-end)
+      (mfts-pop-i64-to! (field s root-vreg) root-end)
+      (mfts-pop-i64-to! (field s root-reg) root-end)
+      (mfts-pop-i64-to! (field s root-spill) root-end)
+      (mfts-pop-i64-to! (field s symbols) count)
+      (mfts-pop-i64-to! (field s identity-kinds) count)
+      (mfts-pop-i64-to! (field s identity-units) count)
+      (mfts-pop-i64-to! (field s identity-locals) count)
+      (mfts-pop-i64-to! (field s abi-arities) count)
+      (mfts-pop-i64-to! (field s abi-hashes) count)
+      (mfts-pop-i64-to! (field s abi-return-kinds) count)
+      (mfts-pop-i64-to! (field s dispatch-return-codes) count)
+      (mfts-pop-i64-to! (field s cache-reasons) count)
+      (mfts-pop-i64-to! (field s frame-sizes) count)
+      (mfts-pop-i64-to! (field s callee-masks) count)
+      (mfts-pop-i64-to! (field s callee-counts) count)
+      (mfts-pop-i64-to! (field s byte-firsts) count)
+      (mfts-pop-i64-to! (field s byte-counts) count)
+      (mfts-pop-i64-to! (field s reloc-firsts) count)
+      (mfts-pop-i64-to! (field s reloc-counts) count)
+      (mfts-pop-i64-to! (field s site-firsts) count)
+      (mfts-pop-i64-to! (field s site-counts) count)
+      true)))
+
+(defn mfts-retain-cacheable-kind! [(identity-kind i64)] (-> i64)
+  ;; Stable in-place archive compaction. Destination cursors never overtake source cursors because
+  ;; records are visited in order and some are discarded, so forward copies are overlap-safe.
+  (let [s (mfts)
+        old-count (mfts-count)
+        (mut source) 0
+        (mut kept) 0
+        (mut byte-write) 0
+        (mut reloc-write) 0
+        (mut site-write) 0
+        (mut root-write) 0]
+    (loop (if (>= (load source) old-count) (break)
+              (do
+                (if (and (and (or (= identity-kind -1)
+                                  (= (mfts-identity-kind (load source)) identity-kind))
+                              (!= (mfts-symbol (load source)) -1))
+                         (mfts-cacheable? (load source)))
+                    (let [dest (load kept)
+                          old-byte-first (al-get [i64] (.byte-firsts s) (load source))
+                          byte-count (al-get [i64] (.byte-counts s) (load source))
+                          old-reloc-first (al-get [i64] (.reloc-firsts s) (load source))
+                          reloc-count (al-get [i64] (.reloc-counts s) (load source))
+                          old-site-first (al-get [i64] (.site-firsts s) (load source))
+                          site-count (al-get [i64] (.site-counts s) (load source))
+                          (mut i) 0]
+                      (al-set! [i64] (field s symbols) dest (mfts-symbol (load source)))
+                      (al-set! [i64] (field s identity-kinds) dest
+                               (mfts-identity-kind (load source)))
+                      (al-set! [i64] (field s identity-units) dest
+                               (mfts-identity-unit (load source)))
+                      (al-set! [i64] (field s identity-locals) dest
+                               (mfts-identity-local (load source)))
+                      (al-set! [i64] (field s abi-arities) dest
+                               (mfts-abi-arity (load source)))
+                      (al-set! [i64] (field s abi-hashes) dest
+                               (mfts-abi-hash (load source)))
+                      (al-set! [i64] (field s abi-return-kinds) dest
+                               (mfts-abi-return-kind (load source)))
+                      (al-set! [i64] (field s dispatch-return-codes) dest
+                               (al-get [i64] (.dispatch-return-codes s) (load source)))
+                      (al-set! [i64] (field s cache-reasons) dest
+                               (mfts-cache-reason (load source)))
+                      (al-set! [i64] (field s frame-sizes) dest
+                               (al-get [i64] (.frame-sizes s) (load source)))
+                      (al-set! [i64] (field s callee-masks) dest
+                               (al-get [i64] (.callee-masks s) (load source)))
+                      (al-set! [i64] (field s callee-counts) dest
+                               (al-get [i64] (.callee-counts s) (load source)))
+                      (al-set! [i64] (field s byte-firsts) dest (load byte-write))
+                      (al-set! [i64] (field s byte-counts) dest byte-count)
+                      (set! i 0)
+                      (loop (if (>= (load i) byte-count) (break)
+                                (do
+                                  (al-set! [u8] (field s bytes) (+ (load byte-write) (load i))
+                                           (al-get [u8] (.bytes s) (+ old-byte-first (load i))))
+                                  (set! i (+ (load i) 1)))))
+                      (set! byte-write (+ (load byte-write) byte-count))
+                      (al-set! [i64] (field s reloc-firsts) dest (load reloc-write))
+                      (al-set! [i64] (field s reloc-counts) dest reloc-count)
+                      (set! i 0)
+                      (loop (if (>= (load i) reloc-count) (break)
+                                (let [from (+ old-reloc-first (load i))
+                                      to (+ (load reloc-write) (load i))]
+                                  (al-set! [i64] (field s reloc-kind) to
+                                           (al-get [i64] (.reloc-kind s) from))
+                                  (al-set! [i64] (field s reloc-offset) to
+                                           (al-get [i64] (.reloc-offset s) from))
+                                  (al-set! [i64] (field s reloc-target) to
+                                           (al-get [i64] (.reloc-target s) from))
+                                  (al-set! [i64] (field s reloc-target-kind) to
+                                           (al-get [i64] (.reloc-target-kind s) from))
+                                  (al-set! [i64] (field s reloc-target-unit) to
+                                           (al-get [i64] (.reloc-target-unit s) from))
+                                  (al-set! [i64] (field s reloc-target-local) to
+                                           (al-get [i64] (.reloc-target-local s) from))
+                                  (al-set! [i64] (field s reloc-target-abi-arity) to
+                                           (al-get [i64] (.reloc-target-abi-arity s) from))
+                                  (al-set! [i64] (field s reloc-target-abi-hash) to
+                                           (al-get [i64] (.reloc-target-abi-hash s) from))
+                                  (al-set! [i64] (field s reloc-target-abi-return-kind) to
+                                           (al-get [i64] (.reloc-target-abi-return-kind s) from))
+                                  (al-set! [i64] (field s reloc-aux) to
+                                           (al-get [i64] (.reloc-aux s) from))
+                                  (set! i (+ (load i) 1)))))
+                      (set! reloc-write (+ (load reloc-write) reloc-count))
+                      (al-set! [i64] (field s site-firsts) dest (load site-write))
+                      (al-set! [i64] (field s site-counts) dest site-count)
+                      (set! i 0)
+                      (loop (if (>= (load i) site-count) (break)
+                                (let [from (+ old-site-first (load i))
+                                      to (+ (load site-write) (load i))
+                                      old-root-first (al-get [i64] (.site-root-first s) from)
+                                      root-count (al-get [i64] (.site-root-count s) from)
+                                      (mut root) 0]
+                                  (al-set! [i64] (field s site-offset) to
+                                           (al-get [i64] (.site-offset s) from))
+                                  (al-set! [i64] (field s site-inst) to
+                                           (al-get [i64] (.site-inst s) from))
+                                  (al-set! [i64] (field s site-op) to
+                                           (al-get [i64] (.site-op s) from))
+                                  (al-set! [i64] (field s site-root-first) to (load root-write))
+                                  (al-set! [i64] (field s site-root-count) to root-count)
+                                  (loop (if (>= (load root) root-count) (break)
+                                            (let [old (+ old-root-first (load root))
+                                                  new (+ (load root-write) (load root))]
+                                              (al-set! [i64] (field s root-kind) new
+                                                       (al-get [i64] (.root-kind s) old))
+                                              (al-set! [i64] (field s root-vreg) new
+                                                       (al-get [i64] (.root-vreg s) old))
+                                              (al-set! [i64] (field s root-reg) new
+                                                       (al-get [i64] (.root-reg s) old))
+                                              (al-set! [i64] (field s root-spill) new
+                                                       (al-get [i64] (.root-spill s) old))
+                                              (set! root (+ (load root) 1)))))
+                                  (set! root-write (+ (load root-write) root-count))
+                                  (set! i (+ (load i) 1)))))
+                      (set! site-write (+ (load site-write) site-count))
+                      (set! kept (+ (load kept) 1)))
+                    0)
+                (set! source (+ (load source) 1)))))
+    (mfts-truncate-records! (load kept))
+    (load kept)))
+
+(defn mfts-record-semantic-leaf? [(record i64)] (-> bool)
+  (let [s (mfts)
+        first (al-get [i64] (.reloc-firsts s) record)
+        count (al-get [i64] (.reloc-counts s) record)
+        (mut offset) 0
+        (mut leaf) true]
+    (loop (if (or (not (load leaf)) (>= (load offset) count)) (break)
+              (let [kind (al-get [i64] (.reloc-kind s) (+ first (load offset)))]
+                (if (or (= kind MFT-RELOC-CALL)
+                        (or (= kind MFT-RELOC-ADDRESS) (= kind MFT-RELOC-CALLABLE-ID)))
+                    (set! leaf false)
+                    0)
+                (set! offset (+ (load offset) 1)))))
+    (load leaf)))
+
+(defn mfts-jsl-dependency-reason [(record i64)] (-> i64)
+  (let [s (mfts)
+        first (al-get [i64] (.reloc-firsts s) record)
+        count (al-get [i64] (.reloc-counts s) record)
+        (mut offset) 0
+        (mut reason) MFT-DEPENDENCY-CLOSED]
+    (loop (if (or (!= (load reason) MFT-DEPENDENCY-CLOSED)
+                  (>= (load offset) count)) (break)
+              (let [reloc (+ first (load offset))
+                    kind (al-get [i64] (.reloc-kind s) reloc)]
+                (if (or (= kind MFT-RELOC-CALL)
+                        (or (= kind MFT-RELOC-ADDRESS) (= kind MFT-RELOC-CALLABLE-ID)))
+                    (let [target-kind (al-get [i64] (.reloc-target-kind s) reloc)
+                          arity (al-get [i64] (.reloc-target-abi-arity s) reloc)]
+                      (cond (!= target-kind FUN-IDENTITY-JSL)
+                              (set! reason MFT-DEPENDENCY-KIND)
+                            (< arity 0)
+                              (set! reason MFT-DEPENDENCY-ABI)
+                            (< (mfts-find-cacheable-identity-abi
+                                 target-kind
+                                 (al-get [i64] (.reloc-target-unit s) reloc)
+                                 (al-get [i64] (.reloc-target-local s) reloc)
+                                 arity
+                                 (al-get [i64] (.reloc-target-abi-hash s) reloc)
+                                 (al-get [i64] (.reloc-target-abi-return-kind s) reloc)) 0)
+                              (set! reason MFT-DEPENDENCY-MISSING)
+                            :else 0))
+                    0)
+                (set! offset (+ (load offset) 1)))))
+    (load reason)))
+
+(defn mfts-jsl-dependencies-closed? [(record i64)] (-> bool)
+  (= (mfts-jsl-dependency-reason record) MFT-DEPENDENCY-CLOSED))
+
+(defn mfts-dependency-kind-drops-ptr [] (-> (ptr i64))
+  (primitive/alloc-static i64))
+(defn mfts-dependency-abi-drops-ptr [] (-> (ptr i64))
+  (primitive/alloc-static i64))
+(defn mfts-dependency-missing-drops-ptr [] (-> (ptr i64))
+  (primitive/alloc-static i64))
+(defn mfts-dependency-rounds-ptr [] (-> (ptr i64))
+  (primitive/alloc-static i64))
+(defn mfts-dependency-kind-drops [] (-> i64) (load (mfts-dependency-kind-drops-ptr)))
+(defn mfts-dependency-abi-drops [] (-> i64) (load (mfts-dependency-abi-drops-ptr)))
+(defn mfts-dependency-missing-drops [] (-> i64) (load (mfts-dependency-missing-drops-ptr)))
+(defn mfts-dependency-rounds [] (-> i64) (load (mfts-dependency-rounds-ptr)))
+
+(defn mfts-retain-cacheable-jsl! [] (-> i64)
+  ;; Retain the greatest fixed point of cacheable JSL records whose semantic call/address targets
+  ;; are themselves retained JSL records with the exact declared ABI. Marking a rejected record
+  ;; ephemeral removes it from subsequent identity lookup, so rejection propagates through callers
+  ;; until no dangling dependency remains.
+  (store! (mfts-dependency-kind-drops-ptr) 0)
+  (store! (mfts-dependency-abi-drops-ptr) 0)
+  (store! (mfts-dependency-missing-drops-ptr) 0)
+  (store! (mfts-dependency-rounds-ptr) 0)
+  (let [s (mfts) (mut changed) true]
+    (loop (if (not (load changed)) (break)
+              (do
+                (set! changed false)
+                (store! (mfts-dependency-rounds-ptr)
+                        (+ (mfts-dependency-rounds) 1))
+                (let [(mut record) 0]
+                  (loop (if (>= (load record) (mfts-count)) (break)
+                            (do
+                              (if (and (= (mfts-identity-kind (load record))
+                                          FUN-IDENTITY-JSL)
+                                       (and (mfts-cacheable? (load record))
+                                            (not (mfts-jsl-dependencies-closed?
+                                                   (load record)))))
+                                  (let [reason (mfts-jsl-dependency-reason (load record))]
+                                    (cond (= reason MFT-DEPENDENCY-KIND)
+                                            (store! (mfts-dependency-kind-drops-ptr)
+                                                    (+ (mfts-dependency-kind-drops) 1))
+                                          (= reason MFT-DEPENDENCY-ABI)
+                                            (store! (mfts-dependency-abi-drops-ptr)
+                                                    (+ (mfts-dependency-abi-drops) 1))
+                                          (= reason MFT-DEPENDENCY-MISSING)
+                                            (store! (mfts-dependency-missing-drops-ptr)
+                                                    (+ (mfts-dependency-missing-drops) 1))
+                                          :else 0)
+                                    (al-set! [i64] (field s identity-kinds) (load record)
+                                             FUN-IDENTITY-EPHEMERAL)
+                                    (set! changed true))
+                                  0)
+                              (set! record (+ (load record) 1)))))))))
+    (mfts-retain-cacheable-kind! FUN-IDENTITY-JSL)))
+
+(defn mfts-publish-import-catalog! [] (-> i64)
+  (n-import-catalog-clear!)
+  (let [(mut record) 0]
+    (loop (if (>= (load record) (mfts-count)) (break)
+              (do
+                (if (mfts-cacheable? (load record))
+                    (n-import-catalog-add! (mfts-identity-kind (load record))
+                                           (mfts-identity-unit (load record))
+                                           (mfts-identity-local (load record)))
+                    0)
+                (set! record (+ (load record) 1))))))
+  (mfts-count))
+
+;; A seed artifact is compiler data, never JavaScript state. Keep the format deliberately simple:
+;; one magic/version pair followed by every parallel store array as a counted little-endian vector.
+;; The loader validates every count before mutating its destination and clears the entire store on
+;; any mismatch, so truncated or stale files are cache misses rather than partially linked images.
+(const MFTS-ARTIFACT-MAGIC i64 4707459275134718795)
+(const MFTS-ARTIFACT-VERSION i64 3)
+
+(defn mfts-artifact-push-i64! [(out (mut (ArrayList u8))) (value i64)] (-> i64)
+  (let [(mut byte) 0]
+    (loop (if (>= (load byte) 8) (break)
+              (do
+                (al-push! [u8] (mut out) (cast u8 (>> value (* (load byte) 8))))
+                (set! byte (+ (load byte) 1))))))
+  0)
+
+(defn mfts-artifact-write-i64s! [(out (mut (ArrayList u8)))
+                                  (values (ArrayList i64))] (-> i64)
+  (mfts-artifact-push-i64! (mut out) (al-len [i64] values))
+  (let [(mut index) 0]
+    (loop (if (>= (load index) (al-len [i64] values)) (break)
+              (do
+                (mfts-artifact-push-i64! (mut out) (al-get [i64] values (load index)))
+                (set! index (+ (load index) 1))))))
+  0)
+
+(defn mfts-artifact-write-u8s! [(out (mut (ArrayList u8)))
+                                 (values (ArrayList u8))] (-> i64)
+  (mfts-artifact-push-i64! (mut out) (al-len [u8] values))
+  (let [(mut index) 0]
+    (loop (if (>= (load index) (al-len [u8] values)) (break)
+              (do
+                (al-push! [u8] (mut out) (al-get [u8] values (load index)))
+                (set! index (+ (load index) 1))))))
+  0)
+
+(defn mfts-artifact-write-types! [(out (mut (ArrayList u8)))] (-> i64)
+  ;; Tuple hashing reads the child window, so restore it before inserting any tuple record into
+  ;; the rebuilt intern map.
+  (mfts-artifact-push-i64! (mut out) (ty-kids-len))
+  (let [(mut kid) 0]
+    (loop (if (>= (load kid) (ty-kids-len)) (break)
+              (do (mfts-artifact-push-i64! (mut out) (ty-kid 0 (load kid)))
+                  (set! kid (+ (load kid) 1))))))
+  (mfts-artifact-push-i64! (mut out) (ty-count))
+  (let [(mut id) 0]
+    (loop (if (>= (load id) (ty-count)) (break)
+              (let [t (ty-get (load id))]
+                (mfts-artifact-push-i64! (mut out) (ty-tag t))
+                (match t
+                  (TVal [v]
+                    (do (mfts-artifact-push-i64! (mut out) (val-kinds v))
+                        (mfts-artifact-push-i64! (mut out) (val-ilo v))
+                        (mfts-artifact-push-i64! (mut out) (val-ihi v))
+                        (mfts-artifact-push-i64! (mut out) (val-iwide v))
+                        (mfts-artifact-push-i64! (mut out) (val-fsz v))
+                        (mfts-artifact-push-i64! (mut out) (val-fbits v))
+                        (mfts-artifact-push-i64! (mut out) (val-fidxs v))
+                        (mfts-artifact-push-i64! (mut out) (val-shapes v))))
+                  (TTuple [off len]
+                    (do (mfts-artifact-push-i64! (mut out) off)
+                        (mfts-artifact-push-i64! (mut out) len)
+                        (let [(mut field) 2]
+                          (loop (if (>= (load field) 8) (break)
+                                    (do (mfts-artifact-push-i64! (mut out) 0)
+                                        (set! field (+ (load field) 1))))))))
+                  (TMem [aliases child]
+                    (do (mfts-artifact-push-i64! (mut out) aliases)
+                        (mfts-artifact-push-i64! (mut out) child)
+                        (let [(mut field) 2]
+                          (loop (if (>= (load field) 8) (break)
+                                    (do (mfts-artifact-push-i64! (mut out) 0)
+                                        (set! field (+ (load field) 1))))))))
+                  (_ (let [(mut field) 0]
+                       (loop (if (>= (load field) 8) (break)
+                                 (do (mfts-artifact-push-i64! (mut out) 0)
+                                     (set! field (+ (load field) 1))))))))
+                (mfts-artifact-push-i64! (mut out) (ty-dual (load id)))
+                (mfts-artifact-push-i64! (mut out) (ty-depth (load id)))
+                (set! id (+ (load id) 1))))))
+  0)
+
+;; Shape ids and aliases occur in retained machine relocations and in the restored type prefix.
+;; Persist the semantic transition tree, not ArrayList storage: replaying the ordered edges through
+;; `shape-transition` rebuilds names, field windows, aliases and descendants by their one owner.
+(defn mfts-artifact-write-shapes! [(out (mut (ArrayList u8)))] (-> i64)
+  (mfts-artifact-push-i64! (mut out) (shape-edge-count))
+  (let [(mut edge) 0]
+    (loop (if (>= (load edge) (shape-edge-count)) (break)
+              (let [record (shape-edge-at (load edge))
+                    name (shape-name-bytes (se-name record))
+                    (mut byte) 0]
+                (mfts-artifact-push-i64! (mut out) (se-from record))
+                (mfts-artifact-push-i64! (mut out) (se-ty record))
+                (mfts-artifact-push-i64! (mut out) (slice-len name))
+                (loop (if (>= (load byte) (slice-len name)) (break)
+                          (do (al-push! [u8] (mut out) (slice-get name (load byte)))
+                              (set! byte (+ (load byte) 1)))))
+                (set! edge (+ (load edge) 1))))))
+  0)
+
+(defn mfts-artifact-read-i64! [(source (slice u8))
+                                (cursor (ptr i64))
+                                (ok (ptr bool))] (-> i64)
+  (if (or (not (load ok)) (> (+ (load cursor) 8) (slice-len source)))
+      (do (store! ok false) 0)
+      (let [(mut value) 0 (mut byte) 0]
+        (loop (if (>= (load byte) 8) (break)
+                  (do
+                    (set! value
+                          (| (load value)
+                             (<< (cast i64 (load (index (slice-data source)
+                                                       (+ (load cursor) (load byte)))))
+                                 (* (load byte) 8))))
+                    (set! byte (+ (load byte) 1)))))
+        (store! cursor (+ (load cursor) 8))
+        (load value))))
+
+(defn mfts-artifact-read-i64s! [(source (slice u8))
+                                 (cursor (ptr i64))
+                                 (ok (ptr bool))
+                                 (values (mut (ArrayList i64)))] (-> i64)
+  (let [count (mfts-artifact-read-i64! source cursor ok)]
+    (if (or (not (load ok))
+            (or (< count 0) (> count (/ (- (slice-len source) (load cursor)) 8))))
+        (store! ok false)
+        (let [(mut index) 0]
+          (al-clear! [i64] (mut values))
+          (loop (if (>= (load index) count) (break)
+                    (do
+                      (al-push! [i64] (mut values)
+                                (mfts-artifact-read-i64! source cursor ok))
+                      (set! index (+ (load index) 1))))))))
+  0)
+
+(defn mfts-artifact-read-u8s! [(source (slice u8))
+                                (cursor (ptr i64))
+                                (ok (ptr bool))
+                                (values (mut (ArrayList u8)))] (-> i64)
+  (let [count (mfts-artifact-read-i64! source cursor ok)]
+    (if (or (not (load ok))
+            (or (< count 0) (> count (- (slice-len source) (load cursor)))))
+        (store! ok false)
+        (let [(mut index) 0]
+          (al-clear! [u8] (mut values))
+          (loop (if (>= (load index) count) (break)
+                    (do
+                      (al-push! [u8] (mut values)
+                                (load (index (slice-data source)
+                                             (+ (load cursor) (load index)))))
+                      (set! index (+ (load index) 1)))))
+          (store! cursor (+ (load cursor) count)))))
+  0)
+
+(defn mfts-artifact-read-types! [(source (slice u8))
+                                  (cursor (ptr i64))
+                                  (ok (ptr bool))] (-> i64)
+  (ty-artifact-clear!)
+  (let [kids (mfts-artifact-read-i64! source cursor ok)]
+    (if (or (not (load ok))
+            (or (< kids 0) (> kids (/ (- (slice-len source) (load cursor)) 8))))
+        (store! ok false)
+        (let [(mut kid) 0]
+          (loop (if (or (not (load ok)) (>= (load kid) kids)) (break)
+                    (do (ty-artifact-push-kid!
+                          (mfts-artifact-read-i64! source cursor ok))
+                        (set! kid (+ (load kid) 1))))))))
+  (let [count (mfts-artifact-read-i64! source cursor ok)]
+    (if (or (not (load ok))
+            (or (< count 0) (> count (/ (- (slice-len source) (load cursor)) 88))))
+        (store! ok false)
+        (do
+          (let [(mut id) 0]
+            (loop (if (or (not (load ok)) (>= (load id) count)) (break)
+                      (let [tag (mfts-artifact-read-i64! source cursor ok)
+                            p0 (mfts-artifact-read-i64! source cursor ok)
+                            p1 (mfts-artifact-read-i64! source cursor ok)
+                            p2 (mfts-artifact-read-i64! source cursor ok)
+                            p3 (mfts-artifact-read-i64! source cursor ok)
+                            p4 (mfts-artifact-read-i64! source cursor ok)
+                            p5 (mfts-artifact-read-i64! source cursor ok)
+                            p6 (mfts-artifact-read-i64! source cursor ok)
+                            p7 (mfts-artifact-read-i64! source cursor ok)
+                            dual (mfts-artifact-read-i64! source cursor ok)
+                            depth (mfts-artifact-read-i64! source cursor ok)
+                            t (case tag
+                                0 (TBot)
+                                1 (TTop)
+                                2 (TCtrl)
+                                3 (TXCtrl)
+                                4 (TVal (val-make p0 p1 p2 p3 p4 p5 p6 p7))
+                                5 (TTuple p0 p1)
+                                6 (TMem p0 p1)
+                                (do (store! ok false) (TBot)))]
+                        (if (and (load ok) (not (ty-artifact-push! t dual depth)))
+                            (store! ok false) 0)
+                        (set! id (+ (load id) 1))))))
+          (if (and (load ok) (not (ty-artifact-valid?))) (store! ok false) 0))))
+  0)
+
+(defn mfts-artifact-read-shapes! [(source (slice u8))
+                                   (cursor (ptr i64))
+                                   (ok (ptr bool))] (-> i64)
+  (shape-reset!)
+  (let [count (mfts-artifact-read-i64! source cursor ok)]
+    (if (or (not (load ok)) (or (< count 0) (>= count SHAPE-MAX)))
+        (store! ok false)
+        (let [(mut edge) 0]
+          (loop (if (or (not (load ok)) (>= (load edge) count)) (break)
+                    (let [from (mfts-artifact-read-i64! source cursor ok)
+                          ty (mfts-artifact-read-i64! source cursor ok)
+                          length (mfts-artifact-read-i64! source cursor ok)]
+                      (if (or (not (load ok))
+                              (or (< length 0)
+                                  (> length (- (slice-len source) (load cursor)))))
+                          (store! ok false)
+                          (let [name (slice-new [u8]
+                                               (index (slice-data source) (load cursor))
+                                               length)
+                                to (shape-transition from name ty)]
+                            (store! cursor (+ (load cursor) length))
+                            ;; Ordered transitions form a tree rooted at shape zero, so edge k must
+                            ;; mint shape k+1 and alias k. Any other result is a malformed artifact.
+                            (if (or (!= to (+ (load edge) 1))
+                                    (!= (se-alias (shape-edge-at (load edge))) (load edge)))
+                                (store! ok false) 0)))
+                      (set! edge (+ (load edge) 1)))))
+          (if (and (load ok) (not (shape-alias-invariant-ok?)))
+              (store! ok false) 0))))
+  0)
+
+(defn mfts-save-artifact! [(path (slice u8))] (-> bool)
+  (try
+    (block :save
+      (let [a (malloc-allocator)
+            s (mfts)
+            (mut out) (al-new [u8] a)]
+        (mfts-artifact-push-i64! (mut out) MFTS-ARTIFACT-MAGIC)
+        (mfts-artifact-push-i64! (mut out) MFTS-ARTIFACT-VERSION)
+        (mfts-artifact-write-types! (mut out))
+        (mfts-artifact-write-shapes! (mut out))
+        (mfts-artifact-write-i64s! (mut out) (.symbols s))
+        (mfts-artifact-write-i64s! (mut out) (.identity-kinds s))
+        (mfts-artifact-write-i64s! (mut out) (.identity-units s))
+        (mfts-artifact-write-i64s! (mut out) (.identity-locals s))
+        (mfts-artifact-write-i64s! (mut out) (.abi-arities s))
+        (mfts-artifact-write-i64s! (mut out) (.abi-hashes s))
+        (mfts-artifact-write-i64s! (mut out) (.abi-return-kinds s))
+        (mfts-artifact-write-i64s! (mut out) (.dispatch-return-codes s))
+        (mfts-artifact-write-i64s! (mut out) (.cache-reasons s))
+        (mfts-artifact-write-i64s! (mut out) (.frame-sizes s))
+        (mfts-artifact-write-i64s! (mut out) (.callee-masks s))
+        (mfts-artifact-write-i64s! (mut out) (.callee-counts s))
+        (mfts-artifact-write-i64s! (mut out) (.byte-firsts s))
+        (mfts-artifact-write-i64s! (mut out) (.byte-counts s))
+        (mfts-artifact-write-u8s! (mut out) (.bytes s))
+        (mfts-artifact-write-i64s! (mut out) (.reloc-firsts s))
+        (mfts-artifact-write-i64s! (mut out) (.reloc-counts s))
+        (mfts-artifact-write-i64s! (mut out) (.reloc-kind s))
+        (mfts-artifact-write-i64s! (mut out) (.reloc-offset s))
+        (mfts-artifact-write-i64s! (mut out) (.reloc-target s))
+        (mfts-artifact-write-i64s! (mut out) (.reloc-target-kind s))
+        (mfts-artifact-write-i64s! (mut out) (.reloc-target-unit s))
+        (mfts-artifact-write-i64s! (mut out) (.reloc-target-local s))
+        (mfts-artifact-write-i64s! (mut out) (.reloc-target-abi-arity s))
+        (mfts-artifact-write-i64s! (mut out) (.reloc-target-abi-hash s))
+        (mfts-artifact-write-i64s! (mut out) (.reloc-target-abi-return-kind s))
+        (mfts-artifact-write-i64s! (mut out) (.reloc-aux s))
+        (mfts-artifact-write-i64s! (mut out) (.site-firsts s))
+        (mfts-artifact-write-i64s! (mut out) (.site-counts s))
+        (mfts-artifact-write-i64s! (mut out) (.site-offset s))
+        (mfts-artifact-write-i64s! (mut out) (.site-inst s))
+        (mfts-artifact-write-i64s! (mut out) (.site-op s))
+        (mfts-artifact-write-i64s! (mut out) (.site-root-first s))
+        (mfts-artifact-write-i64s! (mut out) (.site-root-count s))
+        (mfts-artifact-write-i64s! (mut out) (.root-kind s))
+        (mfts-artifact-write-i64s! (mut out) (.root-vreg s))
+        (mfts-artifact-write-i64s! (mut out) (.root-reg s))
+        (mfts-artifact-write-i64s! (mut out) (.root-spill s))
+        (let [payload (slice-new [u8] (load (field out data)) (al-len [u8] out))]
+          (try-or! (write-file a path payload) (return-from :save false)))
+        (al-free! [u8] (mut out))
+        true))))
+
+(defn mfts-load-artifact! [(path (slice u8))] (-> bool)
+  (try
+    (block :load
+      (let [a (malloc-allocator)
+            source (try-or! (read-file a path) (return-from :load false))
+            cursor (primitive/alloc-stack i64)
+            ok (primitive/alloc-stack bool)
+            s (mfts)]
+        (store! cursor 0)
+        (store! ok true)
+        (if (!= (mfts-artifact-read-i64! source cursor ok) MFTS-ARTIFACT-MAGIC)
+            (store! ok false) 0)
+        (if (!= (mfts-artifact-read-i64! source cursor ok) MFTS-ARTIFACT-VERSION)
+            (store! ok false) 0)
+        (mfts-artifact-read-types! source cursor ok)
+        (mfts-artifact-read-shapes! source cursor ok)
+        (mfts-artifact-read-i64s! source cursor ok (field s symbols))
+        (mfts-artifact-read-i64s! source cursor ok (field s identity-kinds))
+        (mfts-artifact-read-i64s! source cursor ok (field s identity-units))
+        (mfts-artifact-read-i64s! source cursor ok (field s identity-locals))
+        (mfts-artifact-read-i64s! source cursor ok (field s abi-arities))
+        (mfts-artifact-read-i64s! source cursor ok (field s abi-hashes))
+        (mfts-artifact-read-i64s! source cursor ok (field s abi-return-kinds))
+        (mfts-artifact-read-i64s! source cursor ok (field s dispatch-return-codes))
+        (mfts-artifact-read-i64s! source cursor ok (field s cache-reasons))
+        (mfts-artifact-read-i64s! source cursor ok (field s frame-sizes))
+        (mfts-artifact-read-i64s! source cursor ok (field s callee-masks))
+        (mfts-artifact-read-i64s! source cursor ok (field s callee-counts))
+        (mfts-artifact-read-i64s! source cursor ok (field s byte-firsts))
+        (mfts-artifact-read-i64s! source cursor ok (field s byte-counts))
+        (mfts-artifact-read-u8s! source cursor ok (field s bytes))
+        (mfts-artifact-read-i64s! source cursor ok (field s reloc-firsts))
+        (mfts-artifact-read-i64s! source cursor ok (field s reloc-counts))
+        (mfts-artifact-read-i64s! source cursor ok (field s reloc-kind))
+        (mfts-artifact-read-i64s! source cursor ok (field s reloc-offset))
+        (mfts-artifact-read-i64s! source cursor ok (field s reloc-target))
+        (mfts-artifact-read-i64s! source cursor ok (field s reloc-target-kind))
+        (mfts-artifact-read-i64s! source cursor ok (field s reloc-target-unit))
+        (mfts-artifact-read-i64s! source cursor ok (field s reloc-target-local))
+        (mfts-artifact-read-i64s! source cursor ok (field s reloc-target-abi-arity))
+        (mfts-artifact-read-i64s! source cursor ok (field s reloc-target-abi-hash))
+        (mfts-artifact-read-i64s! source cursor ok (field s reloc-target-abi-return-kind))
+        (mfts-artifact-read-i64s! source cursor ok (field s reloc-aux))
+        (mfts-artifact-read-i64s! source cursor ok (field s site-firsts))
+        (mfts-artifact-read-i64s! source cursor ok (field s site-counts))
+        (mfts-artifact-read-i64s! source cursor ok (field s site-offset))
+        (mfts-artifact-read-i64s! source cursor ok (field s site-inst))
+        (mfts-artifact-read-i64s! source cursor ok (field s site-op))
+        (mfts-artifact-read-i64s! source cursor ok (field s site-root-first))
+        (mfts-artifact-read-i64s! source cursor ok (field s site-root-count))
+        (mfts-artifact-read-i64s! source cursor ok (field s root-kind))
+        (mfts-artifact-read-i64s! source cursor ok (field s root-vreg))
+        (mfts-artifact-read-i64s! source cursor ok (field s root-reg))
+        (mfts-artifact-read-i64s! source cursor ok (field s root-spill))
+        (if (!= (load cursor) (slice-len source)) (store! ok false) 0)
+        (alloc/free [u8] a source)
+        (if (load ok)
+            true
+            (do (mfts-clear!) false))))))
+
+(defn mfts-count [] (-> i64) (al-len [i64] (.symbols (mfts))))
+(defn mfts-symbol [(i i64)] (-> i64) (al-get [i64] (.symbols (mfts)) i))
+(defn mfts-identity-kind [(i i64)] (-> i64) (al-get [i64] (.identity-kinds (mfts)) i))
+(defn mfts-identity-unit [(i i64)] (-> i64) (al-get [i64] (.identity-units (mfts)) i))
+(defn mfts-identity-local [(i i64)] (-> i64) (al-get [i64] (.identity-locals (mfts)) i))
+(defn mfts-abi-arity [(i i64)] (-> i64) (al-get [i64] (.abi-arities (mfts)) i))
+(defn mfts-abi-hash [(i i64)] (-> i64) (al-get [i64] (.abi-hashes (mfts)) i))
+(defn mfts-abi-return-kind [(i i64)] (-> i64)
+  (al-get [i64] (.abi-return-kinds (mfts)) i))
+(defn mfts-abi-compatible? [(left i64) (right i64)] (-> bool)
+  (and (= (mfts-abi-arity left) (mfts-abi-arity right))
+       (and (= (mfts-abi-hash left) (mfts-abi-hash right))
+            (= (mfts-abi-return-kind left) (mfts-abi-return-kind right)))))
+(defn mfts-cache-reason [(i i64)] (-> i64) (al-get [i64] (.cache-reasons (mfts)) i))
+(defn mfts-cacheable? [(i i64)] (-> bool) (= (mfts-cache-reason i) MFT-CACHEABLE))
+(defn mfts-jsl-record-count [] (-> i64)
+  (let [(mut record) 0 (mut count) 0]
+    (loop (if (>= (load record) (mfts-count)) (break)
+              (do
+                (if (= (mfts-identity-kind (load record)) FUN-IDENTITY-JSL)
+                    (set! count (+ (load count) 1))
+                    0)
+                (set! record (+ (load record) 1)))))
+    (load count)))
+(defn mfts-cacheable-jsl-record-count [] (-> i64)
+  (let [(mut record) 0 (mut count) 0]
+    (loop (if (>= (load record) (mfts-count)) (break)
+              (do
+                (if (and (= (mfts-identity-kind (load record)) FUN-IDENTITY-JSL)
+                         (mfts-cacheable? (load record)))
+                    (set! count (+ (load count) 1))
+                    0)
+                (set! record (+ (load record) 1)))))
+    (load count)))
+(defn mfts-cache-reason-count [(reason i64)] (-> i64)
+  (let [(mut record) 0 (mut count) 0]
+    (loop (if (>= (load record) (mfts-count)) (break)
+              (do
+                (if (and (= (mfts-identity-kind (load record)) FUN-IDENTITY-JSL)
+                         (= (mfts-cache-reason (load record)) reason))
+                    (set! count (+ (load count) 1))
+                    0)
+                (set! record (+ (load record) 1)))))
+    (load count)))
+(defn mfts-find-cacheable-identity-abi [(kind i64) (unit i64) (local i64)
+                                        (arity i64) (hash i64) (return-kind i64)] (-> i64)
+  ;; A semantic name is not sufficient for separate compilation: a stale record with the same
+  ;; name but a changed calling convention is a cache miss, never a candidate for linking.
+  (let [(mut record) 0 (mut found) -1]
+    (loop (if (or (>= (load record) (mfts-count)) (>= (load found) 0)) (break)
+              (do
+                (if (and (mfts-cacheable? (load record))
+                         (and (= (mfts-identity-kind (load record)) kind)
+                              (and (= (mfts-identity-unit (load record)) unit)
+                                   (and (= (mfts-identity-local (load record)) local)
+                                        (and (= (mfts-abi-arity (load record)) arity)
+                                             (and (= (mfts-abi-hash (load record)) hash)
+                                                  (= (mfts-abi-return-kind (load record))
+                                                     return-kind)))))))
+                    (set! found (load record))
+                    0)
+                (set! record (+ (load record) 1)))))
+    (load found)))
+(defn mfts-byte-count [(i i64)] (-> i64) (al-get [i64] (.byte-counts (mfts)) i))
+(defn mfts-reloc-count [(i i64)] (-> i64) (al-get [i64] (.reloc-counts (mfts)) i))
+(defn mfts-site-count [(i i64)] (-> i64) (al-get [i64] (.site-counts (mfts)) i))
+
+(defn mfts-reloc-index [(record i64) (which i64)] (-> i64)
+  (+ (al-get [i64] (.reloc-firsts (mfts)) record) which))
+(defn mfts-reloc-kind-at [(record i64) (which i64)] (-> i64)
+  (al-get [i64] (.reloc-kind (mfts)) (mfts-reloc-index record which)))
+(defn mfts-reloc-offset-at [(record i64) (which i64)] (-> i64)
+  (al-get [i64] (.reloc-offset (mfts)) (mfts-reloc-index record which)))
+(defn mfts-reloc-target-abi-arity-at [(record i64) (which i64)] (-> i64)
+  (al-get [i64] (.reloc-target-abi-arity (mfts)) (mfts-reloc-index record which)))
+(defn mfts-reloc-target-abi-hash-at [(record i64) (which i64)] (-> i64)
+  (al-get [i64] (.reloc-target-abi-hash (mfts)) (mfts-reloc-index record which)))
+(defn mfts-reloc-target-abi-return-kind-at [(record i64) (which i64)] (-> i64)
+  (al-get [i64] (.reloc-target-abi-return-kind (mfts)) (mfts-reloc-index record which)))
+
+(defn mfti-clear! [] (-> i64)
+  (let [image (mfti)]
+    (al-clear! [u8] (field image bytes))
+    (set! (.entry-start image) -1)
+    (al-clear! [i64] (field image starts))
+    (al-clear! [i64] (field image sizes))
+    (al-clear! [i64] (field image symbols))
+    (al-clear! [i64] (field image dispatch-return-codes))
+    (al-clear! [i64] (field image frame-sizes))
+    (al-clear! [i64] (field image callee-masks))
+    (al-clear! [i64] (field image callee-counts))
+    (al-clear! [i64] (field image site-owners))
+    (al-clear! [i64] (field image site-offsets))
+    (al-clear! [i64] (field image site-insts))
+    (al-clear! [i64] (field image site-ops))
+    (al-clear! [i64] (field image site-root-firsts))
+    (al-clear! [i64] (field image site-root-counts))
+    (al-clear! [i64] (field image root-kinds))
+    (al-clear! [i64] (field image root-vregs))
+    (al-clear! [i64] (field image root-regs))
+    (al-clear! [i64] (field image root-spills))
+    (al-clear! [i64] (field image external-sites))
+    (al-clear! [i64] (field image external-ops))
+    (al-clear! [i64] (field image external-aux))
+    (al-clear! [u8] (field image stackmap))
+    (al-clear! [u8] (field image layouts))
+    0))
+(defn mfti-u32 [(at i64)] (-> i64)
+  (let [bytes (.bytes (mfti))]
+    (| (cast i64 (al-get [u8] bytes at))
+       (| (<< (cast i64 (al-get [u8] bytes (+ at 1))) 8)
+          (| (<< (cast i64 (al-get [u8] bytes (+ at 2))) 16)
+             (<< (cast i64 (al-get [u8] bytes (+ at 3))) 24))))))
+(defn mfti-set-u32! [(at i64) (word i64)] (-> i64)
+  (al-set! [u8] (field (mfti) bytes) at (cast u8 word))
+  (al-set! [u8] (field (mfti) bytes) (+ at 1) (cast u8 (>> word 8)))
+  (al-set! [u8] (field (mfti) bytes) (+ at 2) (cast u8 (>> word 16)))
+  (al-set! [u8] (field (mfti) bytes) (+ at 3) (cast u8 (>> word 24)))
+  0)
+(defn mfti-set-fixed-mov! [(at i64) (value i64)] (-> i64)
+  (let [rd (& (mfti-u32 at) 31)]
+    (mfti-set-u32! at (a64-movz rd (& value 65535) 0))
+    (mfti-set-u32! (+ at 4) (a64-movk rd (& (>> value 16) 65535) 1))
+    (mfti-set-u32! (+ at 8) (a64-movk rd (& (>> value 32) 65535) 2))
+    (mfti-set-u32! (+ at 12) (a64-movk rd (& (>> value 48) 65535) 3))
+    0))
+
+(defn mfti-profile-record-hash [(record i64)] (-> i64)
+  ;; Hash final linked bytes, after every semantic relocation has been applied. This makes a
+  ;; cached/uncached profile comparison identify the first divergent separately compiled
+  ;; function without changing the image or retaining process-local compiler state.
+  (let [image (mfti)
+        start (al-get [i64] (.starts image) record)
+        count (al-get [i64] (.sizes image) record)
+        (mut hash) 1469598103934665603
+        (mut offset) 0]
+    (loop (if (>= (load offset) count) (break)
+              (do
+                (set! hash (* (^ (load hash)
+                                 (cast i64 (al-get [u8] (.bytes image)
+                                                   (+ start (load offset)))))
+                              1099511628211))
+                (set! offset (+ (load offset) 1)))))
+    (load hash)))
+
+(defn mfti-find-record [(kind i64) (unit i64) (local i64) (symbol i64)] (-> i64)
+  ;; Appended snapshots put the current compilation after the immutable cache prefix. Search from
+  ;; the suffix so ephemeral symbols (especially host Start symbol zero) never bind to an older
+  ;; compilation retained in the same object archive.
+  (let [store (mfts) (mut record) (- (mfts-count) 1) (mut found) -1]
+    (loop (if (or (< (load record) 0) (>= (load found) 0)) (break)
+              (do
+                (if (if (= kind FUN-IDENTITY-EPHEMERAL)
+                        (and (= (al-get [i64] (.identity-kinds store) (load record))
+                                FUN-IDENTITY-EPHEMERAL)
+                             (= (al-get [i64] (.symbols store) (load record)) symbol))
+                        (and (= (al-get [i64] (.identity-kinds store) (load record)) kind)
+                             (and (= (al-get [i64] (.identity-units store) (load record)) unit)
+                                  (= (al-get [i64] (.identity-locals store) (load record)) local))))
+                    (set! found (load record)) 0)
+                (set! record (- (load record) 1)))))
+    (load found)))
+(defn mfti-reloc-target-abi-compatible? [(reloc i64) (target i64)] (-> bool)
+  (let [store (mfts) expected (al-get [i64] (.reloc-target-abi-arity store) reloc)]
+    (if (< expected 0)
+        true
+        (and (= expected (mfts-abi-arity target))
+             (and (= (al-get [i64] (.reloc-target-abi-hash store) reloc)
+                     (mfts-abi-hash target))
+                  (= (al-get [i64] (.reloc-target-abi-return-kind store) reloc)
+                     (mfts-abi-return-kind target)))))))
+(defn mfti-find-shape [(layout i64)] (-> i64)
+  (let [(mut shape) 0 (mut found) -1]
+    (loop (if (or (>= (load shape) (shape-count)) (>= (load found) 0)) (break)
+              (do (if (= (shape-layout-fingerprint (load shape)) layout)
+                      (set! found (load shape)) 0)
+                  (set! shape (+ (load shape) 1)))))
+    (load found)))
+
+(defn mfti-shape-reloc? [(reloc i64)] (-> bool)
+  (let [kind (al-get [i64] (.reloc-kind (mfts)) reloc)]
+    (or (= kind MFT-RELOC-SHAPE-ID) (= kind MFT-RELOC-SHAPE-SIZE))))
+
+(defn mfti-layout-records-equal? [(a i64) (b i64)] (-> bool)
+  (let [store (mfts)]
+    (and (= (al-get [i64] (.reloc-target store) a)
+            (al-get [i64] (.reloc-target store) b))
+         (and (= (al-get [i64] (.reloc-aux store) a)
+                 (al-get [i64] (.reloc-aux store) b))
+              (and (= (al-get [i64] (.reloc-target-kind store) a)
+                      (al-get [i64] (.reloc-target-kind store) b))
+                   (and (= (al-get [i64] (.reloc-target-unit store) a)
+                           (al-get [i64] (.reloc-target-unit store) b))
+                        (= (al-get [i64] (.reloc-target-local store) a)
+                           (al-get [i64] (.reloc-target-local store) b))))))))
+
+(defn mfti-layout-matches-shape? [(reloc i64) (shape i64)] (-> bool)
+  (let [store (mfts)]
+    (and (= (al-get [i64] (.reloc-target store) reloc)
+            (shape-layout-fingerprint shape))
+         (and (= (al-get [i64] (.reloc-aux store) reloc) (shape-size shape))
+              (and (= (al-get [i64] (.reloc-target-kind store) reloc)
+                      (shape-field-count shape))
+                   (and (= (al-get [i64] (.reloc-target-unit store) reloc)
+                           (mobj-shape-bitmap shape))
+                        (= (al-get [i64] (.reloc-target-local store) reloc)
+                           (mobj-shape-boxed-bitmap shape))))))))
+
+;; -2 is a fingerprint collision or inconsistent archived record; -1 means no fresh layout.
+(defn mfti-fresh-shape-for-reloc [(reloc i64)] (-> i64)
+  (let [store (mfts) fingerprint (al-get [i64] (.reloc-target store) reloc)
+        (mut shape) 0 (mut found) -1]
+    (loop (if (or (>= (load shape) (shape-count)) (= (load found) -2)) (break)
+              (do
+                (if (= (shape-layout-fingerprint (load shape)) fingerprint)
+                    (if (mfti-layout-matches-shape? reloc (load shape))
+                        (set! found (load shape))
+                        (set! found -2))
+                    0)
+                (set! shape (+ (load shape) 1)))))
+    (load found)))
+
+(defn mfti-catalog-first? [(reloc i64)] (-> bool)
+  (let [store (mfts) fingerprint (al-get [i64] (.reloc-target store) reloc)
+        (mut at) 0 (mut first) true]
+    (loop (if (or (>= (load at) reloc) (not (load first))) (break)
+              (do
+                (if (and (= (al-get [i64] (.reloc-kind store) (load at)) MFT-RELOC-SHAPE-ID)
+                         (= (al-get [i64] (.reloc-target store) (load at)) fingerprint))
+                    (set! first false) 0)
+                (set! at (+ (load at) 1)))))
+    (load first)))
+
+(defn mfti-catalog-shape-id [(reloc i64)] (-> i64)
+  (let [store (mfts) fresh (mfti-fresh-shape-for-reloc reloc)
+        fingerprint (al-get [i64] (.reloc-target store) reloc)
+        (mut at) 0 (mut ordinal) 0 (mut representative) -1]
+    (if (>= fresh 0) fresh
+      (if (= fresh -2) -1
+        (do
+          (loop (if (>= (load at) (al-len [i64] (.reloc-kind store))) (break)
+                    (do
+                      (if (= (al-get [i64] (.reloc-kind store) (load at)) MFT-RELOC-SHAPE-ID)
+                          (let [prior-fresh (mfti-fresh-shape-for-reloc (load at))]
+                            (if (= (al-get [i64] (.reloc-target store) (load at)) fingerprint)
+                                (if (mfti-layout-records-equal? reloc (load at))
+                                    (if (< (load representative) 0)
+                                        (set! representative (load ordinal)) 0)
+                                    (set! representative -2))
+                                0)
+                            (if (and (= prior-fresh -1) (mfti-catalog-first? (load at)))
+                                (set! ordinal (+ (load ordinal) 1)) 0))
+                          0)
+                      (set! at (+ (load at) 1)))))
+          (if (< (load representative) 0) -1
+              (+ (shape-count) (load representative))))))))
+
+(defn mfti-catalog-layout-count [] (-> i64)
+  (let [store (mfts) (mut reloc) 0 (mut count) 0]
+    (loop (if (>= (load reloc) (al-len [i64] (.reloc-kind store))) (break)
+              (do
+                (if (and (= (al-get [i64] (.reloc-kind store) (load reloc)) MFT-RELOC-SHAPE-ID)
+                         (and (mfti-catalog-first? (load reloc))
+                              (= (mfti-fresh-shape-for-reloc (load reloc)) -1)))
+                    (set! count (+ (load count) 1)) 0)
+                (set! reloc (+ (load reloc) 1)))))
+    (load count)))
+
+;; Callable symbols are image-local, not part of a retained function's semantic identity. A seed
+;; compiled before any Script assigns different numeric symbols from a later Script that imports
+;; those same JSL identities. Resolve every retained identity against the current MachineUnit so
+;; runtime dispatch sees the callable id carried by values in this Script, never the seed's old id.
+(defn mfti-linked-symbol [(record i64)] (-> i64)
+  (let [store (mfts)
+        kind (al-get [i64] (.identity-kinds store) record)
+        unit (al-get [i64] (.identity-units store) record)
+        local (al-get [i64] (.identity-locals store) record)
+        archived (al-get [i64] (.symbols store) record)
+        (mut owner) 0
+        (mut max-current) 0
+        (mut answer) -1]
+    (if (= kind FUN-IDENTITY-EPHEMERAL)
+        archived
+        (do
+          (loop (if (>= (load owner) (mu-function-count))
+                    (break)
+                    (do
+                      (if (> (mu-function-symbol (load owner)) (load max-current))
+                          (set! max-current (mu-function-symbol (load owner)))
+                          0)
+                      (if (and (= (mu-function-identity-kind (load owner)) kind)
+                               (and (= (mu-function-identity-unit (load owner)) unit)
+                                    (= (mu-function-identity-local (load owner)) local)))
+                          (set! answer (mu-function-symbol (load owner)))
+                          0)
+                      (set! owner (+ (load owner) 1)))))
+          ;; A retained-only identity has no graph-local symbol in this Script. Give it a unique
+          ;; image-local symbol above the complete current namespace. Every materialization in
+          ;; retained text is relocated through this same function, so the number need not escape
+          ;; the image and can never collide with a source callable.
+          (if (>= (load answer) 0) (load answer) (+ (+ (load max-current) 1) record))))))
+
+(defn mfti-build! [] (-> bool)
+  (block :done
+  (mfti-clear!)
+  (let [store (mfts) image (mfti) (mut record) 0]
+    (loop (if (>= (load record) (mfts-count)) (break)
+              (let [first (al-get [i64] (.byte-firsts store) (load record))
+                    count (al-get [i64] (.byte-counts store) (load record))
+                    (mut byte) 0]
+                ;; The native entry is machine owner 0, whose semantic identity is ephemeral.
+                ;; `symbol == -1` is not an entry contract: non-exported internal Script functions
+                ;; may also lack a symbol, and record order then made the last one the entry.
+                (if (= (mfts-identity-kind (load record)) FUN-IDENTITY-EPHEMERAL)
+                    (set! (.entry-start image) (al-len [u8] (.bytes image)))
+                    0)
+                (al-push! [i64] (field image starts) (al-len [u8] (.bytes image)))
+                (al-push! [i64] (field image sizes) count)
+                (let [linked-symbol (mfti-linked-symbol (load record))
+                      (mut prior) 0
+                      (mut duplicate) false]
+                  (loop (if (>= (load prior) (al-len [i64] (.symbols image)))
+                            (break)
+                            (do
+                              (if (and (>= linked-symbol 0)
+                                       (= linked-symbol
+                                          (al-get [i64] (.symbols image) (load prior))))
+                                  (set! duplicate true)
+                                  0)
+                              (set! prior (+ (load prior) 1)))))
+                  ;; Runtime callable resolution is keyed by this symbol. Publishing two records
+                  ;; under one nonnegative id can dispatch through arbitrary function metadata;
+                  ;; reject the image so the runner can retry its independent singleton units.
+                  (if (load duplicate)
+                      (do
+                        (fmt (stderr)
+                             "function-text: duplicate linked callable symbol record={d} symbol={d} identity={d}/{d}/{d}\n"
+                             (load record) linked-symbol
+                             (mfts-identity-kind (load record))
+                             (mfts-identity-unit (load record))
+                             (mfts-identity-local (load record)))
+                        (return-from :done false))
+                      0)
+                  (al-push! [i64] (field image symbols) linked-symbol))
+                (al-push! [i64] (field image dispatch-return-codes)
+                          (al-get [i64] (.dispatch-return-codes store) (load record)))
+                (al-push! [i64] (field image frame-sizes)
+                          (al-get [i64] (.frame-sizes store) (load record)))
+                (al-push! [i64] (field image callee-masks)
+                          (al-get [i64] (.callee-masks store) (load record)))
+                (al-push! [i64] (field image callee-counts)
+                          (al-get [i64] (.callee-counts store) (load record)))
+                (loop (if (>= (load byte) count) (break)
+                          (do (al-push! [u8] (field image bytes)
+                                        (al-get [u8] (.bytes store) (+ first (load byte))))
+                              (set! byte (+ (load byte) 1)))))
+                (set! record (+ (load record) 1)))))
+    ;; Rebase retained GC metadata onto the linked function starts. Root windows are copied into
+    ;; one image-owned array so registration never needs the old machine unit or record store.
+    (set! record 0)
+    (loop (if (>= (load record) (mfts-count)) (break)
+              (let [start (al-get [i64] (.starts image) (load record))
+                    first (al-get [i64] (.site-firsts store) (load record))
+                    count (al-get [i64] (.site-counts store) (load record))
+                    (mut which) 0]
+                (loop (if (>= (load which) count) (break)
+                          (let [site (+ first (load which))
+                                old-root-first (al-get [i64] (.site-root-first store) site)
+                                root-count (al-get [i64] (.site-root-count store) site)
+                                new-root-first (al-len [i64] (.root-kinds image))
+                                (mut root) 0]
+                            (al-push! [i64] (field image site-owners) (load record))
+                            (al-push! [i64] (field image site-offsets)
+                                      (+ start (al-get [i64] (.site-offset store) site)))
+                            (al-push! [i64] (field image site-insts)
+                                      (al-get [i64] (.site-inst store) site))
+                            (al-push! [i64] (field image site-ops)
+                                      (al-get [i64] (.site-op store) site))
+                            (al-push! [i64] (field image site-root-firsts) new-root-first)
+                            (al-push! [i64] (field image site-root-counts) root-count)
+                            (loop (if (>= (load root) root-count) (break)
+                                      (do
+                                        (al-push! [i64] (field image root-kinds)
+                                                  (al-get [i64] (.root-kind store)
+                                                          (+ old-root-first (load root))))
+                                        (al-push! [i64] (field image root-vregs)
+                                                  (al-get [i64] (.root-vreg store)
+                                                          (+ old-root-first (load root))))
+                                        (al-push! [i64] (field image root-regs)
+                                                  (al-get [i64] (.root-reg store)
+                                                          (+ old-root-first (load root))))
+                                        (al-push! [i64] (field image root-spills)
+                                                  (al-get [i64] (.root-spill store)
+                                                          (+ old-root-first (load root))))
+                                        (set! root (+ (load root) 1)))))
+                            (set! which (+ (load which) 1)))))
+                (set! record (+ (load record) 1)))))
+    (set! record 0)
+    (loop (if (>= (load record) (mfts-count)) (break)
+              (let [start (al-get [i64] (.starts image) (load record))
+                    first (al-get [i64] (.reloc-firsts store) (load record))
+                    count (al-get [i64] (.reloc-counts store) (load record))
+                    (mut which) 0]
+                (loop (if (>= (load which) count) (break)
+                          (let [reloc (+ first (load which))
+                                kind (al-get [i64] (.reloc-kind store) reloc)
+                                site (+ start (al-get [i64] (.reloc-offset store) reloc))]
+                            (case kind
+                              MFT-RELOC-CALL
+                                (let [target (mfti-find-record
+                                               (al-get [i64] (.reloc-target-kind store) reloc)
+                                               (al-get [i64] (.reloc-target-unit store) reloc)
+                                               (al-get [i64] (.reloc-target-local store) reloc)
+                                               (al-get [i64] (.reloc-target store) reloc))]
+                                  (if (or (< target 0)
+                                          (not (mfti-reloc-target-abi-compatible? reloc target)))
+                                      (return-from :done false)
+                                      (mfti-set-u32! site
+                                        (a64-bl (/ (- (al-get [i64] (.starts image) target) site) 4)))))
+                              MFT-RELOC-ADDRESS
+                                (let [target (mfti-find-record
+                                               (al-get [i64] (.reloc-target-kind store) reloc)
+                                               (al-get [i64] (.reloc-target-unit store) reloc)
+                                               (al-get [i64] (.reloc-target-local store) reloc)
+                                               (al-get [i64] (.reloc-target store) reloc))]
+                                  (if (or (< target 0)
+                                          (not (mfti-reloc-target-abi-compatible? reloc target)))
+                                      (return-from :done false)
+                                      (do (mfti-set-u32! site (a64-adr (& (mfti-u32 site) 31) 0))
+                                          (mfti-set-fixed-mov! (+ site 4)
+                                            (- (al-get [i64] (.starts image) target) site)))))
+                              MFT-RELOC-CALLABLE-ID
+                                (let [target (mfti-find-record
+                                               (al-get [i64] (.reloc-target-kind store) reloc)
+                                               (al-get [i64] (.reloc-target-unit store) reloc)
+                                               (al-get [i64] (.reloc-target-local store) reloc)
+                                               (al-get [i64] (.reloc-target store) reloc))]
+                                  (if (< target 0)
+                                      (return-from :done false)
+                                      (mfti-set-fixed-mov! site (mfti-linked-symbol target))))
+                              MFT-RELOC-SHAPE-ID
+                                (let [shape (mfti-catalog-shape-id reloc)]
+                                  (if (< shape 0) (return-from :done false)
+                                      (mfti-set-fixed-mov! site shape)))
+                              MFT-RELOC-SHAPE-SIZE
+                                (let [shape (mfti-catalog-shape-id reloc)]
+                                  (if (< shape 0) (return-from :done false)
+                                      (mfti-set-fixed-mov! site
+                                        (al-get [i64] (.reloc-aux store) reloc))))
+                              MFT-RELOC-EXTERNAL
+                                (do (al-push! [i64] (field image external-sites) site)
+                                    (al-push! [i64] (field image external-ops)
+                                              (al-get [i64] (.reloc-target store) reloc))
+                                    (al-push! [i64] (field image external-aux)
+                                              (al-get [i64] (.reloc-aux store) reloc)))
+                              (return-from :done false))
+                            (set! which (+ (load which) 1)))))
+                (set! record (+ (load record) 1)))))
+    (if (be-profiling?)
+        (do
+          (set! record 0)
+          (loop (if (>= (load record) (mfts-count)) (break)
+                    (do
+                      (fmt (stderr)
+                           "AOTK_PROFILE phase=linked_record record={d} kind={d} unit={d} local={d} symbol={d} start={d} size={d} hash={d}\n"
+                           (load record)
+                           (mfts-identity-kind (load record))
+                           (mfts-identity-unit (load record))
+                           (mfts-identity-local (load record))
+                           (al-get [i64] (.symbols image) (load record))
+                           (al-get [i64] (.starts image) (load record))
+                           (al-get [i64] (.sizes image) (load record))
+                           (mfti-profile-record-hash (load record)))
+                      (set! record (+ (load record) 1)))))
+          0)
+        0)
+    (mfti-write-metadata!)
+    true)))
+
+(defn mfti-bytes-u8! [(out (mut (ArrayList u8))) (value i64)] (-> i64)
+  (al-push! [u8] (mut out) (cast u8 value)) 0)
+(defn mfti-bytes-u32! [(out (mut (ArrayList u8))) (value i64)] (-> i64)
+  (mfti-bytes-u8! (mut out) value)
+  (mfti-bytes-u8! (mut out) (>> value 8))
+  (mfti-bytes-u8! (mut out) (>> value 16))
+  (mfti-bytes-u8! (mut out) (>> value 24)) 0)
+(defn mfti-bytes-u64! [(out (mut (ArrayList u8))) (value i64)] (-> i64)
+  (mfti-bytes-u32! (mut out) value) (mfti-bytes-u32! (mut out) (>> value 32)) 0)
+
+(defn mfti-write-metadata! [] (-> i64)
+  (let [image (mfti) (mut index) 0 (mut root-first) 0]
+    (al-clear! [u8] (field image stackmap))
+    (al-clear! [u8] (field image layouts))
+    (mfti-bytes-u32! (field image stackmap) 1398034241)
+    (mfti-bytes-u32! (field image stackmap) 3)
+    (mfti-bytes-u32! (field image stackmap) (mfti-site-count))
+    (mfti-bytes-u32! (field image stackmap) (mfti-root-count))
+    (mfti-bytes-u32! (field image stackmap) (mfts-count))
+    (mfti-bytes-u32! (field image stackmap) 40)
+    (loop (if (>= (load index) (mfts-count)) (break)
+              (do
+                (mfti-bytes-u32! (field image stackmap) (load index))
+                (mfti-bytes-u32! (field image stackmap) (mfti-function-start (load index)))
+                (mfti-bytes-u32! (field image stackmap)
+                                  (al-get [i64] (.sizes image) (load index)))
+                (mfti-bytes-u32! (field image stackmap)
+                                  (mfti-function-frame-size (load index)))
+                (mfti-bytes-u64! (field image stackmap)
+                                  (mfti-function-callee-mask (load index)))
+                (mfti-bytes-u32! (field image stackmap)
+                                  (mfti-function-callee-count (load index)))
+                (mfti-bytes-u32! (field image stackmap) 0)
+                (mfti-bytes-u32! (field image stackmap)
+                                  (let [symbol
+                                          (al-get [i64] (.symbols image) (load index))]
+                                    (if (>= symbol 1) symbol 0)))
+                (mfti-bytes-u32! (field image stackmap)
+                                  (al-get [i64] (.dispatch-return-codes image) (load index)))
+                (set! index (+ (load index) 1)))))
+    (set! index 0)
+    (loop (if (>= (load index) (mfti-site-count)) (break)
+              (do
+                (mfti-bytes-u32! (field image stackmap) (mfti-site-offset (load index)))
+                (mfti-bytes-u32! (field image stackmap) (mfti-site-owner (load index)))
+                (mfti-bytes-u32! (field image stackmap)
+                                  (al-get [i64] (.site-insts image) (load index)))
+                (mfti-bytes-u32! (field image stackmap) (load root-first))
+                (mfti-bytes-u32! (field image stackmap) (mfti-site-root-count (load index)))
+                (mfti-bytes-u32! (field image stackmap)
+                                  (al-get [i64] (.site-ops image) (load index)))
+                (set! root-first (+ (load root-first) (mfti-site-root-count (load index))))
+                (set! index (+ (load index) 1)))))
+    (set! index 0)
+    (loop (if (>= (load index) (mfti-root-count)) (break)
+              (do
+                (mfti-bytes-u32! (field image stackmap) (mfti-root-vreg (load index)))
+                (mfti-bytes-u32! (field image stackmap) (mfti-root-kind (load index)))
+                (mfti-bytes-u32! (field image stackmap)
+                                  (if (>= (mfti-root-reg (load index)) 0) 0 1))
+                (mfti-bytes-u32! (field image stackmap)
+                                  (if (>= (mfti-root-reg (load index)) 0)
+                                      (mfti-root-reg (load index))
+                                      (mfti-root-spill (load index))))
+                (set! index (+ (load index) 1)))))
+    (mfti-bytes-u32! (field image layouts) 1280593729)
+    (mfti-bytes-u32! (field image layouts) 1)
+    (mfti-bytes-u32! (field image layouts) (+ (shape-count) (mfti-catalog-layout-count)))
+    (mfti-bytes-u32! (field image layouts) 32)
+    (set! index 0)
+    (loop (if (>= (load index) (shape-count)) (break)
+              (do
+                (mfti-bytes-u32! (field image layouts) (load index))
+                (mfti-bytes-u32! (field image layouts) (shape-size (load index)))
+                (mfti-bytes-u32! (field image layouts) 8)
+                (mfti-bytes-u32! (field image layouts) (shape-field-count (load index)))
+                (mfti-bytes-u64! (field image layouts) (mobj-shape-bitmap (load index)))
+                (mfti-bytes-u64! (field image layouts) (mobj-shape-boxed-bitmap (load index)))
+                (set! index (+ (load index) 1)))))
+    (let [store (mfts) (mut reloc) 0]
+      (loop (if (>= (load reloc) (al-len [i64] (.reloc-kind store))) (break)
+                (do
+                  (if (and (= (al-get [i64] (.reloc-kind store) (load reloc)) MFT-RELOC-SHAPE-ID)
+                           (and (mfti-catalog-first? (load reloc))
+                                (= (mfti-fresh-shape-for-reloc (load reloc)) -1)))
+                      (do
+                        (mfti-bytes-u32! (field image layouts)
+                                          (mfti-catalog-shape-id (load reloc)))
+                        (mfti-bytes-u32! (field image layouts)
+                                          (al-get [i64] (.reloc-aux store) (load reloc)))
+                        (mfti-bytes-u32! (field image layouts) 8)
+                        (mfti-bytes-u32! (field image layouts)
+                                          (al-get [i64] (.reloc-target-kind store) (load reloc)))
+                        (mfti-bytes-u64! (field image layouts)
+                                          (al-get [i64] (.reloc-target-unit store) (load reloc)))
+                        (mfti-bytes-u64! (field image layouts)
+                                          (al-get [i64] (.reloc-target-local store) (load reloc))))
+                      0)
+                  (set! reloc (+ (load reloc) 1))))))
+    0))
+
+(defn mfti-byte-count [] (-> i64) (al-len [u8] (.bytes (mfti))))
+(defn mfti-function-start [(i i64)] (-> i64) (al-get [i64] (.starts (mfti)) i))
+(defn mfti-current-entry-start [] (-> i64)
+  (.entry-start (mfti)))
+(defn mfti-function-frame-size [(i i64)] (-> i64)
+  (al-get [i64] (.frame-sizes (mfti)) i))
+(defn mfti-function-callee-mask [(i i64)] (-> i64)
+  (al-get [i64] (.callee-masks (mfti)) i))
+(defn mfti-function-callee-count [(i i64)] (-> i64)
+  (al-get [i64] (.callee-counts (mfti)) i))
+(defn mfti-site-count [] (-> i64) (al-len [i64] (.site-offsets (mfti))))
+(defn mfti-site-owner [(i i64)] (-> i64) (al-get [i64] (.site-owners (mfti)) i))
+(defn mfti-site-offset [(i i64)] (-> i64) (al-get [i64] (.site-offsets (mfti)) i))
+(defn mfti-site-root-count [(i i64)] (-> i64)
+  (al-get [i64] (.site-root-counts (mfti)) i))
+(defn mfti-root-count [] (-> i64) (al-len [i64] (.root-kinds (mfti))))
+(defn mfti-root-kind [(i i64)] (-> i64) (al-get [i64] (.root-kinds (mfti)) i))
+(defn mfti-root-vreg [(i i64)] (-> i64) (al-get [i64] (.root-vregs (mfti)) i))
+(defn mfti-root-reg [(i i64)] (-> i64) (al-get [i64] (.root-regs (mfti)) i))
+(defn mfti-root-spill [(i i64)] (-> i64) (al-get [i64] (.root-spills (mfti)) i))
+(defn mfti-external-count [] (-> i64) (al-len [i64] (.external-sites (mfti))))
+(defn mfti-external-site [(i i64)] (-> i64)
+  (al-get [i64] (.external-sites (mfti)) i))
+(defn mfti-external-op [(i i64)] (-> i64)
+  (al-get [i64] (.external-ops (mfti)) i))
+(defn mfti-external-aux [(i i64)] (-> i64)
+  (al-get [i64] (.external-aux (mfti)) i))
+(defn mfti-byte [(i i64)] (-> i64) (cast i64 (al-get [u8] (.bytes (mfti)) i)))
+(defn mfti-stackmap-data [] (-> (ptr u8))
+  (load (field (field (mfti) stackmap) data)))
+(defn mfti-layout-data [] (-> (ptr u8))
+  (load (field (field (mfti) layouts) data)))
+(defn mfti-stackmap-size [] (-> i64) (al-len [u8] (.stackmap (mfti))))
+(defn mfti-layout-size [] (-> i64) (al-len [u8] (.layouts (mfti))))
+(defn mfti-stackmap-u32 [(at i64)] (-> i64)
+  (let [bytes (.stackmap (mfti))]
+    (| (cast i64 (al-get [u8] bytes at))
+       (| (<< (cast i64 (al-get [u8] bytes (+ at 1))) 8)
+          (| (<< (cast i64 (al-get [u8] bytes (+ at 2))) 16)
+             (<< (cast i64 (al-get [u8] bytes (+ at 3))) 24))))))
+(defn mfti-layout-u32 [(at i64)] (-> i64)
+  (let [bytes (.layouts (mfti))]
+    (| (cast i64 (al-get [u8] bytes at))
+       (| (<< (cast i64 (al-get [u8] bytes (+ at 1))) 8)
+          (| (<< (cast i64 (al-get [u8] bytes (+ at 2))) 16)
+             (<< (cast i64 (al-get [u8] bytes (+ at 3))) 24))))))
+(defn mfti-layout-u64 [(at i64)] (-> i64)
+  (| (mfti-layout-u32 at) (<< (mfti-layout-u32 (+ at 4)) 32)))

@@ -1,3 +1,600 @@
+## 2026-08-27: Symbol callability is executable; nested callable bind remains open
+
+- Fixed AArch64 in-memory publication for polymorphic calls. The runtime target table already
+  mapped `MI-CALL` to `aot_js_dispatch_resolve`, but `nh-runtime-branch-pc` omitted the matching
+  branch-PC case. The emitted `bl` therefore targeted itself forever. It now patches through the
+  same verified 16-byte runtime veneer as every other external call.
+- LLDB identified the exact stuck instruction as `bl` to its own PC. Focused witnesses now pass
+  for a runtime-valued source call, ordinary captured `Function.prototype.bind`, direct
+  `Symbol.prototype.valueOf`, and borrowed `valueOf.call(symbol)`.
+- The complete retained Symbol cohort is
+  `results/test262-symbol-call-reloc-2026-08-27.jsonl`: 32 passed, 120 failed, 2 refused, and 15
+  policy-skipped. This intentionally makes no pass-rate claim from the relocation repair: the
+  completed total is unchanged from the previous 32-pass run.
+- The largest remaining Symbol blocker is Test262's property helper. Direct
+  `hasOwnProperty.call(object, key)` passes, and ordinary source bind passes, but
+  `Function.prototype.call.bind(Object.prototype.hasOwnProperty)` still forwards the nested JSL
+  callable as its own receiver. Its trace is `FunctionBind1 -> BoundFunction2 -> FunctionCall2 ->
+  FunctionCall2`; 44 Symbol failures currently surface through property-helper diagnostics.
+- Two rejected experiments are not present: a selector-wide `Fun`/`Closure` boxing change broke
+  ordinary bind, and a DSL fast path for bound `Function.prototype.call` corrupted both closure
+  branches. The remaining fix belongs in the shared nested JSL callable receiver/capture ABI, not
+  in Symbol or the Test262 harness. Other coherent Symbol gaps are strict primitive assignment,
+  constructor classification/error paths, and object-to-string coercion ordering.
+
+## 2026-08-27: complete ECMA-262-to-JSL execution plan
+
+- `docs/ECMA262-JSL-COMPLETION-PLAN.md` is the strict breakdown for accounting for the complete
+  pinned specification, assigning every normative item to JSL/frontend/runtime/host ownership,
+  extending JSL only where spec machinery requires it, publishing intrinsics declaratively, and
+  implementing the remaining language and built-in surface in dependency order.
+- The plan makes focused feedback the ordinary loop: metadata checking, one-operation lowering,
+  evaluator/native case tables, Node differential witnesses where valid, public-source witnesses,
+  and mapped deterministic Test262 slices all precede subsystem or whole-corpus runs.
+- Completion is defined by a generated zero-gap normative ledger, exact Test262 transition
+  comparisons with no pass regression, complete internal-method/intrinsic matrices, reproducible
+  manifests, a green bounded gate, and an honest frontier. No implementation behavior changed in
+  this documentation tranche.
+
+## 2026-08-26: global binding keys are runtime strings and ReferenceErrors name the binding
+
+- Global binding semantics now have one representation: `GetGlobalBinding`,
+  `TypeOfGlobalBinding`, `SetGlobalDeclarativeBinding`, and `SetUnresolvableBinding` accept the
+  canonical runtime property-key string. Compiler-local shape-name IDs no longer cross this DSL
+  boundary. The same string drives environment lookup, mutation, and `<name> is not defined`.
+- The frontend supplies only identifier structure as a string constant. JavaScript-visible lookup,
+  prototype traversal, strict/sloppy assignment behavior, and exception construction remain in
+  `lib/abstract/property.jsl` through ordinary `HasProperty`, `GetProperty`, and `SetProperty`.
+- The focused former failure now reports decoded `Date is not defined` in both variants. The full
+  1,480-path former-ReferenceError cohort produced 2,815 variants in 441.233s with zero
+  pass-to-nonpass transitions. Evidence:
+  `results/test262-results-reference-errors-named-v2-2026-08-26.jsonl` and
+  `results/test262-reference-error-paths-2026-08-26.txt`.
+- Leading missing bindings are: `Symbol` 398, `Temporal` 366, `Date` 282, `eval` 263,
+  `ArrayBuffer` 188, `Int8Array` 180, `Intl` 144, `Proxy` 141, `RegExp` 112, `Set` 81,
+  `Promise` 68, `DataView` 59, `Map` 53, and `Reflect` 52. These are real absent subsystems, not
+  globals whose existing DSL implementation merely needs publication. `Symbol` is the largest
+  non-Temporal target, but requires a real primitive/key representation before its constructor can
+  be materialized honestly.
+
+## 2026-08-26: 10,000-path retained Test262 observability run
+
+- A deterministic random 10,000-file Test262 selection is retained at
+  `results/test262-random-10000-paths-2026-08-26.txt`; all 18,011 expanded variants are retained at
+  `results/test262-results-random-10000-2026-08-26.jsonl`.
+- Results: 4,009 passed, 10,880 failed, 1,879 refused, and 1,243 skipped. The resumed execution
+  after recovery took 561.892s at 16 jobs.
+- Of 5,048 visible JavaScript throws, 2,811 are decoded `ReferenceError` (2,810 say `unbound global
+  identifier`), 235 are null throws, and 181 remain undecoded. Other leading failure classes are
+  2,559 `SIGABRT`, 1,561 native signal 11, 961 graph corruptions, 472 native signal 5, and 222
+  `SIGSEGV`.
+- The previous complete-run JSONL and the first partial targeted rerun were deleted during disk
+  cleanup, so the exact prior exit-70 path cohort could not be reconstructed. This deterministic
+  sample replaces that lost evidence and lives under `results/` to keep it out of temporary-file
+  cleanup.
+
+## 2026-08-26: Test262 results retain JavaScript throw diagnostics
+
+- Failed native execution now prefers the runtime's `uncaught JavaScript throw` diagnostic over
+  the later generic `native-harness: execution failed` process summary. This changes reporting
+  only; execution, harness assembly, and JavaScript semantics are untouched.
+- The focused `Object.defineProperties/15.2.3.7-5-b-173.js` witness now records both variants as
+  `uncaught JavaScript throw value=0x0000000000000000`, exposing the null throw previously hidden
+  beneath exit 70. Evidence: `/tmp/aotk-exit70-observability-after.jsonl`.
+- The existing deterministic 1,000-path corpus produced 1,644 variants in 65.382s: 375 passed,
+  1,104 failed, 165 refused, and 147 skipped. Of 538 visible JavaScript throws, 330 are decoded
+  `ReferenceError`, 18 are null throws, and 190 are other decoded or undecoded exceptions. The
+  other leading failure classes are 257 aborts, 120 graph corruptions, 118 signal-11 crashes, and
+  26 signal-named segmentation faults. Evidence:
+  `/tmp/aotk-exit70-observability-1000.jsonl`.
+- The bounded gate is 52/52 green. The frontier remains exactly the two expected open bugs:
+  `for-await-has-no-bridge-kind` and `shortest-round-trip-digits`.
+
+## 2026-08-26: cross-process JSL artifact is exact on disk but unsafe to execute
+
+- The complete artifact-enabled run finished all 93,122 accounted variants in 3,708.366s:
+  21,239 passed, 55,725 failed, 9,755 refused, and 6,403 skipped. Results are retained at
+  `/tmp/aotk-full-artifact-20260826.jsonl`.
+- That run is **not** accepted as the new default result. A current uncached control over 815 files
+  that had passed in the prior v5 run found 34 passing variants. Comparing those exact variants
+  against artifact execution exposed 17 cached pass-to-failed outcomes. Ten repeated runs over the
+  disputed set produced 326/340 artifact passes versus 340/340 uncached passes.
+- The serializer itself round-trips exactly: a seed built to `/tmp/aotk-seed-a.mfts`, loaded in a
+  clean process, and reserialized to `/tmp/aotk-seed-b.mfts` is byte-identical. The defect is a
+  missing separate-compilation invariant, not binary corruption.
+- Exception tracing gives stable semantic witnesses. Retained `ObjectCreate` followed by property
+  definition reaches `DefineProperty` with a value classified as non-object; retained
+  `DefineProperties` misses descriptor/accessor behavior. This narrows the missing state to
+  cross-process object/shape/callable metadata or relocation, despite direct-call ABI checks.
+- The runner default is restored to fresh exec plus per-request JSL compilation. Artifact loading
+  is available only with explicit `--seed-artifact`; source/graph batching remains default one.
+  Parse and early-negative requests do not load the artifact because they do not lower JavaScript.
+- Evidence: `/tmp/aotk-prior-pass-current-uncached-20260826.jsonl`,
+  `/tmp/aotk-disputed-cached-*.jsonl`, `/tmp/aotk-disputed-uncached-*.jsonl`, and
+  `/tmp/aotk-cross-process-trace-*.jsonl`. Next: make object/shape/callable identities fully
+  relocatable, require 340/340 repeated equivalence, then repeat the complete run.
+
+## 2026-08-26: clean Test262 processes now load an immutable compiled-JSL artifact
+
+- The runner still compiles every Test262 Script in a fresh exec-created process with batch size
+  one. It now builds the JSL machine-text seed once per invocation, writes a versioned binary
+  `MachineFunctionTextStore` artifact, and loads that immutable prefix in every request process.
+  No Realm, JavaScript global, AST, graph, or mutable compiler state crosses Script boundaries.
+- The Coil-owned format contains every parallel machine-text table: semantic and ABI identities,
+  code bytes, relocations, frame metadata, safepoint sites, and roots. Counts are bounds-checked;
+  malformed/truncated files clear the store and fail. The import catalog is rebuilt from semantic
+  identities after load rather than serialized as process state.
+- Artifact startup re-reads and structurally lowers JSL declarations because that initializes
+  frontend metadata needed by a fresh Script. It deliberately skips library graph analysis,
+  selection, scheduling, allocation, encoding, and publication. Mean startup on the random
+  100-path corpus is 30.96ms versus roughly 180-210ms for full seed compilation.
+- Current-code control (`--no-seed-artifact`) on 166 executable variants took 18.836s and produced
+  39 passed, 104 failed, 23 refused. The default artifact path took 18.103s in the final corrected
+  run and produced 41 passed, 101 failed, 24 refused. There were zero pass-to-nonpass transitions:
+  two positive destructuring variants changed from signal 5 to pass, and one changed from SIGSEGV
+  to a compiler refusal. Evidence:
+  `/tmp/aotk-random-100-current-uncached-20260826.jsonl` and
+  `/tmp/aotk-random-100-artifact-lowered-20260826.jsonl`.
+- `--no-seed-artifact` is retained as an explicit diagnostic control. The default gate now includes
+  `tests/gate/seed-artifact-gate.coil`, which builds, writes, clears, reloads, links, executes, and
+  cleans up a restored seed. `coil test` is 52/52 green.
+- Next: run the complete supported Test262 scope with the artifact default, compare it to the last
+  retained complete result, and investigate any passed-to-nonpassed transition before accepting
+  the full-suite throughput number.
+
+## 2026-08-26: warm singleton workers rejected; immutable seed artifact is the safe speed path
+
+- Multi-test source/graph batching remains rejected and defaults to one. The 100-path comparison
+  was slower in bulk and exposed a cross-unit indirect-call crash, so compilation-unit sharing is
+  not an acceptable throughput mechanism.
+- The server protocol no longer compiles in a post-fork request child. It now compiles directly in
+  its exec-created worker; only generated JavaScript enters the later isolated child, which never
+  calls Go. This removes the protocol's unsupported Go-after-fork operation.
+- Long-lived mutable workers were tested but are **not** the runner default. On the same random
+  100-path/166-executable-variant corpus, the clean baseline was 39 passed, 104 failed, 23 refused;
+  warm singleton workers produced 38 passed, 105 failed, 23 refused. Exact comparison found three
+  status transitions, including String `15.5.5.5.2-3-5.js` strict changing from pass to execution
+  SIGSEGV. It passes when run first in a worker, proving order-dependent compiler-state leakage.
+- Warm execution was 20.604s versus 20.344s for clean one-shot execution, so compiler crashes and
+  worker replacement also erased the expected seed benefit. Evidence is
+  `/tmp/aotk-random-100-warm-singleton-20260826.jsonl`; the clean baseline is
+  `/tmp/aotk-random-100-singleton-20260826.jsonl`.
+- The runner therefore remains fresh-exec-per-Script. The next throughput implementation is a
+  versioned immutable artifact for `MachineFunctionTextStore`: persist the retained JSL records,
+  relocations, ABI metadata, sites, and roots, then rebuild the import catalog after loading it in
+  each clean process. This removes the measured 180-210ms JSL seed rebuild without preserving any
+  mutable compiler or JavaScript state.
+- `coil test` remains 51/51 green; frontier remains exactly `for-await-has-no-bridge-kind` and
+  `shortest-round-trip-digits`.
+
+## 2026-08-26: Test262 compilation now uses a fork-safe one-shot request boundary
+
+- The warm supervisor architecture was invalid: it initialized the Go TypeScript runtime and then
+  entered Go from forked request children. In a 510-variant former-timeout cohort, 501 completed
+  records stopped after `source_parse_begin`, and two requests remained unreaped past timeout.
+  This was a post-fork Go-runtime deadlock, not representative compiler performance.
+- The default runner now `exec`s a fresh native request process for every independent Test262
+  Script unit. The process parses and compiles from clean runtime state; generated JavaScript still
+  executes in its own later fork child, which never enters Go. There are no source wrappers,
+  concatenated tests, shared Realms, receiver rewriting, or persistent mutable compiler state.
+- The rebuilt Map `valid-keys.js` witness parses in 3.1-3.4ms and reaches the expected frontend
+  refusal in about 0.74s instead of timing out. The large Array sort stability witness parses in
+  about 9ms and indexes in about 0.40s, then times out later in compilation; that is a separate
+  large-program performance issue.
+- Independent-unit bulk compilation remains opt-in (`--batch-size`; default 1). It structurally
+  preserves distinct ASTs, Script records, callable ranges, and execution children, but it is not
+  yet status-equivalent: the current two-variant `length-falsey.js` witness returns tagged
+  `undefined` (`0x7ffc000000000000`) for both selectors instead of host status zero.
+- Bulk-path defects fixed while diagnosing that mismatch: `REFUSED` is now a recognized batch
+  outcome; fallback uses clean one-shot requests; linked images can be retained across isolated
+  execution children and released once; batch compilation initializes the immutable JSL seed and
+  publishes its suffix through `nh-cache-compiled-script?`; normal dispatcher completion is host
+  status zero; retained entry selection uses ephemeral semantic identity rather than `symbol=-1`.
+- Current evidence: `/tmp/aotk-exec-boundary-witness-20260826.jsonl` for the fork-safe singleton
+  boundary and `/tmp/aotk-bulk-two-semantic-entry-20260826.jsonl` for the remaining bulk mismatch.
+  `coil test` is 51/51 green; frontier remains exactly `for-await-has-no-bridge-kind` and
+  `shortest-round-trip-digits`. Next: trace the linked owner-0 return path against direct owner-0
+  execution and fix the retained image identity/layout issue before changing the default batch.
+
+## 2026-08-26: retained Test262 cache crash is a function-text ownership defect
+
+- The official-semantics architecture remains unchanged: each Test262 case is an independent
+  ordered Script unit, executed in a fresh fork child. Speed comes from a persistent compiler and
+  immutable compiled JSL records, never JavaScript wrappers, shared Realms, or receiver rewriting.
+- Full 76-record retention exposed an AArch64 `CBZ` landing in veneer data. Crash tracing proved
+  the instruction was internally well-sized and its CFG label was valid in the freshly encoded
+  unit. The retained linker was copying a truncated function record, not misencoding the branch.
+- `mft-extract-mode!` now diagnoses every plain `B`/`CBZ` whose target falls outside its claimed
+  function-text range. The focused String-concat witness identifies owner 16: its record begins at
+  byte 455216 and is truncated at 483336, while owner-16 blocks and branches continue through
+  roughly byte 670000. Compact image assembly consequently omitted live control-flow targets.
+- Selection lowering and the local scheduler now both publish canonical function/RPO order rather
+  than raw graph-discovery block-id order. Those are correct independent fixes, but the focused
+  witness proves a deeper owner/block inconsistency remains before encoding. Re-running with all
+  existing graph/backend verification enabled did not reject it, so this invariant is currently
+  absent from verification rather than hidden by the Test262 production policy.
+- Runtime image registration now carries the actual linked code base separately from the kernel
+  entry, semantic ephemeral lookup cannot collide with JSL symbols, and linked entry lookup uses
+  the reserved synthetic-kernel symbol `-1`. Keep those fixes; retained prefixes make the old
+  `kernel - first-function-offset` resolver arithmetic invalid.
+- Current focused evidence is `/tmp/aotk-focused-post-allocation-layout-20260826.jsonl`; production
+  verification is restored off. `coil test` is 51/51 green and the frontier remains exactly the
+  two expected cases. Next: add a bounded final packed-owner/block invariant, identify the first
+  mismatched instruction and producer phase, repair ownership at construction, then require zero
+  out-of-record branches before repeating throughput measurements.
+
+## 2026-08-26: 76/76 cache experiment identifies need for an explicit callable-id IR value
+
+- Retained text now has `MFT-RELOC-CALLABLE-ID`, cache dependency closure understands that kind,
+  AArch64 can emit a fixed four-word callable immediate, and image assembly can resolve its target
+  by stable function kind/unit/local identity before patching an image-local callable symbol.
+- Callable relocations participate in cacheability and retained dependency closure. With the
+  callback exclusion temporarily removed, a rebuilt runner retained all 76 JSL records with zero
+  dependency drops. The focused Script graph fell from roughly 30,943 to 24,540 nodes and from 34
+  to 29 selected functions, proving that callback-bearing library work moved across the intended
+  separate-compilation boundary.
+- Reusing `Fun` itself as the closure target value was incorrect: the runtime closure field is an
+  integer callable ID, and changing its ideal type/storage contract made the safe-seed witness
+  segfault. That representation change was reverted. The correct next step is an explicit
+  integer-valued `CallableId(target-fun)` ideal operation which preserves semantic target identity
+  through selection without changing the closure object model.
+- Production seed admission is restored to the proven 45 non-callback records. The relocation and
+  collision-free symbol infrastructure remains present. The rebuilt safe-seed String concat
+  witness passes default and strict. Do not reopen all 76 until the explicit IR value has a rebuilt
+  native witness; `--no-build` uses the prior standalone runner binary and is not evidence after
+  compiler source changes.
+
+## 2026-08-26: Test262 cache seed is independent of test order
+
+- The persistent singleton runner now builds its immutable cache from `lib/index` before compiling
+  the first Test262 Script. It no longer treats an arbitrary first test's specialized graph as the
+  common-library image.
+- The seed includes exactly the transitive non-callback JSL subgraph. The DSL checker already
+  computes `calls-back` to a fixed point, so excluded declarations include both direct JavaScript
+  call forms and every JSL caller that can reach one. This preserves the existing closed-world
+  callback semantics: callback-bearing operations are still compiled with each fresh Script.
+- This is a proper separate-compilation boundary, not JavaScript batching: source and harness files
+  remain independent Script records, and execution still occurs in a fresh fork child. The next
+  expansion requires runtime-resolved indirect dispatch so callback-capable JSL can join the seed
+  without embedding a test-specific function universe.
+- The rebuilt focused String-concat witness passes default and strict variants. On the identical
+  100-file String scope used by the preceding cache measurements, all 199 variants completed in
+  58.744s versus 62.516s for the previous profiled path and 60.818s for its unprofiled run. Exact
+  transitions are 74 passed-to-passed, 8 failed-to-passed, 117 failed-to-failed, and zero
+  passed-to-nonpassed; totals are now 82 passed, 117 failed, 0 refused. The retained seed is a
+  measurable improvement, not yet the large recovery expected from making callback-capable JSL
+  separately compilable.
+- Linked function metadata is now version 3 with explicit 32-bit JavaScript callable identity and
+  signed return-normalization code fields. Both ordinary object publication and retained-image
+  publication emit the same 40-byte record. The runtime resolves an ID against the currently
+  registered image and returns its relocated code address plus ABI code; this is the shared
+  architecture-independent foundation for replacing the AArch64 and x86-64 closed-world ladders.
+
+## 2026-08-26: allocation-bearing JSL cache is live without semantic batching
+
+- Runtime `MI-NEW` is fixed-width and retained text records three size plus two shape-ID
+  relocations keyed by a stable runtime-layout fingerprint.
+- Retained relocations archive size, field count, raw-reference bitmap, and boxed bitmap. The
+  linker assigns per-image IDs, deduplicates exact layouts, rejects conflicts, appends
+  `LayoutRec` metadata, and never retains compiler type/alias/Realm state.
+- A shape-reset witness proves an allocation relinks after its original compiler shape table is
+  gone. The slow-path publication locator was corrected to fixed word 37; before that fix the
+  rebuilt child branched through the old variable-width relocation site.
+- Rebuilt focused Test262 witness `String/prototype/concat/S15.5.4.6_A6.js` passes default and
+  strict through cold and warm production paths.
+- Identical 100-file String scope: 199 variants, 74 passed, 125 failed, 0 refused, and zero status
+  transitions. Unprofiled total is 60.818s versus 74.903s immediately before this work. Profiled
+  total is 62.516s; largest totals are selection 12.253s, frontend analysis 9.521s, native
+  execution 9.290s, allocation 8.795s, native-to-first-output 8.617s, and suffix snapshot 6.334s.
+- Cache admission changed from 11/18 directly cacheable with seven shape rejections and three
+  retained to 18/18 directly cacheable with zero shape rejections and four retained. A later cold
+  seed in the scope retained 7/23 after dependency closure.
+- Runner stderr retention increased from 64 KiB to a bounded 1 MiB per active request. The old cap
+  silently discarded completion-side cache/link/native profiles and produced impossible compile
+  totals; persisted phase attribution is now complete.
+
+## 2026-08-26: official singleton Test262 execution now reuses compiled JSL text
+
+- The persistent native worker now retains ABI-identified, dependency-free JSL function text after
+  its first successful Script compilation. Later requests lower matching declarations as explicit
+  bodyless imports, compile a fresh Script-specific suffix, resolve semantic call/address
+  relocations into an in-memory image, execute that image in the existing forked child, and
+  truncate the suffix afterward. Test262 source and harness files remain ordered, independent
+  Script records; there is no concatenation, generated JavaScript wrapper, shared executed Realm,
+  or receiver substitution.
+- The initial cache tier is intentionally safe and narrow. A retained JSL record must already be
+  cacheable and contain no semantic call/address relocation, so it cannot refer to an omitted
+  function. Imported functions retain stable identity plus declared ABI, have zero local CFG
+  blocks, and are resolved by the ABI-checking image linker. A dependency-closed cache is the next
+  expansion point; broadening retention without proving closure is prohibited.
+- Integration exposed and fixed two backend assumptions that local bodies had hidden: call return
+  representation now consults a declared function ABI before body inference, and return-tag
+  propagation treats only `-1` as absent instead of rejecting valid negative function, closure,
+  and array tags. AArch64 polymorphic dispatch now emits fixed-width semantic address relocations
+  for imported targets rather than a one-word `BRK`, keeping sizing and emission identical.
+- Warm imported suffixes bypass standalone memory publication because unresolved imports make a
+  standalone image invalid; they proceed directly to the semantic linker. The linked entry is the
+  first record after the retained prefix, which follows the owned snapshot invariant (fresh owner
+  0 first) rather than guessing an identity kind. Every child result, including failure, truncates
+  the suffix and clears linked-current state.
+- Snapshot extraction was the dominant initial regression: it rebuilt global object indexes and
+  GC roots once per function. Hoisting those unit-wide builders reduced warm suffix snapshot cost
+  from about 346 ms/request to about 19 ms/request. On the identical 100-file String cohort (199
+  variants), execution improved from 167,398 ms to 53,257 ms and total time from 175,896 ms to
+  61,629 ms, a 2.85x end-to-end improvement. Both runs produced exactly 74 passed, 125 failed,
+  zero refused, and zero skipped. Results are
+  `test262-results-2026-08-26T05-07-06-172Z.jsonl` and
+  `test262-results-2026-08-26T05-12-52-151Z.jsonl`.
+- The focused upstream witness
+  `built-ins/String/prototype/concat/S15.5.4.6_A6.js` passes both default and strict variants in one
+  worker, proving cold publication followed by imported linking and execution. The bounded gate is
+  51/51. Remaining performance work is ordinary fresh frontend/selection/scheduling/allocation and
+  expanding the cache through a proven dependency-closed JSL set, not changing Test262 semantics.
+- Retention now computes that dependency closure as a fixed point: a cacheable JSL record survives
+  only while every semantic call/address target resolves to another retained JSL identity with an
+  exactly compatible ABI. This is strictly more general than the original leaf rule and still
+  cannot retain a dangling target. On the String concat witness it does not broaden the cache:
+  cold admission reports 18 JSL records, 11 initially cacheable, 7 rejected for `MI-NEW` shape
+  specialization, and only 3 dependency-closed records retained. Warm lowering remains 16 bodies
+  and 6,167 nodes, so the observed 10-variant wall variation is not claimed as a cache speedup.
+- The image linker already understands shape-id and shape-size relocations, but extraction does not
+  yet emit them and imported bodies do not repopulate the fresh compiler shape table. Merely keeping
+  the first test's shape table would make later compilation depend on corpus order and consume the
+  bounded shape-id space, so that is not an acceptable shortcut. The next reusable boundary needs
+  a deterministic cached-shape catalog (or a dedicated common-library/harness seed) whose runtime
+  layout metadata is restored independently of any test Realm.
+
+## 2026-08-25: internal calls now retain relocatable function metadata
+
+- AArch64 previously resolved every direct internal `BL` during encoding and discarded the call's
+  semantic relocation. `MachineUnit` now retains `(source owner, absolute code offset, target
+  owner)` for every direct internal call while emitting the exact same branch bytes.
+- Polymorphic JavaScript dispatch also embeds internal code addresses using
+  `ADR + fixed-width delta + ADD`; these are not calls and cannot share the `BL` patcher. Both
+  address-materialization sites now route through one helper and retain a separate
+  `(source owner, ADR offset, target owner)` relocation stream. This closes the known internal
+  layout dependencies in AArch64 text rather than caching code with hidden stale addresses.
+- Read-only model accessors expose relocation count, source, offset, and target. The bounded object
+  witness compiles a two-function call, requires one relocation, proves its site lies inside the
+  recorded source function range, and independently checks the encoded `BL` against the target
+  function's published code start.
+- This is prerequisite infrastructure, not a cache or measured speedup. A reusable function-text
+  record can now store a source-relative call site and repatch it at a new layout without retaining
+  machine IR or scanning function ranges. External runtime relocations remain separate and
+  unchanged. Stack maps, layout metadata, stable cache keys, and Script-global initialization are
+  still required before any function can actually be reused across Test262 compilations.
+- Direct-call relocation has a bounded byte-level witness. A focused polymorphic witness uses the
+  valid runtime target set `{1, 2}`, requires exactly two address relocations, proves each ADR site
+  lies inside its source function, verifies each target owner, and checks the encoded ADR opcode.
+  `tests/backend-call-test.coil` is 20/21: this new witness is green; the sole failure is the
+  pre-existing `explicit_capture_prefix_does_not_duplicate_closure_captures_or_shift_receiver`
+  native execution mismatch and is unrelated to relocation metadata.
+
+## 2026-08-25: backend-only profiling identifies the reusable-code boundary
+
+- Direct profiling of one official ordered unit (`assert.js`, `sta.js`, then the test) avoids the
+  runner's retained-stderr cap and accounts for the complete backend. The representative unit has
+  17,631 ideal nodes, 25 machine functions, 3,177 blocks, 20,840 vregs, and 29,207 scheduled
+  instructions.
+- Selection spends 15.706 ms in recursive preselection and 7.378 ms emitting function
+  terminators. Liveness totals 11.840 ms, led by a 2.315 ms predecessor-worklist solve; allocation
+  totals 20.595 ms, led by 11.914 ms of exact interference construction and 5.461 ms of coloring.
+  Liveness is already owner-local, word-packed, and worklist-driven; the old scheduler
+  `pair_queries` number is not executed work.
+- Per-function accounting shows 24,937 instructions before scheduling copies: 16,100 in the 12
+  source-owned functions (including the 6,716-instruction host/main path) and 8,837 in 13 JSL
+  functions. Scheduling adds another 4,270 instructions. Most work is therefore repeated common
+  harness/runtime code, not the tiny test body or process protocol.
+- The next large speed boundary is reusable compiled functions with relocatable calls and an
+  explicit Script-global initialization interface. Official harness records still execute for
+  every test against a fresh global; only immutable machine text and compiler results may be
+  reused. Splitting frontend owners without that global lexical/declaration interface is not safe,
+  and concatenation, JavaScript wrappers, or a shared executed Realm remain prohibited.
+- Profile-only `machine_function` records now report owner, ideal function node, blocks, and
+  pre-scheduling instruction count. They are emitted only under backend profiling and do not alter
+  compilation or execution.
+
+## 2026-08-25: shared JSL lowering is idempotent and allocator ingress setup is linear
+
+- Independently appended Script units reserve one stable JSL function-id range, but declaration-
+  local visited metadata resets per unit. `jl-require-decl!` now consults the retained graph by
+  stable function id before opening a body. Width 2 consequently lowers 19 JSL declarations and
+  6,594 nodes rather than 38 declarations and 13,224 nodes; calls from both units still reach the
+  one shared body and participate in whole-image analysis.
+- On the exact retained 100-file/190-variant cohort, width-2 execution fell from 17,174 ms to
+  14,284 ms, a 16.8% improvement, while preserving 42 pass, 129 fail, 19 refuse, and zero exact
+  `(path, variant)` status changes. It remains 26.8% slower than singleton and remains opt-in.
+- Register-allocation initialization performed a complete machine-instruction scan for every ABI
+  ingress copy merely to reconstruct that function's fixed argument-register mask. It now builds
+  one mask per function during the existing instruction pass and applies it in O(1) per copy.
+- The same exact singleton cohort remains status-identical and improves from 11,261 ms execution to
+  10,623 ms, a 5.7% end-to-end execution gain. Aggregate allocation time fell from 9,544.6 ms to
+  6,912.7 ms, a 27.6% phase reduction. Artifacts are `/tmp/aotk-current-single-v5.jsonl` and
+  `/tmp/aotk-current-single-allocmask-v1.jsonl`.
+- The reported scheduler `pair_queries` field is currently a legacy shape metric equal to the sum
+  of squared block sizes, not an executed query count. Scheduler construction already uses indexed
+  explicit dependency edges and a ready heap; do not cite that metric as performed work.
+
+## 2026-08-25: exact batching equivalence is green, but combined backend work is slower
+
+- Batched compilation now refuses unsupported members individually during independent frontend
+  indexing. A rejected Script no longer poisons its supported neighbor or forces that neighbor
+  through a redundant singleton retry. The protocol records `BATCH <index> REFUSED`, and the
+  runner preserves it as native refusal status 2.
+- The retained upstream 100-file/190-variant cohort is exactly status-equivalent between fresh
+  singleton and width-2 runs: both report 42 pass, 129 fail, and 19 refuse, with **zero** per-path
+  or per-variant status changes. Artifacts are `/tmp/aotk-current-single-v5.jsonl` and
+  `/tmp/aotk-current-batch2-v5.jsonl`.
+- Width 2 is not a throughput win and remains opt-in. Singleton execution took 11,261 ms; width 2
+  took 17,174 ms, a 52.5% regression. Total times including the roughly 7.8-second Coil build were
+  19,001 ms and 25,018 ms respectively.
+- The cost is compiler work, not Realm/process isolation. Combined graphs make selection,
+  scheduling, allocation, and analysis superlinear; later combined-graph failures also caused 51
+  failed variants to retry at width 1. The correct next speed architecture is to retain independent
+  Script parsing, indexing, graph ownership, and child execution while sharing immutable compiled
+  harness/JSL machinery. Do not enable combined-graph batching by default merely because its
+  semantics now agree on this cohort.
+- The local 28-variant fixture corpus is also exact at width 1 versus 2 (28 pass, zero transitions),
+  but width 2 took 2,276 ms execution versus 1,753 ms singleton. The bounded gate remains green at
+  50/50; the frontier remains intentionally red on its two recorded bugs.
+
+## 2026-08-25: real Test262 batching is end-to-end but remains opt-in
+
+- The persistent protocol accepts a batch manifest whose rows retain one assembled Test262 unit
+  each: official `assert.js`, `sta.js`, requested includes, and the test remain ordered Script
+  records. The native harness independently parses/indexes every unit, reserves disjoint source
+  callable ranges plus one shared JSL range, lowers one compiler-owned dispatcher, publishes once,
+  and executes one selector per forked child.
+- This is not enabled by default. `--batch-size` defaults to 1. Exact equivalence is now green on
+  the current deterministic 100-file/190-variant cohort, but combined backend work is slower; see
+  the newer entry above. Do not claim the earlier batch throughput measurements as usable.
+- Fixed along the way: internal Script completion now uses Script rather than host-publication
+  ownership; returned diagnostic words are no longer blindly called passes; normal Script
+  completion is recognized as canonical `JSV-UNDEFINED`; singleton fallback retries use a fresh
+  worker so late batch stderr cannot contaminate classification; and closure/direct-call metadata
+  no longer assumes graph function id equals frontend-local id plus one.
+- The earlier `assert` visibility failure was caused by dispatching a hard-coded function id rather
+  than each indexed unit's actual synthetic main id. Entries now use the frontend's real main id;
+  official harness declarations remain ordinary Script declarations and require no runner rewrite.
+
+## 2026-08-25: independent Script units now share one compiler-owned dispatcher
+
+- The frontend can now begin a Script compilation unit, append further independently parsed and
+  indexed units without resetting graph/JSL state, emit an indexed native dispatcher, and run
+  whole-image analysis once after the final append. Each unit receives a disjoint graph-level
+  function-id base; no JavaScript wrapper or source concatenation participates.
+- The bounded witness compiles two separate `NativeFrontend` instances at bases 64 and 128,
+  requires both Script entry functions (65 and 129) and both host calls to remain live, verifies
+  the combined graph, and selects the machine program. The bounded gate is green at 50/50.
+- Host dispatch comparison is explicitly compiler-owned IR structure in `node.coil`; it is not a
+  JavaScript equality operation and does not create an exception to DSL ownership. The frontend's
+  exact semantic-op budget remains unchanged.
+- This proves the core batching graph but does not yet make the Test262 runner use it. The runner
+  still compiles one test variant per request. Next is a batch-manifest protocol, one published
+  image per batch, and one forked child per selector, followed by singleton-versus-batch semantic
+  comparison and timing. Harness records must remain official, ordered Script records, and every
+  child must execute exactly one test against pristine pre-execution state.
+
+## 2026-08-25: Script semantics no longer require the sole host Start
+
+- Frontend compilation now distinguishes `script-entry` from `host-entry`. Script semantics
+  (`this`, global declaration initialization, global environments, and no function `arguments`)
+  remain attached to the former; graph publication, host exception completion, DSL entry control,
+  and returns attached to global `Stop` belong to the latter. Existing compilation still sets both
+  flags, so the ordinary path is behavior-neutral.
+- `frontend-native-build-dispatched-script!` proves the next structural boundary without changing
+  JavaScript source: it opens the synthetic Script entry as an internal `Fun`, compiles it with
+  Script semantics, and emits a compiler-owned host `Start` call. The bounded witness requires the
+  internal function and host call, verifies the graph, and selects the multi-function machine
+  program. The gate is now 50/50.
+- This is not yet multi-test batching. The next step is assigning globally unique function/symbol
+  ranges to several independently indexed frontend units and extending the compiler-owned
+  dispatcher to select one internal Script entry. No generated JavaScript function, shared Realm,
+  or modified harness is involved.
+- Source frontend ids now remain local while graph `Fun` identities accept an explicit reserved
+  base. The dispatched-Script witness compiles at source-function base 64 and requires its live
+  Script `Fun` identity to be at least 65 before graph verification and machine selection. This
+  removes the first cross-unit collision without mutating frontend resolution tables. The remaining
+  lifecycle work is to reserve every unit range up front, append units without resetting graph/JSL
+  state, and run whole-image analysis plus one indexed dispatcher only after the final append.
+- The attempted shortcut that reduced retained-snapshot folding to one seed round was rejected:
+  an exact previously passing cohort found three passed-to-failed transitions. That experiment was
+  removed. The sound selective first `iterate!` drain remains: the exact 107-variant passing cohort
+  is restored to 107/107, and the earlier compiled cohort reduced mean frontend graph time from
+  298.15 ms to 247.28 ms.
+
+## 2026-08-25: loop discovery no longer rescans the complete CFG
+
+- A 100-file/200-variant compiled Test262 profile confirms that singleton compilation is dominated
+  by frontend graph work: 299.69 ms mean `frontend_graph`, including 230.54 ms of
+  analyze/fold/iterate. Selection averaged 15.82 ms, allocation 10.63 ms, publication 2.84 ms, and
+  native execution 2.33 ms. This is why process, parser, or publication batching alone cannot
+  recover the old synthetic-wrapper throughput; the proper independent-entry architecture must
+  reuse already analyzed harness code.
+- Machine CFG loop discovery contained an unrelated but measurable algorithmic defect: for every
+  backedge and every visited natural-loop block it scanned the complete edge array to rediscover
+  predecessors, despite predecessor adjacency already being available. It now walks the block's
+  predecessor slice. On the identical cohort, `mu_loops` fell from 18.66 ms to 0.394 ms per
+  variant, a 47x phase reduction. End-to-end wall time was flat under eight-worker contention, so
+  no whole-run speedup is claimed from this local fix.
+- The exact official Module parse/early-error cohort is now 204/204, not the earlier 195/204
+  checkpoint below. The bounded gate remains green at 49/49. Independent Script/Module entry
+  batching remains active work and must not use generated JavaScript wrappers or shared Realm
+  state.
+
+## 2026-08-25: fresh-process in-memory execution removes the ARM64 loader round trip
+
+- The semantically correct full baseline is retained as
+  `test262-results-full-2026-08-25.jsonl`: 90,610 total variants, of which 84,302 were attempted;
+  20,992 passed, 54,375 failed, 8,935 refused, and 6,308 were policy skips. It took 4,070,202 ms
+  (67m50s) with eight persistent compiler workers. The complete module parse/early-negative cohort
+  is now 204 pass and 0 fail for the currently enumerated Module parse/early-error cohort.
+- The runner already compiles each case from distinct Script records (`assert.js`, `sta.js`, each
+  include, then the test). It no longer combines independent tests as generated JavaScript
+  functions. That preserves directive prologues, declaration instantiation, top-level `this`, and
+  one fresh process/Realm per test, but exposes the real per-program compiler cost.
+- ARM64 Test262 execution now forks the persistent compiler worker after code generation and runs
+  the encoded machine code directly in the child. Copy-on-write process state preserves isolation;
+  a pipe carries the complete i64 assertion result, and `alarm(2)` confines nontermination to the
+  child. No Test262 source, metadata, harness file, or JavaScript operation is changed. x86-64 keeps
+  the linked ELF path.
+- A deterministic sample of 100 previously passing official files produced 196/196 passes with no
+  status transitions. Mean matched attempt time fell from 155.53 ms in the retained full baseline
+  to 113.26 ms, and native execution fell from 12.81 ms to 2.90 ms. This is a real 27% sample-level
+  gain, not a restoration of synthetic-wrapper batching: graph construction, selection,
+  allocation, and scheduling remain the dominant work.
+- `--quiet` now actually suppresses all per-variant console lines; durable JSONL and summary output
+  are unchanged. The bounded gate is green at 49/49. The active runner goal remains open: the next
+  large throughput step must share compiled harness initialization across structurally independent
+  Script entries, not wrap tests in functions or share JavaScript runtime state.
+- ARM64 Test262 publication now emits only the model-verified stack-map and layout payload needed
+  by direct execution, rather than serializing a complete Mach-O container and a duplicate text
+  section. The same deterministic sample remains 196/196. Mean measured compilation falls from
+  107.68 ms on the fork-only path to 89.10 ms; sample wall time is flat within contention/noise, so
+  no additional end-to-end percentage is claimed. Full Mach-O publication remains exercised by the
+  bounded native gate and all non-Test262 native paths.
+- Ordinary runner invocations now default to `min(8, availableParallelism())` workers instead of
+  serial execution. `docs/TEST262-INDEPENDENT-BATCHING.md` records the required compiler boundary
+  for the remaining large gain: separate frontend declaration namespaces and structural Script
+  entries sharing immutable harness text/code.
+- Forced Module parsing no longer applies the Script-goal rule that rejects every static `import`,
+  `export`, and `import.meta`. That bug made 109 module-negative tests pass for the wrong reason.
+  The bridge now implements Module strictness; module `await`/`yield` grammar contexts; top-level
+  import/export declaration position; imported-binding restrictions; imported/exported-name
+  uniqueness; local export resolution; and default-export grammar using AST ownership and name
+  tables. The exact 204-case cohort moved from an inflated 189 pass/15 fail, through an honest
+  95/109 after removing the false positive, through 195/9, to **204 pass/0 fail**. This proves the
+  currently enumerated cohort, not complete Module execution or every ECMAScript static semantic.
+
+## 2026-08-25: runtime-backed globals no longer abandon successful exception checks
+
+- Branch, loop, optional-expression, switch, and try/catch snapshots used `fng-assigned!` to build
+  SSA carried-symbol sets. That set incorrectly included script globals, even though their sole
+  JavaScript state already lives in `JS-PROPERTY-ALIAS`. Snapshotting such a symbol called the DSL
+  global lookup, emitted a pending-exception guard, and then abandoned its successful control arm
+  when construction restored another snapshot. The exceptional return remained live, so CFG
+  selection either refused a dangling `CProj` or compiled the only surviving exceptional edge as
+  an unconditional jump.
+- `fng-assigned!` now admits only true lexical SSA bindings. Runtime-backed global-object and
+  script-global symbols travel exclusively through the property-memory snapshot, matching the
+  existing exception-target capture rule and keeping JavaScript-visible behavior in `lib/`.
+- Pending transport now unboxes descriptor 101's tagged boolean before `If`, synthetic Script
+  completion is emitted whenever live top-level control remains, and CFG construction ignores a
+  folded projection only when it has no control continuation. The runtime also has opt-in
+  `AOT_TRACE_EXCEPTION` records for transport operations 200--203; tracing proved every status
+  read returned false before the erroneous uncaught operation executed.
+- Focused evidence is 8/8: inert try/catch and no-throw-call witnesses plus default/strict variants
+  of `assert-throws-incorrect-ctor.js` and `assert-throws-null-fn.js`. The complete local Test262
+  fixture set is now 28 passed, 0 failed, 0 refused, and 0 skipped in
+  `/tmp/test262-local-after-global-snapshot.jsonl`. A permanent native differential regression
+  assigns a runtime-backed global on both try/catch arms and verifies normal no-throw completion.
+- `coil test` is green at 49/49. `coil test --suite frontier` remains intentionally red on the same
+  two open bugs. A monitored `coil build tools/test262-native.coil ...` completed in 9.82 seconds
+  at 2,139,832,320 bytes maximum RSS (about 1.99 GiB), so that invocation did not reproduce the
+  separately reported 60 GB event. Official modules, async completion, runtime-negative phases,
+  complete early errors, `$262`, and the full official corpus remain protocol work; the active
+  Test262-runner goal is not complete.
+
 ## 2026-08-25: batched Test262 runs no longer drop or misroute variants
 
 - `--batch-size > 1` isolated parse-negative tasks into singleton units and then accidentally sent
@@ -3099,3 +3696,471 @@ and use `call-dynamic-with-receiver`, matching `map`, `filter`, `forEach`, `some
 - Full negative-parse result `test262-results-negative-parse-current-v13-2026-08-25.jsonl`:
   8,179 passed, 37 failed, 0 refused, 204 skipped. Relative to v12: 12 failed-to-passed,
   8,167 passed-to-passed, 37 failed-to-failed, 204 skipped-to-skipped, zero regressions.
+## 2026-08-25: Test262 `early` SyntaxError negatives use the pre-execution path
+
+- Extended the production Test262 metadata policy from parse-only negatives to the two
+  pre-execution phases defined for this runner: `parse` and `early`, while requiring the expected
+  constructor to be `SyntaxError`. Other early-error constructors remain explicit policy skips;
+  runtime and resolution negatives are not misclassified as parser tests.
+- Renamed the native-worker protocol from parse-negative to pre-execution-negative so the boundary
+  describes what it actually proves: parser/static-semantics rejection before any Script executes.
+- A focused `negative: { phase: early, type: SyntaxError }` witness passed in default and strict
+  variants. A deliberately unsupported `early` + `ReferenceError` witness was skipped with an
+  explicit policy reason rather than falsely passing.
+- The complete checked-in Test262 case set remained 28 passed, 0 failed, 0 refused, 0 skipped in
+  `/tmp/test262-local-preexecution-regression.jsonl`. The bounded gate remained 49/49 green and the
+  frontier retained only its two recorded open bugs.
+- Exact runtime-negative support is deliberately separate. The correct next step is to classify
+  the existing structured uncaught-exception record by its JavaScript `name` property and require
+  an exact metadata-type match; accepting any nonzero process result would hide crashes and wrong
+  exception constructors.
+## 2026-08-25: runtime-negative Test262 completion uses real Script records
+
+- Recognized runtime-negative metadata is transported to the native compiler without changing the
+  assembled harness or test source. The entry graph installs a host completion boundary before
+  Script declaration instantiation and evaluation, so exceptions escaping any real Script record
+  merge through the ordinary exception path; normal completion is an explicit host failure.
+- JavaScript-visible matching remains DSL-owned. Built-in error constructors expose their standard
+  `name` property, and `ThrownConstructorNameMatches` performs ordinary property access before
+  comparing the thrown value's constructor name with the expected constructor's name. The native
+  runtime only transports success/failure and does not inspect JavaScript object layout. A
+  constructor mismatch becomes a dedicated host failure completion without manufacturing new
+  JavaScript state.
+- The expected side of runtime-negative matching is now the canonical constructor-name string from
+  DSL `BuiltinConstructorName`, rather than allocating a second constructor and reading its own
+  property. The thrown side still performs ordinary `constructor.name` access as required.
+- Runtime kind 7 names harness-defined `Test262Error`. It uses the same constructor-name matching
+  path as native Errors, so the runner no longer policy-skips that official negative type or needs
+  object-layout knowledge of the harness constructor.
+- `/tmp/aotk-runtime-negative-complete.jsonl` is the complete current runtime-negative phase: 14
+  pass, 40 fail on actual parser/runtime behavior, and 8 module variants remain policy-skipped.
+  No synchronous Script variant is skipped for an unsupported expected constructor type. The 24
+  non-module `Test262Error` variants specifically produce 14 passes and 10 Annex B HTML-comment
+  parser failures instead of the former policy skips.
+- Ordinary named functions now receive their standard non-writable, non-enumerable, configurable
+  `name` data property through DSL `InitializeOrdinaryFunctionName`. The frontend contributes only
+  the structurally inferred source name and invokes the DSL for top-level declarations and closure
+  materialization; there is no `Test262Error` name special case. The initializer explicitly boxes
+  the managed string at the property-value boundary.
+- Focused witnesses now distinguish all three runtime-negative outcomes: matching `TypeError`
+  passes, wrong `RangeError` fails with host exit 72, and normal completion fails with host exit 71.
+  The retained JSONL is `/tmp/aotk-runtime-negative-name-v2.jsonl`. Modules, async completion,
+  resolution negatives, complete early errors, fresh-realm isolation, and `$262` remain protocol
+  work; the active Test262-runner goal is not complete.
+- The persistent protocol's `?K:` runtime-negative prefix must retain multi-Script compilation;
+  treating it as a separate alternative to `@` concatenated harness and test records and changed
+  directive/declaration semantics. `?K:` now carries both the expected kind and multi-Script mode.
+- DSL abrupt collection also fed descriptor 101's tagged JavaScript boolean directly to ideal
+  `If`. Since tagged false is nonzero, successful primitive calls entered their captured exception
+  arms. `jl-check-pending!` now unboxes the transport value to a machine boolean, matching the
+  already-correct frontend pending check.
+- The complete current Test262 run is retained in
+  `test262-results-full-runtime-negative-wip-2026-08-25.jsonl`: 90,598 variants produced 20,747
+  passes, 54,391 failures, 8,936 refusals, and 6,524 policy skips in 72m44s. Excluding Temporal gives
+  81,308 variants: 20,747 pass, 46,888 fail, 7,149 refuse, and 6,524 skip. The non-Temporal pass rate
+  is 25.52% of all classified variants, 27.74% excluding policy skips, or 30.67% among attempted
+  pass/fail variants. This is a stopping-point measurement, not evidence that runtime negatives are
+  complete.
+- Fresh-Realm isolation does not require restarting the expensive compiler worker. Each variant is
+  published and executed in a fresh native child process, while only parsing/compilation metadata
+  stays resident. The checked-in `realm-isolation-poison.js` and `realm-isolation-clean.js` pair is
+  intended to run on one worker with `--batch-size 2`; the second must not observe the first test's
+  `Object.prototype` mutation.
+- Full runs now default to concise per-variant output instead of replaying every native stderr
+  timing/profile line. JSONL persistence and extracted failure diagnostics are unchanged;
+  `--verbose` opts into the raw stream for focused debugging, and `--quiet` still suppresses
+  successful result lines.
+- Module parse/early negatives use a dedicated `^path` persistent protocol operation and the
+  TypeScript bridge's forced external-module indicator. They receive one `module` variant and must
+  reject before execution; module linking, resolution, and runtime evaluation remain explicitly
+  unsupported.
+## 2026-08-25: function text now has an owned multi-record snapshot
+
+- `backend_function_text` can snapshot every encoded machine function into one flattened owned
+  store: exact text bytes, frame sizes, relative internal/external relocations, safepoint offsets,
+  and final root locations survive without retaining machine IR.
+- The store intentionally labels numeric function symbols as compilation-local link identities,
+  not cache keys. Source and JSL function ids can move when an independently indexed Script has a
+  different callable count. Cross-compilation lookup remains disabled until the frontend assigns
+  explicit semantic namespaces; silently hashing layout-dependent bytes would not make reuse safe.
+- The bounded object witness requires one record per machine function, exact aggregate text size,
+  matching function ranges/symbols, and retained call plus safepoint metadata. This advances the
+  honest shared-code linker boundary without combining tests, wrapping source, or sharing executed
+  Realm state.
+## 2026-08-25: semantic function identity survives the complete backend
+
+- A `Fun` may carry an explicit identity triple `(namespace, unit, local)` independently of its
+  temporary closed-world function index. Selection copies it onto the machine function, and the
+  owned function-text store retains it with bytes and relocation metadata.
+- Existing raw graphs remain explicitly `EPHEMERAL`; matching function numbers cannot accidentally
+  become cache hits. A bounded witness proves a source identity survives graph construction,
+  selection, encoding, extraction, and multi-record snapshotting.
+- Source/JSL producers are not wired yet. Source identities must use each original Script record,
+  and JSL identities need declaration identity plus a library ABI fingerprint. Cache lookup stays
+  disabled until both producers and dependency validation are complete.
+## 2026-08-25: source identities are stable across graph namespaces
+
+- Every lowered source `Fun` now receives `(SOURCE, record fingerprint, record-local callable)`.
+  The fingerprint covers the exact original Script root, not the concatenated Test262 parser
+  input, and callable order resets per Script. Unchanged official harness records therefore keep
+  the same identity when tests, includes, or graph function bases differ.
+- A focused frontend witness compiles the same independent Script at graph bases 64 and 192 and
+  requires identical semantic identities despite different closed-world function ids. The host
+  dispatcher remains ephemeral and cannot enter the reusable-function cache.
+- This is identity metadata only. No cache hit is enabled yet; retained functions still need JSL
+  identities plus explicit layout/global dependency validation before image linking is safe.
+## 2026-08-25: JSL identities cover the complete checked library
+
+- JSL functions now use `(JSL, checked-library fingerprint, declaration ordinal)`, independent of
+  their graph namespace base. The fingerprint covers every declaration name, label, kind, return,
+  parameter name/type, capture name, transitioning bit, and complete ordered body tree.
+- Floating literals contribute their exact reader-retained IEEE bits. Lists, vectors, keywords,
+  symbols, strings, C strings, integers, and view nodes have distinct tags, so structurally
+  different checked libraries cannot alias through a lossy scalar conversion.
+- The complete library, including macros, is one unit because macro bodies are inlined into other
+  declarations. The fingerprint is computed once per lowering session and used by both eager and
+  lazy JSL function opening. A frontend witness now compiles the same `JsAdd`-using Script at two
+  graph namespace bases and requires `JsAdd` to retain the same JSL unit/local identity while its
+  temporary fidx moves. This is still metadata only; dependency validation and cache linking remain
+  disabled.
+## 2026-08-25: internal relocations retain semantic target identities
+
+- Retained direct-call and polymorphic-address relocations now carry the target function's full
+  `(namespace, unit, local)` identity in addition to the current image's numeric symbol. A future
+  linker can resolve dependencies across independent compilations without assuming equal graph
+  function numbers.
+- External runtime relocations remain explicitly ephemeral semantic targets: their operation and
+  operation-specific immediate already resolve through the runtime ABI rather than a JavaScript or
+  JSL function identity.
+- The bounded call witness requires the source target's exact identity to survive extraction.
+  Cache insertion/lookup is still disabled until every internal target is non-ephemeral and layout
+  dependencies are represented.
+## 2026-08-25: cache insertion has a strict dependency audit
+
+- Extracted text now has a named cacheability result. Ephemeral owners, internal dependencies on
+  ephemeral functions, and unresolved shape allocations are rejected. Only identified functions
+  whose internal targets resolve by semantic identity are eligible.
+- Runtime `MI-NEW` is deliberately rejected for now: it embeds compilation-local shape id and size
+  through variable-width MOV sequences. Fixed-width shape relocations are required before
+  allocation-heavy functions can be reused safely.
+- Runtime strings carry content through ordinary machine values rather than compiler string-table
+  addresses, and external runtime calls already resolve through the stable runtime ABI. A bounded
+  witness proves the ephemeral host is rejected while an identified pure source function is
+  eligible.
+## 2026-08-26: fixed-width runtime shape encoding was reverted
+
+- The attempted fixed-width `MI-NEW` encoding passed object-model tests but the broader native
+  execution module produced only 9/82 passes; allocation-heavy children exited 86 without protocol
+  output. Restoring the old executor did not change that result, isolating the regression to shape
+  encoding rather than linked-image execution.
+- Variable-width shape/size materialization is restored. `MI-NEW` functions are again explicitly
+  uncacheable, and shape relocations are not extracted. A future implementation must carry a focused
+  native allocation witness while changing branch offsets, not infer correctness from byte counts.
+## 2026-08-25: retained records have an identity-resolving text linker
+
+- The function-text linker lays out owned records into a fresh image, resolves semantic internal
+  call and polymorphic-address targets, repatches fixed-width shape id/size operands against the
+  current shape table, and retains external runtime sites explicitly for publication.
+- Fresh ephemeral host/test records resolve only by current-image symbols. Reusable source and JSL
+  records resolve by `(namespace, unit, local)`, so graph function numbers do not cross the
+  separate-compilation boundary.
+- A bounded byte-level witness snapshots a two-function program, rebuilds its image, and checks the
+  repatched `BL` against the linked target start. The image is not executable until retained
+  external runtime sites are resolved and stack maps are rebased; runner integration stays off.
+## 2026-08-25: linked images own rebased GC metadata
+
+- Image assembly now copies frame sizes and rebases every retained safepoint PC onto the linked
+  function start. Root windows, kinds, registers, and spill offsets are copied into image-owned
+  arrays, so GC registration no longer needs the old machine IR or compilation layout.
+- The linker witness requires the rebuilt call image's safepoint owner/PC/root count to match the
+  retained function-relative record after layout. External runtime branches are still explicitly
+  unresolved; the next integration step is for `native_harness` to install its existing veneers
+  from the image's site/op/aux stream and serialize/register this image metadata.
+## 2026-08-25: retained GC metadata now covers the runtime format
+
+- Function records and linked images now retain frame size, callee-save mask, and callee-save count.
+  Root records retain the original vreg identity in addition to kind and final register/spill
+  location. These were required fields in the existing runtime stack-map format and were missing
+  from the initial extraction model.
+- The linker witness cross-checks all function unwind fields against the machine unit. The next
+  step can serialize the existing stack-map schema from image-owned metadata without consulting
+  liveness, allocation, or machine instructions.
+## 2026-08-25: linked images serialize the existing GC metadata schema
+
+- Retained safepoints now include original machine-instruction id and opcode, and linked functions
+  retain exact text size. Image assembly serializes stack-map v2 and layout v1 byte streams with
+  the same headers and record widths as ordinary memory publication.
+- A bounded witness requires linked metadata sizes to equal the existing model's computed sizes and
+  checks stack-map magic, site count, and function count directly from serialized bytes. Runtime
+  registration can therefore consume linked-image metadata without a schema fork.
+## 2026-08-26: linked ARM64 execution remains disabled after focused failure
+
+- A linked-image executor exists and uses the existing runtime-symbol table, but it is not selected
+  by isolated execution. The focused native suite passed only 9/82 before linked children exited
+  without protocol output, proving a remaining text/metadata equivalence defect.
+- Product/Test262 execution was restored immediately to `nh-exec-memory-checked!`; no fallback or
+  silent acceptance hides the linker failure. The linker stays behind bounded byte-level tests
+  until complete original-vs-linked image and metadata equivalence names the defect.
+## 2026-08-26: reusable functions now declare ABI at the definition
+
+- The graph stores immutable parameter and return type windows for separately compiled functions.
+  Backend parameter register classes and return representation consult the declaration before
+  closed-world callers, removing the first caller-dependent machine-code input.
+- Source callables inside independently compiled Script units declare their JavaScript ABI: tagged
+  environment, tagged receiver, raw argc, tagged explicit arguments, and tagged completion. Script
+  entries declare zero parameters and tagged completion. The public native `main` entry retains its
+  separate raw host ABI. Test262 source and harness records remain untouched.
+- JSL functions derive declarations from checked parameter and `:ret` annotations, including the
+  callable hidden slots. Legacy graph tests without declarations retain inferred behavior.
+- A bounded witness calls one declared function with incompatible integer and string evidence and
+  requires its parameter and return classes to remain boxed. This is the stable representation
+  boundary required before retained text can be reused across tests.
+- Internal call and code-address relocations now retain the target ABI expected by their encoded
+  caller. Image linking requires both semantic identity and ABI compatibility, so a stale retained
+  caller cannot silently bind to a same-source function with different register or return classes.
+# 2026-08-26: singleton Test262 records now use the internal Script ABI
+
+- `nh-try-compile-scripts?` no longer lowers an ordered multi-record Test262 input as an ordinary
+  raw-host native function. It indexes the complete `ts-open-scripts` AST, lowers its synthetic
+  entry through `frontend-native-build-dispatched-script!`, and finishes that prepared graph through
+  the existing source-free host `Start` bridge.
+- This preserves record boundaries, source order, and the shared Script global environment. It does
+  not concatenate source, introduce JavaScript wrappers, or alter the official harness.
+- This is a correctness prerequisite for reuse, not yet the reuse itself: immutable harness/JSL
+  bodies still need an external-function import boundary so cache hits skip lowering and selection.
+- The graph now records an explicit imported-function bit, and the retained store exposes exact
+  cache lookup by semantic identity plus ABI. Nothing marks a function imported yet: activation is
+  intentionally gated on teaching graph verification, CFG construction, selection, and snapshots
+  that an imported declaration has no local body.
+- Retained function snapshots now have an explicit append operation. Ordinary clients still replace
+  the store; the persistent worker can eventually keep a validated cache prefix and append only the
+  current compilation's locally emitted records before linking.
+- Semantic relocation lookup now searches an appended archive newest-first, and linked execution
+  finds the newest ephemeral symbol-zero host `Start` instead of assuming record zero. A retained
+  prefix therefore cannot redirect execution or an ephemeral call into an older compilation.
+- `mfts-truncate-records!` removes an appended suffix from every record and flattened payload table,
+  including bytes, relocations, safepoints, and roots. This is the memory-bounded request boundary
+  required by a persistent Test262 worker.
+- Machine functions now distinguish imported semantic targets explicitly. CFG construction gives an
+  imported graph function an identity-bearing, zero-block machine owner instead of walking its local
+  body; this preserves the existing owner-based call relocation model. Imports are still inactive
+  until verification and snapshot emission explicitly skip those zero-block owners.
+- Verification now admits the one-input imported `Fun` declaration shape only with a declared ABI
+  and non-ephemeral semantic identity. Machine verification accepts zero blocks only for imported
+  owners, and retained snapshots omit those owners, leaving their definitions to the cache prefix.
+- AArch64 direct calls to imported owners now emit the ordinary relocatable `BL` placeholder and
+  semantic call relocation even though no local target offset exists. Invalid non-imported targets
+  remain encoding failures; the retained linker is solely responsible for resolving imports.
+- Retained archives can now compact in place to one cacheable semantic identity kind, copying and
+  rebasing bytes, relocations, safepoints, and roots before truncating all discarded payload. The
+  Test262 worker will use the JSL-specific wrapper so no first-test Script/source state survives in
+  the immutable cache prefix.
+- A persistent, graph-reset-independent import catalog now carries retained semantic identities from
+  the backend store to JSL lowering. Requiring a cataloged JSL declaration opens and ABI-declares its
+  `Fun`, marks it imported, and skips its body; no JavaScript operation is moved out of the DSL.
+## 2026-08-26: dynamic dispatch is runtime-resolved; callable constants remain the cache boundary
+
+- AArch64 and x86-64 polymorphic JavaScript calls no longer emit a closed-world ladder over every
+  function in the compilation unit. Both decode the callable value, preserve prepared ABI
+  arguments across `_aot_js_dispatch_resolve`, call its returned address indirectly, and normalize
+  the result using the return code published in version-3 function metadata. AArch64 and ELF
+  publication retain the resolver as an ordinary external relocation.
+- This does not batch JavaScript. Test262 still parses ordered harness/test files as distinct Script
+  records, compiles one test suffix, links immutable text in memory, and executes in a fresh forked
+  child with fresh runtime state. The focused upstream String concat witness passes default and
+  strict variants through that production path.
+- Expanding the deterministic seed from 45 non-callback records to all 76 JSL records exposed the
+  next separate-compilation invariant: callback-bearing JSL can embed callable ids in boxed Fun
+  constants and closure target fields. Seed compilation and Script compilation assign different
+  numeric JSL ids, so remapping linked metadata alone is insufficient; those machine-code
+  immediates require semantic callable-identity relocations. The unsafe expansion was removed and
+  the focused witness returned to 2/2 passing.
+- A sparse high-bit JSL namespace was rejected immediately because graph function lookup is dense;
+  its first bounded frontend build took 16.3 seconds and was interrupted before it could recreate
+  the prior high-memory failure. A compact JSL-prefix/source-suffix experiment also changed existing
+  frontend ABI assumptions and did not solve every embedded id, so it too was removed rather than
+  weakening tests.
+- On the identical 100-file String cohort, runtime resolution with the safe 45-record seed takes
+  58.486s for 199 variants versus 58.744s before this work. Results are status-identical at 82
+  passed, 117 failed, zero refused. Artifact: `/tmp/aotk-resolver-string-100.jsonl`. The 0.4% wall
+  change is noise-level evidence: the large speed recovery depends on callable-id relocations and
+  admitting callback-bearing JSL, not merely shortening dispatch code.
+- The bounded gate is 51/51 and the frontier remains the expected two open bugs. Runtime resolver
+  tracing is opt-in with `AOT_TRACE_DISPATCH`; normal execution emits nothing.
+## 2026-08-26: retained Script execution is correct again; compiled harness caching is next
+
+The official-semantics Test262 path still evaluates each test as an independent Script in a fresh
+forked child. It does not concatenate sources, wrap tests in functions, reuse a JavaScript-visible
+Realm, or synthesize a receiver. The persistent parent retains compiler artifacts only.
+
+The full 76-record JSL cache crash was an encoder metadata bug. Imported machine functions have
+zero blocks and emit no text, but AArch64 and x86-64 function-range publication still asked for
+`mu-function-block(imported, 0)`. That out-of-range block-order lookup created a fake function entry
+inside an emitted function and truncated its retained record. Both encoders now publish imported
+functions as `code-start=-1, code-size=0` and exclude them from emitted-function boundary searches.
+
+Focused proof:
+
+- Test262 `built-ins/String/prototype/concat/S15.5.4.6_A6.js` now passes both default and strict
+  variants with all 76 JSL records retained.
+- Result: `/tmp/aotk-focused-import-range-fix-20260826.jsonl`.
+- Before the fix, owner 16 was recorded as `[455216, 483336)` while its valid block-3456 target was
+  at 673292. The target label was unique and correctly owned; the false boundary came from an
+  imported zero-block function.
+- `coil test`: 51/51 green. `coil test --suite frontier`: the exact two expected open bugs.
+
+Warm independent-Script timing, one persistent worker, retained JSONL, identical lexical 100-file
+cohort (182 executable variants plus 9 policy skips):
+
+- Total execution: 52.565 s; retained-row wall sum 51.831 s.
+- Median: 147 ms/variant; p95: 1,156 ms/variant.
+- Per executable variant: selection 62.05 ms, allocation 48.49 ms, suffix snapshot 42.80 ms,
+  frontend analysis 41.42 ms, scheduling 40.34 ms, frontend graph construction 23.68 ms.
+- Native execution itself is 4.91 ms/variant; image linking is below the dominant phases.
+- Result: `/tmp/aotk-100-independent-production-snapshot-20260826.jsonl`.
+
+This cohort is the lexical Annex B prefix and is not representative of pass rate (0 passed,
+98 failed, 84 refused, 9 skipped), but it is valid throughput evidence and completed without the
+former retained-image crash. Removing the temporary whole-unit/per-function branch audit changed
+the same cohort from 53.131 s to 52.565 s, only 1.1%; snapshot diagnostics were not the main cost.
+
+The next speed boundary is compiled Test262 harness Scripts. Retained JSL functions are imported
+correctly, but every test still parses, expands JSL macros into, optimizes, selects, schedules,
+allocates, encodes, and snapshots the standard harness sources again. The standards-preserving
+design is to cache compiled harness Script records by exact source identity, link them with each
+freshly compiled test Script, and execute the ordered Script records in every fresh child/Realm.
+Caching native Script artifacts is legitimate; sharing a Realm, wrapping, concatenating, or
+skipping harness evaluation is not.
+## 2026-08-26: independent Test262 workers recover throughput without changing semantics
+
+- Rejected whole-graph Script batching remains disabled: it combines compiler graphs, grew to
+  3.37 GiB RSS on the 100-file witness, and does not provide the isolation contract we need.
+- Tested exact-source native-body reuse as a separate-compilation boundary. It reduced the second
+  String concat variant's compiler phases dramatically, but three imported source bodies caused a
+  native crash. Capture-free narrowing did not fix it, proving that source records still contain a
+  compilation-local invariant not represented by the relocation model. The activation was removed;
+  no Test262 source body is currently reused across compilations.
+- The linked image now owns its resolved host-entry byte offset. Execution no longer consults the
+  mutable machine-text archive after cache compaction, which is the correct lifetime boundary
+  independent of future caching work.
+- Correct parallelism already exists at the worker boundary. The runner defaults to
+  `min(8, availableParallelism())`; every worker compiles each original Script independently and
+  executes it in a fresh forked child.
+- On the identical lexical 100-file cohort (182 executable variants and 9 policy skips), one worker
+  took 52.565 s of execution and eight workers took 11.774 s: 4.47x higher throughput. The eight
+  worker run additionally paid an 8.916 s one-time build, for 20.691 s total.
+- `/tmp/aotk-100-independent-production-snapshot-20260826.jsonl` and
+  `/tmp/aotk-100-independent-jobs8-20260826.jsonl` have byte-equivalent sorted
+  path/variant/status/category/detail projections: zero outcome changes.
+- Focused semantic witness after removing unsafe source reuse:
+  `/tmp/aotk-focused-safe-baseline-20260826.jsonl`; default and strict both pass.
+## 2026-08-26: Test262 requests now have fresh compiler state and crash-safe warm seeds
+
+- Complete retained baseline: `/tmp/aotk-full-independent-jobs8-20260826.jsonl`.
+  86,719 executable variants plus 6,403 policy skips completed in 3,730.481 s execution
+  (62m10s): 19,617 passed, 57,263 failed, 9,839 refused.
+- The baseline rebuilt the supposedly persistent JSL seed 18,589 times, costing 4,184.872 aggregate
+  seconds. Compiler aborts killed the seed-owning server; Node respawned it for later requests.
+- More importantly, compiling successive tests in one mutable server was observably order-dependent.
+  A fresh-request full run changed 1,279 failed results to passed and 623 passed results to failed.
+  Test262 tests require fresh Realm/test state, and compiler request state must be fresh as well if
+  reset is not proven complete; the old throughput path did not meet that standard.
+- `tools/test262-native.coil` now initializes immutable JSL machine text in a warm supervisor and
+  forks one compilation child per Script request. Compiler assertions/signals are request-local;
+  each child starts from the same copy-on-write seed, and JavaScript execution remains isolated.
+- Request children establish their own process groups and publish their PID. Node timeouts now kill
+  only that request, retain the supervisor, and remain categorized as `TIMEOUT` rather than signal 9.
+- Crash witness: `/tmp/aotk-warm-supervisor-crash-witness-3-20260826.jsonl`. Two SIGABRT variants
+  are followed by two passing String concat variants on one server; the seed is compiled once.
+- Timeout witness: `/tmp/aotk-warm-supervisor-timeout-witness-2-20260826.jsonl`. Two forced
+  one-second timeouts are followed by two passes on one server; exactly one 209.044 ms seed build.
+- Complete fresh-request profile before the final timeout-process-group refinement:
+  `/tmp/aotk-full-warm-supervisors-jobs8-20260826.jsonl`. It produced 20,272 passes, 56,991 failures,
+  and 9,456 refusals, but took 5,162.677 s execution (86m03s). The cause is explicit: 506 requests
+  reached the 30-second timeout versus 64 before, accounting for about 31.6 wall minutes at eight
+  workers. A representative `Map/valid-keys` variant still produced no frontend phase after 120 s.
+- Timed-out source sizes range from 351 bytes to 3.2 MiB, while observed passing variants take up to
+  12.1 s, so source-size skipping or an aggressively shorter default timeout would be dishonest.
+  The next efficiency target is the pre-frontend parser/open path that can fail to complete, followed
+  by selection (5,866 aggregate seconds), allocation (4,211 s), frontend analysis (3,862 s),
+  scheduling (3,110 s), and cache suffix snapshotting (2,920 s).
+- Quiet runs now report completed/total, percentage, elapsed time, throughput, and ETA every minute.
+  Retained JSONL remains the authoritative recovery and analysis artifact.
+# 2026-08-26: isolated Test262 execution now reuses immutable compiler artifacts by default
+
+- Persistent compiler experiments were rejected and removed from the runner. Same-process reuse
+  caused six passed-to-failed transitions on the 1,000-file corpus; reloading the artifact between
+  requests caused nine; and compiling in a post-seed fork child stalled permanently at 797/1,791
+  records. The supported runner therefore keeps the exec boundary that broad evidence proves.
+- Automatic isolated concurrency now caps at 16 rather than 8 (and never exceeds
+  `availableParallelism()`); `--jobs N` remains the explicit override. On the same deterministic
+  1,000-file corpus, 1,644 variants took 76.731s at 8 jobs, 72.415s at 12, and 68.226s at 16.
+  Sixteen jobs was 11.1% faster than eight. `/usr/bin/time -l` reported essentially unchanged
+  peak memory footprint (117.5MB at 8 versus 115.8MB at 16); the maximum-resident-set field rose
+  from 1.56GB to 1.76GB. This changes scheduling only: every variant remains an isolated process.
+- The complete official checkout run retained 93,122 variant records in
+  `test262-results-official-isolated-artifact-full-2026-08-26.jsonl`: 21,295 passed, 56,079
+  failed, 9,345 refused, and 6,403 policy-skipped. All 86,719 executable variants completed in
+  3,515.910s (58m 35.9s) with eight jobs. Median variant latency was 201ms; p90 507ms; p95
+  1,642ms; p99 2,067ms; max 30,168ms.
+- The retained phase sums identify the remaining cost rather than attributing it to isolation:
+  selection 5,087.315s, allocation 4,320.699s, frontend analysis 4,085.404s, scheduling
+  3,183.485s, cache suffix snapshots 2,974.777s, and frontend graph construction 2,345.907s.
+  Immutable artifact restore was 1,517.697s over 78,196 loads, or 19.409ms/load. Native
+  JavaScript execution itself summed to 606.887s. These sums overlap through eight-way parallel
+  execution and therefore are not wall-clock components to add.
+- Test262 still executes one official Script per isolated native process. There is no source
+  concatenation, generated JavaScript wrapper, shared Realm/global state, or receiver rewriting.
+- The default runner now restores the validated cross-process JSL compiler artifact. The explicit
+  `--no-seed-artifact` control rebuilds that immutable compiler state from source in every process.
+- On one deterministic 100-file corpus (162 executable variants), isolated artifact execution took
+  5.665s versus 9.337s fresh, a 1.65x end-to-end speedup. Pass/non-pass results were identical:
+  all 44 passing variants stayed passing. Detailed failure mechanisms differed on three variants;
+  repeated fresh controls showed one affected class-destructuring case is itself nondeterministic,
+  alternating between selection refusal and SIGSEGV. That pre-existing compiler bug remains work,
+  but artifact reuse does not convert a passing test into a failing test.
+## 2026-08-26: Symbol uses a traced primitive identity, not compiler interning
+
+- Symbol representation is the former reserved NaN-box tag whose payload is an ordinary GC
+  allocation identity. `%NewObject` supplies uniqueness and `%SymbolFromObject` is a pure retag;
+  there is no mutable hidden counter and no execution-time dependency on compiler intern tables.
+- Runtime code owns only tagging, tracing, truthiness, and identity-preserving property-key
+  mechanics. Construction, description coercion, conversion errors, `typeof`, `ToPropertyKey`,
+  constructor properties, construct rejection, and well-known Symbol values live in `lib/`.
+- The frontend only distinguishes intrinsic call syntax from construct syntax and routes both to
+  the corresponding DSL operations. Identifier reads materialize the DSL constructor value.
+- The complete `test/built-ins/Symbol` cohort against a correctly relinked runtime produced 154
+  executable variants: 8 passed, 144 failed, 2 refused, and 15 policy-skipped in 34.994s. Both
+  uniqueness variants pass with distinct traced allocation payloads; both Symbol-description
+  TypeError variants and both construct-rejection variants pass. Evidence is retained at
+  `results/test262-symbol-fixed-runtime-2026-08-26.jsonl`.
+- The first cohort result was invalid because Coil reused
+  `.coil/build/native/2232296025890215446/source.o` after both `native/gc/runtime.c` and its
+  `js-value.h` dependency changed. Repeated `coil build`, including after touching the source,
+  relinked the stale object; the executable lacked the new runtime strings and operation 122 fell
+  through to `undefined`. Manually rebuilding that declared object with `AOT_IN_MEMORY_HOST`
+  produced a binary containing the branch and immediately changed uniqueness from 0/2 to 2/2.
+  This needs a Coil native-source dependency invalidation bug report; it must not be worked around
+  in JavaScript semantics.
+- Next Symbol work is constructor/prototype materialization and primitive boxing. The current
+  failures show missing `length`, prototype methods/accessors, registry methods, and well-known
+  property descriptors; these are DSL semantic gaps rather than primitive identity failures.
+# 2026-08-27: retained DSL dynamic calls are open-world across seed import
+
+The immutable JSL seed used to lower `call-dynamic-with-receiver` to its callee value when the
+seed graph contained no frontend JavaScript function targets. That changed semantics for retained
+callables such as `BoundFunction2`: after import they can receive Script functions even though no
+such target existed while the library artifact was compiled. `jl-js-call-receiver-core` now always
+evaluates the receiver and arguments and emits the dynamic receiver call. Closed-world target
+discovery remains only an optimization for the target cast and missing-argument padding.
+
+The captured-callable JSL test now pins a real `CALL-ABI-DYNAMIC-RECEIVER` in the zero-frontend-
+target graph. The seeded Test262 witness using
+`Function.prototype.call.bind(Object.prototype.hasOwnProperty)` passes in default and strict mode.
+The complete Symbol cohort is unchanged at 32 passed, 120 failed, 2 refused, and 15 skipped, so the
+fix has zero passed-to-nonpassed transitions. Evidence is retained in
+`results/test262-bound-has-zero-target-call-2026-08-27.jsonl` and
+`results/test262-symbol-zero-target-call-2026-08-27.jsonl`.
+
+`coil test` is green at 52/52. `coil test --suite frontier` remains red on exactly the two recorded
+open bugs: `for-await-has-no-bridge-kind` and `shortest-round-trip-digits`.

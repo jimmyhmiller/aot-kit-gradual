@@ -124,6 +124,7 @@
 (defn mra-init! [] (-> i64)
   (let [u (machine-unit)
         vregs (ml-vreg-count)
+        (mut ingress-masks) (al-new [i64] (malloc-allocator))
         (mut i) 0]
     (al-clear! [i64] (field u alloc-interference))
     (al-clear! [i64] (field u alloc-row-first))
@@ -178,6 +179,7 @@
               (break)
               (do
                 (al-push! [i64] (field u alloc-owner-head) -1)
+                (al-push! [i64] (mut ingress-masks) 0)
                 (set! i (+ (load i) 1)))))
     (set! i 0)
     (loop (if (>= (load i) (be-inst-count))
@@ -191,11 +193,14 @@
                             (al-set! [i64] (field u alloc-owner) dst (.owner m))
                             0)
                         (if (= (.op m) MI-ARG)
-                            (al-set! [i64]
-                                     (field u alloc-reg)
-                                     dst
-                                     (+ (.imm m)
-                                        (if (= (ml-register-class dst) MRC-FPR) 32 0)))
+                            (let [reg (+ (.imm m)
+                                         (if (= (ml-register-class dst) MRC-FPR) 32 0))]
+                              (al-set! [i64] (field u alloc-reg) dst reg)
+                              (al-set! [i64]
+                                       (mut ingress-masks)
+                                       (.owner m)
+                                       (| (al-get [i64] (load ingress-masks) (.owner m))
+                                          (<< 1 reg))))
                             0))
                       0))
                 (set! i (+ (load i) 1))
@@ -226,33 +231,18 @@
                       (let [source-def (ms-owner-def-inst (.owner m)
                                                           (.a m))
                             dst (.dst m)
-                            owner (.owner m)
-                            (mut at) 0
-                            (mut mask) 0]
+                            owner (.owner m)]
                         (if (and (>= source-def 0)
                                  (or (= (ms-inst-op source-def) MI-ARG)
                                      (= (ms-inst-op source-def) MI-STACKARG)))
-                            (do
-                              (loop (if (>= (load at) (be-inst-count))
-                                        (break)
-                                        (do
-                                          (let [arg (be-inst (load at))]
-                                            (if (and (= (.owner arg) owner)
-                                                     (= (.op arg) MI-ARG))
-                                                (set! mask
-                                                      (| (load mask)
-                                                         (<< 1
-                                                             (+ (.imm arg)
-                                                                (if (= (ml-register-class (.dst arg))
-                                                                       MRC-FPR)
-                                                                    32
-                                                                    0)))))
-                                                0))
-                                          (set! at (+ (load at) 1)))))
-                              (al-set! [i64] (field u alloc-forbidden) dst (load mask)))
+                            (al-set! [i64]
+                                     (field u alloc-forbidden)
+                                     dst
+                                     (al-get [i64] (load ingress-masks) owner))
                             0))
                       0))
                 (set! i (+ (load i) 1)))))
+    (al-free! [i64] (mut ingress-masks))
     0))
 
 (defn mra-live-add! [(vreg i64)] (-> i64)

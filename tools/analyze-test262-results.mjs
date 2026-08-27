@@ -37,6 +37,17 @@ function reason(row) {
   if (detail === "RUNTIME-FAILED") return "runtime: nonzero exit without diagnostic";
   if (/^SIG[A-Z]+/.test(detail)) return `runtime: ${detail}`;
   if (/^TIMEOUT/.test(detail)) return "runtime: timeout";
+  if (detail.startsWith("native-harness: execution failed")) {
+    const exit = Number(detail.match(/\bexit=(\d+)/)?.[1] ?? -1);
+    const signal = Number(detail.match(/\bsignal=(\d+)/)?.[1] ?? -1);
+    const output = Number(detail.match(/\bhas_output=(\d+)/)?.[1] ?? -1);
+    if (exit === 124 || exit === 137) return "runtime process: timeout";
+    if (signal > 0) return `runtime process: signal ${signal}`;
+    if (exit >= 128) return `runtime process: signal-like exit ${exit - 128}`;
+    if (exit > 0) return `runtime process: exit ${exit}`;
+    if (output === 0) return "runtime process: no output";
+    return "runtime process: other";
+  }
   if (detail.startsWith("native-harness: selection")) return detail.includes("Region : ctrl") ? "compiler selection: control/Region fanout" : "compiler selection: other";
   if (detail.startsWith("native-harness: frontend")) {
     const match = detail.match(/^native-harness: frontend status=(\d+) code=(\d+)/);

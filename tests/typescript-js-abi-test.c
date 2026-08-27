@@ -251,6 +251,56 @@ int main(int argc, char **argv) {
   require(aot_ts_diagnostic_count(script_goal_parse) >= 3,
     "module-only forms rejected under Script goal");
   aot_ts_parse_delete(script_goal_parse);
+  const char *module_goal_errors =
+    "var await; var public; yield; function f(x = await 1) { await 0; } "
+    "class await {} class C { x = await; } export var duplicate, duplicate;";
+  AotTsParse module_goal_parse = aot_ts_parse_ex(module_goal_errors,
+    (int32_t)strlen(module_goal_errors), "module-goal.js", 14, AOT_TS_SCRIPT_JS_MODULE);
+  require(aot_ts_diagnostic_count(module_goal_parse) >= 8,
+    "module strictness, await/yield contexts, and duplicate exports rejected");
+  aot_ts_parse_delete(module_goal_parse);
+  const char *module_goal_valid =
+    "export var ok; const value = await 1; function f(o) { return o.await; } "
+    "class C { await = 1; m() { return this.await; } }";
+  AotTsParse module_goal_valid_parse = aot_ts_parse_ex(module_goal_valid,
+    (int32_t)strlen(module_goal_valid), "module-valid.js", 15, AOT_TS_SCRIPT_JS_MODULE);
+  require(aot_ts_diagnostic_count(module_goal_valid_parse) == 0,
+    "valid module exports, top-level await, and await property names accepted");
+  aot_ts_parse_delete(module_goal_valid_parse);
+  const char *module_declaration_position =
+    "if (true) export default 1; { import x from './x.js'; }";
+  AotTsParse module_declaration_position_parse = aot_ts_parse_ex(module_declaration_position,
+    (int32_t)strlen(module_declaration_position), "module-position.js", 18,
+    AOT_TS_SCRIPT_JS_MODULE);
+  require(aot_ts_diagnostic_count(module_declaration_position_parse) >= 2,
+    "module import and export declarations rejected outside ModuleItem position");
+  aot_ts_parse_delete(module_declaration_position_parse);
+  const char *module_table_errors =
+    "import { x, y as x, eval } from './x.js'; export { missing }; "
+    "const local = 1; export { local }; export { local };";
+  AotTsParse module_table_parse = aot_ts_parse_ex(module_table_errors,
+    (int32_t)strlen(module_table_errors), "module-tables.js", 16,
+    AOT_TS_SCRIPT_JS_MODULE);
+  require(aot_ts_diagnostic_count(module_table_parse) >= 4,
+    "module import bindings, exported names, and local export resolution checked");
+  aot_ts_parse_delete(module_table_parse);
+  const char *module_default_errors =
+    "export default var x; export default 1; export { x as default };";
+  AotTsParse module_default_parse = aot_ts_parse_ex(module_default_errors,
+    (int32_t)strlen(module_default_errors), "module-default.js", 17,
+    AOT_TS_SCRIPT_JS_MODULE);
+  require(aot_ts_diagnostic_count(module_default_parse) >= 3,
+    "default-export grammar and canonical exported-name uniqueness checked");
+  aot_ts_parse_delete(module_default_parse);
+  const char *module_name_errors =
+    "import.m\\u0065ta; import { '\\uD83D' as x } from './x.js' with "
+    "{ type: 'json', 'typ\\u0065': 'json' }; export { 'x' as 'y' };";
+  AotTsParse module_name_parse = aot_ts_parse_ex(module_name_errors,
+    (int32_t)strlen(module_name_errors), "module-names.js", 15,
+    AOT_TS_SCRIPT_JS_MODULE);
+  require(aot_ts_diagnostic_count(module_name_parse) >= 4,
+    "module terminals, Unicode export names, local string bindings, and attributes checked");
+  aot_ts_parse_delete(module_name_parse);
   const char *dynamic_import_valid = "import('./x.js');";
   AotTsParse dynamic_import_parse = aot_ts_parse_ex(dynamic_import_valid,
     (int32_t)strlen(dynamic_import_valid), "dynamic-import.js", 17, AOT_TS_SCRIPT_JS);

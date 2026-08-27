@@ -18,7 +18,7 @@
 #include <unistd.h>
 
 int aot_gc_configure(size_t, int);
-void aot_gc_register_unit(const uint8_t *, const uint8_t *, const uint8_t *);
+void aot_gc_register_unit(const uint8_t *, const uint8_t *, const uint8_t *, const uint8_t *);
 int64_t aot_gc_enter1(int64_t (*)(int64_t), int64_t);
 uintptr_t aot_gc_runtime_symbol(int);
 
@@ -35,6 +35,7 @@ static uintptr_t runtime_symbol(const char *name) {
   if (!strcmp(name, "_aot_arr_store")) return aot_gc_runtime_symbol(4);
   if (!strcmp(name, "_aot_arr_len")) return aot_gc_runtime_symbol(5);
   if (!strcmp(name, "_aot_js_string")) return aot_gc_runtime_symbol(6);
+  if (!strcmp(name, "_aot_js_dispatch_resolve")) return aot_gc_runtime_symbol(7);
   return 0;
 }
 
@@ -102,7 +103,7 @@ int main(int argc, char **argv) {
   if (mprotect(image, image_size, PROT_READ | PROT_EXEC) != 0) fail("mprotect");
   sys_icache_invalidate(image, image_size);
   int64_t (*kernel)(int64_t) = (int64_t (*)(int64_t))(image + kernel_offset);
-  aot_gc_register_unit((const uint8_t *)kernel, object + stackmaps->offset,
+  aot_gc_register_unit((const uint8_t *)kernel, image, object + stackmaps->offset,
                        object + layouts->offset);
   if (!aot_gc_configure(1u << 20, 0)) return 66;
   printf("%lld\n", (long long)aot_gc_enter1(kernel, atoll(argv[2])));

@@ -81,6 +81,18 @@ function main(n) {
   }
 }" 1)))
 
+;; Script globals live in the runtime property heap, not in frontend SSA snapshots. Carrying
+;; `caught` as both made snapshot bookkeeping call the DSL, abandon the successful pending-check
+;; arm when restoring the other branch, and compile a no-throw try/catch as an unconditional jump
+;; to the uncaught sink.
+(deftest a_no_throw_try_catch_preserves_a_runtime_backed_global
+  (assert (agrees-with-node? "var caught = false;
+function main(n) {
+  try { caught = false; }
+  catch (error) { caught = true; }
+  return caught ? 0 : n;
+}" 7)))
+
 (deftest a_source_throw_is_caught_in_the_same_function
   (assert (agrees-with-node? "function main(n) {
   try { if (n) throw { value: 10 }; return 3; }
@@ -165,6 +177,7 @@ function main(n) {
   try { missingValue + 1; return 0; }
   catch (error) {
     return (error instanceof ReferenceError &&
+            error.message === 'missingValue is not defined' &&
             new TypeError('x') instanceof TypeError ? 1 : 0) | 0;
   }
 }" 0)))
@@ -1279,4 +1292,39 @@ class Counter {
   read() { return this.value; }
 }
 function main(n) { return new Counter(n).read() | 0; }
+" 7)))
+
+(deftest script_global_this_has_stable_identity_properties_and_coercion
+  (assert (agrees-with-node? "function main(n: number): number {
+  const global = this;
+  global.persisted = 7;
+  return ((this === global ? 1 : 0)
+    + (this.persisted === 7 ? 2 : 0)
+    + (!!this ? 4 : 0)) | 0;
+}
+" 7)))
+
+(deftest script_global_this_is_an_ordinary_descriptor_value
+  (assert (agrees-with-node? "function main(n: number): number {
+  const target = {};
+  Object.defineProperty(target, \"value\", { value: 1, writable: this });
+  target.value = 2;
+  return (target.value === 2 ? n : 0) | 0;
+}
+" 7)))
+
+(deftest an_unqualified_sloppy_call_receives_the_script_global_object
+  (assert (agrees-with-node? "function main(n: number): number {
+  const global = this;
+  function ordinary() { return this === global; }
+  return (ordinary() ? n : 0) | 0;
+}
+" 7)))
+
+(deftest an_arrow_captures_the_script_global_object
+  (assert (agrees-with-node? "function main(n: number): number {
+  const global = this;
+  const arrow = () => this === global;
+  return (arrow() ? n : 0) | 0;
+}
 " 7)))

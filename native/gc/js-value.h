@@ -67,7 +67,7 @@ enum {
 #define AOT_JS_FUNCTION UINT64_C(0xfff9000000000000)
 #define AOT_JS_CLOSURE UINT64_C(0xfffa000000000000)
 #define AOT_JS_REGEXP UINT64_C(0xfffb000000000000)
-#define AOT_JS_RESERVED_0 UINT64_C(0xfffc000000000000)
+#define AOT_JS_SYMBOL UINT64_C(0xfffc000000000000)
 #define AOT_JS_NEGATIVE_ZERO UINT64_C(0x8000000000000000)
 #define AOT_JS_INT_MIN INT64_C(-140737488355328)
 #define AOT_JS_INT_MAX INT64_C(140737488355327)
@@ -79,17 +79,19 @@ static inline int aot_js_managed(AotJsValue value) {
 #ifdef AOT_JS_FALSIFY_OBJECT_TAG
   return tag == AOT_JS_STRING || tag == AOT_JS_ARRAY || tag == AOT_JS_CLOSURE || tag == AOT_JS_REGEXP;
 #else
-  return tag == AOT_JS_OBJECT || tag == AOT_JS_ARRAY || tag == AOT_JS_CLOSURE || tag == AOT_JS_REGEXP;
+  return tag == AOT_JS_OBJECT || tag == AOT_JS_ARRAY || tag == AOT_JS_CLOSURE ||
+         tag == AOT_JS_REGEXP || tag == AOT_JS_SYMBOL;
 #endif
 }
 static inline int aot_js_tagged(AotJsValue value) {
   uint64_t tag = aot_js_tag(value);
   return (tag >= AOT_JS_NAN && tag <= AOT_JS_REF) ||
-         (tag >= AOT_JS_ARRAY && tag <= AOT_JS_REGEXP);
+         (tag >= AOT_JS_ARRAY && tag <= AOT_JS_SYMBOL);
 }
 static inline int aot_js_reference(AotJsValue value) {
   uint64_t tag = aot_js_tag(value);
-  return aot_js_managed(value) || tag == AOT_JS_STRING || tag == AOT_JS_FUNCTION;
+  return (aot_js_managed(value) && tag != AOT_JS_SYMBOL) ||
+         tag == AOT_JS_STRING || tag == AOT_JS_FUNCTION;
 }
 static inline AotJsValue aot_js_with_payload(AotJsValue value, uintptr_t payload) {
   return aot_js_tag(value) | ((uint64_t)payload & AOT_JS_PAYLOAD_MASK);
@@ -105,8 +107,8 @@ static inline int aot_js_well_formed(AotJsValue value) {
   uint64_t tag = aot_js_tag(value), payload = value & AOT_JS_PAYLOAD_MASK;
   if (tag == AOT_JS_UNDEFINED || tag == AOT_JS_NULL || tag == AOT_JS_NAN) return payload == 0;
   if (tag == AOT_JS_BOOLEAN) return payload <= 1;
-  if (tag >= UINT64_C(0xfffc000000000000)) return 0;
   if (aot_js_managed(value)) return payload != 0 && (payload & 7u) == 0;
+  if (tag > AOT_JS_SYMBOL) return 0;
   return 1;
 }
 static inline int aot_js_truthy(AotJsValue value) {
@@ -115,6 +117,7 @@ static inline int aot_js_truthy(AotJsValue value) {
   if (tag == AOT_JS_BOOLEAN) return payload != 0;
   if (tag == AOT_JS_INTEGER) return aot_js_unbox_int(value) != 0;
   if (tag == AOT_JS_STRING) return payload != 0;
+  if (tag == AOT_JS_SYMBOL) return 1;
   if (aot_js_reference(value)) return 1;
   return value != 0 && value != AOT_JS_NEGATIVE_ZERO;
 }

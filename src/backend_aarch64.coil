@@ -437,6 +437,14 @@
     (be-u32! (a64-add-reg rd rd scratch))
     0))
 
+(defn be-relocatable-code-address! [(source-owner i64) (target-owner i64)
+                                     (rd i64) (scratch i64) (target i64)] (-> i64)
+  (let [site (be-code-len)]
+    (al-push! [i64] (field (machine-unit) internal-address-sources) source-owner)
+    (al-push! [i64] (field (machine-unit) internal-address-offsets) site)
+    (al-push! [i64] (field (machine-unit) internal-address-targets) target-owner)
+    (be-relative-code-address! rd scratch target)))
+
 (defn be-mov-words [(v i64)] (-> i64)
   (let [(mut words) 1
         (mut hw) 1]
@@ -465,7 +473,9 @@
 
 (defn be-js-managed-tag? [(tag i64)] (-> bool)
   (or (= tag JSV-OBJECT)
-      (or (= tag JSV-ARRAY) (or (= tag JSV-CLOSURE) (= tag JSV-REGEXP)))))
+      (or (= tag JSV-ARRAY)
+          (or (= tag JSV-CLOSURE)
+              (or (= tag JSV-REGEXP) (= tag JSV-SYMBOL))))))
 (defn be-js-unbox-validation-words [(tag i64)] (-> i64)
   (if (or (= tag JSV-UNDEFINED) (= tag JSV-NULL))
       3
@@ -482,12 +492,7 @@
   ;; the summary can return as a fast path once the flow analysis covers dynamic stores.
   (if (be-poly-call? m) 0 0))
 (defn be-poly-return-code [(owner i64)] (-> i64)
-  (let [kind (be-function-return-kind owner)]
-    (if (= kind MLK-BOXED)
-        -4
-        (if (and (= kind MLK-SCALAR) (be-function-fp-return? owner))
-            -3
-            (be-function-return-tag owner)))))
+  (be-function-dispatch-return-code owner))
 (defn be-poly-call-dispatch-words [(m (ptr MInst))] (-> i64)
   (let [targets (be-poly-call-targets m)
         (mut fidx) 0
@@ -536,7 +541,11 @@
                             (mu-function-callee-count owner)))
                       0))
                   MI-MOVI
-                (be-mov-words (load (field m imm))) MI-FMOVI
+                (if (and (!= (load (field m node)) NO-NODE)
+                         (match (n-op (load (field m node)))
+                           (Fun [_] true) (CallableId [_] true) (_ false)))
+                    4
+                    (be-mov-words (load (field m imm)))) MI-FMOVI
                 (+ (be-mov-words (load (field m imm))) 1) MI-SCVTF
                 1 MI-I32FROMFP
                 (+ (be-mov-words 4751297606875873280) 8) MI-FADD
@@ -585,9 +594,7 @@
                           (be-mov-words (load (field m imm))))))
                   MI-NEW
                 (if (be-runtime-allocation?)
-                    (let [sw (be-mov-words (shape-size (load (field m imm))))]
-                      (+ (+ 19 sw)
-                         (* 2 (+ sw (be-mov-words (load (field m imm)))))))
+                    39
                     1)
                   MI-EQ
                 2 MI-LT
@@ -595,23 +602,24 @@
                 2 MI-CSEL
                 2 MI-CALL
                 (let [area (be-call-area
-                             (+ (load (field m arg-count))
-                                (if (be-poly-call? m) 1 0)))
+                             (if (be-poly-call? m)
+                                 (+ (* (load (field m arg-count)) 2) 2)
+                                 (load (field m arg-count))))
                       poly-words
                         (if (be-poly-call? m)
-                            ; A materialized closure has its own callable tag. The closure arm also
-                            ; retags argument 0 as an object before entering the body, because that
-                            ; slot is the hidden environment pointer rather than the callable value.
-                            (+ 35
+                            ; Fixed-size runtime dispatch preserves register arguments across the
+                            ; resolver, calls its returned address, then normalizes that function's
+                            ; declared return representation.
+                            (+ 34
                                (+ (if (< (be-reg-of (load (field m a))) 0) 1 0)
-                                  (+ (be-mov-words JSV-TAG-MASK)
-                                     (+ (be-mov-words JSV-FUNCTION)
-                                        (+ (be-mov-words JSV-CLOSURE)
-                                           (+ (be-mov-words JSV-PAYLOAD-MASK)
-                                              (+ (be-mov-words JSV-OBJECT)
-                                                 (+ (be-mov-words -3)
-                                                    (+ (be-mov-words -4)
-                                                       (be-poly-call-dispatch-words m))))))))))
+                                  (+ (* 2 (be-call-register-loads m))
+                                     (+ (be-mov-words JSV-TAG-MASK)
+                                        (+ (be-mov-words JSV-FUNCTION)
+                                           (+ (be-mov-words JSV-CLOSURE)
+                                              (+ (* 2 (be-mov-words JSV-PAYLOAD-MASK))
+                                                 (+ (be-mov-words JSV-OBJECT)
+                                                    (+ (be-mov-words -3)
+                                                       (be-mov-words -4))))))))))
                             5)]
                   (+ (+ poly-words
                         (* 2 (- (be-sp-adjust-words area) 1)))
@@ -674,6 +682,7 @@
   (let [p (backend)
         n (be-inst-count)
         legacy-entry (and (> n 0) (< (.owner (be-inst 0)) 0))
+        (mut expected-size) 0
         (mut i) 0]
     (al-clear! [i64] (field p a64-code))
     (do
@@ -702,7 +711,8 @@
                         0)
                     (set! off (+ (load off) (* 4 (be-inst-words (be-inst (load i))))))
                     (set! i (+ (load i) 1))
-                    0))))
+                    0)))
+        (set! expected-size (load off)))
       ; Publish exact function text ranges from entry labels. Ranges are structural metadata,
       ; not inferred later from symbol order in the object writer.
       (let [funcs (mu-function-count)
@@ -710,27 +720,41 @@
         (loop (if (>= (load owner) funcs)
                   (break)
                   (do
-                    (let [f (mu-function (load owner))
-                          start (be-label-off (mu-function-block (load owner) 0))
-                          lastm (be-inst (- n 1))
-                          (mut end) (+ (.first lastm) (* 4 (be-inst-words lastm)))
-                          (mut other) 0]
-                      (loop (if (>= (load other) funcs)
-                                (break)
-                                (do
-                                  (if (!= (load other) (load owner))
-                                      (let [candidate (be-label-off (mu-function-block (load other) 0))]
-                                        (if (and (> candidate start) (< candidate (load end)))
-                                            (set! end candidate)
-                                            0))
-                                      0)
-                                  (set! other (+ (load other) 1))
-                                  0)))
-                      (set! (.code-start f) start)
-                      (set! (.code-size f) (- (load end) start)))
+                    (let [f (mu-function (load owner))]
+                      (if (mu-function-imported? (load owner))
+                          (do
+                            (set! (.code-start f) -1)
+                            (set! (.code-size f) 0))
+                          (let [start (be-label-off (mu-function-block (load owner) 0))
+                                lastm (be-inst (- n 1))
+                                (mut end) (+ (.first lastm) (* 4 (be-inst-words lastm)))
+                                (mut other) 0]
+                            (loop (if (>= (load other) funcs)
+                                      (break)
+                                      (do
+                                        (if (and (!= (load other) (load owner))
+                                                 (not (mu-function-imported? (load other))))
+                                            (let [candidate
+                                                    (be-label-off
+                                                      (mu-function-block (load other) 0))]
+                                              (if (and (> candidate start)
+                                                       (< candidate (load end)))
+                                                  (set! end candidate)
+                                                  0))
+                                            0)
+                                        (set! other (+ (load other) 1))
+                                        0)))
+                            (set! (.code-start f) start)
+                            (set! (.code-size f) (- (load end) start)))))
                     (set! owner (+ (load owner) 1))
                     0)))
         0)
+      (al-clear! [i64] (field (machine-unit) internal-call-sources))
+      (al-clear! [i64] (field (machine-unit) internal-call-offsets))
+      (al-clear! [i64] (field (machine-unit) internal-call-targets))
+      (al-clear! [i64] (field (machine-unit) internal-address-sources))
+      (al-clear! [i64] (field (machine-unit) internal-address-offsets))
+      (al-clear! [i64] (field (machine-unit) internal-address-targets))
       (set! i 0)
       (loop (if (or (>= (load i) n) (!= (be-result) BER-OK))
                 (break)
@@ -770,7 +794,11 @@
                               -1
                               (be-read-value! (.b m) 16))]
                     (case op MI-MOVI
-                          (be-mov-imm! rd (load (field m imm))) MI-FMOVI
+                          (if (and (!= (.node m) NO-NODE)
+                                   (match (n-op (.node m))
+                                     (Fun [_] true) (CallableId [_] true) (_ false)))
+                              (be-mov-imm-fixed! rd (.imm m))
+                              (be-mov-imm! rd (.imm m))) MI-FMOVI
                           (do
                             (be-mov-imm! 15 (load (field m imm)))
                             (be-u32! (a64-fmov-d-x (- rd 32) 15))
@@ -1083,8 +1111,15 @@
                                 here
                                   (+ (load (field m first))
                                      (if (< (be-reg-of (load (field m a))) 0) 4 0))]
-                            (if (< target 0)
-                                -1
+                            (if (or (< target 0) (>= target (load expected-size)))
+                                (do
+                                  (fmt (stderr)
+                                       "invalid-aarch64-branch inst={d} owner={d} ideal={d} op={d} label={d} source={d} target={d} code-size={d}\n"
+                                       (load i) (load (field m owner)) (load (field m node))
+                                       (load (field m op)) (load (field m imm)) here target
+                                       (load expected-size))
+                                  (be-fail! BER-ENCODING (load (field m node)))
+                                  -1)
                                 (be-u32! (a64-cbz ra (/ (- target here) 4)))))
                             MI-CSEL
                           (do
@@ -1124,7 +1159,12 @@
                                   (if polymorphic
                                       (be-read-value! (load (field m a)) 15)
                                       -1)
-                                area (be-call-area (+ argc (if polymorphic 1 0)))
+                                ;; A polymorphic call keeps the original argument snapshots plus
+                                ;; one protected snapshot per register argument and two resolver
+                                ;; result slots. The C resolver may clobber every caller-saved
+                                ;; register; the actual JavaScript callee must still observe the
+                                ;; exact ABI state prepared above.
+                                area (be-call-area (if polymorphic (+ (* argc 2) 2) argc))
                                 (mut j) 0]
                             (be-sub-sp! area)
                             (if polymorphic (be-u32! (a64-str callee-reg 31 (* argc 8))) 0)
@@ -1184,14 +1224,10 @@
                             ; Values live across calls cannot occupy caller-saved registers: G6/G7
                             ; enforce the clobber mask, so no provisional save envelope is needed.
                             (if polymorphic
-                                (let [targets (be-poly-call-targets m)
-                                      (mut fidx) 0]
-                                  ; The callee value dispatches by tag: a bare function's payload
-                                  ; IS the callable id, and a closure carries its id in the
-                                  ; environment's __closure_target field. Ordinary objects are not
-                                  ; callable. The closure VALUE remains tagged as a closure, while
-                                  ; hidden environment argument x0 is retagged as an object before
-                                  ; entering the body, matching the x64 ABI.
+                                (let [(mut save) 0]
+                                  ; Decode the JavaScript callable identity. Bare functions carry
+                                  ; the id directly; closures carry it in __closure_target and pass
+                                  ; their retagged environment as hidden argument x0.
                                   (be-u32! (a64-ldr 16 31 (* argc 8)))
                                   (be-mov-imm! 17 JSV-TAG-MASK)
                                   (be-u32! (a64-and-reg 17 16 17))
@@ -1202,7 +1238,11 @@
                                   (be-u32! (a64-bcond 0 (+ 9 (be-mov-words JSV-OBJECT))))
                                   (be-u32! (a64-cmp-reg 17 14))
                                   (be-u32! (a64-bcond 0 2))
-                                  (be-u32! (a64-brk))
+                                  ;; Route a non-callable tag through the resolver's invalid-id
+                                  ;; path so diagnostics identify the bad value before the common
+                                  ;; unresolved-target trap. This remains one word and preserves
+                                  ;; the ordinary invalid-call behavior.
+                                  (be-u32! (a64-add-reg 16 31 31))
                                   (be-u32! (a64-and-reg 16 16 13))
                                   (be-u32! (a64-ldr 16 16 8))
                                   (be-u32! (a64-and-reg 0 0 13))
@@ -1210,69 +1250,52 @@
                                   (be-u32! (a64-orr-reg 0 0 14))
                                   (be-u32! (a64-b 2))
                                   (be-u32! (a64-and-reg 16 16 13))
-                                  (be-u32! (a64-add-reg 13 31 31))
-                                  (be-u32! (a64-add-reg 12 31 31))
-                                  (if (= targets 0)
-                                      ; No summary: dispatch over every function in the unit.
-                                      ; A JavaScript value only carries a JavaScript callable id,
-                                      ; so JSL internals in the chain simply never match.
-                                      (let [(mut owner-i) 0]
-                                        (loop (if (>= (load owner-i) (mu-function-count))
-                                                  (break)
-                                                  (let [symbol
-                                                          (al-get (load (field (machine-unit)
-                                                                              symbols))
-                                                                  (load owner-i))]
-                                                    (if (>= symbol 1)
-                                                        (let [target-block
-                                                                (mu-function-block (load owner-i) 0)
-                                                              target-off
-                                                                (if (< target-block 0)
-                                                                    -1
-                                                                    (be-label-off target-block))]
-                                                          (be-mov-imm! 15 symbol)
-                                                          (be-u32! (a64-cmp-reg 16 15))
-                                                          (if (< target-off 0)
-                                                              (be-u32! (a64-brk))
-                                                              (be-relative-code-address! 17 15 target-off))
-                                                          (be-u32! (a64-csel 13 17 13 0))
-                                                          (be-mov-imm! 15 (be-poly-return-code (load owner-i)))
-                                                          (be-u32! (a64-csel 12 15 12 0))
-                                                          0)
-                                                        0)
-                                                    (store! owner-i (+ (load owner-i) 1))))))
-                                      (loop (if (>= (load fidx) 63)
+                                  ; Preserve the prepared register arguments above the live ABI
+                                  ; stack area. The resolver is an ordinary C call and may clobber
+                                  ; all of them.
+                                  (store! save 0)
+                                  (loop (if (>= (load save) argc)
                                             (break)
-                                            (do
-                                              (if (!= (& targets (<< 1 (load fidx))) 0)
-                                                  (let [target-owner (mu-find-function-symbol (load fidx))
-                                                        target-block
-                                                          (if (< target-owner 0)
-                                                              -1
-                                                              (mu-function-block target-owner 0))
-                                                        target-off
-                                                          (if (< target-block 0)
-                                                              -1
-                                                              (be-label-off target-block))]
-                                                    (be-mov-imm! 15 (load fidx))
-                                                    (be-u32! (a64-cmp-reg 16 15))
-                                                    (if (< target-off 0)
-                                                        (be-u32! (a64-brk))
-                                                        (be-relative-code-address! 17 15 target-off))
-                                                    (be-u32! (a64-csel 13 17 13 0))
-                                                    (let [return-code
-                                                            (if (< target-owner 0)
-                                                                -4
-                                                                (be-poly-return-code target-owner))]
-                                                      (be-mov-imm! 15 return-code)
-                                                      (be-u32! (a64-csel 12 15 12 0))))
+                                            (let [vr
+                                                    (al-get
+                                                      (load (field (machine-unit) call-args))
+                                                      (+ first (load save)))
+                                                  abi-index
+                                                    (be-call-arg-class-index m (load save))
+                                                  off (* (+ argc (+ 2 (load save))) 8)]
+                                              (if (< abi-index 8)
+                                                  (if (= (be-register-class vr) MRC-FPR)
+                                                      (be-u32! (a64-str-d abi-index 31 off))
+                                                      (be-u32! (a64-str abi-index 31 off)))
                                                   0)
-                                              (store! fidx (+ (load fidx) 1))))))
+                                              (store! save (+ (load save) 1)))))
+                                  (be-u32! (a64-add-reg 0 16 31))
+                                  (set! (field m last) (be-code-len))
+                                  (be-u32! (a64-bl 0))
+                                  (be-u32! (a64-str 0 31 (* argc 8)))
+                                  (be-u32! (a64-str 1 31 (* (+ argc 1) 8)))
+                                  (store! save 0)
+                                  (loop (if (>= (load save) argc)
+                                            (break)
+                                            (let [vr
+                                                    (al-get
+                                                      (load (field (machine-unit) call-args))
+                                                      (+ first (load save)))
+                                                  abi-index
+                                                    (be-call-arg-class-index m (load save))
+                                                  off (* (+ argc (+ 2 (load save))) 8)]
+                                              (if (< abi-index 8)
+                                                  (if (= (be-register-class vr) MRC-FPR)
+                                                      (be-u32! (a64-ldr-d abi-index 31 off))
+                                                      (be-u32! (a64-ldr abi-index 31 off)))
+                                                  0)
+                                              (store! save (+ (load save) 1)))))
+                                  (be-u32! (a64-ldr 13 31 (* argc 8)))
                                   (be-u32! (a64-cbnz 13 2))
                                   (be-u32! (a64-brk))
-                                  (be-u32! (a64-str 12 31 (* argc 8)))
                                   (be-u32! (a64-blr 13))
-                                  (be-u32! (a64-ldr 12 31 (* argc 8)))
+                                  (set! (field m earliest) (be-code-len))
+                                  (be-u32! (a64-ldr 12 31 (* (+ argc 1) 8)))
                                   ;; Box the selected target's natural return representation. -4
                                   ;; means it was already tagged; -3 means the result is in d0.
                                   (be-mov-imm! 17 JSV-PAYLOAD-MASK)
@@ -1294,9 +1317,24 @@
                                               (+ (be-sp-adjust-words area)
                                                  (+ argc
                                                     (+ spill-loads (+ register-loads stack-moves))))))]
-                                  (if (< target 0)
+                                  (if (and (< target 0)
+                                           (not (mu-function-imported?
+                                                  (load (field m imm)))))
                                       -1
-                                      (be-u32! (a64-bl (/ (- target bl-off) 4))))))
+                                      (do
+                                        (al-push! [i64]
+                                                  (field (machine-unit) internal-call-sources)
+                                                  (load (field m owner)))
+                                        (al-push! [i64]
+                                                  (field (machine-unit) internal-call-offsets)
+                                                  bl-off)
+                                        (al-push! [i64]
+                                                  (field (machine-unit) internal-call-targets)
+                                                  (load (field m imm)))
+                                        (be-u32! (a64-bl (if (< target 0)
+                                                            0
+                                                            (/ (- target bl-off) 4))))
+                                        0))))
                             (if (= (be-register-class dst) MRC-FPR)
                                 (be-u32! (a64-fmov-d 30 0))
                                 (be-u32! (a64-add-reg 14 0 31)))
@@ -1371,8 +1409,15 @@
                             MI-B
                           (let [target (be-label-off (load (field m imm)))
                                 here (load (field m first))]
-                            (if (< target 0)
-                                -1
+                            (if (or (< target 0) (>= target (load expected-size)))
+                                (do
+                                  (fmt (stderr)
+                                       "invalid-aarch64-branch inst={d} owner={d} ideal={d} op={d} label={d} source={d} target={d} code-size={d}\n"
+                                       (load i) (load (field m owner)) (load (field m node))
+                                       (load (field m op)) (load (field m imm)) here target
+                                       (load expected-size))
+                                  (be-fail! BER-ENCODING (load (field m node)))
+                                  -1)
                                 (be-u32! (a64-b (/ (- target here) 4)))))
                           ; Allocation is an external runtime safepoint. The object writer relocates
                           ; the slow-path zero BL to `_aot_alloc_slow`. x28 points at
@@ -1383,12 +1428,12 @@
                             (if (be-runtime-allocation?)
                                 (let [size (shape-size (load (field m imm)))
                                       shape (load (field m imm))
-                                      sw (be-mov-words size)
-                                      shw (be-mov-words shape)
+                                      sw 4
+                                      shw 4
                                       cw (+ 6 sw)]
                                   (be-u32! (a64-ldr 9 28 0))
                                   (be-u32! (a64-ldr 10 28 8))
-                                  (be-mov-imm! 11 size)
+                                  (be-mov-imm-fixed! 11 size)
                                   (be-u32! (a64-add-reg 11 9 11))
                                   (be-u32! (a64-cmp-reg 11 10))
                                   (be-u32! (a64-bcond 8 (+ 7 (+ shw cw))))
@@ -1396,7 +1441,7 @@
                                   (be-u32! (a64-cbnz 10 (+ 5 (+ shw cw))))
                                   (be-u32! (a64-str 11 28 0))
                                   (be-u32! (a64-add-reg 0 9 31))
-                                  (be-mov-imm! 10 shape)
+                                  (be-mov-imm-fixed! 10 shape)
                                   (be-u32! (a64-str 10 0 0))
                                   ; Exact allocation metrics live in the thread state so the
                                   ; generated fast path and C slow path share one counter domain.
@@ -1404,12 +1449,12 @@
                                   (be-u32! (a64-add-imm 15 15 1))
                                   (be-u32! (a64-str 15 28 72))
                                   (be-u32! (a64-ldr 15 28 80))
-                                  (be-mov-imm! 16 size)
+                                  (be-mov-imm-fixed! 16 size)
                                   (be-u32! (a64-add-reg 15 15 16))
                                   (be-u32! (a64-str 15 28 80))
                                   (be-u32! (a64-b (+ 2 (+ sw shw))))
-                                  (be-mov-imm! 0 size)
-                                  (be-mov-imm! 1 shape)
+                                  (be-mov-imm-fixed! 0 size)
+                                  (be-mov-imm-fixed! 1 shape)
                                   (be-u32! (a64-bl 0))
                                   (be-u32! (a64-add-reg rd 0 31))
                                   0)
@@ -1514,6 +1559,13 @@
                         (if (>= dst 0) (be-store-written! dst rd) 0)
                         (set! i (+ (load i) 1))
                         0)))))
+      (if (and (= (be-result) BER-OK) (!= (be-code-len) (load expected-size)))
+          (do
+            (fmt (stderr) "encoding-final-size-mismatch expected={d} actual={d}\n"
+                 (load expected-size) (be-code-len))
+            (be-fail! BER-ENCODING NO-NODE)
+            0)
+          0)
       (be-code-len))))
 
 (defn be-encode-checked! [] (-> bool)

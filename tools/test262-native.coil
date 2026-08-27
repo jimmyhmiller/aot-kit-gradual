@@ -3,10 +3,12 @@
 (import "coil.primitive" :as primitive)
 (import "nativeharness" :use *)
 (import "frontendnative" :use *)
-(import "frontendnativegraph" :use [frontend-native-reuse-jsl-index!])
+(import "frontendnativegraph"
+        :use [frontend-native-reuse-jsl-index! frontend-native-expected-uncaught-kind!])
 (import "backend_core" :use [be-use-profiling! be-profiling?])
 (import "typescriptnative" :use *)
 (import "coil.alloc" :use * :as alloc)
+(import "coil.arraylist" :use *)
 (import "coil.args" :use *)
 (import "coil.fmt" :use *)
 (import "coil.fs" :use *)
@@ -17,67 +19,282 @@
 (extern fdopen :cc c [i32 (ptr i8)] (-> (ptr u8)))
 (extern fgets :cc c [(ptr i8) i32 (ptr u8)] (-> (ptr i8)))
 (extern fflush :cc c [(ptr u8)] (-> i32))
+(extern fork :cc c [] (-> i32))
+(extern waitpid :cc c [i32 (ptr i32) i32] (-> i32))
+(extern _exit :cc c [i32] (-> void))
+(extern setpgid :cc c [i32 i32] (-> i32))
 
-(defn t262-native-parse-negative [(path (slice u8))] (-> i64)
+(defn t262-native-append! [(out (mut (ArrayList u8))) (text (slice u8))] (-> i64)
+  (let [(mut index) 0]
+    (loop (if (>= (load index) (slice-len text))
+              (break)
+              (do (al-push! [u8] (mut out) (slice-get text (load index)))
+                  (set! index (+ (load index) 1))))))
+  0)
+
+(defn t262-native-length-path [(a (dyn Allocator)) (path (slice u8))] (-> (slice u8))
+  (let [(mut out) (al-new [u8] a)]
+    (t262-native-append! (mut out) path)
+    (t262-native-append! (mut out) ".lengths")
+    (al-into-slice [u8] (mut out))))
+
+(defn t262-native-parse-lengths! [(text (slice u8)) (out (mut (ArrayList i32)))] (-> bool)
+  (let [(mut index) 0 (mut value) 0 (mut seen) false (mut valid) true]
+    (loop (if (>= (load index) (slice-len text))
+              (break)
+              (let [byte (slice-get text (load index))]
+                (if (and (>= byte (cast u8 48)) (<= byte (cast u8 57)))
+                    (do (set! value (+ (* (load value) 10) (- (cast i64 byte) 48)))
+                        (set! seen true)
+                        (if (> (load value) 2147483647) (set! valid false) 0))
+                    (if (or (= byte (cast u8 10)) (= byte (cast u8 13)) (= byte (cast u8 44)))
+                        (if (load seen)
+                            (do (al-push! [i32] (mut out) (cast i32 (load value)))
+                                (set! value 0)
+                                (set! seen false))
+                            0)
+                        (set! valid false)))
+                (set! index (+ (load index) 1)))))
+    (if (load seen) (al-push! [i32] (mut out) (cast i32 (load value))) 0)
+    (and (load valid) (> (al-len [i32] (load out)) 0))))
+
+(defn t262-native-preexecution-negative [(path (slice u8)) (script-kind i64)] (-> i64)
   (let [a (malloc-allocator)
         source (t262-native-read a path)]
     (if (= (slice-len source) 0)
-        (do (fmt (stderr) "test262-native: cannot read empty parse-negative source\n") 66)
-        (let [(mut ast) (ts-open-file source path TS-SCRIPT-JS)
+        (do (fmt (stderr) "test262-native: cannot read empty pre-execution-negative source\n") 66)
+        (let [(mut ast) (ts-open-file source path script-kind)
               rejected (> (ts-diagnostic-count ast) 0)]
           (ts-close! (mut ast))
+          (alloc/free [u8] a source)
           (if rejected
               (do (fmt (stdout) "PASS\n") 0)
               (do (fmt (stdout) "RUNTIME-FAILED 0\n") 1))))))
 
-(defn t262-native-server [] (-> i64)
-  (let [input (fdopen 0 (cast (ptr i8) (slice-data "r")))
-        buffer (primitive/alloc-stack (array i8 4096))
-        (mut index) 0]
-    (loop
-      (let [line (fgets (cast (ptr i8) buffer) 4096 input)]
-        (if (= (cast i64 line) 0)
-            (break)
-            (let [(mut length) 0]
-              (loop (if (or (>= (load length) 4095)
-                            (= (load (index (cast (ptr i8) buffer) (load length))) (cast i8 0)))
-                        (break)
-                        (set! length (+ (load length) 1))))
-              (loop (if (or (<= (load length) 0)
-                            (and (!= (load (index (cast (ptr i8) buffer) (- (load length) 1)))
-                                      (cast i8 10))
-                                 (!= (load (index (cast (ptr i8) buffer) (- (load length) 1)))
-                                      (cast i8 13))))
-                        (break)
-                        (set! length (- (load length) 1))))
-              (if (> (load length) 0)
-                  (do
-                    (fmt (stderr) "AOTK_CASE_BEGIN index={d}\n" (load index))
-                    (let [parse-negative (= (load (index (cast (ptr i8) buffer) 0))
-                                             (cast i8 33))
-                          path (slice-new [u8]
+(defn t262-native-free-script-batch! [(a (dyn Allocator))
+                                      (sources (mut (ArrayList (slice u8))))
+                                      (lengths (mut (ArrayList (slice i32))))] (-> i64)
+  (let [(mut index) 0]
+    (loop (if (>= (load index) (al-len [(slice u8)] (load sources)))
+              (break)
+              (do
+                (alloc/free [u8] a (al-get [(slice u8)] (load sources) (load index)))
+                (alloc/free [i32] a (al-get [(slice i32)] (load lengths) (load index)))
+                (set! index (+ (load index) 1))))))
+  (al-free! [(slice u8)] (mut sources))
+  (al-free! [(slice i32)] (mut lengths))
+  0)
+
+;; Manifest rows are `<expected-runtime-kind>\t<assembled-unit-path>`. Each assembled unit retains
+;; its `.lengths` sidecar and therefore its official ordered Script records. The manifest combines
+;; compiler work only; one forked child executes one selector and cannot observe another test.
+(defn t262-native-batch-manifest [(path (slice u8))] (-> i64)
+  (block :done
+    (fmt (stderr) "AOTK_READY ns={d}\n" (nh-now-ns))
+    (let [a (malloc-allocator)
+          manifest (t262-native-read a path)
+          (mut sources) (al-new [(slice u8)] a)
+          (mut lengths) (al-new [(slice i32)] a)
+          (mut kinds) (al-new [i64] a)
+          (mut from) 0]
+      (loop (if (>= (load from) (slice-len manifest))
+                (break)
+                (let [(mut to) (load from)]
+                  (loop (if (or (>= (load to) (slice-len manifest))
+                                (= (slice-get manifest (load to)) (cast u8 10)))
+                            (break)
+                            (set! to (+ (load to) 1))))
+                  (let [(mut end) (load to)]
+                    (if (and (> (load end) (load from))
+                             (= (slice-get manifest (- (load end) 1)) (cast u8 13)))
+                        (set! end (- (load end) 1))
+                        0)
+                    (if (> (load end) (+ (load from) 2))
+                        (let [kind-byte (slice-get manifest (load from))
+                              tab (slice-get manifest (+ (load from) 1))
+                              unit-path (slice-new [u8]
                                           (cast (ptr u8)
-                                                (if parse-negative
-                                                    (+ (cast i64 buffer) 1)
-                                                    (cast i64 buffer)))
-                                          (- (load length) (if parse-negative 1 0)))
-                          status (if parse-negative
-                                     (t262-native-parse-negative path)
-                                     (t262-native-one path))]
-                      ;; stdout ordering guarantees the result line above is visible before this
-                      ;; completion marker even though diagnostics use a separate stderr pipe.
-                      (fmt (stdout) "AOTK_CASE_END index={d} status={d}\n"
-                           (load index) (if (= status 0) 0 1))
-                      (fflush (cast (ptr u8) 0)))
-                    (set! index (+ (load index) 1))
-                    0)
-                  0))))
-    0)))
+                                            (+ (cast i64 (slice-data manifest))
+                                               (+ (load from) 2)))
+                                          (- (load end) (+ (load from) 2)))
+                              source (t262-native-read a unit-path)
+                              length-path (t262-native-length-path a unit-path)
+                              length-source (t262-native-read a length-path)
+                              (mut unit-lengths) (al-new [i32] a)
+                              valid (and (and (>= kind-byte (cast u8 48))
+                                              (<= kind-byte (cast u8 56)))
+                                         (and (= tab (cast u8 9))
+                                              (> (slice-len source) 0)))
+                              parsed (if valid
+                                         (t262-native-parse-lengths!
+                                           length-source (mut unit-lengths))
+                                         false)]
+                          (alloc/free [u8] a length-source)
+                          (alloc/free [u8] a length-path)
+                          (if parsed
+                              (do
+                                (al-push! [(slice u8)] (mut sources) source)
+                                (al-push! [(slice i32)] (mut lengths)
+                                          (al-into-slice [i32] (mut unit-lengths)))
+                                (al-push! [i64] (mut kinds) (- (cast i64 kind-byte) 48)))
+                              (do
+                                (alloc/free [u8] a source)
+                                (al-free! [i32] (mut unit-lengths))
+                                (t262-native-free-script-batch!
+                                  a (mut sources) (mut lengths))
+                                (al-free! [i64] (mut kinds))
+                                (alloc/free [u8] a manifest)
+                                (fmt (stdout) "BATCH-COMPILE-FAILED\n")
+                                (return-from :done 2))))
+                        0))
+                  (set! from (+ (load to) 1)))))
+      (let [(mut accepted) (al-new [i64] a)
+            compiled
+              (nh-try-compile-script-unit-batch?
+                (al-slice [(slice u8)] (load sources))
+                (al-slice [(slice i32)] (load lengths))
+                (al-slice [i64] (load kinds))
+                (mut accepted)
+                TS-SCRIPT-JS)
+            had-accepted (> (al-len [i64] (load accepted)) 0)]
+        (let [(mut source-index) 0]
+          (loop (if (>= (load source-index) (al-len [(slice u8)] (load sources)))
+                    (break)
+                    (do
+                      (let [(mut found) false
+                            (mut accepted-index) 0]
+                        (loop (if (>= (load accepted-index) (al-len [i64] (load accepted)))
+                                  (break)
+                                  (do
+                                    (if (= (al-get [i64] (load accepted) (load accepted-index))
+                                           (load source-index))
+                                        (set! found true)
+                                        0)
+                                    (set! accepted-index (+ (load accepted-index) 1)))))
+                        (if (not (load found))
+                            (do
+                              (fmt (stdout) "BATCH {d} REFUSED\n" (load source-index))
+                              0)
+                            0))
+                      (set! source-index (+ (load source-index) 1))))))
+        (if (not compiled)
+            (if (= (al-len [i64] (load accepted)) 0)
+                0
+                (do
+                  (fmt (stdout) "BATCH-COMPILE-FAILED\n")
+                  0))
+            (if (!= (nh-prepare-isolated-execution!) 0)
+                (do (fmt (stdout) "BATCH-LINK-FAILED\n") 0)
+                (let [(mut index) 0]
+                  (loop (if (>= (load index) (al-len [i64] (load accepted)))
+                            (break)
+                            (let [original-index (al-get [i64] (load accepted) (load index))
+                                  ok (primitive/alloc-stack bool)
+                                  answer
+                                    (do
+                                      (fmt (stderr) "AOTK_BATCH_EXEC index={d}\n" (load index))
+                                      (set! ok true)
+                                      (nh-exec-isolated-retained-checked-timeout!
+                                        (load index) 2 ok))]
+                              (if (and (load ok) (= answer 0))
+                                  (fmt (stdout) "BATCH {d} PASS\n" original-index)
+                                  (fmt (stdout) "BATCH {d} RUNTIME-FAILED {d}\n"
+                                       original-index answer))
+                              (set! index (+ (load index) 1))))))))
+        (nh-cleanup!)
+        (al-free! [i64] (mut accepted))
+        (t262-native-free-script-batch! a (mut sources) (mut lengths))
+        (al-free! [i64] (mut kinds))
+        (alloc/free [u8] a manifest)
+        (if (or compiled (not had-accepted)) 0 2)))))
+
+(defn t262-native-server-request [(buffer (ptr i8)) (length i64)] (-> i64)
+  (let [batch-manifest (= (load (index buffer 0)) (cast i8 35))
+        module-negative (= (load (index buffer 0)) (cast i8 94))
+        preexecution-negative
+          (or module-negative (= (load (index buffer 0)) (cast i8 33)))
+        runtime-negative (= (load (index buffer 0)) (cast i8 63))
+        ;; Runtime-negative cases still contain the ordinary harness/test Script record sidecar.
+        ;; `?K:` adds completion policy; it does not concatenate those records or change their
+        ;; directive/declaration semantics.
+        multi-script (or runtime-negative (= (load (index buffer 0)) (cast i8 64)))
+        runtime-kind (if runtime-negative
+                         (- (cast i64 (load (index buffer 1))) 48)
+                         0)
+        prefix-length (if runtime-negative 3
+                          (if (or batch-manifest (or preexecution-negative multi-script)) 1 0))
+        path (slice-new [u8]
+                        (cast (ptr u8) (+ (cast i64 buffer) prefix-length))
+                        (- length prefix-length))]
+    (if batch-manifest
+        (t262-native-batch-manifest path)
+        (if preexecution-negative
+            (t262-native-preexecution-negative
+              path (if module-negative TS-SCRIPT-JS-MODULE TS-SCRIPT-JS))
+            (do
+              (frontend-native-expected-uncaught-kind! runtime-kind)
+              (let [answer (t262-native-one-mode path multi-script)]
+                (frontend-native-expected-uncaught-kind! 0)
+                answer))))))
+
+(defn t262-native-server-launch [(buffer (ptr i8))
+                                 (length i64)
+                                 (index i64)
+                                 (child-status (ptr i32))] (-> i64)
+  (fmt (stderr) "AOTK_CASE_BEGIN index={d}\n" index)
+  ;; Compile in the exec-created worker itself. Entering the Go TypeScript runtime in a post-fork
+  ;; child is unsupported and can deadlock in source parsing. Generated JavaScript still executes
+  ;; in the harness's isolated child, which never calls Go.
+  (let [(mut status) (t262-native-server-request buffer length)]
+    (fflush (cast (ptr u8) 0))
+    (fmt (stderr) "AOTK_CASE_END index={d} status={d}\n" index (load status))
+    (fflush (cast (ptr u8) 0))
+    (load status)))
+
+(defn t262-native-server [] (-> i64)
+  ;; Build immutable JSL text once in an exec-created worker. Requests compile sequentially against
+  ;; that prefix, but remain separate Script graphs and execute in separate isolated children. A
+  ;; compiler assertion, signal, or timeout kills only this worker; the controller starts a clean
+  ;; replacement before assigning another request.
+  (if (not (nh-ensure-jsl-seed-cache?))
+      (do (fmt (stderr) "test262-native: cannot initialize JSL seed\n") 70)
+      (let [input (fdopen 0 (cast (ptr i8) (slice-data "r")))
+            buffer (primitive/alloc-stack (array i8 4096))
+            child-status (primitive/alloc-stack i32)
+            (mut index) 0]
+        (loop
+          (let [line (fgets (cast (ptr i8) buffer) 4096 input)]
+            (if (= (cast i64 line) 0)
+                (break)
+                (let [(mut length) 0]
+                  (loop (if (or (>= (load length) 4095)
+                                (= (load (index (cast (ptr i8) buffer) (load length)))
+                                   (cast i8 0)))
+                            (break)
+                            (set! length (+ (load length) 1))))
+                  (loop (if (or (<= (load length) 0)
+                                (and
+                                  (!= (load (index (cast (ptr i8) buffer)
+                                                   (- (load length) 1)))
+                                      (cast i8 10))
+                                  (!= (load (index (cast (ptr i8) buffer)
+                                                   (- (load length) 1)))
+                                      (cast i8 13))))
+                            (break)
+                            (set! length (- (load length) 1))))
+                  (if (> (load length) 0)
+                      (do
+                        (t262-native-server-launch
+                          (cast (ptr i8) buffer) (load length) (load index) child-status)
+                        (set! index (+ (load index) 1))
+                        0)
+                      0)))))
+        0)))
 
 (defn t262-native-read [(a (dyn Allocator)) (path (slice u8))] (-> (slice u8))
   (try (try-or! (read-file a path) "")))
 
-(defn t262-native-one [(path (slice u8))] (-> i64)
+(defn t262-native-one-mode [(path (slice u8)) (multi-script bool)] (-> i64)
   (block :done
     (fmt (stderr) "AOTK_READY ns={d}\n" (nh-now-ns))
     (let [a (malloc-allocator)
@@ -86,20 +303,42 @@
           (return-from :done
                        (do (fmt (stderr) "test262-native: cannot read empty source\n") 66))
           0)
-      (if (not (nh-try-compile? source))
+      (let [(mut lengths) (al-new [i32] a)
+            length-path (if multi-script (t262-native-length-path a path) "")
+            length-source (if multi-script (t262-native-read a length-path) "")
+            lengths-valid (if multi-script
+                              (t262-native-parse-lengths! length-source (mut lengths)) true)
+            compiled (if (not lengths-valid)
+                         false
+                         (if multi-script
+                             (nh-try-compile-scripts?
+                               source
+                               (slice-new [i32]
+                                          (cast (ptr i32) (load (field lengths data)))
+                                          (al-len [i32] lengths))
+                               TS-SCRIPT-JS)
+                             (nh-try-compile? source)))]
+      (al-free! [i32] (mut lengths))
+      (alloc/free [u8] a length-source)
+      (alloc/free [u8] a length-path)
+      (alloc/free [u8] a source)
+      (if (not compiled)
           (do (fmt (stdout) "REFUSED\n") 2)
-          (if (!= (nh-link!) 0)
+          (if (!= (nh-prepare-isolated-execution!) 0)
               (do (fmt (stdout) "LINK-FAILED\n") 3)
               (let [ok (primitive/alloc-stack bool)
                     exec-start (nh-now-ns)
-                    answer (do (set! ok true) (nh-exec-checked-timeout! 0 2 ok))
+                    answer (do (set! ok true) (nh-exec-isolated-checked-timeout! 0 2 ok))
                     _ (nh-timing! "native_execution" exec-start)
                     cleanup-start (nh-now-ns)
                     _ (nh-cleanup!)
                     _ (nh-timing! "native_cleanup" cleanup-start)]
                 (if (load ok)
                     (do (fmt (stdout) "PASS\n") 0)
-                    (do (fmt (stdout) "RUNTIME-FAILED {d}\n" answer) 1))))))))
+                    (do (fmt (stdout) "RUNTIME-FAILED {d}\n" answer) 1)))))))))
+
+(defn t262-native-one [(path (slice u8))] (-> i64)
+  (t262-native-one-mode path false))
 
 (defn t262-native-batch [(path (slice u8)) (count i64)] (-> i64)
   (block :done
@@ -110,9 +349,11 @@
           (return-from :done
                        (do (fmt (stderr) "test262-native: cannot read empty source\n") 66))
           0)
-      (if (not (nh-try-compile? source))
+      (let [compiled (nh-try-compile? source)]
+      (alloc/free [u8] a source)
+      (if (not compiled)
           (do (fmt (stdout) "REFUSED\n") 2)
-          (if (!= (nh-link!) 0)
+          (if (!= (nh-prepare-isolated-execution!) 0)
               (do (fmt (stdout) "LINK-FAILED\n") 3)
               (let [(mut index) 0]
                 (loop (if (>= (load index) count)
@@ -121,7 +362,7 @@
                                 exec-start (nh-now-ns)
                                 answer (do (fmt (stderr) "AOTK_BATCH_EXEC index={d}\n" (load index))
                                            (set! ok true)
-                                           (nh-exec-checked-timeout! (load index) 2 ok))
+                                           (nh-exec-isolated-checked-timeout! (load index) 2 ok))
                                 _ (nh-timing! "native_execution" exec-start)]
                             (if (load ok)
                                 (fmt (stdout) "BATCH {d} PASS\n" (load index))
@@ -131,7 +372,7 @@
                 (let [cleanup-start (nh-now-ns)]
                   (nh-cleanup!)
                   (nh-timing! "native_cleanup" cleanup-start))
-                0))))))
+                0)))))))
 
 (defn main [(argc i32) (argv (ptr (ptr i8)))] (-> i64)
   (block :done
@@ -140,26 +381,53 @@
     ;; The bounded/native test suites leave exhaustive graph verification enabled by default.
     ;; Test262 is the production-throughput corpus and does not pay for that debug pass.
     (nh-use-graph-verification! false)
+    ;; ARM64 executes encoded text in a fresh forked child and needs only GC metadata, not a Mach-O
+    ;; container. x86-64 ignores this policy and retains full ELF publication/linking.
+    (nh-use-direct-memory-execution! true)
     (let [profile (and (> (args-count) 1) (= (args-nth 1) "--profile"))
-          first (if profile 2 1)]
+          first (if profile 2 1)
+          seeded (and (> (args-count) (+ first 1)) (= (args-nth first) "--seed"))
+          command-first (if seeded (+ first 2) first)]
     (be-use-profiling! profile)
     (if (be-profiling?)
         (do (fmt (stderr) "AOTK_PROFILE enabled\n") 0)
         0)
-    (if (< (args-count) (+ first 1))
+    (if seeded
+        (if (nh-load-jsl-seed-artifact? (args-nth (+ first 1)))
+            0
+            (return-from :done
+              (do (fmt (stderr) "test262-native: cannot load JSL seed artifact\n") 70)))
+        0)
+    (if (and (= (args-count) (+ command-first 2))
+             (= (args-nth command-first) "--build-seed"))
+        (return-from :done
+          (if (nh-save-jsl-seed-artifact? (args-nth (+ command-first 1)))
+              0
+              (do (fmt (stderr) "test262-native: cannot write JSL seed artifact\n") 70)))
+        0)
+    (if (< (args-count) (+ command-first 1))
         (return-from :done
                      (do (fmt (stderr) "usage: test262-native [--profile] <assembled-source.js>...\n") 64))
         0)
-    (if (and (= (args-count) (+ first 1)) (= (args-nth first) "--server"))
+    (if (and (= (args-count) (+ command-first 1)) (= (args-nth command-first) "--server"))
         (return-from :done (t262-native-server))
         0)
-    (if (= (args-count) (+ first 2))
+    ;; A request process starts from exec, not from a supervisor that has already entered the Go
+    ;; TypeScript runtime. Go is not safe to re-enter in a post-fork child. Keeping this protocol
+    ;; one-shot also gives every Test262 Script unit fresh compiler and JavaScript runtime state.
+    (if (and (= (args-count) (+ command-first 2)) (= (args-nth command-first) "--request"))
+        (let [request (args-nth (+ command-first 1))]
+          (return-from :done
+            (t262-native-server-request
+              (cast (ptr i8) (slice-data request)) (slice-len request))))
+        0)
+    (if (= (args-count) (+ command-first 2))
         (return-from :done
                      (t262-native-batch
-                       (args-nth first)
-                       (atoll (cast (ptr i8) (slice-data (args-nth (+ first 1)))))))
+                       (args-nth command-first)
+                       (atoll (cast (ptr i8) (slice-data (args-nth (+ command-first 1)))))))
         0)
-    (let [(mut index) first (mut failed) false]
+    (let [(mut index) command-first (mut failed) false]
       (loop (if (>= (load index) (args-count))
                 (break)
                 (let [status (t262-native-one (args-nth (load index)))]

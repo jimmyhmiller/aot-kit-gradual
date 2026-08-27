@@ -47,6 +47,7 @@
 (const FE-INTRINSIC-BOOLEAN i64 -23)
 (const FE-INTRINSIC-UNBOUND i64 -24)
 (const FE-INTRINSIC-FUNCTION i64 -25)
+(const FE-INTRINSIC-SYMBOL i64 -26)
 
 (defn fe-function-expression-kind? [(kind i64)] (-> bool)
   (or (= kind TSK-FUNCTION-EXPRESSION)
@@ -89,6 +90,7 @@
         (= name "JSON") FE-INTRINSIC-JSON
         (= name "Boolean") FE-INTRINSIC-BOOLEAN
         (= name "Function") FE-INTRINSIC-FUNCTION
+        (= name "Symbol") FE-INTRINSIC-SYMBOL
         :else -1))
 
 (defstruct FeFunction
@@ -102,6 +104,7 @@
    (receiver-type-node i64)
    (arrow bool)
    (lexical-this bool)
+   (strict bool)
    (rest bool)
    (parameter-start i64)
    (parameter-count i64)])
@@ -121,8 +124,14 @@
 (defn fe-target-make [(label-node i64) (can-break bool) (can-continue bool)] (-> FeTarget)
   (FeTarget :label-node label-node :can-break can-break :can-continue can-continue))
 
+(defstruct FeScriptRecord [(ast TsAst) (index i64) (strict bool)])
+
 (defstruct NativeFrontend
   [(ast TsAst)
+   ;; Ordered Script records evaluated in one Realm. During the migration `.ast` aliases record
+   ;; zero so the existing one-Script frontend remains source-compatible; parser ownership stays
+   ;; with `.ast` until multi-record cleanup is introduced with the remaining records.
+   (scripts (ArrayList FeScriptRecord))
    (functions (ArrayList FeFunction))
    (symbols (ArrayList FeSymbol))
    ;; One symbol-list index per formal ABI slot. Pattern leaves may add more symbols between
@@ -154,6 +163,7 @@
                         (receiver-type i64)
                         (arrow bool)
                         (lexical-this bool)
+                        (strict bool)
                         (rest bool)
                         (parameter-start i64)
                         (parameter-count i64)] (-> FeFunction)
@@ -177,6 +187,8 @@
               arrow
               :lexical-this
               lexical-this
+              :strict
+              strict
               :rest
               rest
               :parameter-start
@@ -202,10 +214,21 @@
 (defn fe-field-make [(owner i64) (node i64) (name-node i64) (type-node i64)] (-> FeField)
   (FeField :owner owner :node node :name-node name-node :type-node type-node))
 
-(defn fe-native-new [(source (slice u8))] (-> NativeFrontend)
+(defn fe-native-new-ast [(ast TsAst)] (-> NativeFrontend)
   (let [a (malloc-allocator)
-        (mut frontend) (zeroed NativeFrontend)]
-    (set! (.ast frontend) (ts-open source))
+        (mut frontend) (zeroed NativeFrontend)
+        (mut script-index) 0]
+    (set! (.ast frontend) ast)
+    (set! (.scripts frontend) (al-new [FeScriptRecord] a))
+    (loop (if (>= (load script-index) (ts-script-count ast))
+              (break)
+              (do
+                (al-push! [FeScriptRecord]
+                          (mut (.scripts frontend))
+                          (FeScriptRecord :ast ast
+                                          :index (load script-index)
+                                          :strict (ts-script-strict-at? ast (load script-index))))
+                (set! script-index (+ (load script-index) 1)))))
     (set! (.functions frontend) (al-new [FeFunction] a))
     (set! (.symbols frontend) (al-new [FeSymbol] a))
     (set! (.parameter-symbols frontend) (al-new [i64] a))
@@ -224,6 +247,14 @@
     (set! (.error-code frontend) 0)
     (set! (.error-role frontend) 0)
     (load frontend)))
+
+(defn fe-native-new [(source (slice u8))] (-> NativeFrontend)
+  (fe-native-new-ast (ts-open source)))
+
+(defn fe-native-new-scripts [(source (slice u8))
+                             (lengths (slice i32))
+                             (script-kind i64)] (-> NativeFrontend)
+  (fe-native-new-ast (ts-open-scripts source lengths script-kind)))
 
 (defn fe-fail! [(frontend (mut NativeFrontend)) (code i64) (node i64) (role i64)] (-> i64)
   (if (= (.status frontend) FE-OK)
@@ -1311,6 +1342,29 @@
                 0))))
   0)
 
+;; Directive prologues are structural function metadata. Stop at the first non-string statement;
+;; a later string literal is an ordinary expression and cannot make the body strict.
+(defn fe-body-use-strict? [(ast TsAst) (body i64)] (-> bool)
+  (if (< body 0)
+      false
+      (let [(mut index) 0 (mut strict) false (mut done) false]
+        (loop (if (or (load done) (>= (load index) (ts-child-count ast body)))
+                  (break)
+                  (let [statement (ts-child ast body (load index))
+                        expression (if (= (ts-kind ast statement) TSK-EXPRESSION-STATEMENT)
+                                       (ts-role ast statement TS-ROLE-EXPRESSION 0)
+                                       -1)]
+                    (if (or (< expression 0) (!= (ts-kind ast expression) TSK-STRING-LITERAL))
+                        (set! done true)
+                        (let [(mut bytes) (al-new [u8] (malloc-allocator))
+                              text (ts-literal-text! ast expression (mut bytes))]
+                          (if (= text "use strict")
+                              (do (set! strict true) (set! done true) 0)
+                              0)
+                          (al-free! [u8] (mut bytes))
+                          (set! index (+ (load index) 1)))))))
+        (load strict))))
+
 (defn fe-find-function-parts! [(frontend (mut NativeFrontend)) (node i64) (id i64) (parent i64)] (-> i64)
   (let [ast (field frontend ast)
         ;; Function metadata comes from semantic roles, never child position. Arrow functions add
@@ -1350,6 +1404,11 @@
                     0)
                 (set! index (+ (load index) 1)))))
     (let [arrow (= (ts-kind ast node) TSK-ARROW-FUNCTION)
+          strict
+            (or (or (and (>= parent 0)
+                         (.strict (index (load (field (field frontend functions) data)) parent)))
+                    (fe-body-use-strict? ast (load body)))
+                (ts-script-strict-at? ast (ts-node-script ast node)))
           lexical-this
             (and arrow
                  (and (!= (load body) -1)
@@ -1380,6 +1439,7 @@
                                   (load receiver-type)
                                   arrow
                                   lexical-this
+                                  strict
                                   (load rest)
                                   (load parameter-start)
                                   (load parameter-count))))
@@ -1448,6 +1508,18 @@
               count (ts-child-count ast node)
               maybe-type (if (> count 2) (ts-child ast node 1) -1)]
           (fe-index-binding-names! (mut frontend) node name owner FE-ROLE-LOCAL maybe-type symbol-base))
+        0)
+    ;; The bridge exposes a simple catch parameter directly as an Identifier rather than a
+    ;; VariableDeclaration. It is still a real lexical binding owned by this function/Script
+    ;; entry and needs a symbol for exception materialization and catch-body resolution.
+    (if (= (ts-kind ast node) TSK-CATCH)
+        (let [declaration (ts-role ast node TS-ROLE-CATCH-BINDING 0)]
+          (if (and (!= declaration -1) (= (ts-kind ast declaration) TSK-IDENTIFIER))
+              (let [sid (+ symbol-base (al-len [FeSymbol] (.symbols frontend)))]
+                (al-push! [FeSymbol]
+                          (mut (.symbols frontend))
+                          (fe-symbol-make sid declaration declaration owner FE-ROLE-LOCAL -1)))
+              0))
         0)
     (if (fe-function-expression-kind? (ts-kind ast node))
         0
@@ -1560,7 +1632,18 @@
                                       (load index))))
                     0)
                 (set! index (+ (load index) 1)))))
-    (load answer)))
+    (if (>= (load answer) 0)
+        (load answer)
+        (let [(mut fallback) 0 (mut found) -1]
+          (loop (if (or (>= (load fallback) (al-len [FeFunction] (.functions frontend)))
+                        (>= (load found) 0))
+                    (break)
+                    (let [fn (al-get [FeFunction] (.functions frontend) (load fallback))]
+                      (if (= (.node fn) (ts-root (field frontend ast)))
+                          (set! found (.id fn))
+                          0)
+                      (set! fallback (+ (load fallback) 1)))))
+          (load found)))))
 
 (defn fe-validate-receiver-abis! [(frontend (mut NativeFrontend)) (node i64)] (-> i64)
   (let [ast (field frontend ast)
@@ -1783,7 +1866,15 @@
                   declaration (ts-role ast node TS-ROLE-CATCH-BINDING 0)
                   block (ts-role ast node TS-ROLE-BODY 0)]
               (if (!= declaration -1)
-                  (fe-resolve-node! (mut frontend) (mut bindings) declaration owner (+ depth 1))
+                  (if (= (ts-kind ast declaration) TSK-IDENTIFIER)
+                      (al-push! [FeBinding]
+                                (mut bindings)
+                                (fe-binding-make declaration
+                                                 (fe-symbol-for-declaration frontend declaration owner)
+                                                 (+ depth 1)))
+                      (fe-resolve-node! (mut frontend)
+                                        (mut bindings)
+                                        declaration owner (+ depth 1)))
                   0)
               (fe-resolve-node! (mut frontend) (mut bindings) block owner (+ depth 1))
               (store! (field bindings len) saved)
@@ -1940,9 +2031,11 @@
     (loop (if (or (>= (load index) (ts-child-count ast root))
                   (= (.status frontend) FE-UNBOUND))
               (break)
-              (let [statement (ts-child ast root (load index))
-                    kind (ts-kind ast statement)]
-                (if (or (= kind TSK-VARIABLE-STATEMENT) (= kind TSK-EXPRESSION-STATEMENT))
+              (let [statement (ts-child ast root (load index))]
+                ;; Script evaluation supports the full statement set, so resolution must walk the
+                ;; same set. Function declarations stop their own child walk in fe-resolve-node!
+                ;; and are resolved by fe-resolve-function!; EOF is structural, not executable.
+                (if (!= (ts-kind ast statement) TSK-END-OF-FILE)
                     (fe-resolve-node! (mut frontend) (mut bindings) statement owner 0)
                     0)
                 (set! index (+ (load index) 1)))))
@@ -2286,6 +2379,16 @@
                 (fe-index-object-layouts! (mut frontend) root)
                 ;; Function ids are allocated globally in syntax preorder before any parameter/local id.
                 (fe-index-functions! (mut frontend) root -1)
+                ;; A Script is a complete executable unit and must not contain a user-authored
+                ;; `main`. When no explicit native entry exists, add frontend STRUCTURE whose body
+                ;; is the SourceFile root; no JavaScript declaration or wrapper is injected.
+                (if (< (fe-main-id frontend) 0)
+                    (let [id (al-len [FeFunction] (.functions frontend))]
+                      (al-push! [FeFunction]
+                                (mut (.functions frontend))
+                                (fe-function-make id root -1 -1 root -1 -1 false false
+                                                  (fe-body-use-strict? ast root) false 0 0)))
+                    0)
                 (set! function-count (al-len [FeFunction] (.functions frontend)))
                 (set! index 0)
                 (loop (if (>= (load index) (ts-child-count ast root))
@@ -2349,6 +2452,7 @@
                   (.status frontend))))))))
 
 (defn fe-native-free! [(frontend (mut NativeFrontend))] (-> i64)
+  (al-free! [FeScriptRecord] (mut (.scripts frontend)))
   (al-free! [FeFunction] (mut (.functions frontend)))
   (al-free! [FeSymbol] (mut (.symbols frontend)))
   (al-free! [i64] (mut (.parameter-symbols frontend)))

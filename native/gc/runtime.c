@@ -6,6 +6,12 @@
 #include <string.h>
 #include <time.h>
 #include <stdio.h>
+#ifdef __APPLE__
+#include <fcntl.h>
+#include <signal.h>
+#include <sys/ucontext.h>
+#include <unistd.h>
+#endif
 #include "js-value.h"
 
 #ifdef __APPLE__
@@ -21,8 +27,108 @@ extern const uint8_t aot_layouts[] __asm("__start_aot_layout");
 #endif
 
 static const uint8_t *registered_kernel;
+static const uint8_t *registered_code_base;
 static const uint8_t *registered_stackmaps;
 static const uint8_t *registered_layouts;
+#ifdef __APPLE__
+static int crash_trace_fd = -1;
+static void aot_report_native_crash(int signal, siginfo_t *info, void *context) {
+  (void)info;
+  ucontext_t *uc = (ucontext_t *)context;
+  uintptr_t pc = (uintptr_t)uc->uc_mcontext->__ss.__pc;
+  const uint64_t *registers = uc->uc_mcontext->__ss.__x;
+  uint32_t instructions[9];
+  uint32_t return_instructions[20];
+  memcpy(instructions, (const void *)(pc - 16u), sizeof(instructions));
+  memcpy(return_instructions,
+         (const void *)(uc->uc_mcontext->__ss.__lr - 16u), sizeof(return_instructions));
+  int64_t kernel_offset = registered_kernel
+                              ? (int64_t)(pc - (uintptr_t)registered_kernel)
+                              : -1;
+  uint32_t record_index = UINT32_MAX, owner = UINT32_MAX, callable_id = 0;
+  uint32_t function_start = 0, function_size = 0, in_function = 0;
+  if (registered_stackmaps && kernel_offset >= 0) {
+    uint32_t count = 0, first_start = 0;
+    memcpy(&count, registered_stackmaps + 16, 4);
+    if (count) memcpy(&first_start, registered_stackmaps + 24 + 4, 4);
+    uint64_t image_pc = (uint64_t)kernel_offset + first_start;
+    for (uint32_t i = 0; i < count; ++i) {
+      const uint8_t *record = registered_stackmaps + 24 + (size_t)i * 40u;
+      uint32_t start = 0, size = 0;
+      memcpy(&start, record + 4, 4);
+      memcpy(&size, record + 8, 4);
+      if (image_pc >= start && image_pc < (uint64_t)start + size) {
+        record_index = i;
+        memcpy(&owner, record, 4);
+        memcpy(&callable_id, record + 32, 4);
+        function_start = start;
+        function_size = size;
+        in_function = (uint32_t)(image_pc - start);
+        break;
+      }
+    }
+  }
+  if (crash_trace_fd >= 0)
+    dprintf(crash_trace_fd, "signal=%d pc=0x%llx kernel_offset=%lld kernel=0x%llx\n",
+            signal, (unsigned long long)pc, (long long)kernel_offset,
+            (unsigned long long)(uintptr_t)registered_kernel),
+    dprintf(crash_trace_fd,
+            "record=%u owner=%u callable_id=%u function_start=%u function_size=%u in_function=%u\n",
+            record_index, owner, callable_id, function_start, function_size, in_function),
+    dprintf(crash_trace_fd,
+            "x13=0x%llx x15=0x%llx x16=0x%llx x17=0x%llx lr=0x%llx sp=0x%llx\n",
+            (unsigned long long)registers[13], (unsigned long long)registers[15],
+            (unsigned long long)registers[16], (unsigned long long)registers[17],
+            (unsigned long long)uc->uc_mcontext->__ss.__lr,
+            (unsigned long long)uc->uc_mcontext->__ss.__sp),
+    dprintf(crash_trace_fd,
+            "x0=0x%llx x1=0x%llx x2=0x%llx x3=0x%llx x4=0x%llx x5=0x%llx x6=0x%llx x7=0x%llx\n",
+            (unsigned long long)registers[0], (unsigned long long)registers[1],
+            (unsigned long long)registers[2], (unsigned long long)registers[3],
+            (unsigned long long)registers[4], (unsigned long long)registers[5],
+            (unsigned long long)registers[6], (unsigned long long)registers[7]),
+    dprintf(crash_trace_fd,
+            "x8=0x%llx x9=0x%llx x10=0x%llx x11=0x%llx x12=0x%llx x18=0x%llx x19=0x%llx x20=0x%llx\n",
+            (unsigned long long)registers[8], (unsigned long long)registers[9],
+            (unsigned long long)registers[10], (unsigned long long)registers[11],
+            (unsigned long long)registers[12], (unsigned long long)registers[18],
+            (unsigned long long)registers[19], (unsigned long long)registers[20]),
+    dprintf(crash_trace_fd,
+            "x21=0x%llx x22=0x%llx x23=0x%llx x24=0x%llx x25=0x%llx x26=0x%llx x27=0x%llx x28=0x%llx\n",
+            (unsigned long long)registers[21], (unsigned long long)registers[22],
+            (unsigned long long)registers[23], (unsigned long long)registers[24],
+            (unsigned long long)registers[25], (unsigned long long)registers[26],
+            (unsigned long long)registers[27], (unsigned long long)registers[28]),
+    dprintf(crash_trace_fd,
+            "instructions=%08x %08x %08x %08x [%08x] %08x %08x %08x %08x\n",
+            instructions[0], instructions[1], instructions[2], instructions[3], instructions[4],
+            instructions[5], instructions[6], instructions[7], instructions[8]);
+  if (crash_trace_fd >= 0) {
+    dprintf(crash_trace_fd, "return_instructions=");
+    for (size_t i = 0; i < 20; ++i) dprintf(crash_trace_fd, "%s%08x", i ? " " : "", return_instructions[i]);
+    dprintf(crash_trace_fd, "\n");
+  }
+  _exit(128 + signal);
+}
+static void aot_maybe_install_native_crash_trace(void) {
+  if (!getenv("AOT_TRACE_CRASH")) return;
+  crash_trace_fd = open("/tmp/aotk-native-crash.log", O_WRONLY | O_CREAT | O_APPEND, 0644);
+  struct sigaction action;
+  memset(&action, 0, sizeof(action));
+  action.sa_sigaction = aot_report_native_crash;
+  action.sa_flags = SA_SIGINFO;
+  sigemptyset(&action.sa_mask);
+  sigaction(SIGILL, &action, NULL);
+  sigaction(SIGSEGV, &action, NULL);
+  sigaction(SIGBUS, &action, NULL);
+  sigaction(SIGABRT, &action, NULL);
+}
+#else
+static void aot_maybe_install_native_crash_trace(void) {}
+#endif
+#define LAYOUT_CACHE_SIZE 256u
+static const void *layout_cache[LAYOUT_CACHE_SIZE];
+static uint64_t layout_cache_shapes[LAYOUT_CACHE_SIZE];
 static const uint8_t *unit_kernel(void) {
 #ifdef AOT_IN_MEMORY_HOST
   return registered_kernel;
@@ -45,17 +151,21 @@ static const uint8_t *unit_layouts(void) {
 #endif
 }
 
-void aot_gc_register_unit(const uint8_t *kernel, const uint8_t *stackmaps,
-                          const uint8_t *layouts) {
+void aot_gc_register_unit(const uint8_t *kernel, const uint8_t *code_base,
+                          const uint8_t *stackmaps, const uint8_t *layouts) {
   registered_kernel = kernel;
+  registered_code_base = code_base;
   registered_stackmaps = stackmaps;
   registered_layouts = layouts;
+  memset(layout_cache, 0, sizeof(layout_cache));
 }
 
 typedef struct {
   uint32_t owner, code_start, code_size, frame_size;
   uint64_t callee_mask;
   uint32_t callee_count, reserved;
+  uint32_t callable_id;
+  int32_t return_code;
 } FunctionRec;
 typedef struct {
   uint32_t pc, owner, instruction, root_first, root_count, op;
@@ -546,6 +656,18 @@ AotJsValue aot_js_builtin(AotJsValue a, AotJsValue b, uint64_t operation) {
     return AOT_JS_FUNCTION | (UINT64_C(0x10000) + (a & UINT64_C(0xff)));
   if (operation == 21)
     return AOT_JS_OBJECT | (UINT64_C(0x20000) + ((a & UINT64_C(0xff)) << 3));
+  if (operation == 22) {
+    AotJsValue symbol = AOT_JS_SYMBOL | aot_js_payload(a);
+    const char *trace_path = getenv("AOT_TRACE_SYMBOL");
+    if (trace_path && *trace_path) {
+      FILE *trace = fopen(trace_path, "a");
+      if (trace) {
+        fprintf(trace, "symbol-retag input=%016" PRIx64 " result=%016" PRIx64 "\n", a, symbol);
+        fclose(trace);
+      }
+    }
+    return symbol;
+  }
   double x = js_builtin_number(a), y = js_builtin_number(b), result = NAN;
   switch (operation) {
     case AOT_JS_BUILTIN_ABS: result = fabs(x); break;
@@ -846,19 +968,34 @@ AotJsValue aot_js_string(uintptr_t a, int64_t b,
 #else
     pending_exception = (AotJsValue)a;
     exception_pending = 1;
+    if (getenv("AOT_TRACE_EXCEPTION"))
+      fprintf(stderr, "exception op=200 pending=1 value=0x%016" PRIx64 "\n",
+              (uint64_t)pending_exception);
     return pending_exception;
 #endif
   }
-  if (operation == 201)
-    return AOT_JS_BOOLEAN | (AotJsValue)(exception_pending != 0);
+  if (operation == 201) {
+    AotJsValue result = AOT_JS_BOOLEAN | (AotJsValue)(exception_pending != 0);
+    if (getenv("AOT_TRACE_EXCEPTION"))
+      fprintf(stderr, "exception op=201 pending=%d result=0x%016" PRIx64 "\n",
+              exception_pending, (uint64_t)result);
+    return result;
+  }
   if (operation == 202) {
     AotJsValue result = exception_pending ? pending_exception : AOT_JS_UNDEFINED;
+    if (getenv("AOT_TRACE_EXCEPTION"))
+      fprintf(stderr, "exception op=202 pending=%d value=0x%016" PRIx64 "\n",
+              exception_pending, (uint64_t)result);
     pending_exception = AOT_JS_UNDEFINED;
     exception_pending = 0;
     return result;
   }
   if (operation == 203) {
     AotJsValue thrown = exception_pending ? pending_exception : (AotJsValue)a;
+    if (getenv("AOT_TRACE_EXCEPTION"))
+      fprintf(stderr, "exception op=203 pending=%d argument=0x%016" PRIxPTR
+                      " thrown=0x%016" PRIx64 "\n",
+              exception_pending, a, (uint64_t)thrown);
     if (getenv("AOT_TRACE_THROW")) {
       fprintf(stderr, "uncaught JavaScript throw value=0x%016" PRIx64 "\n", thrown);
     if (aot_js_tag(thrown) == AOT_JS_STRING) {
@@ -917,9 +1054,17 @@ AotJsValue aot_js_string(uintptr_t a, int64_t b,
     fflush(stderr);
     exit(70);
   }
+  if (operation == 205) {
+    fputs("Test262 runtime-negative test completed normally\n", stderr);
+    exit(71);
+  }
+  if (operation == 206) {
+    fputs("Test262 runtime-negative test threw the wrong constructor\n", stderr);
+    exit(72);
+  }
   if (operation == 204)
     return AOT_JS_UNDEFINED;
-  if ((operation >= 100 && operation < 117) || (operation >= 120 && operation <= 121))
+  if ((operation >= 100 && operation < 117) || (operation >= 120 && operation <= 122))
     return aot_js_builtin((AotJsValue)a, (AotJsValue)b, operation - 100);
   if (operation == AOT_JS_STRING_NEW) {
     JsStringRec *result = js_string_new(b < 0 ? 0 : (size_t)b);
@@ -1856,7 +2001,7 @@ static uint32_t function_count(void) { return u32(unit_stackmaps() + 16); }
 static uint32_t site_count(void) { return u32(unit_stackmaps() + 8); }
 static uint32_t root_count(void) { return u32(unit_stackmaps() + 12); }
 static const SiteRec *sites(void) {
-  return (const SiteRec *)(aot_stackmaps + 24 + function_count() * sizeof(FunctionRec));
+  return (const SiteRec *)(unit_stackmaps() + 24 + function_count() * sizeof(FunctionRec));
 }
 static const RootRec *roots(void) {
   return (const RootRec *)((const uint8_t *)sites() + site_count() * sizeof(SiteRec));
@@ -1866,7 +2011,19 @@ static const LayoutRec *layouts(void) { return (const LayoutRec *)(unit_layouts(
 
 static const LayoutRec *layout_for(uint64_t shape) {
   const LayoutRec *table = layouts();
-  for (uint32_t i = 0; i < layout_count(); ++i) if (table[i].shape == shape) return &table[i];
+  uint32_t count = layout_count();
+  /* Compiler-owned shapes are dense and layouts are emitted in shape order. Keep the exact
+     comparison because linked images may append catalogued layouts whose ids are not dense.
+     The fallback also preserves compatibility with older or externally produced images. */
+  if (shape < count && table[shape].shape == shape) return &table[shape];
+  uint32_t slot = (uint32_t)(shape & (LAYOUT_CACHE_SIZE - 1u));
+  if (layout_cache[slot] && layout_cache_shapes[slot] == shape)
+    return (const LayoutRec *)layout_cache[slot];
+  for (uint32_t i = 0; i < count; ++i) if (table[i].shape == shape) {
+    layout_cache[slot] = &table[i];
+    layout_cache_shapes[slot] = shape;
+    return &table[i];
+  }
   return NULL;
 }
 
@@ -1874,6 +2031,40 @@ static const FunctionRec *function_for(uint32_t owner) {
   const FunctionRec *table = functions();
   for (uint32_t i = 0; i < function_count(); ++i) if (table[i].owner == owner) return &table[i];
   return NULL;
+}
+
+typedef struct {
+  uintptr_t target;
+  int64_t return_code;
+} AotJsDispatchTarget;
+
+/* Resolve against the currently registered linked image, not the compilation unit that emitted
+   the call site. This is the separate-compilation seam: immutable JSL text can call a source
+   function supplied by a later Script suffix without embedding that suffix's address. */
+AotJsDispatchTarget aot_js_dispatch_resolve(uint64_t callable_id) {
+  AotJsDispatchTarget answer = {0, -1};
+  const int trace = getenv("AOT_TRACE_DISPATCH") != NULL;
+  if (!unit_stackmaps() || !registered_code_base || callable_id == 0) {
+    if (trace) fprintf(stderr, "AOTK_DISPATCH id=%llu unavailable\n",
+                       (unsigned long long)callable_id);
+    return answer;
+  }
+  const FunctionRec *table = functions();
+  for (uint32_t i = 0; i < function_count(); ++i) {
+    if ((uint64_t)table[i].callable_id == callable_id) {
+      answer.target = (uintptr_t)registered_code_base + table[i].code_start;
+      answer.return_code = table[i].return_code;
+      if (trace) fprintf(stderr,
+                         "AOTK_DISPATCH id=%llu record=%u owner=%u code=%llu return=%lld\n",
+                         (unsigned long long)callable_id, i, table[i].owner,
+                         (unsigned long long)table[i].code_start,
+                         (long long)table[i].return_code);
+      return answer;
+    }
+  }
+  if (trace) fprintf(stderr, "AOTK_DISPATCH id=%llu unresolved functions=%u\n",
+                     (unsigned long long)callable_id, function_count());
+  return answer;
 }
 
 typedef struct { uintptr_t old_addr, new_addr; } Forward;
@@ -2387,6 +2578,7 @@ static int collect(void *context, uint8_t *caller_sp, void *return_pc) {
 }
 
 int aot_gc_configure(size_t bytes, int stress) {
+  aot_maybe_install_native_crash_trace();
   free(spaces[0]); free(spaces[1]);
   free(old_space);
   capacity = (bytes + 7u) & ~7u;
@@ -2499,6 +2691,7 @@ uintptr_t aot_gc_runtime_symbol(int operation) {
     case 4: return (uintptr_t)aot_arr_store;
     case 5: return (uintptr_t)aot_arr_len;
     case 6: return (uintptr_t)aot_js_string;
+    case 7: return (uintptr_t)aot_js_dispatch_resolve;
     default: return 0;
   }
 }

@@ -78,6 +78,7 @@
   (TypeTest [(target i64)])
   (CallEnd)
   (Fun [(index i64)])
+  (CallableId [(index i64)])
   (Parm [(index i64)])
   (Call [(abi i64)])
   (FunStart)
@@ -209,6 +210,9 @@
 (const OPTAG-TYPETEST i64 28)  ; (_, dynamic value), aux = tested type
 (const OPTAG-CALLEND i64 29)  ; (ctrl, call) control after a completed call
 (const OPTAG-FUN i64 30)  ; (FunStart, body Returns...), aux = closed-world function index
+(const FUN-IDENTITY-EPHEMERAL i64 0)
+(const FUN-IDENTITY-SOURCE i64 1)
+(const FUN-IDENTITY-JSL i64 2)
 (const OPTAG-PARM i64 31)  ; (Fun), aux = zero-based parameter index
 (const OPTAG-CALL i64 32)  ; (ctrl, callee, args...) -> value
 (const OPTAG-FUNSTART i64 33)  ; (Fun) control entry for one dynamic invocation
@@ -286,7 +290,8 @@
 ;; through a loop accumulator produces exactly that order from data dependence alone.
 (const OPTAG-STRINGALLOC i64 91)   ; (_, raw length) -> a fresh string, all units zero
 (const OPTAG-STRINGSETUNIT i64 92) ; (_, string, raw index, raw unit) -> the SAME string
-(const OPTAG-COUNT i64 93)
+(const OPTAG-CALLABLEID i64 93) ; (Start), aux = compiler-local Fun index -> runtime integer id
+(const OPTAG-COUNT i64 94)
 
 ;; Temporary serialization/parser boundary while textual graph opcodes are still numeric.
 ;; A RETIRED TAG IS A HOLE IN A DENSE, SCANNED ID SPACE. `gparse-op` walks 0..OPTAG-COUNT asking
@@ -329,6 +334,7 @@
         OPTAG-TYPETEST (TypeTest aux)
         OPTAG-CALLEND (CallEnd)
         OPTAG-FUN (Fun aux)
+        OPTAG-CALLABLEID (CallableId aux)
         OPTAG-PARM (Parm aux)
         OPTAG-CALL (Call aux)
         OPTAG-FUNSTART (FunStart)
@@ -424,6 +430,7 @@
     (TypeTest [target] OPTAG-TYPETEST)
     (CallEnd [] OPTAG-CALLEND)
     (Fun [index] OPTAG-FUN)
+    (CallableId [index] OPTAG-CALLABLEID)
     (Parm [index] OPTAG-PARM)
     (Call [abi] OPTAG-CALL)
     (FunStart [] OPTAG-FUNSTART)
@@ -518,6 +525,7 @@
     (TypeTest [target] target)
     (CallEnd [] 0)
     (Fun [index] index)
+    (CallableId [index] index)
     (Parm [index] index)
     (Call [abi] abi)
     (FunStart [] 0)
@@ -620,6 +628,7 @@
     (TypeTest [_] "TypeTest")
     (CallEnd [] "CallEnd")
     (Fun [_] "Fun")
+    (CallableId [_] "CallableId")
     (Parm [_] "Parm")
     (Call [_] "Call")
     (FunStart [] "FunStart")
@@ -734,6 +743,7 @@
     (TypeTest [_] 98)
     (CallEnd [] 513)
     (Fun [_] 2)
+    (CallableId [_] 34)
     (Parm [_] 98)
     (Call [_] 514)
     (FunStart [] 33)
@@ -749,14 +759,14 @@
     (UShr [] 354)
     (BitNot [] 98)
     (PropLoad [_] 98)
-    (PropStore [_] 98)
-    (SetProto [] 98)
+    (PropStore [_] 610)
+    (SetProto [] 610)
     (ArrayMark [] 98)
     (ArrayLoad [_] 610)
-    (ArrayStore [] 98)
+    (ArrayStore [] 610)
     (ArrayLen [] 98)
-    (ArrayResize [] 98)
-    (ArrayCopy [] 98)
+    (ArrayResize [] 610)
+    (ArrayCopy [] 610)
     (StringConst [_] 98)
     (StringLen [] 98)
     (StringEq [] 98)
@@ -766,7 +776,7 @@
     (ToString [] 98)
     (ParseInt [] 98)
     (IsNaN [] 98)
-    (StringSplit [] 98)
+    (StringSplit [] 610)
     (StringFromCodeUnit [] 98)
     (NumberToString [] 98)
     (ToFixed [] 98)
@@ -785,17 +795,17 @@
     (ArrayUnbox [] 98)
     (ParseFloat [] 98)
     (PropHas [_] 98)
-    (PropDelete [_] 98)
+    (PropDelete [_] 610)
     (ProtoHas [] 98)
     (PropLoadKey [_] 98)
-    (PropStoreKey [_] 98)
+    (PropStoreKey [_] 610)
     (PropHasKey [] 98)
-    (PropDeleteKey [] 98)
+    (PropDeleteKey [] 610)
     (OwnKeyCount [] 98)
     (OwnKeyAt [] 98)
-    (ObjectFreeze [] 98)
+    (ObjectFreeze [] 610)
     (InternalLoad [_] 98)
-    (InternalStore [_] 98)
+    (InternalStore [_] 610)
     (StringNormalize [] 98)))
 
 (defn op-has-class? [(op Op) (class i64)] (-> bool)
@@ -880,9 +890,58 @@
 ; ============================================================================
 ; The graph
 ; ============================================================================
+(defstruct FunctionImportCatalog
+  [(kinds (ArrayList i64))
+   (units (ArrayList i64))
+   (locals (ArrayList i64))
+   (inited bool)])
+
+(defn function-import-catalog [] (-> (ptr FunctionImportCatalog))
+  (let [p (primitive/alloc-static FunctionImportCatalog)]
+    (if (.inited p) 0
+        (do
+          (set! (.kinds p) (al-new [i64] (malloc-allocator)))
+          (set! (.units p) (al-new [i64] (malloc-allocator)))
+          (set! (.locals p) (al-new [i64] (malloc-allocator)))
+          (set! (.inited p) true)))
+    p))
+(defn n-import-catalog-clear! [] (-> i64)
+  (let [p (function-import-catalog)]
+    (al-clear! [i64] (field p kinds))
+    (al-clear! [i64] (field p units))
+    (al-clear! [i64] (field p locals))
+    0))
+(defn n-import-catalog-add! [(kind i64) (unit i64) (local i64)] (-> i64)
+  (let [p (function-import-catalog)]
+    (al-push! [i64] (field p kinds) kind)
+    (al-push! [i64] (field p units) unit)
+    (al-push! [i64] (field p locals) local)
+    0))
+(defn n-import-catalog-contains? [(kind i64) (unit i64) (local i64)] (-> bool)
+  (let [p (function-import-catalog) (mut i) 0 (mut found) false]
+    (loop (if (or (>= (load i) (al-len [i64] (.kinds p))) (load found)) (break)
+              (do
+                (if (and (= (al-get [i64] (.kinds p) (load i)) kind)
+                         (and (= (al-get [i64] (.units p) (load i)) unit)
+                              (= (al-get [i64] (.locals p) (load i)) local)))
+                    (set! found true) 0)
+                (set! i (+ (load i) 1)))))
+    (load found)))
+
 (defstruct Graph
   [(nodes (ArrayList i64))  ; id -> (ptr Node), held as an integer address
    (fun-index (ArrayList i64))  ; fidx -> live Fun node, or NO-NODE
+   (fun-identity-kind (ArrayList i64))
+   (fun-identity-unit (ArrayList i64))
+   (fun-identity-local (ArrayList i64))
+   ;; True only when this semantic function is supplied by the retained-function linker. Imported
+   ;; functions still carry a checked ABI and identity, but their body must never be scheduled from
+   ;; this graph.
+   (fun-imported (ArrayList bool))
+   (fun-abi-param-first (ArrayList i64))
+   (fun-abi-param-count (ArrayList i64))
+   (fun-abi-param-types (ArrayList i64))
+   (fun-abi-return-type (ArrayList i64))
    (gvn (HashMap i64 i64))  ; structural key -> node id (see gvn-keyops)
    (wl (ArrayList i64))  ; the worklist
    (onwl (ArrayList bool))  ; id -> is it on the worklist
@@ -951,6 +1010,14 @@
           (set! (.inited p) true)
           (set! (.nodes p) (al-new [i64] (malloc-allocator)))
           (set! (.fun-index p) (al-new [i64] (malloc-allocator)))
+          (set! (.fun-identity-kind p) (al-new [i64] (malloc-allocator)))
+          (set! (.fun-identity-unit p) (al-new [i64] (malloc-allocator)))
+          (set! (.fun-identity-local p) (al-new [i64] (malloc-allocator)))
+          (set! (.fun-imported p) (al-new [bool] (malloc-allocator)))
+          (set! (.fun-abi-param-first p) (al-new [i64] (malloc-allocator)))
+          (set! (.fun-abi-param-count p) (al-new [i64] (malloc-allocator)))
+          (set! (.fun-abi-param-types p) (al-new [i64] (malloc-allocator)))
+          (set! (.fun-abi-return-type p) (al-new [i64] (malloc-allocator)))
           (set! (.gvn p) (hm-new [i64 i64] (malloc-allocator) (gvn-keyops)))
           (set! (.wl p) (al-new [i64] (malloc-allocator)))
           (set! (.onwl p) (al-new [bool] (malloc-allocator)))
@@ -1027,6 +1094,14 @@
                   0))))
     (al-clear! [i64] (field p nodes))
     (al-clear! [i64] (field p fun-index))
+    (al-clear! [i64] (field p fun-identity-kind))
+    (al-clear! [i64] (field p fun-identity-unit))
+    (al-clear! [i64] (field p fun-identity-local))
+    (al-clear! [bool] (field p fun-imported))
+    (al-clear! [i64] (field p fun-abi-param-first))
+    (al-clear! [i64] (field p fun-abi-param-count))
+    (al-clear! [i64] (field p fun-abi-param-types))
+    (al-clear! [i64] (field p fun-abi-return-type))
     (hm-clear! [i64 i64] (field p gvn))
     (al-clear! [i64] (field p wl))
     (al-clear! [bool] (field p onwl))
@@ -1128,6 +1203,7 @@
 (def-op-payload-accessor n-unbox-target-type Unbox "n-unbox-target-type: wrong Op variant")
 (def-op-payload-accessor n-typetest-target-type TypeTest "n-typetest-target-type: wrong Op variant")
 (def-op-payload-accessor n-fun-index Fun "n-fun-index: wrong Op variant")
+(def-op-payload-accessor n-callable-id-index CallableId "n-callable-id-index: wrong Op variant")
 (def-op-payload-accessor n-parm-index Parm "n-parm-index: wrong Op variant")
 (def-op-payload-accessor n-call-abi Call "n-call-abi: wrong Op variant")
 (def-op-payload-accessor n-closure-capture-count Closure "n-closure-capture-count: wrong Op variant")
@@ -1720,6 +1796,9 @@
         ;; may use the disjoint high namespace; their exact identity remains on this OPTAG-FUN node.
         ;; Give those a generic callable type instead of wrapping the shift and aliasing a low id.
         (if (< index 63) (t-fun-con index) (t-fun)))
+    ;; The payload identifies a compiler-local Fun, but the machine value is the runtime integer
+    ;; callable symbol. Keep it non-constant so folding cannot erase relocation identity.
+    (CallableId [index] (t-int))
     (Parm [index] (if (.infer (graph)) (infer-parm-compute n) (t-dyn)))
     (Call [abi] (if (.infer (graph)) (infer-call-compute n) (t-dyn)))
     (FunStart [] (t-ctrl))
@@ -2208,6 +2287,17 @@
     (n-unkeep! (.f r))
     (load r)))
 
+;; Branch on compiler-owned host dispatch metadata. This comparison is not a JavaScript
+;; operation: `selector` is the integer argument of the native batch entry point and `index`
+;; identifies an independently compiled Script. Keeping it here prevents structural dispatch
+;; from being mistaken for frontend implementation of JavaScript equality.
+(defn n-host-index-arms! [(ctrl i64) (selector i64) (index i64)] (-> Arms)
+  (let [predicate
+          (n-peephole
+            (n-new3 (Eq) NO-NODE selector
+                    (n-new1 (Const (t-int-con index)) (g-start))))]
+    (n-if-arms! (n-peephole (n-new2 (If) ctrl predicate)))))
+
 ;; The live projection of a multi node at one slot, or NO-NODE. Found by walking def-use, the
 ;; same way `ev-if-arm` finds a branch arm: a multi node's projections are not held anywhere else,
 ;; so this is the only place that knows how to get from the multi to its outputs.
@@ -2441,18 +2531,68 @@
 (defn n-typetest! [(v i64) (target i64)] (-> i64)
   (n-peephole (n-new2 (TypeTest target) NO-NODE v)))
 
+(defn n-callable-id! [(fun i64)] (-> i64)
+  (n-peephole (n-new1 (CallableId (n-fun-index fun)) (g-start))))
+
 ;; Function definitions are cyclic by construction: Parm -> Fun -> body Return -> expression ->
 ;; Parm. The open/close API makes that cycle explicit and prevents a caller from pretending a
 ;; half-built function is ready to call.
-(defn n-fun-open! [(fidx i64)] (-> i64)
+(defn n-fun-open-identity! [(fidx i64) (kind i64) (unit i64) (local i64)] (-> i64)
   (let [fun (n-new (Fun fidx))
         entry (n-new1 (FunStart) fun)]
     (loop (if (> (al-len [i64] (.fun-index (graph))) fidx)
               (break)
-              (do (al-push! [i64] (field (graph) fun-index) NO-NODE) 0)))
+              (do
+                (al-push! [i64] (field (graph) fun-index) NO-NODE)
+                (al-push! [i64] (field (graph) fun-identity-kind) FUN-IDENTITY-EPHEMERAL)
+                (al-push! [i64] (field (graph) fun-identity-unit) 0)
+                (al-push! [i64] (field (graph) fun-identity-local) 0)
+                (al-push! [bool] (field (graph) fun-imported) false)
+                (al-push! [i64] (field (graph) fun-abi-param-first) 0)
+                (al-push! [i64] (field (graph) fun-abi-param-count) -1)
+                (al-push! [i64] (field (graph) fun-abi-return-type) TY-NO-ID)
+                0)))
     (al-set! [i64] (field (graph) fun-index) fidx fun)
+    (al-set! [i64] (field (graph) fun-identity-kind) fidx kind)
+    (al-set! [i64] (field (graph) fun-identity-unit) fidx unit)
+    (al-set! [i64] (field (graph) fun-identity-local) fidx local)
+    (al-set! [bool] (field (graph) fun-imported) fidx false)
     (n-add-def! fun entry)
     fun))
+(defn n-fun-open! [(fidx i64)] (-> i64)
+  (n-fun-open-identity! fidx FUN-IDENTITY-EPHEMERAL 0 fidx))
+(defn n-fun-identity-kind [(fun i64)] (-> i64)
+  (al-get [i64] (.fun-identity-kind (graph)) (n-fun-index fun)))
+(defn n-fun-identity-unit [(fun i64)] (-> i64)
+  (al-get [i64] (.fun-identity-unit (graph)) (n-fun-index fun)))
+(defn n-fun-identity-local [(fun i64)] (-> i64)
+  (al-get [i64] (.fun-identity-local (graph)) (n-fun-index fun)))
+(defn n-fun-mark-imported! [(fun i64)] (-> i64)
+  (al-set! [bool] (field (graph) fun-imported) (n-fun-index fun) true)
+  0)
+(defn n-fun-imported? [(fun i64)] (-> bool)
+  (and (op-is? fun Fun [_])
+       (al-get [bool] (.fun-imported (graph)) (n-fun-index fun))))
+(defn n-fun-declare-abi! [(fun i64) (params (slice i64)) (ret i64)] (-> i64)
+  (let [p (graph) fidx (n-fun-index fun)
+        first (al-len [i64] (.fun-abi-param-types p))
+        (mut i) 0]
+    (al-set! [i64] (field p fun-abi-param-first) fidx first)
+    (al-set! [i64] (field p fun-abi-param-count) fidx (slice-len params))
+    (al-set! [i64] (field p fun-abi-return-type) fidx ret)
+    (loop (if (>= (load i) (slice-len params)) (break)
+              (do (al-push! [i64] (field p fun-abi-param-types) (slice-get params (load i)))
+                  (set! i (+ (load i) 1)))))
+    0))
+(defn n-fun-abi-declared? [(fun i64)] (-> bool)
+  (>= (al-get [i64] (.fun-abi-param-count (graph)) (n-fun-index fun)) 0))
+(defn n-fun-abi-param-count [(fun i64)] (-> i64)
+  (al-get [i64] (.fun-abi-param-count (graph)) (n-fun-index fun)))
+(defn n-fun-abi-param-type [(fun i64) (index i64)] (-> i64)
+  (al-get [i64] (.fun-abi-param-types (graph))
+          (+ (al-get [i64] (.fun-abi-param-first (graph)) (n-fun-index fun)) index)))
+(defn n-fun-abi-return-type [(fun i64)] (-> i64)
+  (al-get [i64] (.fun-abi-return-type (graph)) (n-fun-index fun)))
 (defn n-fun-entry [(fun i64)] (-> i64)
   (if (and (op-is? fun Fun [_]) (> (n-nins fun) 0)) (n-in fun 0) NO-NODE))
 (defn n-parm! [(fun i64) (idx i64)] (-> i64)
@@ -4025,8 +4165,29 @@
 ; ============================================================================
 ; idealize: local rewrites
 ; ============================================================================
-(defn n-idealize [(n i64)] (-> i64)
+(defn dead-controlled-memory-effect? [(n i64)] (-> bool)
   (match (n-op n)
+    (Store [_] true)
+    (PropStore [_] true)
+    (PropDelete [_] true)
+    (PropStoreKey [_] true)
+    (PropDeleteKey [] true)
+    (SetProto [] true)
+    (ObjectFreeze [] true)
+    (InternalStore [_] true)
+    (ArrayStore [] true)
+    (ArrayResize [] true)
+    (ArrayCopy [] true)
+    (StringSplit [] true)
+    (_ false)))
+
+(defn n-idealize [(n i64)] (-> i64)
+  ;; An effect on proven-unreachable control never executes. Its outgoing memory is therefore
+  ;; exactly its incoming memory; retaining the write also retains every value used only to build
+  ;; that dead arm and can manufacture a control-only CFG leaf with no terminator.
+  (if (and (dead-controlled-memory-effect? n) (n-in-proven-xctrl? n 0))
+      (n-in n 1)
+      (match (n-op n)
     (Start [] NO-NODE)
     (Stop [] (stop-idealize n))
     (Return [] NO-NODE)
@@ -4058,6 +4219,7 @@
     (TypeTest [_] NO-NODE)
     (CallEnd [] (callend-idealize n))
     (Fun [_] NO-NODE)
+    (CallableId [_] NO-NODE)
     (Parm [_] NO-NODE)
     (Call [_] (call-idealize n))
     (FunStart [] NO-NODE)
@@ -4117,7 +4279,7 @@
     (ObjectFreeze [] NO-NODE)
     (InternalLoad [_] NO-NODE)
     (InternalStore [_] NO-NODE)
-    (StringNormalize [] NO-NODE)))
+    (StringNormalize [] NO-NODE))))
 
 (defn callend-idealize [(n i64)] (-> i64)
   (let [ctrl (n-in n 0)]
@@ -4928,14 +5090,23 @@
 ;; progress, and progress is monotone (types only fall, nodes only die), so this terminates.
 (defn iterate! [] (-> i64)
   (let [(mut steps) 0
-        (mut sweeps) 0]
+        (mut sweeps) 0
+        ;; `g-fold-proven-for-iterate!` leaves both a proof snapshot and the exact affected-node
+        ;; worklist behind. Preserve that selective first drain. Standalone callers have no
+        ;; snapshot and retain the original all-live seed; any changing selective drain also earns
+        ;; the original all-live fallback sweep, so deferred proof rewrites remain order-independent.
+        selective-first (.psnapshot (graph))]
     (loop (let [before (g-changes)]
             ;; The frontend's fold pass may hand off its final no-change snapshot. Standalone
             ;; iterate callers arrive with psnapshot clear and retain the original behavior.
             (if (not (.psnapshot (graph))) (n-proof-snapshot!) 0)
-            (set! (.prof-iterate-live-scans (graph))
-                  (+ (.prof-iterate-live-scans (graph)) (n-count)))
-            (wl-push-live!)
+            (if (and selective-first (= (load sweeps) 0))
+                0
+                (do
+                  (set! (.prof-iterate-live-scans (graph))
+                        (+ (.prof-iterate-live-scans (graph)) (n-count)))
+                  (wl-push-live!)
+                  0))
             (set! steps (+ (load steps) (wl-drain!)))
             (n-proof-snapshot-clear!)
             (set! sweeps (+ (load sweeps) 1))

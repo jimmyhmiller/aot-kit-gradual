@@ -8,7 +8,8 @@
 typedef uintptr_t AotTsParse;
 typedef int32_t AotTsNode;
 
-enum AotTsScriptKind { AOT_TS_SCRIPT_AUTO = 0, AOT_TS_SCRIPT_JS = 1, AOT_TS_SCRIPT_TS = 2 };
+enum AotTsScriptKind { AOT_TS_SCRIPT_AUTO = 0, AOT_TS_SCRIPT_JS = 1,
+  AOT_TS_SCRIPT_TS = 2, AOT_TS_SCRIPT_JS_MODULE = 3 };
 enum AotTsLiteralKind { AOT_TS_LITERAL_NONE = 0, AOT_TS_LITERAL_NUMBER = 1,
   AOT_TS_LITERAL_STRING = 2, AOT_TS_LITERAL_BOOLEAN = 3, AOT_TS_LITERAL_NULL = 4,
   AOT_TS_LITERAL_REGEXP = 5 };
@@ -24,8 +25,24 @@ enum AotTsRole { AOT_TS_ROLE_NAME = 1, AOT_TS_ROLE_BODY = 2, AOT_TS_ROLE_TYPE = 
 AotTsParse aot_ts_parse(const char *source, int32_t source_length);
 AotTsParse aot_ts_parse_ex(const char *source, int32_t source_length,
                            const char *filename, int32_t filename_length, int32_t script_kind);
+// Parse independent Script records from adjacent source bytes. `lengths` contains `script_count`
+// source lengths whose sum is `source_length`; no record can affect another record's grammar or
+// directive prologue. The returned handle has one global node-id space and an ordered virtual root.
+AotTsParse aot_ts_parse_scripts(const char *source, int32_t source_length,
+                                const int32_t *lengths, int32_t script_count,
+                                int32_t script_kind);
 void aot_ts_parse_delete(AotTsParse parse);
 int32_t aot_ts_script_kind(AotTsParse parse);
+// Whether this SourceFile's own directive prologue contains "use strict".  This is deliberately
+// a property of one parsed Script record, not of a concatenated compilation buffer.
+int32_t aot_ts_script_is_strict(AotTsParse parse);
+int32_t aot_ts_script_is_strict_at(AotTsParse parse, int32_t script_index);
+int32_t aot_ts_script_count(AotTsParse parse);
+AotTsNode aot_ts_script_root(AotTsParse parse, int32_t script_index);
+int32_t aot_ts_node_script(AotTsParse parse, AotTsNode node);
+// 0 is not a binding declaration, 1 is an object-environment (`var`/function) binding, and 2 is
+// a declarative-environment (`let`/`const`/class) binding.
+int32_t aot_ts_node_binding_class(AotTsParse parse, AotTsNode node);
 
 // Nodes are immutable preorder indexes owned by the parse handle. Kind codes are
 // an explicit aot-kit mapping and do not change if upstream ast.Kind is reordered.

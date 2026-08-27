@@ -575,6 +575,60 @@
 (defn ty-get [(t i64)] (-> Ty) (al-get (.tab (types)) t))
 (defn ty-count [] (-> i64) (al-len [Ty] (.tab (types))))
 
+;; Separate compilation restores this append-only table from semantic records, never from raw
+;; process memory. The hash map is derived from the ordered table and rebuilt as records arrive.
+(defn ty-artifact-clear! [] (-> i64)
+  (let [p (types)]
+    (al-clear! [Ty] (field p tab))
+    (al-clear! [i64] (field p duals))
+    (al-clear! [i64] (field p kids))
+    (al-clear! [i64] (field p depths))
+    (hm-clear! [Ty i64] (field p intern))
+    0))
+
+(defn ty-artifact-push! [(t Ty) (dual i64) (depth i64)] (-> bool)
+  (let [p (types)]
+    (if (or (< depth 0) (!= (ty-lookup p t) TY-NO-ID))
+        false
+        (let [id (al-len [Ty] (.tab p))]
+          (al-push! [Ty] (field p tab) t)
+          (al-push! [i64] (field p duals) dual)
+          (al-push! [i64] (field p depths) depth)
+          (hm-put! [Ty i64] (field p intern) t id)
+          true))))
+
+(defn ty-artifact-push-kid! [(kid i64)] (-> i64)
+  (al-push! [i64] (field (types) kids) kid)
+  0)
+
+(defn ty-artifact-valid? [] (-> bool)
+  (let [p (types) count (ty-count) (mut id) 0 (mut ok) true]
+    (if (or (!= count (al-len [i64] (.duals p)))
+            (!= count (al-len [i64] (.depths p))))
+        (set! ok false) 0)
+    (loop (if (or (not (load ok)) (>= (load id) count)) (break)
+              (let [dual (al-get [i64] (.duals p) (load id))
+                    t (al-get [Ty] (.tab p) (load id))]
+                (if (or (< dual 0)
+                        (or (>= dual count)
+                            (!= (al-get [i64] (.duals p) dual) (load id))))
+                    (set! ok false) 0)
+                (match t
+                  (TTuple [off len]
+                    (if (or (< off 0)
+                            (or (< len 0) (> (+ off len) (al-len [i64] (.kids p)))))
+                        (set! ok false)
+                        (let [(mut which) 0]
+                          (loop (if (or (not (load ok)) (>= (load which) len)) (break)
+                                    (let [kid (al-get [i64] (.kids p) (+ off (load which)))]
+                                      (if (or (< kid 0) (>= kid count)) (set! ok false) 0)
+                                      (set! which (+ (load which) 1))))))))
+                  (TMem [aliases child]
+                    (if (or (< child 0) (>= child count)) (set! ok false) 0))
+                  (_ 0))
+                (set! id (+ (load id) 1)))))
+    (load ok)))
+
 (defn ty-push [(p (ptr Types)) (t Ty)] (-> i64)
   (let [id (al-len [Ty] (.tab p))]
     (al-push! [Ty]  (field p tab)   t)
@@ -807,6 +861,7 @@
 (defn t-int    [] (-> i64) (t-kinds VK-INT))
 (defn t-flt    [] (-> i64) (t-kinds VK-FLT))
 (defn t-str    [] (-> i64) (t-kinds VK-STR))
+(defn t-sym    [] (-> i64) (t-kinds VK-SYM))
 (defn t-bool   [] (-> i64) (t-kinds VK-BOOL))
 (defn t-undef  [] (-> i64) (t-kinds VK-UNDEF))
 (defn t-null   [] (-> i64) (t-kinds VK-NULL))

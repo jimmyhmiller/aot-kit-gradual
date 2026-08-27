@@ -30,6 +30,15 @@
 (macro InstanceOfErrorValue :params [(v dyn) (constructor dyn)] :ret bool
   (StrictEqual (GetProperty v "constructor") constructor))
 
+;; Test hosts inspect an abrupt Script completion without rewriting the Script itself. Test262's
+;; runtime-negative contract compares the name of the thrown value's constructor, using ordinary
+;; JavaScript [[Get]] semantics for both properties. Keep that meaning here rather than teaching
+;; the native runner about object layout or accepting the writable Error-instance `name` property.
+(macro ThrownConstructorNameMatches :transitioning true
+  :params [(thrown dyn) (expectedName dyn)] :ret bool
+  (StrictEqual (GetProperty (GetProperty thrown "constructor") "name")
+               expectedName))
+
 (macro SetObjectPrototype :params [(object dyn) (proto dyn)] :ret dyn
   (let [(ignored (%SetPrototype object proto))] object))
 
@@ -46,6 +55,38 @@
 (macro SetNamedProperty :params [(object dyn) (name int) (value dyn)] :ret dyn
   (let [(ignored (%PropStoreNamed object name (%Box value)))] value))
 
+;; ResolveBinding against the two components of this Realm's GlobalEnvironmentRecord. This is a
+;; runtime operation: code created by one Script can be called after another Script has introduced
+;; a binding. The frontend supplies only the identifier name and never decides JavaScript-visible
+;; absence or exception behavior.
+(macro GetGlobalBinding :params [(name dyn)] :ret dyn
+  (if (HasProperty (GlobalDeclarativeEnvironmentValue) name)
+      (GetProperty (GlobalDeclarativeEnvironmentValue) name)
+      (if (HasProperty (GlobalObjectValue) name)
+          (GetProperty (GlobalObjectValue) name)
+          (ThrowReferenceError (%StringConcat name " is not defined")))))
+
+;; `typeof IdentifierReference` uses ResolveBinding but suppresses ReferenceError only when that
+;; resolution is unresolvable. Keep the presence decision beside GetGlobalBinding so the frontend
+;; does not duplicate the Realm environment semantics.
+(macro TypeOfGlobalBinding :params [(name dyn)] :ret str
+  (if (HasProperty (GlobalDeclarativeEnvironmentValue) name)
+      (TypeOfValue (%Box (GetProperty (GlobalDeclarativeEnvironmentValue) name)))
+      (if (HasProperty (GlobalObjectValue) name)
+          (TypeOfValue (%Box (GetProperty (GlobalObjectValue) name)))
+          "undefined")))
+
+(macro SetGlobalDeclarativeBinding :params [(name dyn) (value dyn)] :ret dyn
+  (SetProperty (GlobalDeclarativeEnvironmentValue) name value))
+
+;; PutValue for an unresolvable Reference. Strict code throws; sloppy code creates or updates the
+;; named property on the Realm global object. The frontend supplies syntax-derived strictness and
+;; never decides the JavaScript-visible branch itself.
+(macro SetUnresolvableBinding :params [(name dyn) (value dyn) (strict bool)] :ret dyn
+  (if strict
+      (ThrowReferenceError (%StringConcat name " is not defined"))
+      (SetProperty (GlobalObjectValue) name value)))
+
 (macro GetElement :params [(array dyn) (index int)] :ret dyn
   (%ArrayLoad array index))
 
@@ -55,10 +96,10 @@
 (macro ResizeArray :params [(array dyn) (length int) (dependency dyn)] :ret dyn
   (let [(ignored (%ArrayResize array length dependency))] array))
 
-;; https://tc39.es/ecma262/#sec-topropertykey. Symbols become the second arm once the runtime has
-;; its Symbol representation; all currently representable JavaScript keys canonicalize through
-;; ToString and enter one content-based runtime key space.
-(macro ToPropertyKey :params [(key dyn)] :ret dyn (ToStringValue (%Box key)))
+;; https://tc39.es/ecma262/#sec-topropertykey. Symbols preserve identity; every other key
+;; canonicalizes through ToString into the content-based runtime string-key space.
+(macro ToPropertyKey :params [(key dyn)] :ret dyn
+  (if (%IsSymbol (%Box key)) (%Box key) (ToStringValue (%Box key))))
 
 (callable ObjectHasOwnProperty1 :transitioning true :params [(key dyn)] :ret dyn
   (%Box (HasOwnProperty this key)))
