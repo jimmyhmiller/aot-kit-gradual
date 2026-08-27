@@ -1,3 +1,26 @@
+## 2026-08-27: dead folded branches no longer become impossible machine blocks
+
+- Test262 typed-array constructor refusals converged on ideal `If` nodes whose two `CProj` arms
+  and every continuation had folded away. `backend_cfg` walked forward from reachable control,
+  retained the obsolete `If` as a block, and selection then correctly refused to emit a two-way
+  terminator for a block with zero successors.
+- `be-if-has-machine-continuation?` now admits an `If` to MachineUnit control discovery only when
+  it has a live projected control continuation or a live direct continuation rewired around a
+  folded arm. This is CFG structure, not JavaScript meaning; no DSL, frontend, or harness semantics
+  changed.
+- The exact 44-variant Int8Array/Uint8Array constructor cohort moved from 8 pass / 25 fail / 11
+  refuse to 8 pass / 35 fail / 1 refuse. Ten selector refusals now reach executable semantic
+  failures, with zero lost passes. Retained result:
+  `results/test262-int8-uint8-live-if-final-2026-08-27.jsonl`.
+- The one remaining refusal is a separate SSA/CFG defect in strict
+  `Uint8Array/prototype/BYTES_PER_ELEMENT.js`: `Not(Phi<bool>)` is consumed in a sibling block with
+  a bypass predecessor not dominated by the Phi Region. Late GCM reports earliest block 10364 and
+  latest/use block 10365; cloning or hoisting the unavailable value would be wrong. Selector and
+  native-harness diagnostics now preserve the full ideal/machine dependency chain and late-GCM
+  block/idom data for that next fix.
+- `coil test` is green 52/52. `coil test --suite frontier` remains exactly the expected two red
+  bugs: `for-await-has-no-bridge-kind` and `shortest-round-trip-digits`.
+
 ## 2026-08-27: typed-array numeric keys and one-byte stores are DSL-owned
 
 - `TypedArrayIndex` now parses canonical nonnegative decimal property keys in a JSL `builtin`.
