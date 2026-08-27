@@ -1,3 +1,24 @@
+## 2026-08-27: descriptor control and integer boxing stabilize Array filter
+
+- Property-descriptor classification now probes fixed descriptor fields with named DSL primitives
+  and branches before transitioning operations. DefineProperty validates its receiver through the
+  shared RequireObjectValue DSL operation and carries that stable target through descriptor reads,
+  writes, attributes, accessors, and Array length maintenance.
+- BoxInt is an explicit structural primitive for raw machine integers crossing into the dynamic
+  JavaScript ABI. Array-like iteration uses typed integer induction variables and BoxInt for
+  JavaScript-visible indices; the backend no longer mistakes raw numeric representations for
+  already-tagged values.
+- ArrayFilter keeps its selected-element count in internal heap state across dynamic callbacks,
+  eliminating corruption of the loop-carried raw count without changing JavaScript semantics.
+- The focused regression set is green at 6/6:
+  results/test262-array-filter-regressions-fixed2-2026-08-27.jsonl.
+- The complete 476-variant Array filter cohort is 280 passed, 194 failed, 2 refused, 2 skipped.
+  Against an isolated build of commit 532a8b0, it has 48 failed-to-passed transitions and zero
+  passed-to-nonpassed transitions. Evidence:
+  results/test262-array-filter-regressions-final-2026-08-27.jsonl.
+- coil test is green at 52/52. The final frontier remains exactly the two expected red bugs:
+  for-await-has-no-bridge-kind and shortest-round-trip-digits.
+
 ## 2026-08-27: indexed Array descriptors become visible and maintain Array length
 
 - `DefineProperty` now maintains Array exotic `length` for canonical indexed keys in JSL, and
