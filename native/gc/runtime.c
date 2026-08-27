@@ -207,6 +207,7 @@ static int exception_pending;
 typedef struct {
   uintptr_t owner;
   uintptr_t prototype;
+  AotJsValue prototype_value;
   int frozen;
   int extensible;
   int internal_kind;
@@ -361,7 +362,8 @@ static JsObjectRec *js_object(uintptr_t owner, int create) {
                        js_objects_len + 1, sizeof(*js_objects))) return NULL;
   int state = side_index_reserve(&js_object_index, js_objects_len + 1);
   if (!state) return NULL;
-  js_objects[js_objects_len] = (JsObjectRec){owner, 0, 0, 1, -1, AOT_JS_UNDEFINED, 0};
+  js_objects[js_objects_len] =
+      (JsObjectRec){owner, 0, AOT_JS_NULL, 0, 1, -1, AOT_JS_UNDEFINED, 0};
   ++js_objects_len;
   if (state == 2) {
     if (!js_object_index_rebuild()) return NULL;
@@ -1703,6 +1705,10 @@ AotJsValue aot_js_property(uintptr_t owner, uint64_t name,
     js_any_frozen = 1;
     return (AotJsValue)owner;
   }
+  if (operation == 24) {
+    JsObjectRec *object = js_object(owner, 0);
+    return object && object->prototype ? object->prototype_value : AOT_JS_NULL;
+  }
   JsObjectRec *integrity = js_object(owner, 0);
   if (integrity && integrity->frozen &&
       (operation == 1 || operation == 2 || operation == 4))
@@ -1936,6 +1942,7 @@ AotJsValue aot_js_property(uintptr_t owner, uint64_t name,
       cursor = parent ? parent->prototype : 0;
     }
     object->prototype = prototype;
+    object->prototype_value = prototype ? js_canonical_stored_value(value) : AOT_JS_NULL;
     js_write_barrier(owner, prototype);
     return (AotJsValue)prototype;
   }
@@ -2223,6 +2230,7 @@ static int relocate_side_edges(int scan_old_side, int *next_remembered_dirty) {
       uintptr_t moved = relocate(object->prototype);
       if (!moved) return 0;
       object->prototype = moved;
+      object->prototype_value = (object->prototype_value & AOT_JS_TAG_MASK) | moved;
       if (object->owner >= (uintptr_t)old_space &&
           object->owner < (uintptr_t)(old_space + old_used) &&
           moved >= (uintptr_t)to_start && moved < (uintptr_t)(to_start + capacity))

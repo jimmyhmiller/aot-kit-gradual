@@ -1,3 +1,10 @@
+## 2026-08-27: `Object.getPrototypeOf` is a DSL operation and JSDoc metadata is not executable syntax
+
+- Added `%GetPrototype` as the runtime property primitive and implemented `ObjectGetPrototypeOf`, its callable entry, and the standard `Object.getPrototypeOf` function value in `lib/abstract/property.jsl`. The frontend only recognizes the structural direct/aliased call and publishes the DSL-owned function value; JavaScript semantics remain in `lib/`.
+- Objects now retain the canonical tagged prototype value alongside the runtime prototype record. GC relocation updates that side edge, so prototype identity survives movement and `Object.getPrototypeOf` returns the JavaScript-visible value rather than a compiler-internal record.
+- Fixed the TypeScript-Go multi-script bridge so parser JSDoc nodes remain registered for stable role IDs but are detached from both ordinary child lists and the virtual compilation-unit statement list. This is not a Test262 harness exception: comments and JSDoc metadata no longer become executable statements for any multi-script compilation.
+- The focused aliased `Object.getPrototypeOf` native witness and a JSDoc `@callback` witness are in the bounded gate. `coil test` is green at 52/52. `coil test --suite frontier` remains intentionally red only for `for-await-has-no-bridge-kind` and `shortest-round-trip-digits`.
+- Complete Int8Array and Uint8Array constructor cohorts each remain 6 passed / 16 failed / 0 refused across 22 variants, with zero regressions. The two `proto.js` variants in each family now compile and execute instead of aborting on bridge kind 0; they expose the next independent dependency, `Float64Array is not defined`. Retained results: `results/test262-int8-get-prototype-jsdoc-final-2026-08-27.jsonl` and `results/test262-uint8-get-prototype-jsdoc-final-2026-08-27.jsonl` plus summaries.
 ## 2026-08-27: typed-array constructor cohort has zero compiler refusals
 
 - The last refusal was an optimizer miscompile, not a selector limitation. A nested short-circuit

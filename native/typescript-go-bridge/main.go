@@ -155,7 +155,9 @@ func aot_ts_parse_scripts(source *C.char, sourceLength C.int32_t, rawLengths *C.
 		combined.scriptStrict = append(combined.scriptStrict,
 			statementsHaveUseStrict(parsed.file.Statements.Nodes))
 		for _, statement := range parsed.file.Statements.Nodes {
-			statements = append(statements, combined.nodeIDs[statement])
+			if !parsed.isJSDocMetadata(statement) {
+				statements = append(statements, combined.nodeIDs[statement])
+			}
 		}
 		for index, code := range parsed.diagnosticCodes {
 			combined.diagnosticCodes = append(combined.diagnosticCodes, code)
@@ -2382,6 +2384,26 @@ func (parsed *parseResult) addRestrictedGrammarEarlyErrors(node *ast.Node) {
 	}
 }
 
+func (parsed *parseResult) isJSDocMetadata(node *ast.Node) bool {
+	if ast.IsJSDocNode(node) || node.Flags&ast.NodeFlagsJSDoc != 0 ||
+		node.Kind == ast.KindJSTypeAliasDeclaration {
+		return true
+	}
+	if int(node.Kind) == 0 {
+		start, end := node.Pos(), node.End()
+		if start >= 0 && end >= start && end <= len(parsed.source) {
+			span := strings.TrimSpace(parsed.source[start:end])
+			if strings.HasPrefix(span, "/**") || strings.HasPrefix(span, "@") {
+				return true
+			}
+		}
+	}
+	position := node.Pos()
+	if position < 0 || position > len(parsed.source) { return false }
+	prefix := parsed.source[:position]
+	return strings.LastIndex(prefix, "/**") > strings.LastIndex(prefix, "*/")
+}
+
 func (parsed *parseResult) appendNode(node *ast.Node) int32 {
 	id := int32(len(parsed.nodes))
 	parsed.nodes = append(parsed.nodes, node)
@@ -2393,7 +2415,13 @@ func (parsed *parseResult) appendNode(node *ast.Node) int32 {
 		return false
 	})
 	for _, child := range childNodes {
-		parsed.children[id] = append(parsed.children[id], parsed.appendNode(child))
+		childID := parsed.appendNode(child)
+		// JSDoc is parser metadata, not JavaScript/TypeScript program syntax. Keep every node in
+		// the identity registry because upstream role links may still target it, but detach raw
+		// JSDoc and JavaScript's synthetic JSDoc type aliases from the executable child tree.
+		if !parsed.isJSDocMetadata(child) {
+			parsed.children[id] = append(parsed.children[id], childID)
+		}
 	}
 	return id
 }
