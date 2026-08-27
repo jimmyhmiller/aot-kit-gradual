@@ -59,6 +59,12 @@
               (or (= kind TSK-METHOD-DECLARATION)
                   (or (= kind TSK-GET-ACCESSOR) (= kind TSK-SET-ACCESSOR)))))))
 
+;; Function and class EXPRESSIONS create a private lexical binding for their explicit name.
+;; Declarations use the surrounding hoisted binding; method and accessor property names are not
+;; bindings inside their bodies.
+(defn fe-named-expression-kind? [(kind i64)] (-> bool)
+  (or (= kind TSK-FUNCTION-EXPRESSION) (= kind TSK-CLASS-EXPRESSION)))
+
 (defn fe-function-declaration-kind? [(kind i64)] (-> bool)
   (or (= kind TSK-FUNCTION-DECLARATION) (= kind TSK-CLASS-DECLARATION)))
 
@@ -1302,6 +1308,24 @@
                           (set! index (+ (load index) 1)))))
               (load found))))))
 
+;; Resolution, not spelling, decides whether a function body observes a binding. This walk is
+;; deliberately transparent through nested functions: a descendant that closes over a named
+;; expression's private self binding still requires the owner to materialize that callable.
+(defn fe-uses-resolved-symbol? [(frontend (ptr NativeFrontend)) (node i64) (symbol i64)] (-> bool)
+  (if (= (fe-resolution-symbol frontend node) symbol)
+      true
+      (let [ast (field frontend ast) (mut index) 0 (mut found) false]
+        (loop (if (or (>= (load index) (ts-child-count ast node)) (load found))
+                  (break)
+                  (do
+                    (if (fe-uses-resolved-symbol? frontend
+                                                  (ts-child ast node (load index))
+                                                  symbol)
+                        (set! found true)
+                        0)
+                    (set! index (+ (load index) 1)))))
+        (load found))))
+
 ;; A REST NODE, detected from its own source text because the bridge deliberately does not expose
 ;; punctuation tokens. This is structural syntax only: parameter packing and binding-pattern
 ;; iterator consumption are delegated to DSL operations by the graph frontend.
@@ -1803,8 +1827,10 @@
                   function-id (load (field fn id))
                   parameter-count (load (field fn parameter-count))
                   (mut index) 0]
-              ;; A named expression's name exists only in its own body.
-              (if (!= (load (field fn name-node)) -1)
+              ;; A named expression's name exists only in its own body. A method's property name
+              ;; and a declaration's surrounding binding are different structures.
+              (if (and (fe-named-expression-kind? kind)
+                       (!= (load (field fn name-node)) -1))
                   (al-push! [FeBinding]
                             (mut bindings)
                             (fe-binding-make (load (field fn name-node)) function-id depth))
@@ -1968,6 +1994,15 @@
                                                0))
                     0)
                 (set! index (+ (load index) 1)))))
+    ;; Driver-resolved functions must receive the same named-expression environment as functions
+    ;; encountered by fe-resolve-node!. This binding is private to the expression body and maps to
+    ;; the function identity, which is what recursive calls load.
+    (if (and (fe-named-expression-kind? (ts-kind ast (.node fn)))
+             (!= (.name-node fn) -1))
+        (al-push! [FeBinding]
+                  (mut bindings)
+                  (fe-binding-make (.name-node fn) owner 0))
+        0)
     ;; `var` hoisting inside the function: every local this function owns is visible from the top
     ;; of the body, including from nested functions declared before the `var` statement appears
     ;; (NavierStokes declares FluidField's state vars BELOW the nested helpers that write them).

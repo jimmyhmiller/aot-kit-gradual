@@ -1971,14 +1971,22 @@
     ; observe the closure that is materialized after the referencing sibling's own closure.
     (if (< symbol (al-len [FeFunction] (.functions frontend)))
         (let [function-index (fng-function-index frontend symbol)
+              private-self
+                (and (>= function-index 0)
+                     (and (= symbol owner)
+                          (let [fn (al-get [FeFunction] (.functions frontend) function-index)]
+                            (fe-named-expression-kind?
+                              (ts-kind (field frontend ast) (.node fn))))))
               parent (if (< function-index 0)
                          -1
                          (let [fn (al-get [FeFunction] (.functions frontend)
                                           function-index)]
                            (.parent fn)))]
+          (if private-self
+              (fng-captured-symbol? frontend symbol)
           (if (and (>= parent 0) (= parent owner))
               (fng-captured-symbol? frontend symbol)
-              (fng-function-captures-symbol? frontend owner symbol)))
+              (fng-function-captures-symbol? frontend owner symbol))))
         (if (= (fe-symbol-owner frontend symbol) owner)
             (fng-captured-symbol? frontend symbol)
             (fng-function-captures-symbol? frontend owner symbol)))))
@@ -5507,7 +5515,10 @@
         ;; passes the boxed closure value for a capture-carrying target and undefined otherwise.
         call-env
           (if (>= function-index 0)
-              (if (> (fng-capture-count frontend (.id fn)) 0)
+              (if (or (> (fng-capture-count frontend (.id fn)) 0)
+                      (and (!= (.name-node fn) -1)
+                           (and (fe-named-expression-kind? (ts-kind ast (.node fn)))
+                                (fe-uses-resolved-symbol? frontend (.body-node fn) (.id fn)))))
                   (fng-box-dynamic-argument! (fng-expression context callee-node))
                   (fng-undefined))
               (if direct-value-callee (n-box! target) target))
@@ -6305,6 +6316,13 @@
               false
               (let [fn (al-get [FeFunction] (.functions frontend) index)] (.strict fn)))))))
 
+(defn fng-named-expression-symbol? [(frontend (ptr NativeFrontend)) (symbol i64)] (-> bool)
+  (let [index (fng-function-index frontend symbol)]
+    (if (< index 0)
+        false
+        (let [fn (al-get [FeFunction] (.functions frontend) index)]
+          (fe-named-expression-kind? (ts-kind (field frontend ast) (.node fn)))))))
+
 (defn fng-lvalue [(context FngContext) (node i64)] (-> FngLValue)
   (let [frontend (load (field context frontend))
         ast (field frontend ast)
@@ -6509,7 +6527,13 @@
 
 (defn fng-lvalue-write [(context FngContext) (target FngLValue) (new-value i64)] (-> i64)
   (if (= (.kind target) FNG-LVALUE-LOCAL)
-      (do (fng-set-symbol! context (.symbol target) new-value) new-value)
+      (let [frontend (load (field context frontend))]
+        (if (fng-named-expression-symbol? frontend (.symbol target))
+            (let [ignored
+                    (fng-jsl-call2 context "SetImmutableBinding" new-value
+                                   (fng-bool (fng-reference-strict? context 0)))]
+              new-value)
+            (do (fng-set-symbol! context (.symbol target) new-value) new-value)))
       (if (= (.kind target) FNG-LVALUE-UNRESOLVABLE)
           (fng-jsl-call3 context "SetUnresolvableBinding"
                          (.key target) new-value (.object target))
@@ -9720,6 +9744,24 @@
                                                  (fng-symbol-node context (.id parameter-symbol)))
                               0))
                         (set! index (+ (load index) 1)))))))
+      ;; A named function/class expression owns a private immutable lexical binding containing
+      ;; the callable being invoked. Parameter 0 is the uniform callable/environment ABI slot;
+      ;; publish it as the binding value so first-class self reads and descendant captures observe
+      ;; the same object identity as the caller. Save it with ordinary captures because `values`
+      ;; is shared while each function graph is built.
+      (if (and (not script-entry)
+               (and (!= (.name-node fn) -1)
+                    (and (fe-named-expression-kind?
+                           (ts-kind (field frontend ast) (.node fn)))
+                         (fe-uses-resolved-symbol? frontend (.body-node fn) fun-id))))
+          (let [prior (al-get [i64] (load values) fun-id)
+                callable (n-parm! fun 0)]
+            (al-push! [i64] (mut saved-capture-symbols) fun-id)
+            (al-push! [i64] (mut saved-capture-values) prior)
+            (al-set! [i64] (mut values) fun-id NO-NODE)
+            (fng-set-symbol! context fun-id callable)
+            0)
+          0)
       ;; Install the host completion boundary before Script declaration instantiation. A
       ;; multi-Script program evaluates its real Script records from top-level initialization, so
       ;; installing this afterward misses exceptions escaping those records. This target observes

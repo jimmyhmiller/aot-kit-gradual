@@ -1,3 +1,25 @@
+## 2026-08-27: named-expression self bindings are private, immutable, and first-class
+
+- Resolution now creates a private binding only for explicitly named function/class expressions;
+  declarations retain their surrounding hoisted binding, and method/accessor property names are
+  not treated as body bindings. Both resolver entry paths apply the same rule.
+- The frontend supplies callable ABI/storage structure only when the body actually resolves a use
+  of that private symbol. Parameter 0 publishes the current callable at entry, first-class self
+  reads retain object identity, and descendant arrow/function captures materialize the binding as
+  a cell. Empty named expressions keep their prior representation and function metadata.
+- Assignment meaning remains in `lib/`: `SetImmutableBinding` preserves the RHS and binding in
+  sloppy code and throws `TypeError` in strict code. The frontend only recognizes the immutable
+  lexical binding and routes the write; no Test262 harness behavior changed.
+- The focused function-expression cohort moved from 2/6 to 6/6: direct self reads, sloppy no-op
+  writes, strict throws, and arrow captures all pass in their required modes. Evidence:
+  `results/test262-named-function-expression-immutable-final-v3-2026-08-27.jsonl`.
+- The complete `language/expressions/function` directory currently reports 52 passed, 43 failed,
+  and 4 refused across 99 executable variants. Remaining families include `eval`, parameter
+  environments, function `length`, `with`, and separate scope-cell bugs. Evidence:
+  `results/test262-function-expressions-full-after-private-self-2026-08-27.jsonl`.
+- `coil test` is green at 52/52. Final `coil test --suite frontier` remains exactly the two expected
+  red bugs: `for-await-has-no-bridge-kind` and `shortest-round-trip-digits`.
+
 ## 2026-08-27: caught exceptions remain effectful when the binding is unused
 
 - Catch entry now sequences descriptor-102 `ExceptionTake` through a dedicated
