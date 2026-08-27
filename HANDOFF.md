@@ -19,6 +19,27 @@
 - `coil test` is green 52/52. `coil test --suite frontier` remains exactly the expected two red
   bugs: `for-await-has-no-bridge-kind` and `shortest-round-trip-digits`.
 
+## 2026-08-27: typed-array constructor cohort has zero compiler refusals
+
+- The last refusal was an optimizer miscompile, not a selector limitation. A nested short-circuit
+  expression correctly built an outer value Phi over Region 101267, but `phi-single-input`
+  discarded its bypass arm because that control was dead-typed in the proof snapshot. Another
+  rewrite in the same sweep rewired the bypass live, leaving `Not(innerPhi)` on a block the inner
+  Phi did not dominate.
+- Phi collapse now follows the structural Region/Phi invariant: `region-remove-path!` exclusively
+  owns proven-dead path deletion and removes the matching Phi arm atomically. `phi-single-input`
+  ignores only self-edges and never independently skips a dead-typed structural arm. This keeps
+  irreversible value removal from depending on sweep order.
+- The complete 44-variant Int8Array/Uint8Array constructor cohort is now 8 passed / 36 failed /
+  0 refused, preserving every prior pass and converting the final compiler refusal into an honest
+  descriptor failure. Retained result:
+  `results/test262-int8-uint8-zero-refusals-final-2026-08-27.jsonl`.
+- The next progress is JavaScript semantics rather than compiler infrastructure: constructor
+  classification, prototype chains, property descriptors (`BYTES_PER_ELEMENT`, `constructor`,
+  `name`, `length`), and ordinary built-in metadata account for this cohort's executable failures.
+- `coil test` is green 52/52. `coil test --suite frontier` remains exactly the expected two red
+  bugs: `for-await-has-no-bridge-kind` and `shortest-round-trip-digits`.
+
 ## 2026-08-27: dead folded branches no longer become impossible machine blocks
 
 - Test262 typed-array constructor refusals converged on ideal `If` nodes whose two `CProj` arms
