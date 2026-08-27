@@ -1,159 +1,3 @@
-## 2026-08-27: descriptor control and integer boxing stabilize Array filter
-
-- Property-descriptor classification now probes fixed descriptor fields with named DSL primitives
-  and branches before transitioning operations. DefineProperty validates its receiver through the
-  shared RequireObjectValue DSL operation and carries that stable target through descriptor reads,
-  writes, attributes, accessors, and Array length maintenance.
-- BoxInt is an explicit structural primitive for raw machine integers crossing into the dynamic
-  JavaScript ABI. Array-like iteration uses typed integer induction variables and BoxInt for
-  JavaScript-visible indices; the backend no longer mistakes raw numeric representations for
-  already-tagged values.
-- ArrayFilter keeps its selected-element count in internal heap state across dynamic callbacks,
-  eliminating corruption of the loop-carried raw count without changing JavaScript semantics.
-- The focused regression set is green at 6/6:
-  results/test262-array-filter-regressions-fixed2-2026-08-27.jsonl.
-- The complete 476-variant Array filter cohort is 280 passed, 194 failed, 2 refused, 2 skipped.
-  Against an isolated build of commit 532a8b0, it has 48 failed-to-passed transitions and zero
-  passed-to-nonpassed transitions. Evidence:
-  results/test262-array-filter-regressions-final-2026-08-27.jsonl.
-- coil test is green at 52/52. The final frontier remains exactly the two expected red bugs:
-  for-await-has-no-bridge-kind and shortest-round-trip-digits.
-
-## 2026-08-27: indexed Array descriptors become visible and maintain Array length
-
-- `DefineProperty` now maintains Array exotic `length` for canonical indexed keys in JSL, and
-  Array indexed reads/presence checks distinguish explicit ordinary descriptor components from
-  dense storage. Array-like iteration boxes internal integer keys, and predicate methods apply
-  JavaScript `ToBoolean` to dynamic callback results. JavaScript meaning remains in `lib/`.
-- The native property representation now lets explicit indexed descriptor records override dense
-  Array slots. Defining a descriptor retires stale dense storage; attribute/load/presence/delete
-  operations consistently consult the descriptor, so deletion cannot reveal an old dense value.
-- A direct `Object.defineProperty([], "2", {get(){return 12}})` witness now passes string and
-  numeric reads in default and strict variants (2/2) using a forced-current native host. Evidence:
-  `results/test262-array-descriptor-current-runtime-2026-08-27.jsonl`.
-- The upstream filter witness remains red: in the larger graph, descriptor-field presence misses
-  `"get"`, so `DefineProperty` emits an undefined data component (`op=16`) rather than a getter
-  (`op=17`). This is reduced below filter and is the next target; no harness workaround landed.
-- Coil's build cache does not invalidate the statically linked native object when
-  `native/gc/runtime.c` changes. A distinct output/profile still linked stale code. Focused proof
-  required temporarily substituting a unique runtime source path in `Coil.toml` under a restoring
-  shell trap. This build-system bug should be reported/fixed separately.
-- `coil test` is green at 52/52. Final frontier is unchanged at exactly the two expected red bugs:
-  `for-await-has-no-bridge-kind` and `shortest-round-trip-digits`.
-
-## 2026-08-27: polymorphic non-callables no longer dereference a null closure
-
-- The propertyHelper signal-11 failure was reduced to ARM64 callable dispatch, not JavaScript
-  semantics or Test262 harness behavior. The crash trace identified callable 24 at generated
-  instruction `ldr x16, [x16, #8]` with `x16 == 0`.
-- Polymorphic dispatch intentionally materializes callable ID zero for non-callable values so the
-  resolver owns the invalid-call path. The encoder incorrectly fell through from that zeroing into
-  the closure-only environment dereference. It now branches around closure decoding, and all
-  affected branch distances and fixed encoded-word accounting move together.
-- `backend-call-test.coil` pins the exact encoded ARM64 guard: non-callables branch over the
-  closure payload load while closures retain that load.
-- The exact assembled propertyHelper descriptor witness that reproducibly died with signal 11 now
-  reports `PASS` and leaves the native crash log empty after rebuilding `test262-native`.
-  No Test262 harness or DSL semantics were changed by this backend safety fix.
-- `coil test` is green at 52/52. Final `coil test --suite frontier` remains exactly the two
-  expected red bugs: `for-await-has-no-bridge-kind` and `shortest-round-trip-digits`.
-
-## 2026-08-27: Array join now preserves its accumulator and owns separator coercion
-
-- Reduced the property-helper string symptom to a standalone upstream-style witness. Before this
-  change, `["first", "second"].join("; ")` returned only `"second"`; after an intermediate recurrence
-  correction it returned `"firstsecond"`. The root cause was `ArrayJoinSeen` testing `i == 0` inside
-  an open JSL loop: the test folded against the initializer before the back edge was established, so
-  every iteration took the first-element arm.
-- Rewrote the DSL algorithm to handle empty/first elements before opening the loop and carry a raw
-  `str` accumulator from index 1 onward. Every back-edge now unconditionally depends on the prior
-  accumulator and concatenates the separator.
-- `ArrayJoin` now owns separator ToString conversion. The frontend passes only the structurally boxed
-  source argument (or default comma); `ToStringValueSeen` exposes one raw `str` contract and unboxes
-  the recursive array builtin result at its actual tagged call boundary. No JavaScript semantics were
-  added to C or the Test262 harness.
-- Strengthened the existing native differential witness to compare a dynamically joined string with
-  equal and unequal literals. The focused Test262 witnesses for value equality and `.length` are 4/4
-  passing. Evidence: `/tmp/aotk-arrayjoin-inline-piece-minimal-2026-08-27.jsonl`.
-- The complete `Array.prototype.join` directory is persisted at 10 passed / 34 failed / 2 refused
-  across 46 variants in `results/test262-array-join-after-consistent-accumulator-2026-08-27.jsonl`.
-  Available partial full-suite baselines do not contain this directory, so no historical transition
-  count is claimed.
-- The broader property-helper/function-length probes remain 0/12 and are a separate large-graph
-  execution issue; scripts containing the inert complete helper pass, while executing descriptor
-  paths in the combined graph can signal 11.
-- `coil test` is green at 52/52. Frontier remains exactly the expected two red bugs. The exhaustive
-  suite cannot compile because of pre-existing unrelated errors: unbound `JSV-RESERVED-0` in
-  `tests/backend-test.coil:260`, and an 18-argument parse of `agrees-with-node?` in
-  `tests/native-execution-test.coil:1172`.
-
-## 2026-08-27: String equality representation boundary diagnosed; broad macro boxing rejected
-
-The completed function-symbol/global-binding work remains in pushed commits `b6ca7a6` and `81df66b`.
-The next `verifyProperty` failure was reduced to representation identity: array `push`/`join` produce
-the correct UTF-16 contents, but `StrictEqual` receives a raw string pointer where its `dyn` DSL
-contract requires a tagged JavaScript value, so `%IsString` falls through and `%Eq` compares pointer
-identity.
-
-Two structural fixes were tested and deliberately not landed:
-
-- Preventing every pinned node from folding/idealizing/GVN avoids `n-kill!: node is pinned`, but
-  permanently suppresses required canonicalization for scoped/permanent pins and breaks
-  `native-graph-basic`.
-- Normalizing every macro/structural-inline `dyn` argument and retaining pinned `Box` nodes avoids
-  corruption, but does not make the focused `verifyProperty` value witness pass. It also expands the
-  witness to roughly 443k graph nodes and takes about 25 seconds for two variants, so it is not an
-  acceptable boundary.
-
-The clean next step is to establish the tagged JavaScript-value invariant at the expression/value
-boundary that feeds semantic DSL operations, not at every JSL macro parameter. `StrictEqual` already
-implements the right ECMAScript semantics in `lib/abstract/conversions.jsl`; the missing fact is that
-both operands satisfy its declared `dyn` representation. Preserve the existing callable ABI boxing,
-avoid harness changes, and add a narrow regression proving dynamically constructed and literal
-strings compare by contents before rerunning the four `verifyProperty` branches.
-
-Validation after reverting the experiments:
-
-- `coil test`: 52 passed, 0 failed.
-- `coil test --suite frontier`: exactly the two expected red bugs,
-  `for-await-has-no-bridge-kind` and `shortest-round-trip-digits`.
-
-## 2026-08-27: Ordinary functions now inherit the initialized Function prototype
-
-- Split `InitializeFunctionProperties` from `InitializeOrdinaryFunctionMetadata`. The first owns standard own `length`/`name` descriptors; the second applies those properties, idempotently initializes the shared Function prototype's `length: 0` and `name: ""`, and links each ordinary function to that shared prototype. `FunctionConstructorValue` uses only the property initializer for its prototype, avoiding recursive/self prototype linkage.
-- This is entirely DSL-owned JavaScript semantics. No frontend, runtime C, or Test262 harness behavior changed.
-- The focused delete/inherited lookup witness moved from 0/2 to 2/2: after deleting an ordinary function's configurable own `length`, inherited `Function.prototype.length` is `0` in default and strict variants. Evidence: `results/test262-function-prototype-final-2026-08-27.jsonl` and summary.
-- The upstream `language/expressions/function/length-dflt.js` remains 0/2, despite direct own descriptors and inherited length now being correct; its remaining failure is a separate property-helper/runtime dependency and is not claimed fixed.
-- The complete 484-variant function-expression cohort is `336 passed / 142 failed / 6 refused`. Against the prior `335 / 143 / 6`, exact transitions are `335 passed->passed`, `142 failed->failed`, `1 failed->passed`, and `6 refused->refused`. The lone transition is the already observed flaky `dstr/dflt-ary-ptrn-elem-obj-val-undef.js` default variant, so no deterministic Test262 gain is attributed to this change. Evidence: `results/test262-function-expressions-after-function-prototype-2026-08-27.jsonl` and summary.
-- Architectural next steps remain explicit: surplus actuals need a hidden per-invocation argument record rather than an arbitrary ABI maximum; shortest-round-trip formatting needs a real DSL-owned Ryu/Grisu-class digit generator, not a C `printf` workaround.
-- `coil test` is green at 52/52. Final frontier remains exactly the expected two red bugs: `for-await-has-no-bridge-kind` and `shortest-round-trip-digits`.
-
-## 2026-08-27: Function metadata and indexed arguments are materialized structurally
-
-- Corrected the previous checkpoint's transition accounting: the overlap between `test262-function-expressions-default-parameter-symbols-final-2026-08-27.jsonl` and `test262-function-expressions-after-callsite-omission-2026-08-27.jsonl` was `58 passed->passed`, `11 passed->failed`, `9 failed->passed`, `17 failed->failed`, and `4 refused->refused`, not 99 common passes. The earlier claim used a nonexistent `file` field instead of the result record's `path` field.
-- Ordinary functions now receive DSL-owned own `length` and `name` properties through `InitializeOrdinaryFunctionMetadata`. The frontend contributes only structural expected-argument counting: parameters before the first initializer, excluding rest. Direct descriptor evidence confirms value `1`, non-writable, non-enumerable, and configurable for `(x, y = 42, ...z)`-shaped metadata.
-- Each ordinary invocation now lazily materializes one arguments object when source reads `arguments`. The frontend supplies actual ABI structure (`argc`, ordinal, raw parameter value); DSL macro `InitializeArgumentsElement` owns indexed property initialization. Both default and strict indexed-argument witnesses pass.
-- The complete 484-variant function-expression cohort is `335 passed / 143 failed / 6 refused`, versus `328 / 152 / 4`. Exact overlap is `327 passed->passed`, `8 failed->passed`, `142 failed->failed`, `1 passed->failed`, `2 failed->refused`, and `4 refused->refused`. The single apparent regression (`dflt-ary-ptrn-elem-obj-val-undef`, default) passed immediately in a two-variant rerun, so it is recorded as run instability rather than hidden; no harness semantics changed.
-- Known boundaries are explicit. Surplus actual arguments still cannot be initialized because exact call normalization currently discards non-rest surplus values; `params-dflt-ref-arguments` exposes that path as a selector refusal. Mapped non-strict parameter aliases and lexical-arrow `arguments` are also not claimed here. The upstream `length-dflt` helper still fails despite direct own-descriptor checks passing, indicating a separate helper/runtime dependency rather than incorrect function metadata.
-- Evidence: `results/test262-function-expressions-after-length-arguments-2026-08-27.jsonl`, `results/test262-arguments-and-length-after-materialization-v2-2026-08-27.jsonl`, and `results/test262-function-length-descriptor-2026-08-27.jsonl`, with summaries. `coil test` is green at 52/52. Final frontier remains exactly the expected two red bugs: `for-await-has-no-bridge-kind` and `shortest-round-trip-digits`.
-
-## 2026-08-27: Omitted arguments are materialized at call sites, not rebound in callees
-
-- Replaced callee-side `NormalizeParameterValue` rebinding with the DSL-owned zero-argument `OmittedArgumentValue`; exact and generic call sites now materialize every native formal slot while preserving the real source `argc` separately.
-- This keeps valid incoming `Parm` values untouched and fixes the multi-parameter corruption that made Test262's `verifyProperty(obj, name, desc, options)` observe its object argument as a non-object.
-- Bounded gate: `coil test` is green (`52 passed`). Frontier remains exactly the two expected open bugs: `for-await-has-no-bridge-kind` and `shortest-round-trip-digits`.
-- Authoritative transition against `results/test262-function-expressions-default-parameter-symbols-final-2026-08-27.jsonl`: all 99 common variants now pass (`69 passed->passed`, `26 failed->passed`, `4 refused->passed`, zero regressions).
-- Broader function-expression cohort: `results/test262-function-expressions-after-callsite-omission-2026-08-27.jsonl` records `328 passed / 152 failed / 4 refused` across 484 variants. The remaining focused `name`/`length-dflt` failures now reach own-property descriptor assertions rather than trapping on corrupted parameters.
-
-## 2026-08-27: default-parameter values and ordered parameter bindings
-
-- Added DSL-owned `NormalizeParameterValue(value, argc, ordinal)`: omitted native ABI parameter slots now become JavaScript `undefined` before default initialization instead of exposing uninitialized machine values.
-- Added DSL-owned `GetParameterBinding(value, initialized, name)` and frontend structural detection for self/later parameter references inside default initializers. Prior parameter references retain their initialized value; self/later reads raise a catchable DSL `ReferenceError`.
-- Added recursive AST containment support for identifying the active parameter initializer and a native witness that checks TDZ error identity, constructor, and name through ordinary source `catch`.
-- The complete `language/expressions/function` cohort is now **69 passed / 26 failed / 4 refused** (`results/test262-function-expressions-default-parameter-symbols-final-2026-08-27.jsonl`), versus 59/36/4 at the prior checkpoint. There are 15 failed-to-passed transitions. Five former passes now expose assertion failures after omitted arguments became deterministic `undefined`; those prior outcomes depended on uninitialized ABI slots and must not be preserved as semantics.
-- Known remaining issue: `dflt-params-ref-self` and `dflt-params-ref-later` throw the correct catchable `ReferenceError`, but Test262 runtime-negative host classification still reports a mismatch because initialization effects visible to source `catch` are not visible at the uncaught completion classifier. Attempts to classify via ErrorData and to add a memory operand directly to `JsThrow` were removed; the latter exposed an unhandled backend ABI invariant and caused SIGSEGVs. No experiment remains in the checkpoint.
-- Gate: `coil test` passes 52/52. Frontier: exactly the two expected open bugs remain, `for-await-has-no-bridge-kind` and `shortest-round-trip-digits`.
-
 ## 2026-08-27: descendant self captures and parameter environments stop corrupting graphs
 
 - Resolver capture classification now distinguishes a named expression's private function-ID
@@ -217,6 +61,7 @@ Validation after reverting the experiments:
   unbound `JSV-RESERVED-0` in `tests/backend-test.coil:260`, and an existing malformed
   `agrees-with-node?` form at `tests/native-execution-test.coil:1138`.
 
+
 ## 2026-08-27: `%UnboxArray` stays below its DSL control guards
 
 - JSL primitive lowering now constructs `%UnboxArray` as `ArrayUnbox(jl-ctrl, value)` instead of
@@ -274,42 +119,6 @@ Validation after reverting the experiments:
 - Of the remaining 16 cohort failures, four require `eval`, two are missing function binding/TCO, and ten are one unresolvable-reference family. Direct and logical missing-name reads catch an allocated object whose `name`, `message`, and `constructor` initialization stores are absent; explicit top-level `new ReferenceError` survives intact. Converting `NewErrorObject` to a builtin produced zero transitions and was reverted. The next target is abrupt-path property-memory capture for DSL-thrown global-reference errors. Focused evidence is retained in `results/test262-unresolvable-reference-error-memory-2026-08-27.jsonl`.
 - `coil test` is green at 52/52. `coil test --suite frontier` remains intentionally red at exactly `for-await-has-no-bridge-kind` and `shortest-round-trip-digits`.
 
-## 2026-08-27: empty-string logical values confirmed after native cache invalidation
-
-- Complete logical-AND plus logical-OR cohorts now report 52 passed / 16 failed / 0 refused across 68 variants. Each directory is 26/34, up from 24/34 at `bc8eaa7` and 22/34 before tagged logical arms.
-- The four new transitions are default and strict `S11.11.1_A3_T3.js` and `S11.11.2_A3_T3.js`: empty strings now drive the correct branch and preserve the selected string value. No previous passes regressed.
-- The source fix was already in `bc8eaa7`: native `VALUE_TRUTHY` resolves raw or tagged managed strings and tests the runtime record length. Test262 rebuilds initially appeared unchanged because Coil reused `.coil/build/native/2232296025890215446/source.o` from 00:31 after `native/gc/runtime.c` changed. Removing that one stale object and rebuilding made all four focused variants pass. This is a Coil native-source cache invalidation bug, not a harness semantic adjustment.
-- Authoritative results: `results/test262-logical-empty-string-native-runtime-2026-08-27.jsonl` and `results/test262-logical-cohorts-empty-string-fixed-2026-08-27.jsonl`, with summaries.
-- Of the remaining 16 cohort failures, four require `eval`, two are missing function binding/TCO, and ten are one unresolvable-reference family. Direct and logical missing-name reads catch an allocated object whose `name`, `message`, and `constructor` initialization stores are absent; explicit top-level `new ReferenceError` survives intact. Converting `NewErrorObject` to a builtin produced zero transitions and was reverted. The next target is abrupt-path property-memory capture for DSL-thrown global-reference errors. Focused evidence is retained in `results/test262-unresolvable-reference-error-memory-2026-08-27.jsonl`.
-- `coil test` is green at 52/52. `coil test --suite frontier` remains intentionally red at exactly `for-await-has-no-bridge-kind` and `shortest-round-trip-digits`.
-
-## 2026-08-27: empty-string logical values confirmed after native cache invalidation
-
-- Complete logical-AND plus logical-OR cohorts now report 52 passed / 16 failed / 0 refused across 68 variants. Each directory is 26/34, up from 24/34 at `bc8eaa7` and 22/34 before tagged logical arms.
-- The four new transitions are default and strict `S11.11.1_A3_T3.js` and `S11.11.2_A3_T3.js`: empty strings now drive the correct branch and preserve the selected string value. No previous passes regressed.
-- The source fix was already in `bc8eaa7`: native `VALUE_TRUTHY` resolves raw or tagged managed strings and tests the runtime record length. Test262 rebuilds initially appeared unchanged because Coil reused `.coil/build/native/2232296025890215446/source.o` from 00:31 after `native/gc/runtime.c` changed. Removing that one stale object and rebuilding made all four focused variants pass. This is a Coil native-source cache invalidation bug, not a harness semantic adjustment.
-- Authoritative results: `results/test262-logical-empty-string-native-runtime-2026-08-27.jsonl` and `results/test262-logical-cohorts-empty-string-fixed-2026-08-27.jsonl`, with summaries.
-- Of the remaining 16 cohort failures, four require `eval`, two are missing function binding/TCO, and ten are one unresolvable-reference family. Direct and logical missing-name reads catch an allocated object whose `name`, `message`, and `constructor` initialization stores are absent; explicit top-level `new ReferenceError` survives intact. Converting `NewErrorObject` to a builtin produced zero transitions and was reverted. The next target is abrupt-path property-memory capture for DSL-thrown global-reference errors. Focused evidence is retained in `results/test262-unresolvable-reference-error-memory-2026-08-27.jsonl`.
-- `coil test` is green at 52/52. `coil test --suite frontier` remains intentionally red at exactly `for-await-has-no-bridge-kind` and `shortest-round-trip-digits`.
-
-## 2026-08-27: empty-string logical values confirmed after native cache invalidation
-
-- Complete logical-AND plus logical-OR cohorts now report 52 passed / 16 failed / 0 refused across 68 variants. Each directory is 26/34, up from 24/34 at `bc8eaa7` and 22/34 before tagged logical arms.
-- The four new transitions are default and strict `S11.11.1_A3_T3.js` and `S11.11.2_A3_T3.js`: empty strings now drive the correct branch and preserve the selected string value. No previous passes regressed.
-- The source fix was already in `bc8eaa7`: native `VALUE_TRUTHY` resolves raw or tagged managed strings and tests the runtime record length. Test262 rebuilds initially appeared unchanged because Coil reused `.coil/build/native/2232296025890215446/source.o` from 00:31 after `native/gc/runtime.c` changed. Removing that one stale object and rebuilding made all four focused variants pass. This is a Coil native-source cache invalidation bug, not a harness semantic adjustment.
-- Authoritative results: `results/test262-logical-empty-string-native-runtime-2026-08-27.jsonl` and `results/test262-logical-cohorts-empty-string-fixed-2026-08-27.jsonl`, with summaries.
-- Of the remaining 16 cohort failures, four require `eval`, two are missing function binding/TCO, and ten are one unresolvable-reference family. Direct and logical missing-name reads catch an allocated object whose `name`, `message`, and `constructor` initialization stores are absent; explicit top-level `new ReferenceError` survives intact. Converting `NewErrorObject` to a builtin produced zero transitions and was reverted. The next target is abrupt-path property-memory capture for DSL-thrown global-reference errors. Focused evidence is retained in `results/test262-unresolvable-reference-error-memory-2026-08-27.jsonl`.
-- `coil test` is green at 52/52. `coil test --suite frontier` remains intentionally red at exactly `for-await-has-no-bridge-kind` and `shortest-round-trip-digits`.
-
-## 2026-08-27: empty-string logical values confirmed after native cache invalidation
-
-- Complete logical-AND plus logical-OR cohorts now report 52 passed / 16 failed / 0 refused across 68 variants. Each directory is 26/34, up from 24/34 at `bc8eaa7` and 22/34 before tagged logical arms.
-- The four new transitions are default and strict `S11.11.1_A3_T3.js` and `S11.11.2_A3_T3.js`: empty strings now drive the correct branch and preserve the selected string value. No previous passes regressed.
-- The source fix was already in `bc8eaa7`: native `VALUE_TRUTHY` resolves raw or tagged managed strings and tests the runtime record length. Test262 rebuilds initially appeared unchanged because Coil reused `.coil/build/native/2232296025890215446/source.o` from 00:31 after `native/gc/runtime.c` changed. Removing that one stale object and rebuilding made all four focused variants pass. This is a Coil native-source cache invalidation bug, not a harness semantic adjustment.
-- Authoritative results: `results/test262-logical-empty-string-native-runtime-2026-08-27.jsonl` and `results/test262-logical-cohorts-empty-string-fixed-2026-08-27.jsonl`, with summaries.
-- Of the remaining 16 cohort failures, four require `eval`, two are missing function binding/TCO, and ten are one unresolvable-reference family. Direct and logical missing-name reads catch an allocated object whose `name`, `message`, and `constructor` initialization stores are absent; explicit top-level `new ReferenceError` survives intact. Converting `NewErrorObject` to a builtin produced zero transitions and was reverted. The next target is abrupt-path property-memory capture for DSL-thrown global-reference errors. Focused evidence is retained in `results/test262-unresolvable-reference-error-memory-2026-08-27.jsonl`.
-- `coil test` is green at 52/52. `coil test --suite frontier` remains intentionally red at exactly `for-await-has-no-bridge-kind` and `shortest-round-trip-digits`.
-
 ## 2026-08-27: logical signed-zero values now survive truthiness selection
 
 - `If` selection now sends every predicate not proven to be a raw machine number through the JavaScript value-truthiness primitive. The old `n-ty == dyn` test misclassified tagged numeric merges such as `-0` because ideal type is not machine representation.
@@ -335,27 +144,6 @@ Validation after reverting the experiments:
 - Fixed the TypeScript-Go multi-script bridge so parser JSDoc nodes remain registered for stable role IDs but are detached from both ordinary child lists and the virtual compilation-unit statement list. This is not a Test262 harness exception: comments and JSDoc metadata no longer become executable statements for any multi-script compilation.
 - The focused aliased `Object.getPrototypeOf` native witness and a JSDoc `@callback` witness are in the bounded gate. `coil test` is green at 52/52. `coil test --suite frontier` remains intentionally red only for `for-await-has-no-bridge-kind` and `shortest-round-trip-digits`.
 - Complete Int8Array and Uint8Array constructor cohorts each remain 6 passed / 16 failed / 0 refused across 22 variants, with zero regressions. The two `proto.js` variants in each family now compile and execute instead of aborting on bridge kind 0; they expose the next independent dependency, `Float64Array is not defined`. Retained results: `results/test262-int8-get-prototype-jsdoc-final-2026-08-27.jsonl` and `results/test262-uint8-get-prototype-jsdoc-final-2026-08-27.jsonl` plus summaries.
-## 2026-08-27: typed-array constructor cohort has zero compiler refusals
-
-- The last refusal was an optimizer miscompile, not a selector limitation. A nested short-circuit
-  expression correctly built an outer value Phi over Region 101267, but `phi-single-input`
-  discarded its bypass arm because that control was dead-typed in the proof snapshot. Another
-  rewrite in the same sweep rewired the bypass live, leaving `Not(innerPhi)` on a block the inner
-  Phi did not dominate.
-- Phi collapse now follows the structural Region/Phi invariant: `region-remove-path!` exclusively
-  owns proven-dead path deletion and removes the matching Phi arm atomically. `phi-single-input`
-  ignores only self-edges and never independently skips a dead-typed structural arm. This keeps
-  irreversible value removal from depending on sweep order.
-- The complete 44-variant Int8Array/Uint8Array constructor cohort is now 8 passed / 36 failed /
-  0 refused, preserving every prior pass and converting the final compiler refusal into an honest
-  descriptor failure. Retained result:
-  `results/test262-int8-uint8-zero-refusals-final-2026-08-27.jsonl`.
-- The next progress is JavaScript semantics rather than compiler infrastructure: constructor
-  classification, prototype chains, property descriptors (`BYTES_PER_ELEMENT`, `constructor`,
-  `name`, `length`), and ordinary built-in metadata account for this cohort's executable failures.
-- `coil test` is green 52/52. `coil test --suite frontier` remains exactly the expected two red
-  bugs: `for-await-has-no-bridge-kind` and `shortest-round-trip-digits`.
-
 ## 2026-08-27: typed-array constructor cohort has zero compiler refusals
 
 - The last refusal was an optimizer miscompile, not a selector limitation. A nested short-circuit
@@ -451,6 +239,25 @@ Validation after reverting the experiments:
   collided with `OrdinaryToPrimitiveNumber`. The structural witness now reserves 512 and 1024;
   verifier experiments were fully reverted. `coil test` is green 52/52. The frontier remains the
   expected two red bugs: `for-await-has-no-bridge-kind` and `shortest-round-trip-digits`.
+
+## 2026-08-27: pinned ECMA-262 source is an executable zero-claim ledger
+
+- `spec/ecma262-sources.json` pins full ECMA-262 and Test262 commits and the SHA-256 of the exact
+  Ecmarkup entry document. `tools/ecma262-ledger.mjs` acquires that revision into the ignored
+  `.spec-cache/`, rejects dirty or mismatched inputs, and deterministically extracts clauses,
+  algorithms, built-ins, signatures, effects, direct dependencies, grammar productions, and exact
+  source locations.
+- `spec/generated/ecma262-raw-ledger.json` accounts for 2,340 clauses (2,268 normative) and 404
+  named productions (387 normative), with zero Ecmarkup warnings. Every normative item is
+  explicitly `unclassified`; this tranche creates the complete work queue but makes no false JSL
+  coverage claim.
+- `npm run spec:ledger:gate` is the sub-second normal loop. Minimal imported-spec fixtures test the
+  extractor, and an offline full-ledger validator checks pins, unique identities, locations,
+  production references, classification fields, and recomputed totals without network access or
+  Test262. `npm run spec:ledger:check` independently rebuilt the real pinned source and matched the
+  committed ledger byte for byte.
+- `docs/ECMA262-LEDGER.md` documents source updates, exact reproduction, focused fixture additions,
+  and the boundary between raw extraction and reviewed implementation classification.
 
 ## 2026-08-27: Symbol callability is executable; nested callable bind remains open
 
@@ -4618,3 +4425,66 @@ fix has zero passed-to-nonpassed transitions. Evidence is retained in
 
 `coil test` is green at 52/52. `coil test --suite frontier` remains red on exactly the two recorded
 open bugs: `for-await-has-no-bridge-kind` and `shortest-round-trip-digits`.
+## 2026-08-27: concrete typed-array intrinsic topology and constructor descriptor
+
+- `lib/typed-array/core.jsl` now materializes stable `%TypedArray%` and
+  `%TypedArray.prototype%` identities and links both Int8Array/Uint8Array constructor and
+  prototype objects through the standard intrinsic spine. All visible topology remains DSL
+  semantics; the frontend and Test262 harness are unchanged.
+- `BuiltinConstructorValue` now defines every built-in prototype's `constructor` property with
+  attributes 5: writable and configurable, but non-enumerable. Repeated intrinsic materialization
+  is idempotent instead of resetting that descriptor through ordinary assignment defaults.
+- The complete 44-variant Int8Array/Uint8Array constructor cohort moved from 8 passed / 36 failed /
+  0 refused to 12 passed / 32 failed / 0 refused, with zero lost passes. All four
+  `prototype/constructor.js` variants now pass. Retained results:
+  `results/test262-int8-intrinsic-topology-2026-08-27.jsonl` and
+  `results/test262-uint8-intrinsic-topology-2026-08-27.jsonl`.
+- The direct intrinsic-topology native witness passes. Test262's `proto.js` variants still abort
+  because the harness aliases `Object.getPrototypeOf` before calling it; generic calls through
+  that function value are not implemented yet. This is the next shared functionality boundary,
+  not a reason to specialize or alter the harness.
+- `coil test` is green 52/52. `coil test --suite frontier` remains exactly the expected two red
+  bugs: `for-await-has-no-bridge-kind` and `shortest-round-trip-digits`.
+## 2026-08-27: abrupt targets preserve dynamic JavaScript property memory
+
+- Jump and exception targets previously snapshotted only declared-field memory indices. DSL error
+  construction reached `catch`, but the dynamic `JS-PROPERTY-ALIAS` stores that initialized the
+  error object's `constructor`, `name`, and `message` were dropped on the abrupt edge.
+- Target snapshots now retain dynamic aliases in an explicit negative-tagged entry representation,
+  while preserving the established non-negative declared-field-index representation. Capture,
+  merge, and snapshot paths decode both through one helper. JavaScript lookup and error semantics
+  remain entirely in `lib/`; this is frontend control-state transport, not a harness special case.
+- A real core-Test262-harness fixture pins a top-level logical unresolvable read and checks
+  `constructor`, `instanceof`, `name`, and `message`. The production runner passes 2/2 default and
+  strict variants; evidence is
+  `results/test262-unresolvable-logical-regression-2026-08-27.jsonl` and its summary.
+- `coil test` is green at 52/52. The legacy standalone Test262 harness module remains independently
+  blocked because all ten native cases fail the existing Mach-O byte verifier before execution.
+  The former upstream checkout is no longer present (only `tests/test262/cases` is retained), so
+  the complete 68-variant logical cohorts could not be rerun at this checkpoint.
+## 2026-08-27: ordinary calls and array callbacks now bind JavaScript receivers
+
+- Ordinary function entry now performs `OrdinaryCallBindThis` semantics once: strict functions preserve the supplied receiver, while sloppy functions substitute the stable DSL global for `undefined`/`null` and box primitive receivers. Arrow functions retain lexical receiver handling. The frontend owns only strict/sloppy/arrow structure; substitution and boxing are implemented by `OrdinaryCallBindThisSloppy` in `lib/`.
+- Array callback operations now pass the source-level `thisArg` through the DSL for `map`, `filter`, `forEach`, `some`, `every`, `find`, `findIndex`, `flatMap`, and `Array.from`. Reduce operations continue to treat their second argument as the initial accumulator, not a receiver. No Test262 harness behavior was changed.
+- The complete `Array.prototype.every` cohort moved from 232 passed / 201 failed to 262 passed / 171 failed across 433 variants. Key-for-key comparison found 31 failed-to-passed transitions. The sole apparent passed-to-failed transition was a nondeterministic pipeline-execution failure; its default and strict variants both passed on isolated rerun, leaving zero reproduced regressions.
+- Split direct witnesses pass explicit receiver identity for `every`, `some`, `filter`, `forEach`, `find`, and `findIndex` in both default and strict variants. `map`, `flatMap`, and `Array.from` direct result assertions still signal 11 in result materialization; existing map receiver witnesses and 31 every transitions show callback receiver delivery itself works, so those are separate next targets.
+- Authoritative results are `results/test262-array-every-ordinary-this-v2-2026-08-27.jsonl`, `results/test262-array-every-thisarg-v3-2026-08-27.jsonl`, `results/test262-array-every-regression-check-2026-08-27.jsonl`, and `results/test262-array-callback-thisarg-split-2026-08-27.jsonl`, with summaries.
+- `coil test` is green at 52/52. `coil test --suite frontier` remains intentionally red at exactly `for-await-has-no-bridge-kind` and `shortest-round-trip-digits`.
+## 2026-08-27: callback dispatch ABI and three-argument `Array.from` are structurally complete
+
+- The literal-array `map` specialization now boxes its callback before `call-dynamic-with-receiver`, matching every iterative callback macro. The missing boundary made ordinary-object `thisArg` cases signal 11 during the map call; the reduced default/strict witness moved from 0/2 to 2/2.
+- `ToObjectValue` now preserves function identity as well as object and array identity. Functions are ECMAScript objects, not primitives to wrap. This closes the remaining sloppy callback receiver gap: `every/15.4.4.16-5-9.js` and `map/15.4.4.19-5-9.js` now pass in both default and strict variants.
+- The structural `Array.from` recognizer now admits four AST children (callee plus source, map function, and `thisArg`). Its lowering already evaluated all three source arguments and delegated to DSL `ArrayFrom` plus `ArrayMap`; the old three-child bound incorrectly diverted valid calls to generic dispatch. Copy, map, and explicit-receiver reductions now pass 6/6.
+- The final complete `Array.prototype.map` cohort reports 234 passed / 189 failed / 2 refused / 2 policy-skipped across 425 variants. Compared with the first post-callback-ABI run, function identity adds exactly one failed-to-passed transition with every other variant unchanged.
+- The complete `Array.from` cohort reports 4 passed / 82 failed / 2 refused / 1 policy-skipped across 88 variants. Its remaining failures are broader constructor and array-like semantics, not the fixed three-argument recognizer. Official `flatMap/thisArg-argument.js` passes; a separate conditional-array callback return still traps and is the next dynamic return-typing target.
+- Authoritative results: `results/test262-array-map-boxed-callback-2026-08-27.jsonl`, `results/test262-array-map-callback-receiver-final-2026-08-27.jsonl`, `results/test262-array-from-thisarg-complete-2026-08-27.jsonl`, `results/test262-array-from-thisarg-structural-2026-08-27.jsonl`, `results/test262-function-thisarg-identity-2026-08-27.jsonl`, and `results/test262-flatmap-thisarg-upstream-2026-08-27.jsonl`, with summaries.
+- `coil test` is green at 52/52. `coil test --suite frontier` remains intentionally red at exactly `for-await-has-no-bridge-kind` and `shortest-round-trip-digits`.
+## 2026-08-27: array-kind proof follows boxed conditional returns
+
+- `be-array-value?` now follows `Box` nodes with bounded fuel. A callback returning `condition ? [value] : []` produces a Phi that is boxed before its function `Return`; call-graph array proof stopped at that representation boundary, so `flatMap` tagged the callback result as an ordinary object and trapped in append-or-spread. Direct calls happened to work because their consumers used the runtime tag rather than proving the callee return kind.
+- The focused matrix covers direct conditional and statement-form array returns plus both forms through `flatMap`. It moved from 6 passed / 2 signal-5 failures to 8/8. The bounded differential witness now pins the all-array conditional callback alongside scalar, array, and heterogeneous flatMap returns.
+- Against the retained earlier full-suite slice, the complete 47-variant `flatMap` cohort is cumulatively 7 passed / 40 failed / 0 refused, up from 2 passed / 43 failed / 2 refused. Those five transitions include callback receiver fixes from the preceding checkpoint; there is no matching upstream all-array conditional-return file, so this section does not misattribute the aggregate gain to the one-node backend change.
+- A generic array-like loop conversion was tested and reverted after it regressed `thisArg-argument.js [strict]` with no upstream gains. A canonical `Array.prototype.flatMap` callable/prototype-value experiment was also reverted: its direct metadata probes passed, but Test262 `verifyProperty` still hits a separate composed mutation/control defect and yielded zero complete-file transitions.
+- The next isolated defect is abrupt callback-result consumption in `flatMap`: direct calls, `every`, and `map` propagate the same thrown callback value, while `flatMap` signals 5 when its append-or-spread branch consumes that exceptional call result.
+- Authoritative results: `results/test262-conditional-array-return-reduction-2026-08-27.jsonl`, `results/test262-conditional-array-return-final-2026-08-27.jsonl`, and `results/test262-array-flatmap-box-transparent-2026-08-27.jsonl`, with summaries.
+- `coil test` is green at 52/52. `coil test --suite frontier` remains intentionally red at exactly `for-await-has-no-bridge-kind` and `shortest-round-trip-digits`.
