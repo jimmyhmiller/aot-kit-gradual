@@ -1,3 +1,13 @@
+## 2026-08-27: Ordinary functions now inherit the initialized Function prototype
+
+- Split `InitializeFunctionProperties` from `InitializeOrdinaryFunctionMetadata`. The first owns standard own `length`/`name` descriptors; the second applies those properties, idempotently initializes the shared Function prototype's `length: 0` and `name: ""`, and links each ordinary function to that shared prototype. `FunctionConstructorValue` uses only the property initializer for its prototype, avoiding recursive/self prototype linkage.
+- This is entirely DSL-owned JavaScript semantics. No frontend, runtime C, or Test262 harness behavior changed.
+- The focused delete/inherited lookup witness moved from 0/2 to 2/2: after deleting an ordinary function's configurable own `length`, inherited `Function.prototype.length` is `0` in default and strict variants. Evidence: `results/test262-function-prototype-final-2026-08-27.jsonl` and summary.
+- The upstream `language/expressions/function/length-dflt.js` remains 0/2, despite direct own descriptors and inherited length now being correct; its remaining failure is a separate property-helper/runtime dependency and is not claimed fixed.
+- The complete 484-variant function-expression cohort is `336 passed / 142 failed / 6 refused`. Against the prior `335 / 143 / 6`, exact transitions are `335 passed->passed`, `142 failed->failed`, `1 failed->passed`, and `6 refused->refused`. The lone transition is the already observed flaky `dstr/dflt-ary-ptrn-elem-obj-val-undef.js` default variant, so no deterministic Test262 gain is attributed to this change. Evidence: `results/test262-function-expressions-after-function-prototype-2026-08-27.jsonl` and summary.
+- Architectural next steps remain explicit: surplus actuals need a hidden per-invocation argument record rather than an arbitrary ABI maximum; shortest-round-trip formatting needs a real DSL-owned Ryu/Grisu-class digit generator, not a C `printf` workaround.
+- `coil test` is green at 52/52. Final frontier remains exactly the expected two red bugs: `for-await-has-no-bridge-kind` and `shortest-round-trip-digits`.
+
 ## 2026-08-27: Function metadata and indexed arguments are materialized structurally
 
 - Corrected the previous checkpoint's transition accounting: the overlap between `test262-function-expressions-default-parameter-symbols-final-2026-08-27.jsonl` and `test262-function-expressions-after-callsite-omission-2026-08-27.jsonl` was `58 passed->passed`, `11 passed->failed`, `9 failed->passed`, `17 failed->failed`, and `4 refused->refused`, not 99 common passes. The earlier claim used a nonexistent `file` field instead of the result record's `path` field.
