@@ -1,3 +1,26 @@
+## 2026-08-27: `%UnboxArray` stays below its DSL control guards
+
+- JSL primitive lowering now constructs `%UnboxArray` as `ArrayUnbox(jl-ctrl, value)` instead of
+  sending it through the generic null-control value-op builder. This is representation/control
+  structure, not JavaScript semantics; `ArrayConcatValue` and `ArrayFlatMap` remain entirely in
+  `lib/array/build.jsl`.
+- The production `flatMap` abrupt-completion trap is fixed. Crash tracing mapped signal 5 to ideal
+  `ArrayUnbox` node 45671 in machine block 6421. Its ideal control was `-1`, so GCM anchored it
+  through the callback value to the block *before* descriptor-101's pending-exception branch and
+  checked the exceptional tagged-`undefined` placeholder as an Array. The expected tag guard was
+  correct; the missing ideal control was the whole defect.
+- The original focused Test262 witness moved from 0/2 signal-5 failures to 2/2 passing. The complete
+  callback-abrupt family is 8/8 (`direct`, `map`, `every`, and `flatMap`, default plus strict).
+  Evidence: `results/test262-flatmap-abrupt-original-fixed-2026-08-27.jsonl` and
+  `results/test262-callback-abrupt-family-array-anchor-2026-08-27.jsonl`.
+- Empty and constant-only catch reductions now expose a separate bug instead of trapping: they
+  reach the uncaught sink, while a catch that reads `e` passes. `ExceptionTake` is currently a
+  value-only `JsBuiltin`; when its result is unused, graph reachability deletes the state-clearing
+  runtime operation. The next clean fix is to thread exception transport as an effect, not retain
+  it with a fake JavaScript use.
+- The complete upstream `flatMap` checkout is not present locally, so no cohort-wide transition is
+  claimed. `coil test` is green at 52/52; the 40,000-pass goal remains active.
+
 ## 2026-08-27: standalone JSL calls now publish abrupt returns
 
 - `jl-lower-decl!` now collects abrupt edges owned by a standalone DSL declaration and publishes
