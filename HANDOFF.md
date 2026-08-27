@@ -1,3 +1,34 @@
+## 2026-08-27: String equality representation boundary diagnosed; broad macro boxing rejected
+
+The completed function-symbol/global-binding work remains in pushed commits `b6ca7a6` and `81df66b`.
+The next `verifyProperty` failure was reduced to representation identity: array `push`/`join` produce
+the correct UTF-16 contents, but `StrictEqual` receives a raw string pointer where its `dyn` DSL
+contract requires a tagged JavaScript value, so `%IsString` falls through and `%Eq` compares pointer
+identity.
+
+Two structural fixes were tested and deliberately not landed:
+
+- Preventing every pinned node from folding/idealizing/GVN avoids `n-kill!: node is pinned`, but
+  permanently suppresses required canonicalization for scoped/permanent pins and breaks
+  `native-graph-basic`.
+- Normalizing every macro/structural-inline `dyn` argument and retaining pinned `Box` nodes avoids
+  corruption, but does not make the focused `verifyProperty` value witness pass. It also expands the
+  witness to roughly 443k graph nodes and takes about 25 seconds for two variants, so it is not an
+  acceptable boundary.
+
+The clean next step is to establish the tagged JavaScript-value invariant at the expression/value
+boundary that feeds semantic DSL operations, not at every JSL macro parameter. `StrictEqual` already
+implements the right ECMAScript semantics in `lib/abstract/conversions.jsl`; the missing fact is that
+both operands satisfy its declared `dyn` representation. Preserve the existing callable ABI boxing,
+avoid harness changes, and add a narrow regression proving dynamically constructed and literal
+strings compare by contents before rerunning the four `verifyProperty` branches.
+
+Validation after reverting the experiments:
+
+- `coil test`: 52 passed, 0 failed.
+- `coil test --suite frontier`: exactly the two expected red bugs,
+  `for-await-has-no-bridge-kind` and `shortest-round-trip-digits`.
+
 ## 2026-08-27: Ordinary functions now inherit the initialized Function prototype
 
 - Split `InitializeFunctionProperties` from `InitializeOrdinaryFunctionMetadata`. The first owns standard own `length`/`name` descriptors; the second applies those properties, idempotently initializes the shared Function prototype's `length: 0` and `name: ""`, and links each ordinary function to that shared prototype. `FunctionConstructorValue` uses only the property initializer for its prototype, avoiding recursive/self prototype linkage.
