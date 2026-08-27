@@ -1,3 +1,25 @@
+## 2026-08-27: indexed Array descriptors become visible and maintain Array length
+
+- `DefineProperty` now maintains Array exotic `length` for canonical indexed keys in JSL, and
+  Array indexed reads/presence checks distinguish explicit ordinary descriptor components from
+  dense storage. Array-like iteration boxes internal integer keys, and predicate methods apply
+  JavaScript `ToBoolean` to dynamic callback results. JavaScript meaning remains in `lib/`.
+- The native property representation now lets explicit indexed descriptor records override dense
+  Array slots. Defining a descriptor retires stale dense storage; attribute/load/presence/delete
+  operations consistently consult the descriptor, so deletion cannot reveal an old dense value.
+- A direct `Object.defineProperty([], "2", {get(){return 12}})` witness now passes string and
+  numeric reads in default and strict variants (2/2) using a forced-current native host. Evidence:
+  `results/test262-array-descriptor-current-runtime-2026-08-27.jsonl`.
+- The upstream filter witness remains red: in the larger graph, descriptor-field presence misses
+  `"get"`, so `DefineProperty` emits an undefined data component (`op=16`) rather than a getter
+  (`op=17`). This is reduced below filter and is the next target; no harness workaround landed.
+- Coil's build cache does not invalidate the statically linked native object when
+  `native/gc/runtime.c` changes. A distinct output/profile still linked stale code. Focused proof
+  required temporarily substituting a unique runtime source path in `Coil.toml` under a restoring
+  shell trap. This build-system bug should be reported/fixed separately.
+- `coil test` is green at 52/52. Final frontier is unchanged at exactly the two expected red bugs:
+  `for-await-has-no-bridge-kind` and `shortest-round-trip-digits`.
+
 ## 2026-08-27: polymorphic non-callables no longer dereference a null closure
 
 - The propertyHelper signal-11 failure was reduced to ARM64 callable dispatch, not JavaScript

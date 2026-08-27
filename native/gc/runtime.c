@@ -1746,6 +1746,33 @@ AotJsValue aot_js_property(uintptr_t owner, uint64_t name,
             ks && ks->length ? (char)ks->units[0] : '?');
   }
   if (indexed_array && js_property_array_index((AotJsValue)name, &array_index)) {
+    /* Explicit indexed descriptors use the ordinary component record because dense Array
+       storage has no getter/setter fields.  Once one exists it is the indexed property: every
+       query must consult it before the dense slot, and defining one must retire the old dense
+       value so deleting the descriptor cannot reveal stale storage. */
+    JsPropertyRec *indexed_descriptor = js_own_property(owner, (AotJsValue)name);
+    if (operation >= 16 && operation <= 18) {
+      if ((size_t)array_index < indexed_array->length) {
+        indexed_array->present[array_index] = 0;
+        indexed_array->elements[array_index] = AOT_JS_UNDEFINED;
+        indexed_array->attributes[array_index] = 0;
+      }
+      /* Component definitions continue through the ordinary property-record path below. */
+    } else if (indexed_descriptor) {
+      if (operation == 14) return indexed_descriptor->attributes;
+      if (operation == 15) {
+        indexed_descriptor->attributes = (uint8_t)(value & 15);
+        return indexed_descriptor->attributes;
+      }
+      if (operation == 0) return indexed_descriptor->value;
+      if (operation == 3) return 1;
+      if (operation == 4) {
+        if (!(indexed_descriptor->attributes & 4)) return 0;
+        indexed_descriptor->owner = 0;
+        js_property_cache_rebuild();
+        return 1;
+      }
+    }
     if (operation == 14)
       return (size_t)array_index < indexed_array->length && indexed_array->present[array_index]
                ? (AotJsValue)(indexed_array->attributes[array_index]
@@ -1759,7 +1786,7 @@ AotJsValue aot_js_property(uintptr_t owner, uint64_t name,
       return value & 7;
     }
     if (operation == 0) return aot_js_array(owner, array_index, value, 1);
-    if (operation == 1 || operation == 16) {
+    if (operation == 1) {
       if ((size_t)array_index < indexed_array->length && indexed_array->present[array_index] &&
           operation != 16 &&
           indexed_array->attributes[array_index] &&

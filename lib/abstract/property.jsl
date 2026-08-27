@@ -126,13 +126,31 @@
       value))
 
 (macro GetElement :params [(array dyn) (index int)] :ret dyn
-  (%ArrayLoad array index))
+  (GetProperty array (%Box index)))
 
 (macro SetElement :params [(array dyn) (index int) (value dyn)] :ret dyn
   (let [(ignored (%ArrayStore array index (%Box value)))] value))
 
 (macro ResizeArray :params [(array dyn) (length int) (dependency dyn)] :ret dyn
   (let [(ignored (%ArrayResize array length dependency))] array))
+
+;; ArraySetLength for a newly defined indexed own property. The property descriptor itself remains
+;; in the ordinary key/component tables; this operation maintains the Array exotic's separate
+;; length slot after those writes succeed. The current machine index range is narrower than
+;; ECMAScript's full 32-bit Array-index range, and TypedArrayIndex is the shared canonical
+;; nonnegative decimal-key parser for that supported range.
+(macro MaintainArrayIndexLengthAfterDefine
+  :params [(object dyn) (propertyKey dyn) (dependency dyn)] :ret dyn
+  (if (%IsArray (%Box object))
+      (let [(index (TypedArrayIndex propertyKey))]
+        (if (%Lt index 0)
+            object
+            (let [(length (%ArrayLen object))]
+              (if (%Lt index length)
+                  object
+                  (let [(resized (%ArrayResize object (%Add index 1) dependency))]
+                    object)))))
+      object))
 
 ;; https://tc39.es/ecma262/#sec-topropertykey. Symbols preserve identity; every other key
 ;; canonicalizes through ToString into the content-based runtime string-key space.
@@ -190,12 +208,22 @@
 
 (macro GetProperty :transitioning true :params [(object dyn) (key dyn)] :ret dyn
   (let [(propertyKey (ToPropertyKey key))]
-    (if (IsTypedArray object)
+    (if (%IsArray (%Box object))
+        (let [(index (TypedArrayIndex propertyKey))]
+          (if (%Lt index 0)
+              (OrdinaryGetProperty object propertyKey)
+              ;; Indexed descriptors live in the ordinary component tables, while literal/push
+              ;; elements live in dense Array storage. An own descriptor takes precedence and may
+              ;; invoke an accessor; otherwise the dense slot is the Array exotic's indexed value.
+              (if (%Lt (%OwnPropertyAttributes object propertyKey) 0)
+                  (%ArrayLoad object index)
+                  (OrdinaryGetProperty object propertyKey))))
+        (if (IsTypedArray object)
         (let [(index (TypedArrayIndex propertyKey))]
           (if (%Lt index 0)
               (OrdinaryGetProperty object propertyKey)
               (TypedArrayGet object index)))
-        (OrdinaryGetProperty object propertyKey))))
+        (OrdinaryGetProperty object propertyKey)))))
 
 (macro OrdinarySetProperty :transitioning true
   :params [(object dyn) (propertyKey dyn) (value dyn)] :ret dyn
@@ -229,12 +257,18 @@
 
 (macro HasProperty :params [(object dyn) (key dyn)] :ret bool
   (let [(propertyKey (ToPropertyKey key))]
-    (if (IsTypedArray object)
+    (if (%IsArray (%Box object))
+        (let [(index (TypedArrayIndex propertyKey))]
+          (if (if (%Lt index 0) false
+                  (%Le 0 (%OwnPropertyAttributes object propertyKey)))
+              true
+              (%PropHasKey object propertyKey)))
+        (if (IsTypedArray object)
         (let [(index (TypedArrayIndex propertyKey))]
           (if (%Lt index 0)
               (%PropHasKey object propertyKey)
               (%Lt index (%InternalIndex object))))
-        (%PropHasKey object propertyKey))))
+        (%PropHasKey object propertyKey)))))
 
 (macro DeleteProperty :params [(object dyn) (key dyn)] :ret bool
   (let [(propertyKey (ToPropertyKey key))]
@@ -406,16 +440,20 @@
                                 (getterStored (%DefinePropertyGetter object propertyKey getter))
                                 (setterStored (%DefinePropertySetter object propertyKey setter))
                                 (marked (%SetPropertyAttributes object propertyKey
-                                                                (%BitOr 8 (%BitOr enumerable configurable))))]
-                            object)
+                                                                (%BitOr 8 (%BitOr enumerable configurable))))
+                                (lengthMaintained
+                                  (MaintainArrayIndexLengthAfterDefine object propertyKey setter))]
+                            lengthMaintained)
                           (let [(newValue (if (HasProperty descriptor "value")
                                              (GetProperty descriptor "value") oldValue))
                                 (writable (WritableAttribute descriptor
                                                              (if exists (%BitAnd oldAttributes 1) 0)))
                                 (attributes (%BitOr writable (%BitOr enumerable configurable)))
                                 (stored (%DefinePropertyValue object propertyKey newValue))
-                                (marked (%SetPropertyAttributes object propertyKey attributes))]
-                            object)))))))))
+                                (marked (%SetPropertyAttributes object propertyKey attributes))
+                                (lengthMaintained
+                                  (MaintainArrayIndexLengthAfterDefine object propertyKey newValue))]
+                            lengthMaintained)))))))))
 
 (builtin GetOwnPropertyDescriptor
   :transitioning true :params [(object dyn) (key dyn)] :ret dyn
