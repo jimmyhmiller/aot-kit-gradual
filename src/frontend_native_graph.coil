@@ -1303,6 +1303,10 @@
   (if (= memory NO-NODE)
       false
       (match (n-op memory)
+        ;; Effect orders one value evaluation after its predecessor without changing which alias
+        ;; classes that predecessor describes. Keep the wrapper as the selected leaf below; only
+        ;; delegate the membership question.
+        (Effect [] (fng-memory-has-alias? (n-in memory 1) alias))
         (Store [stored-alias] (= stored-alias alias))
         (PropStore [_] (= alias JS-PROPERTY-ALIAS))
         (PropStoreKey [_] (= alias JS-PROPERTY-ALIAS))
@@ -1339,6 +1343,7 @@
   (if (= memory NO-NODE)
       false
       (match (n-op memory)
+        (Effect [] true)
         (Store [_] true) (PropStore [_] true) (PropStoreKey [_] true)
         (PropDelete [_] true) (PropDeleteKey [] true) (SetProto [] true)
         (ArrayStore [] true) (ArrayResize [] true) (ArrayCopy [] true) (MemMerge [] true)
@@ -9005,9 +9010,16 @@
       ;; A rethrow from the catch belongs to the next enclosing handler, never this one.
       (fng-pop-target! context target)
       (if has-exception
-          (let [thrown
+          (do
+            (fng-ensure-memory! context)
+            (let [thrown
                   (fng-exception-runtime context FNG-EXCEPTION-TAKE-DESCRIPTOR
-                                         (load (load (field context exception-dependency))))]
+                                         (load (load (field context exception-dependency))))
+                  effect
+                    (n-effect! (load (load (field context ctrl)))
+                               (load (load (field context memory)))
+                               thrown)]
+            (set! (load (field context memory)) effect)
             (if (!= catch-declaration -1)
                 (fng-set-symbol! context
                                  (fe-symbol-for-declaration frontend catch-declaration (.owner context))
@@ -9020,7 +9032,8 @@
                     (fng-merge-snapshots! context
                                           try-ctrl try-start
                                           catch-ctrl catch-start
-                                          (mut changed) (mut active) (mut snapshots)))))
+                                          (mut changed) (mut active) (mut snapshots))))
+            0))
           (do
             (if try-continues
                 (do (set! (load (field context ctrl)) try-ctrl)

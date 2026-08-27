@@ -1,3 +1,23 @@
+## 2026-08-27: caught exceptions remain effectful when the binding is unused
+
+- Catch entry now sequences descriptor-102 `ExceptionTake` through a dedicated
+  `Effect(control, memory, value) -> memory` ideal node. The node emits no machine instruction of
+  its own; it orders selection of the existing runtime operation and prevents reachability/DCE from
+  deleting the pending-exception state clear when a catch binding is absent or unread.
+- `Effect` is compiler structure, not JavaScript semantics. Its opcode metadata, graph text codec,
+  verifier contract, dead-control idealization, alias-transparent frontend memory ownership, and
+  backend ordered-memory traversal are explicit. No Test262 harness behavior changed and no
+  JavaScript operation was open-coded outside `lib/`.
+- The focused empty, constant-only, and value-reading catch matrix moved from 2 passed / 4 uncaught
+  failures to 6/6 across default and strict variants. The empty-catch bounded witness throws again
+  afterward, proving the first pending exception was consumed rather than hidden. Evidence:
+  `results/test262-flatmap-catch-effect-memory-v3-2026-08-27.jsonl` and its summary.
+- `coil test` is green at 52/52. Final `coil test --suite frontier` reports exactly the two
+  expected open bugs: `for-await-has-no-bridge-kind` and `shortest-round-trip-digits`.
+  `coil test --suite full` is currently blocked before execution by unrelated dirty test sources:
+  unbound `JSV-RESERVED-0` in `tests/backend-test.coil:260`, and an existing malformed
+  `agrees-with-node?` form at `tests/native-execution-test.coil:1138`.
+
 ## 2026-08-27: `%UnboxArray` stays below its DSL control guards
 
 - JSL primitive lowering now constructs `%UnboxArray` as `ArrayUnbox(jl-ctrl, value)` instead of

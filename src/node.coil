@@ -140,7 +140,11 @@
   (ObjectFreeze)
   (InternalLoad [(slot i64)])
   (InternalStore [(operation i64)])
-  (StringNormalize))
+  (StringNormalize)
+  ;; Orders an externally effectful value-producing operation in the memory chain without
+  ;; introducing another runtime operation. Input 0 is control, 1 is prior memory, 2 is the
+  ;; value whose evaluation must occur before the outgoing memory is observed.
+  (Effect))
 
 ;; A concise variant test that still expands to ordinary pattern matching. The payload pattern is
 ;; explicit at each call site, so a payload change remains a compile-time migration rather than a
@@ -291,7 +295,8 @@
 (const OPTAG-STRINGALLOC i64 91)   ; (_, raw length) -> a fresh string, all units zero
 (const OPTAG-STRINGSETUNIT i64 92) ; (_, string, raw index, raw unit) -> the SAME string
 (const OPTAG-CALLABLEID i64 93) ; (Start), aux = compiler-local Fun index -> runtime integer id
-(const OPTAG-COUNT i64 94)
+(const OPTAG-EFFECT i64 94)
+(const OPTAG-COUNT i64 95)
 
 ;; Temporary serialization/parser boundary while textual graph opcodes are still numeric.
 ;; A RETIRED TAG IS A HOLE IN A DENSE, SCANNED ID SPACE. `gparse-op` walks 0..OPTAG-COUNT asking
@@ -395,6 +400,7 @@
         OPTAG-INTERNALLOAD (InternalLoad aux)
         OPTAG-INTERNALSTORE (InternalStore aux)
         OPTAG-STRINGNORMALIZE (StringNormalize)
+        OPTAG-EFFECT (Effect)
         (do (panic-corrupt "op-decode-tag: unknown opcode") (Start))))
 
 (defn op-encode-tag [(op Op)] (-> i64)
@@ -490,7 +496,8 @@
     (ObjectFreeze [] OPTAG-OBJECTFREEZE)
     (InternalLoad [slot] OPTAG-INTERNALLOAD)
     (InternalStore [operation] OPTAG-INTERNALSTORE)
-    (StringNormalize [] OPTAG-STRINGNORMALIZE)))
+    (StringNormalize [] OPTAG-STRINGNORMALIZE)
+    (Effect [] OPTAG-EFFECT)))
 
 (defn op-encode-payload [(op Op)] (-> i64)
   (match op
@@ -585,7 +592,8 @@
     (ObjectFreeze [] 0)
     (InternalLoad [slot] slot)
     (InternalStore [operation] operation)
-    (StringNormalize [] 0)))
+    (StringNormalize [] 0)
+    (Effect [] 0)))
 
 (const INTERNAL-TARGET i64 0)
 (const INTERNAL-INDEX i64 1)
@@ -688,7 +696,8 @@
     (ObjectFreeze [] "ObjectFreeze")
     (InternalLoad [_] "InternalLoad")
     (InternalStore [_] "InternalStore")
-    (StringNormalize [] "StringNormalize")))
+    (StringNormalize [] "StringNormalize")
+    (Effect [] "Effect")))
 
 (defn op-name [(op Op)] (-> (slice u8))
   (op-value-name op))
@@ -806,7 +815,8 @@
     (ObjectFreeze [] 610)
     (InternalLoad [_] 98)
     (InternalStore [_] 610)
-    (StringNormalize [] 98)))
+    (StringNormalize [] 98)
+    (Effect [] 610)))
 
 (defn op-has-class? [(op Op) (class i64)] (-> bool)
   (!= (& (op-class op) class) 0))
@@ -1857,7 +1867,8 @@
     (ArrayTest [] (arraytest-compute n))
     (ArrayUnbox [] (t-obj))
     (ParseFloat [] (t-dyn))
-    (StringNormalize [] (t-str))))
+    (StringNormalize [] (t-str))
+    (Effect [] (n-in-ty n 1))))
 
 ;; An absent input contributes ANY (nothing known yet), which keeps compute monotone while a
 ;; graph is still being wired up.
@@ -2417,6 +2428,9 @@
 (defn n-load! [(mem i64) (ptr i64) (alias i64)] (-> i64)
   (n-check-alias alias "n-load!: not an allocated alias number")
   (n-peephole (n-new3 (Load alias) NO-NODE mem ptr)))
+
+(defn n-effect! [(ctrl i64) (mem i64) (value i64)] (-> i64)
+  (n-peephole (n-new3 (Effect) ctrl mem value)))
 
 ;; The `-at!` variant, for the reason `jl-prim-mem` gives about its own: a read with a null control
 ;; anchor floats, and global code motion then hoists it to the shallowest block between its inputs
@@ -4175,6 +4189,7 @@
     (ArrayResize [] true)
     (ArrayCopy [] true)
     (StringSplit [] true)
+    (Effect [] true)
     (_ false)))
 
 (defn n-idealize [(n i64)] (-> i64)
@@ -4275,7 +4290,8 @@
     (ObjectFreeze [] NO-NODE)
     (InternalLoad [_] NO-NODE)
     (InternalStore [_] NO-NODE)
-    (StringNormalize [] NO-NODE))))
+    (StringNormalize [] NO-NODE)
+    (Effect [] NO-NODE))))
 
 (defn callend-idealize [(n i64)] (-> i64)
   (let [ctrl (n-in n 0)]
