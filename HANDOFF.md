@@ -1,3 +1,11 @@
+## 2026-08-27: logical value merges preserve the JavaScript tagged boundary
+
+- `&&` and `||` used to merge raw operand representations directly into a `dyn` Phi. `verifyProp || name` therefore selected an untagged string pointer when the left operand was `undefined`, even though the source-level result was an ordinary JavaScript String.
+- Logical value arms now cross the same tagged boundary as conditional and nullish expressions, using the tagged-aware argument helper so already-tagged parameters, property loads, and call results are not boxed twice. The frontend still owns only branch structure; truthiness and value semantics remain in the DSL/IR contracts.
+- The bounded native witness covers both a false raw-Boolean helper result and `undefined || "value"` used as a computed property key. `coil test` is green 52/52. The frontier remains exactly the expected `for-await-has-no-bridge-kind` and `shortest-round-trip-digits` failures.
+- The reduced upstream `propertyHelper.js` `isWritable` shape moved from 0/2 to 2/2. In each complete Int8Array and Uint8Array constructor cohort, constructor and prototype `BYTES_PER_ELEMENT` moved failed-to-passed in both variants. Four former passes also became honest failures because the same broken helper had hidden writable-constructor and thrown-value defects, so each cohort remains 6 passed / 16 failed / 0 refused rather than claiming false progress.
+- Complete logical-AND and logical-OR expression directories each report 22 passed / 12 failed / 0 refused across 34 variants. Remaining direct value bugs include preserving `""` and `-0`; eval and TCO cases have independent missing-global/function issues. Retained results are `results/test262-logical-{and,or}-tagged-values-2026-08-27.jsonl` and `results/test262-{int8,uint8}-tag-aware-logical-boxing-2026-08-27.jsonl`, with summaries.
+
 ## 2026-08-27: `Object.getPrototypeOf` is a DSL operation and JSDoc metadata is not executable syntax
 
 - Added `%GetPrototype` as the runtime property primitive and implemented `ObjectGetPrototypeOf`, its callable entry, and the standard `Object.getPrototypeOf` function value in `lib/abstract/property.jsl`. The frontend only recognizes the structural direct/aliased call and publishes the DSL-owned function value; JavaScript semantics remain in `lib/`.
