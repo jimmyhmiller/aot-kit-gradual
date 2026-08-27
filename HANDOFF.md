@@ -34,6 +34,15 @@
 - Of the remaining 16 cohort failures, four require `eval`, two are missing function binding/TCO, and ten are one unresolvable-reference family. Direct and logical missing-name reads catch an allocated object whose `name`, `message`, and `constructor` initialization stores are absent; explicit top-level `new ReferenceError` survives intact. Converting `NewErrorObject` to a builtin produced zero transitions and was reverted. The next target is abrupt-path property-memory capture for DSL-thrown global-reference errors. Focused evidence is retained in `results/test262-unresolvable-reference-error-memory-2026-08-27.jsonl`.
 - `coil test` is green at 52/52. `coil test --suite frontier` remains intentionally red at exactly `for-await-has-no-bridge-kind` and `shortest-round-trip-digits`.
 
+## 2026-08-27: empty-string logical values confirmed after native cache invalidation
+
+- Complete logical-AND plus logical-OR cohorts now report 52 passed / 16 failed / 0 refused across 68 variants. Each directory is 26/34, up from 24/34 at `bc8eaa7` and 22/34 before tagged logical arms.
+- The four new transitions are default and strict `S11.11.1_A3_T3.js` and `S11.11.2_A3_T3.js`: empty strings now drive the correct branch and preserve the selected string value. No previous passes regressed.
+- The source fix was already in `bc8eaa7`: native `VALUE_TRUTHY` resolves raw or tagged managed strings and tests the runtime record length. Test262 rebuilds initially appeared unchanged because Coil reused `.coil/build/native/2232296025890215446/source.o` from 00:31 after `native/gc/runtime.c` changed. Removing that one stale object and rebuilding made all four focused variants pass. This is a Coil native-source cache invalidation bug, not a harness semantic adjustment.
+- Authoritative results: `results/test262-logical-empty-string-native-runtime-2026-08-27.jsonl` and `results/test262-logical-cohorts-empty-string-fixed-2026-08-27.jsonl`, with summaries.
+- Of the remaining 16 cohort failures, four require `eval`, two are missing function binding/TCO, and ten are one unresolvable-reference family. Direct and logical missing-name reads catch an allocated object whose `name`, `message`, and `constructor` initialization stores are absent; explicit top-level `new ReferenceError` survives intact. Converting `NewErrorObject` to a builtin produced zero transitions and was reverted. The next target is abrupt-path property-memory capture for DSL-thrown global-reference errors. Focused evidence is retained in `results/test262-unresolvable-reference-error-memory-2026-08-27.jsonl`.
+- `coil test` is green at 52/52. `coil test --suite frontier` remains intentionally red at exactly `for-await-has-no-bridge-kind` and `shortest-round-trip-digits`.
+
 ## 2026-08-27: logical signed-zero values now survive truthiness selection
 
 - `If` selection now sends every predicate not proven to be a raw machine number through the JavaScript value-truthiness primitive. The old `n-ty == dyn` test misclassified tagged numeric merges such as `-0` because ideal type is not machine representation.
