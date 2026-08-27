@@ -1,3 +1,12 @@
+## 2026-08-27: default-parameter values and ordered parameter bindings
+
+- Added DSL-owned `NormalizeParameterValue(value, argc, ordinal)`: omitted native ABI parameter slots now become JavaScript `undefined` before default initialization instead of exposing uninitialized machine values.
+- Added DSL-owned `GetParameterBinding(value, initialized, name)` and frontend structural detection for self/later parameter references inside default initializers. Prior parameter references retain their initialized value; self/later reads raise a catchable DSL `ReferenceError`.
+- Added recursive AST containment support for identifying the active parameter initializer and a native witness that checks TDZ error identity, constructor, and name through ordinary source `catch`.
+- The complete `language/expressions/function` cohort is now **69 passed / 26 failed / 4 refused** (`results/test262-function-expressions-default-parameter-symbols-final-2026-08-27.jsonl`), versus 59/36/4 at the prior checkpoint. There are 15 failed-to-passed transitions. Five former passes now expose assertion failures after omitted arguments became deterministic `undefined`; those prior outcomes depended on uninitialized ABI slots and must not be preserved as semantics.
+- Known remaining issue: `dflt-params-ref-self` and `dflt-params-ref-later` throw the correct catchable `ReferenceError`, but Test262 runtime-negative host classification still reports a mismatch because initialization effects visible to source `catch` are not visible at the uncaught completion classifier. Attempts to classify via ErrorData and to add a memory operand directly to `JsThrow` were removed; the latter exposed an unhandled backend ABI invariant and caused SIGSEGVs. No experiment remains in the checkpoint.
+- Gate: `coil test` passes 52/52. Frontier: exactly the two expected open bugs remain, `for-await-has-no-bridge-kind` and `shortest-round-trip-digits`.
+
 ## 2026-08-27: descendant self captures and parameter environments stop corrupting graphs
 
 - Resolver capture classification now distinguishes a named expression's private function-ID

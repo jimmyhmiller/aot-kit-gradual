@@ -6318,6 +6318,36 @@
               false
               (let [fn (al-get [FeFunction] (.functions frontend) index)] (.strict fn)))))))
 
+(defn fng-parameter-tdz-reference? [(context FngContext) (node i64)] (-> bool)
+  (let [frontend (load (field context frontend))
+        ast (field frontend ast)
+        function-index (fng-function-index frontend (.owner context))
+        symbol (fe-resolution-symbol frontend node)
+        (mut found) false]
+    (if (>= function-index 0)
+        (let [fn (al-get [FeFunction] (.functions frontend) function-index)
+              (mut current) 0]
+          (loop (if (or (>= (load current) (.parameter-count fn)) (load found))
+                    (break)
+                    (let [parameter (fe-parameter-symbol frontend fn (load current))
+                          initializer (ts-role ast (.node parameter) TS-ROLE-INITIALIZER 0)]
+                      (if (and (!= initializer -1)
+                               (fe-node-contains? ast initializer node))
+                          (let [(mut later) (load current)]
+                            (loop (if (or (>= (load later) (.parameter-count fn)) (load found))
+                                      (break)
+                                      (do
+                                        (let [later-parameter
+                                                (fe-parameter-symbol frontend fn (load later))]
+                                          (if (= symbol (.id later-parameter))
+                                              (set! found true)
+                                              0))
+                                        (set! later (+ (load later) 1))))))
+                          0)
+                      (set! current (+ (load current) 1))))))
+        0)
+    (load found)))
+
 (defn fng-named-expression-symbol? [(frontend (ptr NativeFrontend)) (symbol i64)] (-> bool)
   (let [index (fng-function-index frontend symbol)]
     (if (< index 0)
@@ -6760,6 +6790,13 @@
                                           (jss-from-utf8! (ts-text ast node)))))
                     (< symbol 0) NO-NODE
                     :else
+                      (if (fng-parameter-tdz-reference? context node)
+                          (fng-jsl-call3 context
+                                         "GetParameterBinding"
+                                         (fng-symbol-node context symbol)
+                                         (fng-bool false)
+                                         (n-string-const!
+                                           (jss-from-utf8! (ts-text ast node))))
                       (let [stored (fng-symbol-node context symbol)
                             declaration
                               (fe-find-function-name-in-owner frontend node (.owner context))
@@ -6776,7 +6813,7 @@
                                               declaration)
                                       stored)
                                   stored)]
-                        value)))
+                        value))))
           (= kind TSK-THIS)
             ;; The synthetic entry function represents Script evaluation and has no receiver ABI
             ;; value. Materialize its `this` through the semantic library. Real functions and
@@ -7331,21 +7368,22 @@
               (set! (load (field context ctrl)) (arms-f arms))
               (let [incoming-ctrl (load (load (field context ctrl)))
                     incoming-start (fng-snapshot! context (mut symbols) (mut active) (mut snapshots))]
-                (if (fng-merge-snapshots! context
-                                          default-ctrl default-start
-                                          incoming-ctrl incoming-start
-                                          (mut symbols) (mut active) (mut snapshots))
-                    (cond (= default-ctrl NO-NODE) (store! answer incoming-value)
-                          (= incoming-ctrl NO-NODE) (store! answer default-value)
-                          :else
+                (if (= default-ctrl NO-NODE)
+                    (store! answer incoming-value)
+                    (if (fng-merge-snapshots! context
+                                              default-ctrl default-start
+                                              incoming-ctrl incoming-start
+                                              (mut symbols) (mut active) (mut snapshots))
+                        (if (= incoming-ctrl NO-NODE)
+                            (store! answer default-value)
                             (let [phi (n-new (Phi (if (= parameter-type FNG-NUMBER)
-                                                 (t-num)
-                                                 (t-dyn))))]
+                                                     (t-num)
+                                                     (t-dyn))))]
                               (n-add-def! phi (load (load (field context ctrl))))
                               (n-add-def! phi default-value)
                               (n-add-def! phi incoming-value)
                               (store! answer (fng-peep phi))))
-                    0))))
+                        0)))))
           (fng-set-symbol! context symbol-id (load answer))
           (al-free! [i64] (mut symbols))
           (al-free! [i64] (mut active))
@@ -9755,6 +9793,20 @@
                                 (fng-set-symbol! context symbol-id incoming)
                                 0)
                               0))
+                        (if (= (fng-parameter-type frontend fn (load index)) FNG-DYNAMIC)
+                            (let [parameter-symbol
+                                    (fe-parameter-symbol frontend fn (load index))
+                                  parameter-symbol-id (.id parameter-symbol)
+                                  incoming (fng-symbol-node context parameter-symbol-id)
+                                  normalized
+                                    (fng-jsl-call3 context
+                                                   "NormalizeParameterValue"
+                                                   incoming
+                                                   (load argc)
+                                                   (fng-const (load index)))]
+                              (fng-set-symbol! context parameter-symbol-id normalized)
+                              0)
+                            0)
                         (fng-default-parameter! context fn (load index))
                         (let [parameter-symbol (fe-parameter-symbol frontend fn (load index))
                               name (.name-node parameter-symbol)]
