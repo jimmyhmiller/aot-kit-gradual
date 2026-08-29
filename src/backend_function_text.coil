@@ -390,33 +390,42 @@
     (al-push! [i64] (field r reloc-target-result-count) 0)
     (al-push! [i64] (field r reloc-aux) aux)
     0))
-(defn mft-note-internal-reloc! [(kind i64) (offset i64) (target-owner i64)] (-> i64)
-  (mft-note-reloc-aux! kind offset (mu-function-symbol target-owner) 0)
+(defn mft-note-reloc-abi! [(index i64) (fun i64)] (-> i64)
+  (let [r (mft)]
+    (if (and (!= fun NO-NODE) (n-fun-abi-declared? fun))
+        (do (al-set! [i64] (field r reloc-target-abi-arity) index
+                     (n-fun-abi-param-count fun))
+            (al-set! [i64] (field r reloc-target-abi-hash) index (mft-abi-hash fun))
+            (let [count (n-fun-abi-result-count fun) (mut result) 0]
+              (al-set! [i64] (field r reloc-target-result-count) index count)
+              (loop (if (>= (load result) count) (break)
+                        (do
+                          (al-push! [i64] (field r reloc-target-result-kind)
+                                    (ml-kind-for-type
+                                      (n-fun-abi-result-type fun (load result))))
+                          (al-push! [i64] (field r reloc-target-result-class)
+                                    (if (= (ty-kinds
+                                             (n-fun-abi-result-type fun (load result))) VK-FLT)
+                                        MRC-FPR MRC-GPR))
+                          (set! result (+ (load result) 1)))))))
+        0))
+  0)
+
+(defn mft-note-ideal-fun-reloc! [(kind i64) (offset i64) (fun i64) (symbol i64)] (-> i64)
+  (mft-note-reloc-aux! kind offset symbol 0)
   (let [r (mft) index (- (al-len [i64] (.reloc-kind r)) 1)]
     (al-set! [i64] (field r reloc-target-kind) index
-             (mu-function-identity-kind target-owner))
+             (n-fun-identity-kind fun))
     (al-set! [i64] (field r reloc-target-unit) index
-             (mu-function-identity-unit target-owner))
+             (n-fun-identity-unit fun))
     (al-set! [i64] (field r reloc-target-local) index
-             (mu-function-identity-local target-owner))
-    (let [fun (mu-function-ideal target-owner)]
-      (if (and (!= fun NO-NODE) (n-fun-abi-declared? fun))
-          (do (al-set! [i64] (field r reloc-target-abi-arity) index
-                       (n-fun-abi-param-count fun))
-              (al-set! [i64] (field r reloc-target-abi-hash) index (mft-abi-hash fun))
-              (let [count (n-fun-abi-result-count fun) (mut result) 0]
-                (al-set! [i64] (field r reloc-target-result-count) index count)
-                (loop (if (>= (load result) count) (break)
-                          (do
-                            (al-push! [i64] (field r reloc-target-result-kind)
-                                      (ml-kind-for-type
-                                        (n-fun-abi-result-type fun (load result))))
-                            (al-push! [i64] (field r reloc-target-result-class)
-                                      (if (= (ty-kinds
-                                               (n-fun-abi-result-type fun (load result))) VK-FLT)
-                                          MRC-FPR MRC-GPR))
-                            (set! result (+ (load result) 1)))))))
-          0)))
+             (n-fun-identity-local fun))
+    (mft-note-reloc-abi! index fun))
+  0)
+
+(defn mft-note-internal-reloc! [(kind i64) (offset i64) (target-owner i64)] (-> i64)
+  (mft-note-ideal-fun-reloc! kind offset (mu-function-ideal target-owner)
+                             (mu-function-symbol target-owner))
   0)
 
 (defn mft-owner-for-ideal-fun [(fun i64)] (-> i64)
@@ -585,33 +594,33 @@
                         (do
                           (al-push! [u8] (field r bytes) (cast u8 (be-code-byte (+ start (load i)))))
                           (set! i (+ (load i) 1)))))
+              ;; This owner's bucket, not every relocation in the unit. See MobjPublicationIndex.
               (set! i 0)
-              (loop (if (>= (load i) (mu-internal-call-reloc-count))
+              (loop (if (>= (load i) (mobj-owner-reloc-count MOBJ-RELOC-CALL owner))
                         (break)
                         (do
-                          (if (= (mu-internal-call-reloc-source (load i)) owner)
-                              (mft-note-internal-reloc!
-                                MFT-RELOC-CALL
-                                (- (mu-internal-call-reloc-offset (load i)) start)
-                                (mu-internal-call-reloc-target (load i)))
-                              0)
+                          (let [r (mobj-owner-reloc MOBJ-RELOC-CALL owner (load i))]
+                            (mft-note-internal-reloc!
+                              MFT-RELOC-CALL
+                              (- (mu-internal-call-reloc-offset r) start)
+                              (mu-internal-call-reloc-target r)))
                           (set! i (+ (load i) 1)))))
               (set! i 0)
-              (loop (if (>= (load i) (mu-internal-address-reloc-count))
+              (loop (if (>= (load i) (mobj-owner-reloc-count MOBJ-RELOC-ADDRESS owner))
                         (break)
                         (do
-                          (if (= (mu-internal-address-reloc-source (load i)) owner)
-                              (mft-note-internal-reloc!
-                                MFT-RELOC-ADDRESS
-                                (- (mu-internal-address-reloc-offset (load i)) start)
-                                (mu-internal-address-reloc-target (load i)))
-                              0)
+                          (let [r (mobj-owner-reloc MOBJ-RELOC-ADDRESS owner (load i))]
+                            (mft-note-internal-reloc!
+                              MFT-RELOC-ADDRESS
+                              (- (mu-internal-address-reloc-offset r) start)
+                              (mu-internal-address-reloc-target r)))
                           (set! i (+ (load i) 1)))))
               (set! i 0)
-              (loop (if (>= (load i) (mobj-external-reloc-count))
+              (loop (if (>= (load i) (mobj-owner-reloc-count MOBJ-RELOC-EXTERNAL owner))
                         (break)
                         (do
-                          (let [at (mobj-external-reloc-inst (load i))
+                          (let [at (mobj-external-reloc-inst
+                                     (mobj-owner-reloc MOBJ-RELOC-EXTERNAL owner (load i)))
                                 op (ms-inst-op at)]
                             (if (= (ms-inst-owner at) owner)
                                 (let [site
@@ -629,11 +638,11 @@
                                       0))
                                 0))
                           (set! i (+ (load i) 1)))))
-              (set! i 0)
+              (set! i (mobj-owner-inst-first owner))
               ;; A Fun materialization is a callable symbol, not an integer constant. AArch64
               ;; reserves a fixed-width four-word move so image assembly can replace the
               ;; compilation-local symbol using the target's semantic function identity.
-              (loop (if (>= (load i) (be-inst-count))
+              (loop (if (>= (load i) (mobj-owner-inst-end owner))
                         (break)
                         (do
                           (let [at (load i) m (be-inst at)]
@@ -650,19 +659,27 @@
                                           (CallableId [index] (n-find-fun-index index))
                                           (_ NO-NODE))
                                       target-owner (mft-owner-for-ideal-fun target-fun)]
+                                  ;; Inlining may remove the callable's machine body while leaving
+                                  ;; a materialized Fun in its caller. Callable ids are linked by
+                                  ;; semantic function identity, so they remain relocatable without
+                                  ;; a current MachineUnit owner as long as the ideal ABI is known.
                                   (if (< target-owner 0)
-                                      0
+                                      (mft-note-ideal-fun-reloc!
+                                        MFT-RELOC-CALLABLE-ID
+                                        (- (.first m) start)
+                                        target-fun
+                                        (n-fun-index target-fun))
                                       (mft-note-internal-reloc!
                                         MFT-RELOC-CALLABLE-ID
                                         (- (.first m) start)
                                         target-owner)))
                                 0))
                           (set! i (+ (load i) 1)))))
-              (set! i 0)
+              (set! i (mobj-owner-inst-first owner))
               ;; Runtime MI-NEW is a fixed 39-word sequence. Retained text owns semantic
               ;; relocations for every embedded shape-dependent immediate; the original numeric
               ;; shape id is never a cache key.
-              (loop (if (>= (load i) (be-inst-count))
+              (loop (if (>= (load i) (mobj-owner-inst-end owner))
                         (break)
                         (do
                           (if (and (= (ms-inst-owner (load i)) owner)
@@ -681,8 +698,8 @@
                                   (- (+ inst-start 132) start) shape))
                               0)
                           (set! i (+ (load i) 1)))))
-              (set! i 0)
-              (loop (if (>= (load i) (be-inst-count))
+              (set! i (mobj-owner-inst-first owner))
+              (loop (if (>= (load i) (mobj-owner-inst-end owner))
                         (break)
                         (do
                           (if (and (= (ms-inst-owner (load i)) owner)
@@ -805,9 +822,18 @@
                     (al-push! [i64] (field s callee-counts) (.callee-count r))
                     (al-push! [i64] (field s byte-firsts) byte-first)
                     (al-push! [i64] (field s byte-counts) (al-len [u8] (.bytes r)))
+                    ;; `i` just walked the ABI result vector. Function text is an independent
+                    ;; payload and must always be copied from byte zero; otherwise a one-result
+                    ;; function loses its first instruction byte and every following record start
+                    ;; is displaced while still advertising the original byte count.
+                    (set! i 0)
                     (loop (if (>= (load i) (al-len [u8] (.bytes r))) (break)
                               (do (al-push! [u8] (field s bytes) (al-get [u8] (.bytes r) (load i)))
                                   (set! i (+ (load i) 1)))))
+                    (if (!= (al-len [u8] (.bytes s))
+                            (+ byte-first (al-len [u8] (.bytes r))))
+                        (return-from :snapshot false)
+                        0)
                     (al-push! [i64] (field s reloc-firsts) reloc-first)
                     (al-push! [i64] (field s reloc-counts) (al-len [i64] (.reloc-kind r)))
                     (set! i 0)
@@ -1845,6 +1871,40 @@
     (mfti-set-u32! (+ at 12) (a64-movk rd (& (>> value 48) 65535) 3))
     0))
 
+(defn mfti-fixed-mov-value [(at i64)] (-> i64)
+  (| (>> (& (mfti-u32 at) 2097120) 5)
+     (| (<< (>> (& (mfti-u32 (+ at 4)) 2097120) 5) 16)
+        (| (<< (>> (& (mfti-u32 (+ at 8)) 2097120) 5) 32)
+           (<< (>> (& (mfti-u32 (+ at 12)) 2097120) 5) 48)))))
+
+(defn mfti-callable-relocs-valid? [] (-> bool)
+  (block :done
+    (let [store (mfts) image (mfti) (mut owner) 0]
+      (loop (if (>= (load owner) (al-len [i64] (.owner-records image))) (break)
+                (let [current (al-get [i64] (.owner-records image) (load owner))
+                      first (al-get [i64] (.reloc-firsts store) current)
+                      count (al-get [i64] (.reloc-counts store) current)
+                      start (al-get [i64] (.starts image) current)
+                      (mut which) 0]
+                  (loop (if (>= (load which) count) (break)
+                            (let [reloc (+ first (load which))]
+                              (if (= (al-get [i64] (.reloc-kind store) reloc)
+                                     MFT-RELOC-CALLABLE-ID)
+                                  (let [target (mfti-find-record
+                                                 (al-get [i64] (.reloc-target-kind store) reloc)
+                                                 (al-get [i64] (.reloc-target-unit store) reloc)
+                                                 (al-get [i64] (.reloc-target-local store) reloc)
+                                                 (al-get [i64] (.reloc-target store) reloc))
+                                        site (+ start (al-get [i64] (.reloc-offset store) reloc))]
+                                    (if (or (< target 0)
+                                            (!= (mfti-fixed-mov-value site)
+                                                (mfti-linked-symbol target)))
+                                        (return-from :done false) 0))
+                                  0)
+                              (set! which (+ (load which) 1)))))
+                  (set! owner (+ (load owner) 1)))))
+      true)))
+
 (defn mfti-profile-record-hash [(record i64)] (-> i64)
   ;; Hash final linked bytes, after every semantic relocation has been applied. This makes a
   ;; cached/uncached profile comparison identify the first divergent separately compiled
@@ -2112,16 +2172,18 @@
                       (if (> (mu-function-symbol (load owner)) (load max-current))
                           (set! max-current (mu-function-symbol (load owner)))
                           0)
-                      (if (and (= (mu-function-identity-kind (load owner)) kind)
-                               (and (= (mu-function-identity-unit (load owner)) unit)
-                                    (= (mu-function-identity-local (load owner)) local)))
+                      (if (and (>= (mu-function-symbol (load owner)) 1)
+                               (and (= (mu-function-identity-kind (load owner)) kind)
+                                    (and (= (mu-function-identity-unit (load owner)) unit)
+                                         (= (mu-function-identity-local (load owner)) local))))
                           (set! answer (mu-function-symbol (load owner)))
                           0)
                       (set! owner (+ (load owner) 1)))))
-          ;; A retained-only identity has no graph-local symbol in this Script. Give it a unique
-          ;; image-local symbol above the complete current namespace. Every materialization in
-          ;; retained text is relocated through this same function, so the number need not escape
-          ;; the image and can never collide with a source callable.
+          ;; A retained-only identity, including an imported MachineUnit owner whose symbol is the
+          ;; non-callable sentinel zero, has no graph-local callable id in this Script. Give it a
+          ;; unique image-local symbol above the complete current namespace. Every materialization
+          ;; in retained text is relocated through this same function, so the number need not
+          ;; escape the image and can never collide with a source callable.
           (if (>= (load answer) 0) (load answer) (+ (+ (load max-current) 1) record))))))
 
 ;; Publish exactly the transitive semantic dependency closure of the current entry. The retained
@@ -2338,7 +2400,14 @@
                                   (mfti-function-callee-mask (load index)))
                 (mfti-bytes-u32! (field image stackmap)
                                   (mfti-function-callee-count (load index)))
-                (mfti-bytes-u32! (field image stackmap) 0)
+                ;; Stackmap v4 widened the signed dynamic-dispatch return code to i64 without
+                ;; changing the 40-byte function row: this slot is its high half.  Writing zero
+                ;; here turns every negative representation code (for example -4, "already
+                ;; boxed") into a positive JavaScript payload in retained direct-memory images.
+                (mfti-bytes-u32! (field image stackmap)
+                                  (>> (al-get [i64] (.dispatch-return-codes image)
+                                              (al-get [i64] (.owner-records image) (load index)))
+                                      32))
                 (mfti-bytes-u32! (field image stackmap)
                                   (let [symbol
                                           (al-get [i64] (.symbols image)

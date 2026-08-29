@@ -20,7 +20,7 @@
 ;; is a RAW object pointer at most call sites and the tag test needs the tagged form. Boxing a value
 ;; that is already tagged is the identity, and where the analysis has proven `v` is a number the
 ;; whole test folds away and this is `%ToString` again.
-(macro ToStringValue
+(macro ToStringValue :transitioning true
   :spec "ecma262@ed463bc10dbeaad0410ce67e541a77ea8e9900a5#sec-tostring"
   :spec-name "ToString"
   :status partial
@@ -38,7 +38,7 @@
 ;; The same conversion CONTINUING an array walk already in progress, so the cycle stack it is
 ;; already carrying is the one an inner array is checked against. `ArrayJoinSeen` is the only
 ;; caller; `ToStringValue` above is the entry that starts a fresh stack.
-(macro ToStringValueSeen :params [(v dyn) (seen dyn)] :ret str
+(macro ToStringValueSeen :transitioning true :params [(v dyn) (seen dyn)] :ret str
   (if (%IsArray (%Box v))
       (%UnboxString (ArrayToStringValue (%Box v) seen))
       (%ToString v)))
@@ -159,14 +159,14 @@
                         (ThrowTypeError "Cannot convert object to primitive value")))
                   (ThrowTypeError "Cannot convert object to primitive value")))))))
 
-(macro ToPrimitiveNumber :params [(v dyn)] :ret dyn
+(macro ToPrimitiveNumber :transitioning true :params [(v dyn)] :ret dyn
   ;; Primitive is both the overwhelmingly common path and the one static type information can
   ;; usually prove. Put it first so ordinary numeric/string arithmetic does not retain object-only
   ;; conversion calls in its graph.
   (ToPrimitive (%Box v) "number"))
 
 ;; https://tc39.es/ecma262/#sec-tonumber
-(macro ToNumberValue
+(macro ToNumberValue :transitioning true
   :spec "ecma262@ed463bc10dbeaad0410ce67e541a77ea8e9900a5#sec-tonumber"
   :spec-name "ToNumber"
   :status partial
@@ -193,23 +193,29 @@
 ;; https://tc39.es/ecma262/#sec-number-constructor and #sec-boolean-constructor. Wrapper state is
 ;; an internal slot, never an observable property. Kinds 100 and 101 are deliberately outside the
 ;; array-iterator kind range (0..2), while sharing the representation-owned InternalTarget seam.
-(macro NewNumberObject :params [(v dyn)] :ret dyn
+(macro NewNumberObject :transitioning true :params [(v dyn)] :ret dyn
   (let [(object (%Box (%NewObject)))
         (initialized (%InternalInit object (%Box (ToNumberValue v)) 100))
-        (prototype (SetObjectPrototype object (BuiltinPrototypeValue 19)))]
+        (prototype (InitializeObjectPrototype object (BuiltinPrototypeValue 19)))]
     object))
 
 (macro NewBooleanObject :params [(v dyn)] :ret dyn
   (let [(object (%Box (%NewObject)))
         (initialized (%InternalInit object (%Box (ToBoolean v)) 101))
-        (prototype (SetObjectPrototype object (BuiltinPrototypeValue 20)))]
+        (prototype (InitializeObjectPrototype object (BuiltinPrototypeValue 20)))]
     object))
 
-(macro NewStringObject :params [(v dyn)] :ret dyn
+(macro NewStringObject :transitioning true :params [(v dyn)] :ret dyn
   (let [(string (%Box (ToStringValue v)))
         (object (%Box (%NewObject)))
-        (initialized (%InternalInit object string 102))
-        (prototype (SetObjectPrototype object (BuiltinPrototypeValue 18)))
+        (layout (object-layout-init object StringExoticBase))
+        (extensible (internal-slot-store layout Extensible true))
+        (stringSlot (internal-slot-store extensible StringData string))
+        (family (object-method-family-set stringSlot StringExoticMethods))
+        ;; Compatibility mirror until all legacy `%Internal*` consumers are migrated to named
+        ;; generated slots. It is representation storage, not a second source of String semantics.
+        (initialized (%InternalInit family string 102))
+        (prototype (InitializeObjectPrototype family (BuiltinPrototypeValue 18)))
         ;; StringCreate installs `length` as a real own data property. Indexed code-unit
         ;; properties are supplied by the String exotic [[GetOwnProperty]] method instead.
         (lengthKey (ToPropertyKey "length"))
@@ -220,13 +226,13 @@
 (macro NewSymbolObject :params [(v dyn)] :ret dyn
   (let [(object (%Box (%NewObject)))
         (initialized (%InternalInit object (%Box v) 103))
-        (prototype (SetObjectPrototype object (BuiltinPrototypeValue 22)))]
+        (prototype (InitializeObjectPrototype object (BuiltinPrototypeValue 22)))]
     object))
 
 ;; https://tc39.es/ecma262/#sec-toobject. This is the single semantic boundary for converting an
 ;; arbitrary value to an Object: nullish values throw, represented primitives allocate the exact
 ;; wrapper family carrying its internal data slot, and existing Objects preserve identity.
-(macro ToObject
+(macro ToObject :transitioning true
   :spec "ecma262@ed463bc10dbeaad0410ce67e541a77ea8e9900a5#sec-toobject"
   :spec-name "ToObject"
   :status partial
@@ -245,7 +251,7 @@
 ;; https://tc39.es/ecma262/#sec-object-value. `Object(value)` differs from ToObject only for null
 ;; and undefined, which create a fresh ordinary Object instead of throwing. All other values must
 ;; pass through the canonical ToObject operation so wrapper allocation is implemented once.
-(macro ObjectFromValue :params [(v dyn)] :ret dyn
+(macro ObjectFromValue :transitioning true :params [(v dyn)] :ret dyn
   (let [(value (%Box v))]
     (if (%IsUndefined value)
         (InitializeOrdinaryObject (%Box (%NewObject)))
@@ -261,7 +267,7 @@
 ;; global asks whether ToNumber of the argument is NaN and Number.isNaN asks whether the argument
 ;; already IS the NaN value. Keep the coercion composition here rather than relying on the
 ;; representation primitive's historical partial coercions.
-(macro GlobalIsNaN :params [(v dyn)] :ret bool
+(macro GlobalIsNaN :transitioning true :params [(v dyn)] :ret bool
   (%IsNaN (%Box (ToNumberValue v))))
 
 ;; https://tc39.es/ecma262/#sec-string.fromcharcode, for the single-argument case the frontend emits.

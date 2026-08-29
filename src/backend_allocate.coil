@@ -227,9 +227,8 @@
 (defn mra-live-from-block-out! [(bid i64)] (-> i64)
   (let [u (machine-unit)
         owner (mu-block-owner bid)
-        base (al-get (.live-block-first u) bid)
         (mut pos) 0
-        (mut word) 0]
+        (mut chunk) (ml-set-first (ml-block-set ML-SET-OUT bid))]
     ;; Clear exactly the prior sparse members; unrelated vregs were already zero.
     (loop (if (>= (load pos) (al-len [i64] (.alloc-live-list u)))
               (break)
@@ -239,17 +238,19 @@
                   (al-set! [i64] (field u alloc-live-pos) vr -1))
                 (set! pos (+ (load pos) 1)))))
     (al-clear! [i64] (field u alloc-live-list))
-    (loop (if (>= (load word) (ml-block-words bid))
+    ;; The live-out set's own chunks, not one word per vreg in the function.
+    (loop (if (< (load chunk) 0)
               (break)
               (do
-                (let [bits (al-get (.live-out u) (+ base (load word)))]
+                (let [word (ml-chunk-word (load chunk))
+                      bits (ml-chunk-bits (load chunk))]
                   (if (!= bits 0)
                       (let [(mut bit) 0]
                         (loop (if (>= (load bit) 64)
                                   (break)
                                   (do
                                     (if (!= (& bits (<< 1 (load bit))) 0)
-                                        (let [local (+ (* (load word) 64) (load bit))]
+                                        (let [local (+ (* word 64) (load bit))]
                                           (if (< local
                                                  (al-get (.live-owner-count u) owner))
                                               (mra-live-add! (ml-owner-vreg owner local))
@@ -258,7 +259,7 @@
                                     (set! bit (+ (load bit) 1))
                                     0))))
                       0))
-                (set! word (+ (load word) 1))
+                (set! chunk (ml-chunk-next (load chunk)))
                 0)))
     0))
 
@@ -343,17 +344,17 @@
         (do (set! value (>> (load value) 2)) (set! index (+ (load index) 2))) 0)
     (if (= (& (load value) 1) 0) (+ (load index) 1) (load index))))
 
-(defn mra-note-block-live-set! [(bid i64) (bits (ArrayList i64)) (position i64)] (-> i64)
+(defn mra-note-block-live-set! [(bid i64) (set i64) (position i64)] (-> i64)
   (let [u (machine-unit)
         owner (mu-block-owner bid)
-        base (al-get (.live-block-first u) bid)
         locals (al-get (.live-owner-count u) owner)
-        (mut word) 0]
-    (loop (if (>= (load word) (ml-block-words bid)) (break)
-              (let [(mut word-bits) (al-get bits (+ base (load word)))]
+        (mut chunk) (ml-set-first set)]
+    (loop (if (< (load chunk) 0) (break)
+              (let [word (ml-chunk-word (load chunk))
+                    (mut word-bits) (ml-chunk-bits (load chunk))]
                 (loop (if (= (load word-bits) 0) (break)
                           (let [bit (mra-lowest-set-bit-index (load word-bits))
-                                local (+ (* (load word) 64) bit)]
+                                local (+ (* word 64) bit)]
                             (if (< local locals)
                                 (let [vreg (ml-owner-vreg owner local)
                                       start (al-get (.alloc-interval-start u) vreg)
@@ -366,7 +367,7 @@
                                                vreg position) 0))
                                 0)
                             (set! word-bits (& (load word-bits) (- (load word-bits) 1))))))
-                (set! word (+ (load word) 1)))))
+                (set! chunk (ml-chunk-next (load chunk))))))
     0))
 
 ;; Construct the conservative linear live-range product from the frozen instruction sequence.
@@ -401,8 +402,9 @@
       (loop (if (>= (load bid) (mu-block-count)) (break)
                 (let [first (mu-block-inst-first (load bid))
                       count (mu-block-inst-count (load bid))]
-                  (mra-note-block-live-set! (load bid) (.live-in u) first)
-                  (mra-note-block-live-set! (load bid) (.live-out u) (+ first count))
+                  (mra-note-block-live-set! (load bid) (ml-block-set ML-SET-IN (load bid)) first)
+                  (mra-note-block-live-set! (load bid) (ml-block-set ML-SET-OUT (load bid))
+                                            (+ first count))
                   (set! bid (+ (load bid) 1))))))
     (let [(mut vr) 0]
       (loop (if (>= (load vr) vregs)

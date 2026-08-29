@@ -12,7 +12,7 @@
 
 ;; The ordinary (non-Symbol.hasInstance) path accepts a runtime constructor object. Keeping the
 ;; prototype lookup here makes `instanceof` use the same [[Get]] seam as every other property read.
-(macro OrdinaryInstanceOf :params [(object dyn) (constructor dyn)] :ret bool
+(macro OrdinaryInstanceOf :transitioning true :params [(object dyn) (constructor dyn)] :ret bool
   (OrdinaryHasInstance object (GetProperty constructor "prototype")))
 
 ;; `instanceof` against the two globals this closed world has no value bindings for. Each is the
@@ -27,7 +27,7 @@
 ;; Built-in Error objects are allocated entirely by NewErrorObject and carry their constructor
 ;; identity as representation-visible state. The frontend uses this only for an unshadowed built-in
 ;; Error constructor; user constructors continue through OrdinaryInstanceOf and prototype chains.
-(macro InstanceOfErrorValue :params [(v dyn) (constructor dyn)] :ret bool
+(macro InstanceOfErrorValue :transitioning true :params [(v dyn) (constructor dyn)] :ret bool
   (StrictEqual (GetProperty v "constructor") constructor))
 
 ;; Test hosts inspect an abrupt Script completion without rewriting the Script itself. Test262's
@@ -39,14 +39,108 @@
   (StrictEqual (GetProperty (GetProperty thrown "constructor") "name")
                expectedName))
 
-(macro SetObjectPrototype :params [(object dyn) (proto dyn)] :ret dyn
-  (let [(ignored (%SetPrototype object proto))] object))
+(macro InitializeObjectPrototype :params [(object dyn) (proto dyn)] :ret dyn
+  (let [(slotted
+          (if (internal-slot-has object Prototype)
+              (internal-slot-store object Prototype proto)
+              object))
+        (ignored (%SetPrototype slotted proto))]
+    object))
+
+(macro OrdinaryGetPrototypeOf :params [(object dyn)] :ret dyn
+  (if (internal-slot-has object Prototype)
+      (internal-slot-load object Prototype)
+      (%GetPrototype object (%Box undefined))))
+
+(macro GetPrototypeOfInternal :params [(object dyn)] :ret dyn
+  (if (UsesOrdinaryGetPrototypeOf object)
+      (OrdinaryGetPrototypeOf object)
+      (%GetPrototype object (%Box undefined))))
+
+;; https://tc39.es/ecma262/#sec-ordinarysetprototypeof
+(builtin OrdinarySetPrototypeOf
+  :spec "ecma262@ed463bc10dbeaad0410ce67e541a77ea8e9900a5#sec-ordinarysetprototypeof"
+  :spec-name "OrdinarySetPrototypeOf"
+  :status complete
+  :transitioning true
+  :params [(object dyn) (proto dyn)] :ret bool
+  (let [(current (OrdinaryGetPrototypeOf object))]
+    (if (SameValue proto current)
+        true
+        (if (OrdinaryIsExtensible object)
+            (let [(valid
+                    (loop [(candidate proto)]
+                      (if (%IsNull candidate)
+                          true
+                          (if (SameValue candidate object)
+                              false
+                              ;; The specification stops cycle inspection at a non-ordinary
+                              ;; [[GetPrototypeOf]] method rather than invoking arbitrary exotic
+                              ;; behavior during this ordinary internal method.
+                              (if (UsesOrdinaryGetPrototypeOf candidate)
+                                  (recur (OrdinaryGetPrototypeOf candidate))
+                                  true)))))]
+              (if valid
+                  (let [(slotted
+                          (if (internal-slot-has object Prototype)
+                              (internal-slot-store object Prototype proto)
+                              object))
+                        (stored (%SetPrototype slotted proto))]
+                    true)
+                  false))
+            false))))
+
+(macro SetPrototypeOfInternal :transitioning true
+  :spec "ecma262@ed463bc10dbeaad0410ce67e541a77ea8e9900a5#sec-ordinary-object-internal-methods-and-internal-slots-setprototypeof-v"
+  :spec-name "[[SetPrototypeOf]] ( proto )"
+  :status partial
+  :deviation "Proxy and immutable-prototype exotic [[SetPrototypeOf]] methods are not yet implemented."
+  :params [(object dyn) (proto dyn)] :ret bool
+  (if (UsesOrdinarySetPrototypeOf object)
+      (OrdinarySetPrototypeOf object proto)
+      (ThrowTypeError "exotic [[SetPrototypeOf]] method is not implemented")))
+
+(macro IsObjectOrNull :params [(value dyn)] :ret bool
+  (if (%IsNull value)
+      true
+      (if (%IsObject value) true
+          (if (%IsArray value) true (%IsFunction value)))))
+
+;; https://tc39.es/ecma262/#sec-object.setprototypeof
+(builtin ObjectSetPrototypeOf :transitioning true
+  :spec "ecma262@ed463bc10dbeaad0410ce67e541a77ea8e9900a5#sec-object.setprototypeof"
+  :spec-name "Object.setPrototypeOf"
+  :status partial
+  :deviation "Proxy and immutable-prototype exotic [[SetPrototypeOf]] methods are not yet implemented."
+  :params [(value dyn) (proto dyn)] :ret dyn
+  (let [(coercible (RequireObjectCoercible value))]
+    (if (IsObjectOrNull proto)
+        (if (IsObjectOrNull value)
+            (if (SetPrototypeOfInternal value proto)
+                value
+                (ThrowTypeError "Object.setPrototypeOf failed"))
+            value)
+        (ThrowTypeError "Object prototype may only be an Object or null"))))
+
+(callable ObjectSetPrototypeOf2 :transitioning true
+  :params [(value dyn) (proto dyn)] :ret dyn
+  (ObjectSetPrototypeOf value proto))
+
+(macro ObjectSetPrototypeOfValue :transitioning true :params [] :ret dyn
+  (let [(function (%Box (closure ObjectSetPrototypeOf2)))
+        (lengthKey (ToPropertyKey "length"))
+        (nameKey (ToPropertyKey "name"))
+        (lengthStored (%DefinePropertyValue function lengthKey (%Box 2)))
+        (lengthMarked (%SetPropertyAttributes function lengthKey 4))
+        (nameStored (%DefinePropertyValue function nameKey (%Box "setPrototypeOf")))
+        (nameMarked (%SetPropertyAttributes function nameKey 4))]
+    function))
 
 ;; https://tc39.es/ecma262/#sec-object.getprototypeof. `%GetPrototype` exposes only the
 ;; representation slot; object validation and the JavaScript-visible null/object result live here.
 (macro ObjectGetPrototypeOf :params [(value dyn)] :ret dyn
   (let [(object (RequireObjectValue value "Object.getPrototypeOf called on non-object"))]
-    (%GetPrototype object (%Box undefined))))
+    (GetPrototypeOfInternal object)))
 
 (callable ObjectGetPrototypeOf1
   :transitioning true :params [(value dyn)] :ret dyn
@@ -63,7 +157,12 @@
     function))
 
 (macro InitializeOrdinaryObject :params [(object dyn)] :ret dyn
-  (let [(linked (SetObjectPrototype object (BuiltinPrototypeValue 16)))]
+  (let [(layout (object-layout-init object OrdinaryObjectBase))
+        (prototype (BuiltinPrototypeValue 16))
+        (extensibleSlot (internal-slot-store layout Extensible true))
+        ;; Property/prototype lookup still consumes the legacy prototype field until the generated
+        ;; internal-method protocol lands. Keep both stores in this named migration stage.
+        (linked (InitializeObjectPrototype extensibleSlot prototype))]
     object))
 
 (macro NewArgumentsObject :params [(length int)] :ret dyn
@@ -75,7 +174,7 @@
 ;; CreateMappedArgumentsObject supplies indexed values only for actual arguments. The frontend
 ;; contributes the native ABI ordinal/count structure; property creation and the observable value
 ;; remain ordinary JavaScript operations here.
-(macro InitializeArgumentsElement
+(macro InitializeArgumentsElement :transitioning true
   :params [(object dyn) (index int) (length int) (value dyn)] :ret dyn
   (if (%Lt index length)
       (let [(stored (SetProperty object (%Box index) value))] object)
@@ -88,7 +187,7 @@
 ;; runtime operation: code created by one Script can be called after another Script has introduced
 ;; a binding. The frontend supplies only the identifier name and never decides JavaScript-visible
 ;; absence or exception behavior.
-(macro GetGlobalBinding :params [(name dyn)] :ret dyn
+(macro GetGlobalBinding :transitioning true :params [(name dyn)] :ret dyn
   (if (HasProperty (GlobalDeclarativeEnvironmentValue) name)
       (GetProperty (GlobalDeclarativeEnvironmentValue) name)
       (if (HasProperty (GlobalObjectValue) name)
@@ -98,20 +197,20 @@
 ;; `typeof IdentifierReference` uses ResolveBinding but suppresses ReferenceError only when that
 ;; resolution is unresolvable. Keep the presence decision beside GetGlobalBinding so the frontend
 ;; does not duplicate the Realm environment semantics.
-(macro TypeOfGlobalBinding :params [(name dyn)] :ret str
+(macro TypeOfGlobalBinding :transitioning true :params [(name dyn)] :ret str
   (if (HasProperty (GlobalDeclarativeEnvironmentValue) name)
       (TypeOfValue (%Box (GetProperty (GlobalDeclarativeEnvironmentValue) name)))
       (if (HasProperty (GlobalObjectValue) name)
           (TypeOfValue (%Box (GetProperty (GlobalObjectValue) name)))
           "undefined")))
 
-(macro SetGlobalDeclarativeBinding :params [(name dyn) (value dyn)] :ret dyn
+(macro SetGlobalDeclarativeBinding :transitioning true :params [(name dyn) (value dyn)] :ret dyn
   (SetProperty (GlobalDeclarativeEnvironmentValue) name value))
 
 ;; PutValue for an unresolvable Reference. Strict code throws; sloppy code creates or updates the
 ;; named property on the Realm global object. The frontend supplies syntax-derived strictness and
 ;; never decides the JavaScript-visible branch itself.
-(macro SetUnresolvableBinding :params [(name dyn) (value dyn) (strict bool)] :ret dyn
+(macro SetUnresolvableBinding :transitioning true :params [(name dyn) (value dyn) (strict bool)] :ret dyn
   (if strict
       (ThrowReferenceError (%StringConcat name " is not defined"))
       (SetProperty (GlobalObjectValue) name value)))
@@ -125,7 +224,7 @@
       (ThrowTypeError "Assignment to constant variable")
       value))
 
-(macro GetElement :params [(array dyn) (index int)] :ret dyn
+(macro GetElement :transitioning true :params [(array dyn) (index int)] :ret dyn
   (GetProperty array (%Box index)))
 
 (macro SetElement :params [(array dyn) (index int) (value dyn)] :ret dyn
@@ -139,7 +238,7 @@
 ;; length slot after those writes succeed. The current machine index range is narrower than
 ;; ECMAScript's full 32-bit Array-index range, and TypedArrayIndex is the shared canonical
 ;; nonnegative decimal-key parser for that supported range.
-(macro MaintainArrayIndexLengthAfterDefine
+(macro MaintainArrayIndexLengthAfterDefine :transitioning true
   :params [(object dyn) (propertyKey dyn) (dependency dyn)] :ret dyn
   (if (%IsArray (%Box object))
       (let [(index (TypedArrayIndex propertyKey))]
@@ -154,7 +253,7 @@
 
 ;; https://tc39.es/ecma262/#sec-topropertykey. Symbols preserve identity; every other key
 ;; canonicalizes through ToString into the content-based runtime string-key space.
-(macro ToPropertyKey
+(macro ToPropertyKey :transitioning true
   :spec "ecma262@ed463bc10dbeaad0410ce67e541a77ea8e9900a5#sec-topropertykey"
   :spec-name "ToPropertyKey"
   :status partial
@@ -168,7 +267,7 @@
 (callable ObjectPropertyIsEnumerable1 :transitioning true :params [(key dyn)] :ret dyn
   (%Box (PropertyIsEnumerable this key)))
 
-(macro OrdinaryGetPropertyWithReceiver :transitioning true
+(builtin OrdinaryGetPropertyWithReceiver :transitioning true
   :params [(object dyn) (propertyKey dyn) (receiver dyn)] :ret dyn
   (let [(attributes (%PropertyAttributes object propertyKey))]
     ;; `-1` means no property was found. Its low bits are all set, so testing the accessor bit
@@ -212,7 +311,7 @@
                   (Call getter receiver)
                   (%Box undefined)))))))
 
-(macro CanonicalNumericIndexString
+(macro CanonicalNumericIndexString :transitioning true
   :spec "ecma262@ed463bc10dbeaad0410ce67e541a77ea8e9900a5#sec-canonicalnumericindexstring"
   :spec-name "CanonicalNumericIndexString"
   :status partial
@@ -245,7 +344,10 @@
               (TypedArrayIndex propertyKey)))]
     (if (%Lt index 0)
         (NoPropertyDescriptor)
-        (let [(string (%InternalTarget object))
+        (let [(string
+                (if (object-method-family-is object StringExoticMethods)
+                    (internal-slot-load object StringData)
+                    (%InternalTarget object)))
               (length (StringLength string))]
           (if (%Le length index)
               (NoPropertyDescriptor)
@@ -262,13 +364,20 @@
   (let [(ordinary (OrdinaryGetOwnProperty object propertyKey))]
     (if (PropertyDescriptorPresent ordinary)
         ordinary
-        (if (HasInternalSlot object (InternalSlotStringData))
-            (StringGetOwnProperty object propertyKey)
-            (NoPropertyDescriptor)))))
+        (if (UsesOrdinaryGetOwnProperty object)
+            (NoPropertyDescriptor)
+            (if (object-method-family-is object StringExoticMethods)
+                (StringGetOwnProperty object propertyKey)
+                (if (HasInternalSlot object (InternalSlotStringData))
+                    (StringGetOwnProperty object propertyKey)
+                    ;; Mapped arguments and Proxy remain on their compatibility path until their
+                    ;; declared overrides are implemented; the generated matrix keeps that debt
+                    ;; distinct from ordinary inheritance.
+                    (NoPropertyDescriptor)))))))
 
 (macro GetPropertyWithReceiver :transitioning true
   :params [(object dyn) (propertyKey dyn) (receiver dyn)] :ret dyn
-    (if (HasInternalSlot object (InternalSlotStringData))
+    (if (object-method-family-is object StringExoticMethods)
         (let [(descriptor (StringGetOwnProperty object propertyKey))]
           (if (%Not (PropertyDescriptorPresent descriptor))
               (OrdinaryGetPropertyWithReceiver object propertyKey receiver)
@@ -288,7 +397,11 @@
           (if (%Lt index 0)
               (OrdinaryGetPropertyWithReceiver object propertyKey receiver)
               (TypedArrayGet object index)))
-        (OrdinaryGetPropertyWithReceiver object propertyKey receiver)))))
+        (if (UsesOrdinaryGet object)
+            (OrdinaryGetPropertyWithReceiver object propertyKey receiver)
+            ;; Generated mapped-arguments and Proxy layouts must not silently execute the
+            ;; ordinary method after their matrix row says [[Get]] is overridden.
+            (ThrowTypeError "exotic [[Get]] method is not implemented"))))))
 
 (macro GetProperty :transitioning true
   :spec "ecma262@ed463bc10dbeaad0410ce67e541a77ea8e9900a5#sec-get-o-p"
@@ -360,27 +473,30 @@
   :deviation "Specialized to represented ordinary and TypedArray receivers; the throw flag and false [[Set]] result are not yet surfaced."
   :transitioning true :params [(object dyn) (key dyn) (value dyn)] :ret dyn
   (let [(propertyKey (ToPropertyKey key))]
-    (if (IsTypedArray object)
-        (let [(index (TypedArrayIndex propertyKey))]
-          (if (%Lt index 0)
-              (OrdinarySetProperty object propertyKey value)
-              (TypedArraySet object index value)))
-        (OrdinarySetProperty object propertyKey value))))
+    (if (UsesOrdinarySet object)
+        (if (IsTypedArray object)
+            (let [(index (TypedArrayIndex propertyKey))]
+              (if (%Lt index 0)
+                  (OrdinarySetProperty object propertyKey value)
+                  (TypedArraySet object index value)))
+            (OrdinarySetProperty object propertyKey value))
+        (ThrowTypeError "exotic [[Set]] method is not implemented"))))
 
 ;; https://tc39.es/ecma262/#sec-define-field. Public instance fields define an own data property;
 ;; they do not invoke an inherited setter, so constructor lowering must not use SetProperty.
-(macro DefineField :params [(object dyn) (key dyn) (value dyn)] :ret dyn
+(macro DefineField :transitioning true :params [(object dyn) (key dyn) (value dyn)] :ret dyn
   (let [(propertyKey (ToPropertyKey key))
         (defined (%DefinePropertyValue object propertyKey value))]
     value))
 
-(macro HasProperty
+(builtin HasProperty :transitioning true
   :spec "ecma262@ed463bc10dbeaad0410ce67e541a77ea8e9900a5#sec-hasproperty"
   :spec-name "HasProperty"
   :status partial
   :deviation "Proxy [[HasProperty]] traps and exotic receiver families beyond represented ordinary Objects, Arrays, and fixed TypedArrays are not yet implemented."
   :params [(object dyn) (key dyn)] :ret bool
   (let [(propertyKey (ToPropertyKey key))]
+    (if (UsesOrdinaryHasProperty object)
     (loop [(current object)]
       (let [(hasOwn
               (if (%IsArray (%Box current))
@@ -398,15 +514,18 @@
         (if hasOwn
             true
             (let [(parent (%GetPrototype current (%Box null)))]
-              (if (%IsNull parent) false (recur parent))))))))
+              (if (%IsNull parent) false (recur parent))))))
+    (ThrowTypeError "exotic [[HasProperty]] method is not implemented"))))
 
-(macro DeleteProperty :params [(object dyn) (key dyn)] :ret bool
+(macro DeleteProperty :transitioning true :params [(object dyn) (key dyn)] :ret bool
   (let [(propertyKey (ToPropertyKey key))]
-    (if (%IsArray (%Box object))
-        (if (StringEquals propertyKey "length")
-            (ThrowTypeError "Cannot delete property 'length' of Array")
+    (if (UsesOrdinaryDelete object)
+        (if (%IsArray (%Box object))
+            (if (StringEquals propertyKey "length")
+                (ThrowTypeError "Cannot delete property 'length' of Array")
+                (let [(ignored (%PropDeleteKey object propertyKey))] true))
             (let [(ignored (%PropDeleteKey object propertyKey))] true))
-        (let [(ignored (%PropDeleteKey object propertyKey))] true))))
+        (ThrowTypeError "exotic [[Delete]] method is not implemented"))))
 
 ;; Object-literal accessor definitions share Object.defineProperty's descriptor storage. A later
 ;; getter or setter for the same key preserves its opposite half; replacing a data property starts
@@ -460,7 +579,9 @@
   :spec-name "OrdinaryIsExtensible"
   :status complete
   :params [(object dyn)] :ret bool
-  (%Lt 0 (%ObjectIsExtensible object 0)))
+  (if (internal-slot-has object Extensible)
+      (internal-slot-load object Extensible)
+      (%Lt 0 (%ObjectIsExtensible object 0))))
 
 (macro IsExtensible
   :spec "ecma262@ed463bc10dbeaad0410ce67e541a77ea8e9900a5#sec-isextensible-o"
@@ -468,7 +589,9 @@
   :status partial
   :deviation "Proxy exotic [[IsExtensible]] dispatch and revoked-Proxy abrupt completion are not implemented; every represented non-Proxy Object delegates to the canonical ordinary internal method."
   :params [(object dyn)] :ret bool
-  (OrdinaryIsExtensible object))
+  (if (UsesOrdinaryIsExtensible object)
+      (OrdinaryIsExtensible object)
+      (%Lt 0 (%ObjectIsExtensible object 0))))
 
 (macro ObjectIsExtensible
   :spec "ecma262@ed463bc10dbeaad0410ce67e541a77ea8e9900a5#sec-object.isextensible"
@@ -490,7 +613,18 @@
   :status complete
   :transitioning true
   :params [(object dyn)] :ret bool
-  (let [(ignored (%ObjectPreventExtensions object 0 (%Box undefined)))] true))
+  (let [(layoutUpdated
+          (if (internal-slot-has object Extensible)
+              (internal-slot-store object Extensible false)
+              object))
+        (legacyUpdated (%ObjectPreventExtensions layoutUpdated 0 (%Box undefined)))]
+    true))
+
+(macro PreventExtensionsInternal :transitioning true
+  :params [(object dyn)] :ret bool
+  (if (UsesOrdinaryPreventExtensions object)
+      (OrdinaryPreventExtensions object)
+      (let [(ignored (%ObjectPreventExtensions object 0 (%Box undefined)))] true)))
 
 (macro ObjectPreventExtensions
   :spec "ecma262@ed463bc10dbeaad0410ce67e541a77ea8e9900a5#sec-object.preventextensions"
@@ -500,11 +634,11 @@
   :transitioning true
   :params [(value dyn)] :ret dyn
   (if (%IsObject value)
-      (let [(ignored (OrdinaryPreventExtensions value))] value)
+      (let [(ignored (PreventExtensionsInternal value))] value)
       (if (%IsArray value)
-          (let [(ignored (OrdinaryPreventExtensions value))] value)
+          (let [(ignored (PreventExtensionsInternal value))] value)
           (if (%IsFunction value)
-              (let [(ignored (OrdinaryPreventExtensions value))] value)
+              (let [(ignored (PreventExtensionsInternal value))] value)
               value))))
 
 (macro OrdinaryGetOwnProperty
@@ -538,7 +672,7 @@
               (completed (CompletePropertyDescriptor kind))]
           (SomePropertyDescriptor completed)))))
 
-(macro ApplyPropertyDescriptorRecord
+(builtin ApplyPropertyDescriptorRecord
   :transitioning true
   :params [(object dyn) (propertyKey dyn)
            (propertyDesc (record PropertyDescriptor))
@@ -701,9 +835,15 @@
   :transitioning true
   :params [(object dyn) (propertyKey dyn)
            (propertyDesc (record PropertyDescriptor))] :ret bool
-  (if (HasInternalSlot object (InternalSlotStringData))
-      (StringDefineOwnProperty object propertyKey propertyDesc)
-      (OrdinaryDefineOwnProperty object propertyKey propertyDesc)))
+  (if (UsesOrdinaryDefineOwnProperty object)
+      (OrdinaryDefineOwnProperty object propertyKey propertyDesc)
+      (if (object-method-family-is object StringExoticMethods)
+          (StringDefineOwnProperty object propertyKey propertyDesc)
+          (if (HasInternalSlot object (InternalSlotStringData))
+              (StringDefineOwnProperty object propertyKey propertyDesc)
+              ;; Array, mapped arguments, and Proxy overrides are explicit manifest debt. Keep
+              ;; their current representation behavior until each JSL method lands.
+              (OrdinaryDefineOwnProperty object propertyKey propertyDesc)))))
 
 (macro DefinePropertyOrThrow
   :spec "ecma262@ed463bc10dbeaad0410ce67e541a77ea8e9900a5#sec-definepropertyorthrow"
@@ -795,11 +935,11 @@
         (nameMarked (%SetPropertyAttributes function nameKey 4))]
     function))
 
-(macro HasOwnProperty :params [(object dyn) (key dyn)] :ret bool
+(macro HasOwnProperty :transitioning true :params [(object dyn) (key dyn)] :ret bool
   (PropertyDescriptorPresent
     (GetOwnPropertyDescriptorRecord object (ToPropertyKey key))))
 
-(macro PropertyIsEnumerable :params [(object dyn) (key dyn)] :ret bool
+(macro PropertyIsEnumerable :transitioning true :params [(object dyn) (key dyn)] :ret bool
   (let [(descriptor (GetOwnPropertyDescriptorRecord object (ToPropertyKey key)))]
     (if (%Not (PropertyDescriptorPresent descriptor))
         false
@@ -809,7 +949,8 @@
   :transitioning true :params [(object dyn) (descriptors dyn)] :ret dyn
   (let [(target (RequireObjectValue object "Object.defineProperties called on non-object"))
         (source (RequireObjectValue descriptors "Property descriptions must be an object"))
-        (count (%OwnKeyCount source))
+        (ownKeys (OwnPropertyKeys source))
+        (count (%ArrayLen ownKeys))
         (keys (%NewArray))
         (values (record-list-new PropertyDescriptor))
         ;; ToPropertyDescriptor is completed for every enumerable source property before the first
@@ -818,7 +959,7 @@
           (loop [(index 0) (at 0)]
             (if (%Le count index)
                 at
-                (let [(key (%OwnKeyAt source index))
+                (let [(key (%ArrayLoad ownKeys index))
                       (attributes (%OwnPropertyAttributes source key))]
                   (if (%Eq (%BitAnd attributes 2) 0)
                       (recur (%Add index 1) at)
@@ -837,7 +978,7 @@
 (builtin ObjectCreate :transitioning true :params [(prototype dyn)] :ret dyn
   (if (%IsNull prototype)
       (let [(object (%Box (%NewObject)))
-            (linked (SetObjectPrototype object prototype))]
+            (linked (InitializeObjectPrototype object prototype))]
         object)
       ;; ECMAScript Object values include every exotic and callable object, not only the runtime's
       ;; ordinary-object tag. In particular, Object.create([]) is valid and must retain the Array
@@ -845,6 +986,6 @@
       (if (if (%IsObject prototype) true
               (if (%IsArray prototype) true (%IsFunction prototype)))
           (let [(object (%Box (%NewObject)))
-                (linked (SetObjectPrototype object prototype))]
+                (linked (InitializeObjectPrototype object prototype))]
             object)
           (ThrowTypeError "Object prototype may only be an Object or null"))))

@@ -43,6 +43,29 @@
 (defstruct MobjPublicationIndex
   [(external-mask i64)
    (external-inst (ArrayList i64))
+   ;; RELOCATIONS BUCKETED BY OWNING FUNCTION, as three CSR tables.
+   ;;
+   ;; Extracting one function's text used to walk EVERY internal call relocation, EVERY internal
+   ;; address relocation and EVERY external relocation in the unit, asking each whether it belonged
+   ;; to this owner. The snapshot then did that once per function, so the retained-image path was
+   ;; O(functions x relocations) -- about a fifth of a 14.7 second per-request phase.
+   ;;
+   ;; Counting sort keyed on the owner, built once alongside the instruction index. Entries stay in
+   ;; ascending relocation-id order inside a bucket, which is the order the extraction emitted them
+   ;; in before and therefore the order the record's payload still has.
+   ;; One kind-major table rather than three parallel triples: a Coil `(mut …)` place cannot be
+   ;; returned from a function, so selecting a table per relocation kind would mean repeating every
+   ;; mutation three times. `kind * functions + owner` indexes the bucket instead.
+   (reloc-first (ArrayList i64))
+   (reloc-count (ArrayList i64))
+   (reloc-entry (ArrayList i64))
+   ;; The instruction id range one function occupies, as [first, end). Extracting a function's text
+   ;; asked FOUR separate questions of every instruction in the unit -- is this MOVI mine, is this
+   ;; safepoint mine -- so a snapshot of n functions read the instruction array 4n times. Selection
+   ;; emits function by function, so a min/max per owner is the exact range; scanning it and still
+   ;; testing the owner stays correct even if that ever stops being contiguous.
+   (owner-inst-first (ArrayList i64))
+   (owner-inst-end (ArrayList i64))
    (inited bool)])
 
 (defn mobj-index [] (-> (ptr MobjPublicationIndex))
@@ -51,12 +74,145 @@
         0
         (do
           (set! (.external-inst p) (al-new [i64] (malloc-allocator)))
+          (set! (.reloc-first p) (al-new [i64] (malloc-allocator)))
+          (set! (.reloc-count p) (al-new [i64] (malloc-allocator)))
+          (set! (.reloc-entry p) (al-new [i64] (malloc-allocator)))
+          (set! (.owner-inst-first p) (al-new [i64] (malloc-allocator)))
+          (set! (.owner-inst-end p) (al-new [i64] (malloc-allocator)))
           (set! (.inited p) true)
           0))
     p))
 
 (defn mobj-index-jsarray-bit [(operation i64)] (-> i64)
   (if (and (>= operation 1) (<= operation 3)) (<< 1 (+ 51 operation)) 0))
+
+;; RELOC-BUCKET-KIND selects which relocation table a bucket build or query is about. The three
+;; tables are shaped identically -- a count and a per-entry owning function -- so one builder and
+;; one pair of accessors serve all three rather than three copies of a counting sort.
+(const MOBJ-RELOC-CALL i64 0)
+(const MOBJ-RELOC-ADDRESS i64 1)
+(const MOBJ-RELOC-EXTERNAL i64 2)
+
+(defn mobj-reloc-kind-count [(kind i64)] (-> i64)
+  (case kind
+        MOBJ-RELOC-CALL (mu-internal-call-reloc-count)
+        MOBJ-RELOC-ADDRESS (mu-internal-address-reloc-count)
+        (mobj-external-reloc-count)))
+
+(defn mobj-reloc-kind-owner [(kind i64) (i i64)] (-> i64)
+  (case kind
+        MOBJ-RELOC-CALL (mu-internal-call-reloc-source i)
+        MOBJ-RELOC-ADDRESS (mu-internal-address-reloc-source i)
+        (ms-inst-owner (mobj-external-reloc-inst i))))
+
+(defn mobj-reloc-slot [(kind i64) (owner i64)] (-> i64)
+  (+ (* kind (mu-function-count)) owner))
+
+;; Counting sort on the owner, for all three relocation kinds at once. Two passes over the
+;; relocations plus one over the functions; the fill pass walks ids ascending and appends, so a
+;; bucket ends up in ascending relocation-id order -- the order extraction emitted them in before,
+;; and therefore the order a record's payload still has.
+(defn mobj-build-reloc-buckets! [] (-> i64)
+  (let [p (mobj-index)
+        functions (mu-function-count)
+        slots (* 3 functions)
+        (mut kind) 0
+        (mut i) 0
+        (mut cursor) 0]
+    (al-clear! [i64] (field p reloc-first))
+    (al-clear! [i64] (field p reloc-count))
+    (al-clear! [i64] (field p reloc-entry))
+    (loop (if (>= (load i) slots) (break)
+              (do (al-push! [i64] (field p reloc-first) 0)
+                  (al-push! [i64] (field p reloc-count) 0)
+                  (set! i (+ (load i) 1)))))
+    (loop (if (>= (load kind) 3) (break)
+              (do
+                (set! i 0)
+                (loop (if (>= (load i) (mobj-reloc-kind-count (load kind))) (break)
+                          (do
+                            (let [owner (mobj-reloc-kind-owner (load kind) (load i))]
+                              (if (and (>= owner 0) (< owner functions))
+                                  (let [slot (mobj-reloc-slot (load kind) owner)]
+                                    (al-set! [i64] (field p reloc-count) slot
+                                             (+ (al-get [i64] (.reloc-count p) slot) 1)))
+                                  0))
+                            (set! i (+ (load i) 1)))))
+                (set! kind (+ (load kind) 1)))))
+    (set! i 0)
+    (loop (if (>= (load i) slots) (break)
+              (do (al-set! [i64] (field p reloc-first) (load i) (load cursor))
+                  (set! cursor (+ (load cursor) (al-get [i64] (.reloc-count p) (load i))))
+                  (set! i (+ (load i) 1)))))
+    (set! i 0)
+    (loop (if (>= (load i) (load cursor)) (break)
+              (do (al-push! [i64] (field p reloc-entry) -1) (set! i (+ (load i) 1)))))
+    ;; Reuse the counts as fill cursors, then restore them from the boundaries below.
+    (set! i 0)
+    (loop (if (>= (load i) slots) (break)
+              (do (al-set! [i64] (field p reloc-count) (load i) 0) (set! i (+ (load i) 1)))))
+    (set! kind 0)
+    (loop (if (>= (load kind) 3) (break)
+              (do
+                (set! i 0)
+                (loop (if (>= (load i) (mobj-reloc-kind-count (load kind))) (break)
+                          (do
+                            (let [owner (mobj-reloc-kind-owner (load kind) (load i))]
+                              (if (and (>= owner 0) (< owner functions))
+                                  (let [slot (mobj-reloc-slot (load kind) owner)
+                                        fill (al-get [i64] (.reloc-count p) slot)]
+                                    (al-set! [i64] (field p reloc-entry)
+                                             (+ (al-get [i64] (.reloc-first p) slot) fill) (load i))
+                                    (al-set! [i64] (field p reloc-count) slot (+ fill 1)))
+                                  0))
+                            (set! i (+ (load i) 1)))))
+                (set! kind (+ (load kind) 1)))))
+    0))
+
+(defn mobj-build-owner-inst-ranges! [] (-> i64)
+  (let [p (mobj-index)
+        functions (mu-function-count)
+        insts (be-inst-count)
+        (mut i) 0]
+    (al-clear! [i64] (field p owner-inst-first))
+    (al-clear! [i64] (field p owner-inst-end))
+    (loop (if (>= (load i) functions) (break)
+              (do (al-push! [i64] (field p owner-inst-first) insts)
+                  (al-push! [i64] (field p owner-inst-end) 0)
+                  (set! i (+ (load i) 1)))))
+    (set! i 0)
+    (loop (if (>= (load i) insts) (break)
+              (do
+                (let [owner (ms-inst-owner (load i))]
+                  (if (and (>= owner 0) (< owner functions))
+                      (do
+                        (if (< (load i) (al-get [i64] (.owner-inst-first p) owner))
+                            (al-set! [i64] (field p owner-inst-first) owner (load i)) 0)
+                        (if (>= (load i) (al-get [i64] (.owner-inst-end p) owner))
+                            (al-set! [i64] (field p owner-inst-end) owner (+ (load i) 1)) 0))
+                      0))
+                (set! i (+ (load i) 1)))))
+    0))
+
+(defn mobj-owner-inst-first [(owner i64)] (-> i64)
+  (let [p (mobj-index)]
+    (if (or (< owner 0) (>= owner (al-len [i64] (.owner-inst-first p)))) 0
+        (al-get [i64] (.owner-inst-first p) owner))))
+
+(defn mobj-owner-inst-end [(owner i64)] (-> i64)
+  (let [p (mobj-index)]
+    (if (or (< owner 0) (>= owner (al-len [i64] (.owner-inst-end p)))) (be-inst-count)
+        (al-get [i64] (.owner-inst-end p) owner))))
+
+(defn mobj-owner-reloc-count [(kind i64) (owner i64)] (-> i64)
+  (let [p (mobj-index) slot (mobj-reloc-slot kind owner)]
+    (if (or (< owner 0) (>= slot (al-len [i64] (.reloc-count p)))) 0
+        (al-get [i64] (.reloc-count p) slot))))
+
+(defn mobj-owner-reloc [(kind i64) (owner i64) (which i64)] (-> i64)
+  (let [p (mobj-index) slot (mobj-reloc-slot kind owner)]
+    (al-get [i64] (.reloc-entry p)
+            (+ (al-get [i64] (.reloc-first p) slot) which))))
 
 (defn mobj-build-index! [] (-> i64)
   (let [p (mobj-index)
@@ -86,6 +242,8 @@
                 (set! at (+ (load at) 1))
                 0)))
     (set! (.external-mask p) (load mask))
+    (mobj-build-reloc-buckets!)
+    (mobj-build-owner-inst-ranges!)
     0))
 
 (defn obj-u8! [(v i64)] (-> i64)
@@ -284,6 +442,8 @@
                 bundle (mu-call-bundle (mu-inst-call-bundle at))
                 result-area (if (be-poly-call? m) 0 (.result-area-size bundle))
                 area (+ base-area result-area)
+                result-setup
+                  (be-call-result-setup-words (.owner m) area result-area)
                 common
                   (+ argc
                      (+ (be-call-spill-load-words m area)
@@ -300,7 +460,8 @@
                                   (+ (be-mov-words JSV-FUNCTION)
                                      (+ (be-mov-words JSV-PAYLOAD-MASK)
                                         (be-poly-call-dispatch-words m)))))))
-                      (+ 2 common))]
+                      (+ (be-sp-adjust-words area)
+                         (+ result-setup (+ common 1))))]
             ;; setup includes the call instruction itself; stack maps name its return PC.
             (+ here (* 4 setup)))
             -1))))
@@ -327,6 +488,15 @@
    (tmp-count (ArrayList i64))
    (tmp-vreg (ArrayList i64))
    (flags (ArrayList i64))    ; packed per-vreg live flags during the block walk
+   ;; SUMMARY OF `flags`: one bit per flags WORD, set exactly when that word is non-zero. Every
+   ;; safepoint publishes its roots by reading the live set, and reading it meant scanning one bit
+   ;; per vreg in the whole unit -- 9,455 words for the DataView Test262 file, at every one of
+   ;; thousands of safepoints. Under 2% of those words are ever non-zero. The summary makes the
+   ;; scan proportional to the live set instead of to the program: `words/64` summary reads plus
+   ;; one read per word that actually holds a live value. Kept EXACT rather than conservative --
+   ;; a word that reaches zero clears its summary bit -- because a summary that only ever gains
+   ;; bits degrades back to the full scan over the course of a function.
+   (flag-summary (ArrayList i64))
    (touched (ArrayList i64))  ; vregs whose flag may need clearing before the next block
    ;; Final instruction position -> non-empty block beginning there. This orders block-local root
    ;; streams without sorting the global `(site,vreg)` product afterward.
@@ -345,11 +515,35 @@
           (set! (.tmp-count c) (al-new [i64] (malloc-allocator)))
           (set! (.tmp-vreg c) (al-new [i64] (malloc-allocator)))
           (set! (.flags c) (al-new [i64] (malloc-allocator)))
+          (set! (.flag-summary c) (al-new [i64] (malloc-allocator)))
           (set! (.touched c) (al-new [i64] (malloc-allocator)))
           (set! (.block-at-inst c) (al-new [i64] (malloc-allocator)))
           (set! (.inited c) true)
           0))
     c))
+
+;; The summary is grown alongside `flags` and indexed the same way, one level up.
+(defn mobj-summary-set! [(word i64)] (-> i64)
+  (let [c (mobj-roots) outer (/ word 64)]
+    (loop (if (> (al-len [i64] (.flag-summary c)) outer) (break)
+              (do (al-push! [i64] (field c flag-summary) 0) 0)))
+    (al-set! [i64] (field c flag-summary) outer
+             (| (al-get [i64] (.flag-summary c) outer) (<< 1 (& word 63))))
+    0))
+
+;; Called after a flags word has been cleared. Exact, not conservative: the summary bit goes away
+;; the moment its word does, so a long function cannot accumulate a summary that is all ones.
+(defn mobj-summary-clear-if-empty! [(word i64)] (-> i64)
+  (let [c (mobj-roots) outer (/ word 64)]
+    (if (and (!= (al-get [i64] (.flags c) word) 0)
+             (< outer (al-len [i64] (.flag-summary c))))
+        0
+        (if (>= outer (al-len [i64] (.flag-summary c)))
+            0
+            (al-set! [i64] (field c flag-summary) outer
+                     (& (al-get [i64] (.flag-summary c) outer)
+                        (^ (<< 1 (& word 63)) -1)))))
+    0))
 
 (defn mobj-mark-use! [(vreg i64)] (-> i64)
   (let [c (mobj-roots)]
@@ -360,6 +554,7 @@
                 (if (= (& old (ml-bit vreg)) 0)
                     (do
                       (al-set! [i64] (field c flags) word (| old (ml-bit vreg)))
+                      (mobj-summary-set! word)
                       (al-push! [i64] (field c touched) vreg))
                     0)
                 0)
@@ -389,33 +584,50 @@
   (let [c (mobj-roots)
         first (al-len [i64] (.tmp-vreg c))
         words (al-len [i64] (.flags c))
-        (mut word) 0
+        summary-words (al-len [i64] (.flag-summary c))
+        (mut outer) 0
         (mut count) 0]
-    ;; Packed flags preserve ascending vreg publication while skipping wholly-dead groups of 64.
-    (loop (if (>= (load word) words)
+    ;; Ascending vreg publication is preserved because both levels are walked low bit first: the
+    ;; summary names words in order and each word names vregs in order. The scan touches one
+    ;; summary word per 4,096 vregs and one flags word per 64 LIVE vregs, where it used to touch
+    ;; one flags word per 64 vregs in the entire compilation unit at every safepoint.
+    (loop (if (>= (load outer) summary-words)
               (break)
               (do
-                (let [bits (al-get [i64] (.flags c) (load word))]
-                  (if (!= bits 0)
-                      (let [(mut bit) 0]
-                        (loop (if (>= (load bit) 64)
+                (let [outer-bits (al-get [i64] (.flag-summary c) (load outer))]
+                  (if (!= outer-bits 0)
+                      (let [(mut slot) 0]
+                        (loop (if (>= (load slot) 64)
                                   (break)
                                   (do
-                                    (if (!= (& bits (<< 1 (load bit))) 0)
-                                        (let [vr (+ (* (load word) 64) (load bit))]
-                                          (if (and (< vr vregs)
-                                                   (and (!= vr exclude)
-                                                        (!= (ml-value-kind vr) MLK-SCALAR)))
-                                              (do
-                                                (al-push! [i64] (field c tmp-vreg) vr)
-                                                (set! count (+ (load count) 1))
-                                                0)
-                                              0))
+                                    (if (!= (& outer-bits (<< 1 (load slot))) 0)
+                                        (let [word (+ (* (load outer) 64) (load slot))]
+                                          (if (>= word words) 0
+                                            (let [bits (al-get [i64] (.flags c) word)
+                                                  (mut bit) 0]
+                                              (loop (if (>= (load bit) 64)
+                                                        (break)
+                                                        (do
+                                                          (if (!= (& bits (<< 1 (load bit))) 0)
+                                                              (let [vr (+ (* word 64) (load bit))]
+                                                                (if (and (< vr vregs)
+                                                                         (and (!= vr exclude)
+                                                                              (!= (ml-value-kind vr)
+                                                                                  MLK-SCALAR)))
+                                                                    (do
+                                                                      (al-push! [i64]
+                                                                                (field c tmp-vreg) vr)
+                                                                      (set! count (+ (load count) 1))
+                                                                      0)
+                                                                    0))
+                                                              0)
+                                                          (set! bit (+ (load bit) 1))
+                                                          0))))))
                                         0)
-                                    (set! bit (+ (load bit) 1))
+                                    (set! slot (+ (load slot) 1))
                                     0))))
                       0))
-                (set! word (+ (load word) 1))
+                (set! outer (+ (load outer) 1))
                 0)))
     (al-push! [i64] (field c tmp-site) at)
     (al-push! [i64] (field c tmp-first) first)
@@ -427,8 +639,6 @@
         u (machine-unit)
         words (ml-live-words)
         owner (mu-block-owner bid)
-        local-words (ml-block-words bid)
-        local-base (al-get (.live-block-first u) bid)
         first (mu-block-inst-first bid)
         count (mu-block-inst-count bid)
         (mut touched) 0
@@ -448,29 +658,31 @@
                 (let [vr (al-get [i64] (.touched c) (load touched))
                       global-word (/ vr 64)]
                   (al-set! [i64] (field c flags) global-word
-                           (& (al-get [i64] (.flags c) global-word) (^ (ml-bit vr) -1))))
+                           (& (al-get [i64] (.flags c) global-word) (^ (ml-bit vr) -1)))
+                  (mobj-summary-clear-if-empty! global-word))
                 (set! touched (+ (load touched) 1))
                 0)))
     (al-clear! [i64] (field c touched))
-    (set! word 0)
-    (loop (if (>= (load word) local-words)
+    ;; Seed from the block's live-out set by walking its chunks. This used to read one word per
+    ;; vreg in the owning function, for every block in the unit.
+    (set! word (ml-set-first (ml-block-set ML-SET-OUT bid)))
+    (loop (if (< (load word) 0)
               (break)
               (do
-                (let [bits (al-get [i64] (.live-out u) (+ local-base (load word)))
-                      (mut bit) 0]
+                (let [bits (ml-chunk-bits (load word))
+                      chunk-word (ml-chunk-word (load word))
+                      (mut bit) (if (= bits 0) 64 0)]
                   (loop (if (>= (load bit) 64)
                             (break)
                             (do
                               (if (!= (& bits (<< 1 (load bit))) 0)
-                                  (let [local (+ (* (load word) 64) (load bit))]
+                                  (let [local (+ (* chunk-word 64) (load bit))]
                                     (if (< local (al-get (.live-owner-count u) owner))
-                                        (let [vr (ml-owner-vreg owner local)
-                                              global-word (/ vr 64)]
-                                          (mobj-mark-use! vr))
+                                        (mobj-mark-use! (ml-owner-vreg owner local))
                                         0))
                                   0)
                               (set! bit (+ (load bit) 1))))))
-                (set! word (+ (load word) 1)))))
+                (set! word (ml-chunk-next (load word))))))
     (loop (if (<= (load i) 0)
               (break)
               (do
@@ -487,7 +699,8 @@
                   (if (>= dst 0)
                       (let [word (/ dst 64)]
                         (al-set! [i64] (field c flags) word
-                                 (& (al-get [i64] (.flags c) word) (^ (ml-bit dst) -1))))
+                                 (& (al-get [i64] (.flags c) word) (^ (ml-bit dst) -1)))
+                        (mobj-summary-clear-if-empty! word))
                       0)
                   (mobj-mark-inst-uses! at)
                   ; After the kill and the uses the flags hold live-BEFORE `at`.

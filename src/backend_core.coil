@@ -153,6 +153,7 @@
 (const MSCHED-MEMORY i64 3)
 (const MSCHED-EXACTLY-ONCE i64 4)
 (const MSCHED-BOUNDARY i64 5)
+(const MSCHED-CALL-BUNDLE i64 6)
 
 (const MLIVE-OK i64 0)
 (const MLIVE-RANGE i64 1)
@@ -397,6 +398,9 @@
    (node-phi-next (ArrayList i64))
    (packed-insts (ArrayList MInst))
    (selection-memory-deps (ArrayList i64))
+   ;; Parallel to selection-memory-deps: NO-NODE for a direct dependency, or the control-bearing
+   ;; Effect whose ordering value is conditional on that Effect's path.
+   (selection-memory-dep-carriers (ArrayList i64))
    (selection-memory-pending (ArrayList i64))
    ;; One-time candidate indexes for selection roots. The old selector rediscovered these by
    ;; scanning every ideal node twice for every function.
@@ -463,8 +467,9 @@
    (vreg-abi-index (ArrayList i64))
    (vreg-state (ArrayList i64))
    ;; vreg -> linked list of its uses, rebuilt at the start of each pass that asks
-   ;; ms-gcm-latest-use-block. An entry is an instruction index, or -(block+2) for an edge
-   ;; copy's source-block use. Deriving this by rescanning every instruction and every edge
+   ;; ms-gcm-latest-use-block. An entry is an instruction index, or -(block+2) for a logical use
+   ;; qualified to a block (Phi edge copies and control-bearing Effect values). Deriving this by
+   ;; rescanning every instruction and every edge
    ;; PER DEFINITION made GCM placement and verification quadratic in program size.
    (vreg-use-head (ArrayList i64))
    (vreg-use-entry (ArrayList i64))
@@ -484,13 +489,29 @@
    (live-owner-count (ArrayList i64))
    (live-owner-words (ArrayList i64))
    (live-owner-vregs (ArrayList i64))
-   (live-block-first (ArrayList i64))
-   (live-edge-first (ArrayList i64))
-   (live-use (ArrayList i64))
-   (live-def (ArrayList i64))
-   (live-in (ArrayList i64))
-   (live-out (ArrayList i64))
-   (edge-live (ArrayList i64))
+   ;; LIVENESS SETS ARE SPARSE, AS A CHUNK LIST PER SET.
+   ;;
+   ;; They used to be one dense bit matrix per set kind: `blocks x ceil(owner_vregs/64)` words, for
+   ;; use, def, in and out, plus the same shape over edges. One 253-line Test262 file made that
+   ;; 2.3 BILLION words -- 18.6 GB in a single matrix, and the same count again as the walk cost of
+   ;; every phase that reads it: the solver, interval construction and GC-root discovery alike.
+   ;; Under 2% of those words were ever non-zero.
+   ;;
+   ;; A set is now a singly-linked list of (word, bits) chunks held in ascending word order in one
+   ;; shared arena. `live-set-head` indexes it: `kind * blocks + bid` for the four block sets and
+   ;; `4 * blocks + edge` for an edge set. Cost becomes proportional to what is actually live.
+   ;;
+   ;; The arena is APPEND-ONLY and that is sound rather than lazy: `out` grows monotonically from
+   ;; successors and `in = use u (out - def)` grows with it, so a chunk is never removed during the
+   ;; fixed point. Only whole-unit reset frees anything.
+   (live-set-head (ArrayList i64))
+   (live-chunk-word (ArrayList i64))
+   (live-chunk-bits (ArrayList i64))
+   (live-chunk-next (ArrayList i64))
+   ;; One-entry resume cursor for ml-set-word, so an ascending word scan over a set is O(1) per
+   ;; step. Invalidated by any write, since a splice can insert ahead of the remembered chunk.
+   (live-cursor-set i64)
+   (live-cursor-chunk i64)
    (value-kind (ArrayList i64))
    (register-class (ArrayList i64))
    ;; Node -> generation stamp, and the walk stack, for `be-node-fp-value?`. The question is
@@ -614,6 +635,7 @@
           (set! (.node-phi-next u) (al-new [i64] (malloc-allocator)))
           (set! (.packed-insts u) (al-new [MInst] (malloc-allocator)))
           (set! (.selection-memory-deps u) (al-new [i64] (malloc-allocator)))
+          (set! (.selection-memory-dep-carriers u) (al-new [i64] (malloc-allocator)))
           (set! (.selection-memory-pending u) (al-new [i64] (malloc-allocator)))
           (set! (.selection-ingress-candidates u) (al-new [i64] (malloc-allocator)))
           (set! (.selection-effect-candidates u) (al-new [i64] (malloc-allocator)))
@@ -667,13 +689,12 @@
           (set! (.live-owner-count u) (al-new [i64] (malloc-allocator)))
           (set! (.live-owner-words u) (al-new [i64] (malloc-allocator)))
           (set! (.live-owner-vregs u) (al-new [i64] (malloc-allocator)))
-          (set! (.live-block-first u) (al-new [i64] (malloc-allocator)))
-          (set! (.live-edge-first u) (al-new [i64] (malloc-allocator)))
-          (set! (.live-use u) (al-new [i64] (malloc-allocator)))
-          (set! (.live-def u) (al-new [i64] (malloc-allocator)))
-          (set! (.live-in u) (al-new [i64] (malloc-allocator)))
-          (set! (.live-out u) (al-new [i64] (malloc-allocator)))
-          (set! (.edge-live u) (al-new [i64] (malloc-allocator)))
+          (set! (.live-set-head u) (al-new [i64] (malloc-allocator)))
+          (set! (.live-chunk-word u) (al-new [i64] (malloc-allocator)))
+          (set! (.live-chunk-bits u) (al-new [i64] (malloc-allocator)))
+          (set! (.live-chunk-next u) (al-new [i64] (malloc-allocator)))
+          (set! (.live-cursor-set u) -1)
+          (set! (.live-cursor-chunk u) -1)
           (set! (.value-kind u) (al-new [i64] (malloc-allocator)))
           (set! (.register-class u) (al-new [i64] (malloc-allocator)))
           (set! (.fp-mark u) (al-new [i64] (malloc-allocator)))
@@ -754,6 +775,7 @@
     (al-clear! [i64] (field u node-phi-next))
     (al-clear! [MInst] (field u packed-insts))
     (al-clear! [i64] (field u selection-memory-deps))
+    (al-clear! [i64] (field u selection-memory-dep-carriers))
     (al-clear! [i64] (field u selection-memory-pending))
     (al-clear! [i64] (field u selection-ingress-candidates))
     (al-clear! [i64] (field u selection-effect-candidates))
@@ -807,13 +829,12 @@
     (al-clear! [i64] (field u live-owner-count))
     (al-clear! [i64] (field u live-owner-words))
     (al-clear! [i64] (field u live-owner-vregs))
-    (al-clear! [i64] (field u live-block-first))
-    (al-clear! [i64] (field u live-edge-first))
-    (al-clear! [i64] (field u live-use))
-    (al-clear! [i64] (field u live-def))
-    (al-clear! [i64] (field u live-in))
-    (al-clear! [i64] (field u live-out))
-    (al-clear! [i64] (field u edge-live))
+    (al-clear! [i64] (field u live-set-head))
+    (al-clear! [i64] (field u live-chunk-word))
+    (al-clear! [i64] (field u live-chunk-bits))
+    (al-clear! [i64] (field u live-chunk-next))
+    (set! (.live-cursor-set u) -1)
+    (set! (.live-cursor-chunk u) -1)
     (al-clear! [i64] (field u value-kind))
     (al-clear! [i64] (field u register-class))
     (al-clear! [i64] (field u fp-mark))

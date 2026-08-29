@@ -91,6 +91,11 @@
 (const JSL-ERR-BAD-RECORD-FIELD       i64 41)  ; missing, duplicate, or unknown named field
 (const JSL-ERR-RECORD-ESCAPE          i64 42)  ; a compile-away record crosses a runtime ABI
 (const JSL-ERR-BAD-RECORD-LIST        i64 43)  ; malformed or schema-mismatched record List use
+(const JSL-ERR-BAD-SLOT-LIST          i64 44)  ; malformed/duplicate internal-slot List declaration
+(const JSL-ERR-SLOT-LIST-ESCAPE       i64 45)  ; compile-time slot List crossed a runtime ABI
+(const JSL-ERR-BAD-INTERNAL-SLOT      i64 46)  ; malformed/unknown internal-slot declaration/use
+(const JSL-ERR-BAD-METHOD-FAMILY      i64 47)  ; malformed/unknown internal-method family
+(const JSL-ERR-BAD-INTERNAL-METHOD    i64 48)  ; malformed/unknown essential internal method
 
 (defn jsl-err-name [(code i64)] (-> (slice u8))
   (case code
@@ -128,6 +133,11 @@
         JSL-ERR-RECUR-OUTSIDE-LOOP    "JSL-ERR-RECUR-OUTSIDE-LOOP"
         JSL-ERR-LOOP-NO-RECUR         "JSL-ERR-LOOP-NO-RECUR"
         JSL-ERR-LOOP-NO-EXIT          "JSL-ERR-LOOP-NO-EXIT"
+        JSL-ERR-BAD-SLOT-LIST          "JSL-ERR-BAD-SLOT-LIST"
+        JSL-ERR-SLOT-LIST-ESCAPE       "JSL-ERR-SLOT-LIST-ESCAPE"
+        JSL-ERR-BAD-INTERNAL-SLOT      "JSL-ERR-BAD-INTERNAL-SLOT"
+        JSL-ERR-BAD-METHOD-FAMILY      "JSL-ERR-BAD-METHOD-FAMILY"
+        JSL-ERR-BAD-INTERNAL-METHOD    "JSL-ERR-BAD-INTERNAL-METHOD"
         JSL-ERR-HEAP-IN-BUILTIN       "JSL-ERR-HEAP-IN-BUILTIN"
         JSL-ERR-BAD-SPEC-METADATA      "JSL-ERR-BAD-SPEC-METADATA"
         JSL-ERR-DUP-SPEC-CLAIM         "JSL-ERR-DUP-SPEC-CLAIM"
@@ -805,7 +815,7 @@
 (const JSL-MAX-RECORD-LEAVES i64 256)
 
 (defstruct JslParam
-  [(name (slice u8)) (ty i64) (record i64) (rest bool)
+  [(name (slice u8)) (ty i64) (record i64) (slotlist bool) (rest bool)
    ;; Canonical half-open range in the declaration's lowered parameter vector. Logical source
    ;; arity remains `nparams`; these fields are the ABI shape and are computed once after checking.
    (lowered-off i64) (lowered-width i64)])
@@ -821,6 +831,14 @@
   [(name (slice u8)) (fields-off i64) (nfields i64) (flat-off i64) (flat-width i64)])
 (defstruct JslRecordField
   [(name (slice u8)) (ty i64) (record i64) (flat-off i64) (flat-width i64)])
+(defstruct JslSlotListDecl
+  [(name (slice u8)) (slots-off i64) (nslots i64)])
+(const JSL-SLOT-JS-VALUE i64 1)
+(const JSL-SLOT-BOOLEAN i64 2)
+(const JSL-SLOT-SPEC-LIST i64 3)
+(defstruct JslInternalSlotDecl [(name (slice u8)) (storage i64)])
+(defstruct JslMethodFamilyDecl [(name (slice u8))])
+(defstruct JslInternalMethodDecl [(name (slice u8))])
 
 (defstruct JslDecl
   [(name          (slice u8))
@@ -853,15 +871,22 @@
    (records (ArrayList JslRecordDecl))
    (recordfields (ArrayList JslRecordField))
    (recordflattypes (ArrayList i64)) ; one canonical recursive physical type vector per schema
+   (slotlists (ArrayList JslSlotListDecl))
+   (slotnames (ArrayList (slice u8)))
+   (internalslots (ArrayList JslInternalSlotDecl))
+   (methodfamilies (ArrayList JslMethodFamilyDecl))
+   (internalmethods (ArrayList JslInternalMethodDecl))
    (captures (ArrayList (slice u8)))
    (binds   (ArrayList (slice u8)))   ; the checker's binding stack
    (bindrecords (ArrayList i64))      ; schema index parallel to `binds`, or -1
    (bindlists (ArrayList i64))        ; materialized Record List schema, parallel to `binds`
+   (bindslotlists (ArrayList i64))    ; compile-time slot-list identity, parallel to `binds`
    (marks   (ArrayList i64))          ; DFS colours, for macro-cycle detection
    (arities (ArrayList i64))          ; enclosing `loop` binding counts, innermost last
    (looprecordbases (ArrayList i64))  ; base in `looprecords` for each active loop
    (looprecords (ArrayList i64))      ; one inferred schema per source loop binding
    (looplists (ArrayList i64))        ; parallel inferred Record-list schema per loop binding
+   (loopslotlists (ArrayList i64))    ; parallel compile-time slot-list identity per loop binding
    (paths   (ArrayList (slice u8)))   ; source id -> the path it was read from
    (err     i64)
    (where   (slice u8))               ; the name the first failure was about
@@ -885,16 +910,23 @@
           (set! (.records p) (al-new [JslRecordDecl] (malloc-allocator)))
           (set! (.recordfields p) (al-new [JslRecordField] (malloc-allocator)))
           (set! (.recordflattypes p) (al-new [i64] (malloc-allocator)))
+          (set! (.slotlists p) (al-new [JslSlotListDecl] (malloc-allocator)))
+          (set! (.slotnames p) (al-new [(slice u8)] (malloc-allocator)))
+          (set! (.internalslots p) (al-new [JslInternalSlotDecl] (malloc-allocator)))
+          (set! (.methodfamilies p) (al-new [JslMethodFamilyDecl] (malloc-allocator)))
+          (set! (.internalmethods p) (al-new [JslInternalMethodDecl] (malloc-allocator)))
           (set! (.captures p) (al-new [(slice u8)] (malloc-allocator)))
           (set! (.binds p) (al-new [(slice u8)] (malloc-allocator)))
           (set! (.bindrecords p) (al-new [i64] (malloc-allocator)))
           (set! (.bindlists p) (al-new [i64] (malloc-allocator)))
+          (set! (.bindslotlists p) (al-new [i64] (malloc-allocator)))
           (set! (.marks p) (al-new [i64] (malloc-allocator)))
           (set! (.paths p) (al-new [(slice u8)] (malloc-allocator)))
           (set! (.arities p) (al-new [i64] (malloc-allocator)))
           (set! (.looprecordbases p) (al-new [i64] (malloc-allocator)))
           (set! (.looprecords p) (al-new [i64] (malloc-allocator)))
           (set! (.looplists p) (al-new [i64] (malloc-allocator)))
+          (set! (.loopslotlists p) (al-new [i64] (malloc-allocator)))
           (set! (.err p) JSL-OK)
           (set! (.where p) "")
           0))
@@ -908,16 +940,23 @@
     (al-clear! [JslRecordDecl] (field p records))
     (al-clear! [JslRecordField] (field p recordfields))
     (al-clear! [i64]         (field p recordflattypes))
+    (al-clear! [JslSlotListDecl] (field p slotlists))
+    (al-clear! [(slice u8)]  (field p slotnames))
+    (al-clear! [JslInternalSlotDecl] (field p internalslots))
+    (al-clear! [JslMethodFamilyDecl] (field p methodfamilies))
+    (al-clear! [JslInternalMethodDecl] (field p internalmethods))
     (al-clear! [(slice u8)]  (field p captures))
     (al-clear! [(slice u8)]  (field p binds))
     (al-clear! [i64]         (field p bindrecords))
     (al-clear! [i64]         (field p bindlists))
+    (al-clear! [i64]         (field p bindslotlists))
     (al-clear! [i64]         (field p marks))
     (al-clear! [(slice u8)]  (field p paths))
     (al-clear! [i64]         (field p arities))
     (al-clear! [i64]         (field p looprecordbases))
     (al-clear! [i64]         (field p looprecords))
     (al-clear! [i64]         (field p looplists))
+    (al-clear! [i64]         (field p loopslotlists))
     (set! (.err-src p) -1)
     (set! (.err-lo p) 0)
     (set! (.err-hi p) 0)
@@ -950,11 +989,13 @@
     (al-clear! [(slice u8)] (field p binds))
     (al-clear! [i64] (field p bindrecords))
     (al-clear! [i64] (field p bindlists))
+    (al-clear! [i64] (field p bindslotlists))
     (al-clear! [i64] (field p marks))
     (al-clear! [i64] (field p arities))
     (al-clear! [i64] (field p looprecordbases))
     (al-clear! [i64] (field p looprecords))
     (al-clear! [i64] (field p looplists))
+    (al-clear! [i64] (field p loopslotlists))
     (set! (.err-src p) -1)
     (set! (.err-lo p) 0)
     (set! (.err-hi p) 0)
@@ -1112,6 +1153,7 @@
 (defn jsl-param-name [(d i64) (k i64)] (-> (slice u8)) (.name (jsl-param-p d k)))
 (defn jsl-param-ty [(d i64) (k i64)] (-> i64) (.ty (jsl-param-p d k)))
 (defn jsl-param-record [(d i64) (k i64)] (-> i64) (.record (jsl-param-p d k)))
+(defn jsl-param-slot-list? [(d i64) (k i64)] (-> bool) (.slotlist (jsl-param-p d k)))
 (defn jsl-param-lowered-off [(d i64) (k i64)] (-> i64) (.lowered-off (jsl-param-p d k)))
 (defn jsl-param-lowered-width [(d i64) (k i64)] (-> i64) (.lowered-width (jsl-param-p d k)))
 (defn jsl-param-lowered-type [(d i64) (k i64) (slot i64)] (-> i64)
@@ -1163,6 +1205,59 @@
       TY-NO-ID
       (al-get [i64] (.recordflattypes (jsl))
               (+ (.flat-off (jsl-record-p r)) flat-index))))
+
+(defn jsl-slot-list-count [] (-> i64)
+  (al-len [JslSlotListDecl] (.slotlists (jsl))))
+(defn jsl-slot-list-p [(i i64)] (-> (ptr JslSlotListDecl))
+  (al-elem [JslSlotListDecl] (field (jsl) slotlists) i))
+(defn jsl-slot-list-name [(i i64)] (-> (slice u8)) (.name (jsl-slot-list-p i)))
+(defn jsl-slot-list-size [(i i64)] (-> i64) (.nslots (jsl-slot-list-p i)))
+(defn jsl-slot-list-slot [(i i64) (k i64)] (-> (slice u8))
+  (al-get (.slotnames (jsl)) (+ (.slots-off (jsl-slot-list-p i)) k)))
+(defn jsl-slot-list-find [(name (slice u8))] (-> i64)
+  (let [(mut i) 0 (mut found) -1]
+    (loop (if (or (>= (load i) (jsl-slot-list-count)) (>= (load found) 0)) (break)
+            (do (if (= name (jsl-slot-list-name (load i))) (store! found (load i)) 0)
+                (set! i (+ (load i) 1)))))
+    (load found)))
+(defn jsl-internal-slot-count [] (-> i64)
+  (al-len [JslInternalSlotDecl] (.internalslots (jsl))))
+(defn jsl-internal-slot-p [(i i64)] (-> (ptr JslInternalSlotDecl))
+  (al-elem [JslInternalSlotDecl] (field (jsl) internalslots) i))
+(defn jsl-internal-slot-name [(i i64)] (-> (slice u8))
+  (.name (jsl-internal-slot-p i)))
+(defn jsl-internal-slot-storage [(i i64)] (-> i64)
+  (.storage (jsl-internal-slot-p i)))
+(defn jsl-internal-slot-find [(name (slice u8))] (-> i64)
+  (let [(mut i) 0 (mut found) -1]
+    (loop (if (or (>= (load i) (jsl-internal-slot-count)) (>= (load found) 0)) (break)
+            (do (if (= name (jsl-internal-slot-name (load i))) (store! found (load i)) 0)
+                (set! i (+ (load i) 1)))))
+    (load found)))
+(defn jsl-method-family-count [] (-> i64)
+  (al-len [JslMethodFamilyDecl] (.methodfamilies (jsl))))
+(defn jsl-method-family-p [(i i64)] (-> (ptr JslMethodFamilyDecl))
+  (al-elem [JslMethodFamilyDecl] (field (jsl) methodfamilies) i))
+(defn jsl-method-family-name [(i i64)] (-> (slice u8))
+  (.name (jsl-method-family-p i)))
+(defn jsl-method-family-find [(name (slice u8))] (-> i64)
+  (let [(mut i) 0 (mut found) -1]
+    (loop (if (or (>= (load i) (jsl-method-family-count)) (>= (load found) 0)) (break)
+            (do (if (= name (jsl-method-family-name (load i))) (store! found (load i)) 0)
+                (set! i (+ (load i) 1)))))
+    (load found)))
+(defn jsl-internal-method-count [] (-> i64)
+  (al-len [JslInternalMethodDecl] (.internalmethods (jsl))))
+(defn jsl-internal-method-p [(i i64)] (-> (ptr JslInternalMethodDecl))
+  (al-elem [JslInternalMethodDecl] (field (jsl) internalmethods) i))
+(defn jsl-internal-method-name [(i i64)] (-> (slice u8))
+  (.name (jsl-internal-method-p i)))
+(defn jsl-internal-method-find [(name (slice u8))] (-> i64)
+  (let [(mut i) 0 (mut found) -1]
+    (loop (if (or (>= (load i) (jsl-internal-method-count)) (>= (load found) 0)) (break)
+            (do (if (= name (jsl-internal-method-name (load i))) (store! found (load i)) 0)
+                (set! i (+ (load i) 1)))))
+    (load found)))
 (defn jsl-signature-build! [(params-off i64) (nparams i64) (expected-lowered-nparams i64)
                             (ret i64) (ret-record i64)] (-> JslSignature)
   (let [(mut signature) (zeroed JslSignature)
@@ -1339,6 +1434,12 @@
         (if (rd/sexp-sym? name) (jsl-record-find (rd/sexp-sym name)) -1))
       -1))
 
+(defn jsl-slot-list-type? [(x (ptr rd/Sexp))] (-> bool)
+  (and (rd/sexp-list? x)
+       (and (= (rd/sexp-count x) 1)
+            (and (rd/sexp-sym? (rd/sexp-nth x 0))
+                 (= (rd/sexp-sym (rd/sexp-nth x 0)) "slot-list")))))
+
 ;; The lattice constant a bare literal symbol denotes, or TY-NO-ID when it is not one. These four
 ;; are the only symbols that are values rather than references, which is what makes an unbound
 ;; name detectable at all.
@@ -1354,12 +1455,13 @@
 ; ============================================================================
 (defn jsl-scope-depth [] (-> i64) (al-len [(slice u8)] (.binds (jsl))))
 
-(defn jsl-scope-push-value! [(name (slice u8)) (record i64) (list i64)] (-> i64)
+(defn jsl-scope-push-value! [(name (slice u8)) (record i64) (list i64) (slotlist i64)] (-> i64)
+  (al-push! [i64] (field (jsl) bindslotlists) slotlist)
   (al-push! [i64] (field (jsl) bindlists) list)
   (al-push! [i64] (field (jsl) bindrecords) record)
   (al-push! [(slice u8)] (field (jsl) binds) name))
 (defn jsl-scope-push-record! [(name (slice u8)) (record i64)] (-> i64)
-  (jsl-scope-push-value! name record -1))
+  (jsl-scope-push-value! name record -1 -1))
 (defn jsl-scope-push! [(name (slice u8))] (-> i64) (jsl-scope-push-record! name -1))
 
 ;; Pop back to a remembered depth. `let` is sequential, so a binding is visible to the bindings
@@ -1371,6 +1473,8 @@
           (do (al-pop! [i64] (field (jsl) bindrecords)) 0)))
   (loop (if (<= (al-len [i64] (.bindlists (jsl))) depth) (break)
           (do (al-pop! [i64] (field (jsl) bindlists)) 0)))
+  (loop (if (<= (al-len [i64] (.bindslotlists (jsl))) depth) (break)
+          (do (al-pop! [i64] (field (jsl) bindslotlists)) 0)))
   0)
 
 (defn jsl-scope-record [(name (slice u8))] (-> i64)
@@ -1388,6 +1492,16 @@
                   (if (= name (al-get (.binds (jsl)) (load i)))
                       (set! found (al-get (.bindlists (jsl)) (load i))) 0))))
     (if (= (load found) -2) -1 (load found))))
+
+(defn jsl-scope-slot-list [(name (slice u8))] (-> i64)
+  ;; -2 is a real value here: it means "a slot-list macro parameter whose concrete identity is
+  ;; supplied by expansion". Use -3 solely as the lookup sentinel so let/loop bindings preserve it.
+  (let [(mut i) (jsl-scope-depth) (mut found) -3]
+    (loop (if (or (<= (load i) 0) (!= (load found) -3)) (break)
+              (do (set! i (- (load i) 1))
+                  (if (= name (al-get (.binds (jsl)) (load i)))
+                      (set! found (al-get (.bindslotlists (jsl)) (load i))) 0))))
+    (if (= (load found) -3) -1 (load found))))
 
 (defn jsl-scope-has? [(name (slice u8))] (-> bool)
   (let [n (jsl-scope-depth) (mut i) 0 (mut found) false]
@@ -1427,6 +1541,8 @@
                       (set! result (jsl-fail! JSL-ERR-RECORD-ESCAPE where)) 0)
                   (if (>= (jsl-expr-record-list (rd/sexp-nth x (load i)) d) 0)
                       (set! result (jsl-fail! JSL-ERR-RECORD-ESCAPE where)) 0)
+                  (if (!= (jsl-expr-slot-list (rd/sexp-nth x (load i)) d) -1)
+                      (set! result (jsl-fail! JSL-ERR-SLOT-LIST-ESCAPE where)) 0)
                   (set! i (+ (load i) 1)))))
         (load result)))))
 
@@ -1455,7 +1571,8 @@
                                     (jsl-scope-push-value!
                                       (rd/sexp-sym (rd/sexp-nth b 0))
                                       (jsl-expr-record (rd/sexp-nth b 1) d)
-                                      (jsl-expr-record-list (rd/sexp-nth b 1) d))
+                                      (jsl-expr-record-list (rd/sexp-nth b 1) d)
+                                      (jsl-expr-slot-list (rd/sexp-nth b 1) d))
                                     0)
                                 0))))
                     (store! i (+ (load i) 1)))))
@@ -1548,6 +1665,14 @@
                           (store! err (jsl-fail! JSL-ERR-RECORD-ESCAPE name)) 0)) 0)
                 (if (and (= (load err) JSL-OK) (>= (jsl-expr-record-list arg d) 0))
                     (store! err (jsl-fail! JSL-ERR-RECORD-ESCAPE name)) 0)
+                (if (= (load err) JSL-OK)
+                    (let [actual-slots (jsl-expr-slot-list arg d)
+                          callee (if (jsl-prim-name? name) -1 (jsl-find name))
+                          expected-slots (and (>= callee 0)
+                                              (< (- (load k) 1) (jsl-decl-nparams callee))
+                                              (jsl-param-slot-list? callee (- (load k) 1)))]
+                      (if (!= expected-slots (!= actual-slots -1))
+                          (store! err (jsl-fail! JSL-ERR-SLOT-LIST-ESCAPE name)) 0)) 0)
                 (store! k (+ (load k) 1)))))
           (if (and (= (load err) JSL-OK) (>= owa 0))
               (store! err (jsl-check-expr (rd/sexp-nth x (+ owa 1)) d)) 0)
@@ -1605,6 +1730,8 @@
   (al-get (.looprecords (jsl)) (+ (jsl-loop-record-base) i)))
 (defn jsl-loop-list [(i i64)] (-> i64)
   (al-get (.looplists (jsl)) (+ (jsl-loop-record-base) i)))
+(defn jsl-loop-slot-list [(i i64)] (-> i64)
+  (al-get (.loopslotlists (jsl)) (+ (jsl-loop-record-base) i)))
 
 (defn jsl-check-loop [(x (ptr rd/Sexp)) (d i64)] (-> i64)
   (block :done
@@ -1651,7 +1778,8 @@
                     (let [init (rd/sexp-nth binding 1)]
                       (jsl-scope-push-value! (rd/sexp-sym (rd/sexp-nth binding 0))
                                              (jsl-expr-record init d)
-                                             (jsl-expr-record-list init d)))
+                                             (jsl-expr-record-list init d)
+                                             (jsl-expr-slot-list init d)))
                       (store! i (+ (load i) 1))
                       0)))
           (if (= (load err) JSL-OK)
@@ -1663,6 +1791,8 @@
                                             (al-get (.bindrecords (jsl)) (+ depth (load k))))
                                   (al-push! [i64] (field (jsl) looplists)
                                             (al-get (.bindlists (jsl)) (+ depth (load k))))
+                                  (al-push! [i64] (field (jsl) loopslotlists)
+                                            (al-get (.bindslotlists (jsl)) (+ depth (load k))))
                                   (set! k (+ (load k) 1)))))
                     (al-push! [i64] (field (jsl) arities) nb)
                   (store! err (jsl-check-args x d 2))
@@ -1670,7 +1800,8 @@
                     (al-pop! [i64] (field (jsl) looprecordbases))
                     (loop (if (<= (al-len [i64] (.looprecords (jsl))) record-base) (break)
                               (do (al-pop! [i64] (field (jsl) looprecords))
-                                  (al-pop! [i64] (field (jsl) looplists)) 0))))
+                                  (al-pop! [i64] (field (jsl) looplists))
+                                  (al-pop! [i64] (field (jsl) loopslotlists)) 0))))
                   0)
               0)
           (jsl-scope-drop! depth)
@@ -1693,6 +1824,9 @@
                     (if (!= (jsl-expr-record-list (rd/sexp-nth x (+ (load i) 1)) d)
                             (jsl-loop-list (load i)))
                         (set! err (jsl-fail! JSL-ERR-BAD-RECORD-LIST "recur")) 0)
+                    (if (!= (jsl-expr-slot-list (rd/sexp-nth x (+ (load i) 1)) d)
+                            (jsl-loop-slot-list (load i)))
+                        (set! err (jsl-fail! JSL-ERR-BAD-SLOT-LIST "recur")) 0)
                     (set! i (+ (load i) 1)))))
           (load err))))))
 
@@ -1705,9 +1839,12 @@
                 b (jsl-expr-record (rd/sexp-nth x 3) d)
                 la (jsl-expr-record-list (rd/sexp-nth x 2) d)
                 lb (jsl-expr-record-list (rd/sexp-nth x 3) d)
+                sa (jsl-expr-slot-list (rd/sexp-nth x 2) d)
+                sb (jsl-expr-slot-list (rd/sexp-nth x 3) d)
                 ad (jsl-expr-diverges? (rd/sexp-nth x 2))
                 bd (jsl-expr-diverges? (rd/sexp-nth x 3))]
-            (if (and (not ad) (and (not bd) (or (!= a b) (!= la lb))))
+            (if (and (not ad) (and (not bd)
+                     (or (!= a b) (or (!= la lb) (!= sa sb)))))
                 (jsl-fail! JSL-ERR-BAD-RECORD "if") JSL-OK))))))
 
 (defn jsl-expr-diverges? [(x (ptr rd/Sexp))] (-> bool)
@@ -1784,13 +1921,50 @@
                         (jsl-expr-record-list (rd/sexp-nth x 2) d))
                   (if (= name "let") (jsl-expr-record-list-let x d) -1))))))))))
 
+;; Static identity of an internal-slot List. These values exist only while expanding macros and
+;; deliberately have no graph representation. A declaration name is a constant descriptor; a
+;; macro parameter or let-binding carries that same identity through substitution.
+(defn jsl-expr-slot-list [(x (ptr rd/Sexp)) (d i64)] (-> i64)
+  (if (rd/sexp-sym? x)
+      (let [name (rd/sexp-sym x)]
+        (if (jsl-scope-has? name) (jsl-scope-slot-list name)
+          (let [p (jsl-param-index d name)]
+            (if (and (>= p 0) (jsl-param-slot-list? d p)) -2
+              (jsl-slot-list-find name)))))
+    (if (or (not (rd/sexp-list? x)) (= (rd/sexp-count x) 0)) -1
+      (let [head (rd/sexp-nth x 0)]
+        (if (not (rd/sexp-sym? head)) -1
+          (let [name (rd/sexp-sym head)]
+            (if (= name "if")
+                (if (jsl-expr-diverges? (rd/sexp-nth x 2))
+                    (jsl-expr-slot-list (rd/sexp-nth x 3) d)
+                    (jsl-expr-slot-list (rd/sexp-nth x 2) d))
+              (if (= name "let") (jsl-expr-slot-list-let x d) -1))))))))
+
+(defn jsl-expr-slot-list-let [(x (ptr rd/Sexp)) (d i64)] (-> i64)
+  (let [bindings (rd/sexp-nth x 1) depth (jsl-scope-depth) (mut i) 0]
+    (loop (if (>= (load i) (rd/sexp-count bindings)) (break)
+              (let [binding (rd/sexp-nth bindings (load i)) value (rd/sexp-nth binding 1)]
+                (jsl-scope-push-value! (rd/sexp-sym (rd/sexp-nth binding 0))
+                                       (jsl-expr-record value d)
+                                       (jsl-expr-record-list value d)
+                                       (jsl-expr-slot-list value d))
+                (set! i (+ (load i) 1)))))
+    (let [(mut result) -1 (mut body) 2]
+      (loop (if (>= (load body) (rd/sexp-count x)) (break)
+                (do (set! result (jsl-expr-slot-list (rd/sexp-nth x (load body)) d))
+                    (set! body (+ (load body) 1)))))
+      (jsl-scope-drop! depth)
+      (load result))))
+
 (defn jsl-expr-record-list-let [(x (ptr rd/Sexp)) (d i64)] (-> i64)
   (let [bindings (rd/sexp-nth x 1) depth (jsl-scope-depth) (mut i) 0]
     (loop (if (>= (load i) (rd/sexp-count bindings)) (break)
               (let [binding (rd/sexp-nth bindings (load i)) value (rd/sexp-nth binding 1)]
                 (jsl-scope-push-value! (rd/sexp-sym (rd/sexp-nth binding 0))
                                        (jsl-expr-record value d)
-                                       (jsl-expr-record-list value d))
+                                       (jsl-expr-record-list value d)
+                                       (jsl-expr-slot-list value d))
                 (set! i (+ (load i) 1)))))
     (let [(mut result) -1 (mut body) 2]
       (loop (if (>= (load body) (rd/sexp-count x)) (break)
@@ -1808,7 +1982,8 @@
                 (let [value (rd/sexp-nth binding 1)]
                   (jsl-scope-push-value! (rd/sexp-sym (rd/sexp-nth binding 0))
                                          (jsl-expr-record value d)
-                                         (jsl-expr-record-list value d)))
+                                         (jsl-expr-record-list value d)
+                                         (jsl-expr-slot-list value d)))
                 (set! i (+ (load i) 1)))))
     (let [(mut result) -1 (mut body) 2]
       (loop (if (>= (load body) (rd/sexp-count x)) (break)
@@ -1943,6 +2118,54 @@
                   (return-from :done (jsl-fail! JSL-ERR-BAD-RECORD-LIST name)) 0)) 0))
       JSL-OK)))
 
+(defn jsl-check-object-layout-form [(x (ptr rd/Sexp)) (d i64) (name (slice u8))] (-> i64)
+  (block :done
+    (if (= name "object-layout-init")
+        (do
+          (if (!= (rd/sexp-count x) 3)
+              (return-from :done (jsl-fail! JSL-ERR-ARITY name)) 0)
+          (let [object (rd/sexp-nth x 1) slots (rd/sexp-nth x 2)
+                checked (jsl-check-expr object d)]
+            (if (!= checked JSL-OK) (return-from :done checked) 0)
+            (if (= (jsl-expr-slot-list slots d) -1)
+                (return-from :done (jsl-fail! JSL-ERR-BAD-SLOT-LIST name)) 0))
+          (return-from :done JSL-OK)) 0)
+    (if (or (= name "object-method-family-is") (= name "object-method-family-set"))
+        (do
+          (if (!= (rd/sexp-count x) 3)
+              (return-from :done (jsl-fail! JSL-ERR-ARITY name)) 0)
+          (let [family (rd/sexp-nth x 2)]
+            (if (or (not (rd/sexp-sym? family))
+                    (< (jsl-method-family-find
+                         (if (rd/sexp-sym? family) (rd/sexp-sym family) "")) 0))
+                (return-from :done (jsl-fail! JSL-ERR-BAD-METHOD-FAMILY name)) 0))
+          (return-from :done (jsl-check-expr (rd/sexp-nth x 1) d)) 0)
+        0)
+    (if (= name "object-method-is-ordinary")
+        (do
+          (if (!= (rd/sexp-count x) 3)
+              (return-from :done (jsl-fail! JSL-ERR-ARITY name)) 0)
+          (let [method (rd/sexp-nth x 2)]
+            (if (or (not (rd/sexp-sym? method))
+                    (< (jsl-internal-method-find
+                         (if (rd/sexp-sym? method) (rd/sexp-sym method) "")) 0))
+                (return-from :done (jsl-fail! JSL-ERR-BAD-INTERNAL-METHOD name)) 0))
+          (return-from :done (jsl-check-expr (rd/sexp-nth x 1) d)) 0)
+        0)
+    (let [store (= name "internal-slot-store")
+          expected (if store 4 3)]
+      (if (!= (rd/sexp-count x) expected)
+          (return-from :done (jsl-fail! JSL-ERR-ARITY name)) 0)
+      (let [slot (rd/sexp-nth x 2)]
+        (if (or (not (rd/sexp-sym? slot))
+                (< (jsl-internal-slot-find (if (rd/sexp-sym? slot) (rd/sexp-sym slot) "")) 0))
+            (return-from :done (jsl-fail! JSL-ERR-BAD-INTERNAL-SLOT name)) 0))
+      (let [first (jsl-check-expr (rd/sexp-nth x 1) d)]
+        (if (!= first JSL-OK) (return-from :done first) 0))
+      (if store
+          (return-from :done (jsl-check-expr (rd/sexp-nth x 3) d)) 0)
+      JSL-OK)))
+
 ;; Designed in docs/JSL.md, not built. Refused BY NAME so that a `.jsl` file using one cannot
 ;; produce a graph, and so that the diagnostic says which form stopped it rather than "unknown".
 (defn jsl-unsupported-form? [(name (slice u8))] (-> bool) (= name "class"))
@@ -1969,6 +2192,7 @@
                 0))
           (if (>= (jsl-capture-index d s) 0) (return-from :done JSL-OK) 0)
           (if (and (jsl-callable? d) (= s "this")) (return-from :done JSL-OK) 0)
+          (if (>= (jsl-slot-list-find s) 0) (return-from :done JSL-OK) 0)
           (return-from :done (jsl-fail! JSL-ERR-UNBOUND s)))
         0)
     (if (= (rd/sexp-count x) 0)
@@ -1989,6 +2213,13 @@
         (if (or (= name "record-list-new")
                 (or (= name "record-list-store") (= name "record-list-load")))
             (return-from :done (jsl-check-record-list-form x d name)) 0)
+        (if (or (= name "object-layout-init")
+                (or (= name "object-method-family-is")
+                    (or (= name "object-method-family-set")
+                    (or (= name "object-method-is-ordinary")
+                (or (= name "internal-slot-has")
+                    (or (= name "internal-slot-load") (= name "internal-slot-store")))))))
+            (return-from :done (jsl-check-object-layout-form x d name)) 0)
         (if (= name "call") (return-from :done (jsl-check-js-call x d)) 0)
         (if (= name "call-with-receiver")
             (return-from :done (jsl-check-js-call-with-receiver x d)) 0)
@@ -2074,7 +2305,14 @@
     (let [n (rd/sexp-count x) (mut i) 0 (mut found) false]
       (if (and (rd/sexp-list? x) (and (> n 0) (rd/sexp-sym? (rd/sexp-nth x 0))))
           (let [name (rd/sexp-sym (rd/sexp-nth x 0))]
-            (if (= name "call")
+            (if (or (= name "call")
+                    (or (= name "object-layout-init")
+                        (or (= name "object-method-family-is")
+                            (or (= name "object-method-family-set")
+                            (or (= name "object-method-is-ordinary")
+                        (or (= name "internal-slot-has")
+                            (or (= name "internal-slot-load")
+                                (= name "internal-slot-store"))))))))
                 (set! found true)
               (if (jsl-prim-name? name)
                 (let [id (jsp-find name)]
@@ -2306,6 +2544,7 @@
                 (al-clear! [(slice u8)] (field (jsl) binds))
                 (al-clear! [i64] (field (jsl) bindrecords))
                 (al-clear! [i64] (field (jsl) bindlists))
+                (al-clear! [i64] (field (jsl) bindslotlists))
                 (set! err (jsl-check-expr (jsl-decl-body (load i)) (load i)))
                 (if (and (= (load err) JSL-OK)
                          (!= (jsl-expr-record (jsl-decl-body (load i)) (load i))
@@ -2315,6 +2554,10 @@
                 (if (and (= (load err) JSL-OK)
                          (>= (jsl-expr-record-list (jsl-decl-body (load i)) (load i)) 0))
                     (set! err (jsl-fail! JSL-ERR-RECORD-ESCAPE
+                                         (jsl-decl-name (load i)))) 0)
+                (if (and (= (load err) JSL-OK)
+                         (!= (jsl-expr-slot-list (jsl-decl-body (load i)) (load i)) -1))
+                    (set! err (jsl-fail! JSL-ERR-SLOT-LIST-ESCAPE
                                          (jsl-decl-name (load i)))) 0)
                 (set! i (+ (load i) 1)))))
     ; Cycles LAST: a body that does not resolve has no meaningful call graph, so reporting a
@@ -2366,12 +2609,15 @@
                                                    (and (rd/sexp-sym? (rd/sexp-nth typeform 0))
                                                         (= (rd/sexp-sym (rd/sexp-nth typeform 0))
                                                            "rest"))))
+                                    slotlist (jsl-slot-list-type? typeform)
                                     t (if rest (jsl-type-of (rd/sexp-nth typeform 1))
-                                          (jsl-type-of typeform))
+                                          (if slotlist TY-NO-ID (jsl-type-of typeform)))
                                     record (if rest -1 (jsl-record-type-of typeform))]
-                                (if (and (= t TY-NO-ID) (< record 0))
+                                (if (and (= t TY-NO-ID) (and (< record 0) (not slotlist)))
                                     (store! err (jsl-fail! JSL-ERR-BAD-TYPE
                                                            (rd/sexp-sym (rd/sexp-nth pr 0))))
+                                    (if (and slotlist (!= kind JSL-KIND-MACRO))
+                                        (store! err (jsl-fail! JSL-ERR-SLOT-LIST-ESCAPE name))
                                     (if (and (>= record 0) (= kind JSL-KIND-CALLABLE))
                                         (store! err (jsl-fail! JSL-ERR-RECORD-ESCAPE name))
                                     (if (and rest
@@ -2383,16 +2629,18 @@
                                                   (rd/sexp-sym (rd/sexp-nth pr 0)))
                                           (store! (field p ty) t)
                                           (store! (field p record) record)
+                                          (store! (field p slotlist) slotlist)
                                           (store! (field p rest) rest)
                                           (store! (field p lowered-off) (load lowered))
                                           (store! (field p lowered-width)
-                                                  (if (>= record 0)
-                                                      (jsl-record-flat-width record) 1))
+                                                  (if slotlist 0
+                                                    (if (>= record 0)
+                                                        (jsl-record-flat-width record) 1)))
                                           (store! lowered
                                                   (+ (load lowered)
                                                      (load (field p lowered-width))))
                                           (al-push! [JslParam] (field (jsl) params) (load p))
-                                          0))))))))
+                                          0)))))))))
                     (store! i (+ (load i) 1)))))
         (store! out n)
         (store! lowered-out (load lowered))
@@ -2489,6 +2737,114 @@
             (al-push! [JslRecordDecl] (field (jsl) records) (load r))
             JSL-OK))))))
 
+;; `(internal-slot Name storage-kind)` declares a globally named runtime storage capability. IDs
+;; are declaration-order products generated from the manifest; handwritten JSL uses names only.
+(defn jsl-read-method-family! [(form (ptr rd/Sexp))] (-> i64)
+  (block :done
+    (if (!= (rd/sexp-count form) 2)
+        (return-from :done (jsl-fail! JSL-ERR-BAD-METHOD-FAMILY
+                                      "internal-method-family")) 0)
+    (let [nameform (rd/sexp-nth form 1)]
+      (if (not (rd/sexp-sym? nameform))
+          (return-from :done (jsl-fail! JSL-ERR-BAD-METHOD-FAMILY
+                                        "internal-method-family")) 0)
+      (let [name (rd/sexp-sym nameform)]
+        (if (or (>= (jsl-method-family-find name) 0)
+                (or (>= (jsl-internal-slot-find name) 0)
+                    (or (>= (jsl-slot-list-find name) 0)
+                        (or (>= (jsl-record-find name) 0) (>= (jsl-find name) 0)))))
+            (return-from :done (jsl-fail! JSL-ERR-DUP-NAME name)) 0)
+        (let [(mut declaration) (zeroed JslMethodFamilyDecl)]
+          (store! (field declaration name) name)
+          (al-push! [JslMethodFamilyDecl] (field (jsl) methodfamilies) (load declaration))
+          JSL-OK)))))
+
+(defn jsl-read-internal-method! [(form (ptr rd/Sexp))] (-> i64)
+  (block :done
+    (if (!= (rd/sexp-count form) 2)
+        (return-from :done (jsl-fail! JSL-ERR-BAD-INTERNAL-METHOD "internal-method")) 0)
+    (let [nameform (rd/sexp-nth form 1)]
+      (if (not (rd/sexp-sym? nameform))
+          (return-from :done (jsl-fail! JSL-ERR-BAD-INTERNAL-METHOD "internal-method")) 0)
+      (let [name (rd/sexp-sym nameform)]
+        ;; Internal-method names occupy their own specification namespace. `[[Get]]` and the
+        ;; abstract operation `Get` are intentionally allowed to share a spelling.
+        (if (>= (jsl-internal-method-find name) 0)
+            (return-from :done (jsl-fail! JSL-ERR-DUP-NAME name)) 0)
+        (let [(mut declaration) (zeroed JslInternalMethodDecl)]
+          (store! (field declaration name) name)
+          (al-push! [JslInternalMethodDecl] (field (jsl) internalmethods) (load declaration))
+          JSL-OK)))))
+
+(defn jsl-read-internal-slot! [(form (ptr rd/Sexp))] (-> i64)
+  (block :done
+    (if (!= (rd/sexp-count form) 3)
+        (return-from :done (jsl-fail! JSL-ERR-BAD-INTERNAL-SLOT "internal-slot")) 0)
+    (let [nameform (rd/sexp-nth form 1) storageform (rd/sexp-nth form 2)]
+      (if (or (not (rd/sexp-sym? nameform)) (not (rd/sexp-sym? storageform)))
+          (return-from :done (jsl-fail! JSL-ERR-BAD-INTERNAL-SLOT "internal-slot")) 0)
+      (let [name (rd/sexp-sym nameform) spelling (rd/sexp-sym storageform)
+            storage (if (= spelling "js-value") JSL-SLOT-JS-VALUE
+                      (if (= spelling "boolean") JSL-SLOT-BOOLEAN
+                        (if (= spelling "spec-list") JSL-SLOT-SPEC-LIST -1)))]
+        (if (< storage 0)
+            (return-from :done (jsl-fail! JSL-ERR-BAD-INTERNAL-SLOT name)) 0)
+        (if (or (>= (jsl-internal-slot-find name) 0)
+                (or (>= (jsl-method-family-find name) 0)
+                (or (>= (jsl-slot-list-find name) 0)
+                    (or (>= (jsl-record-find name) 0) (>= (jsl-find name) 0)))))
+            (return-from :done (jsl-fail! JSL-ERR-DUP-NAME name)) 0)
+        (let [(mut declaration) (zeroed JslInternalSlotDecl)]
+          (store! (field declaration name) name)
+          (store! (field declaration storage) storage)
+          (al-push! [JslInternalSlotDecl] (field (jsl) internalslots) (load declaration))
+          JSL-OK)))))
+
+;; `(slot-list Name [Prototype Extensible ...])` declares one immutable compile-time value. The
+;; members are spec internal-slot names; their order is semantic because it becomes layout order.
+(defn jsl-read-slot-list! [(form (ptr rd/Sexp))] (-> i64)
+  (block :done
+    (if (!= (rd/sexp-count form) 3)
+        (return-from :done (jsl-fail! JSL-ERR-BAD-SLOT-LIST "slot-list")) 0)
+    (let [nameform (rd/sexp-nth form 1) slots (rd/sexp-nth form 2)]
+      (if (not (rd/sexp-sym? nameform))
+          (return-from :done (jsl-fail! JSL-ERR-BAD-NAME "slot-list")) 0)
+      (let [name (rd/sexp-sym nameform)]
+        (if (or (>= (jsl-slot-list-find name) 0)
+                (or (>= (jsl-method-family-find name) 0)
+                    (or (>= (jsl-record-find name) 0) (>= (jsl-find name) 0))))
+            (return-from :done (jsl-fail! JSL-ERR-DUP-NAME name)) 0)
+        (if (or (not (rd/sexp-vec? slots)) (= (rd/sexp-count slots) 0))
+            (return-from :done (jsl-fail! JSL-ERR-BAD-SLOT-LIST name)) 0)
+        (let [off (al-len [(slice u8)] (.slotnames (jsl)))
+              n (rd/sexp-count slots)
+              (mut i) 0]
+          (loop (if (>= (load i) n) (break)
+                  (let [slot (rd/sexp-nth slots (load i))]
+                    (if (not (rd/sexp-sym? slot))
+                        (return-from :done (jsl-fail! JSL-ERR-BAD-SLOT-LIST name)) 0)
+                    (let [slotname (rd/sexp-sym slot) (mut k) 0]
+                      (if (< (jsl-internal-slot-find slotname) 0)
+                          (return-from :done (jsl-fail! JSL-ERR-BAD-INTERNAL-SLOT slotname)) 0)
+                      (loop (if (>= (load k) (load i)) (break)
+                              (do (if (= slotname
+                                         (rd/sexp-sym (rd/sexp-nth slots (load k))))
+                                      (return-from :done
+                                        (jsl-fail! JSL-ERR-BAD-SLOT-LIST slotname)) 0)
+                                  (set! k (+ (load k) 1))))))
+                    (set! i (+ (load i) 1)))))
+          (set! i 0)
+          (loop (if (>= (load i) n) (break)
+                  (do (al-push! [(slice u8)] (field (jsl) slotnames)
+                                (rd/sexp-sym (rd/sexp-nth slots (load i))))
+                      (set! i (+ (load i) 1)))))
+          (let [(mut declaration) (zeroed JslSlotListDecl)]
+            (store! (field declaration name) name)
+            (store! (field declaration slots-off) off)
+            (store! (field declaration nslots) n)
+            (al-push! [JslSlotListDecl] (field (jsl) slotlists) (load declaration))
+            JSL-OK))))))
+
 ;; `:labels (Name)`. A label may only appear on a `macro`: a label is a control edge into the
 ;; caller's CFG and a control edge cannot cross a call boundary, so declaring one on a `builtin` is
 ;; refused rather than ignored.
@@ -2535,6 +2891,12 @@
       (if (not (rd/sexp-sym? head)) (return-from :done (jsl-fail! JSL-ERR-UNKNOWN-FORM "")) 0)
       (let [kw (rd/sexp-sym head)]
         (if (= kw "record") (return-from :done (jsl-read-record! form)) 0)
+        (if (= kw "internal-method-family")
+            (return-from :done (jsl-read-method-family! form)) 0)
+        (if (= kw "internal-method")
+            (return-from :done (jsl-read-internal-method! form)) 0)
+        (if (= kw "internal-slot") (return-from :done (jsl-read-internal-slot! form)) 0)
+        (if (= kw "slot-list") (return-from :done (jsl-read-slot-list! form)) 0)
         (if (jsl-unsupported-form? kw)
             (return-from :done (jsl-fail! JSL-ERR-UNSUPPORTED kw)) 0)
         (if (or (= kw "builtin") (or (= kw "macro") (= kw "callable"))) 0
@@ -2542,7 +2904,10 @@
       (let [nameform (rd/sexp-nth form 1)]
         (if (not (rd/sexp-sym? nameform)) (return-from :done (jsl-fail! JSL-ERR-BAD-NAME "")) 0)
         (let [name (rd/sexp-sym nameform)]
-          (if (>= (jsl-find name) 0) (return-from :done (jsl-fail! JSL-ERR-DUP-NAME name)) 0)
+          (if (or (>= (jsl-find name) 0)
+                  (or (>= (jsl-method-family-find name) 0)
+                      (or (>= (jsl-record-find name) 0) (>= (jsl-slot-list-find name) 0))))
+              (return-from :done (jsl-fail! JSL-ERR-DUP-NAME name)) 0)
           (let [n (rd/sexp-count form)
                 kind (let [head-name (rd/sexp-sym (rd/sexp-nth form 0))]
                        (if (= head-name "macro") JSL-KIND-MACRO
@@ -2581,12 +2946,29 @@
                                     (store! err (jsl-read-captures! v name (mut ncaptures)))
                                     (store! err (jsl-fail! JSL-ERR-BAD-KEY key)))
                               (if (= key "ret")
-                                  (let [t (jsl-type-of v) record (jsl-record-type-of v)]
+                                  (let [t (jsl-type-of v) record (jsl-record-type-of v)
+                                        slotlist (jsl-slot-list-type? v)]
+                                    (if slotlist
+                                        (store! err (jsl-fail! JSL-ERR-SLOT-LIST-ESCAPE name))
                                     (if (and (= t TY-NO-ID) (< record 0))
                                         (store! err (jsl-fail! JSL-ERR-BAD-TYPE name))
-                                        (if (and (>= record 0) (= kind JSL-KIND-CALLABLE))
+                                        ;; A RECORD MAY NOT BE RETURNED ACROSS A CALL. It may be
+                                        ;; PASSED across one -- `ValidateAndApplyPropertyDescriptor`,
+                                        ;; `StringDefineOwnProperty` and `DefinePropertyRecord` are
+                                        ;; builtins that take one today -- because an argument is
+                                        ;; flattened into the caller's outgoing slots. Coming back
+                                        ;; is the direction the result-area ABI does not carry: the
+                                        ;; callee has one hidden result pointer and a flat result
+                                        ;; vector, and a record's fields are not in it. Retagging
+                                        ;; `OrdinaryGetOwnProperty`, `StringGetOwnProperty` or
+                                        ;; `CompletePropertyDescriptor` as builtins reached
+                                        ;; selection and died there with BER-ENCODING and an
+                                        ;; out-of-range machine index rather than a diagnosis. This
+                                        ;; is that diagnosis. Lift it by giving the ABI a record
+                                        ;; result, not by relaxing the check.
+                                        (if (and (>= record 0) (!= kind JSL-KIND-MACRO))
                                             (store! err (jsl-fail! JSL-ERR-RECORD-ESCAPE name))
-                                            (do (store! ret t) (store! ret-record record) 0)))
+                                            (do (store! ret t) (store! ret-record record) 0))))
                                     0)
                                 (if (= key "transitioning")
                                     (if (jsl-bool-of v (mut transitioning)) 0

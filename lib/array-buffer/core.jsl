@@ -52,6 +52,97 @@
           (ThrowTypeError "ArrayBuffer is detached")
           (%Box (%InternalIndex arrayBuffer)))))
 
+;; Private encodings of the specification's integer TypedArray element-type values. The first two
+;; are the existing Int8Array/Uint8Array layout kinds; the wider values are compile-time operation
+;; discriminators, not object-layout tags. Keeping interpretation behind these named operations
+;; prevents DataView callers from duplicating a switch over representation numbers.
+(macro IntegerElementSize :params [(elementType int)] :ret int
+  (if (if (%Eq elementType 200) true (%Eq elementType 201)) 1
+      (if (if (%Eq elementType 202) true (%Eq elementType 203)) 2
+          (if (if (%Eq elementType 204) true (%Eq elementType 205)) 4 0))))
+
+(macro IntegerElementTypeIsUnsigned :params [(elementType int)] :ret bool
+  (if (%Eq elementType 201) true
+      (if (%Eq elementType 203) true (%Eq elementType 205))))
+
+;; https://tc39.es/ecma262/#sec-getvaluefrombuffer. This is the fixed, non-shared integer branch:
+;; it reads the canonical byte block and performs RawBytesToNumeric's endian assembly and signed
+;; two's-complement interpretation. Float, BigInt, shared-memory, and detachable-buffer branches
+;; remain explicit deviations rather than being approximated through Number arithmetic.
+(builtin GetValueFromBuffer
+  :spec "ecma262@ed463bc10dbeaad0410ce67e541a77ea8e9900a5#sec-getvaluefrombuffer"
+  :spec-name "GetValueFromBuffer"
+  :status partial
+  :deviation "Only fixed non-shared ArrayBuffers and the six integer element types are represented; Float16/32/64, BigInt64/BigUint64, shared-memory ordering, and detachment remain unimplemented."
+  :params [(arrayBuffer dyn) (byteIndex int) (elementType int)
+           (isTypedArray bool) (order int) (isLittleEndian bool)] :ret dyn
+  (let [(elementSize (IntegerElementSize elementType))]
+    (if (%Eq elementSize 0)
+        (ThrowTypeError "Unsupported ArrayBuffer element type")
+        (if (IsDetachedBuffer arrayBuffer)
+            (ThrowTypeError "ArrayBuffer is detached")
+            (let [(bytes (%InternalTarget arrayBuffer))
+                  (unsignedValue
+                    (loop [(cursor 0) (value 0)]
+                      (if (%Eq cursor elementSize)
+                          value
+                          (let [(stored (%ArrayLoad bytes (%Add byteIndex cursor)))
+                                (byte (if (%IsUndefined stored) 0 (%UnboxInt stored)))
+                                (shift (%Mul (if isLittleEndian
+                                                cursor
+                                                (%Sub (%Sub elementSize 1) cursor))
+                                             8))
+                                ;; IR bitwise operations intentionally implement JavaScript's
+                                ;; signed 32-bit operators. RawBytesToNumeric's Uint32 result is a
+                                ;; mathematical Number up to 2^32-1, so assemble with exact integer
+                                ;; multiplication instead of sign-extending a bit-31 shift.
+                                (factor
+                                  (if (%Eq shift 0) 1
+                                      (if (%Eq shift 8) 256
+                                          (if (%Eq shift 16) 65536 16777216))))]
+                            (recur (%Add cursor 1)
+                                   (%Add value (%Mul byte factor)))))))]
+              (if (IntegerElementTypeIsUnsigned elementType)
+                  (%Box unsignedValue)
+                  (let [(signBoundary
+                          (if (%Eq elementSize 1) 128
+                              (if (%Eq elementSize 2) 32768 2147483648)))
+                        (modulus
+                          (if (%Eq elementSize 1) 256
+                              (if (%Eq elementSize 2) 65536 4294967296)))]
+                    (%Box (if (%Le signBoundary unsignedValue)
+                              (%Sub unsignedValue modulus)
+                              unsignedValue)))))))))
+
+;; https://tc39.es/ecma262/#sec-setvalueinbuffer. NumericToRawBytes for integer element types is
+;; modulo-2^32 conversion followed by byte extraction, which ToUint32 plus unsigned shifts provides
+;; directly. Writes target the same opaque byte block consumed by TypedArray and DataView reads.
+(builtin SetValueInBuffer
+  :spec "ecma262@ed463bc10dbeaad0410ce67e541a77ea8e9900a5#sec-setvalueinbuffer"
+  :spec-name "SetValueInBuffer"
+  :status partial
+  :deviation "Only fixed non-shared ArrayBuffers and the six integer element types are represented; Float16/32/64, BigInt64/BigUint64, shared-memory event ordering, and detachment remain unimplemented."
+  :transitioning true
+  :params [(arrayBuffer dyn) (byteIndex int) (elementType int) (value dyn)
+           (isTypedArray bool) (order int) (isLittleEndian bool)] :ret dyn
+  (let [(elementSize (IntegerElementSize elementType))]
+    (if (%Eq elementSize 0)
+        (ThrowTypeError "Unsupported ArrayBuffer element type")
+        (if (IsDetachedBuffer arrayBuffer)
+            (ThrowTypeError "ArrayBuffer is detached")
+            (let [(bytes (%InternalTarget arrayBuffer))
+                  (bits (ToUint32 value))]
+              (loop [(cursor 0)]
+                (if (%Eq cursor elementSize)
+                    undefined
+                    (let [(shift (%Mul (if isLittleEndian
+                                          cursor
+                                          (%Sub (%Sub elementSize 1) cursor))
+                                       8))
+                          (byte (%BitAnd (%Ushr bits shift) 255))
+                          (stored (%ArrayStore bytes (%Add byteIndex cursor) (%Box byte)))]
+                      (recur (%Add cursor 1))))))))))
+
 ;; ToIndex owns ECMAScript conversion and validation. This helper owns only the fixed-length
 ;; implementation's smaller addressable storage range and raw machine-index representation.
 (macro ToArrayBufferLength :transitioning true :params [(value dyn)] :ret int
@@ -77,10 +168,10 @@
         (sized (%ArrayResize bytes length object))
         (initialized (%InternalInit object bytes 105))
         (lengthInitialized (%InternalSetIndex object length))
-        (prototype (SetObjectPrototype object (BuiltinPrototypeValue 25)))]
+        (prototype (InitializeObjectPrototype object (BuiltinPrototypeValue 25)))]
     object))
 
-(macro ConstructArrayBuffer :transitioning true :params [(lengthValue dyn)] :ret dyn
+(builtin ConstructArrayBuffer :transitioning true :params [(lengthValue dyn)] :ret dyn
   (let [(initialized (ArrayBufferConstructorValue))
         (length (ToArrayBufferLength lengthValue))]
     (NewArrayBuffer length)))
@@ -90,7 +181,7 @@
     (ArrayBufferByteLength this 0)))
 
 (callable ArrayBufferIsView1 :params [(value dyn)] :ret dyn
-  (%Box (IsTypedArray value)))
+  (%Box (if (IsTypedArray value) true (IsDataView value))))
 
 (callable ArrayBufferResizableGetter0 :transitioning true :params [] :ret dyn
   (let [(required (RequireInternalSlot this (InternalSlotArrayBufferData)))]
@@ -106,7 +197,7 @@
 
 (callable ArrayBufferSpeciesGetter0 :params [] :ret dyn this)
 
-(macro InstallBuiltinGetter :params [(target dyn) (key dyn) (getter dyn) (name dyn)] :ret dyn
+(macro InstallBuiltinGetter :transitioning true :params [(target dyn) (key dyn) (getter dyn) (name dyn)] :ret dyn
   (let [(getterLength (%DefinePropertyValue getter (ToPropertyKey "length") (%Box 0)))
         (getterLengthMarked (%SetPropertyAttributes getter (ToPropertyKey "length") 4))
         (getterName (%DefinePropertyValue getter (ToPropertyKey "name") name))
