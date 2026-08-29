@@ -25,6 +25,7 @@
 ;; `:otherwise`, `loop` and `class` all report JSL-ERR-UNSUPPORTED naming the form. There is no
 ;; path by which a `.jsl` file using one of them produces a graph.
 (module jsl)
+(import "coil.fmt" :use *)
 (import "coil.primitive" :as primitive)
 
 (import "coil.alloc"     :use * :as alloc)
@@ -3111,6 +3112,9 @@
 ;; which appear in every printed graph and every golden hash. A library that reordered itself when
 ;; a file was renamed would make a golden diff mean nothing. Paths are used verbatim and are
 ;; therefore relative to the process working directory, which is the repository root under the gate.
+(extern clock_gettime_nsec_np :cc c [i32] (-> i64))
+(defn jsl-profile-now [] (-> i64) (clock_gettime_nsec_np (cast i32 4)))
+
 (defn jsl-load-index! [(path (slice u8))] (-> i64)
   (let [r (read-file (malloc-allocator) path)]
     (match r
@@ -3135,4 +3139,11 @@
           ; is exactly how that happens in practice.
           (if (!= (load err) JSL-OK) (load err)
             (if (= (load loaded) 0) (jsl-fail! JSL-ERR-EMPTY-INDEX path)
-              (jsl-check))))))))
+              ;; Split so a cold compile can say whether reading and parsing the library text or
+              ;; checking it is the cost. Together they are the largest single item in a cold
+              ;; compile of a small program, and they are identical work for every program.
+              (let [check-start (jsl-profile-now)
+                    result (jsl-check)]
+                (fmt (stderr) "AOTK_TIMING phase=jsl_library_check ns={d}\n"
+                     (- (jsl-profile-now) check-start))
+                result))))))))
