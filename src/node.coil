@@ -1561,7 +1561,26 @@
         0)))
 
 ;; Replace every use of `old` with `new`, then kill `old`.
+;; SIMPLE'S INVARIANT: after any rewrite, every node whose peephole result may have changed is on
+;; the worklist -- "for all Nodes, either they are on the worklist OR no peephole applies"
+;; (IterPeeps.java). Simple maintains it by pushing, at every rewrite, the changed node's uses, the
+;; replacement, the replacement's uses, and the old node's INPUTS, which have gained a new user.
+;;
+;; This used to push only the old node, and only when it was pinned. The missing edges are why
+;; `g-fold-proven-core!` swept the whole node array in index order until nothing changed rather
+;; than draining a worklist: its own comment records the failure it was working around -- a
+;; peephole at index j collapsing a region that a phi at index i < j hangs off, with that phi never
+;; revisited, surviving as a one-armed phi that `v-check-phi` rejects as VERR-PHI-REGION.
+;;
+;; Re-queueing completely is the fix for that, not sweeping. The inputs go on BEFORE the rewire,
+;; because after it `old` no longer has users to walk back through.
 (defn n-subsume! [(old i64) (new i64)] (-> i64)
+  (let [(mut i) 0]
+    (loop (if (>= (load i) (n-nins old))
+              (break)
+              (do (let [d (n-in old (load i))]
+                    (if (and (>= d 0) (not (n-dead? d))) (do (wl-push! d) 0) 0))
+                  (set! i (+ (load i) 1))))))
   (loop (let [k (- (n-nouts old) 1)]
           (if (< k 0)
               (break)
@@ -1575,6 +1594,13 @@
   ;; External builders retain node ids for explicitly kept lexical values. Rewire all graph users,
   ;; but leave a pinned old value alive until its owner releases that id; `jl-collect!` will then
   ;; remove it if no later use was built. Killing it here would invalidate the external binding.
+  ;; Everything that now reads the replacement -- which includes every user just rewired off
+  ;; `old`, so this is Simple's "all outputs of the changing node". The replacement itself is NOT
+  ;; pushed: Simple's "free go again" is already covered here, because `n-peephole` recurses into
+  ;; the replacement on the idealize path and re-enters GVN on the others. Deps are moved off the
+  ;; OLD node, which is where they were recorded, and which is what Simple does.
+  (if (not (n-dead? new)) (do (wl-push-outs! new) 0) 0)
+  (n-move-deps! old)
   (if (= (n-keeps old) 0) (n-kill! old) (wl-push! old))
   0)
 
@@ -5552,6 +5578,21 @@
 ;; that. Progress is monotone (types only fall, nodes only die), so this terminates; the round cap
 ;; is a backstop against a non-monotone peephole rather than an expected exit.
 (defn g-fold-proven-core! [(retain-final-snapshot bool)] (-> i64)
+  ;; ONE ORDERED SEEDING PASS, THEN A WORKLIST DRAIN.
+  ;;
+  ;; This used to re-sweep the whole node array in index order until a round changed nothing --
+  ;; five passes over 39,703 nodes on the DataView benchmark, 198,515 index steps, and 81,143
+  ;; peepholes over ~40,000 nodes because a node could be re-peepholed once per round.
+  ;;
+  ;; The sweeps existed because `n-subsume!` did not re-queue what a rewrite invalidated, so a
+  ;; phi at a lower index could be left malformed by a collapse at a higher one. It re-queues
+  ;; completely now -- uses, defs, the replacement and its uses -- which is Simple's invariant:
+  ;; "for all Nodes, either they are on the worklist OR no peephole applies" (IterPeeps.java).
+  ;; With that invariant the drain IS the fixpoint, and it is what Simple's `iterate` does: pop,
+  ;; peephole, push the neighbourhood, repeat until dry. No rounds, no index order.
+  ;;
+  ;; The first pass stays, and stays in index order: it is the seed that puts the initially
+  ;; interesting nodes on the worklist, not a fixpoint step.
   (let [(mut rounds) 0
         (mut changed) true]
     (loop (if (not (load changed))
@@ -5609,7 +5650,12 @@
                 (if (> (load rounds) 1000)
                     (do (panic-corrupt "g-fold-proven!: folding did not converge") 0)
                     0)
+                ;; The seeding pass has run. Everything a rewrite invalidated is queued, so the
+                ;; drain finishes the job; a second ordered sweep would only re-ask questions the
+                ;; worklist already carries.
+                (set! changed false)
                 0)))
+    (wl-drain!)
     (load rounds)))
 
 (defn g-fold-proven! [] (-> i64)
