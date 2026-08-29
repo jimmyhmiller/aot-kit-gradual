@@ -68,33 +68,33 @@
          (and (or (not phi) value)
               (and (or (not merge) control)
                    (or (not commutes) binary))))))
-;; Enough nodes to force spilling at one register, few enough that 200 cases stay quick.
+;;; Enough nodes to force spilling at one register, few enough that 200 cases stay quick.
 (const MAX-OPS i64 24)
-;; The generous register count, and the ceiling of the floor search.
+;;; The generous register count, and the ceiling of the floor search.
 (const WIDE-REGS i64 8)
-;; The three shifts join the set for the same reason the bitwise operators did: total on integers,
-;; no trap, no path out of the integer domain. A shift count is masked identically by both sides --
-;; the evaluator and AArch64 implement the same OP -- so a disagreement about masking would be a
-;; real finding rather than a modelling gap.
+;;; The three shifts join the set for the same reason the bitwise operators did: total on integers,
+;;; no trap, no path out of the integer domain. A shift count is masked identically by both sides --
+;;; the evaluator and AArch64 implement the same OP -- so a disagreement about masking would be a
+;;; real finding rather than a modelling gap.
 (const PROP-OPS i64 8)
 
-;; Build a straight-line integer expression over `arg` and return its Return node.
-;;
-;; EVERY NODE MUST BE REACHABLE FROM THE RETURN. The graph verifier reports an unreferenced node as
-;; a LEAK and rejects the graph, so a generator that builds a pool and returns only its last entry
-;; produces nothing but verifier failures. The chain below is what makes reachability structural:
-;; each new node takes the RUNNING VALUE as its left operand, so walking left edges back from the
-;; final node visits everything the generator ever made.
-;;
-;; The right operand is any earlier value. That is where the register pressure comes from -- a value
-;; picked by a much later node stays live across everything in between, which is exactly the shape
-;; that makes the allocator spill.
-;; One diamond: `if (a < b) a+b else a-b`, merged by a Phi. Returns the Phi, whose first input is
-;; the merge Region -- the caller reads it back with `n-in` and makes it the new control.
-;;
-;; This is what reaches the scheduler, the CFG and Phi handling. A straight-line ADD/SUB chain
-;; touches none of them, which is why the first version of this property saturated at 6.5% of the
-;; backend's edges no matter how long it fuzzed.
+;;; Build a straight-line integer expression over `arg` and return its Return node.
+;;;
+;;; EVERY NODE MUST BE REACHABLE FROM THE RETURN. The graph verifier reports an unreferenced node as
+;;; a LEAK and rejects the graph, so a generator that builds a pool and returns only its last entry
+;;; produces nothing but verifier failures. The chain below is what makes reachability structural:
+;;; each new node takes the RUNNING VALUE as its left operand, so walking left edges back from the
+;;; final node visits everything the generator ever made.
+;;;
+;;; The right operand is any earlier value. That is where the register pressure comes from -- a value
+;;; picked by a much later node stays live across everything in between, which is exactly the shape
+;;; that makes the allocator spill.
+;;; One diamond: `if (a < b) a+b else a-b`, merged by a Phi. Returns the Phi, whose first input is
+;;; the merge Region -- the caller reads it back with `n-in` and makes it the new control.
+;;;
+;;; This is what reaches the scheduler, the CFG and Phi handling. A straight-line ADD/SUB chain
+;;; touches none of them, which is why the first version of this property saturated at 6.5% of the
+;;; backend's edges no matter how long it fuzzed.
 (defn emit-branch! [(ctrl i64) (a i64) (b i64)] (-> i64)
   (let [cond (n-new3 (Lt) NO-NODE a b)
         arms (n-if-arms! (n-peephole (n-new2 (If) ctrl cond)))
@@ -108,7 +108,7 @@
       (n-add-def! phi (n-new3 (Sub) NO-NODE a b))
       phi)))
 
-;; Copy the encoded bytes onto an executable page and call them with one argument.
+;;; Copy the encoded bytes onto an executable page and call them with one argument.
 (defn native1 [(arg i64)] (-> i64)
   (let [mem (mmap (cast (ptr u8) 0) 4096 3 (host-native-mmap-flags) -1 0)]
     (assert (!= (cast i64 mem) -1))
@@ -125,7 +125,7 @@
         (assert (= (munmap mem 4096) 0))
         result))))
 
-;; The graph's single OPTAG-ARG node.
+;;; The graph's single OPTAG-ARG node.
 (defn find-arg [] (-> i64)
   (let [n (n-count)
         (mut i) 0
@@ -138,9 +138,9 @@
                 0)))
     (load found)))
 
-;; How many branch steps this byte string will actually produce. Reported by `classify` below,
-;; because inferring which arms fire from a coverage number is exactly the mistake that let the
-;; branch arm sit dead through 31,000 cases: a flat number looks the same either way.
+;;; How many branch steps this byte string will actually produce. Reported by `classify` below,
+;;; because inferring which arms fire from a coverage number is exactly the mistake that let the
+;;; branch arm sit dead through 31,000 cases: a flat number looks the same either way.
 (defn branch-count [(ops (slice u8))] (-> i64)
   (let [limit (if (> (slice-len ops) MAX-OPS) MAX-OPS (slice-len ops))
         (mut i) 0
@@ -156,18 +156,18 @@
 ; ============================================================================
 ; Floats
 ; ============================================================================
-;; Float arithmetic is where a peephole is most tempting and most often wrong: `x*0 -> 0` is false
-;; for NaN and for negative x (which gives -0.0), `x+0 -> x` is false for x = -0.0, and `x/x -> 1`
-;; is false for 0, Inf and NaN. All four are rewrites a reasonable person writes.
-;;
-;; No trap to worry about either -- IEEE division is total, so `x/0` is an infinity rather than a
-;; fault, which is why DIV appears here and not in the integer operator set.
+;;; Float arithmetic is where a peephole is most tempting and most often wrong: `x*0 -> 0` is false
+;;; for NaN and for negative x (which gives -0.0), `x+0 -> x` is false for x = -0.0, and `x/x -> 1`
+;;; is false for 0, Inf and NaN. All four are rewrites a reasonable person writes.
+;;;
+;;; No trap to worry about either -- IEEE division is total, so `x/0` is an infinity rather than a
+;;; fault, which is why DIV appears here and not in the integer operator set.
 (defn flt-op [(k i64)] (-> Op)
   (if (= k 0) (Add) (if (= k 1) (Sub) (if (= k 2) (Mul) (Div)))))
 (const FLT-OPS i64 4)
 
-;; The identities an optimiser is tempted to shortcut, and the values those shortcuts break on.
-;; -0.0 is spelled by its bit pattern rather than a literal so the reader cannot fold the sign away.
+;;; The identities an optimiser is tempted to shortcut, and the values those shortcuts break on.
+;;; -0.0 is spelled by its bit pattern rather than a literal so the reader cannot fold the sign away.
 (defn flt-const [(k i64)] (-> i64)
   (if (= k 0) (t-flt-con 0.0)
     (if (= k 1) (t-flt-bits -9223372036854775808)
@@ -176,27 +176,27 @@
           (if (= k 4) (t-flt-con 2.0) (t-flt-con 0.5)))))))
 (const FLT-CONSTS i64 6)
 
-;; NaN read straight off the encoding: exponent all ones, mantissa nonzero.
-;;
-;; The obvious `(!= x x)` is unavailable -- coil's `f64` implements no `Eq` -- and the sign bit
-;; makes `/` and `%` on the raw pattern unreliable, so mask it off first.
+;;; NaN read straight off the encoding: exponent all ones, mantissa nonzero.
+;;;
+;;; The obvious `(!= x x)` is unavailable -- coil's `f64` implements no `Eq` -- and the sign bit
+;;; makes `/` and `%` on the raw pattern unreliable, so mask it off first.
 (const F64-EXP-MASK i64 9218868437227405312)   ; 0x7ff0000000000000
 (const F64-MANT-MASK i64 4503599627370495)     ; 0x000fffffffffffff
 (defn nan-bits? [(b i64)] (-> bool)
   (and (= (& b F64-EXP-MASK) F64-EXP-MASK) (!= (& b F64-MANT-MASK) 0)))
 
-;; Equal AS A RESULT VALUE. Bit equality everywhere except NaN, because a NaN payload is not
-;; observable to a JavaScript program while the sign of a zero is -- so -0.0 and 0.0 must NOT
-;; compare equal here, and two differently-encoded NaNs must.
+;;; Equal AS A RESULT VALUE. Bit equality everywhere except NaN, because a NaN payload is not
+;;; observable to a JavaScript program while the sign of a zero is -- so -0.0 and 0.0 must NOT
+;;; compare equal here, and two differently-encoded NaNs must.
 (defn flt-same? [(a i64) (b i64)] (-> bool)
   (if (and (nan-bits? a) (nan-bits? b)) true (= a b)))
 
-;; A float diamond: `if (a < b) a+b else a-b`, merged by a float Phi.
-;;
-;; The integer diamonds never reach this. FP values allocate from a different register bank, so a
-;; Phi merging two float arms is where a spill slot and a merge have to agree about a location in a
-;; class the integer path never touches -- which is the rule the deleted B05 gate policed as a
-;; negative test ("cross-register-class: named liveness rejection").
+;;; A float diamond: `if (a < b) a+b else a-b`, merged by a float Phi.
+;;;
+;;; The integer diamonds never reach this. FP values allocate from a different register bank, so a
+;;; Phi merging two float arms is where a spill slot and a merge have to agree about a location in a
+;;; class the integer path never touches -- which is the rule the deleted B05 gate policed as a
+;;; negative test ("cross-register-class: named liveness rejection").
 (defn emit-flt-branch! [(ctrl i64) (a i64) (b i64)] (-> i64)
   (let [cond (n-new3 (Lt) NO-NODE a b)
         arms (n-if-arms! (n-peephole (n-new2 (If) ctrl cond)))
@@ -269,9 +269,9 @@
   ;; Infinity is not NaN: exponent all ones, mantissa zero.
   (assert (not (nan-bits? 9218868437227405312))))
 
-;; The same page trick as `native1`, but through the FLOAT calling convention: the argument
-;; arrives in d0 and the result comes back in d0, not x0. Casting to the integer signature would
-;; read the wrong register and quietly compare garbage.
+;;; The same page trick as `native1`, but through the FLOAT calling convention: the argument
+;;; arrives in d0 and the result comes back in d0, not x0. Casting to the integer signature would
+;;; read the wrong register and quietly compare garbage.
 (defn native1-flt [(bits i64)] (-> i64)
   (let [mem (mmap (cast (ptr u8) 0) 4096 3 (host-native-mmap-flags) -1 0)]
     (assert (!= (cast i64 mem) -1))
@@ -314,13 +314,13 @@
   (assert (host-native-encode-checked!))
   (native1-flt bits))
 
-;; EVERY GENERATOR ARM MUST ACTUALLY FIRE.
-;;
-;; This exists because one did not. The branch step was originally chosen from a byte's TOP two
-;; bits, and the `(slice u8)` generator produces printable bytes, so the diamond code was dead
-;; through 31,000 cases while the coverage number sat still and read as a ceiling. `classify` would
-;; be the natural guard, but its buckets are not printed by `coil test` or `--verbose`, so the
-;; distribution is not observable from a run. A structural assertion is.
+;;; EVERY GENERATOR ARM MUST ACTUALLY FIRE.
+;;;
+;;; This exists because one did not. The branch step was originally chosen from a byte's TOP two
+;;; bits, and the `(slice u8)` generator produces printable bytes, so the diamond code was dead
+;;; through 31,000 cases while the coverage number sat still and read as a ceiling. `classify` would
+;;; be the natural guard, but its buckets are not printed by `coil test` or `--verbose`, so the
+;;; distribution is not observable from a run. A structural assertion is.
 (defn graph-has-op? [(op i64)] (-> bool)
   (let [n (n-count)
         (mut i) 0
@@ -333,35 +333,35 @@
                 0)))
     (load found)))
 
-;; A CALL NEEDS MORE REGISTERS THAN WIDE-REGS. Measured: the smallest count that colours this
-;; shape is 11, because a call pins argument and return registers by ABI on top of everything the
-;; caller keeps live across it. Searching to 8 made the precondition unsatisfiable and the property
-;; vacuous -- 200 of 200 cases rejected, which the runner reported as a warning rather than letting
-;; it pass silently.
+;;; A CALL NEEDS MORE REGISTERS THAN WIDE-REGS. Measured: the smallest count that colours this
+;;; shape is 11, because a call pins argument and return registers by ABI on top of everything the
+;;; caller keeps live across it. Searching to 8 made the precondition unsatisfiable and the property
+;;; vacuous -- 200 of 200 cases rejected, which the runner reported as a warning rather than letting
+;;; it pass silently.
 (const CALL-WIDE-REGS i64 16)
 ; ============================================================================
 ; The heap
 ; ============================================================================
-;; TWO OBJECTS OF THE SAME SHAPE, which is the case alias analysis has to get right and the only one
-;; that can be got wrong. Their field accesses share an alias class, so nothing distinguishes them
-;; but the allocations themselves: an optimiser that folds a load through a store must prove the two
-;; pointers are distinct, and one that reorders a store past a load must prove they are not. Both
-;; directions are wrong on the same program if the reasoning is wrong.
-;;
-;; NO NATIVE SIDE HERE. Memory arrives as an argument (`mk-mem-in`), so executing an allocating
-;; program from a raw page means supplying a heap pointer in the right slot, which is a different
-;; ABI question from the one this property is about. The optimiser is the target: `iterate!` folds,
-;; commons and eliminates memory operations, and every one of those is a rewrite the graph verifier
-;; will happily accept while being wrong. Interpreting before and after is what catches it.
+;;; TWO OBJECTS OF THE SAME SHAPE, which is the case alias analysis has to get right and the only one
+;;; that can be got wrong. Their field accesses share an alias class, so nothing distinguishes them
+;;; but the allocations themselves: an optimiser that folds a load through a store must prove the two
+;;; pointers are distinct, and one that reorders a store past a load must prove they are not. Both
+;;; directions are wrong on the same program if the reasoning is wrong.
+;;;
+;;; NO NATIVE SIDE HERE. Memory arrives as an argument (`mk-mem-in`), so executing an allocating
+;;; program from a raw page means supplying a heap pointer in the right slot, which is a different
+;;; ABI question from the one this property is about. The optimiser is the target: `iterate!` folds,
+;;; commons and eliminates memory operations, and every one of those is a rewrite the graph verifier
+;;; will happily accept while being wrong. Interpreting before and after is what catches it.
 (defn heap-store [(alias i64) (mem i64) (ptr i64) (v i64)] (-> i64)
   (n-new4 (Store alias) NO-NODE mem ptr v))
 (defn heap-load [(alias i64) (mem i64) (ptr i64)] (-> i64)
   (n-new3 (Load alias) NO-NODE mem ptr))
 
-;; NOT `find-arg`. A heap program has TWO arguments -- the integer and the memory that
-;; `mk-mem-in` threads in -- and `find-arg` returns whichever OPTAG-ARG it meets first. Binding an
-;; integer into the memory argument leaves the evaluator with no heap and it stops, which is what
-;; the first version of this property reported as a crash on every input.
+;;; NOT `find-arg`. A heap program has TWO arguments -- the integer and the memory that
+;;; `mk-mem-in` threads in -- and `find-arg` returns whichever OPTAG-ARG it meets first. Binding an
+;;; integer into the memory argument leaves the evaluator with no heap and it stops, which is what
+;;; the first version of this property reported as a crash on every input.
 (defn find-int-arg [] (-> i64)
   (let [n (n-count)
         (mut i) 0
@@ -380,11 +380,11 @@
 ; ============================================================================
 ; Arrays
 ; ============================================================================
-;; An array is an allocation the runtime treats specially -- marked, indexed, length-carrying -- so
-;; it reaches OPTAG-ARRAYMARK, OPTAG-ARRAYSTORE, OPTAG-ARRAYLOAD, OPTAG-ARRAYLEN and the boxing that indexed
-;; storage requires, none of which the object property touches. Storing at GENERATED indices is the
-;; part that matters: the length is a function of the largest index written, so an optimiser that
-;; reorders or drops a store changes the answer.
+;;; An array is an allocation the runtime treats specially -- marked, indexed, length-carrying -- so
+;;; it reaches OPTAG-ARRAYMARK, OPTAG-ARRAYSTORE, OPTAG-ARRAYLOAD, OPTAG-ARRAYLEN and the boxing that indexed
+;;; storage requires, none of which the object property touches. Storing at GENERATED indices is the
+;;; part that matters: the length is a function of the largest index written, so an optimiser that
+;;; reorders or drops a store changes the answer.
 (defn build-array-program! [(ops (slice u8))] (-> i64)
   (shape-reset!)
   (let [shape (shape-transition SHAPE-ROOT "keep" (t-int))
@@ -417,15 +417,15 @@
 ; ============================================================================
 ; Rejection is behaviour too
 ; ============================================================================
-;; EVERY PROPERTY ABOVE GENERATES PROGRAMS THE BACKEND ACCEPTS, so none of them reach the code that
-;; refuses one -- the verifier's rejection paths, the failure naming, and the atomicity that clears
-;; published bytes. That is a large region, and the deleted gates covered it deliberately:
-;; "malformed graph is distinct from unsupported and clears old bytes",
-;; "unsupported opcode is named before code publication".
-;;
-;; The law: a program the backend cannot compile is refused BY NAME, and nothing is published. A
-;; backend that quietly emits something for input it does not understand is the defect this catches
-;; -- which is not hypothetical here, since exactly that was found and fixed in the legacy selector.
+;;; EVERY PROPERTY ABOVE GENERATES PROGRAMS THE BACKEND ACCEPTS, so none of them reach the code that
+;;; refuses one -- the verifier's rejection paths, the failure naming, and the atomicity that clears
+;;; published bytes. That is a large region, and the deleted gates covered it deliberately:
+;;; "malformed graph is distinct from unsupported and clears old bytes",
+;;; "unsupported opcode is named before code publication".
+;;;
+;;; The law: a program the backend cannot compile is refused BY NAME, and nothing is published. A
+;;; backend that quietly emits something for input it does not understand is the defect this catches
+;;; -- which is not hypothetical here, since exactly that was found and fixed in the legacy selector.
 (defn unsupported-op [(k i64)] (-> Op)
   (if (= k 0) (StringConcat)
     (if (= k 1) (PropLoad 0)
@@ -501,15 +501,15 @@
 ; ============================================================================
 ; Strings
 ; ============================================================================
-;; A WHOLE SUBSYSTEM none of the generators above can enter. `src/jsstring.coil` and the string
-;; opcodes are reached by no arithmetic, heap, array, loop or call program, so every edge in them
-;; has been dark for this entire test file.
-;;
-;; The programs are built from interned constants and the length/concat/equality operators, and the
-;; law is the optimiser one: folding a concatenation or commoning two equal strings must not change
-;; what the program computes. String folding is a classic place to get it wrong, because equal
-;; CONTENT and identical IDENTITY are different questions and an interning table makes them look
-;; like the same one.
+;;; A WHOLE SUBSYSTEM none of the generators above can enter. `src/jsstring.coil` and the string
+;;; opcodes are reached by no arithmetic, heap, array, loop or call program, so every edge in them
+;;; has been dark for this entire test file.
+;;;
+;;; The programs are built from interned constants and the length/concat/equality operators, and the
+;;; law is the optimiser one: folding a concatenation or commoning two equal strings must not change
+;;; what the program computes. String folding is a classic place to get it wrong, because equal
+;;; CONTENT and identical IDENTITY are different questions and an interning table makes them look
+;;; like the same one.
 (defn jss-of [(k i64)] (-> i64)
   (if (= k 0) (jss-from-utf8! "")
     (if (= k 1) (jss-from-utf8! "a")
