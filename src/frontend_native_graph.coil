@@ -64,6 +64,7 @@
 (const FNG-TYPEDARRAY i64 -24)
 (const FNG-CALLABLE i64 -25)
 (const FNG-PROPERTY-OBJECT i64 -26)
+(const FNG-INTRINSIC-DATAVIEW i64 -27)
 (const FNG-JUMP-BREAK i64 0)
 (const FNG-JUMP-CONTINUE i64 1)
 (const FNG-JUMP-THROW i64 2)
@@ -95,6 +96,9 @@
 (defstruct FngContext
   [(frontend (ptr NativeFrontend))
    (values (ptr (ArrayList i64)))
+   ;; Compiler-side lexical storage is not an IR def-use edge. Every node id published there is
+   ;; retained in this function-scoped root list until graph construction for the function ends.
+   (value-roots (ptr (ArrayList i64)))
    (value-types (ptr (ArrayList i64)))
    (functions (ptr (ArrayList i64)))
    (prototypes (ptr (ArrayList i64)))
@@ -124,6 +128,7 @@
 
 (defn fng-context [(frontend (ptr NativeFrontend))
                    (values (ptr (ArrayList i64)))
+                   (value-roots (ptr (ArrayList i64)))
                    (value-types (ptr (ArrayList i64)))
                    (functions (ptr (ArrayList i64)))
                    (prototypes (ptr (ArrayList i64)))
@@ -154,6 +159,8 @@
               frontend
               :values
               values
+              :value-roots
+              value-roots
               :value-types
               value-types
               :functions
@@ -682,6 +689,7 @@
                                        (args (mut (ArrayList i64)))] (-> i64)
   (let [frontend (load (field context frontend))
         (mut function-index) 0
+        (mut declaration) 0
         (mut required) (al-len [i64] (load args))]
     (loop (if (>= (load function-index) (al-len [FeFunction] (.functions frontend)))
               (break)
@@ -690,6 +698,19 @@
                     (set! required (.parameter-count fn))
                     0)
                 (set! function-index (+ (load function-index) 1)))))
+    ;; Generated intrinsic methods are JSL `callable`s, not FeFunctions, but a property load makes
+    ;; them just as dynamic at the call site. Their fixed formals share the JavaScript receiver ABI
+    ;; and must participate in the same closed-world maximum. Otherwise `view.getUint16(0)` padded
+    ;; only to the largest source-function signature and the JSL callable read an uninitialised
+    ;; register for its omitted `littleEndian` parameter instead of `undefined`.
+    (loop (if (>= (load declaration) (jsl-decl-count))
+              (break)
+              (do
+                (if (and (jsl-callable? (load declaration))
+                         (> (jsl-decl-nparams (load declaration)) (load required)))
+                    (set! required (jsl-decl-nparams (load declaration)))
+                    0)
+                (set! declaration (+ (load declaration) 1)))))
     (loop (if (>= (al-len [i64] (load args)) (load required))
               (break)
               (al-push! [i64]
@@ -760,11 +781,16 @@
 ;; no truthy contract -- an empty and a non-empty string are both non-zero addresses -- so a
 ;; string-valued condition boxes and takes the tagged path. This used to be a `StringLength`
 ;; call, which was the frontend spelling out string truthiness (`length != 0`) by hand.
+;; JavaScript control consumes ToBoolean, not an arbitrary value representation. Keep a proven
+;; raw Boolean as-is; every other source value crosses the tagged semantic boundary and delegates
+;; truthiness to the canonical JSL operation. This also gives logical operators a raw predicate
+;; for their short-circuit branch while they continue to return the original operand value.
+(defn fng-to-boolean-condition [(context FngContext) (value i64)] (-> i64)
+  (fng-jsl-call1 context "ToBoolean" (fng-box-dynamic-argument! value)))
+
 (defn fng-condition-representation [(context FngContext) (source i64)] (-> i64)
   (let [value (fng-expression context source)]
-    (if (= (fng-infer context source FNG-DYNAMIC) FNG-STRING)
-        (n-box! value)
-        value)))
+    (fng-to-boolean-condition context value)))
 
 ;; The dynamic-to-number seam, and the difference between an UNBOX and a COERCION.
 ;;
@@ -2005,6 +2031,22 @@
 (defn fng-symbol-storage [(context FngContext) (symbol i64)] (-> i64)
   (al-get [i64] (load (load (field context values))) symbol))
 
+;; A NODE ID IN FRONTEND STORAGE IS AN OWNER, NOT A WEAK CACHE. Graph rewrites only see def-use
+;; edges, so a lexical value with no current IR user can otherwise be collected before its later
+;; source use is built. Roots are deliberately append-only for one function build: reassignment may
+;; make an older binding obsolete, but retaining it until the function is complete is bounded,
+;; keeps ownership simple across branch snapshots/restores, and is released in one balanced pass.
+(defn fng-root-value! [(context FngContext) (node i64)] (-> i64)
+  (if (= node NO-NODE)
+      0
+      (do
+        (if (n-dead? node)
+            (panic-corrupt "frontend: cannot publish a dead node into lexical storage")
+            0)
+        (n-keep! node)
+        (al-push! [i64] (mut (load (field context value-roots))) node)
+        node)))
+
 ;; Lexical Script globals live in the declarative half of the Realm global environment. The DSL
 ;; owns its stable identity and observable binding operations; the frontend only routes bindings
 ;; classified structurally as global lexical declarations.
@@ -2048,7 +2090,13 @@
             (fng-script-global-load context symbol)
             (if (or (load (fng-capture-by-value-ptr))
                     (not (fng-symbol-cell? context symbol)))
-                (fng-symbol-storage context symbol)
+                ;; A pinned lexical wrapper can survive after peephole replacement rewired all of
+                ;; its graph users. Re-entering through the peephole boundary on each source read
+                ;; recovers the canonical value and, crucially, its representation contract;
+                ;; returning a retained dynamic Phi where its replacement is a raw Number makes a
+                ;; later numeric consumer unbox the tagged word as a double.
+                (let [stored (fng-symbol-storage context symbol)]
+                  (if (= stored NO-NODE) NO-NODE (fng-peep stored)))
                 (let [cell (fng-symbol-storage context symbol)
                       alias (.cell-alias context)
                       cast-node
@@ -2065,7 +2113,9 @@
             (fng-script-global-store! context symbol node)
             (if (or (load (fng-capture-by-value-ptr))
                     (not (fng-symbol-cell? context symbol)))
-                (al-set! [i64] (mut (load (field context values))) symbol node)
+                (do
+                  (fng-root-value! context node)
+                  (al-set! [i64] (mut (load (field context values))) symbol node))
                 (let [cell (fng-symbol-storage context symbol)
                       alias (.cell-alias context)]
                   (if (= cell NO-NODE)
@@ -2081,6 +2131,7 @@
                                           object
                                           (fng-box-dynamic-argument! node)
                                           alias)]
+                          (fng-root-value! context object)
                           (al-set! [i64] (mut (load (field context values))) symbol object)
                           (set! (load (field context memory))
                                 (fng-preserve-active-memory context stored))
@@ -2140,6 +2191,7 @@
           (= family FE-INTRINSIC-FAMILY-ARRAY_BUFFER) FNG-INTRINSIC-ARRAYBUFFER
           (= family FE-INTRINSIC-FAMILY-INT8_ARRAY) FNG-INTRINSIC-INT8ARRAY
           (= family FE-INTRINSIC-FAMILY-UINT8_ARRAY) FNG-INTRINSIC-UINT8ARRAY
+          (= family FE-INTRINSIC-FAMILY-DATA_VIEW) FNG-INTRINSIC-DATAVIEW
           :else FNG-DYNAMIC)))
 
 (defn fng-declared-symbol-type [(frontend (ptr NativeFrontend)) (symbol-id i64)] (-> i64)
@@ -2237,6 +2289,16 @@
               (if construct
                   (fng-type-tag frontend (.receiver-type-node fn))
                   result))))))
+
+;; Recognize the structural `%Intrinsic%.prototype` receiver used by a following property access.
+;; The generated manifest owns the property set; this helper preserves only the syntax path needed
+;; to demand-publish that surface before ordinary [[Get]] observes it.
+(defn fng-intrinsic-prototype-symbol [(frontend (ptr NativeFrontend)) (node i64)] (-> i64)
+  (let [ast (field frontend ast)]
+    (if (and (= (ts-kind ast node) TSK-PROPERTY-ACCESS)
+             (= (ts-text ast (ts-role ast node TS-ROLE-PROPERTY 0)) "prototype"))
+        (fe-resolution-symbol frontend (ts-role ast node TS-ROLE-OBJECT 0))
+        -1)))
 
 (defn fng-infer [(context FngContext) (node i64) (expected i64)] (-> i64)
   (if (!= expected FNG-DYNAMIC)
@@ -2383,12 +2445,14 @@
                       name-node (ts-role ast node TS-ROLE-PROPERTY 0)
                       name (ts-text ast name-node)
                       intrinsic-symbol (fe-resolution-symbol frontend object-node)
+                      prototype-symbol (fng-intrinsic-prototype-symbol frontend object-node)
                       field-index
                         (if (or (= owner FNG-DYNAMIC)
                                 (or (= owner FNG-CALLABLE) (= owner FNG-PROPERTY-OBJECT)))
                             -1
                             (fng-field-index frontend owner name-node))]
-                  (if (fe-intrinsic-property-callable? intrinsic-symbol name)
+                  (if (or (fe-intrinsic-property-callable? intrinsic-symbol name)
+                          (fe-intrinsic-prototype-property-callable? prototype-symbol name))
                       FNG-CALLABLE
                   (if (and (= owner FNG-TYPEDARRAY) (= name "buffer"))
                       FNG-ARRAYBUFFER
@@ -2436,37 +2500,13 @@
                           (fng-infer context (ts-child ast node 0) FNG-DYNAMIC))))
               :else FNG-DYNAMIC))))
 
-;; The one report for syntax the builder has no lowering for. `kind` is worth printing because the
-;; interesting case is kind 0: that is the bridge's `default`, so it means "the Go side does not
-;; enumerate this syntax at all" rather than "this kind is known and unhandled", and the two want
-;; different fixes.
-;; THE RECEIVER SLOT TAKES A TAGGED OBJECT-ISH VALUE, and this is the verifier's own rule --
-;; `VERR-CALL-RECEIVER-TAG` accepts `undefined`, an object or a function and nothing else.
-;;
-;; A method on a PRIMITIVE therefore has nowhere to go: `(acc / 4).toFixed(2)` put a raw `Div`
-;; straight into the slot, and `'aXa'.replace(...)` did the same with a string. JavaScript answers
-;; this by boxing the primitive into a wrapper object, and this compiler has no wrapper objects --
-;; so the honest outcome is a refusal, not a Call the verifier will reject afterwards. Neither
-;; method is implemented anyway: there is no `toFixed` in `lib/`, and `lib/string/replace-all.jsl`
-;; is `replaceAll`, which has different semantics from `replace`.
-;;
-;; Checked HERE rather than left to `g-verify` because the frontend is what knows the source text.
-;; See repros/open/method-call-on-primitive-receiver.js.
-(defn fng-valid-receiver? [(value i64)] (-> bool)
-  (if (= value NO-NODE)
-      true
-      ;; A HIGH type passes. The builder analyses lazily, so a node built a moment ago still reads
-      ;; as unanalysed and there is nothing to conclude from it -- and `fng-machine-number-value?`
-      ;; is not the way to fill that gap, whatever it looks like: `ty-isa ANY num` is true, so it
-      ;; reports every unanalysed value as a machine number. Tried here, it refused `reset()` and
-      ;; five NavierStokes repros. The numeric case is caught from the SOURCE instead, at the
-      ;; receiver-call site below, where the frontend has a declared type to read.
-      (let [t (n-ty value)]
-        (if (ty-high? t)
-            true
-            (or (= (ty-kinds t) VK-UNDEF)
-                (or (!= (& (ty-kinds t) VK-OBJ) 0)
-                    (!= (& (ty-kinds t) VK-FUN) 0)))))))
+;; Receiver calls have the same representation boundary whether they originate in JavaScript
+;; source or in JSL. A proven managed Object pointer remains raw so an exact shaped callee can use
+;; it directly. Every other ECMAScript value crosses tagged, including strict primitive receivers.
+;; Sloppy primitive boxing is OrdinaryCallBindThis semantics in JSL; this helper only establishes
+;; the compiler ABI representation and must not reject a language value by kind.
+(defn fng-call-receiver-value [(value i64)] (-> i64)
+  (if (= (n-rep-of value 8) REP-RAW-PTR) value (n-box! value)))
 
 (defn fng-unsupported-syntax! [(position (slice u8)) (kind i64) (text (slice u8))] (-> i64)
   (let [w (stderr)]
@@ -2612,7 +2652,11 @@
                               (mut stores)
                               (n-store! (n-obj-mem nw 0)
                                         object
-                                        (fng-const (n-fun-index target))
+                                        ;; A closure environment crosses Script/link boundaries.
+                                        ;; Store a semantic callable identity so retained-text
+                                        ;; relocation can assign the final image-local symbol;
+                                        ;; a graph-local Fun index is not a runtime callable id.
+                                        (n-callable-id! target)
                                         (shape-field-alias shape 0)))
                     (set! i 0)
                     (loop (if (>= (load i) (al-len [i64] (load captures)))
@@ -2875,7 +2919,7 @@
               (mut index) 0]
           (if (>= parent 0)
               (let [linked
-                      (fng-jsl-call2 context "SetObjectPrototype" object
+                      (fng-jsl-call2 context "InitializeObjectPrototype" object
                                      (fng-constructor-prototype! context parent))]
                 0)
               0)
@@ -3689,7 +3733,8 @@
             (or (= name "defineProperties")
             (or (= name "getOwnPropertyDescriptor")
                 (or (= name "getOwnPropertyNames")
-                    (or (= name "getPrototypeOf") (= name "create"))))))))
+                    (or (= name "getPrototypeOf")
+                        (or (= name "setPrototypeOf") (= name "create")))))))))
 
 (defn fng-object-descriptor-call [(context FngContext) (node i64)] (-> i64)
   (let [frontend (load (field context frontend)) ast (field frontend ast)
@@ -3727,6 +3772,12 @@
           (= name "getPrototypeOf")
             (fng-jsl-call1 context "ObjectGetPrototypeOf"
               (fng-box-dynamic-argument! (if (> argc 0) (fng-expression context (ts-child ast node 1))
+                                      (fng-undefined))))
+          (= name "setPrototypeOf")
+            (fng-jsl-call2 context "ObjectSetPrototypeOf"
+              (fng-box-dynamic-argument! (if (> argc 0) (fng-expression context (ts-child ast node 1))
+                                      (fng-undefined)))
+              (fng-box-dynamic-argument! (if (> argc 1) (fng-expression context (ts-child ast node 2))
                                       (fng-undefined))))
           :else
             (let [object (fng-jsl-call1 context "ObjectCreate"
@@ -3812,9 +3863,10 @@
             (or (= name "getOwnPropertyDescriptor")
                 (or (= name "getOwnPropertyNames")
                     (or (= name "getPrototypeOf")
+                    (or (= name "setPrototypeOf")
                     (or (= name "create")
                         (or (= name "isExtensible")
-                            (or (= name "preventExtensions") (= name "freeze")))))))))))
+                            (or (= name "preventExtensions") (= name "freeze"))))))))))))
 
 (defn fng-object-method-value [(context FngContext) (node i64)] (-> i64)
   (let [name (fng-object-static-direct-name context node)
@@ -3825,10 +3877,12 @@
                    (= name "create") 36
                    (= name "isExtensible") 37
                    (= name "preventExtensions") 38
+                   (= name "setPrototypeOf") 40
                    :else 39)
         length (cond (= name "defineProperty") 3
                      (= name "defineProperties") 2
                      (= name "getOwnPropertyDescriptor") 2
+                     (= name "setPrototypeOf") 2
                      (= name "create") 2
                      :else 1)]
     (if (= name "getOwnPropertyDescriptor")
@@ -3837,10 +3891,12 @@
         (fng-jsl-call0 context "ObjectOwnPropertyNamesValue")
         (if (= name "getPrototypeOf")
         (fng-jsl-call0 context "ObjectGetPrototypeOfValue")
+        (if (= name "setPrototypeOf")
+        (fng-jsl-call0 context "ObjectSetPrototypeOfValue")
         (fng-jsl-call3 context "BuiltinMethodValue"
                        (fng-const kind)
                        (fng-const length)
-                       (n-string-const! (jss-from-utf8! name))))))))
+                       (n-string-const! (jss-from-utf8! name)))))))))
 
 (defn fng-object-integrity-call? [(context FngContext) (node i64)] (-> bool)
   (let [name (fng-object-static-name context node)]
@@ -5539,19 +5595,6 @@
                   (if receiver-aware
                   (if receiver-call
                       (let [receiver-source (ts-child ast callee-node 0)
-                            ;; A METHOD ON A NUMBER HAS NO RECEIVER TO PASS. JavaScript boxes the
-                            ;; primitive into a wrapper object; this compiler has no wrapper
-                            ;; objects, and the receiver slot takes an object, a function or
-                            ;; undefined. `(acc / 4).toFixed(2)` put a raw `Div` in it and the
-                            ;; verifier rejected the Call afterwards -- a graph built wrong and
-                            ;; caught late, rather than a construct refused where it is written.
-                            ;; The declared type is read here because the built node's type is
-                            ;; still unanalysed at this point.
-                            _ (if (= (fng-infer context receiver-source FNG-DYNAMIC) FNG-NUMBER)
-                                  (fng-unsupported-syntax! "method receiver"
-                                                           (ts-kind ast node)
-                                                           (ts-text ast node))
-                                  0)
                             first (fng-expression context receiver-source)]
                         (if (load (fng-omit-receiver-ptr))
                             (fng-undefined)
@@ -5566,17 +5609,12 @@
                   NO-NODE)))
         receiver
           (if (and (not construct) (!= raw-receiver NO-NODE))
-              ; Box only a value that is PURELY a function — a bare Fun/closure crossing into a
-              ; receiver slot. Testing "could be a function" matched every dyn value (dyn contains
-              ; the fun kind), which shadowed the unbox arm below and handed shaped callees a
-              ; tagged receiver to raw-load through.
-              (if (= (ty-kinds (n-ty raw-receiver)) VK-FUN)
-                  (n-box! raw-receiver)
-                  (if (and (>= receiver-owner 0) (fng-value-tagged? raw-receiver))
-                      (n-unbox! raw-receiver
-                                (t-obj-shape
-                                  (al-get [i64] (load (load (field context shapes))) receiver-owner)))
-                      raw-receiver))
+              ;; The callee's declared receiver shape is not proof about a dynamic `thisArg`.
+              ;; Function.prototype.call must be able to deliver a wrong-brand Object or any
+              ;; primitive so the callee's JavaScript checks can reject it. Preserve a proven raw
+              ;; Object pointer and tag everything else; any justified shape conversion belongs
+              ;; at the callee entry, after OrdinaryCallBindThis.
+              (fng-call-receiver-value raw-receiver)
               raw-receiver)
         target
           (if (>= function-index 0)
@@ -5701,7 +5739,7 @@
     (if (and construct (and (< receiver-owner 0) (>= function-index 0)))
         (let [prototype (fng-constructor-prototype! context callee)
               linked
-                (fng-jsl-call2 context "SetObjectPrototype" receiver prototype)]
+                (fng-jsl-call2 context "InitializeObjectPrototype" receiver prototype)]
           0)
         0)
     (loop (if (>= (load index) (ts-child-count ast node))
@@ -5795,12 +5833,7 @@
           ; reserved receiver slot. A call whose target is not statically known is marked DYNAMIC
           ; so selection always dispatches the runtime callee value.
           call
-            (let [_ (if (fng-valid-receiver? receiver)
-                        0
-                        (fng-unsupported-syntax! "method receiver"
-                                                 (ts-kind ast node)
-                                                 (ts-text ast node)))
-                  dynamic-call
+            (let [dynamic-call
                     (and (< function-index 0)
                          (and (not conditional-optional) (not direct-value-callee)))
                   site
@@ -5923,6 +5956,19 @@
                                    (n-box! (fng-expression context (ts-child ast node 1)))
                                    (n-box! (fng-undefined))))
                 (fng-jsl-call0 context "ThrowArrayBufferCall"))
+          (= intrinsic FNG-INTRINSIC-DATAVIEW)
+            (if (= (ts-kind ast node) TSK-NEW-EXPRESSION)
+                (fng-jsl-call3 context "ConstructDataView"
+                               (if (> argc 0)
+                                   (n-box! (fng-expression context (ts-child ast node 1)))
+                                   (n-box! (fng-undefined)))
+                               (if (> argc 1)
+                                   (n-box! (fng-expression context (ts-child ast node 2)))
+                                   (n-box! (fng-undefined)))
+                               (if (> argc 2)
+                                   (n-box! (fng-expression context (ts-child ast node 3)))
+                                   (n-box! (fng-undefined))))
+                (fng-jsl-call0 context "ThrowDataViewCall"))
           (or (= intrinsic FNG-INTRINSIC-INT8ARRAY)
               (= intrinsic FNG-INTRINSIC-UINT8ARRAY))
             (if (= (ts-kind ast node) TSK-NEW-EXPRESSION)
@@ -5966,7 +6012,8 @@
                                 (or (= intrinsic FNG-INTRINSIC-SYMBOL)
                                     (or (= intrinsic FNG-INTRINSIC-ARRAYBUFFER)
                                         (or (= intrinsic FNG-INTRINSIC-INT8ARRAY)
-                                            (= intrinsic FNG-INTRINSIC-UINT8ARRAY)))))))))
+                                            (or (= intrinsic FNG-INTRINSIC-UINT8ARRAY)
+                                                (= intrinsic FNG-INTRINSIC-DATAVIEW))))))))))
             (fng-intrinsic-call context node intrinsic)
             (fng-user-call context node)))))
 
@@ -6329,8 +6376,11 @@
         name-node (ts-role ast node TS-ROLE-PROPERTY 0)
         symbol (fe-resolution-symbol frontend object-node)
         property-name (ts-text ast name-node)
-        generated-publication
+        constructor-publication
           (fe-intrinsic-property-implementation symbol property-name)
+        prototype-symbol (fng-intrinsic-prototype-symbol frontend object-node)
+        prototype-publication
+          (fe-intrinsic-prototype-property-implementation prototype-symbol property-name)
         builtin-constructor
           (or (= symbol FE-INTRINSIC-OBJECT)
               (or (= symbol FE-INTRINSIC-ARRAY)
@@ -6342,19 +6392,28 @@
                                       (or (= symbol FE-INTRINSIC-ARRAYBUFFER)
                                           (or (= symbol FE-INTRINSIC-INT8ARRAY)
                                               (or (= symbol FE-INTRINSIC-UINT8ARRAY)
-                                                  (or (= symbol FE-INTRINSIC-MATH)
-                                                      (= symbol FE-INTRINSIC-JSON))))))))))))]
+                                                  (or (= symbol FE-INTRINSIC-DATAVIEW)
+                                                      (or (= symbol FE-INTRINSIC-MATH)
+                                                          (= symbol FE-INTRINSIC-JSON)))))))))))))]
     ;; Built-in constructors are opaque tagged identities with their observable own properties in
     ;; the DSL property heap. They have no static object layout to load from; syntax resolution is
     ;; used only to choose that representation path, while generic GetProperty owns the operation.
-    (if (!= generated-publication "")
-        (fng-jsl-call0 context generated-publication)
+    (if (!= constructor-publication "")
+        (fng-jsl-call0 context constructor-publication)
+        (if (!= prototype-publication "")
+            ;; Publish the Realm-owned intrinsic surface, then perform ordinary [[Get]] on the
+            ;; evaluated receiver. This preserves replacement of `Symbol.prototype` and invokes
+            ;; accessors instead of exposing their generated getter closure.
+            (let [object (fng-expression context object-node)
+                  initialized (fng-jsl-call0 context prototype-publication)]
+              (fng-jsl-call2 context "GetProperty" object
+                             (n-string-const! (jss-from-utf8! property-name))))
         (if builtin-constructor
             (fng-jsl-call2 context "GetProperty"
                            (fng-expression context object-node)
                            (n-string-const! (jss-from-utf8! property-name)))
             (fng-field-load-value context node object-node name-node
-                                  (fng-expression context object-node))))))
+                                  (fng-expression context object-node)))))))
 
 (defn fng-optional-field-load [(context FngContext) (node i64)] (-> i64)
   (let [frontend (load (field context frontend))
@@ -6893,6 +6952,8 @@
                       (fng-jsl-call0 context "SymbolConstructorValue")
                     (= symbol FE-INTRINSIC-ARRAYBUFFER)
                       (fng-jsl-call0 context "ArrayBufferConstructorValue")
+                    (= symbol FE-INTRINSIC-DATAVIEW)
+                      (fng-jsl-call0 context "DataViewConstructorValue")
                     (= symbol FE-INTRINSIC-INT8ARRAY)
                       (fng-jsl-call1 context "TypedArrayConstructorValue" (fng-const 26))
                     (= symbol FE-INTRINSIC-UINT8ARRAY)
@@ -7085,21 +7146,18 @@
                                                left
                                                true)
                     ;; A string-valued condition BOXES rather than measuring its length -- `If`
-                    ;; owns truthiness; see `fng-condition-representation`.
+                    ;; receives the canonical ToBoolean result; the expression still returns the
+                    ;; original left or right operand rather than that predicate.
                     (if (= operator "&&")
                         (fng-branch-expression context
-                                               (if (= (fng-infer context left-node FNG-DYNAMIC) FNG-STRING)
-                                                   (n-box! left)
-                                                   left)
+                                               (fng-to-boolean-condition context left)
                                                right-node
                                                NO-NODE
                                                -1
                                                left
                                                true)
                         (fng-branch-expression context
-                                               (if (= (fng-infer context left-node FNG-DYNAMIC) FNG-STRING)
-                                                   (n-box! left)
-                                                   left)
+                                               (fng-to-boolean-condition context left)
                                                -1
                                                left
                                                right-node
@@ -7151,8 +7209,17 @@
                             (do (panic-corrupt (ts-text ast node)) 0)
                             0)
                         (fng-lvalue-write context target value))
+                      ;; Graph node ids held in frontend locals are ownership roots until the
+                      ;; enclosing expression wires their real IR use. Evaluating the right child
+                      ;; can peephole and collect a zero-use left result (notably a JSL call result
+                      ;; Phi); building the operator afterward would then read a corpse. Pin both
+                      ;; source operands across sibling evaluation and operator construction, and
+                      ;; transfer ownership to the installed uses by unpinning without collecting.
                       (let [left (fng-expression context left-node)
-                            right (fng-expression context right-node)]
+                            keep-left (n-keep! left)
+                            right (fng-expression context right-node)
+                            keep-right (n-keep! right)
+                            result
                         (cond (= operator "+")
                                 (fng-arith2 context "JsAdd" left right)
                               (= operator "-")
@@ -7273,7 +7340,10 @@
                                                       (ts-text ast right-node))))
                                           (fng-jsl-call2 context "OrdinaryInstanceOf" left right)))))
                               (= operator ",") right
-                              :else NO-NODE)))))
+                              :else NO-NODE)]
+                        (n-unkeep! right)
+                        (n-unkeep! left)
+                        result))))
           (= kind TSK-CALL)
             (if (fng-json-stringify? context node)
                 (fng-json-stringify context node)
@@ -9688,6 +9758,7 @@
         (mut jump-values) (al-new [i64] (malloc-allocator))
         (mut exception-dependency) NO-NODE
         (mut dynamic-aliases) (al-new [i64] (malloc-allocator))
+        (mut value-roots) (al-new [i64] (malloc-allocator))
         (mut saved-capture-symbols) (al-new [i64] (malloc-allocator))
         (mut saved-capture-values) (al-new [i64] (malloc-allocator))
         (mut host-symbols) (al-new [i64] (malloc-allocator))
@@ -9697,6 +9768,22 @@
         (mut argc) NO-NODE
         (mut arguments) NO-NODE
         (mut index) 0]
+    ;; Values inherited through the shared symbol table are lexical roots for this entire function
+    ;; build. Later stores append their own roots through `fng-set-symbol!`; duplicates are valid
+    ;; balanced ownership counts and make branch/capture restoration independent of slot history.
+    (loop (if (>= (load index) (al-len [i64] (load values)))
+              (break)
+              (let [value (al-get [i64] (load values) (load index))]
+                (if (= value NO-NODE)
+                    0
+                    (do
+                      (if (n-dead? value)
+                          (panic-corrupt "frontend: shared lexical storage contains a dead node")
+                          0)
+                      (n-keep! value)
+                      (al-push! [i64] (mut value-roots) value)))
+                (set! index (+ (load index) 1)))))
+    (set! index 0)
     (if script-entry
         0
         ;; The uniform callable ABI: parameter 0 is the hidden closure environment (dead for a
@@ -9728,7 +9815,10 @@
                             (al-push! [i64]
                                       (mut saved-capture-values)
                                       (al-get [i64] (load values) symbol))
-                            (al-set! [i64] (mut values) symbol (n-load! incoming env alias))
+                            (let [loaded (n-load! incoming env alias)]
+                              (n-keep! loaded)
+                              (al-push! [i64] (mut value-roots) loaded)
+                              (al-set! [i64] (mut values) symbol loaded))
                             (set! index (+ (load index) 1)))))
                 (if (fng-lexical-this? frontend fun-id)
                     (let [alias (shape-field-alias env-shape (+ symbol-capture-count 1))
@@ -9770,10 +9860,8 @@
                           ;; rebuilding JavaScript's generic ToNumber control diamond in the callee
                           ;; made tiny callbacks impossible to inline and repeated work the caller's
                           ;; type contract had already established.
-                          (al-set! [i64]
-                                   (mut values)
-                                   (.id symbol)
-                                   (if (and (= declared FNG-NUMBER)
+                          (let [published
+                                  (if (and (= declared FNG-NUMBER)
                                             (and (fng-array-callback-function?
                                                    frontend (ts-root (field frontend ast)) fun-id)
                                             (= (ts-role (field frontend ast)
@@ -9781,11 +9869,15 @@
                                                         TS-ROLE-INITIALIZER 0)
                                                -1)))
                                        (n-unbox! parameter (t-flt))
-                                       parameter)))
+                                       parameter)]
+                            (n-keep! published)
+                            (al-push! [i64] (mut value-roots) published)
+                            (al-set! [i64] (mut values) (.id symbol) published)))
                         (set! index (+ (load index) 1))))))))
     (let [entry-context
             (fng-context frontend
                          values
+                         (mut value-roots)
                          value-types
                          functions
                          prototypes
@@ -9836,6 +9928,7 @@
           context
             (fng-context frontend
                          values
+                         (mut value-roots)
                          value-types
                          functions
                          prototypes
@@ -10037,12 +10130,22 @@
                          (al-get [i64] (load saved-capture-symbols) (load index))
                          (al-get [i64] (load saved-capture-values) (load index)))
                 (set! index (+ (load index) 1)))))
+    ;; Release exactly the ownership counts acquired above and by `fng-root-value!`. Unpinning is
+    ;; an ownership transfer to the graph uses already constructed; whole-graph DCE decides which
+    ;; now-unreferenced nodes are actually dead after every function has been built.
+    (set! index 0)
+    (loop (if (>= (load index) (al-len [i64] (load value-roots)))
+              (break)
+              (do
+                (n-unkeep! (al-get [i64] (load value-roots) (load index)))
+                (set! index (+ (load index) 1)))))
     (al-free! [FngTarget] (mut targets))
     (al-free! [i64] (mut target-symbols))
     (al-free! [i64] (mut target-active))
     (al-free! [FngJump] (mut jumps))
     (al-free! [i64] (mut jump-values))
     (al-free! [i64] (mut dynamic-aliases))
+    (al-free! [i64] (mut value-roots))
     (al-free! [i64] (mut saved-capture-symbols))
     (al-free! [i64] (mut saved-capture-values))
     (al-free! [i64] (mut host-symbols))
@@ -10107,7 +10210,8 @@
   ;; definition and its callees the first time the frontend emits a call to it, so a program that
   ;; uses no library builtin gets exactly the graph it got before this existed — which is what the
   ;; exact-`g-render` migration oracle in tests/frontend-exact-graph-test.mjs compares.
-  (let [reuse (load (fng-reuse-jsl-index-ptr))
+  (let [library-start (fng-profile-now)
+        reuse (load (fng-reuse-jsl-index-ptr))
         ready (load (fng-jsl-index-ready-ptr))
         status (if (not initialize-state)
                    ;; Appended units share the checked declarations and any graph-level JSL
@@ -10122,6 +10226,7 @@
                                (set! (fng-jsl-index-ready-ptr) true)
                                0)
                            loaded))))]
+  (fng-profile-note! "frontend_jsl_library" library-start)
   (if (!= status JSL-OK)
       (do (panic-corrupt "frontend: the JSL runtime library did not load") 0)
       0)
@@ -10358,6 +10463,7 @@
           (fmt (stderr) "AOTK_TIMING phase=frontend_discard_memory ns={d}\n"
                (- (fng-profile-now) phase)))
           (fng-analyze-fresh!)
+          (set! profile-start (fng-profile-note! "frontend_through_analyze" (load profile-start)))
           (let [phase (fng-profile-now)
                 inlined (if optimize (jl-inline-callback-calls!) 0)]
             (fmt (stderr) "AOTK_TIMING phase=frontend_inline_callbacks ns={d}\n"
@@ -10405,6 +10511,7 @@
     ; empty and parameter-start at 0, so the lookup must sit INSIDE the count guard. Binding
     ; it unconditionally was an out-of-bounds al-get that only ever ran because the previous
     ; compiler inlined al-get and dead-code-eliminated the unused load.
+    (set! profile-start (fng-profile-note! "frontend_after_analyze" (load profile-start)))
     (let [answer
             (if (> (.parameter-count main) 0)
                 (let [first (fe-parameter-symbol frontend main 0)]
@@ -10418,6 +10525,7 @@
       (al-free! [i64] (mut aliases))
       (al-free! [bool] (mut effects))
       (al-free! [bool] (mut reachable-functions))
+      (fng-profile-note! "frontend_free" (load profile-start))
       answer)))
 
 (defn frontend-native-build! [(frontend (mut NativeFrontend)) (seed i64) (optimize bool)] (-> i64)
