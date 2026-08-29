@@ -866,7 +866,18 @@
 ;; The failing check is therefore attributed to the innermost form that was under inspection, which
 ;; is the one a reader wants pointed at.
 (defstruct Jsl
-  [(decls   (ArrayList JslDecl))
+  [;; THE DECLARATION CALL GRAPH, built once as CSR: callee-first/count index callee-entry.
+   ;;
+   ;; The effect fixpoints -- memory use, callback use, throw use -- each iterated
+   ;; "for every declaration, walk its whole s-expression body and ask whether it or anything it
+   ;; calls has the flag", once per round. That is a syntax walk of the entire library per round,
+   ;; per fixpoint, and it was 37 ms of a 350 ms cold compile. The FIRST round of each still walks
+   ;; the bodies, because that is what computes the declaration's own bit; every round after it can
+   ;; only add a flag by propagating from a callee, which is integer work over these edges.
+   (callee-first (ArrayList i64))
+   (callee-count (ArrayList i64))
+   (callee-entry (ArrayList i64))
+   (decls   (ArrayList JslDecl))
    (params  (ArrayList JslParam))
    (signaturetypes (ArrayList i64)) ; retained physical parameter/result vectors
    (records (ArrayList JslRecordDecl))
@@ -905,6 +916,9 @@
   (let [p (primitive/alloc-static Jsl)]
     (if (.inited p) 0
       (do (set! (.inited p) true)   ; set FIRST: `jsl-reset!` re-enters through here
+          (set! (.callee-first p) (al-new [i64] (malloc-allocator)))
+          (set! (.callee-count p) (al-new [i64] (malloc-allocator)))
+          (set! (.callee-entry p) (al-new [i64] (malloc-allocator)))
           (set! (.decls p) (al-new [JslDecl] (malloc-allocator)))
           (set! (.params p) (al-new [JslParam] (malloc-allocator)))
           (set! (.signaturetypes p) (al-new [i64] (malloc-allocator)))
@@ -935,6 +949,9 @@
 
 (defn jsl-reset! [] (-> i64)
   (let [p (jsl)]
+    (al-clear! [i64]         (field p callee-first))
+    (al-clear! [i64]         (field p callee-count))
+    (al-clear! [i64]         (field p callee-entry))
     (al-clear! [JslDecl]     (field p decls))
     (al-clear! [JslParam]    (field p params))
     (al-clear! [i64]         (field p signaturetypes))
@@ -2416,26 +2433,78 @@
                   0)))
       (load found))))
 
+
+;; Collect every declaration named in head position anywhere in one body, including inside vectors
+;; -- a call inside a `let` or `loop` binding is a call. Duplicates are allowed: the propagation
+;; below only reads flags, so a repeated edge costs one extra comparison and no correctness.
+(defn jsl-collect-callees! [(x (ptr rd/Sexp)) (self i64)] (-> i64)
+  (if (and (not (rd/sexp-list? x)) (not (rd/sexp-vec? x))) 0
+    (let [n (rd/sexp-count x) (mut i) 0]
+      (if (and (rd/sexp-list? x) (and (> n 0) (rd/sexp-sym? (rd/sexp-nth x 0))))
+          (let [callee (jsl-find (rd/sexp-sym (rd/sexp-nth x 0)))]
+            (if (and (>= callee 0) (!= callee self))
+                (al-push! [i64] (field (jsl) callee-entry) callee)
+                0))
+          0)
+      (loop (if (>= (load i) n) (break)
+              (do (jsl-collect-callees! (rd/sexp-nth x (load i)) self)
+                  (set! i (+ (load i) 1)))))
+      0)))
+
+(defn jsl-build-call-graph! [] (-> i64)
+  (let [p (jsl) n (jsl-decl-count) (mut i) 0]
+    (al-clear! [i64] (field p callee-first))
+    (al-clear! [i64] (field p callee-count))
+    (al-clear! [i64] (field p callee-entry))
+    (loop (if (>= (load i) n) (break)
+            (let [first (al-len [i64] (.callee-entry p))]
+              (jsl-collect-callees! (jsl-decl-body (load i)) (load i))
+              (al-push! [i64] (field p callee-first) first)
+              (al-push! [i64] (field p callee-count)
+                        (- (al-len [i64] (.callee-entry p)) first))
+              (set! i (+ (load i) 1)))))
+    0))
+
+(defn jsl-callee-count [(d i64)] (-> i64)
+  (al-get [i64] (.callee-count (jsl)) d))
+(defn jsl-callee [(d i64) (which i64)] (-> i64)
+  (al-get [i64] (.callee-entry (jsl)) (+ (al-get [i64] (.callee-first (jsl)) d) which)))
+
 (defn jsl-resolve-callback-use! [] (-> i64)
-  (let [n (jsl-decl-count) (mut changed) true (mut rounds) 0]
+  ;; ROUND ONE walks the bodies, because that is what decides a declaration's OWN bit. After it,
+  ;; the only way a declaration can newly gain the flag is through a callee that has it, so the
+  ;; rest of the fixed point runs over the cached call graph instead of over syntax.
+  (let [n (jsl-decl-count) (mut changed) true (mut rounds) 0 (mut i) 0]
+    (loop (if (>= (load i) n) (break)
+            (do
+              (if (jsl-decl-calls-back? (load i)) 0
+                (if (jsl-body-calls-back? (jsl-decl-body (load i)))
+                    (do (jsl-decl-set-calls-back! (load i) true) 0)
+                    0))
+              (set! i (+ (load i) 1)))))
     (loop (if (not (load changed)) (break)
             (do
               (set! changed false)
-              (let [(mut i) 0]
-                (loop (if (>= (load i) n) (break)
-                        (do
-                          (if (jsl-decl-calls-back? (load i)) 0
-                            (if (jsl-body-calls-back? (jsl-decl-body (load i)))
-                                (do (jsl-decl-set-calls-back! (load i) true)
-                                    (set! changed true) 0)
-                                0))
-                          (set! i (+ (load i) 1))
-                          0))))
+              (set! i 0)
+              (loop (if (>= (load i) n) (break)
+                      (do
+                        (if (jsl-decl-calls-back? (load i)) 0
+                          (let [c (jsl-callee-count (load i)) (mut k) 0]
+                            (loop (if (>= (load k) c) (break)
+                                    (do
+                                      (if (jsl-decl-calls-back? (jsl-callee (load i) (load k)))
+                                          (do (jsl-decl-set-calls-back! (load i) true)
+                                              (set! changed true)
+                                              (set! k c) 0)
+                                          0)
+                                      (set! k (+ (load k) 1)))))))
+                        (set! i (+ (load i) 1)))))
               (set! rounds (+ (load rounds) 1))
+              ; Each round either sets a flag that never clears or stops, so this terminates in at
+              ; most one round per declaration. The cap makes that a named failure, not a hang.
               (if (> (load rounds) (+ n 1))
                   (do (jsl-fail! JSL-ERR-MACRO-RECURSION "callback-use fixpoint") 0)
-                  0)
-              0)))
+                  0))))
     JSL-OK))
 
 (defn jsl-name-calls-back? [(name (slice u8))] (-> bool)
@@ -2472,20 +2541,37 @@
       (load found))))
 
 (defn jsl-resolve-throw-use! [] (-> i64)
-  (let [n (jsl-decl-count) (mut changed) true (mut rounds) 0]
+  ;; ROUND ONE walks the bodies, because that is what decides a declaration's OWN bit. After it,
+  ;; the only way a declaration can newly gain the flag is through a callee that has it, so the
+  ;; rest of the fixed point runs over the cached call graph instead of over syntax.
+  (let [n (jsl-decl-count) (mut changed) true (mut rounds) 0 (mut i) 0]
+    (loop (if (>= (load i) n) (break)
+            (do
+              (if (jsl-decl-can-throw? (load i)) 0
+                (if (jsl-body-can-throw? (jsl-decl-body (load i)))
+                    (do (jsl-decl-set-can-throw! (load i) true) 0)
+                    0))
+              (set! i (+ (load i) 1)))))
     (loop (if (not (load changed)) (break)
             (do
               (set! changed false)
-              (let [(mut i) 0]
-                (loop (if (>= (load i) n) (break)
-                        (do
-                          (if (jsl-decl-can-throw? (load i)) 0
-                              (if (jsl-body-can-throw? (jsl-decl-body (load i)))
-                                  (do (jsl-decl-set-can-throw! (load i) true)
-                                      (set! changed true))
-                                  0))
-                          (set! i (+ (load i) 1))))))
+              (set! i 0)
+              (loop (if (>= (load i) n) (break)
+                      (do
+                        (if (jsl-decl-can-throw? (load i)) 0
+                          (let [c (jsl-callee-count (load i)) (mut k) 0]
+                            (loop (if (>= (load k) c) (break)
+                                    (do
+                                      (if (jsl-decl-can-throw? (jsl-callee (load i) (load k)))
+                                          (do (jsl-decl-set-can-throw! (load i) true)
+                                              (set! changed true)
+                                              (set! k c) 0)
+                                          0)
+                                      (set! k (+ (load k) 1)))))))
+                        (set! i (+ (load i) 1)))))
               (set! rounds (+ (load rounds) 1))
+              ; Each round either sets a flag that never clears or stops, so this terminates in at
+              ; most one round per declaration. The cap makes that a named failure, not a hang.
               (if (> (load rounds) (+ n 1))
                   (do (jsl-fail! JSL-ERR-MACRO-RECURSION "throw-use fixpoint") 0)
                   0))))
@@ -2496,27 +2582,40 @@
     (and (>= d 0) (jsl-decl-can-throw? d))))
 
 (defn jsl-resolve-memory-use! [] (-> i64)
-  (let [n (jsl-decl-count) (mut changed) true (mut rounds) 0]
+  ;; ROUND ONE walks the bodies, because that is what decides a declaration's OWN bit. After it,
+  ;; the only way a declaration can newly gain the flag is through a callee that has it, so the
+  ;; rest of the fixed point runs over the cached call graph instead of over syntax.
+  (let [n (jsl-decl-count) (mut changed) true (mut rounds) 0 (mut i) 0]
+    (loop (if (>= (load i) n) (break)
+            (do
+              (if (jsl-decl-uses-memory? (load i)) 0
+                (if (jsl-body-reads-memory? (jsl-decl-body (load i)))
+                    (do (jsl-decl-set-uses-memory! (load i) true) 0)
+                    0))
+              (set! i (+ (load i) 1)))))
     (loop (if (not (load changed)) (break)
             (do
               (set! changed false)
-              (let [(mut i) 0]
-                (loop (if (>= (load i) n) (break)
-                        (do
-                          (if (jsl-decl-uses-memory? (load i)) 0
-                            (if (jsl-body-reads-memory? (jsl-decl-body (load i)))
-                                (do (jsl-decl-set-uses-memory! (load i) true)
-                                    (set! changed true) 0)
-                                0))
-                          (set! i (+ (load i) 1))
-                          0))))
+              (set! i 0)
+              (loop (if (>= (load i) n) (break)
+                      (do
+                        (if (jsl-decl-uses-memory? (load i)) 0
+                          (let [c (jsl-callee-count (load i)) (mut k) 0]
+                            (loop (if (>= (load k) c) (break)
+                                    (do
+                                      (if (jsl-decl-uses-memory? (jsl-callee (load i) (load k)))
+                                          (do (jsl-decl-set-uses-memory! (load i) true)
+                                              (set! changed true)
+                                              (set! k c) 0)
+                                          0)
+                                      (set! k (+ (load k) 1)))))))
+                        (set! i (+ (load i) 1)))))
               (set! rounds (+ (load rounds) 1))
               ; Each round either sets a flag that never clears or stops, so this terminates in at
               ; most one round per declaration. The cap makes that a named failure, not a hang.
               (if (> (load rounds) (+ n 1))
                   (do (jsl-fail! JSL-ERR-MACRO-RECURSION "memory-use fixpoint") 0)
-                  0)
-              0)))
+                  0))))
     JSL-OK))
 
 (defn jsl-check-macro-cycles [] (-> i64)
@@ -2565,14 +2664,30 @@
     ; Cycles LAST: a body that does not resolve has no meaningful call graph, so reporting a
     ; recursion through an unknown name would name the wrong problem.
     (if (!= (load err) JSL-OK) (load err)
-      (let [cycles (jsl-check-macro-cycles)]
+      (let [t0 (jsl-profile-now)
+            _ (jsl-build-call-graph!)
+            t1 (jsl-profile-now)
+            cycles (jsl-check-macro-cycles)
+            t2 (jsl-profile-now)]
         (if (!= cycles JSL-OK) cycles
-          (let [mem (jsl-resolve-memory-use!)]
+          (let [mem (jsl-resolve-memory-use!)
+                t3 (jsl-profile-now)]
             (if (!= mem JSL-OK) mem
-              (let [cb (jsl-resolve-callback-use!)]
+              (let [cb (jsl-resolve-callback-use!)
+                    t4 (jsl-profile-now)]
                 (if (!= cb JSL-OK) cb
-                    (let [throws (jsl-resolve-throw-use!)]
-                      (if (!= throws JSL-OK) throws (jsl-check-heap-shape))))))))))))
+                    (let [throws (jsl-resolve-throw-use!)
+                          t5 (jsl-profile-now)]
+                      (if (!= throws JSL-OK) throws
+                          (let [heap (jsl-check-heap-shape)]
+                            (fmt (stderr) "AOTK_TIMING phase=jsl_graph ns={d}\n" (- t1 t0))
+                            (fmt (stderr) "AOTK_TIMING phase=jsl_cycles ns={d}\n" (- t2 t1))
+                            (fmt (stderr) "AOTK_TIMING phase=jsl_memuse ns={d}\n" (- t3 t2))
+                            (fmt (stderr) "AOTK_TIMING phase=jsl_cbuse ns={d}\n" (- t4 t3))
+                            (fmt (stderr) "AOTK_TIMING phase=jsl_throwuse ns={d}\n" (- t5 t4))
+                            (fmt (stderr) "AOTK_TIMING phase=jsl_heapshape ns={d}\n"
+                                 (- (jsl-profile-now) t5))
+                            heap))))))))))))
 
 ; ============================================================================
 ; The reader
