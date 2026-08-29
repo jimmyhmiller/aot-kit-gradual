@@ -222,13 +222,28 @@
         (if (and (< (load answer) 0) (load exceptional)) MLK-BOXED (load answer))
         -1)))
 
-(defn be-function-return-kind [(owner i64)] (-> i64)
+;; Grow a per-owner memo table to cover `owner`, filling new slots with "not yet asked".
+(defn be-memo-slot! [(table (mut (ArrayList i64))) (owner i64)] (-> i64)
+  (loop (if (> (al-len [i64] (load table)) owner) (break)
+            (do (al-push! [i64] (mut table) -2) 0)))
+  (al-get [i64] (load table) owner))
+
+(defn be-function-return-kind-compute [(owner i64)] (-> i64)
   (let [fun (mu-function-ideal owner)]
     (if (and (!= fun NO-NODE) (n-fun-abi-declared? fun))
         (if (= (n-fun-abi-result-count fun) 1)
             (ml-kind-for-type (n-fun-abi-result-type fun 0))
             -1)
         (be-function-return-kind-fuel owner 32))))
+
+(defn be-function-return-kind [(owner i64)] (-> i64)
+  (if (< owner 0) (be-function-return-kind-compute owner)
+    (let [u (machine-unit)
+          cached (be-memo-slot! (field u fn-return-kind-memo) owner)]
+      (if (!= cached -2) cached
+          (let [answer (be-function-return-kind-compute owner)]
+            (al-set! [i64] (field u fn-return-kind-memo) owner answer)
+            answer)))))
 
 (defn be-function-result-count [(owner i64)] (-> i64)
   (let [fun (mu-function-ideal owner)]
@@ -364,7 +379,18 @@
                 (set! slot (+ (load slot) 1)))))
     (& (+ (load bytes) 15) -16)))
 
+;; Memoized for the same reason be-function-return-kind is: selection asks this at every call site
+;; and it scans every one of the function's returns.
 (defn be-function-fp-return? [(owner i64)] (-> bool)
+  (if (< owner 0) (be-function-fp-return-compute? owner)
+    (let [u (machine-unit)
+          cached (be-memo-slot! (field u fn-abi-fp-return-memo) owner)]
+      (if (!= cached -2) (!= cached 0)
+          (let [answer (be-function-fp-return-compute? owner)]
+            (al-set! [i64] (field u fn-abi-fp-return-memo) owner (if answer 1 0))
+            answer)))))
+
+(defn be-function-fp-return-compute? [(owner i64)] (-> bool)
   (let [fun (mu-function-ideal owner)]
   (if (and (!= fun NO-NODE) (n-fun-abi-declared? fun))
       (and (= (n-fun-abi-result-count fun) 1)
@@ -3574,6 +3600,15 @@
             -1))))
 
 (defn ms-function-fp-return? [(owner i64)] (-> bool)
+  (if (< owner 0) (ms-function-fp-return-compute? owner)
+    (let [u (machine-unit)
+          cached (be-memo-slot! (field u fn-fp-return-memo) owner)]
+      (if (!= cached -2) (!= cached 0)
+          (let [answer (ms-function-fp-return-compute? owner)]
+            (al-set! [i64] (field u fn-fp-return-memo) owner (if answer 1 0))
+            answer)))))
+
+(defn ms-function-fp-return-compute? [(owner i64)] (-> bool)
   (let [count (mu-function-return-count owner)
         (mut i) 0
         (mut fp) false]
@@ -3605,6 +3640,7 @@
   (let [u (machine-unit) (mut node) 0]
     (al-clear! [i64] (field u selection-ingress-candidates))
     (al-clear! [i64] (field u selection-effect-candidates))
+    (al-clear! [i64] (field u selection-effect-chain-owner))
     (loop (if (>= (load node) (n-count))
               (break)
               (do
@@ -3617,7 +3653,15 @@
                           0)
                       (if (or (op-is? (load node) Call [_])
                               (ms-linear-memory-effect? (load node)))
-                          (al-push! [i64] (field u selection-effect-candidates) (load node))
+                          (do
+                            (al-push! [i64] (field u selection-effect-candidates) (load node))
+                            ;; A Call is adopted by its block's owner, never by the memory chain,
+                            ;; so it records -1 and keeps the existing test.
+                            (al-push! [i64] (field u selection-effect-chain-owner)
+                                      (if (op-is? (load node) Call [_])
+                                          -1
+                                          (ms-memory-chain-owner (load node))))
+                            0)
                           0))
                     0)
                 (set! node (+ (load node) 1)))))
@@ -3778,8 +3822,16 @@
                             ;; ownership test -- see `ms-memory-chain-owner`. When the chain names a
                             ;; function, only that function adopts the effect; when it names none,
                             ;; the block fallback still decides, exactly as before.
-                            (let [bid (ms-memory-block owner candidate)
-                                  chain-owner (ms-memory-chain-owner candidate)]
+                            ;;
+                            ;; The chain owner is read from the table built with the candidate list
+                            ;; rather than recomputed here: it does not depend on `owner`, and
+                            ;; walking it once per function is what made this quadratic.
+                            (let [chain-owner (al-get [i64]
+                                                (.selection-effect-chain-owner (machine-unit))
+                                                (load node))
+                                  bid (if (and (>= chain-owner 0) (!= chain-owner owner))
+                                          -1
+                                          (ms-memory-block owner candidate))]
                               (if (and (>= bid 0)
                                        (and (= (mu-block-owner bid) owner)
                                             (or (< chain-owner 0) (= chain-owner owner))))
