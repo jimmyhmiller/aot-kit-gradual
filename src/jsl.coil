@@ -2484,17 +2484,46 @@
 ;; Collect every declaration named in head position anywhere in one body, including inside vectors
 ;; -- a call inside a `let` or `loop` binding is a call. Duplicates are allowed: the propagation
 ;; below only reads flags, so a repeated edge costs one extra comparison and no correctness.
-(defn jsl-collect-callees! [(x (ptr rd/Sexp)) (self i64)] (-> i64)
+;; ONE WALK, FOUR ANSWERS. The callee edges and the three effect bits a definition owns -- does it
+;; read memory, can it call back, can it throw -- all come from the same head symbols, and each used
+;; to be recovered by its own recursion over every body in the library. Four passes over 576
+;; declarations to answer questions about the 83 a one-line program reaches.
+;;
+;; This collects only what a body OWNS. Propagation to callers is the CSR fixpoint below, which is
+;; where it belongs: it is integer work over edges, not a syntax walk.
+(defn jsl-collect-callees! [(x (ptr rd/Sexp)) (self i64)
+                            (memory (ptr bool)) (callback (ptr bool)) (throws (ptr bool))] (-> i64)
   (if (and (not (rd/sexp-list? x)) (not (rd/sexp-vec? x))) 0
     (let [n (rd/sexp-count x) (mut i) 0]
       (if (and (rd/sexp-list? x) (and (> n 0) (rd/sexp-sym? (rd/sexp-nth x 0))))
-          (let [callee (jsl-find (rd/sexp-sym (rd/sexp-nth x 0)))]
+          (let [name (rd/sexp-sym (rd/sexp-nth x 0))
+                callee (jsl-find name)
+                calls-back (or (= name "call")
+                               (or (= name "call-with-receiver")
+                                   (or (= name "call-dynamic-with-receiver")
+                                       (= name "call-dynamic-with-receiver-rest"))))]
             (if (and (>= callee 0) (!= callee self))
                 (al-push! [i64] (field (jsl) callee-entry) callee)
-                0))
+                0)
+            (if calls-back (do (store! callback true) (store! throws true) 0) 0)
+            (if (= name "%Throw") (store! throws true) 0)
+            (if (or (= name "call")
+                    (or (= name "object-layout-init")
+                        (or (= name "object-method-family-is")
+                            (or (= name "object-method-family-set")
+                                (or (= name "object-method-is-ordinary")
+                                    (or (= name "internal-slot-has")
+                                        (or (= name "internal-slot-load")
+                                            (= name "internal-slot-store")))))))) 
+                (store! memory true)
+                (if (jsl-prim-name? name)
+                    (let [id (jsp-find name)]
+                      (if (and (!= id JSP-NONE) (jsp-reads-memory? id))
+                          (store! memory true) 0))
+                    0)))
           0)
       (loop (if (>= (load i) n) (break)
-              (do (jsl-collect-callees! (rd/sexp-nth x (load i)) self)
+              (do (jsl-collect-callees! (rd/sexp-nth x (load i)) self memory callback throws)
                   (set! i (+ (load i) 1)))))
       0)))
 
@@ -2504,11 +2533,18 @@
     (al-clear! [i64] (field p callee-count))
     (al-clear! [i64] (field p callee-entry))
     (loop (if (>= (load i) n) (break)
-            (let [first (al-len [i64] (.callee-entry p))]
-              (jsl-collect-callees! (jsl-decl-body (load i)) (load i))
+            (let [first (al-len [i64] (.callee-entry p))
+                  memory (primitive/alloc-stack bool)
+                  callback (primitive/alloc-stack bool)
+                  throws (primitive/alloc-stack bool)]
+              (store! memory false) (store! callback false) (store! throws false)
+              (jsl-collect-callees! (jsl-decl-body (load i)) (load i) memory callback throws)
               (al-push! [i64] (field p callee-first) first)
               (al-push! [i64] (field p callee-count)
                         (- (al-len [i64] (.callee-entry p)) first))
+              (if (load memory) (jsl-decl-set-uses-memory! (load i) true) 0)
+              (if (load callback) (jsl-decl-set-calls-back! (load i) true) 0)
+              (if (load throws) (jsl-decl-set-can-throw! (load i) true) 0)
               (set! i (+ (load i) 1)))))
     0))
 
@@ -2571,13 +2607,8 @@
   ;; the only way a declaration can newly gain the flag is through a callee that has it, so the
   ;; rest of the fixed point runs over the cached call graph instead of over syntax.
   (let [n (jsl-decl-count) (mut changed) true (mut rounds) 0 (mut i) 0]
-    (loop (if (>= (load i) n) (break)
-            (do
-              (if (jsl-decl-calls-back? (load i)) 0
-                (if (jsl-body-calls-back? (jsl-decl-body (load i)))
-                    (do (jsl-decl-set-calls-back! (load i) true) 0)
-                    0))
-              (set! i (+ (load i) 1)))))
+    ;; No body pass. jsl-build-call-graph! already set every declaration's own bit in the one
+    ;; walk that built the edges; all that is left is propagating it to callers.
     (loop (if (not (load changed)) (break)
             (do
               (set! changed false)
@@ -2641,13 +2672,8 @@
   ;; the only way a declaration can newly gain the flag is through a callee that has it, so the
   ;; rest of the fixed point runs over the cached call graph instead of over syntax.
   (let [n (jsl-decl-count) (mut changed) true (mut rounds) 0 (mut i) 0]
-    (loop (if (>= (load i) n) (break)
-            (do
-              (if (jsl-decl-can-throw? (load i)) 0
-                (if (jsl-body-can-throw? (jsl-decl-body (load i)))
-                    (do (jsl-decl-set-can-throw! (load i) true) 0)
-                    0))
-              (set! i (+ (load i) 1)))))
+    ;; No body pass. jsl-build-call-graph! already set every declaration's own bit in the one
+    ;; walk that built the edges; all that is left is propagating it to callers.
     (loop (if (not (load changed)) (break)
             (do
               (set! changed false)
@@ -2682,13 +2708,8 @@
   ;; the only way a declaration can newly gain the flag is through a callee that has it, so the
   ;; rest of the fixed point runs over the cached call graph instead of over syntax.
   (let [n (jsl-decl-count) (mut changed) true (mut rounds) 0 (mut i) 0]
-    (loop (if (>= (load i) n) (break)
-            (do
-              (if (jsl-decl-uses-memory? (load i)) 0
-                (if (jsl-body-reads-memory? (jsl-decl-body (load i)))
-                    (do (jsl-decl-set-uses-memory! (load i) true) 0)
-                    0))
-              (set! i (+ (load i) 1)))))
+    ;; No body pass. jsl-build-call-graph! already set every declaration's own bit in the one
+    ;; walk that built the edges; all that is left is propagating it to callers.
     (loop (if (not (load changed)) (break)
             (do
               (set! changed false)
