@@ -76,11 +76,15 @@ function jslFiles(root = "lib") {
 
 const HEAD = /^\((macro|builtin|callable)\s+(\S+)/gm;
 
-// The body with the declaration header (name, :params, :ret and friends) removed, so a match is
-// about what the definition DOES rather than how it is declared.
-function stripHeader(code) {
+// Does EVERY path through this body throw? Only when the body's whole outermost form is `%Throw`.
+// A body that merely contains one -- ArrayFrom, GetIterator, NumberToFixed and four others throw on
+// an error path and return normally otherwise -- is an ordinary definition and crosses a call fine.
+function divergesAlways(code) {
   const ret = /:ret\s+\S+/.exec(code);
-  return ret ? code.slice(ret.index + ret[0].length) : code;
+  if (!ret) return false;
+  const body = code.slice(ret.index + ret[0].length)
+    .split("\n").filter((line) => !line.trimStart().startsWith(";;")).join("\n").trim();
+  return body.startsWith("(%Throw");
 }
 const NAMED_KEY_PRIMS = ["%PropLoadNamed", "%PropStoreNamed", "%PropHasNamed", "%PropDeleteNamed"];
 
@@ -118,7 +122,7 @@ function read() {
         slotList: code.includes("(slot-list)"),
         recordReturn: /:ret\s*\(record\s/.test(code),
         recordParam: /\(record\s/.test(params),
-        diverges: /\(%Throw\b/.test(stripHeader(code)),
+        diverges: divergesAlways(code),
         staticKey: staticKeyParameter(code, params),
       });
     }
