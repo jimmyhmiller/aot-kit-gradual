@@ -4642,6 +4642,15 @@
 
 ;; Validate EARLIEST -> LATEST dominance and choose the lowest-loop-depth block in one idom walk.
 ;; Returning -1 preserves the old dependency failure without paying for a separate dominates walk.
+;; A machine value cheap enough to recompute rather than keep alive: a constant materialisation
+;; with no register operands. Simple calls these `MachNode.isClone()` and treats them specially in
+;; three places -- GCM clones them, the interference graph refuses to let one hold a register, and
+;; the allocator splits one into private uses rather than spilling it.
+(defn ms-clonable-inst? [(at i64)] (-> bool)
+  (let [m (be-inst at)]
+    (and (= (.op m) MI-MOVI)
+         (and (< (.a m) 0) (< (.b m) 0)))))
+
 (defn ms-gcm-best-late-block [(earliest i64) (latest i64)] (-> i64)
   (let [(mut choice) latest
         (mut cursor) latest
@@ -4714,7 +4723,18 @@
                                       -1)
                                 latest (if (< use-block 0) earliest use-block)]
                             (set! (.latest m) latest)
-                            (let [choice (ms-gcm-best-late-block earliest latest)]
+                            (let [choice
+                                    ;; A CLONABLE VALUE IS NOT HOISTED. best-late-block walks up
+                                    ;; from the use to the lowest loop depth, which is right for
+                                    ;; real computation -- do it once outside the loop -- and wrong
+                                    ;; for a constant, whose `mov` is cheaper than the live range
+                                    ;; that hoisting creates. Simple never lets one of these hold a
+                                    ;; register across a loop either; it re-clones at the use.
+                                    (if (and (ms-clonable-inst? (load at))
+                                             (>= latest 0)
+                                             (mu-dominates? earliest latest))
+                                        latest
+                                        (ms-gcm-best-late-block earliest latest))]
                               (if (< choice 0)
                                   (do
                                     (if (be-profiling?)
