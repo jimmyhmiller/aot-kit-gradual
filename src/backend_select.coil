@@ -1496,6 +1496,61 @@
 (defn ms-memory-chain-owner [(node i64)] (-> i64)
   (ms-memory-chain-owner-fuel node 64))
 
+
+;; The NODE the memory chain ends at, which is what `ms-memory-block` finally asks `ms-node-block`
+;; about. The walk is owner-independent; only that final lookup is filtered, and the lookup itself
+;; is O(1). Caching the terminal therefore removes the whole walk from the per-function loop while
+;; leaving the owner-sensitive part exactly where it was.
+(defn ms-memory-chain-terminal [(node i64)] (-> i64)
+  (let [(mut current) node (mut answer) -1 (mut done) false]
+    (loop (if (load done)
+              (break)
+              (match (n-op (load current))
+                (Store [alias] (set! current (n-in (load current) 1)))
+                (Load [alias] (set! current (n-in (load current) 1)))
+                (PropStore [name] (set! current (n-in (load current) 1)))
+                (PropDelete [name] (set! current (n-in (load current) 1)))
+                (SetProto [] (set! current (n-in (load current) 1)))
+                (PropLoad [name] (set! current (n-in (load current) 1)))
+                (PropHas [name] (set! current (n-in (load current) 1)))
+                (ProtoHas [] (set! current (n-in (load current) 1)))
+                (PropLoadKey [_] (set! current (n-in (load current) 1)))
+                (PropHasKey [] (set! current (n-in (load current) 1)))
+                (OwnKeyCount [] (set! current (n-in (load current) 1)))
+                (OwnKeyAt [] (set! current (n-in (load current) 1)))
+                (PropStoreKey [_] (set! current (n-in (load current) 1)))
+                (PropDeleteKey [] (set! current (n-in (load current) 1)))
+                (ObjectFreeze [] (set! current (n-in (load current) 1)))
+                (InternalLoad [slot] (set! current (n-in (load current) 1)))
+                (InternalStore [operation] (set! current (n-in (load current) 1)))
+                (ArrayStore [] (set! current (n-in (load current) 1)))
+                (ArrayResize [] (set! current (n-in (load current) 1)))
+                (ArrayLoad [alias] (set! current (n-in (load current) 1)))
+                (ArrayLen [] (set! current (n-in (load current) 1)))
+                (ArrayCopy [] (set! current (n-in (load current) 1)))
+                (StringSplit [] (set! current (n-in (load current) 1)))
+                (Proj [slot] (do
+                      (set! answer
+                            (if (match (n-op (n-proj-source (load current)))
+                                  (New [shape] true) (_ false))
+                                (n-proj-source (load current))
+                                (load current)))
+                      (set! done true)))
+                (_ (do (set! answer (load current))
+                       (set! done true))))))
+    (load answer)))
+
+;; ms-memory-block's answer for one owner, given the cached chain terminal. Both lookups are the
+;; ORIGINAL ms-node-block, so every special case it has -- a control-less node mapping to the
+;; asking function's entry block, the Start control belonging to owner 0 -- is preserved. Only the
+;; walk between them was hoisted out.
+(defn ms-memory-block-cached [(owner i64) (node i64) (terminal i64)] (-> i64)
+  (let [pinned (if (and (> (n-nins node) 0) (!= (n-in node 0) NO-NODE))
+                   (ms-node-block owner node)
+                   -1)]
+    (if (>= pinned 0) pinned
+        (if (< terminal 0) -1 (ms-node-block owner terminal)))))
+
 (defn ms-memory-block [(owner i64) (node i64)] (-> i64)
   ;; Memory operations put their memory dependency, not control, in input 0. Placing one from
   ;; ms-node-block would therefore confuse a loop Memory Phi with the operation's control block
@@ -3661,10 +3716,21 @@
                                       (if (op-is? (load node) Call [_])
                                           -1
                                           (ms-memory-chain-owner (load node))))
+                            (al-push! [i64] (field u selection-effect-chain-block)
+                                      (if (op-is? (load node) Call [_]) -1
+                                          (ms-memory-chain-terminal (load node))))
                             0)
                           0))
                     0)
                 (set! node (+ (load node) 1)))))
+    (let [total (al-len [i64] (.selection-effect-candidates u))
+          (mut i) 0 (mut undecided) 0]
+      (loop (if (>= (load i) total) (break)
+                (do (if (< (al-get [i64] (.selection-effect-chain-owner u) (load i)) 0)
+                        (set! undecided (+ (load undecided) 1)) 0)
+                    (set! i (+ (load i) 1)))))
+      (fmt (stderr) "AOTK_TIMING phase=preselect_candidates ns={d}\n"
+           (+ (* 1000000 total) (load undecided))))
     0))
 
 (defn ms-preselect-function! [(owner i64)] (-> i64)
@@ -3831,7 +3897,11 @@
                                                 (load node))
                                   bid (if (and (>= chain-owner 0) (!= chain-owner owner))
                                           -1
-                                          (ms-memory-block owner candidate))]
+                                          (ms-memory-block-cached
+                                            owner candidate
+                                            (al-get [i64]
+                                              (.selection-effect-chain-block (machine-unit))
+                                              (load node))))]
                               (if (and (>= bid 0)
                                        (and (= (mu-block-owner bid) owner)
                                             (or (< chain-owner 0) (= chain-owner owner))))
