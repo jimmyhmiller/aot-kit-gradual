@@ -269,94 +269,52 @@
   (let [enabled (primitive/alloc-static bool)] enabled))
 
 (defn fng-analyze-fresh! [] (-> i64)
-  (let [(mut index) 0
-        started (fng-profile-now)]
+  ;; ONE ANALYSIS, ONE DRAIN. Simple's `opto()` is a single `iterate()`; this was a loop of
+  ;; { reset every type to TOP; analyse the whole graph; fold; iterate } run until two rounds in a
+  ;; row changed nothing, then one more whole-graph analysis -- four complete re-analyses of 40,000
+  ;; nodes on the benchmark.
+  ;;
+  ;; The loop existed because rewrites did not re-queue what they invalidated; `n-subsume!` does
+  ;; now, which is Simple's invariant, so the drain IS the fixed point.
+  ;;
+  ;; THE ORDER MATTERS AND IS WHY A NAIVE DRAIN FAILS. `n-peephole` folds a node to a constant only
+  ;; when `n-ty-proven?`, which reads the proof snapshot; a snapshot taken before any analysis sees
+  ;; every type at TOP, nothing is proven, no branch ever collapses, and five of twenty smoke
+  ;; programs died with BER-MALFORMED-GRAPH at selection -- all of them loops, because their `If`s
+  ;; stood with one dead arm. So: seed types optimistically, bring them to a fixed point, snapshot
+  ;; THAT, and only then drain the peephole worklist that rewrites against it.
+  (let [started (fng-profile-now)
+        (mut index) 0]
     (loop (if (>= (load index) (n-count))
               (break)
               (do
                 (if (n-dead? (load index)) 0 (n-set-ty! (load index) (t-top)))
                 (set! index (+ (load index) 1)))))
-    ;; ANALYSE, FOLD, AND THEN ANALYSE WHAT THE FOLD LEFT.
-    ;;
-    ;; `g-fold-proven!` REWIRES the graph -- it replaces proven nodes with constants, collapses the
-    ;; branches that then become dead, and reduces the phis on the regions those collapses remove.
-    ;; Every one of those is an input change for something downstream, and nothing re-queued them,
-    ;; so the pass returned with types describing the graph as it was BEFORE the fold. `g-verify`
-    ;; says VERR-STALE-TYPE, and the stale type is the pre-fold one, which is wider than the truth
-    ;; in some places and narrower in others.
-    ;;
-    ;; It was invisible while little folded. Once `box-compute` began carrying its input's kind,
-    ;; the DSL's tag guards started proving and the amount of folding went up sharply, which is
-    ;; what surfaced it. See docs/DSL-OWNERSHIP.md.
-    ;;
-    ;; Bounded because each round must FOLD something to earn the next one, and folding is
-    ;; monotone: it only ever replaces nodes with constants and deletes control.
-    (let [(mut rounds) 0
-          (mut stable) 0
-          (mut analyze-ns) 0
-          (mut fold-ns) 0
-          (mut iterate-ns) 0
-          (mut fold-rounds) 0
-          (mut iterate-steps) 0]
-      (loop (do
-                (let [phase (fng-profile-now)]
-                  (g-analyze!)
-                  (set! analyze-ns (+ (load analyze-ns) (- (fng-profile-now) phase))))
-                (let [before (g-live-count)]
-                  (let [phase (fng-profile-now)]
-                    (set! fold-rounds (+ (load fold-rounds) (g-fold-proven-for-iterate!)))
-                    (set! fold-ns (+ (load fold-ns) (- (fng-profile-now) phase))))
-                  ;; `g-fold-proven!` turns a proven predicate into a constant; `iterate!` is what
-                  ;; then collapses the `If`, retires the unreachable projection and reduces the
-                  ;; phis on the region that loses an arm. Folding without it leaves the branch
-                  ;; standing with one dead side -- every guard proved and none of them removed,
-                  ;; which is most of the cost the DSL was being blamed for.
-                  (let [phase (fng-profile-now)]
-                    (set! iterate-steps (+ (load iterate-steps) (iterate!)))
-                    (set! iterate-ns (+ (load iterate-ns) (- (fng-profile-now) phase))))
-                  (set! rounds (+ (load rounds) 1))
-                  ;; ONE STABLE ROUND. This wanted two, because "a round that folds nothing may
-                  ;; still have PROVEN something -- the analysis at the top of it -- and that proof
-                  ;; only becomes a deletion in the round after". That was true while a rewrite did
-                  ;; not re-queue what it invalidated; `n-subsume!` does now, so the proof and the
-                  ;; deletion happen in the same round. Byte-identical output on the benchmark --
-                  ;; 5,535 blocks, 5,947 edges, 50,645 vregs, 64,851 instructions -- and one fewer
-                  ;; whole-graph analysis.
-                  ;;
-                  ;; The loop itself STAYS. Draining once, the way Simple does, breaks every
-                  ;; program with a loop: `g-analyze!` resets every type to TOP first, and a loop
-                  ;; phi's `compute` reads its own current type for `ty-widen-from`'s fuel, so the
-                  ;; optimistic restart is what makes the widening terminate at the right type.
-                  ;; Simple needs no restart because its types only ever refine downward from
-                  ;; construction. Removing it here produced BER-MALFORMED-GRAPH at selection on
-                  ;; five of twenty smoke programs.
-                  (if (= (g-live-count) before)
-                      (set! stable (+ (load stable) 1))
-                      (set! stable 0))
-                  (if (or (>= (load stable) 1) (> (load rounds) 12))
-                      (break)
-                      0))))
-      ;; One last analysis so the types describe the graph that actually survived.
-      (let [phase (fng-profile-now)]
-        (g-analyze!)
-        (set! analyze-ns (+ (load analyze-ns) (- (fng-profile-now) phase))))
-      (fmt (stderr) "AOTK_TIMING phase=frontend_analyze_core ns={d}\n" (load analyze-ns))
-      (fmt (stderr) "AOTK_TIMING phase=frontend_fold ns={d}\n" (load fold-ns))
-      (fmt (stderr) "AOTK_TIMING phase=frontend_iterate ns={d}\n" (load iterate-ns))
-      (fmt (stderr) "AOTK_TIMING phase=frontend_analyze_rounds ns={d}\n" (load rounds))
-      (fmt (stderr) "AOTK_TIMING phase=frontend_fold_rounds ns={d}\n" (load fold-rounds))
-      (fmt (stderr) "AOTK_TIMING phase=frontend_iterate_steps ns={d}\n" (load iterate-steps))
-      (fmt (stderr) "AOTK_PROFILE phase=peephole peeps={d} compute_ns={d} proof_ns={d} proof_calls={d} proof_snapshot_ns={d} proof_snapshot_calls={d} proof_visits={d} proof_max={d} idealize_ns={d} gvn_ns={d}\n"
-           (g-profile-peeps) (g-profile-compute-ns) (g-profile-proof-ns)
-           (g-profile-proof-calls) (g-profile-proof-snapshot-ns)
-           (g-profile-proof-snapshot-calls) (g-profile-proof-visits) (g-profile-proof-max)
-           (g-profile-idealize-ns) (g-profile-gvn-ns))
-      (fmt (stderr) "AOTK_PROFILE phase=frontend_work analyze_pops={d} fold_scans={d} fold_candidates={d} iterate_live_scans={d} iterate_pops={d} iterate_sweeps={d} proof_snapshot_seeds={d} proof_snapshot_edges={d}\n"
-           (g-profile-analyze-pops) (g-profile-fold-scans) (g-profile-fold-candidates)
-           (g-profile-iterate-live-scans) (g-profile-iterate-pops) (g-profile-iterate-sweeps)
-           (g-profile-proof-snapshot-seeds) (g-profile-proof-snapshot-edges))
-      (fng-profile-note! "frontend_analyze" started))))
-
+    (let [analyze-start (fng-profile-now)]
+      (g-analyze!)
+      (let [drain-start (fng-profile-now)]
+        (n-proof-snapshot!)
+        (wl-push-live!)
+        (let [steps (wl-drain!)]
+          (n-proof-snapshot-clear!)
+          (fmt (stderr) "AOTK_TIMING phase=frontend_analyze_core ns={d}\n"
+               (- drain-start analyze-start))
+          (fmt (stderr) "AOTK_TIMING phase=frontend_fold ns={d}\n"
+               (- (fng-profile-now) drain-start))
+          (fmt (stderr) "AOTK_TIMING phase=frontend_iterate ns={d}\n" 0)
+          (fmt (stderr) "AOTK_TIMING phase=frontend_analyze_rounds ns={d}\n" 1)
+          (fmt (stderr) "AOTK_TIMING phase=frontend_fold_rounds ns={d}\n" 1)
+          (fmt (stderr) "AOTK_TIMING phase=frontend_iterate_steps ns={d}\n" steps)
+          (fmt (stderr) "AOTK_PROFILE phase=peephole peeps={d} compute_ns={d} proof_ns={d} proof_calls={d} proof_snapshot_ns={d} proof_snapshot_calls={d} proof_visits={d} proof_max={d} idealize_ns={d} gvn_ns={d}\n"
+               (g-profile-peeps) (g-profile-compute-ns) (g-profile-proof-ns)
+               (g-profile-proof-calls) (g-profile-proof-snapshot-ns)
+               (g-profile-proof-snapshot-calls) (g-profile-proof-visits) (g-profile-proof-max)
+               (g-profile-idealize-ns) (g-profile-gvn-ns))
+          (fmt (stderr) "AOTK_PROFILE phase=frontend_work analyze_pops={d} fold_scans={d} fold_candidates={d} iterate_live_scans={d} iterate_pops={d} iterate_sweeps={d} proof_snapshot_seeds={d} proof_snapshot_edges={d}\n"
+               (g-profile-analyze-pops) (g-profile-fold-scans) (g-profile-fold-candidates)
+               (g-profile-iterate-live-scans) (g-profile-iterate-pops) (g-profile-iterate-sweeps)
+               (g-profile-proof-snapshot-seeds) (g-profile-proof-snapshot-edges))
+          (fng-profile-note! "frontend_analyze" started))))))
 (defn fng-peep [(node i64)] (-> i64)
   (if (load (fng-optimize-ptr)) (n-peephole node) node))
 
