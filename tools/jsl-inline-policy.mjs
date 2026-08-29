@@ -15,7 +15,13 @@
 //   * a `(slot-list)` parameter or return is compile-time only, for the same reason;
 //   * a `(record ...)` RETURN cannot cross a call -- the result-area ABI has a hidden result
 //     pointer and a flat result vector and a record's fields are not in it. Record ARGUMENTS are
-//     fine and three builtins already take one.
+//     fine and three builtins already take one;
+//   * a definition that passes one of its OWN PARAMETERS as the key of `%PropLoadNamed`,
+//     `%PropStoreNamed`, `%PropHasNamed` or `%PropDeleteNamed` cannot cross a call. Named-property
+//     IR carries the interned name in the node's aux field, not as a data input, so the key has to
+//     be a literal at lowering time (`jl-static-property-key`). Inlined, the caller's literal
+//     argument is visible and it folds; called, the key is a runtime value and lowering refuses it
+//     with "a named-property key must be an interned id or string literal".
 //
 // A definition that calls a callback stays an expansion whatever it is declared, because the
 // frontend needs the caller's memory at the callback site (`frontend_native_graph.coil`, the
@@ -61,6 +67,19 @@ function jslFiles(root = "lib") {
 }
 
 const HEAD = /^\((macro|builtin|callable)\s+(\S+)/gm;
+const NAMED_KEY_PRIMS = ["%PropLoadNamed", "%PropStoreNamed", "%PropHasNamed", "%PropDeleteNamed"];
+
+// True when the key operand of a named-property primitive is one of this declaration's parameters,
+// rather than a literal. Such a definition only lowers when it is inlined into a call site that
+// supplies the literal.
+function staticKeyParameter(code, params) {
+  const names = new Set([...params.matchAll(/\((\w+)\s/g)].map((m) => m[1]));
+  for (const prim of NAMED_KEY_PRIMS) {
+    const uses = code.matchAll(new RegExp(`${prim}\\s+\\S+\\s+([A-Za-z_]\\w*)`, "g"));
+    for (const use of uses) if (names.has(use[1])) return true;
+  }
+  return false;
+}
 
 function read() {
   const declarations = [];
@@ -83,18 +102,20 @@ function read() {
         rest: /\(rest\s/.test(params),
         slotList: code.includes("(slot-list)"),
         recordReturn: /:ret\s*\(record\s/.test(code),
+        staticKey: staticKeyParameter(code, params),
       });
     }
   }
   return declarations;
 }
 
-const eligible = (d) => !d.rest && !d.slotList && !d.recordReturn;
+const eligible = (d) => !d.rest && !d.slotList && !d.recordReturn && !d.staticKey;
 const violation = (d) => {
   if (d.kind === "macro") return null;
   if (d.rest) return "a rest parameter cannot cross a call";
   if (d.slotList) return "a slot list cannot cross a call";
   if (d.recordReturn) return "a record return cannot cross a call";
+  if (d.staticKey) return "a parameter used as a named-property key cannot cross a call";
   return null;
 };
 

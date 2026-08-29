@@ -5,16 +5,16 @@
 ;; `%NewArray` allocates and tags; `%ArrayStore` writes an element and yields the new heap, which
 ;; the lowering threads. Neither appears as a memory operand in the source.
 
-(macro InitializeArray :params [(array dyn)] :ret dyn
+(builtin InitializeArray :transitioning true :params [(array dyn)] :ret dyn
   (let [(layout (object-layout-init array OrdinaryObjectBase))
         (extensible (internal-slot-store layout Extensible true))
         (family (object-method-family-set extensible ArrayExoticMethods))
         (prototype (InitializeObjectPrototype family (BuiltinPrototypeValue 17)))]
     array))
 
-(macro NewArray :params [] :ret dyn
+(macro NewArray :transitioning true :params [] :ret dyn
   (InitializeArray (%NewArray)))
-(macro IsArray
+(builtin IsArray
   :spec "ecma262@ed463bc10dbeaad0410ce67e541a77ea8e9900a5#sec-isarray"
   :spec-name "IsArray"
   :status partial
@@ -22,10 +22,10 @@
   :params [(value dyn)] :ret bool
   (%IsArray value))
 
-(callable ArrayIsArray1 :params [(value dyn)] :ret dyn
+(callable ArrayIsArray1 :transitioning true :params [(value dyn)] :ret dyn
   (%Box (IsArray value)))
 
-(macro ArrayIsArrayValue :transitioning true :params [] :ret dyn
+(builtin ArrayIsArrayValue :transitioning true :params [] :ret dyn
   (let [(function (%Box (closure ArrayIsArray1)))
         (lengthKey (ToPropertyKey "length"))
         (nameKey (ToPropertyKey "name"))
@@ -39,14 +39,14 @@
 ;; length from an ordinary first element at runtime; that dispatch belongs here, not in syntax
 ;; lowering. ClampedIndex supplies the current machine-index representation of ToUint32-sized
 ;; lengths. Exact RangeError validation for non-integral and overflowing lengths remains separate.
-(macro ArrayFromOne :transitioning true :params [(value dyn)] :ret dyn
+(builtin ArrayFromOne :transitioning true :params [(value dyn)] :ret dyn
   (let [(out (NewArray))]
     (if (IsNumber value)
         (let [(resized (%ArrayResize out (ClampedIndex value 4294967295) out))] out)
         (let [(stored (%ArrayStore out 0 (%Box value)))] out))))
 
 ;; Append one concat argument, spreading it exactly when its runtime tag is Array.
-(builtin ArrayConcatValue :params [(out dyn) (value dyn)] :ret dyn
+(builtin ArrayConcatValue :transitioning true :params [(out dyn) (value dyn)] :ret dyn
   (if (%IsArray value)
       (let [(array (%UnboxArray value))
             (len (%ArrayLen array))]
@@ -110,7 +110,7 @@
 ;; The length is re-read on each call rather than being carried, which is what makes the
 ;; one-at-a-time factoring correct: the answer is the length AFTER this element, so `a.push(x, y)`
 ;; answers len+2 by answering len+1 twice over a heap that moved in between.
-(macro ArrayPush1 :params [(a dyn) (v dyn)] :ret int
+(builtin ArrayPush1 :params [(a dyn) (v dyn)] :ret int
   (let [(len (%ArrayLen a))
         (ignored (%ArrayStore a len v))]
     (%Add len 1)))
@@ -138,7 +138,7 @@
 ;; values[0]` then answered one low, because the Phi reaches the multiply unboxed while the sibling
 ;; load does not. The branch-free form has one representation on every path, and it is also the
 ;; smaller graph.
-(macro ArrayPop :params [(a dyn)] :ret dyn
+(builtin ArrayPop :transitioning true :params [(a dyn)] :ret dyn
   (let [(last (Clamp (%Sub (%ArrayLen a) 1) 0 (%ArrayLen a)))
         (v (%ArrayLoad a last))
         (ignored (%ArrayResize a last v))]
@@ -156,7 +156,7 @@
 ;;
 ;; The empty case is the same clamp `pop` uses, and for the same reason: `last` is 0, so the loop
 ;; never runs, the resize is a no-op, and the load of index 0 answers `undefined`.
-(builtin ArrayShift :params [(a dyn)] :ret dyn
+(builtin ArrayShift :transitioning true :params [(a dyn)] :ret dyn
   (let [(last (Clamp (%Sub (%ArrayLen a) 1) 0 (%ArrayLen a)))
         (head (%ArrayLoad a 0))
         (moved (loop [(i 0 int)]
@@ -183,7 +183,7 @@
 ;; existing bounds, so their receiver's length never changes while they iterate. `shift`'s resize
 ;; is its last binding, outside the loop, deliberately.
 ;; repros/array-unshift-does-not-terminate.js.
-(builtin ArrayUnshift1 :params [(a dyn) (v dyn)] :ret int
+(builtin ArrayUnshift1 :transitioning true :params [(a dyn) (v dyn)] :ret int
   (let [(copy (%NewArray))
         (copied
           (loop [(i 0 int)]
@@ -200,7 +200,7 @@
 
 ;; https://tc39.es/ecma262/#sec-array.prototype.reverse. Swapping only the lower half makes odd
 ;; lengths leave their centre element untouched.
-(builtin ArrayReverse :params [(a dyn)] :ret dyn
+(builtin ArrayReverse :transitioning true :params [(a dyn)] :ret dyn
   (let [(len (%ArrayLen a))
         (copy (%NewArray))
         (copied
@@ -241,14 +241,14 @@
 ;; The normalized insertion/deletion point shared by splice's deletion and the frontend's
 ;; syntax-argument insertion loop. Keeping it named in JSL prevents the two halves of variadic
 ;; splice from acquiring different negative-index rules.
-(macro ArraySpliceStart :params [(a dyn) (start int)] :ret int
+(builtin ArraySpliceStart :transitioning true :params [(a dyn) (start int)] :ret int
   (let [(len (%ArrayLen a))]
     (Clamp (if (%Lt start 0) (%Add len start) start) 0 len)))
 
 ;; Delete a range and close the gap. A negative count is the frontend's explicit "argument was
 ;; absent" sentinel and means the remainder; an actual negative JavaScript deleteCount clamps to
 ;; zero before it reaches this definition.
-(builtin ArraySpliceDelete :params [(a dyn) (start int) (count int)] :ret dyn
+(builtin ArraySpliceDelete :transitioning true :params [(a dyn) (start int) (count int)] :ret dyn
   (let [(len (%ArrayLen a))
         (n (if (%Lt count 0) (%Sub len start) (Clamp count 0 (%Sub len start))))
         (out (%NewArray))
@@ -275,7 +275,7 @@
 
 ;; Insert one already-evaluated syntax argument. The frontend invokes this left-to-right after
 ;; deletion; a scratch copy prevents destructive right shifts from overtaking their source reads.
-(builtin ArraySpliceInsert1 :params [(a dyn) (start int) (offset int) (value dyn)] :ret dyn
+(builtin ArraySpliceInsert1 :transitioning true :params [(a dyn) (start int) (offset int) (value dyn)] :ret dyn
   (let [(at (%Add start offset))
         (len (%ArrayLen a))
         (tail (%NewArray))
@@ -291,13 +291,13 @@
         (let [(stored (%ArrayStore a (%Add (%Add at i) 1) (%ArrayLoad tail i)))]
           (recur (%Add i 1)))))))
 
-(macro ArrayOfAppend1 :params [(a dyn) (value dyn)] :ret dyn
+(builtin ArrayOfAppend1 :params [(a dyn) (value dyn)] :ret dyn
   (let [(stored (%ArrayStore a (%ArrayLen a) value))] a))
 
 ;; https://tc39.es/ecma262/#sec-array.from for the iterable kinds this runtime represents today.
 ;; String iteration is by Unicode code point, not UTF-16 code unit: a valid surrogate pair is
 ;; concatenated into one element and advances by two units.
-(builtin ArrayFrom :params [(source dyn)] :ret dyn
+(builtin ArrayFrom :transitioning true :params [(source dyn)] :ret dyn
   (let [(out (%NewArray))]
     (if (%IsArray source)
         (let [(array (%UnboxArray source))
@@ -339,7 +339,7 @@
 ;; No `%ArrayResize` here. `%ArrayStore` past the end grows the array, so writing `hi - lo`
 ;; elements into a fresh one leaves exactly that length, and a zero-width slice is the empty array
 ;; `%NewArray` already produced.
-(builtin ArraySlice :params [(a dyn) (start int) (end int)] :ret dyn
+(builtin ArraySlice :transitioning true :params [(a dyn) (start int) (end int)] :ret dyn
   (let [(len (%ArrayLen a))
         (lo (Clamp (if (%Lt start 0) (%Add len start) start) 0 len))
         (hi (Clamp (if (%Lt end 0) (%Add len end) end) 0 len))
@@ -376,14 +376,14 @@
 
 ;; Compile-time-unrolled literal callbacks use these policies. The frontend supplies literal
 ;; values/counts; callback invocation and array semantics remain DSL-owned.
-(macro ArrayMapAt :transitioning true
+(builtin ArrayMapAt :transitioning true
   :params [(src dyn) (callback dyn) (out dyn) (i int) (thisArg dyn)] :ret dyn
   (let [(mapped (Call (%Box callback) thisArg
                                              (%ArrayLoad src i) (%BoxInt i) src))
         (ignored (%ArrayStore out i mapped))]
     out))
 
-(macro ArrayReduceValueAt :transitioning true
+(builtin ArrayReduceValueAt :transitioning true
   :params [(value dyn) (callback dyn) (accumulator dyn) (i int)] :ret dyn
   (Call callback (%Box undefined) accumulator value (%BoxInt i) (%Box undefined)))
 
