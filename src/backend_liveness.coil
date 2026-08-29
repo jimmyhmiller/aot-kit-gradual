@@ -38,9 +38,9 @@
 (defn ml-block-words [(bid i64)] (-> i64)
   (ml-owner-words (mu-block-owner bid)))
 (defn ml-vreg-owner [(vreg i64)] (-> i64)
-  (if (or (< vreg 0) (>= vreg (al-len [i64] (.live-vreg-owner (machine-unit)))))
+  (if (or (< vreg 0) (>= vreg (al-len [i64] (.vreg-owner (machine-unit)))))
       -1
-      (al-get (.live-vreg-owner (machine-unit)) vreg)))
+      (al-get (.vreg-owner (machine-unit)) vreg)))
 (defn ml-vreg-local [(vreg i64)] (-> i64)
   (if (or (< vreg 0) (>= vreg (al-len [i64] (.live-vreg-local (machine-unit)))))
       -1
@@ -166,6 +166,7 @@
           (and (ml-vreg-class-is? a MRC-GPR)
                (ml-vreg-class-is? dst (if (= (load (field m imm)) 0) MRC-FPR MRC-GPR)))
             MI-COPY
+          (= (ml-register-class dst) (ml-register-class a)) MI-RESULT-MATERIALIZE
           (= (ml-register-class dst) (ml-register-class a)) MI-ABI-COPY
           (= (ml-register-class dst) (ml-register-class a)) true)))
 
@@ -175,6 +176,7 @@
 (defstruct MlVerifyScratch
   [(expected-use (ArrayList i64))
    (expected-def (ArrayList i64))
+   (expected-edge (ArrayList i64))
    (inited bool)])
 (defn ml-verify-scratch [] (-> (ptr MlVerifyScratch))
   (let [s (primitive/alloc-static MlVerifyScratch)]
@@ -183,6 +185,7 @@
         (do
           (set! (.expected-use s) (al-new [i64] (malloc-allocator)))
           (set! (.expected-def s) (al-new [i64] (malloc-allocator)))
+          (set! (.expected-edge s) (al-new [i64] (malloc-allocator)))
           (set! (.inited s) true)
           0))
     s))
@@ -267,12 +270,12 @@
                   (al-push! [i64] (field u live-vreg-local) -1)
                   (al-push! [i64] (field u live-owner-vregs) -1)
                   (set! i (+ (load i) 1)))))
-    ;; Scheduled definitions are the authoritative ownership boundary, including synthetic copies.
+    ;; Selection's completed MachineValue rows are the authoritative ownership boundary.
     (set! i 0)
-    (loop (if (>= (load i) (be-inst-count)) (break)
+    (loop (if (>= (load i) vregs) (break)
               (do
-                (let [m (be-inst (load i)) dst (.dst m) owner (.owner m)]
-                  (if (and (>= dst 0) (= (al-get (.live-vreg-owner u) dst) -1))
+                (let [dst (load i) owner (al-get (.vreg-owner u) (load i))]
+                  (if (>= owner 0)
                       (do
                         (al-set! [i64] (field u live-vreg-owner) dst owner)
                         (al-set! [i64] (field u live-owner-count) owner
@@ -331,8 +334,6 @@
     (al-clear! [i64] (field u live-in))
     (al-clear! [i64] (field u live-out))
     (al-clear! [i64] (field u edge-live))
-    (al-clear! [i64] (field u value-kind))
-    (al-clear! [i64] (field u register-class))
     (loop (if (>= (load i)
                    (if (> blocks 0)
                        (+ (al-get (.live-block-first u) (- blocks 1))
@@ -355,14 +356,6 @@
               (break)
               (do
                 (al-push! [i64] (field u edge-live) 0)
-                (set! i (+ (load i) 1))
-                0)))
-    (set! i 0)
-    (loop (if (>= (load i) vregs)
-              (break)
-              (do
-                (al-push! [i64] (field u value-kind) MLK-SCALAR)
-                (al-push! [i64] (field u register-class) MRC-GPR)
                 (set! i (+ (load i) 1))
                 0)))
     0))
@@ -413,70 +406,12 @@
                 (set! bid (+ (load bid) 1))
                 0)))
     (set! phase-start (ms-profile-note! "liveness_use_sets" (load phase-start)))
-    (let [(mut at) 0]
-      (loop (if (>= (load at) (be-inst-count))
-                (break)
-                (do
-                  (let [dst (ms-inst-dst (load at))]
-                    (if (>= dst 0)
-                        (al-set! [i64] (field u value-kind) dst
-                                 (ml-kind-for-inst (load at)))
-                        0))
-                  (set! at (+ (load at) 1))
-                  0))))
-    (set! phase-start (ms-profile-note! "liveness_kinds_initial" (load phase-start)))
-    (let [(mut at) 0]
-      (loop (if (>= (load at) (be-inst-count))
-                (break)
-                (do
-                  (let [dst (ms-inst-dst (load at))]
-                    (if (>= dst 0)
-                        (al-set! [i64] (field u register-class) dst
-                                 (ml-class-for-inst (load at)))
-                        0))
-                  (set! at (+ (load at) 1))
-                  0))))
-    (ms-profile-note! "liveness_classes_initial" (load phase-start))
+    (ms-profile-note! "liveness_value_metadata_reads" (load phase-start))
     0))
 
 ;; Phi resolution can place a synthetic copy before the instruction that defines its source.
 ;; Seed all explicit definitions first, then propagate classes through copies to a fixed point so
 ;; class publication is independent of scheduled instruction order.
-(defn ml-propagate-register-classes! [] (-> i64)
-  (let [u (machine-unit)
-        n (be-inst-count)
-        (mut changed) true
-        (mut rounds) 0]
-    (loop (if (or (not (load changed)) (> (load rounds) n))
-              (break)
-              (do
-                (set! changed false)
-                (let [(mut at) 0]
-                  (loop (if (>= (load at) n)
-                            (break)
-                            (do
-                              (let [m (be-inst (load at))
-                                    op (.op m)
-                                    dst (.dst m)
-                                    src (.a m)]
-                                (if (and (or (= op MI-COPY) (= op MI-ABI-COPY))
-                                         (and (>= dst 0) (>= src 0)))
-                                    (let [class (al-get (.register-class u) src)]
-                                      (if (!= (al-get (.register-class u) dst) class)
-                                          (do
-                                            (al-set! [i64] (field u register-class) dst class)
-                                            (set! changed true))
-                                          0))
-                                    0))
-                              (set! at (+ (load at) 1))
-                              0))))
-                (set! rounds (+ (load rounds) 1))
-                0)))
-    (load rounds)))
-
-;; Word-wise backward dataflow over the bitsets. Only a block whose successor changed can change,
-;; so enqueue predecessors when `live-in` grows instead of rescanning every block and every dense
-;; word for global rounds. The equations and independently verified result are unchanged.
 (defn ml-solve! [(seed i64)] (-> bool)
   (let [u (machine-unit)
         blocks (mu-block-count)
@@ -654,9 +589,30 @@
         edges (mu-edge-count)
         vregs (ml-vreg-count)
         s (ml-verify-scratch)
-        (mut bid) 0]
+        (mut bid) 0
+        (mut max-words) 0]
     (set! (.liveness-result u) MLIVE-OK)
     (set! (.liveness-item u) -1)
+    ;; One fixed scratch shape serves every block and edge. Repeated clear/push cycles across
+    ;; 75,000 blocks paid ArrayList append checks for every represented word.
+    (loop (if (>= (load bid) blocks)
+              (break)
+              (do
+                (let [words (ml-block-words (load bid))]
+                  (if (> words (load max-words)) (set! max-words words) 0))
+                (set! bid (+ (load bid) 1)))))
+    (al-clear! [i64] (field s expected-use))
+    (al-clear! [i64] (field s expected-def))
+    (al-clear! [i64] (field s expected-edge))
+    (let [(mut word) 0]
+      (loop (if (>= (load word) (load max-words))
+                (break)
+                (do
+                  (al-push! [i64] (field s expected-use) 0)
+                  (al-push! [i64] (field s expected-def) 0)
+                  (al-push! [i64] (field s expected-edge) 0)
+                  (set! word (+ (load word) 1))))))
+    (set! bid 0)
     ; Re-derive use/def and the fixed-point equations without mutating the published sets.
     ; One forward operand walk per block fills the per-vreg expectations; asking every vreg
     ; about every instruction made this verifier cubic on large programs.
@@ -670,13 +626,11 @@
                       base (al-get (.live-block-first u) (load bid))
                       (mut vr) 0
                       (mut i) 0]
-                  (al-clear! [i64] (field s expected-use))
-                  (al-clear! [i64] (field s expected-def))
                   (loop (if (>= (load vr) words)
                             (break)
                             (do
-                              (al-push! [i64] (field s expected-use) 0)
-                              (al-push! [i64] (field s expected-def) 0)
+                              (al-set! [i64] (field s expected-use) (load vr) 0)
+                              (al-set! [i64] (field s expected-def) (load vr) 0)
                               (set! vr (+ (load vr) 1))
                               0)))
                   (loop (if (>= (load i) count)
@@ -732,50 +686,58 @@
                             words (ml-block-words target)
                             target-base (al-get (.live-block-first u) target)
                             base (al-get (.live-edge-first u) (load edge))
-                            (mut vr) 0]
-                        (loop (if (>= (load vr) words)
+                            copies (mu-edge-copy-count (load edge))
+                            (mut word) 0
+                            (mut copy) 0]
+                        (loop (if (>= (load word) words)
                                   (break)
                                   (do
-                                    (let [(mut expected)
-                                            (al-get [i64] (.live-in u)
-                                                    (+ target-base (load vr)))
-                                          (mut i) 0]
-                                      (loop (if (>= (load i) (mu-edge-copy-count (load edge)))
-                                                (break)
-                                                (do
-                                                  (if (= (mu-copy-kind (load edge) (load i)) MCOPY-VALUE)
-                                                      (let [dst (mu-copy-dst (load edge) (load i))]
-                                                        (if (= (/ (ml-vreg-local dst) 64) (load vr))
-                                                            (set! expected (& (load expected)
-                                                                              (^ (ml-local-bit dst) -1))) 0))
-                                                      0)
-                                                  (set! i (+ (load i) 1))
-                                                  0)))
-                                      (set! i 0)
-                                      (loop (if (>= (load i) (mu-edge-copy-count (load edge)))
-                                                (break)
-                                                (do
-                                                  (if (= (mu-copy-kind (load edge) (load i)) MCOPY-VALUE)
-                                                      (let [src (mu-copy-src (load edge) (load i))]
-                                                        (if (= (/ (ml-vreg-local src) 64) (load vr))
-                                                            (set! expected
-                                                                  (| (load expected)
-                                                                     (ml-local-bit src))) 0))
-                                                      0)
-                                                  (set! i (+ (load i) 1)))))
-                                      (if (!= (al-get [i64] (.edge-live u) (+ base (load vr)))
-                                              (load expected))
-                                          (do
-                                            (set! (.liveness-result u) MLIVE-PHI)
-                                            (set! (.liveness-item u)
-                                                  (ml-edge-index
-                                                    (load edge)
-                                                    (ml-owner-vreg owner (* (load vr) 64)))))
-                                          0))
-                                    (set! vr (+ (load vr) 1))
-                                    0))))
-                      (set! edge (+ (load edge) 1))
-                      0))))
+                                    (al-set! [i64] (field s expected-edge) (load word)
+                                             (al-get [i64] (.live-in u)
+                                                     (+ target-base (load word))))
+                                    (set! word (+ (load word) 1)))))
+                        ;; Apply each copy once to the independent expected row. The old verifier
+                        ;; reapplied every copy for every word: edge_words * edge_copies.
+                        (loop (if (>= (load copy) copies)
+                                  (break)
+                                  (do
+                                    (if (= (mu-copy-kind (load edge) (load copy)) MCOPY-VALUE)
+                                        (let [dst (mu-copy-dst (load edge) (load copy))
+                                              dst-word (/ (ml-vreg-local dst) 64)]
+                                          (al-set! [i64] (field s expected-edge) dst-word
+                                                   (& (al-get (.expected-edge s) dst-word)
+                                                      (^ (ml-local-bit dst) -1))))
+                                        0)
+                                    (set! copy (+ (load copy) 1)))))
+                        (set! copy 0)
+                        (loop (if (>= (load copy) copies)
+                                  (break)
+                                  (do
+                                    (if (= (mu-copy-kind (load edge) (load copy)) MCOPY-VALUE)
+                                        (let [src (mu-copy-src (load edge) (load copy))
+                                              src-word (/ (ml-vreg-local src) 64)]
+                                          (al-set! [i64] (field s expected-edge) src-word
+                                                   (| (al-get (.expected-edge s) src-word)
+                                                      (ml-local-bit src))))
+                                        0)
+                                    (set! copy (+ (load copy) 1)))))
+                        (set! word 0)
+                        (loop (if (or (>= (load word) words)
+                                      (!= (ml-result) MLIVE-OK))
+                                  (break)
+                                  (do
+                                    (if (!= (al-get [i64] (.edge-live u)
+                                                   (+ base (load word)))
+                                            (al-get [i64] (.expected-edge s) (load word)))
+                                        (do
+                                          (set! (.liveness-result u) MLIVE-PHI)
+                                          (set! (.liveness-item u)
+                                                (ml-edge-index
+                                                  (load edge)
+                                                  (ml-owner-vreg owner (* (load word) 64)))))
+                                        0)
+                                    (set! word (+ (load word) 1))))))
+                      (set! edge (+ (load edge) 1))))))
         0)
     (if (= (ml-result) MLIVE-OK)
         (let [(mut at) 0]
@@ -783,20 +745,24 @@
                     (break)
                     (do
                       (let [dst (ms-inst-dst (load at))]
-                        (if (and (>= dst 0) (!= (ml-value-kind dst) (ml-kind-for-inst (load at))))
+                        (if (not (ms-inst-result-kind-contract-valid? (load at)))
                             (do
                               (set! (.liveness-result u) MLIVE-KIND)
-                              (set! (.liveness-item u) dst))
+                              (set! (.liveness-item u) (if (>= dst 0) dst (load at))))
                             0)
-                        (if (and (and (>= dst 0) (= (ml-result) MLIVE-OK))
-                                 (!= (ml-register-class dst) (ml-class-for-inst (load at))))
+                        (if (and (= (ml-result) MLIVE-OK)
+                                 (not (ms-inst-result-class-contract-valid? (load at))))
                             (do
                               (set! (.liveness-result u) MLIVE-CLASS)
-                              (set! (.liveness-item u) dst))
+                              (set! (.liveness-item u) (if (>= dst 0) dst (load at))))
                             0)
                         (if (and (= (ml-result) MLIVE-OK)
                                  (not (ml-inst-classes-valid? (load at))))
                             (do
+                              (fmt (stderr)
+                                   "liveness-class-operands inst={d} op={d} dst={d} a={d} b={d}\n"
+                                   (load at) (.op (be-inst (load at))) dst
+                                   (.a (be-inst (load at))) (.b (be-inst (load at))))
                               (set! (.liveness-result u) MLIVE-CLASS)
                               (set! (.liveness-item u) (load at)))
                             0))
@@ -813,8 +779,6 @@
     (set! phase-start (ms-profile-note! "liveness_init" (load phase-start)))
     (ml-compute-use-def!)
     (set! phase-start (ms-profile-note! "liveness_use_def" (load phase-start)))
-    (ml-propagate-register-classes!)
-    (set! phase-start (ms-profile-note! "liveness_classes" (load phase-start)))
     (if (not (ml-solve! seed))
         (do
           (set! phase-start (ms-profile-note! "liveness_solve" (load phase-start)))

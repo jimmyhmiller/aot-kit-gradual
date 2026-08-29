@@ -1,6 +1,23 @@
 ;; https://tc39.es/ecma262/#sec-toboolean — `%Not` is JavaScript truthiness, so negating twice IS
 ;; ToBoolean. No primitive required.
-(macro ToBoolean :params [(v dyn)] :ret bool (%Not (%Not v)))
+(macro ToBoolean
+  :spec "ecma262@ed463bc10dbeaad0410ce67e541a77ea8e9900a5#sec-toboolean"
+  :spec-name "ToBoolean"
+  :status partial
+  :deviation "BigInt source values are not yet represented by the supported JavaScript frontend/runtime surface."
+  :params [(v dyn)] :ret bool
+  (%Not (%Not v)))
+
+;; https://tc39.es/ecma262/#sec-iscallable. The runtime primitive answers whether the value carries
+;; this implementation's callable representation; the language operation and its provenance stay
+;; named here so every semantic consumer shares one boundary.
+(macro IsCallable
+  :spec "ecma262@ed463bc10dbeaad0410ce67e541a77ea8e9900a5#sec-iscallable"
+  :spec-name "IsCallable"
+  :status partial
+  :deviation "Callable Proxy exotic objects are not yet implemented by the supported runtime surface."
+  :params [(v dyn)] :ret bool
+  (%IsFunction (%Box v)))
 
 ;; https://tc39.es/ecma262/#sec-logical-not-operator — `!v` is `%Not(ToBoolean(v))`, and `%Not`
 ;; already IS truthiness-negate, so one application is the whole operator.
@@ -60,7 +77,7 @@
       (if (IsNumber v) "number"
         (if (%IsString v) "string"
           (if (%IsSymbol v) "symbol"
-          (if (%IsFunction v) "function"
+          (if (IsCallable v) "function"
             (if (%IsNull v) "object"
               (if (%IsObject v) "object"
                 (if (%IsArray v) "object" "undefined"))))))))))
@@ -80,37 +97,212 @@
 (macro IsNullishCallable :params [(v dyn)] :ret bool
   (if (%IsFunction v) false (IsNullishValue v)))
 
-;; https://tc39.es/ecma262/#sec-tolength — ToIntegerOrInfinity clamped to [0, 2^53-1]. The upper
-;; bound does not fit a NaN-boxed integer, so this saturates to a MACHINE index instead: every
-;; caller uses it to index a string or an array, and neither can be longer than that.
-(macro ToLength :params [(v dyn) (hi int)] :ret int (ClampedIndex v hi))
+;; Storage consumers need a machine index after applying the specification's Number-domain
+;; ToLength. Keep that representation conversion named separately so it cannot masquerade as the
+;; abstract operation or silently narrow callers that only need the ECMAScript Number result.
+(macro ToMachineLength
+  :specializes "ecma262@ed463bc10dbeaad0410ce67e541a77ea8e9900a5#sec-tolength"
+  :deviation "Returns a machine index saturated to an explicit caller-provided storage limit instead of the canonical Number domain through 2^53-1."
+  :params [(v dyn) (hi int)] :ret int
+  (ClampedIndex v hi))
+
+(macro ToLength
+  :spec "ecma262@ed463bc10dbeaad0410ce67e541a77ea8e9900a5#sec-tolength"
+  :spec-name "ToLength"
+  :status partial
+  :deviation "BigInt values and the complete object ToPrimitive protocol inherited from ToIntegerOrInfinity are not yet implemented."
+  :transitioning true
+  :params [(argument dyn)] :ret dyn
+  (let [(length (ToIntegerOrInfinity argument))
+        (maximum (%Box (MaxSafeInteger)))]
+    (if (NumLe length (%Box 0))
+        (%Box 0)
+        (if (NumLt maximum length) maximum length))))
+
+(macro ToIndex
+  :spec "ecma262@ed463bc10dbeaad0410ce67e541a77ea8e9900a5#sec-toindex"
+  :spec-name "ToIndex"
+  :status partial
+  :deviation "BigInt values and the complete object ToPrimitive protocol inherited from ToIntegerOrInfinity are not yet implemented."
+  :transitioning true
+  :params [(value dyn)] :ret dyn
+  (if (%IsUndefined value)
+      (%Box 0)
+      (let [(integer (ToIntegerOrInfinity value))]
+        (if (NumLt integer (%Box 0))
+            (ThrowRangeError "Index must be non-negative")
+            (let [(index (ToLength integer))]
+              (if (SameValueZero integer index)
+                  index
+                  (ThrowRangeError "Index is outside the valid range")))))))
+
+;; Both operands are already specification Numbers. Preserve the immediate-integer representation
+;; when possible so machine-index adapters can erase boxing without narrowing the Number-domain
+;; operation; mixed/large values use the checked numeric-to-double conversion.
+(macro AddNumericValues :params [(left dyn) (right dyn)] :ret dyn
+  (if (%IsInt left)
+      (if (%IsInt right)
+          (%Box (%Add (%UnboxInt left) (%UnboxInt right)))
+          (%Box (%Add (%UnboxInt left) (%UnboxFlt right))))
+      (if (%IsInt right)
+          (%Box (%Add (%UnboxFlt left) (%UnboxInt right)))
+          (%Box (%Add (%UnboxFlt left) (%UnboxFlt right))))))
+
+(macro ToAbsoluteIndex
+  :spec "ecma262@ed463bc10dbeaad0410ce67e541a77ea8e9900a5#sec-toabsoluteindex"
+  :spec-name "ToAbsoluteIndex"
+  :status partial
+  :deviation "BigInt values and the complete object ToPrimitive protocol inherited from ToIntegerOrInfinity are not yet implemented."
+  :transitioning true
+  :params [(value dyn) (length dyn)] :ret dyn
+  (let [(integer (ToIntegerOrInfinity value))]
+    (if (if (IsFiniteNumber integer) (NumLt integer (%Box 0)) false)
+        (AddNumericValues length integer)
+        integer)))
+
+(macro ToClampedIndex
+  :spec "ecma262@ed463bc10dbeaad0410ce67e541a77ea8e9900a5#sec-toclampedindex"
+  :spec-name "ToClampedIndex"
+  :status partial
+  :deviation "BigInt values and the complete object ToPrimitive protocol inherited from ToAbsoluteIndex are not yet implemented."
+  :transitioning true
+  :params [(value dyn) (length dyn)] :ret dyn
+  (let [(index (ToAbsoluteIndex value length))]
+    (if (NumLt index (%Box 0))
+        (%Box 0)
+        (if (NumLt length index) length index))))
 
 ;; https://tc39.es/ecma262/#sec-samevaluezero. Strict equality differs from SameValueZero only at
 ;; NaN: `NaN === NaN` is false and `SameValueZero(NaN, NaN)` is true. Strings need their value
 ;; comparison before the raw equality used by every other tagged representation.
-(macro SameValueZero :params [(a dyn) (b dyn)] :ret bool
-  (if (%IsString a)
-      (if (%IsString b) (StringEquals a b) false)
-      (if (%IsString b) false
-        (if (%Eq a b) true (if (IsNaNValue a) (IsNaNValue b) false)))))
+(macro SameValueZero
+  :spec "ecma262@ed463bc10dbeaad0410ce67e541a77ea8e9900a5#sec-samevaluezero"
+  :spec-name "SameValueZero"
+  :status partial
+  :deviation "BigInt values are not yet represented by the supported frontend/runtime surface."
+  :params [(a dyn) (b dyn)] :ret bool
+  (if (SameType a b)
+      (if (IsNumber a)
+          (NumberSameValueZero a b)
+          (SameValueNonNumber a b))
+      false))
 
 ;; `Number.isNaN`. `v !== v` is exact as a SEMANTIC statement, but it is not compilable: strict
 ;; equality on a `dyn` becomes an integer compare of the boxed word, which is true for NaN. So this
 ;; delegates to `IsNaNNumber` in repr.jsl, which unboxes first and lets IEEE answer.
 (macro IsNaNValue :params [(v dyn)] :ret bool (IsNaNNumber v))
 
+;; https://tc39.es/ecma262/#sec-numeric-types-number-sameValue. Both operands are Numbers by the
+;; numeric-method contract. Equal finite values and infinities compare directly; NaN pairs compare
+;; equal; reciprocal comparison distinguishes the two IEEE zero signs without canonicalizing them.
+(macro NumberSameValue
+  :spec "ecma262@ed463bc10dbeaad0410ce67e541a77ea8e9900a5#sec-numeric-types-number-sameValue"
+  :spec-name "Number::sameValue"
+  :status complete
+  :params [(a dyn) (b dyn)] :ret bool
+  (if (NumEq a b)
+      (if (NumEq a (%Box 0))
+          (%Eq (%Div 1.0 (%UnboxNumber a))
+               (%Div 1.0 (%UnboxNumber b)))
+          true)
+      (if (IsNaNValue a) (IsNaNValue b) false)))
+
+;; https://tc39.es/ecma262/#sec-numeric-types-number-equal. IEEE equality implements the Number
+;; relation exactly: NaN is unequal, the two zero signs are equal, equal infinities are equal, and
+;; all remaining finite values use ordinary numeric equality.
+(macro NumberEqual
+  :spec "ecma262@ed463bc10dbeaad0410ce67e541a77ea8e9900a5#sec-numeric-types-number-equal"
+  :spec-name "Number::equal"
+  :status complete
+  :params [(a dyn) (b dyn)] :ret bool
+  (NumEq a b))
+
+;; https://tc39.es/ecma262/#sec-numeric-types-number-sameValueZero. Number::equal already supplies
+;; signed-zero equivalence and ordinary equality; SameValueZero adds exactly the NaN-pair case.
+(macro NumberSameValueZero
+  :spec "ecma262@ed463bc10dbeaad0410ce67e541a77ea8e9900a5#sec-numeric-types-number-sameValueZero"
+  :spec-name "Number::sameValueZero"
+  :status complete
+  :params [(a dyn) (b dyn)] :ret bool
+  (if (NumberEqual a b) true (if (IsNaNValue a) (IsNaNValue b) false)))
+
+;; https://tc39.es/ecma262/#sec-sametype. Object is one ECMAScript language type across ordinary
+;; objects, arrays, and callable objects; the individual representation predicates are joined here
+;; rather than leaking that layout distinction into semantic consumers.
+(macro SameType
+  :spec "ecma262@ed463bc10dbeaad0410ce67e541a77ea8e9900a5#sec-sametype"
+  :spec-name "SameType"
+  :status partial
+  :deviation "BigInt values are not yet represented by the supported frontend/runtime surface."
+  :params [(a dyn) (b dyn)] :ret bool
+  (if (IsNumber a) (IsNumber b)
+      (if (%IsString a) (%IsString b)
+          (if (%IsSymbol a) (%IsSymbol b)
+              (if (%IsUndefined a) (%IsUndefined b)
+                  (if (%IsNull a) (%IsNull b)
+                      (if (%IsBool a) (%IsBool b)
+                          (if (%IsFunction a)
+                              (if (%IsFunction b) true
+                                  (if (%IsObject b) true (%IsArray b)))
+                              (if (%IsObject a)
+                                  (if (%IsFunction b) true
+                                      (if (%IsObject b) true (%IsArray b)))
+                                  (if (%IsArray a)
+                                      (if (%IsFunction b) true
+                                          (if (%IsObject b) true (%IsArray b)))
+                                      false))))))))))
+
+;; https://tc39.es/ecma262/#sec-samevaluenonnumber. Callers establish SameType and exclude Number,
+;; exactly as the spec requires. Strings compare their UTF-16 contents; every other represented
+;; non-Number language value has a canonical tagged identity, so raw equality implements null,
+;; undefined, Boolean, Symbol, and Object identity without conflating distinct objects.
+(macro SameValueNonNumber
+  :spec "ecma262@ed463bc10dbeaad0410ce67e541a77ea8e9900a5#sec-samevaluenonnumber"
+  :spec-name "SameValueNonNumber"
+  :status partial
+  :deviation "BigInt values are not yet represented by the supported frontend/runtime surface."
+  :params [(a dyn) (b dyn)] :ret bool
+  (if (%IsString a) (StringEquals a b) (%Eq a b)))
+
+;; https://tc39.es/ecma262/#sec-samevalue. Equal zeros require reciprocal comparison to preserve
+;; their IEEE signs; unequal Numbers are SameValue only when both are NaN. Every other represented
+;; type uses String value equality or stable tagged identity after SameType has ruled out cross-type
+;; coincidences.
+(macro SameValue
+  :spec "ecma262@ed463bc10dbeaad0410ce67e541a77ea8e9900a5#sec-samevalue"
+  :spec-name "SameValue"
+  :status partial
+  :deviation "BigInt values are not yet represented by the supported frontend/runtime surface."
+  :params [(a dyn) (b dyn)] :ret bool
+  (if (SameType a b)
+      (if (IsNumber a)
+          (NumberSameValue a b)
+          (SameValueNonNumber a b))
+      false))
+
+(macro ObjectIs
+  :spec "ecma262@ed463bc10dbeaad0410ce67e541a77ea8e9900a5#sec-object.is"
+  :spec-name "Object.is"
+  :status partial
+  :deviation "BigInt, complete callable publication metadata/constructor classification, and all Symbol execution paths are not yet implemented."
+  :params [(value1 dyn) (value2 dyn)] :ret bool
+  (SameValue value1 value2))
+
 ;; https://tc39.es/ecma262/#sec-isstrictlyequal. Boxing first gives every representation one
 ;; tagged comparison domain; Numbers and Strings then use their value semantics instead of boxed
 ;; word identity. In particular NumEq reaches an IEEE floating compare, so NaN is unequal to itself.
-(macro StrictEqual :params [(a dyn) (b dyn)] :ret bool
+(macro StrictEqual
+  :spec "ecma262@ed463bc10dbeaad0410ce67e541a77ea8e9900a5#sec-isstrictlyequal"
+  :spec-name "IsStrictlyEqual"
+  :status partial
+  :deviation "BigInt values are not yet represented by the supported frontend/runtime surface."
+  :params [(a dyn) (b dyn)] :ret bool
   (let [(left a) (right b)]
-    (if (IsNumber left)
-        (if (IsNumber right) (NumEq left right) false)
-        (if (IsNumber right)
-            false
-            (if (%IsString left)
-                (if (%IsString right) (StringEquals left right) false)
-                (if (%IsString right) false (%Eq left right)))))))
+    (if (SameType left right)
+        (if (IsNumber left)
+            (NumberEqual left right)
+            (SameValueNonNumber left right))
+        false)))
 
 ;; https://tc39.es/ecma262/#sec-applystringornumericbinaryoperator, and the numeric operations it
 ;; dispatches to.
@@ -131,11 +323,13 @@
 ;; it concatenation, and everything else makes it addition. That is the whole reason it cannot be a
 ;; peephole and has to be a definition.
 (macro JsAdd :params [(a dyn) (b dyn)] :ret dyn
-  (if (%IsString a)
-      (%StringConcat a (ToStringValue b))
-      (if (%IsString b)
-          (%StringConcat (ToStringValue a) b)
-          (%Box (%Add (NumberRaw a) (NumberRaw b))))))
+  (let [(left (ToPrimitive (%Box a) (%Box undefined)))
+        (right (ToPrimitive (%Box b) (%Box undefined)))]
+    (if (%IsString left)
+        (%StringConcat left (ToStringValue right))
+        (if (%IsString right)
+            (%StringConcat (ToStringValue left) right)
+            (%Box (%Add (NumberRaw left) (NumberRaw right)))))))
 
 (macro JsSub :params [(a dyn) (b dyn)] :ret dyn (%Box (%Sub (NumberRaw a) (NumberRaw b))))
 (macro JsMul :params [(a dyn) (b dyn)] :ret dyn (%Box (%Mul (NumberRaw a) (NumberRaw b))))

@@ -16,9 +16,41 @@
       (assert (nh-load-jsl-seed-artifact? path))
       (assert (= (mfts-count) records))
       (assert (nh-try-compile? "function main(n) { return (n + 1) | 0; }"))
+      ;; The ordinary ARM host path publishes an object directly, while the x86 host harness links
+      ;; the retained image as part of compilation. Make the image product explicit on either host.
+      (if (= (mfts-count) records) (assert (mfts-append-snapshot!)) 0)
+      (assert (mfti-build!))
       (assert (= (nh-prepare-isolated-execution!) 0))
+      ;; The full reusable library remains in the archive, while the executable image contains
+      ;; only the fresh entry and the semantic JSL dependencies actually reached by this source.
+      (assert (> (mfti-function-count) 0))
+      (assert (< (mfti-function-count) (mfts-count)))
       (let [ok (primitive/alloc-stack bool)]
         (store! ok true)
         (assert (= (nh-exec-isolated-checked-timeout! 7 2 ok) 8))
         (assert (load ok)))
       (nh-cleanup!))))
+
+;; The source ABI declares ordinary parameters as tagged JavaScript values. A captured object and
+;; that same object forwarded through a parameter must therefore compare by one unchanged identity.
+;; The two captured field reads also pin the fixed-shape Load boundary: callback construction can
+;; leave the value lattice broad, but the alias still determines integer-vs-floating machine
+;; representation and therefore the tag on the function's boxed return.
+(deftest a_captured_object_keeps_identity_through_a_source_parameter
+  (nh-use-direct-memory-execution! true)
+  (assert (nh-try-compile? "function main(n) {
+  var receiver = { integer: 41, floating: 1.5 };
+  function same(value) { return value === receiver; }
+  function integer() { return receiver.integer; }
+  function floating() { return receiver.floating; }
+  if (!same(receiver)) return 1;
+  if (integer() !== 41) return 2;
+  if (floating() !== 1.5) return 3;
+  return n | 0;
+}"))
+  (assert (= (nh-prepare-isolated-execution!) 0))
+  (let [ok (primitive/alloc-stack bool)]
+    (store! ok true)
+    (assert (= (nh-exec-isolated-checked-timeout! 7 2 ok) 7))
+    (assert (load ok)))
+  (nh-cleanup!))

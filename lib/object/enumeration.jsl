@@ -5,28 +5,6 @@
 ;; Like Torque's `GetOwnPropertyKeys`, the platform intrinsics expose a stable ordinal view of the
 ;; heap representation. Allocation, looping, value lookup, pair construction, and result layout
 ;; remain visible JSL semantics.
-(macro ObjectCoercible :params [(value dyn)] :ret dyn
-  (if (%Eq value (%Box null))
-      (ThrowTypeError "Cannot convert undefined or null to object")
-      (if (%Eq value (%Box undefined))
-          (ThrowTypeError "Cannot convert undefined or null to object")
-          value)))
-
-;; ToObject's representation boundary. Ordinary objects retain identity; primitive wrappers are
-;; ordinary DSL-allocated records populated from the primitive's enumerable own keys. The runtime
-;; intrinsics provide string-index keys/values, so this also materializes String wrapper indices.
-(macro ToObjectValue :params [(value dyn)] :ret dyn
-  (let [(coercible (ObjectCoercible value))]
-    (if (%IsObject coercible)
-        coercible
-        (if (%IsArray coercible)
-            coercible
-            (if (%IsFunction coercible)
-                coercible
-                (let [(wrapper (%Box (%NewObject)))
-                      (copied (ObjectAssignSource wrapper coercible))]
-                  wrapper))))))
-
 ;; https://tc39.es/ecma262/#sec-ordinarycallbindthis
 ;; Function strictness is indexed frontend structure. Receiver substitution and primitive boxing
 ;; are JavaScript semantics and therefore live here, once at function entry rather than at each
@@ -34,23 +12,24 @@
 (macro OrdinaryCallBindThisSloppy :transitioning true
   :params [(receiver dyn)] :ret dyn
   (if (%IsUndefined receiver) (GlobalObjectValue)
-      (if (%IsNull receiver) (GlobalObjectValue) (ToObjectValue receiver))))
+      (if (%IsNull receiver) (GlobalObjectValue) (ToObject receiver))))
 
 ;; One source step from Object.assign. The frontend repeats this macro for variadic source syntax;
 ;; all JavaScript behavior of a step remains here.
 (macro ObjectAssignSource :params [(target dyn) (source dyn)] :ret dyn
   (if (%Eq source (%Box null)) target
       (if (%Eq source (%Box undefined)) target
-          (let [(count (%OwnKeyCount source))]
+          (let [(from (ToObject source))
+                (count (%OwnKeyCount from))]
             (loop [(index 0)]
               (if (%Le count index) target
-                  (let [(key (%OwnKeyAt source index))
-                        (value (%PropLoadKey source key))
+                  (let [(key (%OwnKeyAt from index))
+                        (value (%PropLoadKey from key))
                         (stored (%PropStoreKey target key value))]
                     (recur (%Add index 1)))))))))
 
 (macro ObjectKeys :params [(object dyn)] :ret dyn
-  (let [(target (ObjectCoercible object))
+  (let [(target (ToObject object))
         (out (%NewArray))
         (count (%OwnKeyCount target))]
     (loop [(index 0) (outIndex 0)]
@@ -74,7 +53,7 @@
             (recur (%Add index 1))))))
 
 (macro ObjectRest :params [(source dyn) (excluded dyn)] :ret dyn
-  (let [(from (ToObjectValue (ObjectCoercible source)))
+  (let [(from (ToObject source))
         (out (%Box (%NewObject)))
         (initialized (InitializeOrdinaryObject out))
         (count (%OwnKeyCount from))]
@@ -93,7 +72,7 @@
                   (recur (%Add index 1)))))))))
 
 (macro ObjectOwnPropertyNames :params [(object dyn)] :ret dyn
-  (let [(target (ObjectCoercible object))
+  (let [(target (ToObject object))
         (out (%NewArray))
         (count (%OwnKeyCount target))]
     (loop [(index 0)]
@@ -116,7 +95,7 @@
     function))
 
 (macro ObjectValues :params [(object dyn)] :ret dyn
-  (let [(target (ObjectCoercible object))
+  (let [(target (ToObject object))
         (out (%NewArray))
         (count (%OwnKeyCount target))]
     (loop [(index 0) (outIndex 0)]
@@ -129,7 +108,7 @@
                   (recur (%Add index 1) (%Add outIndex 1)))))))))
 
 (macro ObjectEntries :params [(object dyn)] :ret dyn
-  (let [(target (ObjectCoercible object))
+  (let [(target (ToObject object))
         (out (%NewArray))
         (count (%OwnKeyCount target))]
     (loop [(index 0) (outIndex 0)]

@@ -435,6 +435,29 @@ Generate:
 
 The frontend must not grow a new semantic name switch for every built-in.
 
+Current implementation boundary (2026-08-28): `spec/intrinsics.json` is authoritative for the 25
+global bindings the frontend currently publishes. It generates exact compiler identities,
+lowering-family ids, runtime constructor kinds, callability/constructability queries, global-name
+global/property routing, `lib/generated/intrinsic-publication.jsl`, and
+`spec/generated/intrinsic-support.json`. Distinct Error constructors retain distinct
+identities while sharing the generated `error` lowering family. The `properties` arrays remain
+partial deliberately. Twenty `%Symbol%` properties are now generated: the fifteen standard
+well-known-symbol data properties with their exact all-false attributes; constructor methods `for`
+and `keyFor`; prototype methods `valueOf` and `toString`; and the prototype `description` accessor.
+Method roots create stable callables with observable names, lengths, and exact descriptors.
+Accessor roots create independently named getter/setter closures (including an absent setter) and
+install exact accessor attributes. The frontend carries general semantic owner kinds for callable
+values and Property Descriptor objects so their property reads cannot be confused with unrelated
+shaped fields. Property component operation numbers are part of GVN identity, preventing getter,
+setter, and descriptor-field operations from merging. Constructor metadata, callable adapters for
+the remaining families, and the rest of the standard intrinsic inventory have not yet migrated and
+must not be counted as published by this manifest.
+
+Well-known-symbol dependencies are roots, not a reason to initialize `%Symbol%` wholesale.
+Consumers request focused entries such as `SymbolSpeciesValue` and `SymbolToStringTagValue`; this
+is the publication granularity the completed manifest must generate. It both matches Torque's
+root-table model and keeps an unrelated constructor initializer out of focused operation graphs.
+
 ### F. Diffable lowered graphs and effect summaries
 
 Normalize the graph for a declaration and dependency closure. Record stable summaries or selected
@@ -480,6 +503,12 @@ injected semantic defect is caught before a complete Test262 run.
 
 ### Phase 3: declarative publication and call surface
 
+Status: in progress. Global identity/routing, lowering metadata, fifteen well-known-symbol value
+roots, and the first two general method descriptors/root accessors are generated. General
+data/accessor property generation, complete
+intrinsic inventory migration, adapters, and removal of the remaining property-name switches are
+still required before this phase's exit gate is satisfied.
+
 1. Define the intrinsic descriptor schema.
 2. Migrate current built-ins without changing observable behavior.
 3. Generate identities, properties, attributes, names, lengths, and routing.
@@ -490,6 +519,12 @@ Exit gate: adding a simple built-in requires a JSL definition, one publication d
 cases, and no handwritten frontend routing.
 
 ### Phase 4: specification data and completion machinery
+
+The compiler-wide prerequisite and exact staged implementation contract are defined in
+[Torque-style lowered values](TORQUE-STYLE-LOWERED-VALUES.md). Record migration must follow that
+model: one canonical recursive physical layout, lowered parameter and result signatures, explicit
+multi-result internal calls, and named JavaScript-boundary refusals. Do not extend the provisional
+Record-specific ABI independently.
 
 1. Add compile-away records and enums.
 2. Add specification Lists.
@@ -739,4 +774,3 @@ fast proof that it implements the specification.
 - [ ] `coil test` is green.
 - [ ] The frontier has exactly its honestly remaining open bugs.
 - [ ] `HANDOFF.md` contains the final evidence and retained artifact locations.
-

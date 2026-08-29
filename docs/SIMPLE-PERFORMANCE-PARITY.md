@@ -1,5 +1,59 @@
 # Simple Performance Parity
 
+## Reproducible local reference
+
+The authoritative local comparison checkout is `reference/Simple-pinned`, currently pinned to
+SeaOfNodes/Simple revision `66e426e7c4576a8433449bc649597cf63f22436e`. The older
+`reference/Simple` directory has no `.git` metadata and must not be used to report a revision:
+`git -C` silently walks to the enclosing AOT Kit repository and reports the wrong commit.
+
+Run `npm run bench:simple-scheduler -- 250 500 1000 2000 4000` to compile deliberately wide,
+single-block chapter 23 programs through parsing/optimization, instruction selection, GCM, and
+local scheduling. The driver deliberately stops before allocation: Simple's allocator rejects this
+artificial high-pressure shape, while local scheduling is the phase under comparison. This shape
+is intentional. Aggregate node-count normalization can conceal the
+quadratic ready-set scan in Simple's `ListScheduler.best`, and the corresponding AOT Kit question
+is maximum scheduled block width/ready-set width, not merely total graph nodes.
+
+The pinned revision produced this same-host sweep on 2026-08-28:
+
+| source width | scheduled nodes | maximum block width | frontend/opto | selection | GCM | local schedule |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 250 | 737 | 733 | 294.019 ms | 20.815 ms | 16.191 ms | 18.814 ms |
+| 500 | 1,483 | 1,479 | 458.630 ms | 21.037 ms | 29.499 ms | 29.679 ms |
+| 1,000 | 2,980 | 2,976 | 1,101.410 ms | 29.693 ms | 40.825 ms | 76.795 ms |
+| 2,000 | 5,976 | 5,972 | 4,882.084 ms | 36.353 ms | 117.956 ms | 246.722 ms |
+| 4,000 | 11,973 | 11,969 | 28,586.363 ms | 47.820 ms | 386.270 ms | 1,057.286 ms |
+
+Simple's maximum block grows by 16.3x while local scheduling grows by 56.2x. That is the expected
+superlinear signature of chapter 23's linear search of the ready list for every scheduled node.
+AOT Kit does not use that ready-list algorithm: `ms-schedule-ready-push!` and
+`ms-schedule-ready-pop!` maintain a binary heap. AOT Kit can still do quadratic work while building
+all block-local dependency pairs, so a valid comparison must report maximum block width and edge
+work for both implementations.
+
+## 2026-08-28 large Symbol witness diagnosis
+
+The 26-property Symbol descriptor witness appeared to spend more than twelve minutes in scheduling.
+A live sample disproved that attribution: 100% of sampled main-thread work was in
+`backend_select.ml-kind-for-vreg-scan` (with its graph and machine-unit accessors beneath it). That
+fallback scans every function and every ideal node for one vreg. The compiler already maintains
+the intended dense `vreg-node`/`vreg-node-owner` reverse map, but synthetic or reassigned vregs can
+miss it and invoke the whole-graph fallback repeatedly during liveness/allocation classification.
+
+This is a separate AOT Kit scaling defect, not evidence that Simple's local scheduler is faster or
+that the Symbol graph itself is inherently too large. The benchmark and profiler must keep these
+questions separate:
+
+1. local scheduling: maximum block width, dependency pairs/edges, ready-heap operations, time;
+2. liveness/allocation classification: direct reverse-map hits, fallback scans, scanned nodes, time;
+3. whole compilation: total ideal nodes, live nodes, functions, blocks, machine instructions, time.
+
+The proper repair is to make vreg provenance total for every produced and synthetic vreg, or give
+synthetic vregs an explicit representation kind at creation. Replacing the scan with a guessed
+default would hide missing provenance and can miscompile managed references, so it is not an
+acceptable performance workaround.
+
 ## 2026-08-23 parity achieved
 
 The last material divergence was duplicate dominator traversal in late GCM. AOT Kit validated

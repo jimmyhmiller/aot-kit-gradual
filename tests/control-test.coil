@@ -14,6 +14,7 @@
 
 (import "ty"   :use *)
 (import "node" :use *)
+(import "shape" :use *)
 (import "coil.assert"      :use *)
 (import "coil.control"     :use *)
 (import "coil.io"          :use *)
@@ -166,6 +167,35 @@
   ; a string is undecided, exactly as the branch is
   (graph-reset! 1)
   (assert (= (n-ty (n-peephole (n-new2 (Not) NO-NODE (mk-arg (t-str))))) (t-bool))))
+
+;; A raw union has no post-merge tag discriminator. Graph finalization must tag each incoming value
+;; before joining it; teaching selection to guess one tag for `undefined|bool` would miscompile the
+;; other arm. This also pins the nested case by making the false arm another raw Phi.
+(deftest deferred_boxing_distributes_recursively_across_mixed_raw_phi_edges
+  (graph-reset! 1041)
+  (let [pred (mk-arg (t-bool))
+        inner-if (n-new2 (If) (g-start) pred) inner-arms (n-if-arms! inner-if)
+        inner-region (new-region2 (arms-t inner-arms) (arms-f inner-arms))
+        inner (n-new (Phi (t-dyn)))]
+    (n-add-def! inner inner-region)
+    (n-add-def! inner (mk-con (t-undef)))
+    (n-add-def! inner pred)
+    (let [outer-if (n-new2 (If) inner-region pred) outer-arms (n-if-arms! outer-if)
+          outer-region (new-region2 (arms-t outer-arms) (arms-f outer-arms))
+          outer (n-new (Phi (t-dyn)))]
+      (n-add-def! outer outer-region)
+      (n-add-def! outer inner)
+      (n-add-def! outer (mk-con (t-undef)))
+      (let [boxed (n-new2 (Box BOX-AUX-INFER) NO-NODE outer)
+            ret (n-new2 (Return) outer-region boxed)]
+        (n-add-def! (g-stop) ret)
+        (assert (= (g-distribute-deferred-phi-boxes!) 2))
+        (let [result (n-in ret 1)]
+          (assert (op-is? result Phi [_]))
+          (assert (= (n-rep-of result 8) REP-TAGGED))
+          (assert (op-is? (n-in result 1) Phi [_]))
+          (assert (= (n-rep-of (n-in result 1) 8) REP-TAGGED))
+          (assert (op-is? (n-in result 2) Box [_])))))))
 
 ; ---------------------------------------------------------------------------
 ; Dead control flow really goes away

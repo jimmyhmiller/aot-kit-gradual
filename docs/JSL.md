@@ -5,7 +5,9 @@ Dynamic JavaScript calls require descriptor-driven adapters rather than raw indi
 
 **STATUS: PARTIAL.** Built: the reader, the checker, the expression core, `builtin`, `macro` with
 inlining, `:labels`/`goto`/`:otherwise`, `loop`/`recur`, multi-file loading through `lib/index`,
-ranged diagnostics, and the transition check over the lowered graph (`src/jsl.coil`, `src/jsl_lower.coil`, `lib/`,
+ranged diagnostics, compile-away specification Lists, typed/nested compile-away specification
+Records with branch and loop flattening, and the transition check over the lowered graph
+(`src/jsl.coil`, `src/jsl_lower.coil`, `lib/`,
 `tests/jsl-test.coil`). Designed here and **refused by name** by the checker: `class`, and every
 memory-touching, allocating or JS-calling primitive. Nothing in this file describes code that
 does not exist without that refusal being real and tested.
@@ -118,6 +120,149 @@ Two properties still shape the design:
   exactly one definition and JSL cannot drift from `text.coil`'s printed form.
 - **A quoted token is a type in `:params`/`:ret` and a string literal everywhere else.** The two
   positions never overlap, so nothing is ambiguous.
+
+### Compile-away specification Lists
+
+A macro may declare one final rest parameter with `(rest T)`:
+
+```clojure
+(macro Call
+  :transitioning true
+  :params [(function dyn) (thisValue dyn) (argumentsList (rest dyn))] :ret dyn
+  (call-dynamic-with-receiver-rest function thisValue argumentsList))
+```
+
+This is an ECMA-262 specification List, not a JavaScript rest parameter or Array. Expansion lowers
+each supplied expression exactly once, retains the elements as a compiler-owned SSA slice, and
+spreads that slice directly into the ordinary call ABI with its exact argument count. It performs
+no observable allocation. Rest parameters are legal only on macros, must be final, cannot be read
+as scalar values, and may only be consumed by a checked rest-aware form. Calls remain bounded by
+`JSL-MAX-PARAMS`, and scope exit releases both element pins and compiler storage.
+
+### Compile-away specification Records
+
+The complete target architecture is specified in
+[Torque-style lowered values](TORQUE-STYLE-LOWERED-VALUES.md). The implementation has compile-away
+local, branch, loop, nested, parameter, and return Records; canonical result vectors cross ideal,
+machine, retained-artifact, wide overflow, memory, GC, and exceptional internal-call boundaries.
+Stage 6 is replacing the remaining scalar compatibility seams with the same logical-value API.
+
+Intrinsic publication follows the same rule. `spec/intrinsics.json` assigns each published global
+one exact identity plus generated lowering-family, runtime-kind, callability, and constructability
+metadata. Shared implementation families do not collapse identity: `%TypeError%` and
+`%RangeError%` are different intrinsics in the generated table, while both select the `error`
+lowering family. Well-known symbols are requested as focused roots rather than by running the
+entire `%Symbol%` initializer from an unrelated constructor. The fifteen standard well-known
+Symbol properties are the first generated value-publication family: the manifest emits their
+demand-loadable JSL roots, exact descriptor attributes, and frontend property routing. `%Symbol%`'s
+`for` and `keyFor` constructor methods, `valueOf` and `toString` prototype methods, and the
+`description` prototype accessor are generated too. Method roots create stable callable values and
+install observable names, lengths, and exact method attributes, while the algorithms remain the
+canonical callables in `lib/symbol/core.jsl`. Accessor roots create named getter/setter closures,
+represent an absent setter explicitly, and install exact accessor attributes. General callable and
+Property Descriptor semantic owner kinds keep their property traffic on JSL `[[Get]]`/`[[Set]]`
+rather than shaped-field paths. The IR also includes each property component operation number in
+GVN identity, so otherwise identical getter, setter, and descriptor-field operations stay distinct.
+
+Named ECMA-262 Record schemas are declared before the macros that use them:
+
+```clojure
+(record IteratorRecord [(iterator dyn) (nextMethod dyn) (done bool)])
+(record IteratorResult [(present bool) (record (record IteratorRecord))])
+
+(macro MarkIteratorDone
+  :params [(iteratorRecord (record IteratorRecord))]
+  :ret (record IteratorRecord)
+  (record-with iteratorRecord done true))
+```
+
+`record-new` constructs every field exactly once by name, `record-get` reads a named field, and
+`record-with` returns an immutable copy with one named field replaced. The checker rejects unknown,
+missing, duplicate, or wrongly typed fields and mismatched branch and `recur` schemas. Internal
+builtins accept Record parameters by flattening their leaves into the declared ABI. Records remain
+forbidden across callable, primitive, and JavaScript-call boundaries, and Record returns cross
+internal builtins through verified multi-result calls; they are never boxed merely to cross that
+boundary.
+
+The lowering has no Record opcode and performs no allocation. A Record is a compiler-owned bundle
+of ordinary SSA values. A dynamic branch emits one typed Phi for each differing leaf; a loop emits
+one header Phi per leaf and flattens every `recur` value against the checked schema. Nested Records
+flatten recursively and are reconstructed as typed `JslLoweredValue` slot-range descriptors.
+Bindings recursively own every leaf until scope exit, exactly as compile-away Lists own their
+elements.
+
+Both internal calls and direct inline expansion have logical-value entry points. In particular,
+`jsl-inline-lowered!` accepts and returns scalar or Record descriptors, while `jsl-inline!` is a
+checked scalar adapter for source/frontend callers. The focused public-boundary witness passes a
+two-leaf Record into a macro, returns its immutable replacement Record, consumes both leaves, and
+proves that no `New` was introduced.
+
+The corresponding call boundary returns a `JslLoweredCall`: its `CallSite` owns control/effects and
+its `JslLoweredValue` owns the complete logical result range. This is where scalar conversion or
+Record projections are constructed, exactly once. Internal consumers do not re-read declaration
+metadata to rediscover the result shape. The site-only API remains a checked compatibility
+projection for graph clients that intentionally address physical call results themselves.
+
+Each declaration retains one canonical `JslSignature`, not parallel pieces of ABI metadata. It
+contains the logical source parameter/result identity and exact ranges into retained flat physical
+parameter and result type vectors. Function entry, calls, returns, artifact identity, and signature
+validation all consume that object. The validator checks vector bounds, contiguous parameter
+ranges, scalar and Record leaf types, and result shape before lowering can publish a function or
+call with an inconsistent ABI.
+
+Each checked schema caches one canonical physical leaf-type vector plus a contiguous offset/width
+for every source field. All parameter, loop, branch, and materialization consumers read that layout
+rather than recursively rediscovering it. Empty schemas and layouts wider than 256 physical leaves
+are refused as malformed Records. Schema names, ordered logical fields, nested identities, cached
+leaf types, and Record-valued parameter/return annotations are part of the library identity used by
+immutable machine artifacts.
+
+This distinction is important for specification transcription: an ECMA-262 Record is not a
+JavaScript Object. If a specification Record genuinely must survive a dynamic collection or a
+runtime ABI, it needs an explicit, reviewed materialization boundary; silently replacing it with
+an unreachable ordinary Object is forbidden.
+
+### Checked specification provenance
+
+A canonical implementation claim is declaration metadata, not a nearby comment or a name match:
+
+```clojure
+(macro ToBoolean
+  :spec "ecma262@ed463bc10dbeaad0410ce67e541a77ea8e9900a5#sec-toboolean"
+  :spec-name "ToBoolean"
+  :status complete
+  :params [(v dyn)] :ret bool
+  (%Not (%Not v)))
+```
+
+`:spec`, `:spec-name`, and `:status` are all-or-nothing. Status is `complete` or `partial`; a
+partial claim must carry a non-empty `:deviation`, while a complete claim is forbidden from
+carrying one. The JSL reader retains these fields and rejects malformed combinations and duplicate
+canonical clause claims before lowering. `npm run spec:ledger:gate` independently checks every
+claim against the pinned raw ledger, rejecting stale revisions, missing or informative clauses,
+and canonical-name mismatches.
+
+A deliberately narrower helper uses a different, mutually exclusive form:
+
+```clojure
+(macro ToLength
+  :specializes "ecma262@ed463bc10dbeaad0410ce67e541a77ea8e9900a5#sec-tolength"
+  :deviation "Returns a machine index saturated to the caller's storage limit."
+  :params [(value dyn) (limit int)] :ret int
+  (ClampedIndex value limit))
+```
+
+`:specializes` never creates a canonical implementation claim. It requires a pinned normative
+target and a non-empty `:deviation` that states the narrowing, and it cannot be combined with
+`:spec`, `:spec-name`, or `:status`. Both the JSL checker and offline provenance generator enforce
+that distinction. Generated provenance retains specializations as their own records and excludes
+them from the candidate queue, preventing an exact helper name or nearby spec link from inflating
+coverage.
+
+Comments and exact declaration names remain useful input, but not evidence. The generated
+`spec/generated/jsl-provenance.json` records them as review candidates separately from verified
+claims. Promoting a candidate requires reading the actual implementation and tests and then adding
+the structured metadata; generation never silently turns similarity into coverage.
 
 `coil.reader` also carries `lo`/`hi`/`source` on every node and returns a `Diag` on malformed input,
 which `jsl-read!` keeps as `JSL-ERR-PARSE` rather than retelling.

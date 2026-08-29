@@ -40,6 +40,13 @@ test("extracts imported normative structure, operation dependencies, built-ins, 
   assert.deepEqual(byId.get("sec-add-two").operationDependencies, ["AddOne"]);
   assert.equal(byId.get("sec-widget.prototype.read").builtIn.name, "Widget.prototype.read");
   assert.equal(byId.get("sec-runtime-semantics-evaluation").algorithmKind, "syntax-directed operation");
+  assert.equal(byId.get("sec-runtime-semantics-evaluation").parentId, "sec-widget-literal");
+  assert.deepEqual(byId.get("sec-runtime-semantics-evaluation").ancestorIds, ["sec-widget-literal"]);
+  assert.equal(byId.get("sec-runtime-semantics-evaluation").topLevelId, "sec-widget-literal");
+  assert.equal(byId.get("sec-add-one").parentId, null);
+  assert.deepEqual(byId.get("sec-add-one").ancestorIds, []);
+  assert.equal(byId.get("sec-add-one").proseCount, 0);
+  assert.equal(byId.get("sec-legacy-extra").proseCount, 1);
   assert.equal(byId.get("sec-legacy-extra").normative, true);
   assert.equal(byId.get("sec-informative-extra").normative, false);
   assert.ok(ledger.productions.some(production => production.name === "WidgetLiteral"));
@@ -78,4 +85,8 @@ test("validates ledger pins, identities, references, source locations, and total
   const staleSummary = structuredClone(ledger);
   staleSummary.summary.clauses += 1;
   assert.throws(() => validateLedger(staleSummary, pins), /summary does not match/);
+
+  const corruptHierarchy = structuredClone(ledger);
+  corruptHierarchy.clauses.find(clause => clause.id === "sec-runtime-semantics-evaluation").ancestorIds = [];
+  assert.throws(() => validateLedger(corruptHierarchy, pins), /parent does not match/);
 });

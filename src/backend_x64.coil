@@ -188,6 +188,9 @@
   (x64-u8! 242) (x64-rex! src base) (x64-u8! 15) (x64-u8! 17)
   (x64-mem! src base disp))
 
+(defn x64-lea! [(dst i64) (base i64) (disp i64)] (-> i64)
+  (x64-rex! dst base) (x64-u8! 141) (x64-mem! dst base disp))
+
 (defn x64-save-callees! [(owner i64)] (-> i64)
   (let [mask (mu-function-callee-mask owner)
         (mut reg) 19]
@@ -276,6 +279,65 @@
   (let [off (x64-spill-off vreg)]
     (if (>= off 0) (x64-fstore! 4 off reg) 0)))
 
+(defn x64-abi-spill-off [(owner i64) (slot i64)] (-> i64)
+  (+ 16 (* (+ (mu-function-callee-count owner) slot) 8)))
+
+(defn x64-emit-abi-parallel-moves! [(at i64) (sp-delta i64) (result-base i64)] (-> i64)
+  (let [count (mu-abi-move-count at) (mut move) 0]
+    (loop (if (>= (load move) count) (break)
+              (let [p (mu-abi-move at (load move))
+                    fp (= (.dst-class p) MRC-FPR)
+                    scratch 14
+                    source
+                      (case (.src-kind p) MLOC-REGISTER
+                              (if fp (- (.src-index p) 32) (x64-reg (.src-index p)))
+                            MLOC-SCRATCH scratch
+                            MLOC-SPILL
+                              (do
+                                (if fp
+                                    (x64-fload! scratch 4
+                                                (+ sp-delta (x64-abi-spill-off
+                                                  (.owner p) (.src-index p))))
+                                    (x64-load! scratch 4
+                                              (+ sp-delta (x64-abi-spill-off
+                                                (.owner p) (.src-index p)))))
+                                scratch)
+                            MLOC-RESULT-AREA
+                              (do
+                                (if fp
+                                    (x64-fload! scratch 4 (+ result-base (.src-index p)))
+                                    (x64-load! scratch 4 (+ result-base (.src-index p))))
+                                scratch)
+                            -1)
+                    destination
+                      (if (= (.dst-kind p) MLOC-REGISTER)
+                          (if fp (- (.dst-index p) 32) (x64-reg (.dst-index p)))
+                          scratch)]
+                (case (.dst-kind p) MLOC-REGISTER
+                        (if (= source destination) 0
+                            (if fp (x64-fmov! destination source)
+                                (x64-mov-rr! destination source)))
+                      MLOC-SCRATCH
+                        (if (= source scratch) 0
+                            (if fp (x64-fmov! scratch source)
+                                (x64-mov-rr! scratch source)))
+                      MLOC-SPILL
+                        (if fp
+                            (x64-fstore! 4 (+ sp-delta (x64-abi-spill-off
+                                             (.owner p) (.dst-index p))) source)
+                            (x64-store! 4 (+ sp-delta (x64-abi-spill-off
+                                            (.owner p) (.dst-index p))) source))
+                      MLOC-RESULT-AREA
+                        (do
+                          (x64-load! 15 4
+                                     (mu-function-result-pointer-offset (.owner p)))
+                          (if fp
+                              (x64-fstore! 15 (.dst-index p) source)
+                              (x64-store! 15 (.dst-index p) source)))
+                      (x64-fail! (.inst p)))
+                (set! move (+ (load move) 1)))))
+    0))
+
 (defn x64-movq-xr! [(xd i64) (rs i64)] (-> i64)
   (x64-u8! 102) (x64-rex! xd rs) (x64-u8! 15) (x64-u8! 110) (x64-modrm! xd rs))
 (defn x64-movq-rx! [(rd i64) (xs i64)] (-> i64)
@@ -299,35 +361,22 @@
   (x64-alu! 33 dst 0))
 
 (defn x64-label-off [(label i64)] (-> i64)
-  (let [cached (if (and (>= label 0) (< label (al-len [i64] (.x64-label-offs (backend)))))
-                   (al-get (.x64-label-offs (backend)) label)
-                   -1)
-        (mut i) 0 (mut answer) cached]
-    (loop (if (or (>= (load i) (be-inst-count)) (>= (load answer) 0)) (break)
-              (do (let [m (be-inst (load i))]
-                    (if (and (= (.op m) MI-LABEL) (= (.imm m) label))
-                        (set! answer (.first m)) 0))
-                  (set! i (+ (load i) 1)))))
-    (load answer)))
+  (if (and (>= label 0) (< label (al-len [i64] (.x64-label-offs (backend)))))
+      (al-get (.x64-label-offs (backend)) label)
+      -1))
 
 (defn x64-entry-owner [(bid i64)] (-> i64)
-  (let [cached (if (and (>= bid 0) (< bid (al-len [i64] (.x64-entry-owners (backend)))))
-                   (al-get (.x64-entry-owners (backend)) bid)
-                   -1)
-        (mut owner) 0 (mut answer) cached]
-    (loop (if (or (>= (load owner) (mu-function-count)) (>= (load answer) 0)) (break)
-              (do (if (= (mu-function-block (load owner) 0) bid)
-                      (set! answer (load owner)) 0)
-                  (set! owner (+ (load owner) 1)))))
-    (load answer)))
+  (if (and (>= bid 0) (< bid (al-len [i64] (.x64-entry-owners (backend)))))
+      (al-get (.x64-entry-owners (backend)) bid)
+      -1))
 
 (defn x64-call-class-index [(m (ptr MInst)) (which i64)] (-> i64)
-  (let [class (ml-register-class (ms-inst-arg (load (x64-current-inst)) which))
+  (let [class (ms-call-arg-class m which)
         (mut i) 0
         (mut index) 0]
     (loop (if (>= (load i) which)
               (break)
-              (do (if (= (ml-register-class (ms-inst-arg (load (x64-current-inst)) (load i))) class)
+              (do (if (= (ms-call-arg-class m (load i)) class)
                       (set! index (+ (load index) 1)) 0)
                   (set! i (+ (load i) 1)))))
     (load index)))
@@ -497,6 +546,9 @@
                                       (x64-sp-adjust! true (mu-function-frame-size owner))
                                       ; r14/r15 are encoder scratch registers but SysV callee-saved.
                                       (x64-store! 4 0 14) (x64-store! 4 8 15)
+                                      (if (> (mu-function-result-area-size owner) 0)
+                                          (x64-store! 4
+                                                      (mu-function-result-pointer-offset owner) 14) 0)
                                       (x64-save-callees! owner)))) MI-ARG
                             0 MI-ABI-COPY
                             (let [from (x64-read-gpr! (.a m) 0)
@@ -510,12 +562,21 @@
                               (if (or (< from 0) (< to 0))
                                   (x64-fail! (.node m))
                                   (do (x64-mov-rr! to from) (x64-store-gpr! (.dst m) to))))
-                              MI-MOV
-                            (let [from (x64-read-gpr! (.a m) 0)
-                                  to (x64-write-gpr (.imm m) 14)]
-                              (if (or (< from 0) (< to 0))
-                                  (x64-fail! (.node m))
-                                  (do (x64-mov-rr! to from) (x64-store-gpr! (.imm m) to))))
+                              MI-RESULT-MATERIALIZE
+                            (let [is-fp (= (ml-register-class (.dst m)) MRC-FPR)]
+                              (if is-fp
+                                  (let [from (x64-read-fpr! (.a m) 14)
+                                        to (x64-write-fpr (.dst m) 15)]
+                                    (if (or (< from 0) (< to 0))
+                                        (x64-fail! (.node m))
+                                        (do (x64-fmov! to from)
+                                            (x64-store-fpr! (.dst m) to))))
+                                  (let [from (x64-read-gpr! (.a m) 0)
+                                        to (x64-write-gpr (.dst m) 14)]
+                                    (if (or (< from 0) (< to 0))
+                                        (x64-fail! (.node m))
+                                        (do (x64-mov-rr! to from)
+                                            (x64-store-gpr! (.dst m) to))))))
                               MI-MOVI
                             (let [to (x64-write-gpr (.dst m) 0)]
                               (if (< to 0)
@@ -948,8 +1009,13 @@
                                       (set! (.schedule-order m) (al-len [u8] (.code (backend)))))))
                               MI-CALL
                             (let [polymorphic (< (.imm m) 0)
+                                  bundle (mu-call-bundle (mu-inst-call-bundle (load at)))
+                                  multi-result (> (.capture-count bundle) 0)
                                   argc (.arg-count m)
-                                  area (& (+ (* (if polymorphic (+ (* argc 2) 2) argc) 8) 15) -16)
+                                  base-area
+                                    (& (+ (* (if polymorphic (+ (* argc 2) 2) argc) 8) 15) -16)
+                                  result-area (if polymorphic 0 (.result-area-size bundle))
+                                  area (+ base-area result-area)
                                       (mut arg) 0]
                                   (x64-sp-adjust! true area)
                                   (if polymorphic
@@ -974,7 +1040,7 @@
                                             (let [vr (ms-inst-arg (load at) (load arg))
                                                   abi (x64-call-class-index m (load arg))]
                                               (if (< abi 8)
-                                                  (if (= (ml-register-class vr) MRC-FPR)
+                                                  (if (= (ms-call-arg-class m (load arg)) MRC-FPR)
                                                       (x64-fload! abi 4 (* (load arg) 8))
                                                       (x64-load! (x64-reg abi) 4 (* (load arg) 8)))
                                                   0)
@@ -987,7 +1053,7 @@
                                                   abi (x64-call-class-index m (load arg))]
                                               (if (>= abi 8)
                                                   (let [slot (x64-call-stack-index m (load arg))]
-                                                    (if (= (ml-register-class vr) MRC-FPR)
+                                                    (if (= (ms-call-arg-class m (load arg)) MRC-FPR)
                                                         (do (x64-fload! 15 4 (* (load arg) 8))
                                                             (x64-fstore! 4 (* slot 8) 15))
                                                         (do (x64-load! 15 4 (* (load arg) 8))
@@ -1099,10 +1165,30 @@
                                                         (- (load box-end) (+ (load fp-branch) 4)))
                                           (x64-patch32! (load boxed-jump)
                                                         (- end (+ (load boxed-jump) 4)))))
-                                      (do (x64-u8! 232)
+                                      (do
+                                          (if (> result-area 0)
+                                              (do
+                                                (x64-lea! 14 4 base-area)
+                                                (x64-store! 4
+                                                  (+ area
+                                                     (mu-function-outgoing-result-pointer-offset
+                                                       (.owner m))) 14)
+                                                (x64-mov-imm! 15 0)
+                                                (let [(mut clear) 0]
+                                                  (loop (if (>= (load clear) result-area) (break)
+                                                            (do
+                                                              (x64-store! 14 (load clear) 15)
+                                                              (set! clear (+ (load clear) 8))))))
+                                                0) 0)
+                                          (x64-u8! 232)
                                           (set! (.last m) (al-len [u8] (.code (backend))))
                                           (x64-u32! 0)
                                           (set! (.earliest m) (al-len [u8] (.code (backend))))))
+                                  (if multi-result
+                                      (do
+                                        (x64-emit-abi-parallel-moves!
+                                          (.capture-first bundle) area base-area)
+                                        (x64-sp-adjust! false area))
                                   (if (= (ml-register-class (.dst m)) MRC-FPR)
                                       (let [to (x64-write-fpr (.dst m) 14)]
                                         (if (< to 0) (x64-fail! (.node m))
@@ -1115,7 +1201,7 @@
                                             (do (x64-mov-rr! 14 0)
                                                 (x64-sp-adjust! false area)
                                                 (x64-mov-rr! to 14)
-                                                (x64-store-gpr! (.dst m) to))))))
+                                                (x64-store-gpr! (.dst m) to)))))))
                               MI-STACKARG
                             (let [is-fp (= (ml-register-class (.dst m)) MRC-FPR)
                                   to (if is-fp (x64-write-fpr (.dst m) 14)
@@ -1132,20 +1218,24 @@
                             (x64-runtime-call! m (load at)) MI-JSARRAY
                             (x64-runtime-call! m (load at)) MI-JSSTRING
                             (x64-runtime-call! m (load at))
+                              MI-CALL-RESULT
+                            0
                               MI-RET
-                            (let [is-fp (= (ml-register-class (.a m)) MRC-FPR)
-                                  result (if is-fp (x64-read-fpr! (.a m) 14)
-                                             (x64-read-gpr! (.a m) 14))]
-                              (if (< result 0)
-                                  (x64-fail! (.node m))
-                                  (do (if is-fp (x64-fmov! 0 result) (x64-mov-rr! 0 result))
-                                    (if (< (.owner m) 0) 0
-                                        (do (x64-restore-callees! (.owner m))
-                                            (x64-load! 14 4 0) (x64-load! 15 4 8)
-                                            (x64-sp-adjust! false (mu-function-frame-size (.owner m)))
-                                            (x64-u8! 93)))
-                                      (x64-ret!))))
-                              (x64-fail! (.node m))))
+                            (do
+                              (if (> (.imm m) 1)
+                                  (x64-emit-abi-parallel-moves! (load at) 0 0)
+                                  (let [is-fp (= (ml-register-class (.a m)) MRC-FPR)
+                                        result (if is-fp (x64-read-fpr! (.a m) 14)
+                                                   (x64-read-gpr! (.a m) 14))]
+                                    (if (< result 0) (x64-fail! (.node m))
+                                        (if is-fp (x64-fmov! 0 result)
+                                            (x64-mov-rr! 0 result)))))
+                              (if (< (.owner m) 0) 0
+                                  (do (x64-restore-callees! (.owner m))
+                                      (x64-load! 14 4 0) (x64-load! 15 4 8)
+                                      (x64-sp-adjust! false (mu-function-frame-size (.owner m)))
+                                      (x64-u8! 93)))
+                              (x64-ret!))))
                     (set! at (+ (load at) 1))
                     0)))
         ;; Resolve block-relative branches after all variable-length instructions have exact PCs.
@@ -1188,32 +1278,35 @@
                                         (x64-patch32! (.last m) (- target (.earliest m)))))
                                   0))
                             (set! call (+ (load call) 1)))))) 0)
-        ;; Exact function ranges are consumed by both ELF symbols and stack maps.
-        (let [(mut owner) 0]
+        ;; The scheduled stream groups each function's blocks contiguously. Publish exact ranges
+        ;; while walking its entry labels once; no encoder consumer may rediscover boundaries by
+        ;; comparing every function with every other function.
+        (let [(mut owner) 0 (mut at-range) 0 (mut active) -1]
           (loop (if (>= (load owner) (mu-function-count)) (break)
-                    (do (let [f (mu-function (load owner))]
-                          (if (mu-function-imported? (load owner))
-                              (do (set! (.code-start f) -1) (set! (.code-size f) 0))
-                              (let [start (x64-label-off (mu-function-block (load owner) 0))
-                                    (mut end) (al-len [u8] (.code (backend)))
-                                    (mut other) 0]
-                                (loop (if (>= (load other) (mu-function-count)) (break)
-                                          (do
-                                            (if (and (!= (load other) (load owner))
-                                                     (not (mu-function-imported? (load other))))
-                                                (let [candidate
-                                                        (x64-label-off
-                                                          (mu-function-block (load other) 0))]
-                                                  (if (and (> candidate start)
-                                                           (< candidate (load end)))
-                                                      (set! end candidate)
-                                                      0))
-                                                0)
-                                            (set! other (+ (load other) 1)))))
-                                (set! (.code-start f) start)
-                                (set! (.code-size f) (- (load end) start)))))
+                    (do (set! (.code-start (mu-function (load owner))) -1)
+                        (set! (.code-size (mu-function (load owner))) 0)
                         (set! owner (+ (load owner) 1)))))
-        (and (= (be-result) BER-OK) (> (al-len [u8] (.code (backend))) 0))))))
+          (loop (if (>= (load at-range) n) (break)
+                    (do
+                      (let [m (be-inst (load at-range))]
+                        (if (= (.op m) MI-LABEL)
+                            (let [entry (x64-entry-owner (.imm m))]
+                              (if (< entry 0) 0
+                                  (do
+                                    (if (>= (load active) 0)
+                                        (set! (.code-size (mu-function (load active)))
+                                              (- (.first m)
+                                                 (.code-start (mu-function (load active))))) 0)
+                                    (if (>= (.code-start (mu-function entry)) 0)
+                                        (x64-fail! (.node m))
+                                        (do (set! (.code-start (mu-function entry)) (.first m))
+                                            (set! active entry)))))) 0))
+                      (set! at-range (+ (load at-range) 1)))))
+          (if (>= (load active) 0)
+              (set! (.code-size (mu-function (load active)))
+                    (- (al-len [u8] (.code (backend)))
+                       (.code-start (mu-function (load active))))) 0))
+        (and (= (be-result) BER-OK) (> (al-len [u8] (.code (backend))) 0)))))
 
 (defn be-x64-code-len [] (-> i64)
   (if (= (be-result) BER-OK) (al-len [u8] (.code (backend))) 0))

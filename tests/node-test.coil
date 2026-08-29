@@ -12,6 +12,7 @@
 
 (import "ty"   :use *)
 (import "node" :use *)
+(import "verify" :use *)
 (import "shape" :use *)
 (import "coil.assert"      :use *)
 (import "coil.control"     :use *)
@@ -32,6 +33,69 @@
 (defn mk-un  [(op Op) (a i64)] (-> i64) (n-peephole (n-new2 op NO-NODE a)))
 (defn mk-int [(v i64)] (-> i64) (mk-con (t-int-con v)))
 (defn mk-flt-bits [(v i64)] (-> i64) (mk-con (t-flt-bits v)))
+
+(deftest function_abi_metadata_retains_an_indexed_result_vector
+  (graph-reset! 91001)
+  (let [fun (n-fun-open! 0)
+        pbuf (primitive/alloc-stack (array i64 2))
+        params (cast (ptr i64) pbuf)
+        rbuf (primitive/alloc-stack (array i64 3))
+        results (cast (ptr i64) rbuf)]
+    (store! (index params 0) (t-dyn))
+    (store! (index params 1) (t-int))
+    (store! (index results 0) (t-int))
+    (store! (index results 1) (t-bool))
+    (store! (index results 2) (t-dyn))
+    (n-fun-declare-abi-results! fun (slice-new [i64] params 2)
+                                (slice-new [i64] results 3))
+    (assert (n-fun-abi-declared? fun))
+    (assert (not (n-fun-abi-can-throw? fun)))
+    (n-fun-abi-set-can-throw! fun true)
+    (assert (n-fun-abi-can-throw? fun))
+    (assert (= (n-fun-abi-param-count fun) 2))
+    (assert (= (n-fun-abi-result-count fun) 3))
+    (assert (= (n-fun-abi-result-type fun 0) (t-int)))
+    (assert (= (n-fun-abi-result-type fun 1) (t-bool)))
+    (assert (= (n-fun-abi-result-type fun 2) (t-dyn))))
+
+  ;; The established scalar API is exactly a one-element result-vector constructor.
+  (graph-reset! 91002)
+  (let [fun (n-fun-open! 0)]
+    (n-fun-declare-abi! fun (slice-new [i64] (cast (ptr i64) 0) 0) (t-int))
+    (assert (= (n-fun-abi-result-count fun) 1))
+    (assert (= (n-fun-abi-result-type fun 0) (t-int)))
+    (assert (= (n-fun-abi-return-type fun) (t-int)))))
+
+(deftest declared_multi_result_calls_are_tuples_with_indexed_projections
+  (graph-reset! 91003)
+  (let [fun (n-fun-open! 0)
+        rbuf (primitive/alloc-stack (array i64 2))
+        result-types (cast (ptr i64) rbuf)
+        vbuf (primitive/alloc-stack (array i64 2))
+        values (cast (ptr i64) vbuf)]
+    (store! (index result-types 0) (t-int))
+    (store! (index result-types 1) (t-bool))
+    (n-fun-declare-abi-results!
+      fun (slice-new [i64] (cast (ptr i64) 0) 0)
+      (slice-new [i64] result-types 2))
+    (store! (index values 0) (mk-int 41))
+    (store! (index values 1) (mk-con (t-bool-con true)))
+    (n-fun-close! fun
+                  (n-return-values! (n-fun-entry fun) (slice-new [i64] values 2) NO-NODE))
+    (let [site (n-call! (g-start) fun (slice-new [i64] (cast (ptr i64) 0) 0))
+          first (call-result site 0)
+          second (call-result site 1)]
+      (let [arms (n-if-arms! (n-new2 (If) (call-end site) second))]
+        (n-add-def! (g-stop) (n-new2 (Return) (arms-t arms) first))
+        (n-add-def! (g-stop) (n-new2 (Return) (arms-f arms) first)))
+      (g-analyze!)
+      (assert (op-is? first Proj [_]))
+      (assert (op-is? second Proj [_]))
+      (assert (= (n-proj-slot first) 0))
+      (assert (= (n-proj-slot second) 1))
+      (assert (= (n-ty first) (t-int)))
+      (assert (= (n-ty second) (t-bool)))
+      (assert (= (g-verify) 0)))))
 
 ;; Finish a program: return the value, hook it to Stop, then run peepholes to a fixpoint.
 (defn mk-ret [(v i64)] (-> i64)
@@ -359,6 +423,24 @@
     (assert (= l r))
     (mk-ret (mk-bin (Sub) l r)))
   (check-prog "(arg*arg)-(arg*arg)" "return ((arg*arg)-(arg*arg));"))
+
+(deftest property_component_operations_are_part_of_gvn_identity
+  (graph-reset! 40101)
+  (let [ctrl (g-start)
+        memory (mk-arg (t-mem-alias JS-PROPERTY-ALIAS (t-undef)))
+        object (mk-arg (t-dyn))
+        key (mk-arg (t-dyn))
+        value (mk-arg (t-dyn))
+        getter (n-peephole (n-new4 (PropLoadKey 19) ctrl memory object key))
+        same-getter (n-peephole (n-new4 (PropLoadKey 19) ctrl memory object key))
+        setter (n-peephole (n-new4 (PropLoadKey 20) ctrl memory object key))
+        value-store (n-peephole (n-new5 (PropStoreKey 16) ctrl memory object key value))
+        getter-store (n-peephole (n-new5 (PropStoreKey 17) ctrl memory object key value))]
+    (assert (= getter same-getter))
+    (assert (!= getter setter))
+    (assert (!= value-store getter-store))
+    (assert (= (op-encode-payload (n-op getter)) 19))
+    (assert (= (op-encode-payload (n-op setter)) 20))))
 
 (deftest gvn-dedups-constants
   (graph-reset! 1)

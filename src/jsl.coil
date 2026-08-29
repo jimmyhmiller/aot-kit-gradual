@@ -82,6 +82,15 @@
 (const JSL-ERR-LOOP-NO-RECUR         i64 32)  ; a `loop` no path recurs to: that is a `let`
 (const JSL-ERR-LOOP-NO-EXIT          i64 33)  ; a `loop` every path recurs from: it cannot terminate
 (const JSL-ERR-HEAP-IN-BUILTIN       i64 34)  ; a `builtin` that reads the heap; see the note below
+(const JSL-ERR-BAD-SPEC-METADATA      i64 35)  ; incomplete/invalid provenance or status combination
+(const JSL-ERR-DUP-SPEC-CLAIM         i64 36)  ; two declarations claim one canonical spec item
+(const JSL-ERR-BAD-REST               i64 37)  ; `(rest T)` is not the final parameter of a macro
+(const JSL-ERR-BAD-RECORD             i64 38)  ; malformed record declaration/construction
+(const JSL-ERR-DUP-RECORD             i64 39)  ; two schemas have the same name
+(const JSL-ERR-UNKNOWN-RECORD         i64 40)  ; a record type names no declared schema
+(const JSL-ERR-BAD-RECORD-FIELD       i64 41)  ; missing, duplicate, or unknown named field
+(const JSL-ERR-RECORD-ESCAPE          i64 42)  ; a compile-away record crosses a runtime ABI
+(const JSL-ERR-BAD-RECORD-LIST        i64 43)  ; malformed or schema-mismatched record List use
 
 (defn jsl-err-name [(code i64)] (-> (slice u8))
   (case code
@@ -120,6 +129,15 @@
         JSL-ERR-LOOP-NO-RECUR         "JSL-ERR-LOOP-NO-RECUR"
         JSL-ERR-LOOP-NO-EXIT          "JSL-ERR-LOOP-NO-EXIT"
         JSL-ERR-HEAP-IN-BUILTIN       "JSL-ERR-HEAP-IN-BUILTIN"
+        JSL-ERR-BAD-SPEC-METADATA      "JSL-ERR-BAD-SPEC-METADATA"
+        JSL-ERR-DUP-SPEC-CLAIM         "JSL-ERR-DUP-SPEC-CLAIM"
+        JSL-ERR-BAD-REST               "JSL-ERR-BAD-REST"
+        JSL-ERR-BAD-RECORD             "JSL-ERR-BAD-RECORD"
+        JSL-ERR-DUP-RECORD             "JSL-ERR-DUP-RECORD"
+        JSL-ERR-UNKNOWN-RECORD         "JSL-ERR-UNKNOWN-RECORD"
+        JSL-ERR-BAD-RECORD-FIELD       "JSL-ERR-BAD-RECORD-FIELD"
+        JSL-ERR-RECORD-ESCAPE          "JSL-ERR-RECORD-ESCAPE"
+        JSL-ERR-BAD-RECORD-LIST        "JSL-ERR-BAD-RECORD-LIST"
         "<unknown jsl code>"))
 
 ; ============================================================================
@@ -776,27 +794,46 @@
 (const JSL-KIND-MACRO   i64 1)
 (const JSL-KIND-CALLABLE i64 2)
 
+(const JSL-SPEC-UNSPECIFIED i64 0)
+(const JSL-SPEC-COMPLETE    i64 1)
+(const JSL-SPEC-PARTIAL     i64 2)
+
 ;; ONE LABEL. The pattern a label exists for is a fast path with a bail-out to a generic path, which
 ;; needs exactly one. Supporting N is not hard, but an unbounded design here would be untested
 ;; generality, and the refusal above it is named.
 (const JSL-MAX-LABELS i64 1)
+(const JSL-MAX-RECORD-LEAVES i64 256)
 
-(defstruct JslParam [(name (slice u8)) (ty i64)])
+(defstruct JslParam
+  [(name (slice u8)) (ty i64) (record i64) (rest bool)
+   ;; Canonical half-open range in the declaration's lowered parameter vector. Logical source
+   ;; arity remains `nparams`; these fields are the ABI shape and are computed once after checking.
+   (lowered-off i64) (lowered-width i64)])
+(defstruct JslSignature
+  [;; Logical source signature.
+   (params-off i64) (nparams i64) (ret i64) (ret-record i64)
+   ;; Canonical physical ABI vectors retained in `Jsl.signaturetypes`.
+   (lowered-params-off i64) (lowered-nparams i64)
+   (lowered-results-off i64) (lowered-nresults i64)
+   ;; Effect/linkage facts are part of function compatibility, not parallel declaration trivia.
+   (transitioning bool) (cold bool) (usesmem bool) (callsback bool) (canthrow bool)])
+(defstruct JslRecordDecl
+  [(name (slice u8)) (fields-off i64) (nfields i64) (flat-off i64) (flat-width i64)])
+(defstruct JslRecordField
+  [(name (slice u8)) (ty i64) (record i64) (flat-off i64) (flat-width i64)])
 
 (defstruct JslDecl
   [(name          (slice u8))
    (kind          i64)          ; JSL-KIND-BUILTIN or JSL-KIND-MACRO
    (label         (slice u8))   ; the one label, or empty when the callable has none
-   (transitioning bool)
-   (cold          bool)
-   (params-off    i64)          ; window into the shared `params` array
-   (nparams       i64)
+   (spec          (slice u8)) ; ecma262@<full commit>#<stable clause id>, or empty
+   (specname      (slice u8)) ; canonical algorithm/builtin label from the pinned ledger
+   (specstatus    i64)        ; JSL-SPEC-*, never inferred from a name match
+   (specializes   (slice u8)) ; pinned canonical item deliberately narrowed by this helper
+   (deviation     (slice u8)) ; required for partial, forbidden for complete
+   (signature     JslSignature) ; the one logical and physical function signature
    (captures-off  i64)
    (ncaptures     i64)
-   (ret           i64)          ; a TyId; TY-NO-ID when `:ret` was omitted
-   (usesmem       bool)         ; reads the heap, so it takes memory as a trailing parameter
-   (callsback     bool)         ; invokes a JavaScript callback value, directly or through a callee
-   (canthrow      bool)         ; may execute %Throw, directly or through a callee/callback
    (heapparams    i64)          ; bitset: parameters whose value reaches a heap-array operand
    (body          (ptr rd/Sexp))
    (fun           i64)])        ; the OPTAG-FUN node once lowered; NO-NODE until then
@@ -812,10 +849,19 @@
 (defstruct Jsl
   [(decls   (ArrayList JslDecl))
    (params  (ArrayList JslParam))
+   (signaturetypes (ArrayList i64)) ; retained physical parameter/result vectors
+   (records (ArrayList JslRecordDecl))
+   (recordfields (ArrayList JslRecordField))
+   (recordflattypes (ArrayList i64)) ; one canonical recursive physical type vector per schema
    (captures (ArrayList (slice u8)))
    (binds   (ArrayList (slice u8)))   ; the checker's binding stack
+   (bindrecords (ArrayList i64))      ; schema index parallel to `binds`, or -1
+   (bindlists (ArrayList i64))        ; materialized Record List schema, parallel to `binds`
    (marks   (ArrayList i64))          ; DFS colours, for macro-cycle detection
    (arities (ArrayList i64))          ; enclosing `loop` binding counts, innermost last
+   (looprecordbases (ArrayList i64))  ; base in `looprecords` for each active loop
+   (looprecords (ArrayList i64))      ; one inferred schema per source loop binding
+   (looplists (ArrayList i64))        ; parallel inferred Record-list schema per loop binding
    (paths   (ArrayList (slice u8)))   ; source id -> the path it was read from
    (err     i64)
    (where   (slice u8))               ; the name the first failure was about
@@ -835,11 +881,20 @@
       (do (set! (.inited p) true)   ; set FIRST: `jsl-reset!` re-enters through here
           (set! (.decls p) (al-new [JslDecl] (malloc-allocator)))
           (set! (.params p) (al-new [JslParam] (malloc-allocator)))
+          (set! (.signaturetypes p) (al-new [i64] (malloc-allocator)))
+          (set! (.records p) (al-new [JslRecordDecl] (malloc-allocator)))
+          (set! (.recordfields p) (al-new [JslRecordField] (malloc-allocator)))
+          (set! (.recordflattypes p) (al-new [i64] (malloc-allocator)))
           (set! (.captures p) (al-new [(slice u8)] (malloc-allocator)))
           (set! (.binds p) (al-new [(slice u8)] (malloc-allocator)))
+          (set! (.bindrecords p) (al-new [i64] (malloc-allocator)))
+          (set! (.bindlists p) (al-new [i64] (malloc-allocator)))
           (set! (.marks p) (al-new [i64] (malloc-allocator)))
           (set! (.paths p) (al-new [(slice u8)] (malloc-allocator)))
           (set! (.arities p) (al-new [i64] (malloc-allocator)))
+          (set! (.looprecordbases p) (al-new [i64] (malloc-allocator)))
+          (set! (.looprecords p) (al-new [i64] (malloc-allocator)))
+          (set! (.looplists p) (al-new [i64] (malloc-allocator)))
           (set! (.err p) JSL-OK)
           (set! (.where p) "")
           0))
@@ -849,11 +904,20 @@
   (let [p (jsl)]
     (al-clear! [JslDecl]     (field p decls))
     (al-clear! [JslParam]    (field p params))
+    (al-clear! [i64]         (field p signaturetypes))
+    (al-clear! [JslRecordDecl] (field p records))
+    (al-clear! [JslRecordField] (field p recordfields))
+    (al-clear! [i64]         (field p recordflattypes))
     (al-clear! [(slice u8)]  (field p captures))
     (al-clear! [(slice u8)]  (field p binds))
+    (al-clear! [i64]         (field p bindrecords))
+    (al-clear! [i64]         (field p bindlists))
     (al-clear! [i64]         (field p marks))
     (al-clear! [(slice u8)]  (field p paths))
     (al-clear! [i64]         (field p arities))
+    (al-clear! [i64]         (field p looprecordbases))
+    (al-clear! [i64]         (field p looprecords))
+    (al-clear! [i64]         (field p looplists))
     (set! (.err-src p) -1)
     (set! (.err-lo p) 0)
     (set! (.err-hi p) 0)
@@ -884,8 +948,13 @@
                 (set! i (+ (load i) 1))
                 0)))
     (al-clear! [(slice u8)] (field p binds))
+    (al-clear! [i64] (field p bindrecords))
+    (al-clear! [i64] (field p bindlists))
     (al-clear! [i64] (field p marks))
     (al-clear! [i64] (field p arities))
+    (al-clear! [i64] (field p looprecordbases))
+    (al-clear! [i64] (field p looprecords))
+    (al-clear! [i64] (field p looplists))
     (set! (.err-src p) -1)
     (set! (.err-lo p) 0)
     (set! (.err-hi p) 0)
@@ -996,31 +1065,41 @@
                 0)))
     (load n)))
 
-(defn jsl-decl-nparams [(i i64)] (-> i64) (.nparams (jsl-decl-p i)))
+(defn jsl-decl-signature [(i i64)] (-> (ptr JslSignature))
+  (field (jsl-decl-p i) signature))
+(defn jsl-decl-nparams [(i i64)] (-> i64) (.nparams (jsl-decl-signature i)))
+(defn jsl-decl-lowered-nparams [(i i64)] (-> i64)
+  (.lowered-nparams (jsl-decl-signature i)))
 (defn jsl-decl-ncaptures [(i i64)] (-> i64) (.ncaptures (jsl-decl-p i)))
-(defn jsl-decl-ret [(i i64)] (-> i64) (.ret (jsl-decl-p i)))
-(defn jsl-decl-transitioning? [(i i64)] (-> bool) (.transitioning (jsl-decl-p i)))
-(defn jsl-decl-cold? [(i i64)] (-> bool) (.cold (jsl-decl-p i)))
+(defn jsl-decl-ret [(i i64)] (-> i64) (.ret (jsl-decl-signature i)))
+(defn jsl-decl-transitioning? [(i i64)] (-> bool)
+  (.transitioning (field (jsl-decl-p i) signature)))
+(defn jsl-decl-cold? [(i i64)] (-> bool) (.cold (field (jsl-decl-p i) signature)))
+(defn jsl-decl-spec [(i i64)] (-> (slice u8)) (.spec (jsl-decl-p i)))
+(defn jsl-decl-spec-name [(i i64)] (-> (slice u8)) (.specname (jsl-decl-p i)))
+(defn jsl-decl-spec-status [(i i64)] (-> i64) (.specstatus (jsl-decl-p i)))
+(defn jsl-decl-specializes [(i i64)] (-> (slice u8)) (.specializes (jsl-decl-p i)))
+(defn jsl-decl-deviation [(i i64)] (-> (slice u8)) (.deviation (jsl-decl-p i)))
 (defn jsl-decl-body [(i i64)] (-> (ptr rd/Sexp)) (.body (jsl-decl-p i)))
 (defn jsl-decl-fun [(i i64)] (-> i64) (.fun (jsl-decl-p i)))
-(defn jsl-decl-uses-memory? [(i i64)] (-> bool) (.usesmem (jsl-decl-p i)))
+(defn jsl-decl-uses-memory? [(i i64)] (-> bool) (.usesmem (field (jsl-decl-p i) signature)))
 (defn jsl-decl-heap-params [(i i64)] (-> i64) (.heapparams (jsl-decl-p i)))
 (defn jsl-decl-set-heap-params! [(i i64) (v i64)] (-> i64)
   (set! (.heapparams (jsl-decl-p i)) v) 0)
 (defn jsl-decl-set-uses-memory! [(i i64) (v bool)] (-> i64)
-  (set! (.usesmem (jsl-decl-p i)) v) 0)
+  (set! (.usesmem (field (jsl-decl-p i) signature)) v) 0)
 
 ;; Does this definition invoke a JAVASCRIPT CALLBACK? Distinct from `usesmem`, which asks about the
 ;; heap this library owns. A callback runs USER code, which can write anything the caller's scope
 ;; reaches -- a captured cell, a closure environment field -- none of which is JS-PROPERTY-ALIAS,
 ;; and none of which the JSL memory convention carries. The frontend asks so it can hand such a
 ;; definition the same full memory merge an ordinary JavaScript call gets.
-(defn jsl-decl-calls-back? [(i i64)] (-> bool) (.callsback (jsl-decl-p i)))
+(defn jsl-decl-calls-back? [(i i64)] (-> bool) (.callsback (field (jsl-decl-p i) signature)))
 (defn jsl-decl-set-calls-back! [(i i64) (v bool)] (-> i64)
-  (set! (.callsback (jsl-decl-p i)) v) 0)
-(defn jsl-decl-can-throw? [(i i64)] (-> bool) (.canthrow (jsl-decl-p i)))
+  (set! (.callsback (field (jsl-decl-p i) signature)) v) 0)
+(defn jsl-decl-can-throw? [(i i64)] (-> bool) (.canthrow (field (jsl-decl-p i) signature)))
 (defn jsl-decl-set-can-throw! [(i i64) (v bool)] (-> i64)
-  (set! (.canthrow (jsl-decl-p i)) v) 0)
+  (set! (.canthrow (field (jsl-decl-p i) signature)) v) 0)
 
 ;; A store straight into the live element.
 (defn jsl-decl-set-fun! [(i i64) (fun i64)] (-> i64)
@@ -1028,9 +1107,160 @@
   0)
 
 (defn jsl-param-p [(d i64) (k i64)] (-> (ptr JslParam))
-  (al-elem [JslParam] (field (jsl) params) (+ (.params-off (jsl-decl-p d)) k)))
+  (al-elem [JslParam] (field (jsl) params)
+           (+ (.params-off (jsl-decl-signature d)) k)))
 (defn jsl-param-name [(d i64) (k i64)] (-> (slice u8)) (.name (jsl-param-p d k)))
 (defn jsl-param-ty [(d i64) (k i64)] (-> i64) (.ty (jsl-param-p d k)))
+(defn jsl-param-record [(d i64) (k i64)] (-> i64) (.record (jsl-param-p d k)))
+(defn jsl-param-lowered-off [(d i64) (k i64)] (-> i64) (.lowered-off (jsl-param-p d k)))
+(defn jsl-param-lowered-width [(d i64) (k i64)] (-> i64) (.lowered-width (jsl-param-p d k)))
+(defn jsl-param-lowered-type [(d i64) (k i64) (slot i64)] (-> i64)
+  (let [parameter (jsl-param-p d k)
+        signature (jsl-decl-signature d)]
+    (if (or (< slot 0) (>= slot (jsl-param-lowered-width d k)))
+        (do (panic-corrupt "jsl: lowered parameter slot is outside its canonical range") TY-NO-ID)
+        (al-get [i64] (.signaturetypes (jsl))
+                (+ (.lowered-params-off signature) (+ (.lowered-off parameter) slot))))))
+(defn jsl-param-runtime-width [(d i64) (k i64)] (-> i64) (jsl-param-lowered-width d k))
+(defn jsl-decl-runtime-nparams [(d i64)] (-> i64)
+  (jsl-decl-lowered-nparams d))
+(defn jsl-param-rest? [(d i64) (k i64)] (-> bool) (.rest (jsl-param-p d k)))
+(defn jsl-decl-ret-record [(d i64)] (-> i64) (.ret-record (jsl-decl-signature d)))
+(defn jsl-decl-lowered-nresults [(d i64)] (-> i64)
+  (.lowered-nresults (jsl-decl-signature d)))
+(defn jsl-decl-lowered-param-type [(d i64) (slot i64)] (-> i64)
+  (let [signature (jsl-decl-signature d)]
+    (if (or (< slot 0) (>= slot (.lowered-nparams signature)))
+        (do (panic-corrupt "jsl: lowered parameter slot is outside its canonical vector") TY-NO-ID)
+        (al-get [i64] (.signaturetypes (jsl)) (+ (.lowered-params-off signature) slot)))))
+(defn jsl-decl-lowered-result-type [(d i64) (slot i64)] (-> i64)
+  (let [signature (jsl-decl-signature d)]
+    (if (or (< slot 0) (>= slot (.lowered-nresults signature)))
+        (do (panic-corrupt "jsl: lowered result slot is outside its canonical vector") TY-NO-ID)
+        (al-get [i64] (.signaturetypes (jsl)) (+ (.lowered-results-off signature) slot)))))
+
+(defn jsl-record-count [] (-> i64) (al-len [JslRecordDecl] (.records (jsl))))
+(defn jsl-record-p [(i i64)] (-> (ptr JslRecordDecl))
+  (al-elem [JslRecordDecl] (field (jsl) records) i))
+(defn jsl-record-name [(i i64)] (-> (slice u8)) (.name (jsl-record-p i)))
+(defn jsl-record-nfields [(i i64)] (-> i64) (.nfields (jsl-record-p i)))
+(defn jsl-record-field-p [(r i64) (i i64)] (-> (ptr JslRecordField))
+  (al-elem [JslRecordField] (field (jsl) recordfields)
+           (+ (.fields-off (jsl-record-p r)) i)))
+(defn jsl-record-field-name [(r i64) (i i64)] (-> (slice u8))
+  (.name (jsl-record-field-p r i)))
+(defn jsl-record-field-ty [(r i64) (i i64)] (-> i64) (.ty (jsl-record-field-p r i)))
+(defn jsl-record-field-record [(r i64) (i i64)] (-> i64)
+  (.record (jsl-record-field-p r i)))
+(defn jsl-record-field-flat-off [(r i64) (i i64)] (-> i64)
+  (.flat-off (jsl-record-field-p r i)))
+(defn jsl-record-field-flat-width [(r i64) (i i64)] (-> i64)
+  (.flat-width (jsl-record-field-p r i)))
+(defn jsl-record-flat-width [(r i64)] (-> i64)
+  (.flat-width (jsl-record-p r)))
+(defn jsl-record-flat-field-ty [(r i64) (flat-index i64)] (-> i64)
+  (if (or (< flat-index 0) (>= flat-index (jsl-record-flat-width r)))
+      TY-NO-ID
+      (al-get [i64] (.recordflattypes (jsl))
+              (+ (.flat-off (jsl-record-p r)) flat-index))))
+(defn jsl-signature-build! [(params-off i64) (nparams i64) (expected-lowered-nparams i64)
+                            (ret i64) (ret-record i64)] (-> JslSignature)
+  (let [(mut signature) (zeroed JslSignature)
+        param-types-off (al-len [i64] (.signaturetypes (jsl)))
+        (mut parameter) 0]
+    (loop (if (>= (load parameter) nparams) (break)
+              (let [p (al-elem [JslParam] (field (jsl) params)
+                               (+ params-off (load parameter)))
+                    (mut slot) 0]
+                (loop (if (>= (load slot) (.lowered-width p)) (break)
+                          (do (al-push! [i64] (field (jsl) signaturetypes)
+                                        (if (>= (.record p) 0)
+                                            (jsl-record-flat-field-ty (.record p) (load slot))
+                                            (.ty p)))
+                              (set! slot (+ (load slot) 1)))))
+                (set! parameter (+ (load parameter) 1)))))
+    (let [lowered-nparams (- (al-len [i64] (.signaturetypes (jsl))) param-types-off)
+          results-off (al-len [i64] (.signaturetypes (jsl)))
+          nresults (if (>= ret-record 0) (jsl-record-flat-width ret-record) 1)
+          (mut result) 0]
+      (if (!= lowered-nparams expected-lowered-nparams)
+          (panic-corrupt "jsl: checked parameter ranges disagree with canonical signature") 0)
+      (loop (if (>= (load result) nresults) (break)
+                (do (al-push! [i64] (field (jsl) signaturetypes)
+                              (if (>= ret-record 0)
+                                  (jsl-record-flat-field-ty ret-record (load result))
+                                  (if (= ret TY-NO-ID) (t-dyn) ret)))
+                    (set! result (+ (load result) 1)))))
+      (set! (.params-off signature) params-off)
+      (set! (.nparams signature) nparams)
+      (set! (.ret signature) ret)
+      (set! (.ret-record signature) ret-record)
+      (set! (.lowered-params-off signature) param-types-off)
+      (set! (.lowered-nparams signature) lowered-nparams)
+      (set! (.lowered-results-off signature) results-off)
+      (set! (.lowered-nresults signature) nresults)
+      (load signature))))
+(defn jsl-signature-valid? [(d i64)] (-> bool)
+  (let [signature (jsl-decl-signature d)
+        type-count (al-len [i64] (.signaturetypes (jsl)))
+        params-end (+ (.lowered-params-off signature) (.lowered-nparams signature))
+        results-end (+ (.lowered-results-off signature) (.lowered-nresults signature))
+        expected-results (if (>= (.ret-record signature) 0)
+                             (jsl-record-flat-width (.ret-record signature)) 1)
+        (mut valid)
+          (and (>= (.params-off signature) 0)
+               (and (>= (.nparams signature) 0)
+                    (and (>= (.lowered-params-off signature) 0)
+                         (and (<= params-end type-count)
+                              (and (= (.lowered-results-off signature) params-end)
+                                   (and (= (.lowered-nresults signature) expected-results)
+                                        (<= results-end type-count)))))))
+        (mut parameter) 0
+        (mut flat) 0]
+    (loop (if (or (= (load valid) false) (>= (load parameter) (.nparams signature))) (break)
+              (let [p (al-elem [JslParam] (field (jsl) params)
+                               (+ (.params-off signature) (load parameter)))
+                    (mut slot) 0]
+                (if (!= (.lowered-off p) (load flat)) (set! valid false) 0)
+                (loop (if (or (= (load valid) false) (>= (load slot) (.lowered-width p)))
+                          (break)
+                          (let [expected (if (>= (.record p) 0)
+                                             (jsl-record-flat-field-ty (.record p) (load slot))
+                                             (.ty p))]
+                            (if (!= (al-get [i64] (.signaturetypes (jsl))
+                                           (+ (.lowered-params-off signature) (load flat)))
+                                    expected)
+                                (set! valid false) 0)
+                            (set! flat (+ (load flat) 1))
+                            (set! slot (+ (load slot) 1)))))
+                (set! parameter (+ (load parameter) 1)))))
+    (if (!= (load flat) (.lowered-nparams signature)) (set! valid false) 0)
+    (let [(mut result) 0]
+      (loop (if (or (= (load valid) false) (>= (load result) expected-results)) (break)
+                (let [expected (if (>= (.ret-record signature) 0)
+                                   (jsl-record-flat-field-ty (.ret-record signature) (load result))
+                                   (if (= (.ret signature) TY-NO-ID) (t-dyn) (.ret signature)))]
+                  (if (!= (al-get [i64] (.signaturetypes (jsl))
+                                 (+ (.lowered-results-off signature) (load result)))
+                          expected)
+                      (set! valid false) 0)
+                  (set! result (+ (load result) 1))))))
+    (load valid)))
+(defn jsl-record-find [(name (slice u8))] (-> i64)
+  (let [(mut i) 0 (mut found) -1]
+    (loop (if (or (>= (load i) (jsl-record-count)) (>= (load found) 0)) (break)
+              (do (if (= name (jsl-record-name (load i))) (set! found (load i)) 0)
+                  (set! i (+ (load i) 1)))))
+    (load found)))
+(defn jsl-record-field-find [(r i64) (name (slice u8))] (-> i64)
+  (let [(mut i) 0 (mut found) -1]
+    (loop (if (or (>= (load i) (jsl-record-nfields r)) (>= (load found) 0)) (break)
+              (do (if (= name (jsl-record-field-name r (load i))) (set! found (load i)) 0)
+                  (set! i (+ (load i) 1)))))
+    (load found)))
+(defn jsl-decl-rest? [(d i64)] (-> bool)
+  (and (> (jsl-decl-nparams d) 0)
+       (jsl-param-rest? d (- (jsl-decl-nparams d) 1))))
 (defn jsl-capture-name [(d i64) (k i64)] (-> (slice u8))
   (al-get (.captures (jsl)) (+ (.captures-off (jsl-decl-p d)) k)))
 (defn jsl-capture-index [(d i64) (name (slice u8))] (-> i64)
@@ -1100,6 +1330,15 @@
     (if (rd/sexp-sym? x) (ty-try-parse (rd/sexp-sym x))
       TY-NO-ID)))
 
+(defn jsl-record-type-of [(x (ptr rd/Sexp))] (-> i64)
+  (if (and (rd/sexp-list? x)
+           (and (= (rd/sexp-count x) 2)
+                (and (rd/sexp-sym? (rd/sexp-nth x 0))
+                     (= (rd/sexp-sym (rd/sexp-nth x 0)) "record"))))
+      (let [name (rd/sexp-nth x 1)]
+        (if (rd/sexp-sym? name) (jsl-record-find (rd/sexp-sym name)) -1))
+      -1))
+
 ;; The lattice constant a bare literal symbol denotes, or TY-NO-ID when it is not one. These four
 ;; are the only symbols that are values rather than references, which is what makes an unbound
 ;; name detectable at all.
@@ -1115,15 +1354,40 @@
 ; ============================================================================
 (defn jsl-scope-depth [] (-> i64) (al-len [(slice u8)] (.binds (jsl))))
 
-(defn jsl-scope-push! [(name (slice u8))] (-> i64)
+(defn jsl-scope-push-value! [(name (slice u8)) (record i64) (list i64)] (-> i64)
+  (al-push! [i64] (field (jsl) bindlists) list)
+  (al-push! [i64] (field (jsl) bindrecords) record)
   (al-push! [(slice u8)] (field (jsl) binds) name))
+(defn jsl-scope-push-record! [(name (slice u8)) (record i64)] (-> i64)
+  (jsl-scope-push-value! name record -1))
+(defn jsl-scope-push! [(name (slice u8))] (-> i64) (jsl-scope-push-record! name -1))
 
 ;; Pop back to a remembered depth. `let` is sequential, so a binding is visible to the bindings
 ;; after it and to the body, and to nothing outside.
 (defn jsl-scope-drop! [(depth i64)] (-> i64)
   (loop (if (<= (jsl-scope-depth) depth) (break)
           (do (al-pop! [(slice u8)] (field (jsl) binds)) 0)))
+  (loop (if (<= (al-len [i64] (.bindrecords (jsl))) depth) (break)
+          (do (al-pop! [i64] (field (jsl) bindrecords)) 0)))
+  (loop (if (<= (al-len [i64] (.bindlists (jsl))) depth) (break)
+          (do (al-pop! [i64] (field (jsl) bindlists)) 0)))
   0)
+
+(defn jsl-scope-record [(name (slice u8))] (-> i64)
+  (let [(mut i) (jsl-scope-depth) (mut found) -2]
+    (loop (if (or (<= (load i) 0) (!= (load found) -2)) (break)
+              (do (set! i (- (load i) 1))
+                  (if (= name (al-get (.binds (jsl)) (load i)))
+                      (set! found (al-get (.bindrecords (jsl)) (load i))) 0))))
+    (if (= (load found) -2) -1 (load found))))
+
+(defn jsl-scope-list [(name (slice u8))] (-> i64)
+  (let [(mut i) (jsl-scope-depth) (mut found) -2]
+    (loop (if (or (<= (load i) 0) (!= (load found) -2)) (break)
+              (do (set! i (- (load i) 1))
+                  (if (= name (al-get (.binds (jsl)) (load i)))
+                      (set! found (al-get (.bindlists (jsl)) (load i))) 0))))
+    (if (= (load found) -2) -1 (load found))))
 
 (defn jsl-scope-has? [(name (slice u8))] (-> bool)
   (let [n (jsl-scope-depth) (mut i) 0 (mut found) false]
@@ -1152,6 +1416,20 @@
                 (set! i (+ (load i) 1)))))
     (load err)))
 
+(defn jsl-check-scalar-args [(x (ptr rd/Sexp)) (d i64) (from i64)
+                             (where (slice u8))] (-> i64)
+  (let [err (jsl-check-args x d from)]
+    (if (!= err JSL-OK) err
+      (let [(mut i) from (mut result) JSL-OK]
+        (loop (if (or (>= (load i) (rd/sexp-count x)) (!= (load result) JSL-OK)) (break)
+                (do
+                  (if (>= (jsl-expr-record (rd/sexp-nth x (load i)) d) 0)
+                      (set! result (jsl-fail! JSL-ERR-RECORD-ESCAPE where)) 0)
+                  (if (>= (jsl-expr-record-list (rd/sexp-nth x (load i)) d) 0)
+                      (set! result (jsl-fail! JSL-ERR-RECORD-ESCAPE where)) 0)
+                  (set! i (+ (load i) 1)))))
+        (load result)))))
+
 (defn jsl-check-let [(x (ptr rd/Sexp)) (d i64)] (-> i64)
   (block :done
     (if (< (rd/sexp-count x) 3)
@@ -1174,7 +1452,10 @@
                               (do
                                 (store! err (jsl-check-expr (rd/sexp-nth b 1) d))
                                 (if (= (load err) JSL-OK)
-                                    (jsl-scope-push! (rd/sexp-sym (rd/sexp-nth b 0)))
+                                    (jsl-scope-push-value!
+                                      (rd/sexp-sym (rd/sexp-nth b 0))
+                                      (jsl-expr-record (rd/sexp-nth b 1) d)
+                                      (jsl-expr-record-list (rd/sexp-nth b 1) d))
                                     0)
                                 0))))
                     (store! i (+ (load i) 1)))))
@@ -1219,6 +1500,11 @@
             owa (jsl-otherwise-at x)
             n (rd/sexp-count x)
             nargs (if (>= owa 0) (- owa 1) (- n 1))]
+        ;; Macro expansion stores positional arguments in fixed-size compiler scratch arrays.
+        ;; Rest parameters make the source arity variadic, but they do not relax that compiler
+        ;; representation limit. Refuse before either checking or lowering can index past it.
+        (if (> nargs JSL-MAX-PARAMS)
+            (return-from :done (jsl-fail! JSL-ERR-TOO-MANY-PARAMS name)) 0)
         ; `:otherwise` must be last-but-one and carry exactly one handler expression.
         (if (and (>= owa 0) (!= owa (- n 2)))
             (return-from :done (jsl-fail! JSL-ERR-UNEXPECTED-OTHERWISE name)) 0)
@@ -1233,8 +1519,10 @@
               (if (< callee 0) (return-from :done (jsl-fail! JSL-ERR-UNKNOWN-CALL name)) 0)
               ; The heap argument is supplied by the lowering, never written in the source, so the
               ; DECLARED parameter count is what a call site is checked against.
-              (if (!= nargs (jsl-decl-nparams callee))
-                  (return-from :done (jsl-fail! JSL-ERR-ARITY name)) 0)
+              (let [declared (jsl-decl-nparams callee)
+                    fixed (- declared (if (jsl-decl-rest? callee) 1 0))]
+                (if (if (jsl-decl-rest? callee) (< nargs fixed) (!= nargs declared))
+                    (return-from :done (jsl-fail! JSL-ERR-ARITY name)) 0))
               ; A LABEL MUST HAVE SOMEWHERE TO GO, and only a label may be given one. Both
               ; directions are refused: a labelled macro with no handler would lower a `goto` into
               ; a control edge with no destination, and a handler on an unlabelled callee is a
@@ -1246,10 +1534,21 @@
         ; Positional arguments, then the handler expression when there is one. The handler is
         ; checked in the CALLER's scope, because that is where it is written and where it runs.
         (let [(mut err) JSL-OK (mut k) 1]
-          (loop (if (or (> (load k) nargs) (!= (load err) JSL-OK)) (break)
-                  (do (store! err (jsl-check-expr (rd/sexp-nth x (load k)) d))
-                      (store! k (+ (load k) 1))
-                      0)))
+          (loop
+            (if (or (> (load k) nargs) (!= (load err) JSL-OK)) (break)
+              (let [arg (rd/sexp-nth x (load k))]
+                (store! err (jsl-check-expr arg d))
+                (if (= (load err) JSL-OK)
+                    (let [actual (jsl-expr-record arg d)
+                          callee (if (jsl-prim-name? name) -1 (jsl-find name))
+                          expected (if (and (>= callee 0)
+                                            (< (- (load k) 1) (jsl-decl-nparams callee)))
+                                       (jsl-param-record callee (- (load k) 1)) -1)]
+                      (if (!= actual expected)
+                          (store! err (jsl-fail! JSL-ERR-RECORD-ESCAPE name)) 0)) 0)
+                (if (and (= (load err) JSL-OK) (>= (jsl-expr-record-list arg d) 0))
+                    (store! err (jsl-fail! JSL-ERR-RECORD-ESCAPE name)) 0)
+                (store! k (+ (load k) 1)))))
           (if (and (= (load err) JSL-OK) (>= owa 0))
               (store! err (jsl-check-expr (rd/sexp-nth x (+ owa 1)) d)) 0)
           (load err))))))
@@ -1264,7 +1563,7 @@
       (jsl-fail! JSL-ERR-ARITY "call")
       (if (> (- (rd/sexp-count x) 2) JSL-MAX-PARAMS)
           (jsl-fail! JSL-ERR-TOO-MANY-PARAMS "call")
-          (jsl-check-args x d 1))))
+          (jsl-check-scalar-args x d 1 "call"))))
 
 ;; `(call-with-receiver fn receiver arg ...)` is the ordinary ECMAScript [[Call]] shape. Keeping
 ;; it distinct from `call` makes the receiver ABI explicit in the source and lets the verifier
@@ -1274,7 +1573,22 @@
       (jsl-fail! JSL-ERR-ARITY "call-with-receiver")
       (if (> (- (rd/sexp-count x) 3) JSL-MAX-PARAMS)
           (jsl-fail! JSL-ERR-TOO-MANY-PARAMS "call-with-receiver")
-          (jsl-check-args x d 1))))
+          (jsl-check-scalar-args x d 1 "call-with-receiver"))))
+
+;; Spread a compile-away rest binding into an ordinary [[Call]]. The binding must be the final
+;; `(rest T)` parameter of this macro; accepting an arbitrary expression here would silently turn
+;; a JavaScript Array into a specification List, which are observably different abstractions.
+(defn jsl-check-js-call-with-rest [(x (ptr rd/Sexp)) (d i64)] (-> i64)
+  (if (!= (rd/sexp-count x) 4)
+      (jsl-fail! JSL-ERR-ARITY "call-dynamic-with-receiver-rest")
+      (let [rest-form (rd/sexp-nth x 3)
+            index (if (rd/sexp-sym? rest-form)
+                      (jsl-param-index d (rd/sexp-sym rest-form)) -1)]
+        (if (or (< index 0) (not (jsl-param-rest? d index)))
+            (jsl-fail! JSL-ERR-BAD-REST (jsl-decl-name d))
+            (let [first (jsl-check-expr (rd/sexp-nth x 1) d)]
+              (if (!= first JSL-OK) first
+                  (jsl-check-expr (rd/sexp-nth x 2) d)))))))
 
 ;; `(loop [(name init [type]) ...] BODY...)`. The body is an expression: if it evaluates to `(recur ...)`
 ;; the loop iterates with those values, and otherwise its value is the loop's value. That is a
@@ -1285,6 +1599,12 @@
 (defn jsl-loop-arity [] (-> i64)
   (if (= (jsl-loop-depth) 0) -1
       (al-get (.arities (jsl)) (- (jsl-loop-depth) 1))))
+(defn jsl-loop-record-base [] (-> i64)
+  (al-get (.looprecordbases (jsl)) (- (jsl-loop-depth) 1)))
+(defn jsl-loop-record [(i i64)] (-> i64)
+  (al-get (.looprecords (jsl)) (+ (jsl-loop-record-base) i)))
+(defn jsl-loop-list [(i i64)] (-> i64)
+  (al-get (.looplists (jsl)) (+ (jsl-loop-record-base) i)))
 
 (defn jsl-check-loop [(x (ptr rd/Sexp)) (d i64)] (-> i64)
   (block :done
@@ -1307,23 +1627,50 @@
                           (store! err (jsl-fail! JSL-ERR-BAD-LOOP (jsl-decl-name d)))
                         (if (not (rd/sexp-sym? (rd/sexp-nth b 0)))
                             (store! err (jsl-fail! JSL-ERR-BAD-LOOP (jsl-decl-name d)))
-                          (if (and (= (rd/sexp-count b) 3)
-                                   (= (jsl-type-of (rd/sexp-nth b 2)) TY-NO-ID))
-                              (store! err (jsl-fail! JSL-ERR-BAD-TYPE
-                                                     (rd/sexp-sym (rd/sexp-nth b 0))))
-                              (store! err (jsl-check-expr (rd/sexp-nth b 1) d))))))
+                          (let [init (rd/sexp-nth b 1)
+                                inferred (jsl-expr-record init d)
+                                annotated (if (= (rd/sexp-count b) 3)
+                                              (jsl-record-type-of (rd/sexp-nth b 2)) -1)
+                                scalar-type (if (= (rd/sexp-count b) 3)
+                                              (jsl-type-of (rd/sexp-nth b 2)) (t-dyn))]
+                            (if (and (= (rd/sexp-count b) 3)
+                                     (and (= scalar-type TY-NO-ID) (< annotated 0)))
+                                (store! err (jsl-fail! JSL-ERR-BAD-TYPE
+                                                       (rd/sexp-sym (rd/sexp-nth b 0))))
+                              (if (and (= (rd/sexp-count b) 3)
+                                       (!= inferred annotated))
+                                  (store! err (jsl-fail! JSL-ERR-BAD-RECORD
+                                                         (rd/sexp-sym (rd/sexp-nth b 0))))
+                                  (store! err (jsl-check-expr init d))))))))
                     (store! i (+ (load i) 1))
                     0)))
           ; Then every binding is in scope for the body, all at once.
           (store! i 0)
           (loop (if (or (>= (load i) nb) (!= (load err) JSL-OK)) (break)
-                  (do (jsl-scope-push! (rd/sexp-sym (rd/sexp-nth (rd/sexp-nth binds (load i)) 0)))
+                  (let [binding (rd/sexp-nth binds (load i))]
+                    (let [init (rd/sexp-nth binding 1)]
+                      (jsl-scope-push-value! (rd/sexp-sym (rd/sexp-nth binding 0))
+                                             (jsl-expr-record init d)
+                                             (jsl-expr-record-list init d)))
                       (store! i (+ (load i) 1))
                       0)))
           (if (= (load err) JSL-OK)
-              (do (al-push! [i64] (field (jsl) arities) nb)
+              (do
+                  (let [record-base (al-len [i64] (.looprecords (jsl))) (mut k) 0]
+                    (al-push! [i64] (field (jsl) looprecordbases) record-base)
+                    (loop (if (>= (load k) nb) (break)
+                              (do (al-push! [i64] (field (jsl) looprecords)
+                                            (al-get (.bindrecords (jsl)) (+ depth (load k))))
+                                  (al-push! [i64] (field (jsl) looplists)
+                                            (al-get (.bindlists (jsl)) (+ depth (load k))))
+                                  (set! k (+ (load k) 1)))))
+                    (al-push! [i64] (field (jsl) arities) nb)
                   (store! err (jsl-check-args x d 2))
                   (al-pop! [i64] (field (jsl) arities))
+                    (al-pop! [i64] (field (jsl) looprecordbases))
+                    (loop (if (<= (al-len [i64] (.looprecords (jsl))) record-base) (break)
+                              (do (al-pop! [i64] (field (jsl) looprecords))
+                                  (al-pop! [i64] (field (jsl) looplists)) 0))))
                   0)
               0)
           (jsl-scope-drop! depth)
@@ -1335,12 +1682,266 @@
         (return-from :done (jsl-fail! JSL-ERR-RECUR-OUTSIDE-LOOP (jsl-decl-name d))) 0)
     (if (!= (- (rd/sexp-count x) 1) (jsl-loop-arity))
         (return-from :done (jsl-fail! JSL-ERR-BAD-RECUR (jsl-decl-name d))) 0)
-    (jsl-check-args x d 1)))
+    (let [checked (jsl-check-args x d 1)]
+      (if (!= checked JSL-OK) checked
+        (let [(mut i) 0 (mut err) JSL-OK]
+          (loop (if (or (>= (load i) (jsl-loop-arity)) (!= (load err) JSL-OK)) (break)
+                  (do
+                    (if (!= (jsl-expr-record (rd/sexp-nth x (+ (load i) 1)) d)
+                            (jsl-loop-record (load i)))
+                        (set! err (jsl-fail! JSL-ERR-BAD-RECORD "recur")) 0)
+                    (if (!= (jsl-expr-record-list (rd/sexp-nth x (+ (load i) 1)) d)
+                            (jsl-loop-list (load i)))
+                        (set! err (jsl-fail! JSL-ERR-BAD-RECORD-LIST "recur")) 0)
+                    (set! i (+ (load i) 1)))))
+          (load err))))))
 
 (defn jsl-check-if [(x (ptr rd/Sexp)) (d i64)] (-> i64)
   (if (!= (rd/sexp-count x) 4)
       (jsl-fail! JSL-ERR-BAD-IF (jsl-decl-name d))
-      (jsl-check-args x d 1)))
+      (let [err (jsl-check-args x d 1)]
+        (if (!= err JSL-OK) err
+          (let [a (jsl-expr-record (rd/sexp-nth x 2) d)
+                b (jsl-expr-record (rd/sexp-nth x 3) d)
+                la (jsl-expr-record-list (rd/sexp-nth x 2) d)
+                lb (jsl-expr-record-list (rd/sexp-nth x 3) d)
+                ad (jsl-expr-diverges? (rd/sexp-nth x 2))
+                bd (jsl-expr-diverges? (rd/sexp-nth x 3))]
+            (if (and (not ad) (and (not bd) (or (!= a b) (!= la lb))))
+                (jsl-fail! JSL-ERR-BAD-RECORD "if") JSL-OK))))))
+
+(defn jsl-expr-diverges? [(x (ptr rd/Sexp))] (-> bool)
+  (if (or (not (rd/sexp-list? x)) (= (rd/sexp-count x) 0)) false
+    (let [head (rd/sexp-nth x 0)]
+      (if (not (rd/sexp-sym? head)) false
+        (let [name (rd/sexp-sym head)]
+          (if (or (= name "recur") (or (= name "goto") (= name "%Throw"))) true
+            (if (and (= name "if") (= (rd/sexp-count x) 4))
+                (and (jsl-expr-diverges? (rd/sexp-nth x 2))
+                     (jsl-expr-diverges? (rd/sexp-nth x 3)))
+                (let [callee (jsl-find name)]
+                  ;; One expansion level recognizes canonical Throw* helpers without walking a
+                  ;; malformed recursive macro before the dedicated cycle checker runs.
+                  (if (and (>= callee 0) (jsl-macro? callee))
+                      (let [body (jsl-decl-body callee)]
+                        (and (rd/sexp-list? body)
+                             (and (> (rd/sexp-count body) 0)
+                                  (and (rd/sexp-sym? (rd/sexp-nth body 0))
+                                       (= (rd/sexp-sym (rd/sexp-nth body 0)) "%Throw")))))
+                      false)))))))))
+
+;; Static record identity. `-1` means an ordinary SSA value. The checker uses this to prevent a
+;; compiler-only bundle from reaching a primitive or callable ABI and to require both arms of a
+;; merge to carry the same schema.
+(defn jsl-expr-record [(x (ptr rd/Sexp)) (d i64)] (-> i64)
+  (if (rd/sexp-sym? x)
+      (let [name (rd/sexp-sym x) local (jsl-scope-record name)]
+        (if (jsl-scope-has? name) local
+          (let [p (jsl-param-index d name)]
+            (if (>= p 0) (jsl-param-record d p) -1))))
+    (if (not (rd/sexp-list? x)) -1
+      (if (= (rd/sexp-count x) 0) -1
+        (let [head (rd/sexp-nth x 0)]
+          (if (not (rd/sexp-sym? head)) -1
+            (let [name (rd/sexp-sym head)]
+              (if (= name "record-new")
+                  (let [schema (rd/sexp-nth x 1)]
+                    (if (rd/sexp-sym? schema) (jsl-record-find (rd/sexp-sym schema)) -1))
+                (if (= name "record-with") (jsl-expr-record (rd/sexp-nth x 1) d)
+                  (if (= name "record-list-load")
+                      (jsl-expr-record-list (rd/sexp-nth x 1) d)
+                  (if (= name "record-get")
+                      (let [value (rd/sexp-nth x 1) field (rd/sexp-nth x 2)
+                            schema (jsl-expr-record value d)]
+                        (if (and (>= schema 0) (rd/sexp-sym? field))
+                            (let [index (jsl-record-field-find schema (rd/sexp-sym field))]
+                              (if (>= index 0) (jsl-record-field-record schema index) -1)) -1))
+                  (if (= name "if")
+                      (if (jsl-expr-diverges? (rd/sexp-nth x 2))
+                          (jsl-expr-record (rd/sexp-nth x 3) d)
+                          (jsl-expr-record (rd/sexp-nth x 2) d))
+                    (if (= name "let") (jsl-expr-record-let x d)
+                      (if (= name "loop") (jsl-expr-record-loop x d)
+                        (let [callee (jsl-find name)]
+                          (if (>= callee 0) (jsl-decl-ret-record callee) -1))))))))))))))))
+
+(defn jsl-expr-record-list [(x (ptr rd/Sexp)) (d i64)] (-> i64)
+  (if (rd/sexp-sym? x)
+      (let [name (rd/sexp-sym x)]
+        (if (jsl-scope-has? name) (jsl-scope-list name) -1))
+    (if (or (not (rd/sexp-list? x)) (= (rd/sexp-count x) 0)) -1
+      (let [head (rd/sexp-nth x 0)]
+        (if (not (rd/sexp-sym? head)) -1
+          (let [name (rd/sexp-sym head)]
+            (if (= name "record-list-new")
+                (let [schema (rd/sexp-nth x 1)]
+                  (if (rd/sexp-sym? schema) (jsl-record-find (rd/sexp-sym schema)) -1))
+              (if (= name "record-list-store")
+                  (jsl-expr-record-list (rd/sexp-nth x 1) d)
+                (if (= name "if")
+                    (if (jsl-expr-diverges? (rd/sexp-nth x 2))
+                        (jsl-expr-record-list (rd/sexp-nth x 3) d)
+                        (jsl-expr-record-list (rd/sexp-nth x 2) d))
+                  (if (= name "let") (jsl-expr-record-list-let x d) -1))))))))))
+
+(defn jsl-expr-record-list-let [(x (ptr rd/Sexp)) (d i64)] (-> i64)
+  (let [bindings (rd/sexp-nth x 1) depth (jsl-scope-depth) (mut i) 0]
+    (loop (if (>= (load i) (rd/sexp-count bindings)) (break)
+              (let [binding (rd/sexp-nth bindings (load i)) value (rd/sexp-nth binding 1)]
+                (jsl-scope-push-value! (rd/sexp-sym (rd/sexp-nth binding 0))
+                                       (jsl-expr-record value d)
+                                       (jsl-expr-record-list value d))
+                (set! i (+ (load i) 1)))))
+    (let [(mut result) -1 (mut body) 2]
+      (loop (if (>= (load body) (rd/sexp-count x)) (break)
+                (do (set! result (jsl-expr-record-list (rd/sexp-nth x (load body)) d))
+                    (set! body (+ (load body) 1)))))
+      (jsl-scope-drop! depth)
+      (load result))))
+
+(defn jsl-expr-record-let [(x (ptr rd/Sexp)) (d i64)] (-> i64)
+  (let [bindings (rd/sexp-nth x 1)
+        depth (jsl-scope-depth)
+        (mut i) 0]
+    (loop (if (>= (load i) (rd/sexp-count bindings)) (break)
+              (let [binding (rd/sexp-nth bindings (load i))]
+                (let [value (rd/sexp-nth binding 1)]
+                  (jsl-scope-push-value! (rd/sexp-sym (rd/sexp-nth binding 0))
+                                         (jsl-expr-record value d)
+                                         (jsl-expr-record-list value d)))
+                (set! i (+ (load i) 1)))))
+    (let [(mut result) -1 (mut body) 2]
+      (loop (if (>= (load body) (rd/sexp-count x)) (break)
+                (do (set! result (jsl-expr-record (rd/sexp-nth x (load body)) d))
+                    (set! body (+ (load body) 1)))))
+      (jsl-scope-drop! depth)
+      (load result))))
+
+(defn jsl-expr-record-loop [(x (ptr rd/Sexp)) (d i64)] (-> i64)
+  (let [bindings (rd/sexp-nth x 1)
+        depth (jsl-scope-depth)
+        (mut i) 0]
+    (loop (if (>= (load i) (rd/sexp-count bindings)) (break)
+              (let [binding (rd/sexp-nth bindings (load i))]
+                (jsl-scope-push-record! (rd/sexp-sym (rd/sexp-nth binding 0))
+                                        (jsl-expr-record (rd/sexp-nth binding 1) d))
+                (set! i (+ (load i) 1)))))
+    (let [(mut result) -1 (mut body) 2]
+      (loop (if (>= (load body) (rd/sexp-count x)) (break)
+                (do (set! result (jsl-expr-record (rd/sexp-nth x (load body)) d))
+                    (set! body (+ (load body) 1)))))
+      (jsl-scope-drop! depth)
+      (load result))))
+
+(defn jsl-check-record-form [(x (ptr rd/Sexp)) (d i64) (name (slice u8))] (-> i64)
+  (block :done
+    (if (= name "record-new")
+        (do
+          (if (!= (rd/sexp-count x) 3)
+              (return-from :done (jsl-fail! JSL-ERR-BAD-RECORD name)) 0)
+          (let [schemaform (rd/sexp-nth x 1) fields (rd/sexp-nth x 2)]
+            (if (not (rd/sexp-sym? schemaform))
+                (return-from :done (jsl-fail! JSL-ERR-UNKNOWN-RECORD name)) 0)
+            (let [schema (jsl-record-find (rd/sexp-sym schemaform))]
+              (if (< schema 0)
+                  (return-from :done (jsl-fail! JSL-ERR-UNKNOWN-RECORD
+                                                 (rd/sexp-sym schemaform))) 0)
+              (if (or (not (rd/sexp-vec? fields))
+                      (!= (rd/sexp-count fields) (jsl-record-nfields schema)))
+                  (return-from :done (jsl-fail! JSL-ERR-BAD-RECORD-FIELD
+                                                 (jsl-record-name schema))) 0)
+              (let [(mut i) 0 (mut seen) 0 (mut err) JSL-OK]
+                (loop (if (or (>= (load i) (rd/sexp-count fields))
+                              (!= (load err) JSL-OK)) (break)
+                        (let [pair (rd/sexp-nth fields (load i))]
+                          (if (or (not (rd/sexp-list? pair)) (!= (rd/sexp-count pair) 2))
+                              (store! err (jsl-fail! JSL-ERR-BAD-RECORD-FIELD
+                                                     (jsl-record-name schema)))
+                            (let [field (rd/sexp-nth pair 0)]
+                              (if (not (rd/sexp-sym? field))
+                                  (store! err (jsl-fail! JSL-ERR-BAD-RECORD-FIELD
+                                                         (jsl-record-name schema)))
+                                (let [index (jsl-record-field-find schema (rd/sexp-sym field))]
+                                  (if (or (< index 0)
+                                          (!= (& (load seen) (<< 1 index)) 0))
+                                      (store! err (jsl-fail! JSL-ERR-BAD-RECORD-FIELD
+                                                             (rd/sexp-sym field)))
+                                    (do
+                                      (store! seen (| (load seen) (<< 1 index)))
+                                      (store! err (jsl-check-expr (rd/sexp-nth pair 1) d))
+                                      (if (and (= (load err) JSL-OK)
+                                               (!= (jsl-expr-record (rd/sexp-nth pair 1) d)
+                                                   (jsl-record-field-record schema index)))
+                                          (store! err (jsl-fail! JSL-ERR-RECORD-ESCAPE
+                                                                 (rd/sexp-sym field))) 0)))))))
+                          (store! i (+ (load i) 1)))))
+                (return-from :done (load err)))))) 0)
+    (if (= name "record-get")
+        (do
+          (if (!= (rd/sexp-count x) 3)
+              (return-from :done (jsl-fail! JSL-ERR-BAD-RECORD name)) 0)
+          (let [value (rd/sexp-nth x 1) field (rd/sexp-nth x 2)]
+            (let [err (jsl-check-expr value d)]
+              (if (!= err JSL-OK) (return-from :done err) 0))
+            (let [schema (jsl-expr-record value d)]
+              (if (or (< schema 0) (not (rd/sexp-sym? field)))
+                  (return-from :done (jsl-fail! JSL-ERR-BAD-RECORD name)) 0)
+              (if (< (jsl-record-field-find schema (rd/sexp-sym field)) 0)
+                  (return-from :done (jsl-fail! JSL-ERR-BAD-RECORD-FIELD
+                                                 (rd/sexp-sym field))) 0)))
+          (return-from :done JSL-OK)) 0)
+    ;; record-with: immutable update, preserving schema identity.
+    (if (!= (rd/sexp-count x) 4)
+        (return-from :done (jsl-fail! JSL-ERR-BAD-RECORD name)) 0)
+    (let [value (rd/sexp-nth x 1) field (rd/sexp-nth x 2)
+          err (jsl-check-expr value d)]
+      (if (!= err JSL-OK) (return-from :done err) 0)
+      (let [schema (jsl-expr-record value d)]
+        (if (or (< schema 0) (not (rd/sexp-sym? field)))
+            (return-from :done (jsl-fail! JSL-ERR-BAD-RECORD name)) 0)
+        (if (< (jsl-record-field-find schema (rd/sexp-sym field)) 0)
+            (return-from :done (jsl-fail! JSL-ERR-BAD-RECORD-FIELD (rd/sexp-sym field))) 0))
+      (let [replacement (rd/sexp-nth x 3)
+            checked (jsl-check-expr replacement d)]
+        (if (!= checked JSL-OK) checked
+          (let [schema (jsl-expr-record value d)
+                index (jsl-record-field-find schema (rd/sexp-sym field))]
+            (if (!= (jsl-expr-record replacement d)
+                    (jsl-record-field-record schema index))
+                (jsl-fail! JSL-ERR-RECORD-ESCAPE (rd/sexp-sym field)) JSL-OK)))))))
+
+(defn jsl-check-record-list-form [(x (ptr rd/Sexp)) (d i64) (name (slice u8))] (-> i64)
+  (block :done
+    (if (= name "record-list-new")
+        (do
+          (if (!= (rd/sexp-count x) 2)
+              (return-from :done (jsl-fail! JSL-ERR-BAD-RECORD-LIST name)) 0)
+          (let [schema (rd/sexp-nth x 1)]
+            (if (or (not (rd/sexp-sym? schema))
+                    (< (jsl-record-find (if (rd/sexp-sym? schema)
+                                           (rd/sexp-sym schema) "")) 0))
+                (return-from :done (jsl-fail! JSL-ERR-UNKNOWN-RECORD name)) 0))
+          (return-from :done JSL-OK)) 0)
+    (let [expected-count (if (= name "record-list-store") 4 3)]
+      (if (!= (rd/sexp-count x) expected-count)
+          (return-from :done (jsl-fail! JSL-ERR-BAD-RECORD-LIST name)) 0))
+    (let [list (rd/sexp-nth x 1) index (rd/sexp-nth x 2)
+          checked-list (jsl-check-expr list d)]
+      (if (!= checked-list JSL-OK) (return-from :done checked-list) 0)
+      (let [schema (jsl-expr-record-list list d)]
+        (if (< schema 0)
+            (return-from :done (jsl-fail! JSL-ERR-BAD-RECORD-LIST name)) 0)
+        (let [checked-index (jsl-check-expr index d)]
+          (if (!= checked-index JSL-OK) (return-from :done checked-index) 0)
+          (if (or (>= (jsl-expr-record index d) 0)
+                  (>= (jsl-expr-record-list index d) 0))
+              (return-from :done (jsl-fail! JSL-ERR-RECORD-ESCAPE name)) 0))
+        (if (= name "record-list-store")
+            (let [value (rd/sexp-nth x 3) checked (jsl-check-expr value d)]
+              (if (!= checked JSL-OK) (return-from :done checked) 0)
+              (if (!= (jsl-expr-record value d) schema)
+                  (return-from :done (jsl-fail! JSL-ERR-BAD-RECORD-LIST name)) 0)) 0))
+      JSL-OK)))
 
 ;; Designed in docs/JSL.md, not built. Refused BY NAME so that a `.jsl` file using one cannot
 ;; produce a graph, and so that the diagnostic says which form stopped it rather than "unknown".
@@ -1360,7 +1961,12 @@
           ; denotes, and only in a program that shadows.
           (if (!= (jsl-literal-ty s) TY-NO-ID) (return-from :done JSL-OK) 0)
           (if (jsl-scope-has? s) (return-from :done JSL-OK) 0)
-          (if (>= (jsl-param-index d s) 0) (return-from :done JSL-OK) 0)
+          (let [parameter (jsl-param-index d s)]
+            (if (>= parameter 0)
+                (if (jsl-param-rest? d parameter)
+                    (return-from :done (jsl-fail! JSL-ERR-BAD-REST s))
+                    (return-from :done JSL-OK))
+                0))
           (if (>= (jsl-capture-index d s) 0) (return-from :done JSL-OK) 0)
           (if (and (jsl-callable? d) (= s "this")) (return-from :done JSL-OK) 0)
           (return-from :done (jsl-fail! JSL-ERR-UNBOUND s)))
@@ -1377,11 +1983,19 @@
         (if (= name "goto") (return-from :done (jsl-check-goto x d)) 0)
         (if (= name "loop") (return-from :done (jsl-check-loop x d)) 0)
         (if (= name "recur") (return-from :done (jsl-check-recur x d)) 0)
+        (if (or (= name "record-new")
+                (or (= name "record-get") (= name "record-with")))
+            (return-from :done (jsl-check-record-form x d name)) 0)
+        (if (or (= name "record-list-new")
+                (or (= name "record-list-store") (= name "record-list-load")))
+            (return-from :done (jsl-check-record-list-form x d name)) 0)
         (if (= name "call") (return-from :done (jsl-check-js-call x d)) 0)
         (if (= name "call-with-receiver")
             (return-from :done (jsl-check-js-call-with-receiver x d)) 0)
         (if (= name "call-dynamic-with-receiver")
             (return-from :done (jsl-check-js-call-with-receiver x d)) 0)
+        (if (= name "call-dynamic-with-receiver-rest")
+            (return-from :done (jsl-check-js-call-with-rest x d)) 0)
         (if (= name "closure")
             (let [count (rd/sexp-count x)]
               (if (< count 2) (return-from :done (jsl-fail! JSL-ERR-ARITY name)) 0)
@@ -1539,7 +2153,8 @@
 
 ;; The same walk as `jsl-body-reads-memory?`, asking a narrower question: does this body contain a
 ;; JavaScript CALL form, or call a definition that does. `call`, `call-with-receiver` and
-;; `call-dynamic-with-receiver` are the three surface spellings; every other head is either a
+;; `call-dynamic-with-receiver` and its compile-away rest form are the callback spellings; every
+;; other head is either a
 ;; primitive or another definition, and a definition propagates the answer to its callers.
 (defn jsl-body-calls-back? [(x (ptr rd/Sexp))] (-> bool)
   (if (and (not (rd/sexp-list? x)) (not (rd/sexp-vec? x))) false
@@ -1547,7 +2162,9 @@
       (if (and (rd/sexp-list? x) (and (> n 0) (rd/sexp-sym? (rd/sexp-nth x 0))))
           (let [name (rd/sexp-sym (rd/sexp-nth x 0))]
             (if (or (= name "call")
-                    (or (= name "call-with-receiver") (= name "call-dynamic-with-receiver")))
+                    (or (= name "call-with-receiver")
+                        (or (= name "call-dynamic-with-receiver")
+                            (= name "call-dynamic-with-receiver-rest"))))
                 (set! found true)
               (if (jsl-prim-name? name)
                   0
@@ -1597,7 +2214,9 @@
             (if (= name "%Throw")
                 (set! found true)
                 (if (or (= name "call")
-                        (or (= name "call-with-receiver") (= name "call-dynamic-with-receiver")))
+                        (or (= name "call-with-receiver")
+                            (or (= name "call-dynamic-with-receiver")
+                                (= name "call-dynamic-with-receiver-rest"))))
                     ;; User callbacks may throw even when their concrete target is not statically
                     ;; visible to the library definition.
                     (set! found true)
@@ -1685,7 +2304,18 @@
               (break)
               (do
                 (al-clear! [(slice u8)] (field (jsl) binds))
+                (al-clear! [i64] (field (jsl) bindrecords))
+                (al-clear! [i64] (field (jsl) bindlists))
                 (set! err (jsl-check-expr (jsl-decl-body (load i)) (load i)))
+                (if (and (= (load err) JSL-OK)
+                         (!= (jsl-expr-record (jsl-decl-body (load i)) (load i))
+                             (jsl-decl-ret-record (load i))))
+                    (set! err (jsl-fail! JSL-ERR-RECORD-ESCAPE
+                                         (jsl-decl-name (load i)))) 0)
+                (if (and (= (load err) JSL-OK)
+                         (>= (jsl-expr-record-list (jsl-decl-body (load i)) (load i)) 0))
+                    (set! err (jsl-fail! JSL-ERR-RECORD-ESCAPE
+                                         (jsl-decl-name (load i)))) 0)
                 (set! i (+ (load i) 1)))))
     ; Cycles LAST: a body that does not resolve has no meaningful call graph, so reporting a
     ; recursion through an unknown name would name the wrong problem.
@@ -1712,7 +2342,8 @@
 ;; `:params [(name type) ...]`. A VECTOR of pairs. `coil.reader` distinguishes `KVec` from `KList`,
 ;; so the surface has one spelling and the parenthesised form is a named refusal rather than a
 ;; second accepted syntax.
-(defn jsl-read-params! [(x (ptr rd/Sexp)) (name (slice u8)) (out (ptr i64))] (-> i64)
+(defn jsl-read-params! [(x (ptr rd/Sexp)) (name (slice u8)) (kind i64)
+                        (out (ptr i64)) (lowered-out (ptr i64))] (-> i64)
   (jsl-at! x)
   (block :done
     ; A VECTOR, not a list. `coil.reader` distinguishes them, so `:params ((x dyn))` is refused
@@ -1720,7 +2351,7 @@
     (if (not (rd/sexp-vec? x)) (return-from :done (jsl-fail! JSL-ERR-BAD-PARAMS name)) 0)
     (let [n (rd/sexp-count x)]
       (if (> n JSL-MAX-PARAMS) (return-from :done (jsl-fail! JSL-ERR-TOO-MANY-PARAMS name)) 0)
-      (let [(mut i) 0 (mut err) JSL-OK]
+      (let [(mut i) 0 (mut lowered) 0 (mut err) JSL-OK]
         (loop (if (or (>= (load i) n) (!= (load err) JSL-OK))
                   (break)
                   (do
@@ -1729,17 +2360,42 @@
                           (store! err (jsl-fail! JSL-ERR-BAD-PARAMS name))
                           (if (not (rd/sexp-sym? (rd/sexp-nth pr 0)))
                               (store! err (jsl-fail! JSL-ERR-BAD-PARAMS name))
-                              (let [t (jsl-type-of (rd/sexp-nth pr 1))]
-                                (if (= t TY-NO-ID)
+                              (let [typeform (rd/sexp-nth pr 1)
+                                    rest (and (rd/sexp-list? typeform)
+                                              (and (= (rd/sexp-count typeform) 2)
+                                                   (and (rd/sexp-sym? (rd/sexp-nth typeform 0))
+                                                        (= (rd/sexp-sym (rd/sexp-nth typeform 0))
+                                                           "rest"))))
+                                    t (if rest (jsl-type-of (rd/sexp-nth typeform 1))
+                                          (jsl-type-of typeform))
+                                    record (if rest -1 (jsl-record-type-of typeform))]
+                                (if (and (= t TY-NO-ID) (< record 0))
                                     (store! err (jsl-fail! JSL-ERR-BAD-TYPE
                                                            (rd/sexp-sym (rd/sexp-nth pr 0))))
-                                    (let [(mut p) (zeroed JslParam)]
-                                      (store! (field p name) (rd/sexp-sym (rd/sexp-nth pr 0)))
-                                      (store! (field p ty) t)
-                                      (al-push! [JslParam] (field (jsl) params) (load p))
-                                      0))))))
+                                    (if (and (>= record 0) (= kind JSL-KIND-CALLABLE))
+                                        (store! err (jsl-fail! JSL-ERR-RECORD-ESCAPE name))
+                                    (if (and rest
+                                             (or (!= kind JSL-KIND-MACRO)
+                                                 (!= (load i) (- n 1))))
+                                        (store! err (jsl-fail! JSL-ERR-BAD-REST name))
+                                        (let [(mut p) (zeroed JslParam)]
+                                          (store! (field p name)
+                                                  (rd/sexp-sym (rd/sexp-nth pr 0)))
+                                          (store! (field p ty) t)
+                                          (store! (field p record) record)
+                                          (store! (field p rest) rest)
+                                          (store! (field p lowered-off) (load lowered))
+                                          (store! (field p lowered-width)
+                                                  (if (>= record 0)
+                                                      (jsl-record-flat-width record) 1))
+                                          (store! lowered
+                                                  (+ (load lowered)
+                                                     (load (field p lowered-width))))
+                                          (al-push! [JslParam] (field (jsl) params) (load p))
+                                          0))))))))
                     (store! i (+ (load i) 1)))))
         (store! out n)
+        (store! lowered-out (load lowered))
         (load err)))))
 
 (defn jsl-read-captures! [(x (ptr rd/Sexp)) (name (slice u8)) (out (ptr i64))] (-> i64)
@@ -1756,6 +2412,83 @@
       (store! out n)
       JSL-OK)))
 
+;; `(record Name [(field type) ...])` declares a compiler-only specification Record schema.
+;; It has no body and publishes no callable. Fields are positional only inside the compiler;
+;; source construction and access are always by name so schema edits cannot silently reorder data.
+(defn jsl-read-record! [(form (ptr rd/Sexp))] (-> i64)
+  (block :done
+    (if (!= (rd/sexp-count form) 3)
+        (return-from :done (jsl-fail! JSL-ERR-BAD-RECORD "record")) 0)
+    (let [nameform (rd/sexp-nth form 1) fields (rd/sexp-nth form 2)]
+      (if (not (rd/sexp-sym? nameform))
+          (return-from :done (jsl-fail! JSL-ERR-BAD-NAME "record")) 0)
+      (let [name (rd/sexp-sym nameform)]
+        (if (>= (jsl-record-find name) 0)
+            (return-from :done (jsl-fail! JSL-ERR-DUP-RECORD name)) 0)
+        (if (not (rd/sexp-vec? fields))
+            (return-from :done (jsl-fail! JSL-ERR-BAD-RECORD name)) 0)
+        (let [off (al-len [JslRecordField] (.recordfields (jsl)))
+              flat-off (al-len [i64] (.recordflattypes (jsl)))
+              n (rd/sexp-count fields)
+              (mut i) 0]
+          (if (= n 0)
+              (return-from :done (jsl-fail! JSL-ERR-BAD-RECORD name))
+              0)
+          (loop
+            (if (>= (load i) n) (break)
+              (let [f (rd/sexp-nth fields (load i))]
+                (if (or (not (rd/sexp-list? f)) (!= (rd/sexp-count f) 2))
+                    (return-from :done (jsl-fail! JSL-ERR-BAD-RECORD name)) 0)
+                (let [fname (rd/sexp-nth f 0) tyform (rd/sexp-nth f 1)]
+                  (if (not (rd/sexp-sym? fname))
+                      (return-from :done (jsl-fail! JSL-ERR-BAD-RECORD name)) 0)
+                  (let [fieldname (rd/sexp-sym fname) (mut k) 0]
+                    (loop
+                      (if (>= (load k) (load i)) (break)
+                        (do
+                          (if (= fieldname (.name (al-elem [JslRecordField]
+                                                   (field (jsl) recordfields)
+                                                   (+ off (load k)))))
+                              (return-from :done
+                                (jsl-fail! JSL-ERR-BAD-RECORD-FIELD fieldname)) 0)
+                          (set! k (+ (load k) 1)))))
+                    (let [ty (jsl-type-of tyform)
+                          nested (jsl-record-type-of tyform)]
+                      (if (and (= ty TY-NO-ID) (< nested 0))
+                          (return-from :done (jsl-fail! JSL-ERR-BAD-TYPE fieldname)) 0)
+                      (let [(mut rf) (zeroed JslRecordField)]
+                        (store! (field rf name) fieldname)
+                        (store! (field rf ty) ty)
+                        (store! (field rf record) nested)
+                        (store! (field rf flat-off)
+                                (- (al-len [i64] (.recordflattypes (jsl))) flat-off))
+                        (store! (field rf flat-width)
+                                (if (>= nested 0) (jsl-record-flat-width nested) 1))
+                        (if (>= nested 0)
+                            (let [(mut leaf) 0]
+                              (loop (if (>= (load leaf) (jsl-record-flat-width nested))
+                                        (break)
+                                        (do
+                                          (al-push! [i64] (field (jsl) recordflattypes)
+                                                    (jsl-record-flat-field-ty nested (load leaf)))
+                                          (set! leaf (+ (load leaf) 1))))))
+                            (al-push! [i64] (field (jsl) recordflattypes) ty))
+                        (if (> (- (al-len [i64] (.recordflattypes (jsl))) flat-off)
+                               JSL-MAX-RECORD-LEAVES)
+                            (return-from :done (jsl-fail! JSL-ERR-BAD-RECORD name))
+                            0)
+                        (al-push! [JslRecordField] (field (jsl) recordfields) (load rf))))))
+                (set! i (+ (load i) 1)))))
+          (let [(mut r) (zeroed JslRecordDecl)]
+            (store! (field r name) name)
+            (store! (field r fields-off) off)
+            (store! (field r nfields) n)
+            (store! (field r flat-off) flat-off)
+            (store! (field r flat-width)
+                    (- (al-len [i64] (.recordflattypes (jsl))) flat-off))
+            (al-push! [JslRecordDecl] (field (jsl) records) (load r))
+            JSL-OK))))))
+
 ;; `:labels (Name)`. A label may only appear on a `macro`: a label is a control edge into the
 ;; caller's CFG and a control edge cannot cross a call boundary, so declaring one on a `builtin` is
 ;; refused rather than ignored.
@@ -1771,6 +2504,25 @@
     (store! out (rd/sexp-sym (rd/sexp-nth x 0)))
     JSL-OK))
 
+(defn jsl-read-string! [(x (ptr rd/Sexp)) (name (slice u8)) (out (ptr (slice u8)))] (-> i64)
+  (if (rd/sexp-str? x)
+      (do (store! out (rd/sexp-str x)) JSL-OK)
+      (jsl-fail! JSL-ERR-BAD-SPEC-METADATA name)))
+
+(defn jsl-read-spec-status! [(x (ptr rd/Sexp)) (name (slice u8)) (out (ptr i64))] (-> i64)
+  (if (not (rd/sexp-sym? x)) (jsl-fail! JSL-ERR-BAD-SPEC-METADATA name)
+    (let [value (rd/sexp-sym x)]
+      (if (= value "complete") (do (store! out JSL-SPEC-COMPLETE) JSL-OK)
+        (if (= value "partial") (do (store! out JSL-SPEC-PARTIAL) JSL-OK)
+          (jsl-fail! JSL-ERR-BAD-SPEC-METADATA name))))))
+
+(defn jsl-spec-claim-exists? [(spec (slice u8))] (-> bool)
+  (let [(mut i) 0 (mut found) false]
+    (loop (if (or (>= (load i) (jsl-decl-count)) (load found)) (break)
+            (do (if (= spec (jsl-decl-spec (load i))) (store! found true) 0)
+                (set! i (+ (load i) 1)))))
+    (load found)))
+
 ;; One top-level form. The declaration is assembled in locals and pushed ONLY on success, so a
 ;; malformed form leaves the table exactly as it found it — a half-built declaration is the state
 ;; from which a later pass produces a plausible wrong answer.
@@ -1782,6 +2534,7 @@
     (let [head (rd/sexp-nth form 0)]
       (if (not (rd/sexp-sym? head)) (return-from :done (jsl-fail! JSL-ERR-UNKNOWN-FORM "")) 0)
       (let [kw (rd/sexp-sym head)]
+        (if (= kw "record") (return-from :done (jsl-read-record! form)) 0)
         (if (jsl-unsupported-form? kw)
             (return-from :done (jsl-fail! JSL-ERR-UNSUPPORTED kw)) 0)
         (if (or (= kw "builtin") (or (= kw "macro") (= kw "callable"))) 0
@@ -1798,11 +2551,18 @@
                 params-off (jsl-param-count)
                 captures-off (jsl-capture-count)
                 (mut nparams) 0
+                (mut lowered-nparams) 0
                 (mut ncaptures) 0
                 (mut ret) TY-NO-ID
+                (mut ret-record) -1
                 (mut label) ""
                 (mut transitioning) false
                 (mut cold) false
+                (mut spec) ""
+                (mut specname) ""
+                (mut specstatus) JSL-SPEC-UNSPECIFIED
+                (mut specializes) ""
+                (mut deviation) ""
                 (mut i) 2
                 (mut err) JSL-OK]
             ; The keyword prefix. Each key consumes its value, so the first non-keyword ends it.
@@ -1814,16 +2574,19 @@
                           (let [key (rd/sexp-kw k)
                                 v (rd/sexp-nth form (+ (load i) 1))]
                             (if (= key "params")
-                                (store! err (jsl-read-params! v name (mut nparams)))
+                                (store! err (jsl-read-params! v name kind (mut nparams)
+                                                             (mut lowered-nparams)))
                               (if (= key "captures")
                                 (if (= kind JSL-KIND-CALLABLE)
                                     (store! err (jsl-read-captures! v name (mut ncaptures)))
                                     (store! err (jsl-fail! JSL-ERR-BAD-KEY key)))
                               (if (= key "ret")
-                                  (let [t (jsl-type-of v)]
-                                    (if (= t TY-NO-ID)
+                                  (let [t (jsl-type-of v) record (jsl-record-type-of v)]
+                                    (if (and (= t TY-NO-ID) (< record 0))
                                         (store! err (jsl-fail! JSL-ERR-BAD-TYPE name))
-                                        (store! ret t))
+                                        (if (and (>= record 0) (= kind JSL-KIND-CALLABLE))
+                                            (store! err (jsl-fail! JSL-ERR-RECORD-ESCAPE name))
+                                            (do (store! ret t) (store! ret-record record) 0)))
                                     0)
                                 (if (= key "transitioning")
                                     (if (jsl-bool-of v (mut transitioning)) 0
@@ -1833,10 +2596,33 @@
                                           (store! err (jsl-fail! JSL-ERR-BAD-BOOL name)))
                                     (if (= key "labels")
                                         (store! err (jsl-read-labels! v name kind (mut label)))
-                                      (store! err (jsl-fail! JSL-ERR-BAD-KEY key))))))))
+                                      (if (= key "spec")
+                                          (store! err (jsl-read-string! v name (mut spec)))
+                                        (if (= key "spec-name")
+                                            (store! err (jsl-read-string! v name (mut specname)))
+                                          (if (= key "status")
+                                              (store! err (jsl-read-spec-status! v name (mut specstatus)))
+                                            (if (= key "specializes")
+                                                (store! err (jsl-read-string! v name (mut specializes)))
+                                              (if (= key "deviation")
+                                                  (store! err (jsl-read-string! v name (mut deviation)))
+                                                (store! err (jsl-fail! JSL-ERR-BAD-KEY key)))))))))))))
                             (store! i (+ (load i) 2))
                             0))))))
             (if (!= (load err) JSL-OK) (return-from :done (load err)) 0)
+            (let [has-spec (> (slice-len (load spec)) 0)
+                  has-name (> (slice-len (load specname)) 0)
+                  has-specializes (> (slice-len (load specializes)) 0)
+                  has-deviation (> (slice-len (load deviation)) 0)]
+              (if (or (!= has-spec has-name)
+                      (or (!= has-spec (!= (load specstatus) JSL-SPEC-UNSPECIFIED))
+                          (or (and has-spec has-specializes)
+                              (or (and (= (load specstatus) JSL-SPEC-COMPLETE) has-deviation)
+                                  (or (and (= (load specstatus) JSL-SPEC-PARTIAL) (not has-deviation))
+                                      (!= has-specializes (and (not has-spec) has-deviation)))))))
+                  (return-from :done (jsl-fail! JSL-ERR-BAD-SPEC-METADATA name)) 0)
+              (if (and has-spec (jsl-spec-claim-exists? (load spec)))
+                  (return-from :done (jsl-fail! JSL-ERR-DUP-SPEC-CLAIM (load spec))) 0))
             ; EXACTLY ONE BODY. Zero is a declaration with nothing to lower; more than one would
             ; need a sequencing rule, and every JSL form is an expression, so there is none.
             (if (!= (- n (load i)) 1) (return-from :done (jsl-fail! JSL-ERR-NO-BODY name)) 0)
@@ -1844,16 +2630,24 @@
               (store! (field d name)          name)
               (store! (field d kind)          kind)
               (store! (field d label)         (load label))
-              (store! (field d transitioning) (load transitioning))
-              (store! (field d cold)          (load cold))
-              (store! (field d params-off)    params-off)
-              (store! (field d nparams)       (load nparams))
+              (store! (field d spec)          (load spec))
+              (store! (field d specname)      (load specname))
+              (store! (field d specstatus)    (load specstatus))
+              (store! (field d specializes)   (load specializes))
+              (store! (field d deviation)     (load deviation))
+              (store! (field d signature)
+                      (jsl-signature-build! params-off (load nparams)
+                                            (load lowered-nparams) (load ret)
+                                            (load ret-record)))
+              (store! (field (field d signature) transitioning) (load transitioning))
+              (store! (field (field d signature) cold)          (load cold))
               (store! (field d captures-off)  captures-off)
               (store! (field d ncaptures)     (load ncaptures))
-              (store! (field d ret)           (load ret))
               (store! (field d body)          (rd/sexp-nth form (load i)))
               (store! (field d fun)           NO-NODE)
               (al-push! [JslDecl] (field (jsl) decls) (load d))
+              (if (jsl-signature-valid? (- (jsl-decl-count) 1)) 0
+                  (panic-corrupt "jsl: constructed an inconsistent canonical signature"))
               JSL-OK)))))))
 
 ;; Read a `.jsl` unit and check it. THE CALLER OWNS `src` AND MUST KEEP IT ALIVE: the reader hands
@@ -1876,8 +2670,15 @@
 (defn jsl-read-source! [(raw (slice u8)) (source i64)] (-> i64)
   (match (rd/read-all (malloc-allocator) raw source)
     ; The reader's own refusal is kept as a named JSL failure rather than being retold: its Diag
-    ; already carries the message and the byte range that noticed.
-    (Err [d] (let [dd d] (jsl-fail! JSL-ERR-PARSE (.msg dd))))
+    ; already carries the message and the byte range that noticed. Stamp that range explicitly:
+    ; the ordinary cursor still names the last declaration read from the PREVIOUS file when a
+    ; whole-file read fails, which otherwise reports a convincing but unrelated source location.
+    (Err [d]
+      (let [dd d p (jsl)]
+        (set! (.cur-src p) (.source dd))
+        (set! (.cur-lo p) (.lo dd))
+        (set! (.cur-hi p) (.hi dd))
+        (jsl-fail! JSL-ERR-PARSE (.msg dd))))
     (Ok [forms]
       (let [items (al-slice [rd/Sexp] (load forms))
             n (slice-len items)

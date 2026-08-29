@@ -38,8 +38,6 @@
 ; ============================================================================
 ; Lowering state
 ; ============================================================================
-(defstruct JslBind [(name (slice u8)) (node i64)])
-
 ;; `ctrl` doubles as the divergence flag: NO-NODE means the path taken to here ended in a `goto`,
 ;; so there is no control to hang anything off and nothing further on this path may be built. Every
 ;; construct that merges control has to ask, which is what makes a bail-out a real early exit rather
@@ -51,19 +49,43 @@
 ;; `rvals` holds `nbind` entries per recur and a nested loop may have a different `nbind` — deriving
 ;; the value offset as `control-index * nbind` silently reads another loop's values the moment two
 ;; loops disagree about their arity.
-(defstruct JslLoop [(nbind i64) (base i64) (vbase i64) (memphi i64)])
+(defstruct JslLoop
+  [(nbind i64) (nflat i64) (type-off i64) (base i64) (vbase i64) (memphi i64)])
 (defstruct JslAbrupt [(ctrl i64) (dependency i64) (mem i64)])
+
+;; A logical JSL value is described independently of the graph nodes that physically carry it.
+;; `slots-off/slots-len` is a view into `JslLower.slots`; Records occupy their canonical recursive
+;; leaf range and a Record List occupies one carrier slot. Expression lowering, bindings, CFG
+;; joins, loops, and macro expansion carry this descriptor directly; graph builders receive node
+;; ids only through checked scalar/slot projection.
+(const JLV-SCALAR i64 0)
+(const JLV-RECORD i64 1)
+(const JLV-RECORD-LIST i64 2)
+(const JLV-ABSENT i64 3)
+(defstruct JslLoweredValue
+  [(kind i64) (logical i64) (slots-off i64) (slots-len i64)])
+(defstruct JslLoweredCall [(site CallSite) (result JslLoweredValue)])
+(defstruct JslBind
+  [(name (slice u8))
+   (value JslLoweredValue)
+   (rest bool)
+   (rest-off i64)
+   (rest-len i64)])
 
 (defstruct JslLower
   [(binds  (ArrayList JslBind))
+   (restvals (ArrayList i64)) ; SSA elements owned by compile-away `(rest T)` bindings
+   (slots (ArrayList i64))              ; physical SSA leaves owned by those descriptors
    (exits  (ArrayList i64))   ; control nodes waiting at a label, innermost expansion last
    (loops  (ArrayList JslLoop))
+   (looptypes (ArrayList JslLoweredValue)) ; logical kind/layout of every active loop binding
    (rctrl  (ArrayList i64))   ; one control per `recur` reached
    (rvals  (ArrayList i64))   ; nbind values per `recur`, in the same order
    (rmem   (ArrayList i64))   ; and the heap each `recur` left, one per recur
    (callback-calls (ArrayList i64)) ; dynamic JS calls emitted by callback macros
    (abrupts (ArrayList JslAbrupt)) ; exceptional exits captured while inlining into frontend CFG
    (collect-abrupts bool)
+   (pin-control bool)       ; standalone builtin lowering owns its cursor until Return attachment
    (ctrl   i64)               ; the control the next effectful form hangs off, or JL-DIVERGED
    (mem    i64)               ; the current JS property memory, or NO-NODE before it is needed
    (outer  i64)               ; the CALLER's other memory (cells, closure environments), or NO-NODE
@@ -91,8 +113,11 @@
     (if (.inited p) 0
       (do (set! (.inited p) true)
           (set! (.binds p) (al-new [JslBind] (malloc-allocator)))
+          (set! (.restvals p) (al-new [i64] (malloc-allocator)))
+          (set! (.slots p) (al-new [i64] (malloc-allocator)))
           (set! (.exits p) (al-new [i64] (malloc-allocator)))
           (set! (.loops p) (al-new [JslLoop] (malloc-allocator)))
+          (set! (.looptypes p) (al-new [JslLoweredValue] (malloc-allocator)))
           (set! (.rctrl p) (al-new [i64] (malloc-allocator)))
           (set! (.rvals p) (al-new [i64] (malloc-allocator)))
           (set! (.rmem p) (al-new [i64] (malloc-allocator)))
@@ -135,11 +160,24 @@
   (let [(mut i) 0]
     (loop (if (>= (load i) (jl-depth))
               (break)
-              (do (let [n (.node (jl-bind-p (load i)))]
-                    (if (and (!= n NO-NODE)
-                             (and (>= n 0) (and (< n (n-count)) (> (n-keeps n) 0))))
-                        (n-unkeep! n)
-                        0))
+              (do (let [binding (jl-bind-p (load i))]
+                    (if (.rest binding)
+                        (let [(mut k) 0]
+                          (loop (if (>= (load k) (.rest-len binding)) (break)
+                                    (let [n (al-get [i64] (.restvals (jl))
+                                                    (+ (.rest-off binding) (load k)))]
+                                      (if (and (>= n 0)
+                                               (and (< n (n-count)) (> (n-keeps n) 0)))
+                                          (n-unkeep! n) 0)
+                                      (set! k (+ (load k) 1))))))
+                        (let [value (.value binding) (mut slot) 0]
+                          (loop (if (>= (load slot) (.slots-len value)) (break)
+                                    (let [n (al-get [i64] (.slots (jl))
+                                                    (+ (.slots-off value) (load slot)))]
+                                      (if (and (>= n 0)
+                                               (and (< n (n-count)) (> (n-keeps n) 0)))
+                                          (n-unkeep! n) 0)
+                                      (set! slot (+ (load slot) 1))))))))
                   (set! i (+ (load i) 1))
                   0)))
     0))
@@ -153,14 +191,18 @@
     ;;
     ;; `jl-lower-decl!` is the opposite case -- same graph, still live -- and unpins for real.
     (al-clear! [JslBind] (field p binds))
+    (al-clear! [i64] (field p restvals))
+    (al-clear! [i64] (field p slots))
     (al-clear! [i64] (field p exits))
     (al-clear! [JslLoop] (field p loops))
+    (al-clear! [JslLoweredValue] (field p looptypes))
     (al-clear! [i64] (field p rctrl))
     (al-clear! [i64] (field p rvals))
     (al-clear! [i64] (field p rmem))
     (al-clear! [i64] (field p callback-calls))
     (al-clear! [JslAbrupt] (field p abrupts))
     (set! (.collect-abrupts p) false)
+    (set! (.pin-control p) false)
     (set! (.ctrl p) NO-NODE)
     (set! (.mem p) NO-NODE)
     (set! (.outer p) NO-NODE)
@@ -229,6 +271,48 @@
   (let [lower (jl)]
     (if (.identity-valid lower) (.identity-unit lower)
         (let [(mut hash) 1469598103934665603 (mut decl) 0]
+          ;; Schemas are part of the callable ABI even when two revisions happen to have the same
+          ;; total width. Hash logical field identity and the cached physical vector before
+          ;; declarations so an artifact can never be reused across a reordered or retyped Record.
+          (set! hash (hash-step (load hash) (jsl-record-count)))
+          (let [(mut record) 0]
+            (loop (if (>= (load record) (jsl-record-count)) (break)
+                      (do
+                        (jl-identity-hash-slice! (mut hash) 14
+                                                 (jsl-record-name (load record)))
+                        (set! hash (hash-step (load hash)
+                                             (jsl-record-nfields (load record))))
+                        (set! hash (hash-step (load hash)
+                                             (jsl-record-flat-width (load record))))
+                        (let [(mut field) 0]
+                          (loop (if (>= (load field)
+                                        (jsl-record-nfields (load record)))
+                                    (break)
+                                    (do
+                                      (jl-identity-hash-slice!
+                                        (mut hash) 15
+                                        (jsl-record-field-name (load record) (load field)))
+                                      (set! hash
+                                            (hash-step
+                                              (load hash)
+                                              (jsl-record-field-ty (load record) (load field))))
+                                      (set! hash
+                                            (hash-step
+                                              (load hash)
+                                              (jsl-record-field-record (load record) (load field))))
+                                      (set! field (+ (load field) 1))))))
+                        (let [(mut leaf) 0]
+                          (loop (if (>= (load leaf)
+                                        (jsl-record-flat-width (load record)))
+                                    (break)
+                                    (do
+                                      (set! hash
+                                            (hash-step
+                                              (load hash)
+                                              (jsl-record-flat-field-ty
+                                                (load record) (load leaf))))
+                                      (set! leaf (+ (load leaf) 1))))))
+                        (set! record (+ (load record) 1))))))
           (set! hash (hash-step (load hash) (jsl-decl-count)))
           (loop (if (>= (load decl) (jsl-decl-count)) (break)
                     (do
@@ -236,10 +320,36 @@
                       (jl-identity-hash-slice! (mut hash) 11 (jsl-decl-label (load decl)))
                       (set! hash (hash-step (load hash) (jsl-decl-kind (load decl))))
                       (set! hash (hash-step (load hash) (jsl-decl-ret (load decl))))
+                      (set! hash (hash-step (load hash) (jsl-decl-ret-record (load decl))))
                       (set! hash (hash-step (load hash) (jsl-decl-nparams (load decl))))
+                      (set! hash
+                            (hash-step (load hash)
+                                       (jsl-decl-lowered-nparams (load decl))))
+                      (let [(mut slot) 0]
+                        (loop (if (>= (load slot) (jsl-decl-lowered-nparams (load decl))) (break)
+                                  (do (set! hash (hash-step
+                                                   (load hash)
+                                                   (jsl-decl-lowered-param-type
+                                                     (load decl) (load slot))))
+                                      (set! slot (+ (load slot) 1))))))
+                      (let [(mut slot) 0]
+                        (loop (if (>= (load slot) (jsl-decl-lowered-nresults (load decl))) (break)
+                                  (do (set! hash (hash-step
+                                                   (load hash)
+                                                   (jsl-decl-lowered-result-type
+                                                     (load decl) (load slot))))
+                                      (set! slot (+ (load slot) 1))))))
                       (set! hash (hash-step (load hash) (jsl-decl-ncaptures (load decl))))
                       (set! hash (hash-step (load hash)
                                             (if (jsl-decl-transitioning? (load decl)) 1 0)))
+                      (set! hash (hash-step (load hash)
+                                            (if (jsl-decl-cold? (load decl)) 1 0)))
+                      (set! hash (hash-step (load hash)
+                                            (if (jsl-decl-uses-memory? (load decl)) 1 0)))
+                      (set! hash (hash-step (load hash)
+                                            (if (jsl-decl-calls-back? (load decl)) 1 0)))
+                      (set! hash (hash-step (load hash)
+                                            (if (jsl-decl-can-throw? (load decl)) 1 0)))
                       (let [(mut parameter) 0]
                         (loop (if (>= (load parameter) (jsl-decl-nparams (load decl))) (break)
                                   (do
@@ -249,6 +359,25 @@
                                     (set! hash
                                           (hash-step (load hash)
                                                      (jsl-param-ty (load decl) (load parameter))))
+                                    (set! hash
+                                          (hash-step
+                                            (load hash)
+                                            (jsl-param-record (load decl) (load parameter))))
+                                    (set! hash
+                                          (hash-step
+                                            (load hash)
+                                            (jsl-param-lowered-off (load decl)
+                                                                   (load parameter))))
+                                    (set! hash
+                                          (hash-step
+                                            (load hash)
+                                            (jsl-param-lowered-width (load decl)
+                                                                     (load parameter))))
+                                    (set! hash
+                                          (hash-step (load hash)
+                                                     (if (jsl-param-rest? (load decl)
+                                                                         (load parameter))
+                                                         1 0)))
                                     (set! parameter (+ (load parameter) 1))))))
                       (let [(mut capture) 0]
                         (loop (if (>= (load capture) (jsl-decl-ncaptures (load decl))) (break)
@@ -264,6 +393,8 @@
           (load hash)))))
 
 (defn jl-open-function! [(d i64)] (-> i64)
+  (if (jsl-signature-valid? d) 0
+      (panic-corrupt "jsl lowering: declaration has an inconsistent canonical signature"))
   (let [fun (n-fun-open-identity! (jsl-decl-fidx d) FUN-IDENTITY-JSL
                                   (jl-library-identity-unit) d)
         callable (jsl-callable? d)
@@ -274,11 +405,19 @@
             (al-push! [i64] (mut types) (t-dyn))
             (al-push! [i64] (mut types) (t-int)))
         0)
-    (loop (if (>= (load index) (jsl-decl-nparams d)) (break)
-              (do (al-push! [i64] (mut types) (jsl-param-ty d (load index)))
+    (loop (if (>= (load index) (jsl-decl-lowered-nparams d)) (break)
+              (do (al-push! [i64] (mut types) (jsl-decl-lowered-param-type d (load index)))
                   (set! index (+ (load index) 1)))))
-    (n-fun-declare-abi! fun (al-slice [i64] (load types))
-                        (let [ret (jsl-decl-ret d)] (if (= ret TY-NO-ID) (t-dyn) ret)))
+    (let [(mut results) (al-new [i64] (malloc-allocator))
+          (mut result) 0]
+      (loop (if (>= (load result) (jsl-decl-lowered-nresults d)) (break)
+                (do (al-push! [i64] (mut results)
+                              (jsl-decl-lowered-result-type d (load result)))
+                    (set! result (+ (load result) 1)))))
+      (n-fun-declare-abi-results! fun (al-slice [i64] (load types))
+                                  (al-slice [i64] (load results)))
+      (n-fun-abi-set-can-throw! fun (jsl-decl-can-throw? d))
+      (al-free! [i64] (mut results)))
     (al-free! [i64] (mut types))
     fun))
 
@@ -293,7 +432,22 @@
 (defn jl-profile-lower-nodes [] (-> i64) (.profile-lower-nodes (jl)))
 
 (defn jl-ctrl [] (-> i64) (.ctrl (jl)))
-(defn jl-set-ctrl! [(n i64)] (-> i64) (set! (.ctrl (jl)) n) 0)
+;; The current control is compiler-owned state until the next IR node consumes it. A freshly
+;; created CallEnd/CProj may have no graph user during that interval (especially when an effectful
+;; tail call's value is intentionally unused), so merely storing its id here is not reachability.
+;; Transfer one explicit pin with the control cursor. This is the same ownership rule used by
+;; parked loop backedges: compiler storage holding an SSA id must keep it alive until it is wired.
+(defn jl-set-ctrl! [(n i64)] (-> i64)
+  (let [old (.ctrl (jl))]
+    (if (or (= old n) (not (.pin-control (jl))))
+        (do (set! (.ctrl (jl)) n) 0)
+      (do
+        (if (>= n 0) (jl-keep! n) 0)
+        (set! (.ctrl (jl)) n)
+        (if (>= old 0)
+            (do (jl-unkeep! old) (jl-collect! old))
+            0))))
+  0)
 (defn jl-diverged? [] (-> bool) (= (jl-ctrl) JL-DIVERGED))
 (defn jl-collect-abrupts? [] (-> bool) (.collect-abrupts (jl)))
 (defn jl-set-collect-abrupts! [(enabled bool)] (-> i64)
@@ -414,19 +568,219 @@
 ;; Dormant until DSL guards began folding against typed operands: before that a `%IsInt` on a boxed
 ;; argument never proved, so a binding never lost its last user mid-scope. See
 ;; docs/DSL-OWNERSHIP.md.
-(defn jl-bind! [(name (slice u8)) (node i64)] (-> i64)
+(defn jl-bind-lowered! [(name (slice u8)) (value JslLoweredValue)] (-> i64)
   (let [(mut b) (zeroed JslBind)]
     (set! (.name b) name)
-    (set! (.node b) node)
-    (jl-keep! node)
+    (set! (.value b) value)
+    (set! (.rest b) false)
+    (jl-lowered-keep! value)
     (al-push! [JslBind] (field (jl) binds) (load b))))
 
-;; NO-NODE IS -1 AND EVERY NODE ACCESSOR INDEXES AN ARENA, so pinning "the value of a path that
-;; diverged" is an out-of-bounds write, not a no-op. A `goto` makes exactly that value NO-NODE, and
-;; the diamond builder pins both arms' values before merging them, so these guards are the
-;; difference between a bail-out and a segfault.
-(defn jl-keep! [(n i64)] (-> i64) (if (= n NO-NODE) 0 (n-keep! n)))
-(defn jl-unkeep! [(n i64)] (-> i64) (if (= n NO-NODE) 0 (n-unkeep! n)))
+;; Rest bindings are compile-away specification Lists: their elements remain ordinary SSA values
+;; and no JavaScript Array or runtime allocation is introduced. The binding owns pins for every
+;; element exactly as a scalar binding owns one pin, so later lowering cannot collect an element
+;; before the list consumer is emitted.
+(defn jl-bind-rest! [(name (slice u8)) (values (slice i64))] (-> i64)
+  (let [(mut b) (zeroed JslBind)
+        off (al-len [i64] (.restvals (jl)))
+        n (slice-len values)
+        (mut i) 0]
+    (set! (.name b) name)
+    (set! (.value b) (jl-lowered-absent))
+    (set! (.rest b) true)
+    (set! (.rest-off b) off)
+    (set! (.rest-len b) n)
+    (loop (if (>= (load i) n) (break)
+              (let [value (slice-get values (load i))]
+                (jl-keep! value)
+                (al-push! [i64] (field (jl) restvals) value)
+                (set! i (+ (load i) 1)))))
+    (al-push! [JslBind] (field (jl) binds) (load b))))
+
+(defn jl-lowered-slot [(value JslLoweredValue) (index i64)] (-> i64)
+  (if (or (< index 0) (>= index (.slots-len value)))
+      (do (panic-corrupt "jsl lowering: lowered-value slot index is out of range") NO-NODE)
+      (al-get [i64] (.slots (jl)) (+ (.slots-off value) index))))
+(defn jl-lowered-slot-type [(value JslLoweredValue) (index i64)] (-> i64)
+  (if (or (< index 0) (>= index (.slots-len value)))
+      (do (panic-corrupt "jsl lowering: lowered-value slot type index is out of range") TY-NO-ID)
+      (if (= (.kind value) JLV-RECORD)
+          (jsl-record-flat-field-ty (.logical value) index)
+          (if (= (.kind value) JLV-RECORD-LIST)
+              (t-obj-shape (jsp-aux JSP-NEWARRAY))
+              (if (= (.kind value) JLV-SCALAR)
+                  (.logical value)
+                  (do (panic-corrupt "jsl lowering: absent value has no physical slot type")
+                      TY-NO-ID))))))
+(defn jl-lowered-view [(kind i64) (logical i64) (off i64) (len i64)] (-> JslLoweredValue)
+  (let [(mut descriptor) (zeroed JslLoweredValue)]
+    (set! (.kind descriptor) kind)
+    (set! (.logical descriptor) logical)
+    (set! (.slots-off descriptor) off)
+    (set! (.slots-len descriptor) len)
+    (load descriptor)))
+(defn jl-lowered-from-slots-like! [(prototype JslLoweredValue) (values (ptr i64))]
+                                    (-> JslLoweredValue)
+  (let [off (al-len [i64] (.slots (jl)))
+        width (.slots-len prototype)
+        (mut index) 0]
+    (if (= (.kind prototype) JLV-ABSENT)
+        (do (panic-corrupt "jsl lowering: cannot reconstruct an absent lowered value")
+            (jl-lowered-absent))
+        (do
+          (loop (if (>= (load index) width) (break)
+                    (do (al-push! [i64] (field (jl) slots)
+                                  (load (index values (load index))))
+                        (set! index (+ (load index) 1)))))
+          (jl-lowered-view (.kind prototype) (.logical prototype) off width)))))
+(defn jl-lowered-scalar! [(node i64) (logical i64)] (-> JslLoweredValue)
+  (let [off (al-len [i64] (.slots (jl)))
+        (mut value) (zeroed JslLoweredValue)]
+    (al-push! [i64] (field (jl) slots) node)
+    (set! (.kind value) JLV-SCALAR)
+    (set! (.logical value) logical)
+    (set! (.slots-off value) off)
+    (set! (.slots-len value) 1)
+    (load value)))
+(defn jl-lowered-absent [] (-> JslLoweredValue)
+  (let [(mut value) (zeroed JslLoweredValue)]
+    (set! (.kind value) JLV-ABSENT)
+    (set! (.logical value) TY-NO-ID)
+    (load value)))
+(defn jl-lowered-scalar-node [(value JslLoweredValue)] (-> i64)
+  (if (or (!= (.kind value) JLV-SCALAR) (!= (.slots-len value) 1))
+      (do (panic-corrupt "jsl lowering: aggregate used where one scalar graph node is required")
+          NO-NODE)
+      (al-get [i64] (.slots (jl)) (.slots-off value))))
+(defn jl-lowered-keep! [(value JslLoweredValue)] (-> i64)
+  (let [(mut index) 0]
+    (loop (if (>= (load index) (.slots-len value)) (break)
+              (do (n-keep! (al-get [i64] (.slots (jl))
+                                   (+ (.slots-off value) (load index))))
+                  (set! index (+ (load index) 1)))))
+    0))
+(defn jl-lowered-unkeep! [(value JslLoweredValue)] (-> i64)
+  (let [(mut index) 0]
+    (loop (if (>= (load index) (.slots-len value)) (break)
+              (do (n-unkeep! (al-get [i64] (.slots (jl))
+                                     (+ (.slots-off value) (load index))))
+                  (set! index (+ (load index) 1)))))
+    0))
+(defn jl-lowered-collect! [(value JslLoweredValue)] (-> i64)
+  (let [(mut index) 0]
+    (loop (if (>= (load index) (.slots-len value)) (break)
+              (do (jl-collect! (al-get [i64] (.slots (jl))
+                                      (+ (.slots-off value) (load index))))
+                  (set! index (+ (load index) 1)))))
+    0))
+(defn jl-lowered-record-field [(value JslLoweredValue) (index i64)] (-> JslLoweredValue)
+  (let [off (jsl-record-field-flat-off (.logical value) index)
+        width (jsl-record-field-flat-width (.logical value) index)
+        nested (jsl-record-field-record (.logical value) index)]
+    (if (>= nested 0)
+        (jl-lowered-view JLV-RECORD nested (+ (.slots-off value) off) width)
+        (jl-lowered-view JLV-SCALAR (jsl-record-field-ty (.logical value) index)
+                         (+ (.slots-off value) off) 1))))
+(defn jl-lowered-push-slots! [(value JslLoweredValue)] (-> i64)
+  (if (or (= (.kind value) JLV-RECORD) (= (.kind value) JLV-SCALAR))
+      (let [(mut index) 0]
+        (loop (if (>= (load index) (.slots-len value)) (break)
+                  (do (al-push! [i64] (field (jl) slots)
+                                (al-get [i64] (.slots (jl))
+                                        (+ (.slots-off value) (load index))))
+                      (set! index (+ (load index) 1))))) 0)
+      (do (panic-corrupt "jsl lowering: storage capability or absence used as a Record field") 0)))
+(defn jl-lowered-record-value! [(schema i64) (values (ptr JslLoweredValue))] (-> JslLoweredValue)
+  (let [n (jsl-record-nfields schema)
+        off (al-len [i64] (.slots (jl)))
+        (mut index) 0]
+    (loop (if (>= (load index) n) (break)
+              (do
+                (let [value (load (index values (load index)))
+                      nested (jsl-record-field-record schema (load index))]
+                  (if (>= nested 0)
+                      (if (and (= (.kind value) JLV-RECORD)
+                               (= (.logical value) nested))
+                          (jl-lowered-push-slots! value)
+                          (panic-corrupt
+                            "jsl lowering: nested Record field disagrees with its schema"))
+                      (if (and (= (.kind value) JLV-SCALAR) (= (.slots-len value) 1))
+                          (let [declared (jsl-record-field-ty schema (load index))
+                                raw (jl-lowered-scalar-node value)
+                                ;; A Record leaf's declared type is its physical representation.
+                                ;; In particular, a raw bool stored into a `dyn` field must become
+                                ;; a tagged JavaScript boolean BEFORE the Record can flow through a
+                                ;; Phi or call. Normalizing only at a later call boundary is too
+                                ;; late: the aggregate's logical type already says the slot is dyn.
+                                normalized
+                                  (if (and (= declared (t-dyn))
+                                           (!= (.logical value) (t-dyn)))
+                                      (n-box! raw)
+                                      raw)]
+                            (al-push! [i64] (field (jl) slots) normalized)
+                            0)
+                          (panic-corrupt
+                            "jsl lowering: scalar Record field is not a scalar lowered value"))))
+                  (set! index (+ (load index) 1)))))
+    (let [width (- (al-len [i64] (.slots (jl))) off)]
+      (if (!= width (jsl-record-flat-width schema))
+          (panic-corrupt "jsl lowering: Record physical width disagrees with its cached layout") 0)
+      (jl-lowered-view JLV-RECORD schema off width))))
+(defn jl-lowered-record-from-slots! [(schema i64) (values (ptr i64))] (-> JslLoweredValue)
+  (let [off (al-len [i64] (.slots (jl)))
+        width (jsl-record-flat-width schema)
+        (mut index) 0]
+    (loop (if (>= (load index) width) (break)
+              (do (al-push! [i64] (field (jl) slots) (load (index values (load index))))
+                  (set! index (+ (load index) 1)))))
+    (jl-lowered-view JLV-RECORD schema off width)))
+(defn jl-lowered-record-list-node [(value JslLoweredValue)] (-> i64)
+  (if (or (!= (.kind value) JLV-RECORD-LIST) (!= (.slots-len value) 1))
+      (do (panic-corrupt "jsl lowering: non-Record-List used as a Record List") NO-NODE)
+      (jl-lowered-slot value 0)))
+(defn jl-lowered-record-list-schema [(value JslLoweredValue)] (-> i64)
+  (if (!= (.kind value) JLV-RECORD-LIST)
+      (do (panic-corrupt "jsl lowering: non-Record-List used as a Record List") -1)
+      (.logical value)))
+(defn jl-lowered-record-list-value! [(schema i64) (node i64)] (-> JslLoweredValue)
+  (let [off (al-len [i64] (.slots (jl)))]
+    (al-push! [i64] (field (jl) slots) node)
+    (jl-lowered-view JLV-RECORD-LIST schema off 1)))
+
+(defn jl-lowered-parameter! [(d i64) (source-index i64) (fun i64) (hidden i64)]
+                             (-> JslLoweredValue)
+  (let [off (al-len [i64] (.slots (jl)))
+        width (jsl-param-lowered-width d source-index)
+        record (jsl-param-record d source-index)
+        abi-base (+ hidden (jsl-param-lowered-off d source-index))
+        (mut slot) 0]
+    (loop (if (>= (load slot) width) (break)
+              (do (al-push! [i64] (field (jl) slots)
+                            (n-parm! fun (+ abi-base (load slot))))
+                  (set! slot (+ (load slot) 1)))))
+    (if (>= record 0)
+        (jl-lowered-view JLV-RECORD record off width)
+        (jl-lowered-view JLV-SCALAR (jsl-param-ty d source-index) off width))))
+
+(defn jl-lowered-matches-decl-result? [(d i64) (value JslLoweredValue)] (-> bool)
+  (let [record (jsl-decl-ret-record d)]
+    (and (= (.slots-len value) (jsl-decl-lowered-nresults d))
+         (if (>= record 0)
+             (and (= (.kind value) JLV-RECORD) (= (.logical value) record))
+             (= (.kind value) JLV-SCALAR)))))
+
+(defn jl-lowered-matches-param? [(d i64) (source-index i64) (value JslLoweredValue)]
+                                 (-> bool)
+  (let [record (jsl-param-record d source-index)]
+    (and (= (.slots-len value) (jsl-param-lowered-width d source-index))
+         (if (>= record 0)
+             (and (= (.kind value) JLV-RECORD) (= (.logical value) record))
+             (= (.kind value) JLV-SCALAR)))))
+
+(defn jl-keep! [(n i64)] (-> i64)
+  (if (= n NO-NODE) 0 (n-keep! n)))
+(defn jl-unkeep! [(n i64)] (-> i64)
+  (if (= n NO-NODE) 0 (n-unkeep! n)))
 
 ;; Collect a binding whose value nothing used. A `let` binding is an ordinary SSA value, so an
 ;; unused one is dead code — but nothing else will notice: it has no users to cascade from and no
@@ -448,14 +802,41 @@
           ; reading after it returns the CORRECT node — and would go on doing so until an unrelated
           ; `al-push!` reused that slot, at which point this silently collects a different binding.
           ; The wrong order passes every test today and breaks on an unrelated change later.
-          (let [n (.node (jl-bind-p (- (jl-depth) 1)))]
+          (let [binding (jl-bind-p (- (jl-depth) 1))
+                value (.value binding)
+                is-rest (.rest binding)
+                rest-off (.rest-off binding)
+                rest-len (.rest-len binding)]
             (al-pop! [JslBind] (field (jl) binds))
             ;; Unpin before collecting: the pin is what kept it alive through the scope, and
             ;; `jl-collect!` only kills a value with no users AND no pins.
-            (jl-unkeep! n)
-            (jl-collect! n)
+            (if is-rest
+                (let [(mut i) 0]
+                  (loop (if (>= (load i) rest-len) (break)
+                            (let [value (al-get [i64] (.restvals (jl))
+                                                (+ rest-off (load i)))]
+                              (jl-unkeep! value)
+                              (jl-collect! value)
+                              (set! i (+ (load i) 1)))))
+                  ;; Rest bindings are nested and popped in LIFO order, so this binding owns the
+                  ;; tail of `restvals`. Remove that compile-time slice once its pins are gone;
+                  ;; otherwise every macro expansion would retain stale SSA ids indefinitely.
+                  (loop (if (<= (al-len [i64] (.restvals (jl))) rest-off) (break)
+                            (do (al-pop! [i64] (field (jl) restvals)) 0))))
+                (do (jl-lowered-unkeep! value) (jl-lowered-collect! value)))
             0)))
   0)
+
+(defn jl-rest-binding [(name (slice u8))] (-> (ptr JslBind))
+  (let [(mut i) (jl-depth) (mut found) (cast (ptr JslBind) 0)]
+    (loop (if (or (<= (load i) (jl-frame))
+                  (!= (cast i64 (load found)) 0))
+              (break)
+              (do (set! i (- (load i) 1))
+                  (let [binding (jl-bind-p (load i))]
+                    (if (and (= name (.name binding)) (.rest binding))
+                        (set! found binding) 0)))))
+    (load found)))
 
 ;; The innermost binding of a name, or NO-NODE. Searched from the TOP down so an inner `let`
 ;; shadows an outer one; the checker has already established that the name is bound at all.
@@ -464,14 +845,16 @@
 ;; lowered in the caller's lowering state, so without a floor it would see the caller's `let`
 ;; bindings — dynamic scoping, and worse, dynamic scoping that only misbehaves when a caller
 ;; happens to have picked one of the macro's own names.
-(defn jl-lookup [(name (slice u8))] (-> i64)
-  (let [(mut i) (jl-depth) (mut found) NO-NODE]
-    (loop (if (or (<= (load i) (jl-frame)) (!= (load found) NO-NODE))
+(defn jl-lookup-lowered [(name (slice u8))] (-> JslLoweredValue)
+  (let [(mut i) (jl-depth) (mut found) (jl-lowered-absent) (mut done) false]
+    (loop (if (or (<= (load i) (jl-frame)) (load done))
               (break)
               (do
                 (set! i (- (load i) 1))
                 (let [b (jl-bind-p (load i))]
-                  (if (= name (.name b)) (set! found (.node b)) 0))
+                  (if (= name (.name b))
+                      (do (set! found (.value b))
+                          (set! done true)) 0))
                 0)))
     (load found)))
 
@@ -480,24 +863,6 @@
 ; ============================================================================
 (defn jl-const [(t i64)] (-> i64)
   (n-peephole (n-new1 (Const t) (.anchor (jl)))))
-
-;; A bare symbol: a literal, or a binding. Parameters are bindings too — `jl-lower-decl!` creates
-;; one `OPTAG-PARM` per parameter at entry and binds it by name.
-;;
-;; ONE PARM NODE PER PARAMETER, NOT ONE PER REFERENCE. `op-gvn?` excludes Parm, so `n-parm!` called
-;; twice for the same index yields two live `Parm.0` nodes. Nothing about that graph looks wrong
-;; locally, and the type analysis is perfectly happy with it; what notices is `VERR-CALL-ARITY`,
-;; several nodes away, because the verifier reads a function's arity off its Parm nodes and a
-;; one-parameter builtin referencing its argument twice then appears to take two. That is why the
-;; binding environment owns parameters instead of this function minting them on demand.
-(defn jl-symbol [(s (slice u8))] (-> i64)
-  (let [lit (jsl-literal-ty s)]
-    (if (!= lit TY-NO-ID) (jl-const lit)
-      (let [b (jl-lookup s)]
-        (if (!= b NO-NODE) b
-          (do (panic-corrupt s)
-              (panic-corrupt "jsl lowering: unbound symbol reached lowering; the checker should have refused it")
-              NO-NODE))))))
 
 ; ============================================================================
 ; The expression walk
@@ -568,7 +933,10 @@
   ;; the unbox IS the conversion, which is why the frontend's own `fng-to-number-operand` is a bare
   ;; `n-unbox!`. See docs/DSL-OWNERSHIP.md.
   (if (= id JSP-UNBOXNUMBER)
-      (n-peephole (n-new2 (Unbox (jsp-aux id)) NO-NODE a))
+      ;; Numeric unboxing accepts both tagged integers and IEEE doubles, but it still rejects
+      ;; every non-Number tag. Carry the current control so GCM cannot hoist that checked
+      ;; conversion above the `%IsNumber` branch that established its representation.
+      (n-peephole (n-new2 (Unbox (jsp-aux id)) (jl-ctrl) a))
   (if (or (= id JSP-UNBOXINT)
           (or (= id JSP-UNBOXFLT)
               (or (= id JSP-UNBOXOBJ) (= id JSP-UNBOXSTRING))))
@@ -631,10 +999,13 @@
         (if (op-value-is? op PropLoadKey [_])
             (if (= id JSP-OWNPROPERTYATTRS)
                 (n-own-property-attributes-at! (jl-ctrl) (jl-mem) a b)
-                (if (or (= id JSP-PROPERTYGETTER)
-                        (or (= id JSP-PROPERTYSETTER) (= id JSP-PROPERTYATTRS)))
-                    (n-property-component-at! (jl-ctrl) (jl-mem) a b (jsp-aux id))
-                    (n-prop-load-key-at! (jl-ctrl) (jl-mem) a b)))
+                (if (= id JSP-GETPROTOTYPE)
+                    (n-get-prototype-at! (jl-ctrl) (jl-mem) a b)
+                    (if (or (= id JSP-PROPERTYGETTER)
+                            (or (= id JSP-PROPERTYSETTER) (= id JSP-PROPERTYATTRS)))
+                        (n-property-component-at! (jl-ctrl) (jl-mem) a b (jsp-aux id))
+                        (n-prop-load-key-operation-at!
+                          (jl-ctrl) (jl-mem) a b (jsp-aux id)))))
         (if (op-value-is? op PropHasKey [])
             (n-prop-has-key-at! (jl-ctrl) (jl-mem) a b)
         (if (op-value-is? op PropDeleteKey [])
@@ -648,7 +1019,8 @@
                                              (= id JSP-DEFINEPROPERTYSETTER)))
                                      (n-define-property-component-at! (jl-ctrl) (jl-mem) a b c
                                                                       (jsp-aux id))
-                                     (n-prop-store-key-at! (jl-ctrl) (jl-mem) a b c))))
+                                     (n-prop-store-key-operation-at!
+                                       (jl-ctrl) (jl-mem) a b c (jsp-aux id)))))
                 (jl-const (t-undef)))
         (if (op-value-is? op PropLoad [_])
             (n-peephole (n-new3 (PropLoad (jl-static-property-key b))
@@ -696,25 +1068,147 @@
     (rd/KFloat [bits] bits)
     (_ 0)))
 
-(defn jl-expr [(x (ptr rd/Sexp))] (-> i64)
-  (if (jl-diverged?) NO-NODE
-    (if (rd/sexp-int? x) (jl-const (t-int-con (rd/sexp-int x)))
-      (if (rd/sexp-float? x) (jl-const (t-flt-bits (jl-float-bits x)))
-        (if (rd/sexp-str? x) (n-string-const! (jss-from-utf8! (rd/sexp-str x)))
-          (if (rd/sexp-sym? x) (jl-symbol (rd/sexp-sym x))
-            (let [name (rd/sexp-sym (rd/sexp-nth x 0))]
-              (cond (= name "let") (jl-let x)
-                    (= name "if") (jl-if x)
-                    (= name "goto") (jl-goto x)
-                    (= name "loop") (jl-loop x)
-                    (= name "recur") (jl-recur x)
-                    (= name "call") (jl-js-call x)
-                    (= name "call-with-receiver") (jl-js-call-with-receiver x)
-                    (= name "call-dynamic-with-receiver")
-                      (jl-js-call-dynamic-with-receiver x)
-                    (= name "closure") (jl-closure x)
-                    (jsl-prim-name? name) (jl-prim-call x name)
-                    :else (jl-call x name)))))))))
+(defn jl-lowered-node-result! [(node i64)] (-> JslLoweredValue)
+  (if (= node NO-NODE) (jl-lowered-absent)
+      (jl-lowered-scalar! node (n-ty node))))
+
+;; The expression evaluator has one result type. Scalar graph builders are wrapped as one-slot
+;; values here; aggregate and control constructs already return logical descriptors directly.
+(defn jl-expr-lowered [(x (ptr rd/Sexp))] (-> JslLoweredValue)
+  (if (jl-diverged?) (jl-lowered-absent)
+      (if (rd/sexp-int? x)
+          (jl-lowered-scalar! (jl-const (t-int-con (rd/sexp-int x)))
+                              (t-int-con (rd/sexp-int x)))
+        (if (rd/sexp-float? x)
+            (let [ty (t-flt-bits (jl-float-bits x))]
+              (jl-lowered-scalar! (jl-const ty) ty))
+          (if (rd/sexp-str? x)
+              (let [node (n-string-const! (jss-from-utf8! (rd/sexp-str x)))]
+                (jl-lowered-scalar! node (n-ty node)))
+            (if (rd/sexp-sym? x)
+                (let [name (rd/sexp-sym x)
+                      literal (jsl-literal-ty name)]
+                  (if (!= literal TY-NO-ID)
+                      (jl-lowered-scalar! (jl-const literal) literal)
+                      (jl-lookup-lowered name)))
+                (let [name (rd/sexp-sym (rd/sexp-nth x 0))]
+                  (cond (= name "let") (jl-let x)
+                        (= name "if") (jl-if x)
+                        (= name "goto") (jl-goto x)
+                        (= name "loop") (jl-loop x)
+                        (= name "recur") (jl-lowered-node-result! (jl-recur x))
+                        (= name "record-new") (jl-record-new x)
+                        (= name "record-get") (jl-record-get x)
+                        (= name "record-with") (jl-record-with x)
+                        (= name "record-list-new") (jl-record-list-new x)
+                        (= name "record-list-store") (jl-record-list-store x)
+                        (= name "record-list-load") (jl-record-list-load x)
+                        (= name "call") (jl-lowered-node-result! (jl-js-call x))
+                        (= name "call-with-receiver")
+                          (jl-lowered-node-result! (jl-js-call-with-receiver x))
+                        (= name "call-dynamic-with-receiver")
+                          (jl-lowered-node-result! (jl-js-call-dynamic-with-receiver x))
+                        (= name "call-dynamic-with-receiver-rest")
+                          (jl-lowered-node-result! (jl-js-call-dynamic-with-receiver-rest x))
+                        (= name "closure") (jl-lowered-node-result! (jl-closure x))
+                        (jsl-prim-name? name)
+                          (jl-lowered-node-result! (jl-prim-call x name))
+                        :else (jl-call x name)))))))))
+
+(defn jl-record-new [(x (ptr rd/Sexp))] (-> JslLoweredValue)
+  (let [schema (jsl-record-find (rd/sexp-sym (rd/sexp-nth x 1)))
+        fields (rd/sexp-nth x 2)
+        n (jsl-record-nfields schema)
+        (mut values) (al-new [JslLoweredValue] (malloc-allocator))
+        (mut i) 0]
+    (loop (if (>= (load i) n) (break)
+              (do (al-push! [JslLoweredValue] (mut values) (jl-lowered-absent))
+                  (set! i (+ (load i) 1)))))
+    (set! i 0)
+    (loop (if (>= (load i) (rd/sexp-count fields)) (break)
+              (let [pair (rd/sexp-nth fields (load i))
+                    field (rd/sexp-sym (rd/sexp-nth pair 0))
+                    index (jsl-record-field-find schema field)
+                    value (jl-expr-lowered (rd/sexp-nth pair 1))]
+                (store! (al-elem [JslLoweredValue] (mut values) index) value)
+                (set! i (+ (load i) 1)))))
+    (let [result (jl-lowered-record-value!
+                   schema (slice-data (al-slice [JslLoweredValue] (load values))))]
+      (al-free! [JslLoweredValue] (mut values))
+      result)))
+
+(defn jl-record-get [(x (ptr rd/Sexp))] (-> JslLoweredValue)
+  (let [record (jl-expr-lowered (rd/sexp-nth x 1))
+        index (jsl-record-field-find (.logical record)
+                                     (rd/sexp-sym (rd/sexp-nth x 2)))]
+    (jl-lowered-record-field record index)))
+
+(defn jl-record-with [(x (ptr rd/Sexp))] (-> JslLoweredValue)
+  (let [record (jl-expr-lowered (rd/sexp-nth x 1))
+        schema (.logical record)
+        replace (jsl-record-field-find schema (rd/sexp-sym (rd/sexp-nth x 2)))
+        replacement (jl-expr-lowered (rd/sexp-nth x 3))
+        n (jsl-record-nfields schema)
+        (mut values) (al-new [JslLoweredValue] (malloc-allocator))
+        (mut i) 0]
+    (loop (if (>= (load i) n) (break)
+              (do (al-push! [JslLoweredValue] (mut values)
+                            (if (= (load i) replace) replacement
+                                (jl-lowered-record-field record (load i))))
+                  (set! i (+ (load i) 1)))))
+    (let [result (jl-lowered-record-value!
+                   schema (slice-data (al-slice [JslLoweredValue] (load values))))]
+      (al-free! [JslLoweredValue] (mut values))
+      result)))
+
+(defn jl-record-list-new [(x (ptr rd/Sexp))] (-> JslLoweredValue)
+  (let [schema (jsl-record-find (rd/sexp-sym (rd/sexp-nth x 1)))
+        node (jl-prim JSP-NEWARRAY NO-NODE NO-NODE NO-NODE)]
+    (jl-lowered-record-list-value! schema node)))
+
+(defn jl-record-list-store [(x (ptr rd/Sexp))] (-> JslLoweredValue)
+  (let [list (jl-expr-lowered (rd/sexp-nth x 1))
+        index (jl-lowered-scalar-node (jl-expr-lowered (rd/sexp-nth x 2)))
+        value (jl-expr-lowered (rd/sexp-nth x 3))
+        schema (jl-lowered-record-list-schema list)
+        width (jsl-record-flat-width schema)
+        base (if (= width 1) index
+                 (jl-prim JSP-MUL index (jl-const (t-int-con width)) NO-NODE))
+        (mut i) 0]
+    (if (or (!= (.kind list) JLV-RECORD-LIST) (!= (.kind value) JLV-RECORD))
+        (panic-corrupt "jsl lowering: checked Record List store has invalid lowered kinds") 0)
+    (if (!= (.logical value) schema)
+        (panic-corrupt "jsl lowering: checked Record List store has mismatched schema") 0)
+    (loop (if (>= (load i) width) (break)
+              (let [position (if (= (load i) 0) base
+                                 (jl-prim JSP-ADD base (jl-const (t-int-con (load i))) NO-NODE))
+                    stored (jl-prim JSP-ARRAYSTORE (jl-lowered-record-list-node list) position
+                                    (n-box! (jl-lowered-slot value (load i))))]
+                (jl-collect! stored)
+                (set! i (+ (load i) 1)))))
+    list))
+
+(defn jl-record-list-load [(x (ptr rd/Sexp))] (-> JslLoweredValue)
+  (let [list (jl-expr-lowered (rd/sexp-nth x 1))
+        index (jl-lowered-scalar-node (jl-expr-lowered (rd/sexp-nth x 2)))
+        schema (jl-lowered-record-list-schema list)
+        width (jsl-record-flat-width schema)
+        base (if (= width 1) index
+                 (jl-prim JSP-MUL index (jl-const (t-int-con width)) NO-NODE))
+        (mut leaves) (al-new [i64] (malloc-allocator))
+        (mut i) 0]
+    (loop (if (>= (load i) width) (break)
+              (let [position (if (= (load i) 0) base
+                                 (jl-prim JSP-ADD base (jl-const (t-int-con (load i))) NO-NODE))
+                    loaded (jl-prim JSP-ARRAYLOAD (jl-lowered-record-list-node list) position NO-NODE)
+                    target (jsl-record-flat-field-ty schema (load i))]
+                (al-push! [i64] (mut leaves)
+                          (if (= target (t-dyn)) loaded (jl-unbox target loaded)))
+                (set! i (+ (load i) 1)))))
+    (let [result (jl-lowered-record-from-slots!
+                   schema (slice-data (al-slice [i64] (load leaves))))]
+      (al-free! [i64] (mut leaves))
+      result)))
 
 (defn jl-capture-field-name [(i i64)] (-> (slice u8))
   (case i 0 "__jsl_capture_0" 1 "__jsl_capture_1"
@@ -741,6 +1235,13 @@
         (mut stores) (al-new [i64] (malloc-allocator))
         base-memory (jl-mem)
         (mut i) 0]
+    (if (or (= fun NO-NODE)
+            (or (!= (n-fun-identity-kind fun) FUN-IDENTITY-JSL)
+                (or (!= (n-fun-identity-unit fun) (jl-library-identity-unit))
+                    (or (!= (n-fun-identity-local fun) target)
+                        (!= (n-fun-index fun) (jsl-decl-fidx target))))))
+        (panic-corrupt "jsl lowering: closure target is not its declaration's semantic function")
+        0)
     ;; A zero-capture intrinsic callable needs no environment object: its bare Fun is both a stable
     ;; built-in identity and a complete dynamic-call target. Allocating an empty environment under
     ;; a JSL `if` pinned that New to one arm even after the value Phi simplified, producing a live
@@ -757,7 +1258,9 @@
                 (set! i (+ (load i) 1)))))
     (set! i 0)
     (loop (if (>= (load i) n) (break)
-            (do (al-push! [i64] (mut captures) (jl-expr (rd/sexp-nth x (+ (load i) 2))))
+            (do (al-push! [i64] (mut captures)
+                          (jl-lowered-scalar-node
+                            (jl-expr-lowered (rd/sexp-nth x (+ (load i) 2)))))
                 (set! i (+ (load i) 1)))))
     (let [nw (n-new-obj! (jl-ctrl) shape (al-slice [i64] (load incoming)))
           object (n-obj-ptr nw)]
@@ -791,13 +1294,15 @@
 ;; JavaScript argument; the CallEnd-rooted Arg is the opaque heap the callback returned.
 (defn jl-js-call [(x (ptr rd/Sexp))] (-> i64)
   (block :done
-    (let [callee (jl-expr (rd/sexp-nth x 1))
+    (let [callee (jl-lowered-scalar-node (jl-expr-lowered (rd/sexp-nth x 1)))
           n (- (rd/sexp-count x) 2)
           buf (primitive/alloc-stack (array i64 17))
           p (cast (ptr i64) buf)
           (mut i) 0]
       (loop (if (>= (load i) n) (break)
-              (do (store! (index p (load i)) (jl-expr (rd/sexp-nth x (+ (load i) 2))))
+              (do (store! (index p (load i))
+                          (jl-lowered-scalar-node
+                            (jl-expr-lowered (rd/sexp-nth x (+ (load i) 2)))))
                   (store! i (+ (load i) 1))
                   0)))
       (if (jl-diverged?) (return-from :done NO-NODE) 0)
@@ -811,14 +1316,18 @@
       ;; callee prologue unboxes parameter 0); only a runtime-value callee needs tag dispatch,
       ;; and there the tagged callee value doubles as the environment.
       (let [direct (or (op-is? callee Fun [_]) (op-is? callee Closure [_]))
-            cs (n-call-receiver! (jl-ctrl) callee
-                                 (if direct (n-box! callee) callee)
-                                 (n-box! (jl-const (t-undef)))
-                                 (jl-const (t-int-con n))
-                                 (slice-new [i64] p (+ n 1)))
+            cs (if direct
+                   (n-call-receiver! (jl-ctrl) callee
+                                     (n-box! callee)
+                                     (n-box! (jl-const (t-undef)))
+                                     (jl-const (t-int-con n))
+                                     (slice-new [i64] p (+ n 1)))
+                   (n-call-dynamic-receiver! (jl-ctrl) callee callee
+                                             (n-box! (jl-const (t-undef)))
+                                             (jl-const (t-int-con n))
+                                             (slice-new [i64] p (+ n 1))))
             end (call-end cs)]
-      (if direct 0 (do (n-set-op! (call-value cs) (Call CALL-ABI-DYNAMIC-RECEIVER)) 0))
-        (al-push! [i64] (field (jl) callback-calls) (call-value cs))
+        (al-push! [i64] (field (jl) callback-calls) (call-node cs))
         (jl-set-ctrl! end)
         (jl-set-mem! (n-new1 (Arg (t-mem-alias JS-PROPERTY-ALIAS (t-undef))) end))
         ;; A JavaScript call expression always yields a tagged language value even when the
@@ -906,17 +1415,26 @@
               (set! fidx (+ (load fidx) 1)))))
     (load count)))
 
+;; Receiver calls have a deliberately polymorphic representation boundary. Exact Object receivers
+;; stay as raw managed pointers so a shaped callee can consume them directly; every other
+;; ECMAScript value crosses tagged, which is essential for strict primitive receivers. This is the
+;; same two-member contract verified for receiver slots in `verify.coil`.
+(defn jl-call-receiver-value [(value i64)] (-> i64)
+  (if (= (n-rep-of value 8) REP-RAW-PTR) value (n-box! value)))
+
 (defn jl-js-call-receiver-core [(x (ptr rd/Sexp)) (dynamic bool)] (-> i64)
   (block :done
-    (let [raw-callee (jl-expr (rd/sexp-nth x 1))
+    (let [raw-callee (jl-lowered-scalar-node (jl-expr-lowered (rd/sexp-nth x 1)))
           targets (if dynamic (jl-frontend-function-targets) 0)
           callee
             (if (and dynamic (!= targets 0))
-                (n-peephole
-                  (n-new2 (Cast (t-fun-set targets))
-                          (jl-ctrl) raw-callee))
+                ;; Attach the closed-world target constraint only after the Cast has a dynamic
+                ;; Call use. Peepholing it in isolation can discharge/devirtualize the singleton
+                ;; before the Call exists to say that runtime callable identity must be retained.
+                (n-new2 (Cast (t-fun-set targets)) (jl-ctrl) raw-callee)
                 raw-callee)
-          receiver (jl-expr (rd/sexp-nth x 2))
+          receiver (jl-call-receiver-value
+                     (jl-lowered-scalar-node (jl-expr-lowered (rd/sexp-nth x 2))))
           n (- (rd/sexp-count x) 3)
           max-params (if dynamic (jl-frontend-max-params targets) (+ n 2))
           ;; Parameter indices include hidden environment (0), receiver (1), and actual argc (2).
@@ -925,7 +1443,9 @@
           p (cast (ptr i64) buf)
           (mut i) 0]
       (loop (if (>= (load i) n) (break)
-              (do (store! (index p (load i)) (jl-expr (rd/sexp-nth x (+ (load i) 3))))
+              (do (store! (index p (load i))
+                          (jl-lowered-scalar-node
+                            (jl-expr-lowered (rd/sexp-nth x (+ (load i) 3)))))
                   (store! i (+ (load i) 1))
                   0)))
       ;; JavaScript permits missing arguments. The specialized native ABI does not, so dynamic
@@ -946,11 +1466,14 @@
       (store! (index p call-n) (jl-call-mem))
       ;; The callee value doubles as the hidden environment: a closure is its own environment
       ;; object, and a bare function ignores the slot entirely.
-      (let [cs (n-call-receiver! (jl-ctrl) callee callee receiver
-                               (jl-const (t-int-con n))
-                               (slice-new [i64] p (+ call-n 1)))
+      (let [cs (if dynamic
+                   (n-call-dynamic-receiver! (jl-ctrl) callee callee receiver
+                                             (jl-const (t-int-con n))
+                                             (slice-new [i64] p (+ call-n 1)))
+                   (n-call-receiver! (jl-ctrl) callee callee receiver
+                                     (jl-const (t-int-con n))
+                                     (slice-new [i64] p (+ call-n 1))))
           end (call-end cs)]
-        (if dynamic (n-set-op! (call-value cs) (Call CALL-ABI-DYNAMIC-RECEIVER)) 0)
         (jl-set-ctrl! end)
         (jl-set-mem! (n-new1 (Arg (t-mem-alias JS-PROPERTY-ALIAS (t-undef))) end))
         (let [value (n-box! (call-value cs))]
@@ -963,19 +1486,65 @@
 (defn jl-js-call-dynamic-with-receiver [(x (ptr rd/Sexp))] (-> i64)
   (jl-js-call-receiver-core x true))
 
+;; Invoke [[Call]] with a compile-away `(rest dyn)` binding. The rest binding is a window of SSA
+;; values, not a JavaScript Array: spreading it copies those value edges into the ordinary call ABI
+;; and allocates nothing observable. Closed-world padding remains structural and the actual count
+;; slot retains the exact List length.
+(defn jl-js-call-dynamic-with-receiver-rest [(x (ptr rd/Sexp))] (-> i64)
+  (block :done
+    (let [raw-callee (jl-lowered-scalar-node (jl-expr-lowered (rd/sexp-nth x 1)))
+          targets (jl-frontend-function-targets)
+          callee (if (!= targets 0)
+                     (n-new2 (Cast (t-fun-set targets)) (jl-ctrl) raw-callee)
+                     raw-callee)
+          receiver (jl-call-receiver-value
+                     (jl-lowered-scalar-node (jl-expr-lowered (rd/sexp-nth x 2))))
+          rest-name (rd/sexp-sym (rd/sexp-nth x 3))
+          binding (jl-rest-binding rest-name)]
+      (if (= (cast i64 binding) 0)
+          (do (panic-corrupt "jsl lowering: checked rest binding is absent")
+              (return-from :done NO-NODE)) 0)
+      (let [n (.rest-len binding)
+            max-params (jl-frontend-max-params targets)
+            call-n (if (> (- max-params 3) n) (- max-params 3) n)
+            buf (primitive/alloc-stack (array i64 17))
+            p (cast (ptr i64) buf)
+            (mut i) 0]
+        (loop (if (>= (load i) n) (break)
+                  (do (store! (index p (load i))
+                              (al-get [i64] (.restvals (jl))
+                                      (+ (.rest-off binding) (load i))))
+                      (store! i (+ (load i) 1)))))
+        (if (!= targets 0)
+            (loop (if (>= (load i) call-n) (break)
+                      (do (store! (index p (load i)) (n-box! (jl-const (t-undef))))
+                          (store! i (+ (load i) 1)))))
+            0)
+        (if (jl-diverged?) (return-from :done NO-NODE) 0)
+        (store! (index p call-n) (jl-call-mem))
+        (let [cs (n-call-dynamic-receiver! (jl-ctrl) callee callee receiver
+                                           (jl-const (t-int-con n))
+                                           (slice-new [i64] p (+ call-n 1)))
+              end (call-end cs)]
+          (jl-set-ctrl! end)
+          (jl-set-mem! (n-new1 (Arg (t-mem-alias JS-PROPERTY-ALIAS (t-undef))) end))
+          (let [value (n-box! (call-value cs))]
+            (jl-check-pending! value)
+            value))))))
+
 ;; A bail-out. The current control is parked on the label's pending list and the path is marked
 ;; diverged; the destination does not exist yet, because it is built at the CALL SITE out of every
 ;; exit that reached the label. That is the whole of Torque's `otherwise`: a macro names where it
 ;; gives up, and the caller decides what giving up means.
-(defn jl-goto [(x (ptr rd/Sexp))] (-> i64)
+(defn jl-goto [(x (ptr rd/Sexp))] (-> JslLoweredValue)
   (jl-exit-push! (jl-ctrl))
   (jl-set-ctrl! JL-DIVERGED)
-  NO-NODE)
+  (jl-lowered-absent))
 
 ;; `let` is sequential: a binding sees the ones before it, the body sees them all, and nothing
 ;; outside sees any of them. The bindings emit no node of their own — a JSL binding IS an SSA
 ;; value, which is why the lowering has no notion of a local slot.
-(defn jl-let [(x (ptr rd/Sexp))] (-> i64)
+(defn jl-let [(x (ptr rd/Sexp))] (-> JslLoweredValue)
   (let [binds (rd/sexp-nth x 1)
         nb (rd/sexp-count binds)
         depth (jl-depth)
@@ -983,20 +1552,21 @@
     (loop (if (>= (load i) nb) (break)
             (do
               (let [b (rd/sexp-nth binds (load i))]
-                (jl-bind! (rd/sexp-sym (rd/sexp-nth b 0)) (jl-expr (rd/sexp-nth b 1))))
+                (jl-bind-lowered! (rd/sexp-sym (rd/sexp-nth b 0))
+                                  (jl-expr-lowered (rd/sexp-nth b 1))))
               (set! i (+ (load i) 1))
               0)))
     ; The body is every form after the binding list; its value is the last one.
     (let [n (rd/sexp-count x)
           (mut k) 2
-          (mut v) NO-NODE]
+          (mut v) (jl-lowered-absent)]
       (loop (if (>= (load k) n) (break)
-              (do (set! v (jl-expr (rd/sexp-nth x (load k))))
+              (do (set! v (jl-expr-lowered (rd/sexp-nth x (load k))))
                   (set! k (+ (load k) 1))
                   0)))
-      (jl-keep! (load v))
+      (jl-lowered-keep! (load v))
       (jl-drop! depth)
-      (jl-unkeep! (load v))
+      (jl-lowered-unkeep! (load v))
       (load v))))
 
 ;; A diamond. Built in corpus.coil's documented order, and the keeps are not belt and braces: an
@@ -1017,33 +1587,68 @@
       (wl-push! phi)
       phi)))
 
-(defn jl-join [(va i64) (xa i64) (ma i64) (vb i64) (xb i64) (mb i64)] (-> i64)
+(defn jl-value-phi [(region i64) (a i64) (b i64) (ty i64)] (-> i64)
+  (if (= a b) a
+    (let [phi (n-new (Phi ty))]
+      (n-add-def! phi region)
+      (n-add-def! phi a)
+      (n-add-def! phi b)
+      (wl-push! phi)
+      phi)))
+
+(defn jl-lowered-value-join [(region i64) (a JslLoweredValue) (b JslLoweredValue)]
+                             (-> JslLoweredValue)
+  (let [scalar (= (.kind a) JLV-SCALAR)
+        compatible
+          (and (!= (.kind a) JLV-ABSENT)
+               (and (= (.kind a) (.kind b))
+                    (and (= (.slots-len a) (.slots-len b))
+                         (or scalar (= (.logical a) (.logical b))))))]
+    (if (= compatible false)
+        (do (panic-corrupt "jsl lowering: branch join has incompatible lowered values")
+            (jl-lowered-absent))
+        (let [prototype (jl-lowered-view (.kind a)
+                                         (if scalar (t-dyn) (.logical a))
+                                         (.slots-off a) (.slots-len a))
+              (mut slots) (al-new [i64] (malloc-allocator))
+              (mut index) 0]
+          (loop (if (>= (load index) (.slots-len prototype)) (break)
+                    (do (al-push! [i64] (mut slots)
+                                  (jl-value-phi region
+                                    (jl-lowered-slot a (load index))
+                                    (jl-lowered-slot b (load index))
+                                    (if scalar (t-dyn)
+                                        (jl-lowered-slot-type prototype (load index)))))
+                        (set! index (+ (load index) 1)))))
+          (let [result (jl-lowered-from-slots-like!
+                         prototype (slice-data (al-slice [i64] (load slots))))]
+            (al-free! [i64] (mut slots))
+            result)))))
+
+(defn jl-join-lowered [(va JslLoweredValue) (xa i64) (ma i64)
+                       (vb JslLoweredValue) (xb i64) (mb i64)] (-> JslLoweredValue)
   (if (= xa JL-DIVERGED)
       ; Both gone means the whole construct diverges; one gone is not a merge at all, and building
       ; a Region for it would leave a one-armed merge for the peepholes to undo. The surviving
       ; path's heap is the heap.
       (do (jl-set-ctrl! xb)
-          (if (= xb JL-DIVERGED) NO-NODE (do (jl-set-mem! mb) vb)))
+          (if (= xb JL-DIVERGED) (jl-lowered-absent) (do (jl-set-mem! mb) vb)))
     (if (= xb JL-DIVERGED)
         (do (jl-set-ctrl! xa) (jl-set-mem! ma) va)
       (let [region (n-new (Region))]
         (n-add-def! region NO-NODE)
         (n-add-def! region xa)
         (n-add-def! region xb)
-        (let [phi (n-new (Phi (t-dyn)))]
-          (n-add-def! phi region)
-          (n-add-def! phi va)
-          (n-add-def! phi vb)
+        (let [value (jl-lowered-value-join region va vb)]
           (wl-push! region)
-          (wl-push! phi)
           ; The heap merges the same way the value does, and it must: an arm that wrote and an arm
           ; that did not leave DIFFERENT memory states, and reading the pre-branch memory after the
           ; merge would silently miss the write on exactly one path.
           (if (= (jl-mem-raw) NO-NODE) 0 (jl-set-mem! (jl-mem-phi region ma mb)))
           (jl-set-ctrl! region)
-          phi)))))
+          value)))))
 
-(defn jl-if-dynamic [(x (ptr rd/Sexp)) (pred i64)] (-> i64)
+(defn jl-if-dynamic [(x (ptr rd/Sexp)) (pred i64)] (-> JslLoweredValue)
   (let [iff (n-peephole (n-new2 (If) (jl-ctrl) pred))
         arms (n-if-arms! iff)
         at (arms-t arms)
@@ -1051,28 +1656,28 @@
     (jl-keep! at) (jl-keep! af)
     (let [m0 (jl-mem-raw)]
     (jl-set-ctrl! at)
-    (let [va (jl-expr (rd/sexp-nth x 2))
+    (let [va (jl-expr-lowered (rd/sexp-nth x 2))
           xa (jl-ctrl)
           ma (jl-mem-raw)]
-      (jl-keep! va) (jl-keep! xa)
+      (jl-lowered-keep! va) (jl-keep! xa)
       (jl-set-ctrl! af)
       (jl-set-mem! m0)
-      (let [vb (jl-expr (rd/sexp-nth x 3))
+      (let [vb (jl-expr-lowered (rd/sexp-nth x 3))
             xb (jl-ctrl)
             mb (jl-mem-raw)]
-        (jl-keep! vb) (jl-keep! xb)
+        (jl-lowered-keep! vb) (jl-keep! xb)
         ; The Region and the Phi are built UNPEEPHOLED and pushed together inside `jl-join`: a
         ; two-armed Region with no Phi yet is a degenerate diamond that collapses on sight. The
         ; declared Phi type is `dyn` — the ABSENCE of a claim about the merged value, which is what
         ; D8 says every unproven position must start from.
-        (let [r (jl-join va xa ma vb xb mb)]
-          (jl-unkeep! xb) (jl-unkeep! vb)
-          (jl-unkeep! xa) (jl-unkeep! va)
+        (let [r (jl-join-lowered va xa ma vb xb mb)]
+          (jl-unkeep! xb) (jl-lowered-unkeep! vb)
+          (jl-unkeep! xa) (jl-lowered-unkeep! va)
           (jl-unkeep! af) (jl-unkeep! at)
           r))))))
 
-(defn jl-if [(x (ptr rd/Sexp))] (-> i64)
-  (let [pred (jl-expr (rd/sexp-nth x 1))]
+(defn jl-if [(x (ptr rd/Sexp))] (-> JslLoweredValue)
+  (let [pred (jl-lowered-scalar-node (jl-expr-lowered (rd/sexp-nth x 1)))]
     ;; The checker has already validated both arms. If construction proves the predicate, lower
     ;; only the reachable arm: building an unreachable arm and then peepholing its If used to kill
     ;; the control projection while leaving its values wired into the later Region/Phi.
@@ -1092,16 +1697,16 @@
     ;; `%IsInt` on a boxed argument never proved, so this branch was rarely taken. See
     ;; docs/DSL-OWNERSHIP.md.
     (if (= (n-ty pred) (t-bool-con true))
-        (let [v (jl-expr (rd/sexp-nth x 2))]
-          (jl-keep! v)
+        (let [v (jl-expr-lowered (rd/sexp-nth x 2))]
+          (jl-lowered-keep! v)
           (jl-collect! pred)
-          (jl-unkeep! v)
+          (jl-lowered-unkeep! v)
           v)
         (if (= (n-ty pred) (t-bool-con false))
-            (let [v (jl-expr (rd/sexp-nth x 3))]
-              (jl-keep! v)
+            (let [v (jl-expr-lowered (rd/sexp-nth x 3))]
+              (jl-lowered-keep! v)
               (jl-collect! pred)
-              (jl-unkeep! v)
+              (jl-lowered-unkeep! v)
               v)
             (jl-if-dynamic x pred)))))
 
@@ -1114,21 +1719,32 @@
 ;; `recur` diverges exactly as `goto` does, so a body of the shape `(if c (recur …) v)` needs no
 ;; special case: one arm bails, the other carries the value, and `jl-join` already collapses that to
 ;; the surviving arm rather than a degenerate merge.
-(defn jl-loop [(x (ptr rd/Sexp))] (-> i64)
+(defn jl-flatten-lowered! [(values (ptr (ArrayList i64))) (value JslLoweredValue)] (-> i64)
+  (let [(mut index) 0]
+    (loop (if (>= (load index) (.slots-len value)) (break)
+              (do (al-push! [i64] values (jl-lowered-slot value (load index)))
+                  (set! index (+ (load index) 1)))))
+    0))
+
+(defn jl-loop [(x (ptr rd/Sexp))] (-> JslLoweredValue)
   (let [binds (rd/sexp-nth x 1)
         nb (rd/sexp-count binds)
         ;; Initialisers can move control through calls and dynamic guards. Capture the loop entry
         ;; only after all of them have run; wiring the Loop to the pre-initialiser control strands
         ;; their exit Region as a value-only CFG sink.
         (mut entry) (jl-ctrl)
-        buf (primitive/alloc-stack (array i64 16))
-        inits (cast (ptr i64) buf)
-        pbuf (primitive/alloc-stack (array i64 16))
-        phis (cast (ptr i64) pbuf)
+        (mut source-inits) (al-new [JslLoweredValue] (malloc-allocator))
+        type-off (al-len [JslLoweredValue] (.looptypes (jl)))
+        (mut inits) (al-new [i64] (malloc-allocator))
+        (mut phis) (al-new [i64] (malloc-allocator))
         (mut k) 0]
     ; Initialisers run once, in the ENCLOSING scope, before the loop node exists.
     (loop (if (>= (load k) nb) (break)
-            (do (set! (index inits (load k)) (jl-expr (rd/sexp-nth (rd/sexp-nth binds (load k)) 1)))
+            (let [value (jl-expr-lowered (rd/sexp-nth (rd/sexp-nth binds (load k)) 1))]
+              (al-push! [JslLoweredValue] (mut source-inits) value)
+              (jl-lowered-keep! value)
+              (al-push! [JslLoweredValue] (field (jl) looptypes) value)
+              (jl-flatten-lowered! (mut inits) value)
                 (set! k (+ (load k) 1))
                 0)))
     (set! entry (jl-ctrl))
@@ -1146,18 +1762,30 @@
       (n-add-def! lp (load entry))
       (n-add-def! lp NO-NODE)          ; the back edge, filled in below
       (set! k 0)
-      (loop (if (>= (load k) nb) (break)
-              (let [binding (rd/sexp-nth binds (load k))
-                    declared (if (= (rd/sexp-count binding) 3)
-                                 (jsl-type-of (rd/sexp-nth binding 2))
-                                 (t-dyn))
-                    ph (n-new (Phi declared))]
-                (n-add-def! ph lp)
-                (n-add-def! ph (load (index inits (load k))))
-                (n-add-def! ph NO-NODE)  ; the recur value, filled in below
-                (set! (index phis (load k)) ph)
-                (set! k (+ (load k) 1))
-                0)))
+      (let [(mut flat) 0]
+        (loop (if (>= (load k) nb) (break)
+                (let [binding (rd/sexp-nth binds (load k))
+                      logical (al-get [JslLoweredValue] (.looptypes (jl))
+                                      (+ type-off (load k)))
+                      width (.slots-len logical)
+                      (mut field) 0]
+                  (loop (if (>= (load field) width) (break)
+                          (let [declared
+                                  (if (= (.kind logical) JLV-SCALAR)
+                                      (if (= (rd/sexp-count binding) 3)
+                                          (jsl-type-of (rd/sexp-nth binding 2))
+                                          (t-dyn))
+                                      (jl-lowered-slot-type logical (load field)))
+                                ph (n-new (Phi declared))]
+                            (n-add-def! ph lp)
+                            (n-add-def! ph (al-get (load inits) (load flat)))
+                            (n-add-def! ph NO-NODE)
+                            (al-push! [i64] (mut phis) ph)
+                            (set! flat (+ (load flat) 1))
+                            (set! field (+ (load field) 1)))))
+                  (jl-lowered-unkeep!
+                    (al-get [JslLoweredValue] (load source-inits) (load k)))
+                  (set! k (+ (load k) 1))))))
       ; THE HEAP IS AN EXTRA, UNNAMED BINDING. A loop that writes the heap needs a memory Phi for
       ; exactly the reason it needs one per value: the body reads what the previous iteration wrote,
       ; and the entry memory is only right on the first trip. It is built here alongside the value
@@ -1174,48 +1802,68 @@
             (mut frame) (zeroed JslLoop)]
         (if (= memphi NO-NODE) 0 (jl-set-mem! memphi))
         (set! (.nbind frame) nb)
+        (set! (.nflat frame) (al-len [i64] (load phis)))
+        (set! (.type-off frame) type-off)
         (set! (.base frame) rbase)
         (set! (.vbase frame) vbase)
         (set! (.memphi frame) memphi)
         (al-push! [JslLoop] (field (jl) loops) (load frame))
         (set! k 0)
-        (loop (if (>= (load k) nb) (break)
-                (do (jl-bind! (rd/sexp-sym (rd/sexp-nth (rd/sexp-nth binds (load k)) 0))
-                              (load (index phis (load k))))
-                    (set! k (+ (load k) 1))
-                    0)))
+        (let [(mut flat) 0]
+          (loop (if (>= (load k) nb) (break)
+                  (let [binding (rd/sexp-nth binds (load k))
+                        logical (al-get [JslLoweredValue] (.looptypes (jl))
+                                        (+ type-off (load k)))
+                        width (.slots-len logical)
+                        value (jl-lowered-from-slots-like!
+                                logical
+                                (index (slice-data (al-slice [i64] (load phis))) (load flat)))]
+                    (jl-bind-lowered! (rd/sexp-sym (rd/sexp-nth binding 0)) value)
+                    (set! flat (+ (load flat) width))
+                    (set! k (+ (load k) 1))))) )
         (jl-set-ctrl! lp)
         ; The body, inside the open window.
-        (let [n (rd/sexp-count x) (mut j) 2 (mut v) NO-NODE]
+        (let [n (rd/sexp-count x) (mut j) 2 (mut v) (jl-lowered-absent)]
           (loop (if (>= (load j) n) (break)
-                  (do (set! v (jl-expr (rd/sexp-nth x (load j))))
+                  (do (set! v (jl-expr-lowered (rd/sexp-nth x (load j))))
                       (set! j (+ (load j) 1))
                       0)))
           (let [exit (jl-ctrl)
                 exitmem (jl-mem-raw)]
-            (jl-keep! (load v))
+            (jl-lowered-keep! (load v))
             (jl-drop! depth)
-            (jl-unkeep! (load v))
+            (jl-lowered-unkeep! (load v))
             (al-pop! [JslLoop] (field (jl) loops))
-            (jl-loop-close! lp phis nb rbase vbase memphi exit exitmem (load v))))))))
+            (let [result (jl-loop-close-lowered! lp (al-elem [i64] (mut phis) 0)
+                                                 (al-len [i64] (load phis)) rbase vbase
+                                                 memphi exit exitmem (load v))]
+              (loop (if (<= (al-len [JslLoweredValue] (.looptypes (jl))) type-off) (break)
+                        (do (al-pop! [JslLoweredValue] (field (jl) looptypes)) 0)))
+              (al-free! [JslLoweredValue] (mut source-inits))
+              (al-free! [i64] (mut phis))
+              (al-free! [i64] (mut inits))
+              result)))))))
 
 ;; Close the phis, then the control back edge, then hand back the loop's value.
-(defn jl-loop-close! [(lp i64) (phis (ptr i64)) (nb i64) (rbase i64) (vbase i64)
-                      (memphi i64) (exit i64) (exitmem i64) (v i64)] (-> i64)
+(defn jl-loop-close-lowered! [(lp i64) (phis (ptr i64)) (nflat i64)
+                              (rbase i64) (vbase i64) (memphi i64)
+                              (exit i64) (exitmem i64) (v JslLoweredValue)]
+                              (-> JslLoweredValue)
   (let [nrec (- (jl-rctrl-count) rbase)]
     ; A loop nothing recurs to is a `let` written the long way, and would leave the Loop's back edge
     ; null. A loop everything recurs from cannot terminate and leaves the enclosing body with no
     ; Return. Both are named rather than left to produce a malformed graph three passes later.
-    (if (= nrec 0) (do (jsl-fail! JSL-ERR-LOOP-NO-RECUR "") NO-NODE)
-      (if (= exit JL-DIVERGED) (do (jsl-fail! JSL-ERR-LOOP-NO-EXIT "") NO-NODE)
+    (if (= nrec 0) (do (jsl-fail! JSL-ERR-LOOP-NO-RECUR "") (jl-lowered-absent))
+      (if (= exit JL-DIVERGED)
+          (do (jsl-fail! JSL-ERR-LOOP-NO-EXIT "") (jl-lowered-absent))
         (let [back (if (= nrec 1)
                        (al-get (.rctrl (jl)) rbase)
                        (jl-recur-region! rbase nrec))
               (mut k) 0]
           ; PHIS FIRST, then control: D9's order.
-          (loop (if (>= (load k) nb) (break)
+          (loop (if (>= (load k) nflat) (break)
                   (do (n-set-def! (load (index phis (load k))) 2
-                                  (jl-recur-value! vbase nrec nb (load k) back))
+                                  (jl-recur-value! vbase nrec nflat (load k) back))
                       (wl-push! (load (index phis (load k))))
                       (set! k (+ (load k) 1))
                       0)))
@@ -1280,7 +1928,8 @@
 ;; each of them a real user.
 (defn jl-recur-drop! [(rbase i64) (vbase i64)] (-> i64)
   (loop (if (<= (jl-rctrl-count) rbase) (break)
-          (do (jl-unkeep! (al-get (.rmem (jl)) (- (jl-rctrl-count) 1)))
+          (do (jl-unkeep! (al-get (.rctrl (jl)) (- (jl-rctrl-count) 1)))
+              (jl-unkeep! (al-get (.rmem (jl)) (- (jl-rctrl-count) 1)))
               (al-pop! [i64] (field (jl) rctrl))
               (al-pop! [i64] (field (jl) rmem))
               0)))
@@ -1293,19 +1942,29 @@
 ;; `(recur v ...)`. Parks the control and the next values on the enclosing loop's list and diverges,
 ;; the same shape `goto` uses. The destination does not exist yet: the phis are still open.
 (defn jl-recur [(x (ptr rd/Sexp))] (-> i64)
-  (let [nb (.nbind (jl-loop-p (- (jl-loop-depth) 1)))
-        buf (primitive/alloc-stack (array i64 16))
-        vals (cast (ptr i64) buf)
+  (let [frame (jl-loop-p (- (jl-loop-depth) 1))
+        nb (.nbind frame)
+        nflat (.nflat frame)
+        (mut vals) (al-new [JslLoweredValue] (malloc-allocator))
         (mut k) 0]
     ; ARGUMENTS FIRST, THEN THE CONTROL. An argument may move control — a nested `loop`, a call, an
     ; `if` — so the control at the moment of the jump is the one AFTER they are evaluated, not the
     ; one on entry. Recording it first names the block the arguments started in, and the back edge
     ; then leaves from a block that no longer runs: `g-verify` catches it, several nodes away.
     (loop (if (>= (load k) nb) (break)
-            (do (set! (index vals (load k)) (jl-expr (rd/sexp-nth x (+ (load k) 1))))
+            (let [value (jl-expr-lowered (rd/sexp-nth x (+ (load k) 1)))]
+              (al-push! [JslLoweredValue] (mut vals) value)
+              (jl-lowered-keep! value)
                 (set! k (+ (load k) 1))
                 0)))
-    (if (jl-diverged?) NO-NODE
+    (if (jl-diverged?)
+        (do (set! k 0)
+            (loop (if (>= (load k) nb) (break)
+                      (do (jl-lowered-unkeep!
+                            (al-get [JslLoweredValue] (load vals) (load k)))
+                          (set! k (+ (load k) 1)))))
+            (al-free! [JslLoweredValue] (mut vals))
+            NO-NODE)
       (do
         ; PIN EVERY PARKED VALUE UNTIL THE LOOP CLOSES. A recur's values are held in these arrays,
         ; which are Coil storage, not graph edges — so until `jl-loop-close!` wires them into the
@@ -1314,13 +1973,31 @@
         ; the `let` that dropped them.
         (al-push! [i64] (field (jl) rctrl) (jl-ctrl))
         (al-push! [i64] (field (jl) rmem) (jl-mem-raw))
+        ;; Like the parked values and memory, this control has no graph user until loop close.
+        ;; A later scope drop may otherwise collect the final CProj and leave the Loop wired to a
+        ;; dead back edge. The parked-control array is compiler storage, not an IR edge, so it must
+        ;; own an explicit pin for exactly the same interval.
+        (jl-keep! (jl-ctrl))
         (jl-keep! (jl-mem-raw))
         (set! k 0)
-        (loop (if (>= (load k) nb) (break)
-                (do (al-push! [i64] (field (jl) rvals) (load (index vals (load k))))
-                    (jl-keep! (load (index vals (load k))))
-                    (set! k (+ (load k) 1))
-                    0)))
+        (let [(mut pushed) 0]
+          (loop (if (>= (load k) nb) (break)
+                  (let [value (al-get [JslLoweredValue] (load vals) (load k))
+                        (mut flat) (al-new [i64] (malloc-allocator))
+                        (mut field) 0]
+                    (jl-flatten-lowered! (mut flat) value)
+                    (loop (if (>= (load field) (al-len [i64] (load flat))) (break)
+                            (let [leaf (al-get (load flat) (load field))]
+                              (al-push! [i64] (field (jl) rvals) leaf)
+                              (jl-keep! leaf)
+                              (set! pushed (+ (load pushed) 1))
+                              (set! field (+ (load field) 1)))))
+                    (al-free! [i64] (mut flat))
+                    (jl-lowered-unkeep! value)
+                    (set! k (+ (load k) 1)))))
+          (if (!= (load pushed) nflat)
+              (panic-corrupt "jsl lowering: recur flattening disagrees with loop schema") 0))
+        (al-free! [JslLoweredValue] (mut vals))
         (jl-set-ctrl! JL-DIVERGED)
         NO-NODE))))
 
@@ -1331,9 +2008,12 @@
 (defn jl-prim-call [(x (ptr rd/Sexp)) (name (slice u8))] (-> i64)
   (let [id (jsp-find name)
         n (jsp-arity id)
-        a (if (>= n 1) (jl-expr (rd/sexp-nth x 1)) NO-NODE)
-        b (if (>= n 2) (jl-expr (rd/sexp-nth x 2)) NO-NODE)
-        c (if (>= n 3) (jl-expr (rd/sexp-nth x 3)) NO-NODE)]
+        a (if (>= n 1)
+              (jl-lowered-scalar-node (jl-expr-lowered (rd/sexp-nth x 1))) NO-NODE)
+        b (if (>= n 2)
+              (jl-lowered-scalar-node (jl-expr-lowered (rd/sexp-nth x 2))) NO-NODE)
+        c (if (>= n 3)
+              (jl-lowered-scalar-node (jl-expr-lowered (rd/sexp-nth x 3))) NO-NODE)]
     (if (jl-diverged?) NO-NODE (jl-prim id a b c))))
 
 ;; The macro machinery. A `macro` has no `OPTAG-FUN` and is never called: its body is lowered AGAIN,
@@ -1344,15 +2024,28 @@
 ;;
 ;; The lookup frame is moved so the body cannot see the caller's bindings, and the exit list is
 ;; based so a nested expansion's `goto`s cannot be mistaken for this one's.
-(defn jl-macro-expand [(x (ptr rd/Sexp)) (callee i64) (nargs i64) (owa i64)] (-> i64)
-  (let [buf (primitive/alloc-stack (array i64 16))
-        p (cast (ptr i64) buf)
+(defn jl-macro-expand [(x (ptr rd/Sexp)) (callee i64) (nargs i64) (owa i64)]
+                       (-> JslLoweredValue)
+  (let [(mut args) (al-new [JslLoweredValue] (malloc-allocator))
+        declared (jsl-decl-nparams callee)
+        has-rest (jsl-decl-rest? callee)
+        fixed (- declared (if has-rest 1 0))
         (mut k) 0]
     ; Arguments are lowered in the CALLER's scope, before the frame moves. Call-by-value: the macro
     ; receives nodes, not source, so an argument expression is evaluated once however many times
     ; the body mentions the parameter.
     (loop (if (>= (load k) nargs) (break)
-            (do (set! (index p (load k)) (jl-expr (rd/sexp-nth x (+ (load k) 1))))
+            (do (let [value (jl-expr-lowered (rd/sexp-nth x (+ (load k) 1)))]
+                  ;; A `(rest dyn)` binding is a specification List of ECMAScript values. Preserve
+                  ;; that language-value representation at the collection boundary just as an
+                  ;; ordinary `dyn` call parameter does.
+                  (let [argument
+                          (if (and has-rest (>= (load k) fixed))
+                              (let [node (n-box! (jl-lowered-scalar-node value))]
+                                (jl-lowered-scalar! node (t-dyn)))
+                              (load value))]
+                    (jl-lowered-keep! argument)
+                    (al-push! [JslLoweredValue] (mut args) argument)))
                 (set! k (+ (load k) 1))
                 0)))
     (let [saved-frame (jl-frame)
@@ -1362,43 +2055,72 @@
           exit-base (jl-exit-count)]
       (jl-set-frame! depth)
       (set! k 0)
-      (loop (if (>= (load k) nargs) (break)
-              (do (jl-bind! (jsl-param-name callee (load k)) (load (index p (load k))))
+      (loop (if (>= (load k) fixed) (break)
+              (do (jl-bind-lowered! (jsl-param-name callee (load k))
+                                    (al-get [JslLoweredValue] (load args) (load k)))
                   (set! k (+ (load k) 1))
                   0)))
+      (if has-rest
+          (let [(mut rest) (al-new [i64] (malloc-allocator))]
+            (set! k fixed)
+            (loop (if (>= (load k) nargs) (break)
+                      (do (al-push! [i64] (mut rest)
+                                    (jl-lowered-scalar-node
+                                      (al-get [JslLoweredValue] (load args) (load k))))
+                          (set! k (+ (load k) 1)))))
+            (jl-bind-rest! (jsl-param-name callee fixed) (al-slice [i64] (load rest)))
+            (al-free! [i64] (mut rest)))
+          0)
       (set! (.decl (jl)) callee)
-      (let [v (jl-expr (jsl-decl-body callee))
+      (let [v (jl-expr-lowered (jsl-decl-body callee))
             normal (jl-ctrl)]
         (set! (.decl (jl)) saved-decl)
         (set! (.fun (jl)) saved-fun)
         (jl-set-frame! saved-frame)
-        (jl-keep! v)
+        (jl-lowered-keep! v)
         (jl-drop! depth)
-        (jl-unkeep! v)
-        (jl-macro-finish v normal callee exit-base x owa)))))
+        (jl-lowered-unkeep! v)
+        (let [result (jl-macro-finish-lowered v normal callee exit-base x owa)]
+          (jl-lowered-keep! result)
+          (set! k 0)
+          (loop (if (>= (load k) (al-len [JslLoweredValue] (load args))) (break)
+                    (let [argument (al-get [JslLoweredValue] (load args) (load k))]
+                      ;; The argument list owns a second pin in addition to the macro binding's
+                      ;; scope pin. `jl-drop!` releases the binding first, so an argument the body
+                      ;; never used is still deliberately alive at that point. Releasing this
+                      ;; final owner must perform the matching dead-value collection; otherwise
+                      ;; every unused macro argument remains as an unreachable graph island and
+                      ;; the immutable-library verifier reports VERR-LEAK.
+                      (jl-lowered-unkeep! argument)
+                      (jl-lowered-collect! argument)
+                      (set! k (+ (load k) 1)))))
+          (al-free! [JslLoweredValue] (mut args))
+          (jl-lowered-unkeep! result)
+          result)))))
 
 ;; Build the label's destination out of every exit that reached it, lower the handler there, and
 ;; merge. When no exit survived — the usual outcome once a guard folds — there is nothing to build
 ;; and the handler is simply never emitted, which is exactly the specialisation the language exists
 ;; for.
-(defn jl-macro-finish [(v i64) (normal i64) (callee i64)
-                       (exit-base i64) (x (ptr rd/Sexp)) (owa i64)] (-> i64)
+(defn jl-macro-finish-lowered [(v JslLoweredValue) (normal i64) (callee i64)
+                               (exit-base i64) (x (ptr rd/Sexp)) (owa i64)]
+                               (-> JslLoweredValue)
   (let [nexits (- (jl-exit-count) exit-base)]
     (if (= nexits 0)
         (do (jl-set-ctrl! normal) v)
       (let [hctrl (if (= nexits 1) (jl-exit exit-base) (jl-exit-region exit-base nexits))]
         (jl-exit-drop! exit-base)
-        (jl-keep! v) (jl-keep! normal) (jl-keep! hctrl)
+        (jl-lowered-keep! v) (jl-keep! normal) (jl-keep! hctrl)
         ; D4: the slow path is an ordinary CFG path carrying a cold hint. Nothing downstream needs
         ; to know it is a bail-out; the hint biases block layout and spill costs and that is all.
         (n-mark-cold! hctrl)
         (jl-set-ctrl! hctrl)
-        (let [vh (jl-expr (rd/sexp-nth x (+ owa 1)))
+        (let [vh (jl-expr-lowered (rd/sexp-nth x (+ owa 1)))
               xh (jl-ctrl)]
-          (jl-keep! vh) (jl-keep! xh)
-          (let [r (jl-join v normal (jl-mem-raw) vh xh (jl-mem-raw))]
-            (jl-unkeep! xh) (jl-unkeep! vh)
-            (jl-unkeep! hctrl) (jl-unkeep! normal) (jl-unkeep! v)
+          (jl-lowered-keep! vh) (jl-keep! xh)
+          (let [r (jl-join-lowered v normal (jl-mem-raw) vh xh (jl-mem-raw))]
+            (jl-unkeep! xh) (jl-lowered-unkeep! vh)
+            (jl-unkeep! hctrl) (jl-unkeep! normal) (jl-lowered-unkeep! v)
             r))))))
 
 ;; More than one `goto` to the same label. Unpeepholed and worklisted, following the same rule the
@@ -1418,7 +2140,7 @@
 ;; `call-idealize` accepts a Fun directly, `OPTAG-FUN` computes to `t-fun-con fidx` so
 ;; `infer-call-targets` sees an exact singleton, and with no captures `infer-parm-source` maps
 ;; argument `k` to input `2 + k` either way. A Closure would be a wrapper carrying nothing.
-(defn jl-call [(x (ptr rd/Sexp)) (name (slice u8))] (-> i64)
+(defn jl-call [(x (ptr rd/Sexp)) (name (slice u8))] (-> JslLoweredValue)
   (let [callee (jsl-find name)
         owa (jsl-otherwise-at x)
         nargs (if (>= owa 0) (- owa 1) (- (rd/sexp-count x) 1))]
@@ -1429,55 +2151,167 @@
         (jl-macro-expand x callee nargs owa)
         (jl-builtin-call x callee nargs))))
 
-(defn jl-call-argument [(callee i64) (index i64) (value i64)] (-> i64)
+(defn jl-call-argument [(callee i64) (index i64) (value JslLoweredValue)] (-> i64)
   ;; `dyn` is the tagged JavaScript-value ABI. The other JSL annotations name raw machine
   ;; representations consumed by their primitives. `n-box!` is representation-aware: an already
   ;; tagged argument remains unchanged, while raw strings, objects, arrays, and numbers acquire
   ;; exactly their structural JavaScript tag.
-  (if (= (jsl-param-ty callee index) (t-dyn)) (n-box! value) value))
+  (let [raw (jl-lowered-scalar-node value)]
+    (if (and (= (jsl-param-ty callee index) (t-dyn))
+             (!= (.logical value) (t-dyn)))
+        (n-box! raw)
+        raw)))
 
-(defn jl-builtin-call [(x (ptr rd/Sexp)) (callee i64) (nargs i64)] (-> i64)
+(defn jl-push-builtin-argument! [(callee i64) (source-index i64)
+                                 (value JslLoweredValue)
+                                 (args (ptr (ArrayList i64)))] (-> i64)
+  (let [record (jsl-param-record callee source-index)
+        expected-off (jsl-param-lowered-off callee source-index)
+        expected-width (jsl-param-lowered-width callee source-index)]
+    (if (!= (al-len [i64] (load args)) expected-off)
+        (panic-corrupt "jsl lowering: call argument does not begin at its canonical lowered range")
+        0)
+    (if (>= record 0)
+        (let [(mut leaf) 0]
+          (if (not (jl-lowered-matches-param? callee source-index value))
+              (panic-corrupt "jsl lowering: Record argument disagrees with its canonical signature")
+              0)
+          (loop (if (>= (load leaf) expected-width) (break)
+                  (let [arg (jl-lowered-slot value (load leaf))]
+                    ;; Matching Record schemas already guarantee the exact canonical physical
+                    ;; leaf representation. Re-boxing a dyn leaf here turns `Parm dyn` into a
+                    ;; second representation conversion and corrupts the transported value.
+                    (jl-keep! arg)
+                    (al-push! [i64] args arg)
+                    (set! leaf (+ (load leaf) 1)))))
+          0)
+        (let [arg (jl-call-argument callee source-index value)]
+          (if (!= expected-width 1)
+              (panic-corrupt "jsl lowering: scalar parameter has a non-scalar lowered range") 0)
+          (jl-keep! arg)
+          (al-push! [i64] args arg)
+          0))))
+
+;; The one callable boundary for checked logical values. Source arity is validated before any
+;; physical slots are emitted; `jl-push-builtin-argument!` consumes the declaration's retained
+;; lowered ranges, and the result is published immediately as one logical slot-range descriptor.
+(defn jl-call-lowered-core! [(ctrl i64) (callee i64) (values (slice JslLoweredValue))
+                             (memory i64)] (-> JslLoweredCall)
+  (if (jsl-signature-valid? callee) 0
+      (panic-corrupt "jsl lowering: callee has an inconsistent canonical signature"))
+  (let [(mut args) (al-new [i64] (malloc-allocator))
+        uses-mem (jsl-decl-uses-memory? callee)
+        (mut i) 0
+        (mut answer) (zeroed JslLoweredCall)]
+    (if (!= (slice-len values) (jsl-decl-nparams callee))
+        (panic-corrupt "jsl lowering: logical call arity disagrees with canonical signature") 0)
+    (loop (if (>= (load i) (slice-len values)) (break)
+              (do (jl-push-builtin-argument! callee (load i)
+                                             (slice-get values (load i)) (mut args))
+                  (set! i (+ (load i) 1)))))
+    (if (!= (al-len [i64] (load args)) (jsl-decl-lowered-nparams callee))
+        (panic-corrupt "jsl lowering: physical call arity disagrees with canonical signature") 0)
+    (if uses-mem (al-push! [i64] (mut args) memory) 0)
+    (let [call (n-call! ctrl (jsl-decl-fun callee) (al-slice [i64] (load args)))
+          end (call-end call)
+          ret (jsl-decl-ret callee)]
+      (set! i 0)
+      (loop (if (>= (load i) (jsl-decl-lowered-nparams callee)) (break)
+                (do (jl-unkeep! (al-get [i64] (load args) (load i)))
+                    (set! i (+ (load i) 1)))))
+      (al-free! [i64] (mut args))
+      (let [record (jsl-decl-ret-record callee)]
+        (if (>= record 0)
+            (let [off (al-len [i64] (.slots (jl)))
+                  width (jsl-decl-lowered-nresults callee)
+                  (mut result) 0]
+              (set! (.site answer) call)
+              (loop (if (>= (load result) width) (break)
+                        (do (al-push! [i64] (field (jl) slots)
+                                      (call-result call (load result)))
+                            (set! result (+ (load result) 1)))))
+              (set! (.result answer) (jl-lowered-view JLV-RECORD record off width)))
+            (let [projected (call-result call 0)
+                  value (if (or (= ret TY-NO-ID) (= ret (t-dyn))) projected
+                            (n-peephole (n-new2 (Cast ret) end projected)))]
+              ;; JslLoweredCall retains the effectful call site; its result descriptor is the only
+              ;; logical value. Scalar-only public adapters reconstruct their historical view at
+              ;; the outer boundary.
+              (set! (.site answer) call)
+              (set! (.result answer) (jl-lowered-scalar! value (n-ty value))))))
+      (load answer))))
+
+;; Reconstruct a call's complete logical result under a proven-normal continuation. The call
+;; bundle has already snapshotted the raw ABI vector; these controlled projections are the first
+;; point where those words become JSL values. Throwing calls must use this after the pending split.
+(defn jl-call-normal-result! [(call CallSite) (callee i64) (normal-ctrl i64)]
+                             (-> JslLoweredValue)
+  (let [record (jsl-decl-ret-record callee)
+        ret (jsl-decl-ret callee)]
+    (if (>= record 0)
+        (let [off (al-len [i64] (.slots (jl)))
+              width (jsl-decl-lowered-nresults callee)
+              (mut slot) 0]
+          (loop (if (>= (load slot) width) (break)
+                    (do
+                      (al-push! [i64] (field (jl) slots)
+                        (call-result-at (call-node call) normal-ctrl (load slot)))
+                      (set! slot (+ (load slot) 1)))))
+          (jl-lowered-view JLV-RECORD record off width))
+        (let [projected (call-result-at (call-node call) normal-ctrl 0)
+              value (if (or (= ret TY-NO-ID) (= ret (t-dyn))) projected
+                        (n-peephole (n-new2 (Cast ret) normal-ctrl projected)))]
+          (jl-lowered-scalar! value (n-ty value))))))
+
+(defn jl-builtin-call [(x (ptr rd/Sexp)) (callee i64) (nargs i64)] (-> JslLoweredValue)
   (block :call
-  (let [buf (primitive/alloc-stack (array i64 10))
-        p (cast (ptr i64) buf)
+  (let [(mut values) (al-new [JslLoweredValue] (malloc-allocator))
         uses-mem (jsl-decl-uses-memory? callee)
         (mut i) 0]
     (loop (if (>= (load i) nargs) (break)
-            (do (store! (index p (load i))
-                        (jl-call-argument callee (load i)
-                                          (jl-expr (rd/sexp-nth x (+ (load i) 1)))))
-                (store! i (+ (load i) 1))
-                0)))
-    (if (jl-diverged?) (return-from :call NO-NODE) 0)
-    (if uses-mem
-        (store! (index p nargs)
-                (if (jsl-decl-calls-back? callee) (jl-call-mem) (jl-mem)))
-        0)
-    (let [fun (jsl-decl-fun callee)
-          cs (n-call! (jl-ctrl) fun (slice-new [i64] p (+ nargs (if uses-mem 1 0))))
-          end (call-end cs)]
+            (let [value (jl-expr-lowered (rd/sexp-nth x (+ (load i) 1)))]
+              (jl-lowered-keep! value)
+              (al-push! [JslLoweredValue] (mut values) value)
+              (set! i (+ (load i) 1)))))
+    (if (jl-diverged?)
+        (do (set! i 0)
+            (loop (if (>= (load i) (al-len [JslLoweredValue] (load values))) (break)
+                      (let [value (al-get [JslLoweredValue] (load values) (load i))]
+                        (jl-lowered-unkeep! value)
+                        (jl-lowered-collect! value)
+                          (set! i (+ (load i) 1)))))
+            (al-free! [JslLoweredValue] (mut values))
+            (return-from :call (jl-lowered-absent))) 0)
+    (let [lowered-call (jl-call-lowered-core!
+               (jl-ctrl) callee (al-slice [JslLoweredValue] (load values))
+               (if uses-mem
+                   (if (jsl-decl-calls-back? callee) (jl-call-mem) (jl-mem))
+                   NO-NODE))
+          cs (.site lowered-call)
+          end (call-end cs)
+          initial-result (.result lowered-call)]
+      (set! i 0)
+      (loop (if (>= (load i) (al-len [JslLoweredValue] (load values))) (break)
+                (let [argument (al-get [JslLoweredValue] (load values) (load i))]
+                  (jl-lowered-unkeep! argument)
+                  (jl-lowered-collect! argument)
+                    (set! i (+ (load i) 1)))))
+      (al-free! [JslLoweredValue] (mut values))
       (jl-set-ctrl! end)
       (if uses-mem
           (jl-set-mem! (n-new1 (Arg (t-mem-alias JS-PROPERTY-ALIAS (t-undef))) end))
           0)
-      ;; A DECLARED `:ret` IS A REPRESENTATION CONTRACT ON THE WAY OUT, exactly as a declared
-      ;; parameter type is one on the way in, and nothing carried it. A `Call` computes `dyn`
-      ;; whatever its callee returns, so the result of a definition declared `:ret int` -- a RAW
-      ;; machine integer -- reads as a tagged JavaScript value everywhere downstream. Two consumers
-      ;; then disagree about the same word: `"abcdef".lastIndexOf("c")` RETURNED 2 CORRECTLY, and
-      ;; `lastIndexOf("c") | 0` answered 0, because `be-box-input-already-tagged?` saw `dyn` on the
-      ;; loop phi holding it, called the `Box` an identity, and the DSL's `ToInt32` ran its tag
-      ;; tests on a raw integer.
-      ;;
-      ;; The `Cast` is an assertion of the type the declaration already states, so it adds no claim
-      ;; the callee was not making. It is pinned to the `CallEnd`, which is where the value exists.
-      (let [ret (jsl-decl-ret callee)
-            raw (call-value cs)
-            value (if (or (= ret TY-NO-ID) (= ret (t-dyn)))
-                      raw
-                      (n-peephole (n-new2 (Cast ret) end raw)))]
-        (jl-check-pending! value)
-        value)))))
+      ;; The pending query orders from the call effect itself. It must not consume a normal result
+      ;; slot: doing so materializes poison on the exceptional edge before the split.
+      (jl-check-pending! (call-node cs))
+      (if (jsl-decl-can-throw? callee)
+          (do
+            ;; The provisional CallEnd projections were needed only by the public unchecked-call
+            ;; adapter. Internal throwing calls replace them with normal-edge projections; collect
+            ;; the unused views so one call cannot retain two logical result conventions.
+            (jl-lowered-collect! initial-result)
+            (jl-call-normal-result! cs callee (jl-ctrl)))
+          initial-result)))))
 
 ;; Inline only calls introduced by JSL's JavaScript-callback form. This deliberately excludes
 ;; ordinary source calls: callback macros expose hot per-element calls, while global inlining can
@@ -1547,18 +2381,24 @@
     ;; publishes them as exceptional Returns on its own Fun below, rather than leaking them into
     ;; the source function that happened to trigger lowering.
     (set! (.collect-abrupts p) true)
+    ;; Standalone lowering starts a new cursor ownership interval; an inlining caller's cursor is
+    ;; compiler state but was never pinned by this mode.
+    (set! (.ctrl p) NO-NODE)
+    (set! (.pin-control p) true)
     (jl-unpin-binds!)
     (al-clear! [JslBind] (field p binds))
+    (al-clear! [i64] (field p restvals))
     (set! (.decl p) d)
     (set! (.fun p) fun)
-    (set! (.ctrl p) (n-fun-entry fun))
+    (jl-set-ctrl! (n-fun-entry fun))
     (set! (.anchor p) (n-fun-entry fun))
     ; Parameters are the outermost bindings, created ONCE each. `jl-lookup` searches innermost
     ; first, so a `let` may shadow a parameter, and the checker resolves in the same order.
     (let [np (jsl-decl-nparams d) (mut k) 0]
       (if (jsl-callable? d)
           (do
-            (jl-bind! "this" (n-parm! fun 1))
+            (let [node (n-parm! fun 1)]
+              (jl-bind-lowered! "this" (jl-lowered-scalar! node (n-ty node))))
             (if (> (jsl-decl-ncaptures d) 0)
                 (let [entry (n-fun-entry fun)
                       shape (jl-callable-env-shape d)
@@ -1569,14 +2409,17 @@
                   (loop (if (>= (load capture) (jsl-decl-ncaptures d)) (break)
                           (let [alias (shape-field-alias shape (+ (load capture) 1))
                                 memory (n-new1 (Arg (t-mem-alias alias (t-dyn))) entry)]
-                            (jl-bind! (jsl-capture-name d (load capture))
-                                      (n-load! memory env alias))
+                            (let [node (n-load! memory env alias)]
+                              (jl-bind-lowered! (jsl-capture-name d (load capture))
+                                                (jl-lowered-scalar! node (n-ty node))))
                             (set! capture (+ (load capture) 1))))))
                 0))
           0)
       (loop (if (>= (load k) np) (break)
-              (do (jl-bind! (jsl-param-name d (load k))
-                            (n-parm! fun (+ (load k) (if (jsl-callable? d) 3 0))))
+              (do
+                (jl-bind-lowered!
+                  (jsl-param-name d (load k))
+                  (jl-lowered-parameter! d (load k) fun (if (jsl-callable? d) 3 0)))
                   (set! k (+ (load k) 1))
                   0)))
       ; THE HEAP IS ESTABLISHED BEFORE THE BODY, not on first use, and the difference is a real bug
@@ -1592,7 +2435,20 @@
       ;; memory argument. Reuse that dependency for calls into user code instead of capturing the
       ;; first source caller present while this shared DSL function happened to be lowered.
       (if (jsl-decl-calls-back? d) (jl-set-outer-mem! (jl-mem)) 0))
-    (let [v (jl-expr (jsl-decl-body d))
+    (let [lowered (jl-expr-lowered (jsl-decl-body d))
+          (mut values) (al-new [i64] (malloc-allocator))]
+      ;; A named lowering diagnostic deliberately returns an absent value. Preserve that error for
+      ;; the caller instead of relabelling it graph corruption; signature validation applies only
+      ;; to a lowering that still claims success. The placeholder keeps the open Fun structurally
+      ;; closable while `result` below returns the recorded JSL error and the graph is discarded.
+      (if (jsl-ok?)
+          (do
+            (if (jl-lowered-matches-decl-result? d lowered)
+                0
+                (panic-corrupt "jsl lowering: builtin result disagrees with its lowered signature"))
+            (jl-flatten-lowered! (mut values) lowered))
+          (al-push! [i64] (mut values) NO-NODE))
+      (let [
           ; RAW, not peepholed, and not added to Stop: a function body's Return belongs to its Fun
           ; (`n-fun-close!`), and only a top-level Return is a def of Stop.
           ;
@@ -1600,10 +2456,12 @@
           ; nothing reading the last store, the kill cascade collects the entire chain as unused and
           ; `g-verify` reports VERR-LEAK. corpus.coil's memory fixtures all end this way for the
           ; same reason.
-          ret (if (= (jl-mem-raw) NO-NODE)
-                  (n-new2 (Return) (jl-ctrl) v)
-                  (n-new3 (Return) (jl-ctrl) v (jl-mem-raw)))]
+          ret (n-return-values! (jl-ctrl) (al-slice [i64] (load values)) (jl-mem-raw))]
+      ;; The Return is now the graph owner of final control; release the lowering cursor's pin.
+      (jl-set-ctrl! NO-NODE)
+      (set! (.pin-control p) false)
       (n-fun-close! fun ret)
+      (al-free! [i64] (mut values))
       ;; A callback or transitive JSL call reports an abrupt completion through the process-local
       ;; pending flag. Its result register is deliberately meaningless in that state, so no normal
       ;; operation may consume it. `jl-check-pending!` split each such call and captured the true
@@ -1619,11 +2477,38 @@
                         (n-peephole
                           (n-new3 (JsBuiltin 104) ctrl dependency
                                   (n-new1 (Const (t-int-con 0)) (g-start))))
-                      exceptional
-                        (if (= memory NO-NODE)
-                            (n-new2 (Return) ctrl marked)
-                            (n-new3 (Return) ctrl marked memory))]
-                  (n-fun-add-return! fun exceptional)
+                      (mut exceptional-values) (al-new [i64] (malloc-allocator))]
+                  ;; Pending-exception transport returns to the caller in this runtime; it is not
+                  ;; a machine-level unwind. Consequently an abrupt Return must still satisfy the
+                  ;; declaration's complete physical result ABI. The caller checks pending before
+                  ;; it may semantically consume these values, but its adjacent ABI capture moves
+                  ;; necessarily read every register/result-area slot. A one-word exceptional
+                  ;; Return from a wide Record builtin left those other slots stale and corrupted
+                  ;; live caller state after a caught throw.
+                  (al-push! [i64] (mut exceptional-values) marked)
+                  (let [(mut result) 1]
+                    (loop (if (>= (load result) (n-fun-abi-result-count fun)) (break)
+                              (let [ty (n-fun-abi-result-type fun (load result))
+                                    poison
+                                      (cond (= (ty-kinds ty) VK-BOOL)
+                                              (n-const (t-bool-con false))
+                                            (= (ty-kinds ty) VK-INT)
+                                              (n-const (t-int-con 0))
+                                            (= (ty-kinds ty) VK-FLT)
+                                              (n-const (t-flt-con 0.0))
+                                            ;; General ECMAScript values use the tagged ABI. A
+                                            ;; boxed undefined is a representation-correct poison
+                                            ;; for every such slot; the pending edge makes its
+                                            ;; semantic type intentionally unobservable.
+                                            :else (n-box! (n-const (t-undef))))]
+                                (al-push! [i64] (mut exceptional-values) poison)
+                                (set! result (+ (load result) 1))))))
+                  (let [exceptional
+                          (n-return-values! ctrl
+                                            (al-slice [i64] (load exceptional-values))
+                                            memory)]
+                    (n-fun-add-return! fun exceptional))
+                  (al-free! [i64] (mut exceptional-values))
                   (set! abrupt (+ (load abrupt) 1))))))
       (jl-abrupt-drop! abrupt-base)
       (jl-set-outer-mem! NO-NODE)
@@ -1640,11 +2525,12 @@
         ;; otherwise unreachable node survive `g-write`'s two-root reachability check.
         (jl-unpin-binds!)
         (al-clear! [JslBind] (field p binds))
+        (al-clear! [i64] (field p restvals))
         (set! (.profile-lower-calls p) (+ (.profile-lower-calls p) 1))
         (set! (.profile-lower-nodes p) (+ (.profile-lower-nodes p) (- (n-count) before)))
         (set! (.profile-lower-ns p) (+ (.profile-lower-ns p) (- (node-profile-now) started)))
         (set! (.collect-abrupts p) saved-collect)
-        result))))
+        result)))))
 
 ;; Lower every checked declaration into the CURRENT graph. The caller owns `graph-reset!` and
 ;; `g-analyze!` around this, exactly as the frontend's caller does, because a runtime library is
@@ -1661,6 +2547,7 @@
                           (set! err (jl-lower-decl! (load i))))
                       (set! i (+ (load i) 1))
                       0)))
+        (if (= (load err) JSL-OK) (g-distribute-deferred-phi-boxes!) 0)
         (load err)))))
 
 ;; Lower the complete checked library as one immutable separately-compilable artifact. Closure
@@ -1689,6 +2576,7 @@
                           (set! err (jl-lower-decl! (load i))))
                       (set! i (+ (load i) 1))
                       0)))
+          (if (= (load err) JSL-OK) (g-distribute-deferred-phi-boxes!) 0)
           (load err))))))
 
 ; ============================================================================
@@ -1806,15 +2694,20 @@
 ;;
 ;; `ctrl-cell` is read for the control to build on and written with the control the body ended on,
 ;; which is how a body containing an `if` hands its merge back to the caller.
-(defn jsl-inline! [(ctrl-cell (ptr i64)) (mem-cell (ptr i64)) (owner-entry i64)
-                   (name (slice u8)) (args (slice i64))] (-> i64)
+(defn jsl-inline-lowered! [(ctrl-cell (ptr i64)) (mem-cell (ptr i64)) (owner-entry i64)
+                           (name (slice u8)) (args (slice JslLoweredValue))]
+                           (-> JslLoweredValue)
   (let [d (jsl-find name)]
     (if (< d 0)
-        (do (panic-corrupt "jsl-inline!: no such definition") 0)
+        (do (panic-corrupt "jsl-inline-lowered!: no such definition") 0)
         0)
-    (if (!= (slice-len args) (jsl-decl-nparams d))
-        (do (panic-corrupt "jsl-inline!: argument count does not match the declaration") 0)
-        0)
+    (let [declared (jsl-decl-nparams d)
+          has-rest (jsl-decl-rest? d)
+          fixed (- declared (if has-rest 1 0))]
+      (if (if has-rest (< (slice-len args) fixed) (!= (slice-len args) declared))
+          (do (panic-corrupt
+                "jsl-inline-lowered!: logical argument count does not match the declaration") 0)
+          0))
     ;; THE HEAP THREADS THROUGH; IT IS NOT REFUSED. This used to panic on any definition the checker
     ;; found touches memory, and that was the CALL path's reasoning misapplied here.
     ;;
@@ -1827,9 +2720,14 @@
           saved-mem (jl-mem-raw)
           saved-anchor (.anchor (jl))
           saved-collect (.collect-abrupts (jl))
+          saved-pin-control (.pin-control (jl))
           uses-mem (jsl-decl-uses-memory? d)
           depth (jl-depth)
           (mut k) 0]
+      ;; An inline body also owns its control cursor while it constructs the caller's graph. Start
+      ;; a scoped ownership interval without treating the saved caller cursor as one of our pins.
+      (set! (.ctrl (jl)) NO-NODE)
+      (set! (.pin-control (jl)) true)
       (jl-set-ctrl! (load ctrl-cell))
       (set! (.anchor (jl)) owner-entry)
       ;; Established BEFORE the body, for the reason `jl-lower-decl!` gives at length: a heap first
@@ -1839,12 +2737,33 @@
       ;; Parameters are the only bindings the body may see: `jl-set-frame!` hides everything the
       ;; caller had bound, exactly as a macro expansion does.
       (jl-set-frame! depth)
-      (loop (if (>= (load k) (slice-len args)) (break)
-              (do (jl-bind! (jsl-param-name d (load k)) (slice-get args (load k)))
+      (let [declared (jsl-decl-nparams d)
+            has-rest (jsl-decl-rest? d)
+            fixed (- declared (if has-rest 1 0))]
+      (loop (if (>= (load k) fixed) (break)
+              (do (let [value (slice-get args (load k))]
+                    (if (jl-lowered-matches-param? d (load k) value)
+                        0
+                        (panic-corrupt
+                          "jsl-inline-lowered!: argument disagrees with logical signature"))
+                    (jl-bind-lowered! (jsl-param-name d (load k)) value))
                   (set! k (+ (load k) 1))
                   0)))
+      (if has-rest
+          (let [(mut rest) (al-new [i64] (malloc-allocator))]
+            (set! k fixed)
+            (loop (if (>= (load k) (slice-len args)) (break)
+                      (let [value (slice-get args (load k))]
+                        (if (= (.kind value) JLV-SCALAR) 0
+                            (panic-corrupt
+                              "jsl-inline-lowered!: rest argument is not a scalar value"))
+                        (al-push! [i64] (mut rest) (jl-lowered-scalar-node value))
+                        (set! k (+ (load k) 1)))))
+            (jl-bind-rest! (jsl-param-name d fixed) (al-slice [i64] (load rest)))
+            (al-free! [i64] (mut rest)))
+          0))
       (set! (.decl (jl)) d)
-      (let [v (jl-expr (jsl-decl-body d))]
+      (let [lowered (jl-expr-lowered (jsl-decl-body d))]
         (set! ctrl-cell (jl-ctrl))
         ;; The caller now owns whatever the body left behind. Nothing RETURNS memory here — there is
         ;; no call to return from, which is why this needs no `VERR-LEAK` dance either.
@@ -1855,46 +2774,91 @@
         (set! (.collect-abrupts (jl)) saved-collect)
         (jl-set-frame! saved-frame)
         ;; The result outlives the bindings that built it, so it is pinned across the drop.
-        (jl-keep! v)
+        (jl-lowered-keep! lowered)
         (jl-drop! depth)
-        (jl-unkeep! v)
-        (jl-set-ctrl! saved-ctrl)
-        v))))
+        (jl-lowered-unkeep! lowered)
+        ;; The caller's control cell has the id now; release our scoped pin without collecting,
+        ;; then restore the enclosing lowering state exactly as it was.
+        ;; This is an ownership transfer, not a discard: releasing the pin must not collect the
+        ;; node before the caller can acquire it from `ctrl-cell`.
+        (if (>= (jl-ctrl) 0) (jl-unkeep! (jl-ctrl)) 0)
+        (set! (.ctrl (jl)) NO-NODE)
+        (set! (.pin-control (jl)) saved-pin-control)
+        (set! (.ctrl (jl)) saved-ctrl)
+        lowered))))
+
+;; Source/frontend callers still traffic in scalar graph nodes. Keep that boundary as a checked
+;; adapter over the one logical-value inline convention; aggregate callers must use the lowered
+;; API and aggregate results cannot be projected accidentally.
+(defn jsl-inline! [(ctrl-cell (ptr i64)) (mem-cell (ptr i64)) (owner-entry i64)
+                   (name (slice u8)) (args (slice i64))] (-> i64)
+  (let [(mut lowered) (al-new [JslLoweredValue] (malloc-allocator))
+        (mut index) 0]
+    (loop (if (>= (load index) (slice-len args)) (break)
+              (let [node (slice-get args (load index))]
+                (al-push! [JslLoweredValue] (mut lowered)
+                          (jl-lowered-scalar! node (n-ty node)))
+                (set! index (+ (load index) 1)))))
+    (let [result (jsl-inline-lowered! ctrl-cell mem-cell owner-entry name
+                                      (al-slice [JslLoweredValue] (load lowered)))
+          node (if (= (.kind result) JLV-ABSENT) NO-NODE
+                   (jl-lowered-scalar-node result))]
+      (al-free! [JslLoweredValue] (mut lowered))
+      node)))
+
+(defn jsl-call-lowered-value-with-memory! [(ctrl i64) (name (slice u8))
+                                           (args (slice JslLoweredValue))
+                                           (memory i64)] (-> JslLoweredCall)
+  (let [d (jsl-find name)]
+    (if (< d 0)
+        (do (panic-corrupt "jsl-call-lowered-with-memory!: no such builtin") 0)
+        0)
+    (if (jsl-macro? d)
+        (do (panic-corrupt "jsl-call-lowered-with-memory!: a macro has no callable entry") 0)
+        0)
+    (if (!= (slice-len args) (jsl-decl-nparams d))
+        (do (panic-corrupt
+              "jsl-call-lowered-with-memory!: logical arity does not match the declaration") 0)
+        0)
+    (jl-call-lowered-core! ctrl d args memory)))
+
+;; Compatibility projection for graph/frontend clients which need the call's control/effect site
+;; and address physical result projections themselves. Logical JSL consumers use the value-bearing
+;; API above so result shape is never rediscovered from the declaration after the call.
+(defn jsl-call-lowered-with-memory! [(ctrl i64) (name (slice u8))
+                                     (args (slice JslLoweredValue))
+                                     (memory i64)] (-> CallSite)
+  (let [call (jsl-call-lowered-value-with-memory! ctrl name args memory)]
+    (if (= (.kind (.result call)) JLV-SCALAR)
+        (let [(mut adapter) (zeroed CallSite)]
+          (set! (.call (mut adapter)) (call-node (.site call)))
+          (set! (.value (mut adapter)) (jl-lowered-scalar-node (.result call)))
+          (set! (.end (mut adapter)) (call-end (.site call)))
+          (load adapter))
+        (.site call))))
 
 (defn jsl-call-with-memory! [(ctrl i64) (name (slice u8)) (args (slice i64))
                              (memory i64)] (-> CallSite)
-  (let [d (jsl-find name)]
-    (if (< d 0)
-        (do (panic-corrupt "jsl-call-with-memory!: no such builtin") 0)
-        0)
-    (if (jsl-macro? d)
-        (do (panic-corrupt "jsl-call-with-memory!: a macro has no callable entry") 0)
-        0)
+  (let [d (jsl-find name)
+        (mut lowered) (al-new [JslLoweredValue] (malloc-allocator))
+        (mut i) 0]
+    (if (< d 0) (do (panic-corrupt "jsl-call-with-memory!: no such builtin") 0) 0)
     (if (!= (slice-len args) (jsl-decl-nparams d))
-        (do (panic-corrupt "jsl-call-with-memory!: argument count does not match the declaration") 0)
-        0)
-    (let [buf (primitive/alloc-stack (array i64 10))
-          p (cast (ptr i64) buf)
-          n (slice-len args)
-          uses-mem (jsl-decl-uses-memory? d)
-          (mut i) 0
-          (mut answer) (zeroed CallSite)]
-      (loop (if (>= (load i) n) (break)
-              (do (set! (index p (load i))
-                        (jl-call-argument d (load i) (slice-get args (load i))))
-                  (set! i (+ (load i) 1))
-                  0)))
-      (if uses-mem (set! (index p n) memory) 0)
-      (let [call (n-call! ctrl (jsl-decl-fun d)
-                          (slice-new [i64] p (+ n (if uses-mem 1 0))))
-            ret (jsl-decl-ret d)
-            value (call-value call)]
-        (set! (.end answer) (call-end call))
-        (set! (.value answer)
-              (if (or (= ret TY-NO-ID) (= ret (t-dyn)))
-                  value
-                  (n-peephole (n-new2 (Cast ret) (call-end call) value))))
-        (load answer)))))
+        (panic-corrupt "jsl-call-with-memory!: argument count does not match the declaration") 0)
+    ;; This compatibility boundary is intentionally scalar because its callers traffic in source
+    ;; JavaScript nodes. Aggregate callers use `jsl-call-lowered-with-memory!` directly.
+    (loop (if (>= (load i) (slice-len args)) (break)
+              (do (if (>= (jsl-param-record d (load i)) 0)
+                      (panic-corrupt
+                        "jsl-call-with-memory!: Record parameter requires the lowered-value API") 0)
+                  (al-push! [JslLoweredValue] (mut lowered)
+                            (jl-lowered-scalar! (slice-get args (load i))
+                                                (n-ty (slice-get args (load i)))))
+                  (set! i (+ (load i) 1)))))
+    (let [answer (jsl-call-lowered-with-memory!
+                   ctrl name (al-slice [JslLoweredValue] (load lowered)) memory)]
+      (al-free! [JslLoweredValue] (mut lowered))
+      answer)))
 
 (defn jsl-call! [(ctrl i64) (name (slice u8)) (args (slice i64))] (-> CallSite)
   ;; This public boundary accepts source arguments only. Heap effects are a lowering concern and

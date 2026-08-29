@@ -16,9 +16,11 @@
 (import "corpus" :use *)
 (import "shape" :use *)
 (import "coil.assert" :use *)
-(import "coil.alloc" :use *)
+(import "coil.alloc" :use * :as alloc)
 (import "coil.arraylist" :use *)
 (import "coil.io" :use *)
+(import "coil.fs" :use *)
+(import "coil.slice" :use *)
 (import "coil.fmt" :use *)
 
 (defn object-publish! [] (-> i64)
@@ -55,6 +57,7 @@
   (assert (be-select-machine-program!))
   (assert (>= (be-schedule!) 0))
   (assert (>= (be-function-layout-seeded! seed) 0))
+  (assert (ms-call-bundles-valid?))
   (assert (>= (be-color! 8) 0))
   (assert (be-encode-checked!))
   (object-publish!) 0)
@@ -227,6 +230,72 @@
   (assert (= (mfts-abi-arity 1) 1))
   (assert (= (mfts-abi-return-kind 1) MLK-SCALAR)))
 
+(deftest retained_artifact_round_trips_indexed_multi_result_abi_metadata
+  (object-call-program!)
+  (object-compile!)
+  (assert (mfts-snapshot!))
+  ;; Value kind alone cannot distinguish integer and floating register locations. Preserve both
+  ;; indexed vectors for the function and the caller relocation across a clean artifact reload.
+  (let [s (mfts)
+        target 1
+        reloc (mfts-reloc-index 0 0)
+        path "/tmp/aotk-multi-result-abi.artifact"]
+    (al-set! [i64] (field s abi-result-counts) target 2)
+    (al-set! [i64] (field s abi-can-throws) target 1)
+    (al-push! [i64] (field s abi-result-kinds) MLK-SCALAR)
+    (al-push! [i64] (field s abi-result-classes) MRC-FPR)
+    (al-set! [i64] (field s reloc-target-result-count) reloc 2)
+    (al-push! [i64] (field s reloc-target-result-kind) MLK-SCALAR)
+    (al-push! [i64] (field s reloc-target-result-class) MRC-FPR)
+    (assert (mfts-save-artifact! path 123))
+    (mfts-clear!)
+    (assert (mfts-load-artifact! path))
+    (assert (= (mfts-loaded-artifact-context) (mfts-artifact-context 123)))
+    (assert (!= (mfts-loaded-artifact-digest) 0))
+    (assert (= (mfts-abi-result-count target) 2))
+    (assert (mfts-abi-can-throw? target))
+    (assert (= (mfts-abi-result-kind target 0) MLK-SCALAR))
+    (assert (= (mfts-abi-result-class target 0) MRC-GPR))
+    (assert (= (mfts-abi-result-kind target 1) MLK-SCALAR))
+    (assert (= (mfts-abi-result-class target 1) MRC-FPR))
+    (assert (= (mfts-reloc-target-result-count-at 0 0) 2))
+    (assert (= (mfts-reloc-target-result-kind-at 0 0 0) MLK-SCALAR))
+    (assert (= (mfts-reloc-target-result-class-at 0 0 0) MRC-GPR))
+    (assert (= (mfts-reloc-target-result-kind-at 0 0 1) MLK-SCALAR))
+    (assert (= (mfts-reloc-target-result-class-at 0 0 1) MRC-FPR))
+    (let [loaded (mfts)
+          first (al-get [i64] (.reloc-target-result-first loaded) reloc)]
+      (assert (mfts-result-range-matches-record? first 2 target))
+      ;; Same coarse MLK-SCALAR kinds but a different register class is an ABI mismatch.
+      (al-set! [i64] (field loaded reloc-target-result-class) (+ first 1) MRC-GPR)
+      (assert (not (mfts-result-range-matches-record? first 2 target)))
+      ;; The effect vector is checked artifact data, not truthy metadata with arbitrary values.
+      (al-set! [i64] (field loaded abi-can-throws) target 2)
+      (assert (mfts-save-artifact! path 123))
+      (mfts-clear!)
+      (assert (not (mfts-load-artifact! path)))
+      (assert (= (mfts-count) 0)))))
+
+(deftest retained_artifact_digest_rejects_payload_corruption
+  (object-call-program!)
+  (object-compile!)
+  (assert (mfts-snapshot!))
+  (let [path "/tmp/aotk-corrupt-content-addressed.artifact"]
+    (assert (mfts-save-artifact! path 456))
+    (try
+      (let [a (malloc-allocator)
+            bytes (try-or! (read-file a path) (do (assert false) ""))
+            at 64]
+        (assert (> (slice-len bytes) (+ at 8)))
+        (set! (index (slice-data bytes) at)
+              (cast u8 (^ (cast i64 (load (index (slice-data bytes) at))) 1)))
+        (try-or! (write-file a path bytes) (do (assert false) bytes))
+        (alloc/free [u8] a bytes)
+        ""))
+    (mfts-clear!)
+    (assert (not (mfts-load-artifact! path)))
+    (assert (= (mfts-count) 0))))
+
 (deftest invalid_function_range_is_named_and_object_publication_is_atomic
   (object-call-program!)
   (object-compile!)
@@ -262,8 +331,12 @@
   (object-publish!)
   (let [stackoff (mobj-u32 232) layoutoff (mobj-u32 312)]
     (assert (= (mobj-u32 stackoff) 1398034241))
-    (assert (= (mobj-u32 (+ stackoff 4)) 2))
+    (assert (= (mobj-u32 (+ stackoff 4)) 5))
     (assert (= (mobj-u32 (+ stackoff 8)) 1))
+    (let [record (+ stackoff 24)
+          code (be-function-dispatch-return-code 0)]
+      (assert (= (mobj-u32 (+ record 28)) (cast i64 (cast u32 (>> code 32)))))
+      (assert (= (mobj-u32 (+ record 36)) (cast i64 (cast u32 code)))))
     (assert (= (mobj-u32 layoutoff) 1280593729))
     (assert (= (mobj-u32 (+ layoutoff 4)) 1))
     (assert (mobj-verify-bytes!))))
@@ -412,7 +485,7 @@
   (assert (= (mfti-layout-size) (mobj-layout-size)))
   (assert (= (mfti-stackmap-u32 0) 1398034241))
   (assert (= (mfti-stackmap-u32 8) (mfti-site-count)))
-  (assert (= (mfti-stackmap-u32 16) (mfts-count)))
+  (assert (= (mfti-stackmap-u32 16) (mfti-function-count)))
   (assert (= (mfti-external-count) 0)))
 
 (deftest retained_archive_suffix_is_fully_removed_at_the_request_boundary
@@ -470,7 +543,9 @@
   (assert (= (mfts-identity-kind 0) FUN-IDENTITY-SOURCE))
   (assert (= (mfts-identity-unit 0) 123456))
   (assert (mfts-cacheable? 0))
-  (assert (mfti-build!)))
+  ;; A reusable cache archive is not itself an executable image: compaction deliberately removed
+  ;; the ephemeral entry, so there is no source root from which to form a linked closure.
+  (assert (not (mfti-build!))))
 
 (deftest retained_jsl_archive_keeps_the_complete_abi_checked_dependency_closure
   (graph-reset! 1005)
@@ -482,7 +557,7 @@
     (let [x (n-parm! callee 0)
           body (n-new2 (Return) (n-fun-entry callee) (ob (Add) x (oc 1)))]
       (n-fun-close! callee body))
-    (let [caller (n-fun-open-identity! 0 FUN-IDENTITY-JSL 777 1)
+    (let [caller (n-fun-open-identity! 1 FUN-IDENTITY-JSL 777 1)
           (mut caller-types) (al-new [i64] (malloc-allocator))]
       (al-push! [i64] (mut caller-types) (t-int))
       (n-fun-declare-abi! caller (al-slice [i64] (load caller-types)) (t-int))
@@ -501,12 +576,14 @@
     (assert (= (mfts-count) 2))
     (assert (= (mfts-identity-kind 0) FUN-IDENTITY-JSL))
     (assert (= (mfts-identity-kind 1) FUN-IDENTITY-JSL))
-    (assert (mfti-build!))))
+    ;; The dependency closure is complete but cache-only. It becomes executable only when a fresh
+    ;; source entry imports one of these identities and supplies the reachability root.
+    (assert (not (mfti-build!)))))
 
 (deftest retained_jsl_caller_cannot_link_after_its_exact_dependency_is_removed
   (graph-reset! 1006)
   (let [caller (n-fun-open-identity! 0 FUN-IDENTITY-JSL 778 0)
-        callee (n-fun-open-identity! 0 FUN-IDENTITY-JSL 778 1)
+        callee (n-fun-open-identity! 1 FUN-IDENTITY-JSL 778 1)
         (mut callee-types) (al-new [i64] (malloc-allocator))]
     (al-push! [i64] (mut callee-types) (t-int))
     (n-fun-declare-abi! callee (al-slice [i64] (load callee-types)) (t-int))

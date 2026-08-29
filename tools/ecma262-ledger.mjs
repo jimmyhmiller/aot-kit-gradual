@@ -129,10 +129,10 @@ function pathWithin(root, path) {
   return rel === "" || (!rel.startsWith(`..${sep}`) && rel !== "..");
 }
 
-function flattenClauses(clauses, output = []) {
+function flattenClauses(clauses, output = [], ancestors = []) {
   for (const clause of clauses) {
-    output.push(clause);
-    flattenClauses(clause.subclauses, output);
+    output.push({ clause, ancestorIds: ancestors.map(item => item.id).filter(Boolean) });
+    flattenClauses(clause.subclauses, output, [...ancestors, clause]);
   }
   return output;
 }
@@ -142,6 +142,11 @@ function directDescendants(clause, selector) {
     const owner = node.closest("emu-clause, emu-annex");
     return owner === clause.node;
   });
+}
+
+function directProseCount(spec, clause) {
+  const proseTags = new Set(["P", "TABLE", "UL", "OL", "PRE", "EMU-TABLE"]);
+  return [...clause.node.children].filter(node => proseTags.has(node.tagName) && spec.locate(node)).length;
 }
 
 function sourceLocation(spec, node, sourceRoot) {
@@ -155,7 +160,7 @@ function sourceLocation(spec, node, sourceRoot) {
   };
 }
 
-function clauseEntry(spec, clause, sourceRoot) {
+function clauseEntry(spec, clause, sourceRoot, ancestorIds) {
   const bibliography = clause.id ? spec.biblio.byId(clause.id) : undefined;
   const operation = clause.aoid ? spec.biblio.byAoid(clause.aoid, clause.namespace) : undefined;
   const builtIn = spec.biblio.localEntries().find(entry =>
@@ -180,6 +185,9 @@ function clauseEntry(spec, clause, sourceRoot) {
   };
   return {
     id: clause.id,
+    parentId: ancestorIds.at(-1) ?? null,
+    ancestorIds,
+    topLevelId: ancestorIds[0] ?? clause.id,
     number: clause.number || null,
     title: normalizeSpace(bibliography?.title ?? clause.header?.textContent ?? ""),
     clauseType: clause.type || null,
@@ -193,6 +201,7 @@ function clauseEntry(spec, clause, sourceRoot) {
     builtIn: builtIn ? { name: builtIn.name, params: builtIn.params } : null,
     algorithmCount: directDescendants(clause, "emu-alg").length,
     grammarCount: directDescendants(clause, "emu-grammar").length,
+    proseCount: directProseCount(spec, clause),
     operationDependencies,
     clauseDependencies,
     source: sourceLocation(spec, clause.node, sourceRoot),
@@ -255,7 +264,7 @@ function expectedSummary(ledger) {
 }
 
 export function validateLedger(ledger, pins) {
-  if (ledger.schemaVersion !== 1) throw new Error(`unsupported ledger schema ${ledger.schemaVersion}`);
+  if (ledger.schemaVersion !== 2) throw new Error(`unsupported ledger schema ${ledger.schemaVersion}`);
   if (!Array.isArray(ledger.clauses) || !Array.isArray(ledger.productions) ||
       !Array.isArray(ledger.ecmarkupWarnings)) {
     throw new Error("ledger clauses, productions, and ecmarkupWarnings must be arrays");
@@ -281,6 +290,23 @@ export function validateLedger(ledger, pins) {
     if (!clause.disposition || !clause.status) {
       throw new Error(`clause ${clause.id} has no disposition or status`);
     }
+    if (!Number.isInteger(clause.proseCount) || clause.proseCount < 0)
+      throw new Error(`clause ${clause.id} has invalid direct prose count`);
+  }
+  const clauseById = new Map(ledger.clauses.map(clause => [clause.id, clause]));
+  for (const clause of ledger.clauses) {
+    if (!Array.isArray(clause.ancestorIds) ||
+        clause.ancestorIds.some(id => !clauseIds.has(id) || id === clause.id)) {
+      throw new Error(`clause ${clause.id} has invalid ancestors`);
+    }
+    if ((clause.parentId ?? null) !== (clause.ancestorIds.at(-1) ?? null))
+      throw new Error(`clause ${clause.id} parent does not match its ancestors`);
+    const expectedAncestors = clause.parentId ?
+      [...clauseById.get(clause.parentId).ancestorIds, clause.parentId] : [];
+    if (JSON.stringify(clause.ancestorIds) !== JSON.stringify(expectedAncestors))
+      throw new Error(`clause ${clause.id} ancestor chain is inconsistent`);
+    if (clause.topLevelId !== (clause.ancestorIds[0] ?? clause.id))
+      throw new Error(`clause ${clause.id} top-level identity is inconsistent`);
   }
   const productionNames = new Set();
   for (const production of ledger.productions) {
@@ -329,15 +355,16 @@ export async function generateLedger({ sourceDir, pins, pinsPath }) {
       nodeType: warning.nodeType ?? null,
     }),
   });
-  const clauses = flattenClauses(spec.subclauses);
-  const clauseItems = clauses
-    .map(clause => clauseEntry(spec, clause, sourceDir))
+  const clauseRecords = flattenClauses(spec.subclauses);
+  const clauses = clauseRecords.map(record => record.clause);
+  const clauseItems = clauseRecords
+    .map(record => clauseEntry(spec, record.clause, sourceDir, record.ancestorIds))
     .sort((a, b) => (a.id ?? "").localeCompare(b.id ?? ""));
   const productions = productionEntries(spec, clauses, sourceDir);
   const normativeClauses = clauseItems.filter(item => item.normative);
   const normativeProductions = productions.filter(item => item.normative);
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     generatedFrom: {
       pins: relative(projectRoot, pinsPath).split(sep).join("/"),
       ecma262Commit: pins.ecma262.commit,

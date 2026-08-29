@@ -106,22 +106,39 @@
                   0))))
     n))
 
-(defn be-schedule-seeded! [(seed i64)] (-> i64)
-  (let [n (be-inst-count)
-        (mut profile-start) (ms-profile-now)]
+(defn be-local-schedule-seeded! [(seed i64)] (-> i64)
+  (let [n (be-inst-count)]
     (if (and (> n 0) (>= (ms-inst-owner 0) 0))
         ;; Run the legality scheduler for production seed zero as well as perturbation seeds. GCM
         ;; placement alone does not order a heap read before a later aliasing write; the explicit
         ;; memory anti-edge is enforced here.
-        (if (ms-local-schedule! seed)
-            ;; CFG allocation consumes exact liveness and never reads the legacy linear interval
-            ;; endpoints. Building those endpoints included a quadratic backedge repair over the
-            ;; whole unit; retain it only for the ownerless legacy allocator below.
-            (let [ok (ml-compute! seed)]
-              (set! profile-start (ms-profile-note! "schedule_liveness" (load profile-start)))
-              (if ok n -1))
-            -1)
+        (if (ms-local-schedule! seed) n -1)
         (be-schedule-intervals!))))
+
+(defn be-liveness-seeded! [(seed i64)] (-> i64)
+  (let [n (be-inst-count)]
+    (if (and (> n 0) (>= (ms-inst-owner 0) 0))
+        (let [ok (ml-compute! seed)]
+          (if (be-profiling?)
+              (do
+                (fmt (stderr)
+                     "AOTK_PROFILE phase=backend_work kind_direct={d} memory_alias_candidates={d} memory_duplicate_probes={d}\n"
+                     (mu-work-kind-direct) (mu-work-memory-alias-candidates)
+                     (mu-work-memory-antidep-duplicate-probes))
+                0)
+              0)
+          (if ok n -1))
+        n)))
+
+(defn be-schedule-seeded! [(seed i64)] (-> i64)
+  (let [scheduled (be-local-schedule-seeded! seed)]
+    (if (< scheduled 0) -1 (be-liveness-seeded! seed))))
+
+(defn be-local-schedule! [] (-> i64)
+  (be-local-schedule-seeded! 0))
+
+(defn be-liveness! [] (-> i64)
+  (be-liveness-seeded! 0))
 
 (defn be-schedule! [] (-> i64)
   (be-schedule-seeded! 0))

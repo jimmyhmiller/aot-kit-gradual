@@ -163,9 +163,9 @@ void aot_gc_register_unit(const uint8_t *kernel, const uint8_t *code_base,
 typedef struct {
   uint32_t owner, code_start, code_size, frame_size;
   uint64_t callee_mask;
-  uint32_t callee_count, reserved;
+  uint32_t callee_count, return_code_high;
   uint32_t callable_id;
-  int32_t return_code;
+  uint32_t return_code_low;
 } FunctionRec;
 typedef struct {
   uint32_t pc, owner, instruction, root_first, root_count, op;
@@ -371,6 +371,22 @@ static JsObjectRec *js_object(uintptr_t owner, int create) {
     side_index_put(&js_object_index, owner >> 3, (uint32_t)js_objects_len);
   }
   return &js_objects[js_objects_len - 1];
+}
+
+/* A property receiver can be either a raw String value or the distinct Object allocated by
+   StringCreate/NewStringObject. The latter exposes its code units through [[StringData]] while
+   retaining its own ordinary-object identity, prototype, extensibility, and property table.
+   Resolve only the representation here; descriptor policy remains in the JSL String exotic
+   internal methods. Kind 102 is the runtime brand for the represented [[StringData]] slot. */
+static JsStringRec *js_string_property_data(uintptr_t owner) {
+  owner = js_canonical_owner(owner);
+  JsStringRec *direct = js_string_lookup(owner);
+  if (direct) return direct;
+  JsObjectRec *object = js_object(owner, 0);
+  if (!object || object->internal_kind != 102) return NULL;
+  AotJsValue target = object->internal_target;
+  if (aot_js_tag(target) != AOT_JS_STRING) return NULL;
+  return js_string_lookup(aot_js_payload(target));
 }
 
 static uint64_t js_property_key_hash(AotJsValue key) {
@@ -656,8 +672,18 @@ static AotJsValue js_builtin_bits(double number) {
 AotJsValue aot_js_builtin(AotJsValue a, AotJsValue b, uint64_t operation) {
   if (operation == 20)
     return AOT_JS_FUNCTION | (UINT64_C(0x10000) + (a & UINT64_C(0xff)));
-  if (operation == 21)
-    return AOT_JS_OBJECT | (UINT64_C(0x20000) + ((a & UINT64_C(0xff)) << 3));
+  if (operation == 21) {
+    uintptr_t owner = UINT64_C(0x20000) + ((a & UINT64_C(0xff)) << 3);
+    /* Built-in prototype identities are stable synthetic owners. Most are ordinary objects, but
+       %Array.prototype% is itself an Array exotic (ECMA-262 23.1.3) and therefore needs both the
+       Array value tag and dense-array state. Registering its stable owner here gives every later
+       array/property operation one canonical identity; IsArray can remain the ordinary tag test. */
+    if ((a & UINT64_C(0xff)) == 17) {
+      if (!js_array(owner, 1)) return AOT_JS_UNDEFINED;
+      return AOT_JS_ARRAY | owner;
+    }
+    return AOT_JS_OBJECT | owner;
+  }
   if (operation == 22) {
     AotJsValue symbol = AOT_JS_SYMBOL | aot_js_payload(a);
     const char *trace_path = getenv("AOT_TRACE_SYMBOL");
@@ -898,6 +924,98 @@ static JsStringRec *aot_js_to_fixed_format(int neg, uint64_t m, int e, int64_t f
   return js_string_ascii(out);
 }
 
+/* Number::toString's radix-10 representation is not "17 significant digits". It is the shortest
+   decimal significand that converts back to the same IEEE-754 value, followed by ECMAScript's own
+   fixed-vs-scientific layout rule. The C library already provides correctly rounded decimal
+   generation and parsing; search the binary64 round-trip bound (1..17 significant digits) and
+   then normalize that shortest candidate into the spec's (s, n, k) form. This keeps the platform
+   conversion machinery below JSL while avoiding printf's incompatible %g presentation policy.
+
+   Why the precision search is complete: every finite binary64 has a round-tripping decimal with
+   at most 17 significant digits. At a fixed digit count, the correctly rounded decimal is closest
+   to x; if any decimal of that width lies in x's round-to-nearest interval, that closest one does.
+   The first candidate whose parsed bits equal x therefore has minimal k. */
+static JsStringRec *aot_js_shortest_double(double x) {
+  if (isnan(x)) return js_string_ascii("NaN");
+  if (isinf(x)) return js_string_ascii(signbit(x) ? "-Infinity" : "Infinity");
+  if (x == 0.0) return js_string_ascii("0");
+
+  int negative = signbit(x) != 0;
+  double magnitude = negative ? -x : x;
+  union { double number; uint64_t bits; } original = { .number = magnitude };
+  char candidate[32];
+  for (int precision = 1; precision <= 17; ++precision) {
+    snprintf(candidate, sizeof(candidate), "%.*g", precision, magnitude);
+    char *end = NULL;
+    union { double number; uint64_t bits; } parsed = { .number = strtod(candidate, &end) };
+    if (end && *end == '\0' && parsed.bits == original.bits) break;
+  }
+
+  const char *exponent_marker = strchr(candidate, 'e');
+  if (!exponent_marker) exponent_marker = strchr(candidate, 'E');
+  const char *mantissa_end = exponent_marker ? exponent_marker : candidate + strlen(candidate);
+  int exponent = exponent_marker ? (int)strtol(exponent_marker + 1, NULL, 10) : 0;
+  char digits[18];
+  int digit_count = 0;
+  int decimal_position = 0;
+  int saw_point = 0;
+  for (const char *p = candidate; p < mantissa_end; ++p) {
+    if (*p == '.') {
+      saw_point = 1;
+    } else if (*p >= '0' && *p <= '9') {
+      digits[digit_count++] = *p;
+      if (!saw_point) ++decimal_position;
+    }
+  }
+
+  int first = 0;
+  while (first + 1 < digit_count && digits[first] == '0') ++first;
+  int k = digit_count - first;
+  memmove(digits, digits + first, (size_t)k);
+  int n = decimal_position - first + exponent;
+  while (k > 1 && digits[k - 1] == '0') --k;
+
+  char out[32];
+  int at = 0;
+  if (negative) out[at++] = '-';
+  if (n >= -5 && n <= 21) {
+    if (n >= k) {
+      memcpy(out + at, digits, (size_t)k);
+      at += k;
+      while (at - negative < n) out[at++] = '0';
+    } else if (n > 0) {
+      memcpy(out + at, digits, (size_t)n);
+      at += n;
+      out[at++] = '.';
+      memcpy(out + at, digits + n, (size_t)(k - n));
+      at += k - n;
+    } else {
+      out[at++] = '0';
+      out[at++] = '.';
+      for (int zero = 0; zero < -n; ++zero) out[at++] = '0';
+      memcpy(out + at, digits, (size_t)k);
+      at += k;
+    }
+  } else {
+    out[at++] = digits[0];
+    if (k > 1) {
+      out[at++] = '.';
+      memcpy(out + at, digits + 1, (size_t)(k - 1));
+      at += k - 1;
+    }
+    out[at++] = 'e';
+    int scientific_exponent = n - 1;
+    out[at++] = scientific_exponent < 0 ? '-' : '+';
+    if (scientific_exponent < 0) scientific_exponent = -scientific_exponent;
+    char exponent_digits[8];
+    int exponent_count = snprintf(exponent_digits, sizeof(exponent_digits), "%d", scientific_exponent);
+    memcpy(out + at, exponent_digits, (size_t)exponent_count);
+    at += exponent_count;
+  }
+  out[at] = '\0';
+  return js_string_ascii(out);
+}
+
 AotJsValue aot_js_string(uintptr_t a, int64_t b,
                          AotJsValue value, uint64_t operation) {
   if (operation == AOT_JS_VALUE_TO_FIXED) {
@@ -1095,20 +1213,7 @@ AotJsValue aot_js_string(uintptr_t a, int64_t b,
   }
   if (operation == AOT_JS_STRING_FROM_DOUBLE_BITS) {
     union { uint64_t bits; double number; } decoded = { .bits = (uint64_t)a };
-    char text[64];
-    if (isnan(decoded.number)) {
-      strcpy(text, "NaN");
-    } else if (isinf(decoded.number)) {
-      strcpy(text, signbit(decoded.number) ? "-Infinity" : "Infinity");
-    } else if (decoded.number == 0.0) {
-      strcpy(text, "0");
-    } else {
-      snprintf(text, sizeof(text), "%.17g", decoded.number);
-      char *exponent = strchr(text, 'e');
-      if (exponent && (exponent[1] == '+' || exponent[1] == '-') && exponent[2] == '0')
-        memmove(exponent + 2, exponent + 3, strlen(exponent + 3) + 1);
-    }
-    JsStringRec *result = js_string_ascii(text);
+    JsStringRec *result = aot_js_shortest_double(decoded.number);
     return result ? (AotJsValue)(uintptr_t)result : AOT_JS_UNDEFINED;
   }
   if (operation == AOT_JS_STRING_FROM_BOOL ||
@@ -1543,7 +1648,7 @@ static int js_property_key_ascii_equal(AotJsValue key, const char *ascii) {
 }
 
 static void js_throw_frozen_mutation(void) {
-  fputs("uncaught JavaScript throw\n", stderr);
+  fputs("uncaught JavaScript throw: runtime attempted to mutate a frozen object\n", stderr);
   fflush(stderr);
   exit(70);
 }
@@ -1618,7 +1723,9 @@ static AotJsValue js_own_key_at(uintptr_t owner, size_t ordinal) {
 AotJsValue aot_js_property(uintptr_t owner, uint64_t name,
                            AotJsValue value, uint64_t operation) {
   owner = js_canonical_owner(owner);
-  JsStringRec *receiver_string = js_string_lookup(owner);
+  JsObjectRec *receiver_object = js_object(owner, 0);
+  int receiver_is_string_object = receiver_object && receiver_object->internal_kind == 102;
+  JsStringRec *receiver_string = js_string_property_data(owner);
   if (receiver_string) {
     if (operation == 6) return (AotJsValue)receiver_string->length;
     if (operation == 7) {
@@ -1626,13 +1733,13 @@ AotJsValue aot_js_property(uintptr_t owner, uint64_t name,
       AotJsValue raw = aot_js_string((uintptr_t)(int64_t)name, 0, 0, AOT_JS_STRING_FROM_INT);
       return js_box_string_key(raw);
     }
-    if (operation == 14) {
+    if (!receiver_is_string_object && operation == 14) {
       if (js_property_key_ascii_equal((AotJsValue)name, "length")) return 0;
       int64_t string_index = 0;
       return js_property_array_index((AotJsValue)name, &string_index) && string_index >= 0 &&
              (size_t)string_index < receiver_string->length ? 2 : (AotJsValue)-1;
     }
-    if (operation == 0) {
+    if (!receiver_is_string_object && operation == 0) {
       if (js_property_key_ascii_equal((AotJsValue)name, "length"))
         return aot_js_box_int((int64_t)receiver_string->length);
       int64_t string_index = 0;
@@ -1670,7 +1777,10 @@ AotJsValue aot_js_property(uintptr_t owner, uint64_t name,
        throw when no internal slots were initialized. */
     if (operation == 12 && (!object || object->internal_kind < 0)) return (AotJsValue)-1;
     if (!object || object->internal_kind < 0) {
-      fputs("uncaught JavaScript throw\n", stderr);
+      fprintf(stderr,
+              "uncaught JavaScript throw: missing internal slot operation=%" PRIu64
+              " owner=0x%" PRIxPTR "\n",
+              operation, owner);
       exit(70);
     }
     if (operation == 10) return object->internal_target;
@@ -1719,10 +1829,18 @@ AotJsValue aot_js_property(uintptr_t owner, uint64_t name,
     js_throw_frozen_mutation();
   int64_t array_index = 0;
   JsArrayRec *indexed_array = js_array(owner, 0);
-  if (getenv("AOT_TRACE_ARR"))
-    fprintf(stderr, "js_property owner=%p name=%llx op=%llu indexed=%d value=%llx\n",
+  if (getenv("AOT_TRACE_ARR")) {
+    JsStringRec *trace_name = js_string_lookup(js_canonical_owner((uintptr_t)name));
+    fprintf(stderr, "js_property owner=%p name=%llx op=%llu indexed=%d value=%llx text=",
             (void *)owner, (unsigned long long)name, (unsigned long long)operation,
             indexed_array != NULL, (unsigned long long)value);
+    if (trace_name)
+      for (size_t i = 0; i < trace_name->length; ++i)
+        fputc(trace_name->units[i] < 128 ? (char)trace_name->units[i] : '?', stderr);
+    else
+      fputs("<non-string>", stderr);
+    fputc('\n', stderr);
+  }
   if (indexed_array && js_property_key_ascii_equal((AotJsValue)name, "length")) {
     if (operation == 14) return 1;
     if (operation == 0) return aot_js_box_int((int64_t)indexed_array->length);
@@ -1730,7 +1848,7 @@ AotJsValue aot_js_property(uintptr_t owner, uint64_t name,
       int ok = 0;
       double number = aot_js_to_number_double(value, &ok);
       if (!ok || number < 0 || number > UINT32_MAX || trunc(number) != number) {
-        fputs("uncaught JavaScript throw\n", stderr);
+        fputs("uncaught JavaScript throw: invalid direct array length mutation\n", stderr);
         exit(70);
       }
       return aot_js_array(owner, (int64_t)number, value, 4);
@@ -2091,12 +2209,13 @@ AotJsDispatchTarget aot_js_dispatch_resolve(uint64_t callable_id) {
   for (uint32_t i = 0; i < function_count(); ++i) {
     if ((uint64_t)table[i].callable_id == callable_id) {
       answer.target = (uintptr_t)registered_code_base + table[i].code_start;
-      answer.return_code = table[i].return_code;
+      answer.return_code = (int64_t)(((uint64_t)table[i].return_code_high << 32) |
+                                     table[i].return_code_low);
       if (trace) fprintf(stderr,
                          "AOTK_DISPATCH id=%llu record=%u owner=%u code=%llu return=%lld\n",
                          (unsigned long long)callable_id, i, table[i].owner,
                          (unsigned long long)table[i].code_start,
-                         (long long)table[i].return_code);
+                         (long long)answer.return_code);
       return answer;
     }
   }
@@ -2500,6 +2619,12 @@ static int relocate_site_roots(const SiteRec *site, uint8_t *frame_sp,
       slot = register_slots[root->location - 19];
     else if (root->location_kind == 1)
       slot = (uintptr_t *)(frame_sp + root->location);
+    else if (root->location_kind == 2) {
+      uint32_t pointer_offset = root->location >> 16;
+      uint32_t result_offset = root->location & 0xffffu;
+      uintptr_t area = *(uintptr_t *)(frame_sp + pointer_offset);
+      if (area) slot = (uintptr_t *)(area + result_offset);
+    }
     if (!slot) return 0;
     if (root->kind == 1) {
       uintptr_t moved = relocate(*slot);

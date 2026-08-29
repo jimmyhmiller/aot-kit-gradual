@@ -69,6 +69,11 @@ Read in this order:
    does, or before changing something that looks gratuitous.
 5. **[docs/JSL.md](docs/JSL.md)** for the language the JavaScript runtime library is written in,
    and for why a builtin must stop costing an opcode plus ten dispatch arms.
+6. **[docs/TORQUE-STYLE-LOWERED-VALUES.md](docs/TORQUE-STYLE-LOWERED-VALUES.md)** for the accepted
+   compiler-wide aggregate-value, multi-result call, and specification Record architecture.
+7. **[docs/BACKEND-SCALING-REFACTOR.md](docs/BACKEND-SCALING-REFACTOR.md)** for the mandatory
+   record-once MachineValue pipeline, removal of backend rediscovery fallbacks, runtime-artifact
+   reuse, and sub-second compilation gates.
 
 ## The module map
 
@@ -198,7 +203,9 @@ and the optimistic interprocedural dataflow pass in its chapter 24 `Opto`, which
 explicit whole-world assumption and builds its own call graph.
 
 ```sh
-git clone --depth 1 https://github.com/SeaOfNodes/Simple reference/Simple   # gitignored
+git clone https://github.com/SeaOfNodes/Simple reference/Simple-pinned   # gitignored
+git -C reference/Simple-pinned checkout 66e426e7c4576a8433449bc649597cf63f22436e
+npm run bench:simple-scheduler -- 250 500 1000 2000 4000
 ```
 
 What this project adds is summarised in

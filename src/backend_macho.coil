@@ -318,6 +318,9 @@
    (tmp-vreg (ArrayList i64))
    (flags (ArrayList i64))    ; packed per-vreg live flags during the block walk
    (touched (ArrayList i64))  ; vregs whose flag may need clearing before the next block
+   ;; Final instruction position -> non-empty block beginning there. This orders block-local root
+   ;; streams without sorting the global `(site,vreg)` product afterward.
+   (block-at-inst (ArrayList i64))
    (inited bool)])
 
 (defn mobj-roots [] (-> (ptr MobjRootCache))
@@ -333,6 +336,7 @@
           (set! (.tmp-vreg c) (al-new [i64] (malloc-allocator)))
           (set! (.flags c) (al-new [i64] (malloc-allocator)))
           (set! (.touched c) (al-new [i64] (malloc-allocator)))
+          (set! (.block-at-inst c) (al-new [i64] (malloc-allocator)))
           (set! (.inited c) true)
           0))
     c))
@@ -508,15 +512,35 @@
   (let [c (mobj-roots)
         vregs (ml-vreg-count)
         blocks (mu-block-count)
-        (mut bid) 0]
+        insts (be-inst-count)
+        (mut bid) 0
+        (mut at) 0]
     (al-clear! [i64] (field c site))
     (al-clear! [i64] (field c vreg))
+    (al-clear! [i64] (field c block-at-inst))
+    (loop (if (>= (load at) insts) (break)
+              (do
+                (al-push! [i64] (field c block-at-inst) -1)
+                (set! at (+ (load at) 1)))))
     (loop (if (>= (load bid) blocks)
               (break)
               (do
-                (mobj-build-block-roots! (load bid) vregs)
+                (if (> (mu-block-inst-count (load bid)) 0)
+                    (let [first (mu-block-inst-first (load bid))]
+                      (if (or (< first 0) (>= first insts))
+                          (panic-corrupt "non-empty block has invalid final instruction range")
+                          (al-set! [i64] (field c block-at-inst) first (load bid))))
+                    0)
                 (set! bid (+ (load bid) 1))
                 0)))
+    ;; A block publishes sites ascending internally. Walking block beginnings by final instruction
+    ;; position therefore produces the global `(site,vreg)` order directly in O(I+B+R).
+    (set! at 0)
+    (loop (if (>= (load at) insts) (break)
+              (do
+                (let [block (al-get [i64] (.block-at-inst c) (load at))]
+                  (if (>= block 0) (mobj-build-block-roots! block vregs) 0))
+                (set! at (+ (load at) 1)))))
     0))
 
 (defn mobj-root-count [] (-> i64)
@@ -525,6 +549,33 @@
   (al-get [i64] (.site (mobj-roots)) i))
 (defn mobj-root-vreg [(i i64)] (-> i64)
   (al-get [i64] (.vreg (mobj-roots)) i))
+
+;; Managed overflow results are roots at the call safepoint even though they do not have vregs:
+;; the callee writes them into caller-owned storage through the hidden result pointer.  Keep this
+;; derivation beside the ordinary liveness-root cache so every direct-object size, site, record,
+;; and verifier calculation observes one exact root set.
+(defn mobj-overflow-root-count-at [(at i64)] (-> i64)
+  (if (or (< at 0) (>= at (be-inst-count))) 0
+      (let [m (be-inst at)]
+        (if (or (!= (.op m) MI-CALL) (< (.node m) 0)) 0
+            (let [results (be-call-result-count (.node m)) (mut slot) 0 (mut count) 0]
+              (loop (if (>= (load slot) results) (break)
+                        (let [offset (be-call-result-area-offset (.node m) (load slot))
+                              kind (be-call-result-kind-at (.node m) (load slot))]
+                          (if (and (>= offset 0)
+                                   (or (= kind MLK-RAW-MANAGED) (= kind MLK-BOXED)))
+                              (set! count (+ (load count) 1)) 0)
+                          (set! slot (+ (load slot) 1)))))
+              (load count))))))
+
+(defn mobj-overflow-root-count [] (-> i64)
+  (let [(mut at) 0 (mut count) 0]
+    (loop (if (>= (load at) (be-inst-count)) (break)
+              (do
+                (if (ml-safepoint? (load at))
+                    (set! count (+ (load count) (mobj-overflow-root-count-at (load at)))) 0)
+                (set! at (+ (load at) 1)))))
+    (load count)))
 
 ;; First cache position whose site is >= at. Cache sites ascend, so [result..) begins at's
 ;; root range (possibly empty).
@@ -544,18 +595,21 @@
 (defn mobj-stackmap-size [] (-> i64)
   (+ 24
      (+ (* (mu-function-count) 40)
-        (+ (* (mobj-safepoint-count) 24) (* (mobj-root-count) 16)))))
+        (+ (* (mobj-safepoint-count) 24)
+           (* (+ (mobj-root-count) (mobj-overflow-root-count)) 16)))))
 (defn mobj-layout-size [] (-> i64)
   (+ 16 (* (shape-count) 32)))
 
 (defn mobj-write-stackmaps! [] (-> i64)
   (let [sites (mobj-safepoint-count)
-        roots (mobj-root-count)
+        roots (+ (mobj-root-count) (mobj-overflow-root-count))
         (mut phase-start) (ms-profile-now)
         (mut at) 0
         (mut root-first) 0]
     (obj-u32! 1398034241)
-    (obj-u32! 3)
+    ;; Version 5 adds typed indirect roots (location kind 2) for caller-owned overflow-result
+    ;; areas. Version 4 introduced the high half of the dynamic-dispatch return code.
+    (obj-u32! 5)
     (obj-u32! sites)
     (obj-u32! roots)
     (obj-u32! (mu-function-count))
@@ -570,7 +624,7 @@
                   (obj-u32! (mu-function-frame-size (load owner)))
                   (obj-u64! (mu-function-callee-mask (load owner)))
                   (obj-u32! (mu-function-callee-count (load owner)))
-                  (obj-u32! 0)
+                  (obj-u32! (>> (be-function-dispatch-return-code (load owner)) 32))
                   (obj-u32! (let [symbol (mu-function-symbol (load owner))]
                               (if (>= symbol 1) symbol 0)))
                   (obj-u32! (be-function-dispatch-return-code (load owner)))
@@ -601,6 +655,7 @@
                         (obj-u32! (.owner m))
                         (obj-u32! (load at))
                         (obj-u32! (load root-first))
+                        (set! count (+ (load count) (mobj-overflow-root-count-at (load at))))
                         (obj-u32! (load count))
                         (obj-u32! (.op m))
                         (set! root-first (+ (load root-first) (load count))))
@@ -610,18 +665,55 @@
       (fmt (stderr) "AOTK_PROFILE phase=stackmap_sites ns={d} count={d}\n"
            (- (ms-profile-now) (load phase-start)) sites)
       (set! phase-start (ms-profile-now))
-      (let [(mut r) 0]
-        (loop (if (>= (load r) total)
-                  (break)
-                  (do
-                    (let [vr (al-get [i64] (.vreg c) (load r))
-                          reg (mra-reg vr)]
-                      (obj-u32! vr)
-                      (obj-u32! (ml-value-kind vr))
-                      (obj-u32! (if (>= reg 0) 0 1))
-                      (obj-u32! (if (>= reg 0) reg (be-spill-off-vreg vr))))
-                    (set! r (+ (load r) 1))
-                    0)))))
+      ;; Root records are contiguous per site.  Emit ordinary live vregs followed by the call's
+      ;; typed result-area leaves, matching the site counts above and the linked-image writer.
+      (set! at 0)
+      (set! cursor 0)
+      (loop (if (>= (load at) (be-inst-count)) (break)
+                (do
+                  (if (ml-safepoint? (load at))
+                      (do
+                        (loop (if (or (>= (load cursor) total)
+                                      (!= (al-get [i64] (.site c) (load cursor)) (load at)))
+                                  (break)
+                                  (let [vr (al-get [i64] (.vreg c) (load cursor))
+                                        reg (mra-reg vr)]
+                                    (obj-u32! vr)
+                                    (obj-u32! (ml-value-kind vr))
+                                    (obj-u32! (if (>= reg 0) 0 1))
+                                    (obj-u32! (if (>= reg 0) reg (be-spill-off-vreg vr)))
+                                    (set! cursor (+ (load cursor) 1)))))
+                        (let [m (be-inst (load at))]
+                          (if (and (= (.op m) MI-CALL) (>= (.node m) 0))
+                              (let [owner (.owner m)
+                                    pointer-off (mu-function-outgoing-result-pointer-offset owner)
+                                    results (be-call-result-count (.node m))
+                                    (mut slot) 0]
+                                (loop (if (>= (load slot) results) (break)
+                                          (let [offset (be-call-result-area-offset
+                                                         (.node m) (load slot))
+                                                kind (be-call-result-kind-at
+                                                       (.node m) (load slot))]
+                                            (if (and (>= offset 0)
+                                                     (or (= kind MLK-RAW-MANAGED)
+                                                         (= kind MLK-BOXED)))
+                                                (do
+                                                  (if (or (< pointer-off 0)
+                                                          (> pointer-off 65535)
+                                                          (> offset 65535))
+                                                      (panic-corrupt
+                                                        "overflow result root is outside stackmap range")
+                                                      0)
+                                                  (obj-u32! -1)
+                                                  (obj-u32! kind)
+                                                  (obj-u32! 2)
+                                                  (obj-u32! (| (<< pointer-off 16) offset)))
+                                                0)
+                                            (set! slot (+ (load slot) 1))))))
+                              0)))
+                      0)
+                  (set! at (+ (load at) 1)))))
+      )
     (fmt (stderr) "AOTK_PROFILE phase=stackmap_roots ns={d} count={d}\n"
          (- (ms-profile-now) (load phase-start)) roots)
     0))
@@ -792,9 +884,10 @@
               false)
           (if (and (load ok)
                    (or (!= (mobj-u32 stackoff) 1398034241)
-                       (or (!= (mobj-u32 (+ stackoff 4)) 3)
+                       (or (!= (mobj-u32 (+ stackoff 4)) 5)
                            (or (!= (mobj-u32 (+ stackoff 8)) (mobj-safepoint-count))
-                               (or (!= (mobj-u32 (+ stackoff 12)) (mobj-root-count))
+                               (or (!= (mobj-u32 (+ stackoff 12))
+                                       (+ (mobj-root-count) (mobj-overflow-root-count)))
                                    (or (!= (mobj-u32 (+ stackoff 16)) (mu-function-count))
                                        (or (!= (mobj-u32 (+ stackoff 20)) 40)
                                            (!= stacklen (mobj-stackmap-size)))))))))
@@ -803,7 +896,8 @@
                      "AOTK_PROFILE phase=stackmap_header_failure magic={d} version={d} sites={d}/{d} roots={d}/{d} functions={d}/{d} stride={d} bytes={d}/{d}\n"
                      (mobj-u32 stackoff) (mobj-u32 (+ stackoff 4))
                      (mobj-u32 (+ stackoff 8)) (mobj-safepoint-count)
-                     (mobj-u32 (+ stackoff 12)) (mobj-root-count)
+                     (mobj-u32 (+ stackoff 12))
+                     (+ (mobj-root-count) (mobj-overflow-root-count))
                      (mobj-u32 (+ stackoff 16)) (mu-function-count)
                      (mobj-u32 (+ stackoff 20)) stacklen (mobj-stackmap-size))
                 (set! ok false)
@@ -834,6 +928,11 @@
                                                           (mu-function-callee-mask (load owner)))
                                                       (or (!= (mobj-u32 (+ rec 24))
                                                               (mu-function-callee-count (load owner)))
+                                                          (or (!= (mobj-u32 (+ rec 28))
+                                                                  (cast i64
+                                                                    (cast u32
+                                                                      (>> (be-function-dispatch-return-code
+                                                                            (load owner)) 32))))
                                                           (or (!= (mobj-u32 (+ rec 32))
                                                                   (let [symbol
                                                                           (mu-function-symbol
@@ -843,7 +942,7 @@
                                                                   (cast i64
                                                                     (cast u32
                                                                       (be-function-dispatch-return-code
-                                                                        (load owner))))))))))))
+                                                                        (load owner)))))))))))))
                                   (do
                                     (fmt (stderr)
                                          "AOTK_PROFILE phase=stackmap_function_failure owner={d} id={d}/{d} start={d}/{d} size={d}/{d} frame={d}/{d} mask={d}/{d} callees={d}/{d} callable={d}/{d} return={d}/{d}\n"
@@ -886,6 +985,7 @@
                                   ; site absent from it has zero.
                                   clo (if (< at (be-inst-count)) (mobj-roots-lower-bound at) 0)
                                   (mut chi) clo
+                                  (mut ordinary-count) 0
                                   (mut expected-count) 0]
                               (if (< at (be-inst-count))
                                   (let [c (mobj-roots)
@@ -897,8 +997,12 @@
                                               (break)
                                               (do
                                                 (set! chi (+ (load chi) 1))
+                                                (set! ordinary-count (+ (load ordinary-count) 1))
                                                 (set! expected-count (+ (load expected-count) 1))
                                                 0)))
+                                    (set! expected-count
+                                          (+ (load expected-count)
+                                             (mobj-overflow-root-count-at at)))
                                     0)
                                   0)
                               (if (or (>= at (be-inst-count))
@@ -909,13 +1013,22 @@
                                                       (or (!= root-count (load expected-count))
                                                           (> (+ root-first root-count) roots)))))))
                                   (do
+                                    (fmt (stderr)
+                                         "AOTK_PROFILE phase=stackmap_site_failure site={d} at={d}/{d} pc={d}/{d} owner={d}/{d} op={d}/{d} roots={d}/{d}+{d}/{d}\n"
+                                         (load site)
+                                         at (be-inst-count)
+                                         pc (if (< at (be-inst-count)) (mobj-safepoint-pc at) -1)
+                                         owner (if (< at (be-inst-count)) (.owner (be-inst at)) -1)
+                                         op (if (< at (be-inst-count)) (.op (be-inst at)) -1)
+                                         root-count (load expected-count)
+                                         root-first roots)
                                     (set! ok false)
                                     (mobj-fail! MOBJ-STACKMAP (load site)))
                                   false)
                               (if (load ok)
                                   (let [c (mobj-roots)
                                         (mut ordinal) 0]
-                                    (loop (if (or (>= (load ordinal) (load expected-count))
+                                    (loop (if (or (>= (load ordinal) (load ordinary-count))
                                                   (not (load ok)))
                                               (break)
                                               (do
@@ -942,6 +1055,50 @@
                                                       false))
                                                 (set! ordinal (+ (load ordinal) 1))
                                                 0)))
+                                    (if (and (load ok) (> (mobj-overflow-root-count-at at) 0))
+                                        (let [m (be-inst at)
+                                              pointer-off
+                                                (mu-function-outgoing-result-pointer-offset
+                                                  (.owner m))
+                                              results (be-call-result-count (.node m))
+                                              (mut slot) 0
+                                              (mut overflow-ordinal) 0]
+                                          (loop (if (or (>= (load slot) results)
+                                                        (not (load ok)))
+                                                    (break)
+                                                    (let [offset
+                                                            (be-call-result-area-offset
+                                                              (.node m) (load slot))
+                                                          kind
+                                                            (be-call-result-kind-at
+                                                              (.node m) (load slot))]
+                                                      (if (and (>= offset 0)
+                                                               (or (= kind MLK-RAW-MANAGED)
+                                                                   (= kind MLK-BOXED)))
+                                                          (let [rootrec
+                                                                  (+ sitebase
+                                                                     (+ (* sites 24)
+                                                                        (* (+ root-first
+                                                                              (+ (load ordinary-count)
+                                                                                 (load overflow-ordinal)))
+                                                                           16)))]
+                                                            (if (or (!= (mobj-u32 rootrec)
+                                                                       (cast i64 (cast u32 -1)))
+                                                                    (or (!= (mobj-u32 (+ rootrec 4)) kind)
+                                                                        (or (!= (mobj-u32 (+ rootrec 8)) 2)
+                                                                            (!= (mobj-u32 (+ rootrec 12))
+                                                                                (| (<< pointer-off 16)
+                                                                                   offset)))))
+                                                                (do
+                                                                  (set! ok false)
+                                                                  (mobj-fail! MOBJ-STACKMAP (load site)))
+                                                                false)
+                                                            (set! overflow-ordinal
+                                                                  (+ (load overflow-ordinal) 1)))
+                                                          0)
+                                                      (set! slot (+ (load slot) 1)))))
+                                          0)
+                                        0)
                                     0)
                                   0))
                             (set! site (+ (load site) 1))
@@ -1369,6 +1526,7 @@
     (mobj-build-index!)
     (set! started (mobj-profile! "memory_index" (load started)))
     (mobj-build-roots!)
+    (set! started (mobj-profile! "memory_roots" (load started)))
     (if (or (!= (be-result) BER-OK) (= (be-code-len) 0))
         (be-fail! BER-OBJECT NO-NODE)
         (let [model-ok (mobj-verify-model!)]

@@ -584,8 +584,11 @@
     (PropHas [name] name)
     (PropDelete [name] name)
     (ProtoHas [] 0)
-    (PropLoadKey [_] 0)
-    (PropStoreKey [_] 0)
+    ;; The runtime operation is semantic identity, not merely an encoding immediate. Getter and
+    ;; setter component loads have identical inputs but must never GVN into one another; the same
+    ;; applies to value/getter/setter/attribute stores.
+    (PropLoadKey [operation] operation)
+    (PropStoreKey [operation] operation)
     (PropHasKey [] 0)
     (PropDeleteKey [] 0)
     (OwnKeyCount [] 0)
@@ -755,7 +758,7 @@
     (Fun [_] 2)
     (CallableId [_] 34)
     (Parm [_] 98)
-    (Call [_] 514)
+    (Call [_] 530)
     (FunStart [] 33)
     (Closure [_] 2)
     (Safepoint [] 17)
@@ -952,7 +955,12 @@
    (fun-abi-param-first (ArrayList i64))
    (fun-abi-param-count (ArrayList i64))
    (fun-abi-param-types (ArrayList i64))
-   (fun-abi-return-type (ArrayList i64))
+   (fun-abi-result-first (ArrayList i64))
+   (fun-abi-result-count (ArrayList i64))
+   (fun-abi-result-types (ArrayList i64))
+   ;; Explicit exceptional outcome is part of the lowered function contract. The backend must not
+   ;; rediscover it by scanning bodies or recognizing poison result tuples.
+   (fun-abi-can-throw (ArrayList bool))
    (gvn (HashMap i64 i64))  ; structural key -> node id (see gvn-keyops)
    (wl (ArrayList i64))  ; the worklist
    (onwl (ArrayList bool))  ; id -> is it on the worklist
@@ -1028,7 +1036,10 @@
           (set! (.fun-abi-param-first p) (al-new [i64] (malloc-allocator)))
           (set! (.fun-abi-param-count p) (al-new [i64] (malloc-allocator)))
           (set! (.fun-abi-param-types p) (al-new [i64] (malloc-allocator)))
-          (set! (.fun-abi-return-type p) (al-new [i64] (malloc-allocator)))
+          (set! (.fun-abi-result-first p) (al-new [i64] (malloc-allocator)))
+          (set! (.fun-abi-result-count p) (al-new [i64] (malloc-allocator)))
+          (set! (.fun-abi-result-types p) (al-new [i64] (malloc-allocator)))
+          (set! (.fun-abi-can-throw p) (al-new [bool] (malloc-allocator)))
           (set! (.gvn p) (hm-new [i64 i64] (malloc-allocator) (gvn-keyops)))
           (set! (.wl p) (al-new [i64] (malloc-allocator)))
           (set! (.onwl p) (al-new [bool] (malloc-allocator)))
@@ -1112,7 +1123,10 @@
     (al-clear! [i64] (field p fun-abi-param-first))
     (al-clear! [i64] (field p fun-abi-param-count))
     (al-clear! [i64] (field p fun-abi-param-types))
-    (al-clear! [i64] (field p fun-abi-return-type))
+    (al-clear! [i64] (field p fun-abi-result-first))
+    (al-clear! [i64] (field p fun-abi-result-count))
+    (al-clear! [i64] (field p fun-abi-result-types))
+    (al-clear! [bool] (field p fun-abi-can-throw))
     (hm-clear! [i64 i64] (field p gvn))
     (al-clear! [i64] (field p wl))
     (al-clear! [bool] (field p onwl))
@@ -1303,6 +1317,13 @@
           0)))
 
 (defn n-add-def! [(n i64) (d i64)] (-> i64)
+  (if (and (!= d NO-NODE) (n-dead? d))
+      (do
+        (fmt (stderr) "N_ADD_DEAD_DEF owner=n{d}:{s} input={d} def=n{d}:{s}\n"
+             n (op-name (n-op n)) (n-nins n) d (op-name (n-op d)))
+        (panic-corrupt "n-add-def!: cannot attach a dead definition")
+        0)
+      0)
   (n-bump-cfg! n)
   (n-record-object-use! n (n-nins n) d)
   (al-push! [i64] (field (nd n) ins) d)
@@ -1387,6 +1408,13 @@
         0)))
 
 (defn n-set-def! [(n i64) (i i64) (d i64)] (-> i64)
+  (if (and (!= d NO-NODE) (n-dead? d))
+      (do
+        (fmt (stderr) "N_SET_DEAD_DEF owner=n{d}:{s} input={d} def=n{d}:{s}\n"
+             n (op-name (n-op n)) i d (op-name (n-op d)))
+        (panic-corrupt "n-set-def!: cannot attach a dead definition")
+        0)
+      0)
   (n-check-loop-close n i d)
   (n-bump-cfg! n)
   (let [old (n-in n i)]
@@ -1399,7 +1427,9 @@
           (if (!= d NO-NODE) (do (al-push! [i64] (field (nd d) outs) n) 0) 0)
           (al-set! [i64] (field (nd n) ins) i d)
           (if (!= old NO-NODE)
-              (if (n-del-use! old n) (n-kill! old) (wl-push! old))
+              (if (n-del-use! old n)
+                  (if (= (n-keeps old) 0) (n-kill! old) (wl-push! old))
+                  (wl-push! old))
               0)
           (set! (.hash (nd n)) 0)
           (n-move-deps! n)
@@ -1411,7 +1441,12 @@
   (if (n-dead? n)
       0
       (do
-        (if (> (n-keeps n) 0) (do (panic-corrupt "n-kill!: node is pinned") 0) 0)
+        (if (> (n-keeps n) 0)
+            (do
+              (fmt (stderr) "n-kill-pinned node={d} op={s} keeps={d} uses={d}\n"
+                   n (op-name (n-op n)) (n-keeps n) (n-nouts n))
+              (panic-corrupt "n-kill!: node is pinned") 0)
+            0)
         ;; DEAD MEANS NOBODY USES IT. Killing a node that still has users leaves every one of them
         ;; holding a corpse, and the graph only says so later, somewhere else -- a `Cast` whose
         ;; value was a dead `Box` with four live uses is how this was found. Refusing here names
@@ -1434,7 +1469,13 @@
                     (do
                       (let [d (n-in n (load i))]
                         (if (!= d NO-NODE)
-                            (if (n-del-use! d n) (n-kill! d) (wl-push! d))
+                            ;; Losing the last ordinary user does not make an explicitly kept
+                            ;; value dead. JSL bindings pin values whose later uses have not been
+                            ;; built yet; a discarded duplicate wrapper can remove their current
+                            ;; last edge while that lexical ownership is still active.
+                            (if (n-del-use! d n)
+                                (if (= (n-keeps d) 0) (n-kill! d) (wl-push! d))
+                                (wl-push! d))
                             0))
                       (set! i (+ (load i) 1))
                       0))))
@@ -1475,7 +1516,10 @@
                     ; graph. Spinning forever is the worst way to find that out.
                     (do (panic-corrupt "n-subsume!: def-use edge with no matching use-def edge") 0)
                     (do (n-set-def! u at new) 0))))))
-  (n-kill! old)
+  ;; External builders retain node ids for explicitly kept lexical values. Rewire all graph users,
+  ;; but leave a pinned old value alive until its owner releases that id; `jl-collect!` will then
+  ;; remove it if no later use was built. Killing it here would invalidate the external binding.
+  (if (= (n-keeps old) 0) (n-kill! old) (wl-push! old))
   0)
 
 ;; Killing a node releases its inputs, which cascades. When the node being killed is being
@@ -1725,15 +1769,30 @@
                 0)))
     0))
 
+(defn n-fun-abi-result-tuple [(fun i64)] (-> i64)
+  (let [count (n-fun-abi-result-count fun)
+        tuple (ty-tuple-open count)
+        (mut result) 0]
+    (loop (if (>= (load result) count) (break)
+              (do (ty-tuple-put! tuple (load result)
+                                 (n-fun-abi-result-type fun (load result)))
+                  (set! result (+ (load result) 1)))))
+    (ty-tuple-close tuple)))
+
 (defn infer-call-compute [(call i64)] (-> i64)
+  (block :done
   (let [targets (infer-call-targets call)
         direct (infer-direct-callee-fun call)
         (mut fidx) 0
         (mut acc) (t-top)
         (mut seen) false]
-    (if (!= direct NO-NODE)
-        (infer-meet-fun-returns! direct call (mut acc) (mut seen))
+    ;; A declared multi-result call is itself a tuple producer. Individual consumers use Proj;
+    ;; scalar calls retain the established interprocedural meet so existing precision is unchanged.
+    (if (and (!= direct NO-NODE)
+             (and (n-fun-abi-declared? direct) (!= (n-fun-abi-result-count direct) 1)))
+        (return-from :done (n-fun-abi-result-tuple direct))
         0)
+    (if (!= direct NO-NODE) (infer-meet-fun-returns! direct call (mut acc) (mut seen)) 0)
     (loop (if (>= (load fidx) 64)
               (break)
               (do
@@ -1743,7 +1802,14 @@
                       (if (= fun NO-NODE) 0 (infer-meet-fun-returns! fun call (mut acc) (mut seen)))))
                 (set! fidx (+ (load fidx) 1))
                 0)))
-    (if (load seen) (load acc) (t-top))))
+    (if (load seen) (load acc) (t-top)))))
+
+(defn call-compute [(call i64)] (-> i64)
+  (let [direct (infer-direct-callee-fun call)]
+    (if (and (!= direct NO-NODE)
+             (and (n-fun-abi-declared? direct) (!= (n-fun-abi-result-count direct) 1)))
+        (n-fun-abi-result-tuple direct)
+        (if (.infer (graph)) (infer-call-compute call) (t-dyn)))))
 
 (defn safepoint-compute [(n i64)] (-> i64)
   (let [len (n-nins n)
@@ -1811,7 +1877,7 @@
     ;; callable symbol. Keep it non-constant so folding cannot erase relocation identity.
     (CallableId [index] (t-int))
     (Parm [index] (if (.infer (graph)) (infer-parm-compute n) (t-dyn)))
-    (Call [abi] (if (.infer (graph)) (infer-call-compute n) (t-dyn)))
+    (Call [abi] (call-compute n))
     (FunStart [] (t-ctrl))
     (Closure [captures] (n-in-ty n 0))
     (Safepoint [] (safepoint-compute n))
@@ -2195,7 +2261,9 @@
     (al-pop! [i64] ins)
     (set! (.hash (nd n)) 0)
     (if (!= old NO-NODE)
-        (if (n-del-use! old n) (n-kill! old) (wl-push! old))
+        (if (n-del-use! old n)
+            (if (= (n-keeps old) 0) (n-kill! old) (wl-push! old))
+            (wl-push! old))
         0)
     (n-move-deps! n)
     (wl-push! n)
@@ -2455,14 +2523,29 @@
 (defn n-prop-load-key-at! [(ctrl i64) (mem i64) (ptr i64) (key i64)] (-> i64)
   (n-peephole (n-new4 (PropLoadKey 0) ctrl mem ptr key)))
 
+(defn n-prop-load-key-operation-at! [(ctrl i64) (mem i64) (ptr i64) (key i64)
+                                      (operation i64)] (-> i64)
+  (n-peephole (n-new4 (PropLoadKey operation) ctrl mem ptr key)))
+
 (defn n-own-property-attributes-at! [(ctrl i64) (mem i64) (ptr i64) (key i64)] (-> i64)
   (n-peephole (n-new4 (PropLoadKey 14) ctrl mem ptr key)))
+
+(defn n-get-prototype-at! [(ctrl i64) (mem i64) (ptr i64) (unused i64)] (-> i64)
+  ;; The shared runtime property entry point uses operation 24 for [[GetPrototypeOf]]. Keep the
+  ;; otherwise-unused fourth graph input because PropLoadKey has one uniform shape, but preserve
+  ;; the operation discriminator: lowering this through the ordinary operation-0 constructor
+  ;; performs `object[null]` and can turn a prototype walk into an infinite loop on `undefined`.
+  (n-peephole (n-new4 (PropLoadKey 24) ctrl mem ptr unused)))
 
 (defn n-property-component-at! [(ctrl i64) (mem i64) (ptr i64) (key i64) (operation i64)] (-> i64)
   (n-peephole (n-new4 (PropLoadKey operation) ctrl mem ptr key)))
 
 (defn n-prop-store-key-at! [(ctrl i64) (mem i64) (ptr i64) (key i64) (value i64)] (-> i64)
   (n-peephole (n-new5 (PropStoreKey 1) ctrl mem ptr key value)))
+
+(defn n-prop-store-key-operation-at! [(ctrl i64) (mem i64) (ptr i64) (key i64)
+                                       (value i64) (operation i64)] (-> i64)
+  (n-peephole (n-new5 (PropStoreKey operation) ctrl mem ptr key value)))
 
 (defn n-set-property-attributes-at! [(ctrl i64) (mem i64) (ptr i64) (key i64) (attributes i64)] (-> i64)
   (n-peephole (n-new5 (PropStoreKey 15) ctrl mem ptr key attributes)))
@@ -2553,6 +2636,11 @@
 ;; Parm. The open/close API makes that cycle explicit and prevents a caller from pretending a
 ;; half-built function is ready to call.
 (defn n-fun-open-identity! [(fidx i64) (kind i64) (unit i64) (local i64)] (-> i64)
+  (if (and (>= fidx 0)
+           (and (< fidx (al-len [i64] (.fun-index (graph))))
+                (!= (al-get [i64] (.fun-index (graph)) fidx) NO-NODE)))
+      (do (panic-corrupt "n-fun-open-identity!: function index is already owned") NO-NODE)
+      0)
   (let [fun (n-new (Fun fidx))
         entry (n-new1 (FunStart) fun)]
     (loop (if (> (al-len [i64] (.fun-index (graph))) fidx)
@@ -2565,7 +2653,9 @@
                 (al-push! [bool] (field (graph) fun-imported) false)
                 (al-push! [i64] (field (graph) fun-abi-param-first) 0)
                 (al-push! [i64] (field (graph) fun-abi-param-count) -1)
-                (al-push! [i64] (field (graph) fun-abi-return-type) TY-NO-ID)
+                (al-push! [i64] (field (graph) fun-abi-result-first) 0)
+                (al-push! [i64] (field (graph) fun-abi-result-count) -1)
+                (al-push! [bool] (field (graph) fun-abi-can-throw) false)
                 0)))
     (al-set! [i64] (field (graph) fun-index) fidx fun)
     (al-set! [i64] (field (graph) fun-identity-kind) fidx kind)
@@ -2588,17 +2678,28 @@
 (defn n-fun-imported? [(fun i64)] (-> bool)
   (and (op-is? fun Fun [_])
        (al-get [bool] (.fun-imported (graph)) (n-fun-index fun))))
-(defn n-fun-declare-abi! [(fun i64) (params (slice i64)) (ret i64)] (-> i64)
+(defn n-fun-declare-abi-results! [(fun i64) (params (slice i64)) (results (slice i64))]
+                                  (-> i64)
   (let [p (graph) fidx (n-fun-index fun)
-        first (al-len [i64] (.fun-abi-param-types p))
+        param-first (al-len [i64] (.fun-abi-param-types p))
+        result-first (al-len [i64] (.fun-abi-result-types p))
         (mut i) 0]
-    (al-set! [i64] (field p fun-abi-param-first) fidx first)
+    (al-set! [i64] (field p fun-abi-param-first) fidx param-first)
     (al-set! [i64] (field p fun-abi-param-count) fidx (slice-len params))
-    (al-set! [i64] (field p fun-abi-return-type) fidx ret)
+    (al-set! [i64] (field p fun-abi-result-first) fidx result-first)
+    (al-set! [i64] (field p fun-abi-result-count) fidx (slice-len results))
     (loop (if (>= (load i) (slice-len params)) (break)
               (do (al-push! [i64] (field p fun-abi-param-types) (slice-get params (load i)))
                   (set! i (+ (load i) 1)))))
+    (set! i 0)
+    (loop (if (>= (load i) (slice-len results)) (break)
+              (do (al-push! [i64] (field p fun-abi-result-types) (slice-get results (load i)))
+                  (set! i (+ (load i) 1)))))
     0))
+(defn n-fun-declare-abi! [(fun i64) (params (slice i64)) (ret i64)] (-> i64)
+  (let [buf (primitive/alloc-stack (array i64 1)) p (cast (ptr i64) buf)]
+    (store! p ret)
+    (n-fun-declare-abi-results! fun params (slice-new [i64] p 1))))
 (defn n-fun-abi-declared? [(fun i64)] (-> bool)
   (>= (al-get [i64] (.fun-abi-param-count (graph)) (n-fun-index fun)) 0))
 (defn n-fun-abi-param-count [(fun i64)] (-> i64)
@@ -2606,8 +2707,25 @@
 (defn n-fun-abi-param-type [(fun i64) (index i64)] (-> i64)
   (al-get [i64] (.fun-abi-param-types (graph))
           (+ (al-get [i64] (.fun-abi-param-first (graph)) (n-fun-index fun)) index)))
+(defn n-fun-abi-result-count [(fun i64)] (-> i64)
+  (al-get [i64] (.fun-abi-result-count (graph)) (n-fun-index fun)))
+(defn n-fun-abi-result-type [(fun i64) (index i64)] (-> i64)
+  (if (or (< index 0) (>= index (n-fun-abi-result-count fun)))
+      (do (panic-corrupt "n-fun-abi-result-type: result index is outside the ABI range") TY-NO-ID)
+      (al-get [i64] (.fun-abi-result-types (graph))
+              (+ (al-get [i64] (.fun-abi-result-first (graph)) (n-fun-index fun)) index))))
 (defn n-fun-abi-return-type [(fun i64)] (-> i64)
-  (al-get [i64] (.fun-abi-return-type (graph)) (n-fun-index fun)))
+  ;; Scalar compatibility query. Multi-result consumers must select an explicit result index.
+  (if (!= (n-fun-abi-result-count fun) 1)
+      (do (panic-corrupt "n-fun-abi-return-type: multi-result ABI requires indexed access")
+          TY-NO-ID)
+      (n-fun-abi-result-type fun 0)))
+(defn n-fun-abi-set-can-throw! [(fun i64) (value bool)] (-> i64)
+  (al-set! [bool] (field (graph) fun-abi-can-throw) (n-fun-index fun) value)
+  0)
+(defn n-fun-abi-can-throw? [(fun i64)] (-> bool)
+  (and (n-fun-abi-declared? fun)
+       (al-get [bool] (.fun-abi-can-throw (graph)) (n-fun-index fun))))
 (defn n-fun-entry [(fun i64)] (-> i64)
   (if (and (op-is? fun Fun [_]) (> (n-nins fun) 0)) (n-in fun 0) NO-NODE))
 (defn n-parm! [(fun i64) (idx i64)] (-> i64)
@@ -2724,11 +2842,60 @@
       (do (panic-corrupt "n-fun-add-return!: expected a Fun and a Return") 0)
       (do (n-add-def! fun body-ret) (n-peephole fun) fun)))
 
-(defstruct CallSite [(value i64) (end i64)])
+(defstruct CallSite [(call i64) (value i64) (end i64)])
+(defn call-node [(c CallSite)] (-> i64)
+  (.call c))
 (defn call-value [(c CallSite)] (-> i64)
-  (.value c))
+  ;; Construct the compatibility scalar projection on demand. Calls whose value is ignored must
+  ;; not manufacture a permanently live, userless Proj merely because their control site exists.
+  (if (!= (.value c) NO-NODE)
+      (.value c)
+      (call-result-at (.call c) (.end c) 0)))
 (defn call-end [(c CallSite)] (-> i64)
   (.end c))
+(defn call-result-at [(call i64) (normal-ctrl i64) (index i64)] (-> i64)
+  (let [fun (infer-direct-callee-fun call)]
+    (if (or (= fun NO-NODE) (not (n-fun-abi-declared? fun)))
+        (do (if (= index 0) 0
+                (panic-corrupt "call-result: unknown call signature has no indexed result"))
+            (n-peephole (n-new2 (Proj 0) normal-ctrl call)))
+        (let [count (n-fun-abi-result-count fun)]
+          (if (or (< index 0) (>= index count))
+              (do (panic-corrupt "call-result: result index is outside the call ABI") call)
+              ;; Every declared result uses the same controlled projection, including a scalar
+              ;; one-result signature. The raw Call word is backend state, not a compatibility
+              ;; source-value representation.
+              (n-peephole (n-new2 (Proj index) normal-ctrl call)))))))
+
+(defn call-result [(c CallSite) (index i64)] (-> i64)
+  (call-result-at (.call c) (.end c) index))
+
+(defn n-proj-source [(projection i64)] (-> i64)
+  (if (not (op-is? projection Proj [_]))
+      (do (panic-corrupt "n-proj-source: expected Proj") NO-NODE)
+      (if (= (n-nins projection) 2)
+          (n-in projection 1)
+          (n-in projection 0))))
+
+(defn n-proj-normal-control [(projection i64)] (-> i64)
+  (if (and (op-is? projection Proj [_]) (= (n-nins projection) 2))
+      (n-in projection 0)
+      NO-NODE))
+
+;; A Return carries `[control, result..., optional-memory]`. The owning Fun's declared result count
+;; is the authority that separates the value range from the trailing effect channel.
+(defn n-return-values! [(ctrl i64) (values (slice i64)) (memory i64)] (-> i64)
+  (let [ret (n-new (Return)) (mut i) 0]
+    (n-add-def! ret ctrl)
+    (loop (if (>= (load i) (slice-len values)) (break)
+              (do (n-add-def! ret (slice-get values (load i)))
+                  (set! i (+ (load i) 1)))))
+    (if (= memory NO-NODE) 0 (n-add-def! ret memory))
+    ret))
+(defn n-return-value [(ret i64) (index i64)] (-> i64)
+  (if (or (not (op-is? ret Return [])) (or (< index 0) (>= (+ index 1) (n-nins ret))))
+      (do (panic-corrupt "n-return-value: result index is outside the Return") NO-NODE)
+      (n-in ret (+ index 1))))
 
 (defn n-call! [(ctrl i64) (callee i64) (args (slice i64))] (-> CallSite)
   (let [call (n-new (Call 0))
@@ -2742,18 +2909,23 @@
                 (n-add-def! call (slice-get args (load i)))
                 (set! i (+ (load i) 1))
                 0)))
-    (set! (.value r) (n-peephole call))
-    (set! (.end r) (n-peephole (n-new2 (CallEnd) ctrl (.value r))))
+    (set! (.call r) (n-peephole call))
+    (set! (.end r) (n-peephole (n-new2 (CallEnd) ctrl (.call r))))
+    (set! (.value r) NO-NODE)
     (load r)))
 
-(defn n-call-receiver! [(ctrl i64) (callee i64) (env i64) (receiver i64) (argc i64)
-                        (args (slice i64))] (-> CallSite)
+(defn n-call-receiver-abi! [(abi i64) (ctrl i64) (callee i64) (env i64)
+                            (receiver i64) (argc i64) (args (slice i64))] (-> CallSite)
   ; The JavaScript receiver ABI: input 2 is the hidden closure environment (the callee VALUE at
   ; generic sites — a closure is its own environment — or a boxed closure/undefined at exact
   ; sites), input 3 is the receiver, input 4 is the actual source argument count, and explicit
   ; arguments follow. Aux distinguishes this
   ; layout from legacy/internal calls.
-  (let [call (n-new (Call CALL-ABI-RECEIVER))
+  ;; The ABI is fixed on the node BEFORE its first peephole. Dynamic receiver calls must retain
+  ;; the heap-loaded callable even when its Cast has a singleton target set; constructing them as
+  ;; ordinary receiver calls and relabeling afterward allowed call-idealize to replace that runtime
+  ;; value with the compile-time Fun during this very n-peephole invocation.
+  (let [call (n-new (Call abi))
         (mut i) 0
         (mut r) (zeroed CallSite)]
     (n-add-def! call ctrl)
@@ -2767,9 +2939,18 @@
                 (n-add-def! call (slice-get args (load i)))
                 (set! i (+ (load i) 1))
                 0)))
-    (set! (.value r) (n-peephole call))
-    (set! (.end r) (n-peephole (n-new2 (CallEnd) ctrl (.value r))))
+    (set! (.call r) (n-peephole call))
+    (set! (.end r) (n-peephole (n-new2 (CallEnd) ctrl (.call r))))
+    (set! (.value r) NO-NODE)
     (load r)))
+
+(defn n-call-receiver! [(ctrl i64) (callee i64) (env i64) (receiver i64) (argc i64)
+                        (args (slice i64))] (-> CallSite)
+  (n-call-receiver-abi! CALL-ABI-RECEIVER ctrl callee env receiver argc args))
+
+(defn n-call-dynamic-receiver! [(ctrl i64) (callee i64) (env i64) (receiver i64) (argc i64)
+                                (args (slice i64))] (-> CallSite)
+  (n-call-receiver-abi! CALL-ABI-DYNAMIC-RECEIVER ctrl callee env receiver argc args))
 
 (defn n-call-captured-receiver! [(ctrl i64)
                                   (callee i64)
@@ -2791,8 +2972,9 @@
               (break)
               (do (n-add-def! call (slice-get args (load i)))
                   (set! i (+ (load i) 1)))))
-    (set! (.value r) (n-peephole call))
-    (set! (.end r) (n-peephole (n-new2 (CallEnd) ctrl (.value r))))
+    (set! (.call r) (n-peephole call))
+    (set! (.end r) (n-peephole (n-new2 (CallEnd) ctrl (.call r))))
+    (set! (.value r) NO-NODE)
     (load r)))
 
 (defn n-call1! [(ctrl i64) (callee i64) (a i64)] (-> CallSite)
@@ -2954,10 +3136,20 @@
   (if (n-in-progress? n) (t-ctrl) (n-in-ty n 1)))
 
 (defn proj-compute [(n i64)] (-> i64)
-  (let [t (n-in-ty n 0)
+  (let [source (if (and (op-is? n Proj [_]) (= (n-nins n) 2))
+                   (n-in n 1) (n-in n 0))
+        t (n-ty source)
         idx (match (n-op n) (Proj [slot] slot) (CProj [slot] slot)
               (_ (do (panic-corrupt "proj-compute: expected Proj or CProj") 0)))]
-    (match (ty-get t)
+    (if (and (op-is? n Proj [_])
+             (and (= (n-nins n) 2) (op-is? source Call [_])))
+        (let [fun (infer-direct-callee-fun source)]
+          (if (and (!= fun NO-NODE)
+                   (and (n-fun-abi-declared? fun)
+                        (and (>= idx 0) (< idx (n-fun-abi-result-count fun)))))
+              (n-fun-abi-result-type fun idx)
+              (if (= idx 0) t (t-bot))))
+        (match (ty-get t)
       (TTuple [off len] (if (< idx len) (ty-kid off idx) (t-bot)))
       (TTop [] (t-top))
       (TXCtrl [] (t-top))
@@ -2968,7 +3160,7 @@
       ; follows the TVal arm rather than inventing one, so an optimistic input still reports ANY and
       ; only a settled one falls to ALL. Memory's own projections (a `New`'s per-alias outputs)
       ; arrive in 4b as projections of a TUPLE, which the arm above already handles.
-      (TMem [a c] (if (ty-high? t) (t-top) (t-bot))))))
+      (TMem [a c] (if (ty-high? t) (t-top) (t-bot)))))))
 
 ;; A Phi's type is the meet over the paths that are actually LIVE, joined with its declared
 ;; type (aux). Reading a dead path's value would poison the result with a value that cannot
@@ -3108,7 +3300,7 @@
 ;; one (it refuses in-progress graphs), but the idealizations run DURING construction, where an
 ;; open loop Phi's backedge may later deliver either representation -- deciding from the entry
 ;; arm alone would let a peephole delete a deferred `Box(Phi)` placeholder that
-;; `fng-distribute-deferred-phi-boxes!` still needs to distribute.
+;; `g-distribute-deferred-phi-boxes!` still needs to distribute.
 (defn n-rep-of [(n i64) (fuel i64)] (-> i64)
   (if (or (< n 0) (or (<= fuel 0) (n-dead? n)))
       REP-UNKNOWN
@@ -3141,7 +3333,7 @@
                         (or (= (ty-kinds t) VK-INT) (= (ty-kinds t) VK-FLT)) REP-RAW-NUM
                         :else REP-UNKNOWN)))
         (Proj [slot]
-          (let [parent (n-in n 0)]
+          (let [parent (n-proj-source n)]
             (if (and (!= parent NO-NODE)
                      (match (n-op parent) (New [shape] true) (_ false)))
                 REP-RAW-PTR REP-UNKNOWN)))
@@ -3199,6 +3391,12 @@
         (PropHasKey [] REP-RAW-NUM)
         (ProtoHas [] REP-RAW-NUM)
         (_ REP-UNKNOWN))))
+
+;; Public representation query for backend conversion boundaries. Consumers must not duplicate
+;; the private representation tags: the point of this predicate is to distinguish a physically raw
+;; numeric word from a merely numeric logical type.
+(defn n-raw-number-representation? [(n i64)] (-> bool)
+  (= (n-rep-of n 32) REP-RAW-NUM))
 
 ;; `%IsArray`, and it folds in exactly ONE direction. A value whose kinds do not include VK-OBJ
 ;; cannot be an array, so the test is a constant false -- which is what lets `ToStringValue`'s array
@@ -3784,6 +3982,66 @@
                 v
                 NO-NODE))
         NO-NODE)))
+
+;; A dynamic boundary can be built while a loop Phi is still open. Its missing backedge makes the
+;; representation unknown, so `n-box!` must retain a `Box(Phi)` placeholder until graph construction
+;; closes every incoming edge. A raw Phi spanning different JavaScript tag classes cannot be boxed
+;; after the merge: the merged machine word no longer says whether (for example) it was raw
+;; `undefined` or raw `bool`. Normalize the graph by boxing each incoming value on its own CFG edge
+;; and joining the tagged words instead.
+;;
+;; This is a GRAPH invariant, not JavaScript-frontend policy. Standalone JSL library graphs need the
+;; same normalization, and keeping it in `frontend_native_graph.coil` left their `Box(Phi)` nodes to
+;; fail selection with no single tag. Loop self-edges remain self-edges in the new tagged Phi.
+(defn g-distribute-deferred-phi-boxes! [] (-> i64)
+  (let [(mut node) 0
+        (mut changed) 0]
+    ;; The scan follows the growing graph deliberately. Boxing one arm may expose a nested
+    ;; `Box(Phi)` that did not exist at entry; stopping at the original node count normalizes only
+    ;; the outer join and leaves selection facing the same impossible raw union one level down.
+    (loop (if (>= (load node) (n-count))
+              (break)
+              (do
+                (if (and (not (n-dead? (load node)))
+                         (match (n-op (load node))
+                           (Box [mode] (= mode BOX-AUX-INFER))
+                           (_ false)))
+                    (let [value (n-in (load node) 1)]
+                      (if (and (!= value NO-NODE)
+                               (and (not (n-dead? value)) (op-is? value Phi [_])))
+                          (let [(mut input) 1
+                                (mut closed) true]
+                            (loop (if (or (>= (load input) (n-nins value))
+                                          (not (load closed)))
+                                      (break)
+                                      (do
+                                        (if (= (n-in value (load input)) NO-NODE)
+                                            (set! closed false)
+                                            0)
+                                        (set! input (+ (load input) 1)))))
+                            (if (load closed)
+                                (let [boxed (n-new (Phi (t-dyn)))]
+                                  (n-add-def! boxed (n-in value 0))
+                                  (set! input 1)
+                                  (loop (if (>= (load input) (n-nins value))
+                                            (break)
+                                            (do
+                                              (let [incoming (n-in value (load input))]
+                                                (n-add-def! boxed
+                                                            (if (= incoming value)
+                                                                boxed
+                                                                (n-box! incoming))))
+                                              (set! input (+ (load input) 1)))))
+                                  (n-keep! boxed)
+                                  (n-subsume! (load node) boxed)
+                                  (n-unkeep! boxed)
+                                  (set! changed (+ (load changed) 1))
+                                  0)
+                                0))
+                          0))
+                    0)
+                (set! node (+ (load node) 1)))))
+    (load changed)))
 
 (defn unbox-idealize [(n i64)] (-> i64)
   (let [b (n-in n 1)]
@@ -4514,7 +4772,9 @@
                     (n-subsume! call value)
                     (n-unkeep! value)
                     (n-unkeep! ctrl)
-                    (if (and (not (n-dead? value)) (= (n-nouts value) 0)) (n-kill! value) 0)
+                    (if (and (and (not (n-dead? value)) (= (n-nouts value) 0))
+                             (= (n-keeps value) 0))
+                        (n-kill! value) 0)
                     (g-changed!)
                     true)))))))
 
@@ -5707,7 +5967,7 @@
             (Region [] (do (ps w "Region") (fmt w "{d}" n) 0))
             (Loop [] (do (ps w "Loop") (fmt w "{d}" n) 0))
             (Phi [declared] (do (ps w "phi") (fmt w "{d}" n) 0))
-            (Proj [slot] (do (fmt w "n{d}.{d}" (n-in n 0) slot) 0))
+            (Proj [slot] (do (fmt w "n{d}.{d}" (n-proj-source n) slot) 0))
             (Cast [target] (do
                   (ps w "(")
                   (ty-print w target)

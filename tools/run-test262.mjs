@@ -861,7 +861,11 @@ console.error(
     `total=${invocationMs.toFixed(0)}ms variants=${work.length}`,
 );
 if (results) {
-  const summary = { totals, categories };
+  const summary = { totals, categories, metadata: {
+    expandedVariants: completed.size,
+    executedVariants: work.length,
+    timingMs: { build: Math.round(buildMs), execution: Math.round(executionMs), total: Math.round(invocationMs) },
+  } };
   writeFileSync(`${results}.summary.json`, `${JSON.stringify(summary, null, 2)}\n`);
   console.error(`test262 results: ${results}`);
   console.error(`test262 summary: ${results}.summary.json`);

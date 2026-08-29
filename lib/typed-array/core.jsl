@@ -4,10 +4,81 @@
 ;; through GetProperty/SetProperty in abstract/property.jsl; the frontend remains syntax-only.
 
 (macro IsTypedArray :params [(value dyn)] :ret bool
-  (if (%IsObject value)
-      (let [(kind (%InternalKind value))]
-        (if (%Eq kind 200) true (%Eq kind 201)))
-      false))
+  (HasInternalSlot value (InternalSlotTypedArrayName)))
+
+;; TypedArray element types are specification values. The fixed one-byte representation uses its
+;; existing internal kinds as the private encoding: 200 is ~int8~ and 201 is ~uint8~. Callers name
+;; and compose the specification operations rather than interpreting those tags themselves.
+(macro TypedArrayElementType
+  :spec "ecma262@ed463bc10dbeaad0410ce67e541a77ea8e9900a5#sec-typedarrayelementtype"
+  :spec-name "TypedArrayElementType"
+  :status partial
+  :deviation "Only the represented Int8Array and Uint8Array element types are encoded."
+  :params [(object dyn)] :ret int
+  (%InternalKind object))
+
+(macro TypedArrayElementSize
+  :spec "ecma262@ed463bc10dbeaad0410ce67e541a77ea8e9900a5#sec-typedarrayelementsize"
+  :spec-name "TypedArrayElementSize"
+  :status partial
+  :deviation "Only the represented one-byte Int8Array and Uint8Array element types are supported."
+  :params [(object dyn)] :ret int
+  1)
+
+(macro IsUnsignedElementType
+  :spec "ecma262@ed463bc10dbeaad0410ce67e541a77ea8e9900a5#sec-isunsignedelementtype"
+  :spec-name "IsUnsignedElementType"
+  :status partial
+  :deviation "The element-type value domain currently contains only represented ~int8~ and ~uint8~; ~uint8~ is correctly the sole unsigned member of that domain."
+  :params [(elementType int)] :ret bool
+  (%Eq elementType 201))
+
+;; Specification witness records collapse to their [[Object]] field in the fixed-buffer profile:
+;; buffers cannot detach or resize, so the cached byte length is invariant and recoverable from
+;; the represented backing buffer. This is an explicit partial record encoding, not a second
+;; TypedArray representation.
+(macro MakeTypedArrayWithBufferWitnessRecord
+  :spec "ecma262@ed463bc10dbeaad0410ce67e541a77ea8e9900a5#sec-maketypedarraywithbufferwitnessrecord"
+  :spec-name "MakeTypedArrayWithBufferWitnessRecord"
+  :status partial
+  :deviation "For represented fixed, non-detachable buffers the witness record is encoded by its TypedArray object; the invariant cached byte length is read from [[ViewedArrayBuffer]] when needed."
+  :params [(object dyn) (order int)] :ret dyn
+  object)
+
+(macro IsTypedArrayOutOfBounds
+  :spec "ecma262@ed463bc10dbeaad0410ce67e541a77ea8e9900a5#sec-istypedarrayoutofbounds"
+  :spec-name "IsTypedArrayOutOfBounds"
+  :status partial
+  :deviation "Represented TypedArrays have byte offset zero, fixed explicit lengths, and fixed non-detachable backing buffers; resizable, length-tracking, detached, and nonzero-offset views are not represented."
+  :params [(record dyn)] :ret bool
+  (let [(object record)
+        (buffer (%InternalTarget object))]
+    (if (IsDetachedBuffer buffer)
+        true
+        (let [(bufferByteLength (%InternalIndex buffer))
+              (byteOffsetStart 0)
+              (arrayByteLength (%Mul (%InternalIndex object)
+                                     (TypedArrayElementSize object)))
+              (byteOffsetEnd (%Add byteOffsetStart arrayByteLength))]
+          (if (%Lt bufferByteLength byteOffsetStart)
+              true
+              (%Lt bufferByteLength byteOffsetEnd))))))
+
+(macro TypedArrayLength
+  :spec "ecma262@ed463bc10dbeaad0410ce67e541a77ea8e9900a5#sec-typedarraylength"
+  :spec-name "TypedArrayLength"
+  :status partial
+  :deviation "Represented TypedArrays always have an explicit fixed [[ArrayLength]]; length-tracking views are not represented."
+  :params [(record dyn)] :ret dyn
+  (%Box (%InternalIndex record)))
+
+(macro TypedArrayByteLength
+  :spec "ecma262@ed463bc10dbeaad0410ce67e541a77ea8e9900a5#sec-typedarraybytelength"
+  :spec-name "TypedArrayByteLength"
+  :status partial
+  :deviation "Represented TypedArrays have explicit fixed lengths and one-byte element types; length-tracking and wider element types are not represented."
+  :params [(record dyn)] :ret dyn
+  (%Box (%Mul (%InternalIndex record) (TypedArrayElementSize record))))
 
 (builtin TypedArrayIndex :params [(propertyKey dyn)] :ret int
   (if (%IsString (%Box propertyKey))
@@ -42,9 +113,9 @@
               (bytes (%InternalTarget buffer))
               (stored (%ArrayLoad bytes index))
               (byte (if (%IsUndefined stored) 0 (%UnboxInt stored)))]
-          (if (%Eq (%InternalKind array) 200)
-              (%Box (if (%Le 128 byte) (%Sub byte 256) byte))
-              (%Box byte))))))
+          (if (IsUnsignedElementType (TypedArrayElementType array))
+              (%Box byte)
+              (%Box (if (%Le 128 byte) (%Sub byte 256) byte)))))))
 
 (macro TypedArraySet :transitioning true
   :params [(array dyn) (index int) (value dyn)] :ret dyn
@@ -78,27 +149,30 @@
           (NewTypedArray buffer length constructorKind)))))
 
 (callable TypedArrayBufferGetter0 :transitioning true :params [] :ret dyn
-  (if (IsTypedArray this)
-      (%InternalTarget this)
-      (ThrowTypeError "TypedArray.prototype.buffer called on incompatible receiver")))
+  (let [(required (RequireInternalSlot this (InternalSlotTypedArrayName)))]
+    (%InternalTarget this)))
 
 (callable TypedArrayByteLengthGetter0 :transitioning true :params [] :ret dyn
-  (if (IsTypedArray this)
-      (%Box (%InternalIndex this))
-      (ThrowTypeError "TypedArray.prototype.byteLength called on incompatible receiver")))
+  (let [(required (RequireInternalSlot this (InternalSlotTypedArrayName)))]
+    (let [(record (MakeTypedArrayWithBufferWitnessRecord this 0))]
+      (if (IsTypedArrayOutOfBounds record)
+          (%Box 0)
+          (TypedArrayByteLength record)))))
 
 (callable TypedArrayByteOffsetGetter0 :transitioning true :params [] :ret dyn
-  (if (IsTypedArray this)
-      (%Box 0)
-      (ThrowTypeError "TypedArray.prototype.byteOffset called on incompatible receiver")))
+  (let [(required (RequireInternalSlot this (InternalSlotTypedArrayName)))]
+    (let [(record (MakeTypedArrayWithBufferWitnessRecord this 0))]
+      (if (IsTypedArrayOutOfBounds record) (%Box 0) (%Box 0)))))
 
 (callable TypedArrayLengthGetter0 :transitioning true :params [] :ret dyn
-  (if (IsTypedArray this)
-      (%Box (%InternalIndex this))
-      (ThrowTypeError "TypedArray.prototype.length called on incompatible receiver")))
+  (let [(required (RequireInternalSlot this (InternalSlotTypedArrayName)))]
+    (let [(record (MakeTypedArrayWithBufferWitnessRecord this 0))]
+      (if (IsTypedArrayOutOfBounds record)
+          (%Box 0)
+          (TypedArrayLength record)))))
 
 (macro TypedArrayName :params [(constructorKind int)] :ret dyn
-  (if (%Eq constructorKind 26) "Int8Array" "Uint8Array"))
+  (if (%Eq constructorKind 26) (%Box "Int8Array") (%Box "Uint8Array")))
 
 ;; `%TypedArray%` and `%TypedArray.prototype%` are realm intrinsics shared by every concrete
 ;; typed-array family. They need identities distinct from Int8Array/Uint8Array themselves: the
@@ -147,8 +221,7 @@
         (lengthInstalled
           (InstallBuiltinGetter prototype (ToPropertyKey "length") lengthGetter
                                 (%Box "get length")))
-        (symbolConstructor (SymbolConstructorValue))
-        (toStringTagKey (GetProperty symbolConstructor "toStringTag"))
+        (toStringTagKey (SymbolToStringTagValue))
         (toStringTag (%DefinePropertyValue prototype toStringTagKey
                                           (TypedArrayName constructorKind)))
         (toStringTagMarked (%SetPropertyAttributes prototype toStringTagKey 4))]

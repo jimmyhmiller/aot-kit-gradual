@@ -168,15 +168,26 @@
                 (if (and (!= term NO-NODE) (op-is? term Return []))
                     (if (be-exception-return? term)
                         (set! exceptional true)
-                    (let [value (n-in term 1)]
-                      (if (op-is? value Call [_])
+                    (let [value (n-in term 1)
+                          call (if (op-is? value Call [_]) value
+                                   (if (and (op-is? value Proj [_])
+                                            (op-is? (n-proj-source value) Call [_]))
+                                       (n-proj-source value) NO-NODE))]
+                      (if (!= call NO-NODE)
                           ;; Call nodes have lattice type `dyn` regardless of their eventual native
-                          ;; ABI. Looking only at that type labels every delegated numeric return as
-                          ;; boxed. Follow the bounded call graph instead; recursive edges exhaust
-                          ;; their fuel and contribute no evidence until a concrete return arm does.
+                          ;; ABI. Controlled Proj is now the ordinary scalar call result and carries
+                          ;; the same contract. Follow the bounded call graph instead of classifying
+                          ;; either representation from its provisional lattice type.
                           (let [kind
                                   (if (> fuel 0)
-                                      (be-call-return-kind-fuel value (- fuel 1))
+                                      (match (n-op value)
+                                        (Proj [slot]
+                                          (let [target (infer-direct-callee-fun call)]
+                                            (if (and (!= target NO-NODE)
+                                                     (n-fun-abi-declared? target))
+                                                (be-call-result-kind-at call slot)
+                                                (be-call-return-kind-fuel call (- fuel 1)))))
+                                        (_ (be-call-return-kind-fuel call (- fuel 1))))
                                       -1)]
                             (if (>= kind 0)
                                 (if (< (load answer) 0)
@@ -214,13 +225,150 @@
 (defn be-function-return-kind [(owner i64)] (-> i64)
   (let [fun (mu-function-ideal owner)]
     (if (and (!= fun NO-NODE) (n-fun-abi-declared? fun))
-        (ml-kind-for-type (n-fun-abi-return-type fun))
+        (if (= (n-fun-abi-result-count fun) 1)
+            (ml-kind-for-type (n-fun-abi-result-type fun 0))
+            -1)
         (be-function-return-kind-fuel owner 32))))
+
+(defn be-function-result-count [(owner i64)] (-> i64)
+  (let [fun (mu-function-ideal owner)]
+    (if (and (!= fun NO-NODE) (n-fun-abi-declared? fun))
+        (n-fun-abi-result-count fun)
+        1)))
+
+(defn be-call-result-count [(call i64)] (-> i64)
+  (let [fun (infer-direct-callee-fun call)]
+    (if (and (!= fun NO-NODE) (n-fun-abi-declared? fun))
+        (n-fun-abi-result-count fun)
+        1)))
+
+(defn be-call-result-kind-at [(call i64) (slot i64)] (-> i64)
+  (let [fun (infer-direct-callee-fun call)]
+    (if (and (!= fun NO-NODE)
+             (and (n-fun-abi-declared? fun)
+                  (and (>= slot 0) (< slot (n-fun-abi-result-count fun)))))
+        (ml-kind-for-type (n-fun-abi-result-type fun slot))
+        (if (= slot 0) (be-call-return-kind call) -1))))
+
+;; A logical result slot has an explicit ABI location; its ordinal is within its register class,
+;; never the logical tuple index. Thus `[i64, f64, i64]` occupies `x0, d0, x1`, not `x0, d1, x2`.
+;; The retained lowered result-type vector is authoritative. Encoders and allocation consume these
+;; helpers instead of independently interpreting a projection index as a physical register number.
+(defn be-function-result-fp? [(owner i64) (slot i64)] (-> bool)
+  (let [fun (mu-function-ideal owner)]
+    (if (and (!= fun NO-NODE)
+             (and (n-fun-abi-declared? fun)
+                  (and (>= slot 0) (< slot (n-fun-abi-result-count fun)))))
+        (= (ty-kinds (n-fun-abi-result-type fun slot)) VK-FLT)
+        (and (= slot 0) (be-function-fp-return? owner)))))
+
+(defn be-call-result-fp? [(call i64) (slot i64)] (-> bool)
+  (let [fun (infer-direct-callee-fun call)]
+    (if (and (!= fun NO-NODE)
+             (and (n-fun-abi-declared? fun)
+                  (and (>= slot 0) (< slot (n-fun-abi-result-count fun)))))
+        (= (ty-kinds (n-fun-abi-result-type fun slot)) VK-FLT)
+        (if (!= slot 0) false
+            (let [funcs (mu-function-count)
+                  (mut owner) 0
+                  (mut saw) false
+                  (mut fp) false
+                  (mut consistent) true]
+              ;; MLK-SCALAR includes integers and floating-point values; it cannot choose a
+              ;; register class. For an undeclared legacy signature, derive that class from the
+              ;; same reachable function returns that own the call ABI.
+              (loop (if (or (>= (load owner) funcs) (not (load consistent))) (break)
+                        (let [target (mu-function-ideal (load owner))]
+                          (if (and (!= target NO-NODE)
+                                   (and (op-is? target Fun [_])
+                                        (infer-call-reaches-fun? call target)))
+                              (let [target-fp (be-function-fp-return? (load owner))]
+                                (if (load saw)
+                                    (if (!= (load fp) target-fp) (set! consistent false) 0)
+                                    (do (set! saw true) (set! fp target-fp))))
+                              0)
+                          (set! owner (+ (load owner) 1)))))
+              (and (load saw) (and (load consistent) (load fp))))))))
+
+(defn be-function-result-register-index [(owner i64) (slot i64)] (-> i64)
+  (let [fp (be-function-result-fp? owner slot) (mut at) 0 (mut ordinal) 0]
+    (loop (if (>= (load at) slot) (break)
+              (do
+                (if (= (be-function-result-fp? owner (load at)) fp)
+                    (set! ordinal (+ (load ordinal) 1)) 0)
+                (set! at (+ (load at) 1)))))
+    (load ordinal)))
+
+(defn be-call-result-register-index [(call i64) (slot i64)] (-> i64)
+  (let [fp (be-call-result-fp? call slot) (mut at) 0 (mut ordinal) 0]
+    (loop (if (>= (load at) slot) (break)
+              (do
+                (if (= (be-call-result-fp? call (load at)) fp)
+                    (set! ordinal (+ (load ordinal) 1)) 0)
+                (set! at (+ (load at) 1)))))
+    (load ordinal)))
+
+(defn be-projection-result-register-index [(projection i64) (slot i64)] (-> i64)
+  (be-call-result-register-index (n-proj-source projection) slot))
+
+(const MABI-RESULT-REGISTER i64 0)
+(const MABI-RESULT-AREA i64 1)
+(const MABI-RESULT-REGISTER-LIMIT i64 8)
+
+(defn be-call-result-location-kind [(call i64) (slot i64)] (-> i64)
+  (if (< (be-call-result-register-index call slot) MABI-RESULT-REGISTER-LIMIT)
+      MABI-RESULT-REGISTER MABI-RESULT-AREA))
+
+(defn be-function-result-location-kind [(owner i64) (slot i64)] (-> i64)
+  (if (< (be-function-result-register-index owner slot) MABI-RESULT-REGISTER-LIMIT)
+      MABI-RESULT-REGISTER MABI-RESULT-AREA))
+
+;; Overflow slots share one logical-order result area regardless of register class. Every current
+;; physical JSL leaf is one eight-byte machine word; widening this representation must change the
+;; lowered signature and this alignment calculation together.
+(defn be-call-result-area-offset [(call i64) (slot i64)] (-> i64)
+  (let [(mut at) 0 (mut offset) 0]
+    (loop (if (>= (load at) slot) (break)
+              (do
+                (if (= (be-call-result-location-kind call (load at)) MABI-RESULT-AREA)
+                    (set! offset (+ (load offset) 8)) 0)
+                (set! at (+ (load at) 1)))))
+    (if (= (be-call-result-location-kind call slot) MABI-RESULT-AREA)
+        (load offset) -1)))
+
+(defn be-call-result-area-size [(call i64)] (-> i64)
+  (let [count (be-call-result-count call) (mut slot) 0 (mut bytes) 0]
+    (loop (if (>= (load slot) count) (break)
+              (do
+                (if (= (be-call-result-location-kind call (load slot)) MABI-RESULT-AREA)
+                    (set! bytes (+ (load bytes) 8)) 0)
+                (set! slot (+ (load slot) 1)))))
+    (& (+ (load bytes) 15) -16)))
+
+(defn be-function-result-area-offset [(owner i64) (slot i64)] (-> i64)
+  (let [(mut at) 0 (mut offset) 0]
+    (loop (if (>= (load at) slot) (break)
+              (do
+                (if (= (be-function-result-location-kind owner (load at)) MABI-RESULT-AREA)
+                    (set! offset (+ (load offset) 8)) 0)
+                (set! at (+ (load at) 1)))))
+    (if (= (be-function-result-location-kind owner slot) MABI-RESULT-AREA)
+        (load offset) -1)))
+
+(defn be-function-result-area-size [(owner i64)] (-> i64)
+  (let [count (be-function-result-count owner) (mut slot) 0 (mut bytes) 0]
+    (loop (if (>= (load slot) count) (break)
+              (do
+                (if (= (be-function-result-location-kind owner (load slot)) MABI-RESULT-AREA)
+                    (set! bytes (+ (load bytes) 8)) 0)
+                (set! slot (+ (load slot) 1)))))
+    (& (+ (load bytes) 15) -16)))
 
 (defn be-function-fp-return? [(owner i64)] (-> bool)
   (let [fun (mu-function-ideal owner)]
   (if (and (!= fun NO-NODE) (n-fun-abi-declared? fun))
-      (= (ty-kinds (n-fun-abi-return-type fun)) VK-FLT)
+      (and (= (n-fun-abi-result-count fun) 1)
+           (= (ty-kinds (n-fun-abi-result-type fun 0)) VK-FLT))
   (let [count (mu-function-return-count owner)
         (mut index) 0
         (mut found) false]
@@ -243,12 +391,19 @@
         (mut answer) -1
         (mut saw) false
         (mut consistent) true]
-    ;; An indirect call can dispatch to functions with different natural native return ABIs.
-    ;; The backend normalizes each selected result to a tagged JavaScript value after the call.
-    (if (= direct NO-NODE)
+    ;; A runtime-dispatched call normalizes the selected target's native result to a tagged
+    ;; JavaScript value. `CALL-ABI-DYNAMIC-RECEIVER` deliberately dispatches even when closed-world
+    ;; analysis sees one target: the heap-loaded callee must still be validated at runtime. Static
+    ;; target inference therefore cannot be used to call that result raw. Doing so made the `Box`
+    ;; around an Array.prototype.map callback tag the dispatcher's already-tagged integer a second
+    ;; time; `[3, 4].map(() => 9)` consequently read back zero on the host CPU.
+    (if (or (= direct NO-NODE)
+            (match (n-op call)
+              (Call [abi] (= abi CALL-ABI-DYNAMIC-RECEIVER))
+              (_ false)))
         (do (set! answer MLK-BOXED) (set! saw true))
         0)
-    (loop (if (or (= direct NO-NODE)
+    (loop (if (or (load saw)
                   (or (>= (load owner) funcs) (not (load consistent))))
               (break)
               (let [fun (mu-function-ideal (load owner))]
@@ -347,12 +502,17 @@
 ;; linked targets agree: -4 is already boxed, -3 is an f64 in the FP return register, otherwise the
 ;; value is a scalar payload to tag with this JavaScript tag.
 (defn be-function-dispatch-return-code [(owner i64)] (-> i64)
-  (let [kind (be-function-return-kind owner)]
-    (if (= kind MLK-BOXED)
-        -4
-        (if (and (= kind MLK-SCALAR) (be-function-fp-return? owner))
-            -3
-            (be-function-return-tag owner)))))
+  ;; JavaScript dynamic dispatch has one tagged result. Internal zero/multi-result functions have
+  ;; callable id zero and can never be selected through that linkage; retain an explicit invalid
+  ;; code instead of collapsing their ABI to a fictional scalar return.
+  (if (!= (be-function-result-count owner) 1)
+      -5
+      (let [kind (be-function-return-kind owner)]
+        (if (= kind MLK-BOXED)
+            -4
+            (if (and (= kind MLK-SCALAR) (be-function-fp-return? owner))
+                -3
+                (be-function-return-tag owner))))))
 
 (defn be-call-return-tag-fuel [(call i64) (fuel i64)] (-> i64)
   (let [funcs (mu-function-count)
@@ -430,7 +590,17 @@
           (if (and (op-is? node Parm [_])
                (= (ml-kind-for-parm-representation node) MLK-RAW-MANAGED))
           JSV-OBJECT
-          (let [tag (be-js-tag-for-type (n-ty node))]
+          (let [tag
+                  ;; A fixed-shape Load's analysed value can remain ALL when a callback function
+                  ;; is built before the caller's store reaches the shared memory lattice. Its
+                  ;; alias still has one declared machine representation: the shape table is what
+                  ;; `n-rep-of` and load/store selection already use. Recover the JavaScript tag
+                  ;; from that same field contract instead of refusing a sound boxed return at the
+                  ;; function boundary. This deliberately does not trust arbitrary source types;
+                  ;; it is limited to the fixed-offset alias that determines the physical word.
+                  (match (n-op node)
+                    (Load [alias] (be-js-tag-for-type (shape-alias-ty alias)))
+                    (_ (be-js-tag-for-type (n-ty node))))]
             ;; The numeric lattice includes int|float, but each selected value still has one
             ;; concrete machine representation. Arithmetic with integer inputs is an integer word;
             ;; arithmetic selected onto FP registers is an untagged IEEE double (tag zero in the
@@ -526,6 +696,15 @@
 (defn be-fp-source? [(node i64)] (-> bool)
   (match (n-op node)
     (Mod [] true)
+    ;; Box is a physical representation boundary. Its logical Number type describes the payload,
+    ;; but the selected value is a tagged word in a GPR; an FP reachability walk must stop here.
+    (Box [_] false)
+    ;; Fixed-shape fields have a physical representation independent of how far value analysis has
+    ;; propagated through a callback-owned function. Store selection already converts a value for
+    ;; a `flt` alias before writing it; the matching Load must therefore enter an FPR even when its
+    ;; provisional lattice result is ALL. Otherwise a later JSBOX(tag=double) asks the encoder to
+    ;; read an FPR that selection assigned as a GPR.
+    (Load [alias] (= (shape-alias-ty alias) (t-flt)))
     (Parm [_] (be-parm-fp-value? node))
     (Div [] (or (be-float-only? (n-ty node)) (not (ty-int-only? (n-ty node)))))
     (_ (be-float-only? (n-ty node)))))
@@ -671,25 +850,25 @@
                 (store! call (+ (load call) 1))))))
     false))
 
+(defn graph-parm-position-abi-index [(fun i64) (limit i64)] (-> i64)
+  (let [want-fp (graph-parm-position-fp? fun limit)
+        (mut position) 0
+        (mut idx) 0]
+    (loop (if (>= (load position) limit) (break)
+              (do
+                (if (= (graph-parm-position-fp? fun (load position)) want-fp)
+                    (set! idx (+ (load idx) 1)) 0)
+                (set! position (+ (load position) 1)))))
+    (load idx)))
+
 (defn graph-parm-abi-index [(n i64)] (-> i64)
   (let [u (machine-unit)
         cached (al-get [i64] (.parm-abi-index u) n)]
     (if (>= cached 0)
         cached
-        (let [fun (n-in n 0)
-              want-fp (be-node-fp-value? n)
-              limit (n-parm-index n)
-              (mut position) 0
-              (mut idx) 0]
-          (loop (if (>= (load position) limit)
-                    (break)
-                    (do
-                      (if (= (graph-parm-position-fp? fun (load position)) want-fp)
-                          (set! idx (+ (load idx) 1))
-                          0)
-                      (set! position (+ (load position) 1)))))
-          (al-set! [i64] (field u parm-abi-index) n (load idx))
-          (load idx)))))
+        (let [idx (graph-parm-position-abi-index (n-in n 0) (n-parm-index n))]
+          (al-set! [i64] (field u parm-abi-index) n idx)
+          idx))))
 
 (defn graph-parm-stack-index [(n i64)] (-> i64)
   (let [u (machine-unit)
@@ -697,19 +876,17 @@
     (if (>= cached 0)
         cached
         (let [fun (n-in n 0)
-              (mut i) 0
+              limit (n-parm-index n)
+              (mut position) 0
               (mut idx) 0]
-          (loop (if (>= (load i) (n-nouts fun))
-                    (break)
+          ;; Stack slots are part of the DECLARED positional ABI. A dead Parm still consumes its
+          ;; caller-side position; deriving this from surviving Parm nodes compacted late Record
+          ;; leaves onto earlier overflow arguments whenever optimization removed an unused field.
+          (loop (if (>= (load position) limit) (break)
                     (do
-                      (let [use (n-out fun (load i))]
-                        (if (and (not (n-dead? use))
-                                 (and (op-is? use Parm [_])
-                                      (and (< use n)
-                                           (>= (graph-parm-abi-index use) 8))))
-                            (set! idx (+ (load idx) 1))
-                            0))
-                      (set! i (+ (load i) 1)))))
+                      (if (>= (graph-parm-position-abi-index fun (load position)) 8)
+                          (set! idx (+ (load idx) 1)) 0)
+                      (set! position (+ (load position) 1)))))
           (al-set! [i64] (field u parm-stack-index) n (load idx))
           (load idx)))))
 
@@ -761,6 +938,7 @@
     (al-clear! [i64] (field u selected-value-owners))
     (al-clear! [i64] (field u selected-node-owners))
     (al-clear! [i64] (field u selected-block-owners))
+    (al-clear! [i64] (field u call-result-snapshot-owners))
     (al-clear! [i64] (field u arg-abi-index))
     (al-clear! [i64] (field u parm-abi-index))
     (al-clear! [i64] (field u parm-stack-index))
@@ -774,6 +952,7 @@
                 (al-push! [i64] (field u selected-values) -1)
                 (al-push! [i64] (field u selected-nodes) 0)
                 (al-push! [i64] (field u selected-blocks) -1)
+                (al-push! [i64] (field u call-result-snapshots) -1)
                 (set! i (+ (load i) 1))
                 0)))
     (set! i 0)
@@ -783,6 +962,7 @@
                 (al-push! [i64] (field u selected-value-owners) -1)
                 (al-push! [i64] (field u selected-node-owners) -1)
                 (al-push! [i64] (field u selected-block-owners) -1)
+                (al-push! [i64] (field u call-result-snapshot-owners) -1)
                 (set! i (+ (load i) 1))
                 0)))
     (set! i 0)
@@ -827,23 +1007,180 @@
   (let [u (machine-unit) index (ms-map-index owner node)]
     (al-set! [i64] (field u selected-values) index vreg)
     (al-set! [i64] (field u selected-value-owners) index owner)
-    (if (and (>= vreg 0) (< vreg (al-len [i64] (.vreg-node u))))
-        (do
-          (al-set! [i64] (field u vreg-node) vreg node)
-          (al-set! [i64] (field u vreg-node-owner) vreg owner)
-          0)
-        0))
+    ;; Publication is not provenance construction. Structural graph nodes (Cast, Proj, and other
+    ;; aliases) legitimately publish an existing value whose defining node differs, so validate
+    ;; ownership and row completeness without rewriting the value's original provenance.
+    (if (or (< vreg 0) (>= vreg (al-len [i64] (.vreg-node u))))
+        (ms-fail! MSEL-OWNER node)
+        (if (or (!= (al-get (.vreg-owner u) vreg) owner)
+                (= (al-get (.vreg-origin-kind u) vreg) MV-ORIGIN-UNKNOWN))
+            (ms-fail! MSEL-OWNER node)
+            0)))
   0)
-(defn ms-new-vreg! [] (-> i64)
+(defn ms-call-result-snapshot [(owner i64) (projection i64)] (-> i64)
+  (let [u (machine-unit) index (ms-map-index owner projection)]
+    (if (= (al-get (.call-result-snapshot-owners u) index) owner)
+        (al-get (.call-result-snapshots u) index)
+        -1)))
+(defn ms-set-call-result-snapshot! [(owner i64) (projection i64) (vreg i64)] (-> i64)
+  (let [u (machine-unit) index (ms-map-index owner projection)]
+    (al-set! [i64] (field u call-result-snapshots) index vreg)
+    (al-set! [i64] (field u call-result-snapshot-owners) index owner))
+  0)
+(defn ms-commit-machine-value! [(owner i64) (node i64) (kind i64) (class i64)
+                                (origin i64) (definition i64)
+                                (origin-a i64) (origin-b i64)
+                                (abi-kind i64) (abi-index i64)] (-> i64)
   (let [u (machine-unit)
         p (field u next-vreg)
         v (load p)]
     (set! p (+ v 1))
     (al-push! [i64] (field u vreg-phi-block) -1)
-    (al-push! [i64] (field u vreg-node) -1)
-    (al-push! [i64] (field u vreg-node-owner) -1)
+    (al-push! [i64] (field u vreg-node) node)
+    (al-push! [i64] (field u vreg-node-owner) (if (>= node 0) owner -1))
     (al-push! [i64] (field u vreg-def-inst) -1)
+    (al-push! [i64] (field u vreg-owner) owner)
+    (al-push! [i64] (field u vreg-origin-kind) origin)
+    (al-push! [i64] (field u vreg-definition-kind) definition)
+    (al-push! [i64] (field u vreg-origin-a) origin-a)
+    (al-push! [i64] (field u vreg-origin-b) origin-b)
+    (al-push! [i64] (field u vreg-abi-kind) abi-kind)
+    (al-push! [i64] (field u vreg-abi-index) abi-index)
+    (al-push! [i64] (field u vreg-state) MV-STATE-DEFINED)
+    (al-push! [i64] (field u value-kind) kind)
+    (al-push! [i64] (field u register-class) class)
     v))
+
+(defn ms-new-node-vreg! [(owner i64) (node i64)] (-> i64)
+  (let [class (if (be-node-fp-value? node) MRC-FPR MRC-GPR)]
+    (ms-commit-machine-value! owner node
+                              (if (= class MRC-FPR) MLK-SCALAR (ml-kind-for-node node))
+                              class MV-ORIGIN-IDEAL MV-DEF-INSTRUCTION
+                              node -1 MV-ABI-NONE -1)))
+
+(defn ms-new-phi-vreg! [(owner i64) (node i64) (block i64)] (-> i64)
+  (let [class (if (be-node-fp-value? node) MRC-FPR MRC-GPR)]
+    (let [vreg (ms-commit-machine-value! owner node
+                 (if (= class MRC-FPR) MLK-SCALAR (ml-kind-for-node node))
+                 class MV-ORIGIN-PHI MV-DEF-PHI node block MV-ABI-NONE -1)]
+      (al-set! [i64] (field (machine-unit) vreg-phi-block) vreg block)
+      vreg)))
+
+(defn ms-new-call-result-vreg! [(owner i64) (call i64) (slot i64)] (-> i64)
+  (ms-commit-machine-value! owner -1 (be-call-result-kind-at call slot)
+                            (if (be-call-result-fp? call slot) MRC-FPR MRC-GPR)
+                            MV-ORIGIN-CALL-RESULT MV-DEF-CALL-RESULT
+                            call slot MV-ABI-CALL-RESULT slot))
+
+(defn ms-new-result-materialization-vreg! [(owner i64) (projection i64) (raw i64)]
+  (-> i64)
+  ;; The capture row owns the physical ABI class. The projection owns the logical GC kind, which
+  ;; is available directly from its declared type; re-running call-graph inference while recursive
+  ;; function selection is underway would make construction order observable.
+  (let [u (machine-unit)
+        class (al-get (.register-class u) raw)]
+    (ms-commit-machine-value! owner projection
+                              (if (= class MRC-FPR)
+                                  MLK-SCALAR
+                                  (ml-kind-for-type (n-ty projection)))
+                              class
+                              MV-ORIGIN-IDEAL MV-DEF-INSTRUCTION
+                              projection raw MV-ABI-NONE -1)))
+
+(defn ms-new-copy-vreg! [(owner i64) (source i64) (node i64) (origin i64)] (-> i64)
+  (let [u (machine-unit)]
+    (ms-commit-machine-value! owner node
+                              (al-get (.value-kind u) source)
+                              (al-get (.register-class u) source)
+                              origin MV-DEF-COPY source node MV-ABI-NONE -1)))
+
+(defn ms-new-abi-fixed-vreg! [(owner i64) (node i64) (abi-kind i64) (abi-index i64)]
+  (-> i64)
+  (let [class (if (be-node-fp-value? node) MRC-FPR MRC-GPR)]
+    (ms-commit-machine-value! owner node
+                              (if (= class MRC-FPR) MLK-SCALAR (ml-kind-for-node node))
+                              class MV-ORIGIN-ABI MV-DEF-ABI
+                              node abi-index abi-kind abi-index)))
+
+(defn ms-new-scalar-gpr-vreg! [(owner i64)] (-> i64)
+  (ms-commit-machine-value! owner -1 MLK-SCALAR MRC-GPR
+                            MV-ORIGIN-TEMPORARY MV-DEF-TEMPORARY
+                            -1 -1 MV-ABI-NONE -1))
+
+(defn ms-new-scalar-fpr-vreg! [(owner i64)] (-> i64)
+  (ms-commit-machine-value! owner -1 MLK-SCALAR MRC-FPR
+                            MV-ORIGIN-TEMPORARY MV-DEF-TEMPORARY
+                            -1 -1 MV-ABI-NONE -1))
+
+(defn ms-new-boxed-vreg! [(owner i64)] (-> i64)
+  (ms-commit-machine-value! owner -1 MLK-BOXED MRC-GPR
+                            MV-ORIGIN-TEMPORARY MV-DEF-TEMPORARY
+                            -1 -1 MV-ABI-NONE -1))
+
+(defn ms-new-raw-managed-vreg! [(owner i64) (node i64)] (-> i64)
+  (ms-commit-machine-value! owner node MLK-RAW-MANAGED MRC-GPR
+                            MV-ORIGIN-IDEAL MV-DEF-INSTRUCTION
+                            node -1 MV-ABI-NONE -1))
+
+(defn ms-publish-call-results! [(owner i64) (call i64) (bid i64) (anchor i64)] (-> i64)
+  (let [count (be-call-result-count call)
+        target (infer-direct-callee-fun call)
+        can-throw (and (!= target NO-NODE)
+                       (and (n-fun-abi-declared? target)
+                            (n-fun-abi-can-throw? target)))
+        (mut slot) 0]
+    (loop (if (>= (load slot) count) (break)
+              (let [(mut output) 0 (mut projection) NO-NODE]
+                (loop (if (or (>= (load output) (n-nouts call))
+                              (!= (load projection) NO-NODE))
+                          (break)
+                          (let [user (n-out call (load output))]
+                            (if (and (match (n-op user)
+                                       (Proj [which] (= which (load slot))) (_ false))
+                                     (= (n-proj-source user) call))
+                                (set! projection user) 0)
+                            (set! output (+ (load output) 1)))))
+                (if (or (= (load projection) NO-NODE)
+                        (< (ms-call-result-snapshot owner (load projection)) 0))
+                    (let [fresh (ms-new-call-result-vreg! owner call (load slot))]
+                      ;; The raw snapshot belongs to the call outcome. It exists even when the
+                      ;; logical result is unused, so the physical protocol never depends on use
+                      ;; count or on which successor is selected first.
+                      (ms-emit! owner bid
+                                (mi-new MI-CALL-RESULT fresh anchor -1
+                                        (load slot) call))
+                      (if (!= (load projection) NO-NODE)
+                          (ms-set-call-result-snapshot!
+                            owner (load projection) fresh) 0))
+                    0)
+                (set! slot (+ (load slot) 1)))))
+    ;; A non-throwing call's CallEnd is its only continuation, so publish logical values directly
+    ;; after the complete raw capture bundle. This is semantically required, not an optimization:
+    ;; a later call may overwrite every ABI result register before a scheduled consumer runs.
+    (if can-throw 0
+        (let [(mut output) 0]
+          (loop (if (>= (load output) (n-nouts call)) (break)
+                    (let [projection (n-out call (load output))]
+                      (if (and (op-is? projection Proj [_])
+                               (and (= (n-proj-source projection) call)
+                                    ;; Structure, not target inference, decides whether this is a
+                                    ;; controlled outcome. Indirect calls may have no exact target
+                                    ;; here while their two-input Proj still says the logical value
+                                    ;; begins only on a proven-normal continuation.
+                                    (= (n-proj-normal-control projection) NO-NODE)))
+                          (let [raw (ms-call-result-snapshot owner projection)]
+                            (if (and (>= raw 0) (< (ms-vget owner projection) 0))
+                                (let [fresh (ms-new-result-materialization-vreg!
+                                              owner projection raw)]
+                                  (ms-emit! owner bid
+                                    (mi-new MI-RESULT-MATERIALIZE
+                                            fresh raw -1 0 projection))
+                                  (ms-vset! owner projection fresh)
+                                  (ms-record-selected-block! owner projection bid))
+                                0))
+                          0)
+                      (set! output (+ (load output) 1)))))))
+    0))
 
 ;; The dense-array runtime takes an INTEGER index in a GPR. An index computed in floating
 ;; point (NavierStokes' j*rowSize chains) selects into an FPR vreg, and encoding that FPR's
@@ -853,7 +1190,7 @@
   (let [raw (ms-select-value-at! owner node bid)]
     (if (or (< raw 0) (not (be-node-fp-value? node)))
         raw
-        (let [fresh (ms-new-vreg!)]
+        (let [fresh (ms-new-scalar-gpr-vreg! owner)]
           (ms-emit! owner bid (mi-new MI-I32FROMFP fresh raw -1 0 NO-NODE))
           fresh))))
 (defn ms-seen? [(owner i64) (node i64)] (-> bool)
@@ -895,15 +1232,45 @@
         p (be-inst id)]
     (set! (.owner p) owner)
     (set! (.block-id p) bid)
+    (if (>= (.dst p) 0)
+        (let [dst (.dst p)]
+          (if (or (>= dst (al-len [i64] (.vreg-owner u)))
+                  (!= (al-get (.vreg-owner u) dst) owner))
+              (ms-fail! MSEL-OWNER id)
+              0)
+          0)
+        0)
     (if (and (>= (.dst p) 0)
              (= (al-get [i64] (.vreg-def-inst u) (.dst p)) -1))
         (al-set! [i64] (field u vreg-def-inst) (.dst p) id)
         0)
     id))
 
+(defn ms-call-inst-new [(dst i64) (a i64) (b i64) (target i64) (node i64)] (-> MInst)
+  (let [m (primitive/alloc-stack MInst)]
+    (store! m (mi-new MI-CALL dst a b target node))
+    (set! (.call-contract m) target)
+    (load m)))
+
 (defn ms-push-memory-dep-tree! [(first i64) (node i64) (fuel i64)] (-> i64)
   (if (or (< node 0) (<= fuel 0))
       0
+      ;; Effect is an ordering wrapper, not a machine memory producer. Lower it into BOTH pieces of
+      ;; its contract: the predecessor memory and the value whose evaluation establishes the new
+      ;; order. Keeping only the memory edge let global scheduling move that value after a later
+      ;; call even though `ms-memory-node-before?` correctly rejected the resulting schedule.
+      (if (op-is? node Effect [])
+          (do (ms-push-memory-dep-tree! first (n-in node 1) (- fuel 1))
+              (ms-push-memory-dep-tree! first (n-in node 2) (- fuel 1)))
+      ;; A merge is also structural: each incoming memory/value leaf is the schedulable fact. Do
+      ;; not retain the merge itself as a second, stricter dependency; an incoming leaf may
+      ;; legitimately be provided by a CFG edge or loop backedge rather than earlier in this block.
+      (if (op-is? node MemMerge [])
+          (let [(mut i) 1]
+            (loop (if (>= (load i) (n-nins node)) (break)
+                    (do (ms-push-memory-dep-tree!
+                          first (n-in node (load i)) (- fuel 1))
+                        (set! i (+ (load i) 1))))))
       (let [deps (field (machine-unit) selection-memory-deps)
             (mut scan) first
             (mut seen) false]
@@ -919,13 +1286,6 @@
             (do
               (al-push! [i64] (mut deps) node)
               (match (n-op node)
-                (MemMerge [] (let [(mut i) 1]
-                      (loop (if (>= (load i) (n-nins node))
-                                (break)
-                                (do
-                                  (ms-push-memory-dep-tree!
-                                    first (n-in node (load i)) (- fuel 1))
-                                  (set! i (+ (load i) 1)))))))
                 (Store [alias] (ms-push-memory-dep-tree! first (n-in node 1) (- fuel 1)))
                 (Effect [] (ms-push-memory-dep-tree! first (n-in node 1) (- fuel 1)))
                 (PropStore [name] (ms-push-memory-dep-tree! first (n-in node 1) (- fuel 1)))
@@ -940,7 +1300,7 @@
                 (ArrayCopy [] (ms-push-memory-dep-tree! first (n-in node 1) (- fuel 1)))
                 (StringSplit [] (ms-push-memory-dep-tree! first (n-in node 1) (- fuel 1)))
                 (_ 0))
-              0)))))
+              0)))))))
 
 (defn ms-add-memory-deps! [(at i64) (node i64) (first-slot i64) (count i64)] (-> i64)
   (let [u (machine-unit)
@@ -965,10 +1325,21 @@
     (set! (.arg-count m) count)
     0))
 
+(defn ms-push-call-arg! [(value i64) (abi-class i64)] (-> i64)
+  (let [u (machine-unit)]
+    (al-push! [i64] (field u call-args) value)
+    (al-push! [i64] (field u call-arg-classes) abi-class)
+    0))
+
+(defn ms-call-arg-class [(m (ptr MInst)) (which i64)] (-> i64)
+  (al-get [i64] (.call-arg-classes (machine-unit)) (+ (.arg-first m) which)))
+
 (defn ms-add-single-arg! [(at i64) (value i64)] (-> i64)
   (let [u (machine-unit)
         first (al-len [i64] (.call-args u))]
-    (al-push! [i64] (field u call-args) value)
+    ;; Supplemental operands are not ABI-routed call parameters. Keep the parallel table total;
+    ;; their consumers use the vreg's own class.
+    (ms-push-call-arg! value MRC-GPR)
     (ms-add-call-args! at first 1)))
 
 (defn ms-entry-block [(owner i64)] (-> i64)
@@ -992,7 +1363,10 @@
   (if (or (= node NO-NODE) (<= fuel 0))
       -1
       (if (op-is? node Proj [_])
-          (ms-value-anchor-block owner (n-in node 0) (- fuel 1))
+          (let [normal (n-proj-normal-control node)]
+            (if (!= normal NO-NODE)
+                (ms-node-block owner node)
+                (ms-value-anchor-block owner (n-proj-source node) (- fuel 1))))
           (if (and (> (n-nins node) 0) (!= (n-in node 0) NO-NODE))
               (ms-node-block owner node)
               (let [(mut best) -1 (mut i) 1]
@@ -1119,8 +1493,9 @@
                 (StringSplit [] (set! current (n-in (load current) 1)))
                 (Proj [slot] (do
                       (set! answer
-                            (if (match (n-op (n-in (load current) 0)) (New [shape] true) (_ false))
-                                (ms-node-block owner (n-in (load current) 0))
+                            (if (match (n-op (n-proj-source (load current)))
+                                  (New [shape] true) (_ false))
+                                (ms-node-block owner (n-proj-source (load current)))
                                 (ms-node-block owner (load current))))
                       (set! done true)))
                 (_ (do
@@ -1184,7 +1559,7 @@
       (let [ptr (n-in array 1)]
         (match (n-op ptr)
           (Proj [slot]
-            (let [parent (n-in ptr 0)]
+            (let [parent (n-proj-source ptr)]
               (if (and (!= parent NO-NODE)
                        (match (n-op parent) (New [shape] true) (_ false)))
                   (ms-node-block owner parent)
@@ -1378,8 +1753,9 @@
                                             (be-field-off alias)
                                             node))]
                       (ms-add-memory-deps! at node 1 1))))))
-            (Proj [slot] (if (op-is? (n-in node 0) New [_])
-                  (if (< (ms-select-value-at! owner (n-in node 0) bid) 0) (set! ok false) 0)
+            (Proj [slot] (if (op-is? (n-proj-source node) New [_])
+                  (if (< (ms-select-value-at! owner (n-proj-source node) bid) 0)
+                      (set! ok false) 0)
                   0))
             (PropStore [name] (if (not (ms-select-memory-at! owner (n-in node 1) bid))
                   (set! ok false)
@@ -1387,7 +1763,7 @@
                         value (ms-select-value-at! owner (n-in node 3) bid)]
                     (if (or (< object 0) (< value 0))
                         (set! ok false)
-                        (let [fresh (ms-new-vreg!)
+                        (let [fresh (ms-new-node-vreg! owner node)
                               effect-bid bid
                               key (ms-select-property-key! owner node effect-bid)
                               at (ms-emit! owner effect-bid (mi-new MI-JSPROP fresh object value 1 node))]
@@ -1398,7 +1774,7 @@
                   (let [object (ms-select-value-at! owner (n-in node 2) bid)]
                     (if (< object 0)
                         (set! ok false)
-                        (let [fresh (ms-new-vreg!)
+                        (let [fresh (ms-new-node-vreg! owner node)
                               effect-bid bid
                               key (ms-select-property-key! owner node effect-bid)
                               at (ms-emit! owner effect-bid
@@ -1412,7 +1788,7 @@
                         value (ms-select-value-at! owner (n-in node 4) bid)]
                     (if (or (< object 0) (or (< key 0) (< value 0)))
                         (set! ok false)
-                        (let [fresh (ms-new-vreg!)
+                        (let [fresh (ms-new-node-vreg! owner node)
                               at (ms-emit! owner bid
                                            (mi-new MI-JSPROP fresh object value operation node))]
                           (ms-add-single-arg! at key)
@@ -1423,7 +1799,7 @@
                         key (ms-select-value-at! owner (n-in node 3) bid)]
                     (if (or (< object 0) (< key 0))
                         (set! ok false)
-                        (let [fresh (ms-new-vreg!)
+                        (let [fresh (ms-new-node-vreg! owner node)
                               at (ms-emit! owner bid
                                            (mi-new MI-JSPROP fresh object object 4 node))]
                           (ms-add-single-arg! at key)
@@ -1435,7 +1811,7 @@
                         value (ms-select-value-at! owner (n-in node 4) bid)]
                     (if (or (< object 0) (or (< index 0) (< value 0)))
                         (set! ok false)
-                        (let [fresh (ms-new-vreg!)
+                        (let [fresh (ms-new-node-vreg! owner node)
                               effect-bid
                                 (ms-selection-value-block
                                   owner
@@ -1460,7 +1836,7 @@
                         ordered (ms-select-value-at! owner (n-in node 4) bid)]
                     (if (or (< object 0) (or (< length 0) (< ordered 0)))
                         (set! ok false)
-                        (let [fresh (ms-new-vreg!)
+                        (let [fresh (ms-new-node-vreg! owner node)
                               effect-bid
                                 (ms-selection-value-block
                                   owner
@@ -1485,7 +1861,7 @@
                         start (ms-array-index! owner (n-in node 4) bid)]
                     (if (or (< source 0) (or (< result 0) (< start 0)))
                         (set! ok false)
-                        (let [fresh (ms-new-vreg!)
+                        (let [fresh (ms-new-node-vreg! owner node)
                               effect-bid
                                 (ms-selection-value-block
                                   owner
@@ -1510,7 +1886,7 @@
                         result (ms-select-value-at! owner (n-in node 4) bid)]
                     (if (or (< string 0) (or (< delimiter 0) (< result 0)))
                         (set! ok false)
-                        (let [fresh (ms-new-vreg!)
+                        (let [fresh (ms-new-node-vreg! owner node)
                               at
                                 (ms-emit! owner
                                           bid
@@ -1528,7 +1904,7 @@
                         prototype (ms-select-value-at! owner (n-in node 3) bid)]
                     (if (or (< object 0) (< prototype 0))
                         (set! ok false)
-                        (let [fresh (ms-new-vreg!)
+                        (let [fresh (ms-new-node-vreg! owner node)
                               effect-bid
                                 (ms-selection-value-block
                                   owner
@@ -1549,7 +1925,7 @@
                   (let [object (ms-select-value-at! owner (n-in node 2) bid)]
                     (if (< object 0)
                         (set! ok false)
-                        (let [fresh (ms-new-vreg!)
+                        (let [fresh (ms-new-node-vreg! owner node)
                               key (ms-immediate! owner bid 0)
                               at (ms-emit! owner bid
                                            (mi-new MI-JSPROP fresh object object 8 node))]
@@ -1564,7 +1940,7 @@
                                   value)]
                     (if (or (< object 0) (or (< value 0) (< extra 0)))
                         (set! ok false)
-                        (let [fresh (ms-new-vreg!)
+                        (let [fresh (ms-new-node-vreg! owner node)
                               machine-opcode (if (= operation INTERNAL-INIT) 9 13)
                               key (if (= operation INTERNAL-INIT)
                                       value
@@ -1609,17 +1985,17 @@
         -1
         (let [a
                 (if (be-node-fp-value? an)
-                    (let [fresh (ms-new-vreg!)]
+                    (let [fresh (ms-new-scalar-gpr-vreg! owner)]
                       (ms-emit! owner bid (mi-new MI-I32FROMFP fresh raw-a -1 0 NO-NODE))
                       fresh)
                     raw-a)
               b
                 (if (be-node-fp-value? bn)
-                    (let [fresh (ms-new-vreg!)]
+                    (let [fresh (ms-new-scalar-gpr-vreg! owner)]
                       (ms-emit! owner bid (mi-new MI-I32FROMFP fresh raw-b -1 0 NO-NODE))
                       fresh)
                     raw-b)
-              fresh (ms-new-vreg!)]
+              fresh (ms-new-node-vreg! owner node)]
           (ms-emit! owner bid (mi-new mop fresh a b 0 node))
           fresh))))
 
@@ -1644,27 +2020,33 @@
 ;; converting something. The refusal is recorded and a well-formed instruction still emitted, so
 ;; the rest of selection walks a consistent program on its way to reporting the failure.
 (defn ms-value-is-tagged? [(node i64)] (-> bool)
-  (or (op-is? node ArrayLoad [_])
+  (or (= (n-rep-of node 32) REP-TAGGED)
+      (or (op-is? node ArrayLoad [_])
       (or (op-is? node PropLoad [_])
           (or (op-is? node Box [_])
           (or (and (op-is? node Phi [_]) (be-box-input-already-tagged? node))
           (or (op-is? node ToNumber [])
           (or (op-is? node ToInteger [])
-              (ms-call-returns-tagged? node))))))))
+              (ms-call-returns-tagged? node)))))))))
 
 (defn ms-fp-input! [(owner i64) (node i64) (vreg i64) (bid i64)] (-> i64)
-  (if (be-node-fp-value? node)
-      vreg
-      (let [tagged (ms-value-is-tagged? node)]
+  ;; A structural tagged boundary is stronger evidence than the logical numeric lattice. In
+  ;; particular Box retains a Number type while physically producing a GPR word. Test that fact
+  ;; before FP reachability so comparisons unbox the word instead of feeding it directly to FEQ.
+  (let [tagged (ms-value-is-tagged? node)]
+    (if tagged
+        (let [fresh (ms-new-scalar-fpr-vreg! owner)]
+          (ms-emit! owner bid (mi-new MI-JSUNBOX fresh vreg -1 0 NO-NODE))
+          fresh)
+        (if (be-node-fp-value? node)
+            vreg
+            (do
         (if (or tagged (!= (ml-kind-for-node node) MLK-RAW-MANAGED))
             0
             (ms-fail! MSEL-UNSUPPORTED node))
-        (let [fresh (ms-new-vreg!)]
-          (ms-emit! owner bid
-                    (if tagged
-                        (mi-new MI-JSUNBOX fresh vreg -1 0 NO-NODE)
-                        (mi-new MI-SCVTF fresh vreg -1 0 NO-NODE)))
-          fresh))))
+        (let [fresh (ms-new-scalar-fpr-vreg! owner)]
+              (ms-emit! owner bid (mi-new MI-SCVTF fresh vreg -1 0 NO-NODE))
+              fresh))))))
 
 ;; Narrow a tagged JavaScript word to the machine integer that integer arithmetic needs.
 ;;
@@ -1709,10 +2091,30 @@
 
 (defn ms-integer-input! [(owner i64) (node i64) (vreg i64) (bid i64)] (-> i64)
   (if (ms-call-returns-tagged? node)
-      (let [fresh (ms-new-vreg!)]
+      (let [fresh (ms-new-scalar-gpr-vreg! owner)]
         (ms-emit! owner bid (mi-new MI-JSUNBOX fresh vreg -1 JSV-INTEGER NO-NODE))
         fresh)
       vreg))
+
+;; Ask the selected value's canonical ABI provenance, not its provisional ideal type. A controlled
+;; result can pass through normal-edge materialization and synthetic copies before an ideal Unbox
+;; consumes it; all of those transports preserve the result slot's declared register class.
+(defn ms-vreg-canonical-fp-fuel? [(vreg i64) (fuel i64)] (-> bool)
+  (if (or (< vreg 0) (<= fuel 0))
+      false
+      (let [def (ms-def-inst vreg)]
+        (if (< def 0)
+            false
+            (let [m (be-inst def)]
+              (if (= (.op m) MI-CALL-RESULT)
+                  (be-call-result-fp? (.node m) (.imm m))
+                  (if (or (= (.op m) MI-RESULT-MATERIALIZE)
+                          (or (= (.op m) MI-COPY) (= (.op m) MI-ABI-COPY)))
+                      (ms-vreg-canonical-fp-fuel? (.a m) (- fuel 1))
+                      false)))))))
+
+(defn ms-vreg-canonical-fp? [(vreg i64)] (-> bool)
+  (ms-vreg-canonical-fp-fuel? vreg 8))
 
 (defn ms-select-numeric-binary! [(owner i64) (node i64) (integer-op i64) (bid i64)] (-> i64)
   (if (or (be-node-fp-value? node)
@@ -1724,7 +2126,7 @@
             -1
             (let [a (ms-fp-input! owner (n-in node 1) raw-a bid)
                   b (ms-fp-input! owner (n-in node 2) raw-b bid)
-                  fresh (ms-new-vreg!)]
+                  fresh (ms-new-node-vreg! owner node)]
               (ms-emit! owner bid (mi-new (be-fp-op (n-op node)) fresh a b 0 node))
               fresh)))
       (let [raw-a (ms-select-value-at! owner (n-in node 1) bid)
@@ -1733,7 +2135,7 @@
             -1
             (let [a (ms-integer-input! owner (n-in node 1) raw-a bid)
                   b (ms-integer-input! owner (n-in node 2) raw-b bid)
-                  fresh (ms-new-vreg!)]
+                  fresh (ms-new-node-vreg! owner node)]
               (ms-emit! owner bid (mi-new integer-op fresh a b 0 node))
               fresh)))))
 
@@ -1746,12 +2148,12 @@
         -1
         (let [a (ms-fp-input! owner an raw-a bid)
               b (ms-fp-input! owner bn raw-b bid)
-              fresh (ms-new-vreg!)]
+              fresh (ms-new-node-vreg! owner node)]
           (ms-emit! owner bid (mi-new MI-FMOD fresh a b 0 node))
           fresh))))
 
 (defn ms-immediate! [(owner i64) (bid i64) (value i64)] (-> i64)
-  (let [fresh (ms-new-vreg!)]
+  (let [fresh (ms-new-scalar-gpr-vreg! owner)]
     (ms-emit! owner bid (mi-new MI-MOVI fresh -1 -1 value NO-NODE))
     fresh))
 
@@ -1762,7 +2164,9 @@
                     (b i64)
                     (value i64)
                     (operation i64)] (-> i64)
-  (let [fresh (ms-new-vreg!)
+  (let [fresh (if (and (>= node 0) (< node (n-count)))
+                  (ms-new-node-vreg! owner node)
+                  (ms-new-scalar-gpr-vreg! owner))
         at (ms-emit! owner bid (mi-new MI-JSSTRING fresh a b operation node))]
     (ms-add-single-arg! at value)
     fresh))
@@ -1834,7 +2238,7 @@
                             (or (and (= (ty-kinds (n-ty node)) VK-BOOL)
                                      (ty-const? (n-ty node)))
                                 (and (ty-int-only? (n-ty node)) (ty-const? (n-ty node))))))
-                    (let [fresh (ms-new-vreg!)]
+                    (let [fresh (ms-new-node-vreg! owner node)]
                       (ms-emit! owner
                                 (ms-entry-block owner)
                                 (mi-new MI-MOVI
@@ -1847,13 +2251,17 @@
                                         node))
                       (set! vr fresh))
                     (if (and (be-float-only? (n-ty node)) (ty-const? (n-ty node)))
-                        (let [fresh (ms-new-vreg!)]
+                        (let [fresh (ms-new-node-vreg! owner node)]
                           (ms-emit! owner
                                     (ms-entry-block owner)
                                     (mi-new MI-FMOVI fresh -1 -1 (be-float-bits (n-ty node)) node))
                           (set! vr fresh))
                         0)))
-            (StringConst [id] (set! vr (ms-select-string-const! owner node bid)))
+            ;; A StringConst is one immutable atom for the owning invocation. Its runtime
+            ;; allocation/fill sequence must dominate every use; selecting it in the first
+            ;; demander's branch made later sibling uses depend on an incomparable control arm.
+            (StringConst [id]
+              (set! vr (ms-select-string-const! owner node (ms-entry-block owner))))
             (StringLen [] (let [string (ms-select-value-at! owner (n-in node 1) bid)]
                   (if (>= string 0)
                       (set! vr
@@ -1908,7 +2316,7 @@
                               ;; object tag there is.
                               (if (= tag -1)
                                   -1
-                                  (let [fresh (ms-new-vreg!)]
+                                  (let [fresh (ms-new-boxed-vreg! owner)]
                                     ;; NO-NODE: the ToString node itself is claimed by the
                                     ;; `ms-jsstring!` below, and two instructions naming one node
                                     ;; is MSEL-DUPLICATE.
@@ -2059,9 +2467,9 @@
                                                                 JSSOP-IS-NAN-VALUE)))
                                       (if (be-node-fp-value? value-node)
                                           (let [fp (ms-fp-input! owner value-node value bid)
-                                                ordered (ms-new-vreg!)
+                                                ordered (ms-new-scalar-gpr-vreg! owner)
                                                 zero (ms-immediate! owner bid 0)
-                                                result (ms-new-vreg!)]
+                                                result (ms-new-node-vreg! owner node)]
                                             ;; A Number is NaN exactly when it is not equal to
                                             ;; itself. MI-FEQ performs an ordered comparison, so
                                             ;; invert that boolean with the ordinary integer EQ.
@@ -2170,18 +2578,19 @@
                             (ms-jsstring! owner throw-bid node value
                                           (ms-immediate! owner throw-bid 0)
                                           (ms-immediate! owner throw-bid 0) 200)))))
-            (Fun [index] (let [fresh (ms-new-vreg!)]
+            (Fun [index] (let [fresh (ms-new-node-vreg! owner node)]
                   (ms-emit! owner
                             (ms-entry-block owner)
                             (mi-new MI-MOVI fresh -1 -1 index node))
                   (set! vr fresh)))
-            (CallableId [index] (let [fresh (ms-new-vreg!)]
+            (CallableId [index] (let [fresh (ms-new-node-vreg! owner node)]
                   (ms-emit! owner
                             (ms-entry-block owner)
                             (mi-new MI-MOVI fresh -1 -1 index node))
                   (set! vr fresh)))
-            (Arg [ty] (let [fixed (ms-new-vreg!)
-                      fresh (ms-new-vreg!)]
+            (Arg [ty] (let [fixed (ms-new-abi-fixed-vreg!
+                                     owner node MV-ABI-ARGUMENT (graph-arg-index node))
+                      fresh (ms-new-copy-vreg! owner fixed node MV-ORIGIN-ABI)]
                   (ms-emit! owner
                             (ms-entry-block owner)
                             (mi-new MI-ARG fixed -1 -1 (graph-arg-index node) node))
@@ -2189,9 +2598,10 @@
                             (ms-entry-block owner)
                             (mi-new MI-ABI-COPY fresh fixed -1 0 NO-NODE))
                   (set! vr fresh)))
-            (Parm [index] (let [fixed (ms-new-vreg!)
-                      fresh (ms-new-vreg!)
-                      abi-index (graph-parm-abi-index node)]
+            (Parm [index] (let [abi-index (graph-parm-abi-index node)
+                      fixed (ms-new-abi-fixed-vreg!
+                              owner node MV-ABI-PARAMETER abi-index)
+                      fresh (ms-new-copy-vreg! owner fixed node MV-ORIGIN-ABI)]
                   (ms-emit! owner
                             (ms-entry-block owner)
                             (mi-new (if (< abi-index 8) MI-ARG MI-STACKARG)
@@ -2221,7 +2631,7 @@
                               (set! i (+ (load i) 1))
                               0)))
                   (if (load ok)
-                      (let [fresh (ms-new-vreg!)]
+                      (let [fresh (ms-new-raw-managed-vreg! owner node)]
                         (let [at
                                 (ms-emit! owner
                                           (ms-node-block owner node)
@@ -2234,15 +2644,47 @@
                           (ms-add-memory-deps! at node 1 (- len 1)))
                         (set! vr fresh))
                       0)))
-            (Proj [slot] (if (and (= slot 0) (op-is? (n-in node 0) New [_]))
-                    (set! vr (ms-select-value-at! owner (n-in node 0) bid))
-                    0))
+            (Proj [slot]
+              (let [parent (n-proj-source node)]
+                (if (and (= slot 0) (op-is? parent New [_]))
+                    (set! vr (ms-select-value-at! owner parent bid))
+                    (if (op-is? parent Call [_])
+                        (let [call-bid (ms-node-block owner parent)
+                              call-value (ms-select-value-at! owner parent call-bid)]
+                          (if (< call-value 0) 0
+                            (do
+                              ;; Raw ABI captures are unconditional members of the call bundle.
+                              ;; A controlled projection is a separate logical materialization in
+                              ;; the proven-normal successor; it must not turn its capture vreg
+                              ;; into a source value on the exceptional edge.
+                              (ms-publish-call-results! owner parent call-bid call-value)
+                              (let [raw (ms-call-result-snapshot owner node)
+                                    normal (n-proj-normal-control node)
+                                    normal-bid
+                                      (if (= normal NO-NODE)
+                                          -1
+                                          (al-get (.ctrl-block (machine-unit)) normal))]
+                                (if (or (< raw 0) (= normal NO-NODE))
+                                    (set! vr raw)
+                                    (if (< normal-bid 0)
+                                        (do (ms-fail! MSEL-DEPENDENCY node) (set! vr -1))
+                                    (let [fresh (ms-new-result-materialization-vreg! owner node raw)]
+                                      (ms-emit! owner normal-bid
+                                        ;; The raw capture names the ideal projection for ABI
+                                        ;; classification. This materialization is the one machine
+                                        ;; definition of the controlled ideal projection; keeping
+                                        ;; that identity makes its normal-control anchor explicit.
+                                        (mi-new MI-RESULT-MATERIALIZE
+                                                fresh raw -1 0 node))
+                                      (ms-vset! owner node fresh)
+                                      (set! vr fresh))))))))
+                        0))))
             (Load [alias] (if (not (ms-select-memory! owner (n-in node 1)))
                     0
                     (let [ptr (ms-select-value-at! owner (n-in node 2) (ms-memory-block owner node))]
                       (if (< ptr 0)
                           0
-                          (let [fresh (ms-new-vreg!)]
+                          (let [fresh (ms-new-node-vreg! owner node)]
                             (let [at
                                     (ms-emit! owner
                                               (ms-memory-block owner node)
@@ -2276,7 +2718,7 @@
                       (if (< dynamic-value 0)
                           (set! vr -1)
                           (let [truthy (ms-jsstring! owner bid NO-NODE dynamic-value zero zero JSSOP-VALUE-TRUTHY)
-                                result (ms-new-vreg!)]
+                                result (ms-new-node-vreg! owner node)]
                             (ms-emit! owner bid (mi-new MI-EQ result truthy zero 0 node))
                             (set! vr result))))
                     (if (or (and (= (n-ty (n-in node 1)) (t-dyn))
@@ -2300,13 +2742,13 @@
                       0
                       (let [a
                               (if (be-node-fp-value? an)
-                                  (let [converted (ms-new-vreg!)]
+                                  (let [converted (ms-new-scalar-gpr-vreg! owner)]
                                     (ms-emit! owner
                                               bid
                                               (mi-new MI-I32FROMFP converted raw-a -1 0 NO-NODE))
                                     converted)
                                   raw-a)
-                            fresh (ms-new-vreg!)]
+                            fresh (ms-new-node-vreg! owner node)]
                         (ms-emit! owner bid (mi-new MI-BITNOT fresh a -1 0 node))
                         (set! vr fresh)))))
             (ToNumber [] (let [a (ms-select-value-at! owner (n-in node 1) bid)
@@ -2330,13 +2772,13 @@
                               (if (= (n-rep-of an 32) REP-RAW-NUM)
                                   a
                                   (ms-jsstring! owner bid NO-NODE a zero zero JSSOP-VALUE-TRUTHY))
-                            fresh (ms-new-vreg!)]
+                            fresh (ms-new-node-vreg! owner node)]
                         (ms-emit! owner bid (mi-new MI-EQ fresh operand zero 0 node))
                         (set! vr fresh)))))
             (Minus [] (let [a (ms-select-value-at! owner (n-in node 1) bid)]
                   (if (< a 0)
                       0
-                      (let [fresh (ms-new-vreg!)]
+                      (let [fresh (ms-new-node-vreg! owner node)]
                         (ms-emit! owner
                                   bid
                                   (mi-new (if (be-node-fp-value? (n-in node 1)) MI-FNEG MI-NEG)
@@ -2354,7 +2796,7 @@
                       (let [object (ms-select-value-at! owner (n-in node 2) pinned-bid)]
                       (if (< object 0)
                           (ms-fail! MSEL-UNSUPPORTED node)
-                          (let [fresh (ms-new-vreg!)
+                          (let [fresh (ms-new-node-vreg! owner node)
                                 key (ms-select-property-key! owner node pinned-bid)
                                 at
                                   (ms-emit! owner
@@ -2370,7 +2812,7 @@
                       (let [object (ms-select-value-at! owner (n-in node 2) pinned-bid)]
                         (if (< object 0)
                             (ms-fail! MSEL-UNSUPPORTED node)
-                            (let [fresh (ms-new-vreg!)
+                            (let [fresh (ms-new-node-vreg! owner node)
                                   key (ms-select-property-key! owner node pinned-bid)
                                   at (ms-emit! owner pinned-bid
                                                (mi-new MI-JSPROP fresh object object 3 node))]
@@ -2385,7 +2827,7 @@
                             prototype (ms-select-value-at! owner (n-in node 3) pinned-bid)]
                         (if (or (< object 0) (< prototype 0))
                             (ms-fail! MSEL-UNSUPPORTED node)
-                            (let [fresh (ms-new-vreg!)
+                            (let [fresh (ms-new-node-vreg! owner node)
                                   key (ms-immediate! owner pinned-bid 0)
                                   at (ms-emit! owner pinned-bid
                                                (mi-new MI-JSPROP fresh object prototype 5 node))]
@@ -2400,7 +2842,7 @@
                             key (ms-select-value-at! owner (n-in node 3) pinned-bid)]
                         (if (or (< object 0) (< key 0))
                             (ms-fail! MSEL-UNSUPPORTED node)
-                            (let [fresh (ms-new-vreg!)
+                            (let [fresh (ms-new-node-vreg! owner node)
                                   at (ms-emit! owner pinned-bid
                                                (mi-new MI-JSPROP fresh object object operation node))]
                               (ms-add-single-arg! at key)
@@ -2414,7 +2856,7 @@
                             key (ms-select-value-at! owner (n-in node 3) pinned-bid)]
                         (if (or (< object 0) (< key 0))
                             (ms-fail! MSEL-UNSUPPORTED node)
-                            (let [fresh (ms-new-vreg!)
+                            (let [fresh (ms-new-node-vreg! owner node)
                                   at (ms-emit! owner pinned-bid
                                                (mi-new MI-JSPROP fresh object object 3 node))]
                               (ms-add-single-arg! at key)
@@ -2427,7 +2869,7 @@
                       (let [object (ms-select-value-at! owner (n-in node 2) pinned-bid)]
                         (if (< object 0)
                             (ms-fail! MSEL-UNSUPPORTED node)
-                            (let [fresh (ms-new-vreg!)
+                            (let [fresh (ms-new-node-vreg! owner node)
                                   zero (ms-immediate! owner pinned-bid 0)
                                   at (ms-emit! owner pinned-bid
                                                (mi-new MI-JSPROP fresh object object 6 node))]
@@ -2442,7 +2884,7 @@
                             ordinal (ms-select-value-at! owner (n-in node 3) pinned-bid)]
                         (if (or (< object 0) (< ordinal 0))
                             (ms-fail! MSEL-UNSUPPORTED node)
-                            (let [fresh (ms-new-vreg!)
+                            (let [fresh (ms-new-node-vreg! owner node)
                                   at (ms-emit! owner pinned-bid
                                                (mi-new MI-JSPROP fresh object object 7 node))]
                               (ms-add-single-arg! at ordinal)
@@ -2455,7 +2897,7 @@
                       (let [object (ms-select-value-at! owner (n-in node 2) pinned-bid)]
                         (if (< object 0)
                             (ms-fail! MSEL-UNSUPPORTED node)
-                            (let [fresh (ms-new-vreg!)
+                            (let [fresh (ms-new-node-vreg! owner node)
                                   zero (ms-immediate! owner pinned-bid 0)
                                   operation (+ 10 slot)
                                   at (ms-emit! owner pinned-bid
@@ -2466,8 +2908,8 @@
             (ArrayMark [] (let [ptr (n-in node 1)
                       source
                         (if (and (op-is? ptr Proj [_])
-                                 (op-is? (n-in ptr 0) New [_]))
-                            (n-in ptr 0)
+                                 (op-is? (n-proj-source ptr) New [_]))
+                            (n-proj-source ptr)
                             ptr)
                       ; Prefer the mark's own control anchor; fall back to the allocation's
                       ; block for hand-built graphs that still float it.
@@ -2480,7 +2922,7 @@
                       ; input is THIS mark; without the early registration that re-entry
                       ; selected the mark a second time, and two instructions defining one
                       ; node cannot be scheduled.
-                      fresh (ms-new-vreg!)]
+                      fresh (ms-new-node-vreg! owner node)]
                   (ms-vset! owner node fresh)
                   (ms-record-selected-block! owner node mark-bid)
                   (let [object (ms-select-value-at! owner (n-in node 1) mark-bid)]
@@ -2500,7 +2942,7 @@
                           index (ms-array-index! owner (n-in node 3) pinned-bid)]
                       (if (or (< object 0) (< index 0))
                           (ms-fail! MSEL-UNSUPPORTED node)
-                          (let [fresh (ms-new-vreg!)
+                          (let [fresh (ms-new-node-vreg! owner node)
                                 effect-bid
                                   (if (>= (n-in node 0) 0)
                                       pinned-bid
@@ -2526,7 +2968,7 @@
                     (let [object (ms-select-value-at! owner (n-in node 2) pinned-bid)]
                       (if (< object 0)
                           (ms-fail! MSEL-UNSUPPORTED node)
-                          (let [fresh (ms-new-vreg!)
+                          (let [fresh (ms-new-node-vreg! owner node)
                                 effect-bid
                                   (if (>= (n-in node 0) 0)
                                       pinned-bid
@@ -2557,7 +2999,7 @@
                       (set! vr a)
                       (if (or (< a 0) (= tag -1))
                           (do (ms-fail! MSEL-UNSUPPORTED node) 0)
-                          (let [fresh (ms-new-vreg!)]
+                          (let [fresh (ms-new-node-vreg! owner node)]
                             (ms-emit! owner bid (mi-new MI-JSBOX fresh a -1 tag node))
                             (set! vr fresh))))))
             (Unbox [target] (let [a (ms-select-value-at! owner (n-in node 1) bid)
@@ -2570,9 +3012,33 @@
                               (be-js-tag-for-type target))]
                   (if (or (< a 0) (= tag -1))
                       (do (ms-fail! MSEL-UNSUPPORTED node) 0)
-                      (let [fresh (ms-new-vreg!)]
-                        (ms-emit! owner bid (mi-new MI-JSUNBOX fresh a -1 tag node))
-                        (set! vr fresh)))))
+                      ;; A declared f64 call result is already in its canonical physical FPR.
+                      ;; The frontend's provisional dynamic Call type can leave an ideal Unbox
+                      ;; around it, but lowering must not reinterpret that raw double as a tagged
+                      ;; GPR word. The retained result signature, exposed by
+                      ;; be-node-fp-value?, is authoritative at this boundary.
+                      (if (ms-vreg-canonical-fp? a)
+                          (if (= target (t-flt))
+                              (set! vr a)
+                              (if (= target (t-int))
+                                  (let [fresh (ms-new-node-vreg! owner node)]
+                                    (ms-emit! owner bid
+                                              (mi-new MI-I32FROMFP fresh a -1 0 node))
+                                    (set! vr fresh))
+                                  (do (ms-fail! MSEL-UNSUPPORTED node) 0)))
+                          (if (and (= target (t-flt))
+                                   ;; Logical numeric reachability is not a physical FPR proof.
+                                   ;; A dynamic call projection can flow only to floating-point
+                                   ;; consumers while still transporting a tagged GPR word. Elide
+                                   ;; the conversion only when representation analysis says this
+                                   ;; exact input is already raw f64.
+                                   (and (n-raw-number-representation? (n-in node 1))
+                                        (and (be-node-fp-value? (n-in node 1))
+                                             (not (ms-value-is-tagged? (n-in node 1))))))
+                              (set! vr a)
+                              (let [fresh (ms-new-node-vreg! owner node)]
+                                (ms-emit! owner bid (mi-new MI-JSUNBOX fresh a -1 tag node))
+                                (set! vr fresh)))))))
             (TypeTest [target] (let [a (ms-select-value-at! owner (n-in node 1) bid)
                       tag (be-js-tag-for-type target)
                       numeric (= target (t-num))]
@@ -2590,34 +3056,34 @@
                       ;; the NaN-box range check rather than a tag compare.
                       ;; See docs/DSL-OWNERSHIP.md.
                       (if numeric
-                          (let [as-int (ms-new-vreg!)]
+                          (let [as-int (ms-new-scalar-gpr-vreg! owner)]
                             (ms-emit! owner bid (mi-new MI-JSTEST as-int a -1 JSV-INTEGER NO-NODE))
-                            (let [as-flt (ms-new-vreg!)]
+                            (let [as-flt (ms-new-scalar-gpr-vreg! owner)]
                               (ms-emit! owner bid (mi-new MI-JSTEST as-flt a -1 0 NO-NODE))
-                              (let [fresh (ms-new-vreg!)]
+                              (let [fresh (ms-new-node-vreg! owner node)]
                                 (ms-emit! owner bid (mi-new MI-BITOR fresh as-int as-flt 0 node))
                                 (set! vr fresh))))
                       (if (= target (t-fun))
-                          (let [direct (ms-new-vreg!)]
+                          (let [direct (ms-new-scalar-gpr-vreg! owner)]
                             (ms-emit! owner bid (mi-new MI-JSTEST direct a -1 JSV-FUNCTION NO-NODE))
-                            (let [closure (ms-new-vreg!)]
+                            (let [closure (ms-new-scalar-gpr-vreg! owner)]
                               (ms-emit! owner bid (mi-new MI-JSTEST closure a -1 JSV-CLOSURE NO-NODE))
-                              (let [fresh (ms-new-vreg!)]
+                              (let [fresh (ms-new-node-vreg! owner node)]
                                 (ms-emit! owner bid (mi-new MI-BITOR fresh direct closure 0 node))
                                 (set! vr fresh))))
-                          (let [fresh (ms-new-vreg!)]
+                          (let [fresh (ms-new-node-vreg! owner node)]
                             (ms-emit! owner bid (mi-new MI-JSTEST fresh a -1 tag node))
                             (set! vr fresh)))))))
             (ArrayTest [] (let [a (ms-select-value-at! owner (n-in node 1) bid)]
                   (if (< a 0)
                       (ms-fail! MSEL-UNSUPPORTED node)
-                      (let [fresh (ms-new-vreg!)]
+                      (let [fresh (ms-new-node-vreg! owner node)]
                         (ms-emit! owner bid (mi-new MI-JSTEST fresh a -1 JSV-ARRAY node))
                         (set! vr fresh)))))
             (ArrayUnbox [] (let [a (ms-select-value-at! owner (n-in node 1) bid)]
                   (if (< a 0)
                       (ms-fail! MSEL-UNSUPPORTED node)
-                      (let [fresh (ms-new-vreg!)]
+                      (let [fresh (ms-new-node-vreg! owner node)]
                         (ms-emit! owner bid (mi-new MI-JSUNBOX fresh a -1 JSV-ARRAY node))
                         (set! vr fresh)))))
             (Closure [captures]
@@ -2680,7 +3146,8 @@
                       ; Capture-threading direct calls (a nested function receiving a dozen parent
                       ; cells plus its arguments) legitimately exceed the old 16-slot bound; the
                       ; ABI already spills past eight registers to the stack area.
-                      (if (or (and (= callee NO-NODE) (not polymorphic)) (> argc 32))
+                      (if (or (and (= callee NO-NODE) (not polymorphic))
+                              (> argc M-CALL-MAX-ARGS))
                           (ms-fail! MSEL-CALL node)
                           (let [target (if polymorphic -1 (mu-find-function callee))
                                 callee-value
@@ -2692,8 +3159,12 @@
                                 (ms-fail! MSEL-CALL
                                           (if polymorphic callee-node node))
                                 (let [u (machine-unit)
+                                      ;; Coil array lengths require a literal; the equality to the
+                                      ;; named bound is pinned by the wide-call regression below.
                                       buf (primitive/alloc-stack (array i64 32))
                                       args (cast (ptr i64) buf)
+                                      class-buf (primitive/alloc-stack (array i64 32))
+                                      source-classes (cast (ptr i64) class-buf)
                                       (mut i) 0
                                       (mut ok) true]
                                   (loop (if (or (>= (load i) argc) (not (load ok)))
@@ -2738,7 +3209,7 @@
                                                             -1)
                                                     arg
                                                       (if (!= tag -1)
-                                                          (let [boxed (ms-new-vreg!)]
+                                                          (let [boxed (ms-new-boxed-vreg! owner)]
                                                             (ms-emit! owner call-bid
                                                                       (mi-new MI-JSBOX boxed selected
                                                                               -1 tag NO-NODE))
@@ -2746,19 +3217,43 @@
                                                           selected)]
                                                 (if (< arg 0)
                                                     (set! ok false)
-                                                    (set! (index args (load i)) arg)))
+                                                    (do
+                                                      (set! (index args (load i)) arg)
+                                                      (set! (index source-classes (load i))
+                                                            (if (and (= arg selected)
+                                                                     (be-node-fp-value? source))
+                                                                MRC-FPR
+                                                                MRC-GPR)))))
                                               (set! i (+ (load i) 1))
                                               0)))
                                   (if (load ok)
                                       (let [first (al-len [i64] (.call-args u))
-                                            fresh (ms-new-vreg!)
+                                            fresh (if (> (be-call-result-count node) 1)
+                                                      (ms-new-scalar-gpr-vreg! owner)
+                                                      (ms-new-node-vreg! owner node))
                                             (mut j) 0]
                                         (loop (if (>= (load j) argc)
                                                   (break)
                                                   (do
-                                                    (al-push! [i64]
-                                                              (field u call-args)
-                                                              (load (index args (load j))))
+                                                    (let [value (load (index args (load j)))
+                                                          abi-class
+                                                            (if (and (not polymorphic)
+                                                                     (!= (mu-function-ideal target)
+                                                                         NO-NODE)
+                                                                     (n-fun-abi-declared?
+                                                                       (mu-function-ideal target))
+                                                                     (< (load j)
+                                                                        (n-fun-abi-param-count
+                                                                          (mu-function-ideal target))))
+                                                                (if (= (ty-kinds
+                                                                         (n-fun-abi-param-type
+                                                                           (mu-function-ideal target)
+                                                                           (load j)))
+                                                                       VK-FLT)
+                                                                    MRC-FPR
+                                                                    MRC-GPR)
+                                                                (load (index source-classes (load j))))]
+                                                      (ms-push-call-arg! value abi-class))
                                                     (set! j (+ (load j) 1))
                                                     0)))
                                         (let [a (if polymorphic callee-value
@@ -2767,7 +3262,7 @@
                                               at
                                                 (ms-emit! owner
                                                           call-bid
-                                                          (mi-new MI-CALL fresh a b
+                                                          (ms-call-inst-new fresh a b
                                                                   (if polymorphic
                                                                       (^ (be-call-target-summary (n-ty callee-node)) -1)
                                                                       target)
@@ -2776,7 +3271,9 @@
                                           (if has-memory
                                               (ms-add-memory-deps! at node (- (n-nins node) 1) 1)
                                               0)
-                                          (set! vr fresh)))
+                                          (set! vr fresh)
+                                          (ms-publish-call-results!
+                                            owner node call-bid fresh)))
                                       0)))))))))
             (_ (ms-fail! MSEL-UNSUPPORTED node)))
           (if (< (load vr) 0)
@@ -2844,11 +3341,9 @@
                             (do
                               (if (ty-mem? (n-ty (load node)))
                                   (ms-seen! owner (load node))
-                                  (let [vreg (ms-new-vreg!)]
+                                  (let [vreg (ms-new-phi-vreg! owner (load node) bid)]
                                     (ms-vset! owner (load node) vreg)
-                                    (al-set! [i64] (field (machine-unit) vreg-phi-block)
-                                             vreg
-                                             bid)))
+                                    0))
                               (set! node (al-get (.node-phi-next u) (load node)))))))
                 (set! rpo (+ (load rpo) 1))
                 0)))
@@ -2988,7 +3483,7 @@
                     ; No destination is dead: preserve one source in a fresh vreg, rewrite every use of
                     ; that old source, and the cycle becomes an acyclic chain on the next iteration.
                     (let [old-src (al-get (.copy-work-src u) (load first-live))
-                          temp (ms-new-vreg!)]
+                          temp (ms-new-copy-vreg! (.owner e) old-src -1 MV-ORIGIN-COPY)]
                       (al-push! [MMove] (field u edge-moves) (mm-new edge temp old-src true))
                       (set! i 0)
                       (loop (if (>= (load i) n)
@@ -3127,7 +3622,27 @@
                       0
                       (match (n-op term)
                         (If [] (ms-select-value-at! owner (n-in term 1) bid))
-                        (Return [] (do
+                        (Return []
+                          ;; Pending-exception Returns use the same complete physical result ABI
+                          ;; as normal Returns. Their poison leaves are semantically hidden by the
+                          ;; outcome edge, but they still need selection until raw-result
+                          ;; snapshotting is split from normal-edge materialization.
+                          (if (> (be-function-result-count owner) 1)
+                              (let [results (be-function-result-count owner)
+                                    (mut result) 0 (mut ok) true]
+                                (ms-select-control-effects! owner (n-in term 0) bid)
+                                (if (= (n-nins term) (+ results 2))
+                                    (do (ms-select-memory! owner (n-in term (+ results 1))) 0) 0)
+                                (loop (if (or (>= (load result) results) (not (load ok)))
+                                          (break)
+                                          (do
+                                            (if (< (ms-select-value-at!
+                                                     owner
+                                                     (n-in term (+ (load result) 1)) bid) 0)
+                                                (set! ok false) 0)
+                                            (set! result (+ (load result) 1)))))
+                                (if (not (load ok)) (ms-fail! MSEL-UNSUPPORTED term) 0))
+                          (do
                               (ms-select-control-effects! owner (n-in term 0) bid)
                               (if (> (n-nins term) 2)
                                   (do (ms-select-memory! owner (n-in term 2)) 0)
@@ -3140,7 +3655,7 @@
                                                (and (= return-kind MLK-SCALAR)
                                                     (and (be-function-fp-return? owner)
                                                          (not (be-node-fp-value? node)))))
-                                          (let [converted (ms-new-vreg!)]
+                                          (let [converted (ms-new-scalar-fpr-vreg! owner)]
                                             (ms-emit! owner bid
                                                       (mi-new MI-SCVTF converted raw -1 0 NO-NODE))
                                             converted)
@@ -3172,7 +3687,7 @@
                                       (if (< normalized 0)
                                           normalized
                                           (if kernel-fp-return
-                                              (let [boxed (ms-new-vreg!)]
+                                              (let [boxed (ms-new-boxed-vreg! owner)]
                                                 (ms-emit! owner
                                                           bid
                                                           (mi-new MI-JSBOX boxed normalized -1 0 term))
@@ -3184,7 +3699,7 @@
                                                                 (be-js-tag-for-value node))]
                                                     (if (= tag -1)
                                                         -1
-                                                        (let [boxed (ms-new-vreg!)]
+                                                        (let [boxed (ms-new-boxed-vreg! owner)]
                                                           (ms-emit! owner
                                                                     bid
                                                                     (mi-new MI-JSBOX boxed normalized -1 tag term))
@@ -3202,7 +3717,7 @@
                                       (ms-fail! MSEL-UNSUPPORTED term))
                                     (if (or kernel-fp-return boxed-return)
                                         (do (ms-vset! owner term value) value)
-                                        value)))))
+                                        value))))))
                         (_ (ms-fail! MSEL-TERMINATOR term)))))
                 (set! rpo (+ (load rpo) 1))
                 0)))
@@ -3299,17 +3814,23 @@
           (If [] (let [pred-node (n-in term 1)
                     raw-pred (ms-vget owner pred-node)
                     pred
+                      (if (and (>= raw-pred 0) (= (ty-kinds (n-ty pred-node)) VK-BOOL))
+                          ;; A bool-only graph value is already the machine predicate 0/1. Sending
+                          ;; it through dynamic JavaScript truthiness needlessly creates an
+                          ;; external runtime call and changes a structural branch into a tagged
+                          ;; boundary operation.
+                          raw-pred
                       (if (and (>= raw-pred 0)
                                (!= (n-rep-of pred-node 32) REP-RAW-NUM))
                           (let [zero (ms-immediate! owner bid 0)]
                             (ms-jsstring! owner bid NO-NODE raw-pred zero zero JSSOP-VALUE-TRUTHY))
                           (if (and (>= raw-pred 0) (be-node-fp-value? pred-node))
-                          (let [fresh (ms-new-vreg!)]
+                          (let [fresh (ms-new-scalar-gpr-vreg! owner)]
                             (ms-emit! owner
                                       bid
                                       (mi-new MI-FTRUTH fresh raw-pred -1 0 NO-NODE))
                             fresh)
-                          raw-pred))
+                          raw-pred)))
                     yes (ms-if-target bid 0)
                     no (ms-if-target bid 1)]
                 (if (and (be-profiling?)
@@ -3336,18 +3857,44 @@
                           0)
                       (ms-fail! MSEL-TERMINATOR term))
                     (ms-emit! owner bid (mi-new MI-CBR -1 pred yes no term)))))
-          (Return [] (let [node (n-in term 1)
-                    raw (ms-vget owner node)
-                    normalized (ms-vget owner term)
-                    value
-                      (if (>= normalized 0)
-                          normalized
-                          (if (and (>= raw 0) (ms-function-fp-return? owner))
-                              (ms-fp-input! owner node raw bid)
-                              raw))]
-                (if (< value 0)
-                    (ms-fail! MSEL-DEPENDENCY term)
-                    (ms-emit! owner bid (mi-new MI-RET -1 value -1 0 term)))))
+          (Return []
+            (let [results (be-function-result-count owner)]
+              (if (> results 1)
+                  (let [u (machine-unit) (mut result) 0 (mut ok) true
+                        first (al-len [i64] (.call-args u)) (mut head) -1]
+                    (loop (if (or (>= (load result) results) (not (load ok))) (break)
+                              (let [value (ms-vget owner (n-in term (+ (load result) 1)))]
+                                (if (< value 0)
+                                    (do
+                                      (fmt (stderr)
+                                           "multi-return dependency miss owner={d} term={d} result={d} node={d}\n"
+                                           owner term (load result)
+                                           (n-in term (+ (load result) 1)))
+                                      (set! ok false))
+                                    (if (= (load result) 0)
+                                        (set! head value)
+                                        (ms-push-call-arg! value MRC-GPR)))
+                                (set! result (+ (load result) 1)))))
+                    (if (not (load ok))
+                        (ms-fail! MSEL-DEPENDENCY term)
+                        (let [at (ms-emit! owner bid
+                                           (mi-new MI-RET -1 (load head) -1 results term))]
+                          (ms-add-call-args! at first (- results 1)))))
+                  (let [node (n-in term 1)
+                        raw (ms-vget owner node)
+                        normalized (ms-vget owner term)
+                        value
+                          (if (>= normalized 0)
+                              normalized
+                              (if (and (>= raw 0) (ms-function-fp-return? owner))
+                                  (ms-fp-input! owner node raw bid)
+                                  raw))]
+                    (if (< value 0)
+                        (do
+                          (fmt (stderr) "return dependency miss owner={d} term={d} node={d}\n"
+                               owner term node)
+                          (ms-fail! MSEL-DEPENDENCY term))
+                        (ms-emit! owner bid (mi-new MI-RET -1 value -1 1 term)))))))
           (_ (ms-fail! MSEL-TERMINATOR term)))))))
 
 (defn ms-emit-function! [(owner i64) (base i64)] (-> i64)
@@ -3380,7 +3927,6 @@
 (defn ms-cache-def-insts! [] (-> i64)
   (let [u (machine-unit)
         nodes (n-count)
-        funcs (mu-function-count)
         (mut at) 0]
     (al-clear! [i64] (field u vreg-def-inst))
     (al-clear! [i64] (field u node-inst-head))
@@ -3390,7 +3936,7 @@
               (do (al-push! [i64] (field u vreg-def-inst) -1)
                   (set! at (+ (load at) 1)))))
     (set! at 0)
-    (loop (if (>= (load at) (* funcs nodes))
+    (loop (if (>= (load at) nodes)
               (break)
               (do (al-push! [i64] (field u node-inst-head) -1)
                   (set! at (+ (load at) 1)))))
@@ -3407,9 +3953,8 @@
                       (al-set! [i64] (field u vreg-def-inst) dst (load at))
                       0)
                   (al-push! [i64] (field u node-inst-next) -1)
-                  (if (and (>= node 0) (and (< node nodes)
-                           (and (>= owner 0) (< owner funcs))))
-                      (let [key (+ (* owner nodes) node)]
+                  (if (and (>= node 0) (< node nodes))
+                      (let [key node]
                         (al-set! [i64] (field u node-inst-next) (load at)
                                  (al-get [i64] (.node-inst-head u) key))
                         (al-set! [i64] (field u node-inst-head) key (load at)))
@@ -3528,27 +4073,44 @@
         (let [def (ms-owner-def-inst owner vreg)]
           (if (>= def 0) (ms-inst-block def) -1)))))
 
-(defn ms-gcm-deeper-bound [(current i64) (dependency i64)] (-> i64)
+(defn ms-gcm-deeper-bound [(current i64) (dependency i64) (selected i64)] (-> i64)
   (if (< dependency 0)
       current
       (if (mu-dominates? current dependency)
           dependency
-          (if (mu-dominates? dependency current) current -1))))
+          (if (mu-dominates? dependency current)
+              current
+              ;; Machine-only conversion/call-seam instructions can combine values produced on
+              ;; sibling control arms at the already selected join block. That join is the earliest
+              ;; legal placement only when both accumulated dependencies dominate it. This is not
+              ;; permission to cross control: an unrelated selected block still refuses.
+              (if (and (>= selected 0)
+                       (and (mu-dominates? current selected)
+                            (mu-dominates? dependency selected)))
+                  selected
+                  -1)))))
 
-(defn ms-gcm-input-bound [(owner i64) (current i64) (vreg i64)] (-> i64)
+(defn ms-gcm-input-bound [(owner i64) (current i64) (vreg i64) (selected i64)] (-> i64)
   (if (< vreg 0)
       current
       (let [block (ms-vreg-def-block owner vreg)
             def (ms-owner-def-inst owner vreg)
+            phi (ms-phi-vreg? owner vreg)
             ;; Demand-driven selection may first emit a pure producer in one consumer's block.
             ;; Once GCM has computed that producer's true earliest block, depend on that bound rather
             ;; than treating the provisional emission block as semantic control.
             dependency
-              (if (or (< def 0) (ms-phi-vreg? owner vreg))
+              (if (or (< def 0) phi)
                   block
                   (let [earliest (ms-inst-earliest def)]
                     (if (>= earliest 0) earliest -1)))]
-        (ms-gcm-deeper-bound current dependency))))
+        ;; `-1` has two meanings at the surrounding API and they must not be conflated. A missing
+        ;; vreg operand was handled above and imposes no bound. A real non-Phi definition whose
+        ;; earliest block is still `-1` is unresolved; accepting it as "no dependency" permanently
+        ;; places its consumer above the producer when demand-driven emission is in reverse order.
+        (if (and (>= def 0) (and (not phi) (< dependency 0)))
+            -1
+        (ms-gcm-deeper-bound current dependency selected)))))
 
 ;; A HEAP OPERATION MUST NOT FLOAT OFF THE CONTROL IT WAS ANCHORED TO. `n-array-store-at!` and its
 ;; siblings take a real control input precisely to say which block the operation belongs to, and
@@ -3601,10 +4163,19 @@
 
 ;; The block a control-anchored heap operation belongs to, or -1 when it has none.
 (defn ms-inst-anchor-block [(owner i64) (at i64)] (-> i64)
-  (let [n (.node (be-inst at))]
+  (let [m (be-inst at)
+        n (.node m)]
+    ;; Materialization is the semantic half of a throwing call result. The raw capture may exist
+    ;; beside the call on both outcomes; the controlled Proj's first input is the normal
+    ;; continuation where the logical value begins. Retaining that ideal identity means GCM can
+    ;; neither hoist it above the split nor sink it into one consumer arm.
+    (if (= (.op m) MI-RESULT-MATERIALIZE)
+        (if (and (>= n 0) (op-is? n Proj [_])) (ms-node-block owner n) -1)
+    (if (and (>= n 0) (op-is? n StringConst [_]))
+        (ms-entry-block owner)
     (if (or (< n 0) (not (ms-anchored-memory-op? n)))
         -1
-        (ms-value-anchor-block owner n 16))))
+        (ms-value-anchor-block owner n 16))))))
 
 (defn ms-inst-anchored? [(owner i64) (at i64)] (-> bool)
   (>= (ms-inst-anchor-block owner at) 0))
@@ -3620,13 +4191,13 @@
         inputs (mi-desc-inputs desc)
         (mut bound) (ms-entry-block owner)]
     (if (> inputs 0)
-        (set! bound (ms-gcm-input-bound owner (load bound) (.a m)))
+        (set! bound (ms-gcm-input-bound owner (load bound) (.a m) (.block-id m)))
         0)
     (if (and (>= (load bound) 0) (> inputs 1))
-        (set! bound (ms-gcm-input-bound owner (load bound) (.b m)))
+        (set! bound (ms-gcm-input-bound owner (load bound) (.b m) (.block-id m)))
         0)
     (if (and (>= (load bound) 0) (= (.op m) MI-CSEL))
-        (set! bound (ms-gcm-input-bound owner (load bound) (.imm m)))
+        (set! bound (ms-gcm-input-bound owner (load bound) (.imm m) (.block-id m)))
         0)
     (if (and (>= (load bound) 0) (> (ms-inst-arg-count at) 0))
         (let [(mut arg) 0]
@@ -3636,7 +4207,8 @@
                       (set! bound
                             (ms-gcm-input-bound owner
                                                 (load bound)
-                                                (ms-inst-arg at (load arg))))
+                                                (ms-inst-arg at (load arg))
+                                                (.block-id m)))
                       (set! arg (+ (load arg) 1))))))
         0)
     (set! bound (ms-gcm-anchor-bound owner at (load bound)))
@@ -3644,11 +4216,43 @@
         false
         (do (set! (.earliest m) (load bound)) true))))
 
+(defn ms-gcm-resolve-earliest-input! [(owner i64) (vreg i64) (fuel i64)] (-> bool)
+  (if (or (< vreg 0) (ms-phi-vreg? owner vreg))
+      true
+      (let [def (ms-owner-def-inst owner vreg)]
+        (if (< def 0) true (ms-gcm-resolve-earliest-one! def fuel)))))
+
+(defn ms-gcm-resolve-earliest-one! [(at i64) (fuel i64)] (-> bool)
+  (let [m (be-inst at)]
+    (if (>= (.earliest m) 0)
+        true
+        (if (<= fuel 0)
+            false
+            (if (mi-op-pinned? (.op m))
+                (do (set! (.earliest m) (.block-id m)) true)
+                (let [owner (.owner m)
+                      inputs (mi-op-inputs (.op m))
+                      (mut ok) true
+                      (mut arg) 0]
+                  (if (> inputs 0)
+                      (set! ok (ms-gcm-resolve-earliest-input! owner (.a m) (- fuel 1))) 0)
+                  (if (and (load ok) (> inputs 1))
+                      (set! ok (ms-gcm-resolve-earliest-input! owner (.b m) (- fuel 1))) 0)
+                  (if (and (load ok) (= (.op m) MI-CSEL))
+                      (set! ok (ms-gcm-resolve-earliest-input! owner (.imm m) (- fuel 1))) 0)
+                  (loop (if (or (not (load ok))
+                                (>= (load arg) (ms-inst-arg-count at)))
+                            (break)
+                            (do
+                              (set! ok
+                                    (ms-gcm-resolve-earliest-input!
+                                      owner (ms-inst-arg at (load arg)) (- fuel 1)))
+                              (set! arg (+ (load arg) 1)))))
+                  (and (load ok) (ms-gcm-refresh-earliest! at))))))))
+
 (defn ms-gcm-compute-earliest! [] (-> bool)
   (let [n (be-inst-count)
         started (ms-profile-now)
-        (mut round) 0
-        (mut changed) true
         (mut ok) true]
     (let [(mut at) 0]
       (loop (if (>= (load at) n)
@@ -3657,75 +4261,19 @@
                   (set! (.earliest (be-inst (load at))) -1)
                   (set! (.latest (be-inst (load at))) -1)
                   (set! at (+ (load at) 1))))))
-    ; A few forward fixed-point rounds also cover definitions emitted out of textual order.
-    ; The round bound is a backstop; the fixed point converges within a handful of rounds, and a
-    ; round that changes nothing proves every later round would change nothing too. Without this
-    ; break the pass ran be-inst-count full rounds — hours on DeltaBlue-sized programs.
-    (loop (if (or (>= (load round) (+ n 1)) (or (not (load ok)) (not (load changed))))
-              (break)
-              (do
-                (set! changed false)
-                (let [(mut at) 0]
-                  (loop (if (or (>= (load at) n) (not (load ok)))
-                            (break)
-                            (do
-                              (let [m (be-inst (load at))
-                                    owner (.owner m)
-                                    op (.op m)
-                                    bid (.block-id m)]
-                                (if (mi-op-pinned? op)
-                                    (if (!= (.earliest m) bid)
-                                        (set! (.earliest m) bid)
-                                        0)
-                                    (let [(mut bound) (ms-entry-block owner)
-                                          inputs (mi-op-inputs op)]
-                                      (if (> inputs 0)
-                                          (set! bound
-                                                (ms-gcm-input-bound owner
-                                                                    (load bound)
-                                                                    (.a m)))
-                                          0)
-                                      (if (and (>= (load bound) 0) (> inputs 1))
-                                          (set! bound
-                                                (ms-gcm-input-bound owner
-                                                                    (load bound)
-                                                                    (.b m)))
-                                          0)
-                                      (if (and (>= (load bound) 0) (= (.op m) MI-CSEL))
-                                          (set! bound
-                                                (ms-gcm-input-bound owner
-                                                                    (load bound)
-                                                                    (.imm m)))
-                                          0)
-                                      (if (and (>= (load bound) 0) (> (ms-inst-arg-count (load at)) 0))
-                                          (let [(mut arg) 0]
-                                            (loop (if (or (>= (load arg) (ms-inst-arg-count (load at)))
-                                                          (< (load bound) 0))
-                                                      (break)
-                                                      (do
-                                                        (set! bound
-                                                              (ms-gcm-input-bound owner
-                                                                                  (load bound)
-                                                                                  (ms-inst-arg (load at) (load arg))))
-                                                        (set! arg (+ (load arg) 1))
-                                                        0))))
-                                          0)
-                                      (set! bound (ms-gcm-anchor-bound owner (load at) (load bound)))
-                                      ; A definition may have been emitted later than this use. Leave
-                                      ; the use unresolved for this round; the forward fixed point will
-                                      ; revisit it after the definition acquires an earliest block.
-                                      (if (>= (load bound) 0)
-                                          (if (!= (.earliest m) (load bound))
-                                              (set! (.earliest m) (load bound))
-                                              0)
-                                          ;; A use emitted before its definition is the only reason
-                                          ;; another def-first round is needed. Ordinary ordered
-                                          ;; graphs finish in one pass, as Simple's schedEarly does.
-                                          (set! changed true)))))
-                              (set! at (+ (load at) 1))
-                              0))))
-                (set! round (+ (load round) 1))
-                0)))
+    ;; Resolve producer dependencies directly instead of repeatedly scanning the whole unit.
+    ;; Memoized `.earliest` fields make this linear in the selected def-use graph regardless of
+    ;; whether demand-driven selection emitted a producer before or after its consumer. Phi vregs
+    ;; are control definitions and terminate recursion at their target block. Fuel is a corruption
+    ;; guard for a non-Phi machine dependency cycle.
+    (let [(mut at) 0]
+      (loop (if (or (>= (load at) n) (not (load ok)))
+                (break)
+                (do
+                  (if (not (ms-gcm-resolve-earliest-one! (load at) (+ n 1)))
+                      (do (ms-fail! MSEL-DEPENDENCY (load at))
+                          (set! ok false)) 0)
+                  (set! at (+ (load at) 1))))))
     (if (load ok)
         (let [(mut at) 0]
           (loop (if (or (>= (load at) n) (not (load ok)))
@@ -3748,8 +4296,8 @@
                       (set! at (+ (load at) 1))))))
         0)
     (if (be-profiling?)
-        (do (fmt (stderr) "AOTK_PROFILE phase=selection_gcm_early ns={d} rounds={d}\n"
-                 (- (ms-profile-now) started) (load round))
+        (do (fmt (stderr) "AOTK_PROFILE phase=selection_gcm_early ns={d}\n"
+                 (- (ms-profile-now) started))
             0)
         0)
     (load ok)))
@@ -3949,7 +4497,7 @@
             late-start (ms-profile-now)]
       ;; ONE BACKWARD PASS IS NOT A FIXPOINT. Placement walks instructions from last to first, so a
       ;; value's uses are normally settled before the value itself -- but not always: the deferred
-      ;; phi boxes `fng-distribute-deferred-phi-boxes!` creates are NEW instructions consumed by
+      ;; phi boxes `g-distribute-deferred-phi-boxes!` creates are NEW instructions consumed by
       ;; OLD ones, so a use sits at a lower index and moves after the def has already read its
       ;; block. `for (const x of xs)` with two `continue`s produced exactly that, and
       ;; `ms-gcm-placement-valid?` -- which recomputes the latest use -- then refused the program
@@ -4135,6 +4683,8 @@
     (loop (if (or (load found) (>= (load at) (al-len [i64] (.memory-anti-deps u))))
               (break)
               (do
+                (set! (.work-memory-antidep-duplicate-probes u)
+                      (+ (.work-memory-antidep-duplicate-probes u) 1))
                 (if (= (al-get [i64] (.memory-anti-deps u) (load at)) node)
                     (set! found true)
                     0)
@@ -4153,99 +4703,123 @@
     (al-clear! [i64] (field u memory-anti-deps))
     (al-clear! [i64] (field u memory-read-head))
     (al-clear! [i64] (field u memory-read-next))
+    (al-clear! [i64] (field u memory-owner-read-head))
+    (al-clear! [i64] (field u memory-owner-read-next))
     ;; Heads are keyed by IDEAL MEMORY DEFINITION, matching Simple's `load.mem().outs()` walk.
     (loop (if (>= (load at) (n-count))
               (break)
               (do (al-push! [i64] (field u memory-read-head) -1)
                   (set! at (+ (load at) 1)))))
     (set! at 0)
-    (loop (if (>= (load at) n)
+    (loop (if (>= (load at) (mu-function-count))
               (break)
-              (do
-                (al-push! [i64] (field u memory-read-next) -1)
-                (let [m (be-inst (load at))]
-                  (if (and (ms-machine-memory-read? m)
-                           (and (>= (.node m) 0) (> (n-nins (.node m)) 1)))
-                      (let [memory (n-in (.node m) 1)]
-                        (if (and (>= memory 0) (< memory (al-len [i64] (.memory-read-head u))))
-                          (do
-                        (al-set! [i64] (field u memory-read-next) (load at)
-                                     (al-get (.memory-read-head u) memory))
-                            (al-set! [i64] (field u memory-read-head) memory (load at)))
-                          0))
-                      0))
-                (set! at (+ (load at) 1)))))
+              (do (al-push! [i64] (field u memory-owner-read-head) -1)
+                  (set! at (+ (load at) 1)))))
     (set! at 0)
-    (loop (if (>= (load at) n)
-              (break)
-              (do
-                (let [m (be-inst (load at))
-                      first (al-len [i64] (.memory-anti-deps u))]
-                  (set! (.anti-first m) first)
-                  (set! (.anti-count m) 0)
-                  (if (ms-machine-memory-write? m)
-                      (do
-                        (let [(mut dep) 0]
-                        (loop (if (>= (load dep) (.mem-count m))
-                                  (break)
-                                  (do
-                                    (let [memory (al-get [i64]
-                                                         (.selection-memory-deps u)
-                                                         (+ (.mem-first m) (load dep)))
-                                          (mut prior)
-                                            (if (and (>= memory 0)
-                                                     (< memory (al-len [i64] (.memory-read-head u))))
-                                                (al-get (.memory-read-head u) memory)
-                                                -1)]
-                                      (loop (if (< (load prior) 0)
-                                                (break)
-                                                (do
-                                                  (let [candidate (be-inst (load prior))]
-                                                    (if (and (= (.owner candidate) (.owner m))
-                                                             (and (ms-memory-operands-may-alias?
-                                                                    candidate m)
-                                                                  (and (< (.node candidate) (.node m))
-                                                                       (mu-dominates?
-                                                                         (.block-id candidate)
-                                                                         (.block-id m)))))
-                                                        (ms-add-memory-anti-dep!
-                                                          m first (.node candidate))
-                                                        0))
-                                                  (set! prior
-                                                        (al-get (.memory-read-next u) (load prior)))))))
-                                    (set! dep (+ (load dep) 1))))))
-                        ;; Exact ideal-memory users are only a fast seed. A read can precede this
-                        ;; write through a different arm of a memory Phi and still dominate it;
-                        ;; that is a real read-before-write ordering constraint. Complete the set
-                        ;; from this owner's machine reads using the same semantic predicate the
-                        ;; independent verifier applies.
-                        (let [(mut candidate-at) 0]
-                          (loop (if (>= (load candidate-at) n)
-                                    (break)
-                                    (let [candidate (be-inst (load candidate-at))]
-                                      (if (and (= (.owner candidate) (.owner m))
-                                               (and (ms-machine-memory-read? candidate)
-                                                    (and (ms-memory-operands-may-alias? candidate m)
-                                                         (and (< (.node candidate) (.node m))
-                                                              (mu-dominates? (.block-id candidate)
-                                                                             (.block-id m))))))
-                                          (ms-add-memory-anti-dep! m first (.node candidate))
-                                          0)
-                                      (set! candidate-at (+ (load candidate-at) 1)))))
-                        ))
-                      0))
-                (set! at (+ (load at) 1))
-                0)))
+    (loop
+      (if (>= (load at) n)
+          (break)
+          (do
+            (al-push! [i64] (field u memory-read-next) -1)
+            (al-push! [i64] (field u memory-owner-read-next) -1)
+            (let [m (be-inst (load at))]
+              (if (ms-machine-memory-read? m)
+                  (do
+                    (if (and (>= (.node m) 0) (> (n-nins (.node m)) 1))
+                        (let [memory (n-in (.node m) 1)]
+                          (if (and (>= memory 0)
+                                   (< memory (al-len [i64] (.memory-read-head u))))
+                              (do
+                                (al-set! [i64] (field u memory-read-next) (load at)
+                                         (al-get (.memory-read-head u) memory))
+                                (al-set! [i64] (field u memory-read-head) memory (load at)))
+                              0))
+                        0)
+                    (if (and (>= (.owner m) 0)
+                             (< (.owner m) (al-len [i64] (.memory-owner-read-head u))))
+                        (do
+                          (al-set! [i64] (field u memory-owner-read-next) (load at)
+                                   (al-get (.memory-owner-read-head u) (.owner m)))
+                          (al-set! [i64] (field u memory-owner-read-head) (.owner m) (load at)))
+                        0))
+                  0))
+            (set! at (+ (load at) 1))
+            0)))
+    (set! at 0)
+    (loop
+      (if (>= (load at) n)
+          (break)
+          (do
+            (let [m (be-inst (load at))
+                  first (al-len [i64] (.memory-anti-deps u))]
+              (set! (.anti-first m) first)
+              (set! (.anti-count m) 0)
+              (if (ms-machine-memory-write? m)
+                  (do
+                    ;; First consume reads directly attached to the write's ideal-memory inputs.
+                    (let [(mut dep) 0]
+                      (loop
+                        (if (>= (load dep) (.mem-count m))
+                            (break)
+                            (do
+                              (let [memory (al-get [i64] (.selection-memory-deps u)
+                                                   (+ (.mem-first m) (load dep)))
+                                    (mut prior)
+                                      (if (and (>= memory 0)
+                                               (< memory (al-len [i64] (.memory-read-head u))))
+                                          (al-get (.memory-read-head u) memory)
+                                          -1)]
+                                (loop
+                                  (if (< (load prior) 0)
+                                      (break)
+                                      (do
+                                        (let [candidate (be-inst (load prior))]
+                                          (if (and (= (.owner candidate) (.owner m))
+                                                   (and (ms-memory-operands-may-alias? candidate m)
+                                                        (and (< (.node candidate) (.node m))
+                                                             (mu-dominates? (.block-id candidate)
+                                                                            (.block-id m)))))
+                                              (ms-add-memory-anti-dep! m first (.node candidate))
+                                              0))
+                                        (set! prior
+                                              (al-get (.memory-read-next u) (load prior)))))))
+                              (set! dep (+ (load dep) 1))))))
+                    ;; A read on another arm of a memory Phi may still dominate this write. The
+                    ;; completion walk is owner-local, so unrelated functions never participate.
+                    (let [(mut candidate-at)
+                            (if (and (>= (.owner m) 0)
+                                     (< (.owner m)
+                                        (al-len [i64] (.memory-owner-read-head u))))
+                                (al-get (.memory-owner-read-head u) (.owner m))
+                                -1)]
+                      (loop
+                        (if (< (load candidate-at) 0)
+                            (break)
+                            (do
+                              (let [candidate (be-inst (load candidate-at))]
+                                (set! (.work-memory-alias-candidates u)
+                                      (+ (.work-memory-alias-candidates u) 1))
+                                (if (and (ms-memory-operands-may-alias? candidate m)
+                                         (and (< (.node candidate) (.node m))
+                                              (mu-dominates? (.block-id candidate)
+                                                             (.block-id m))))
+                                    (ms-add-memory-anti-dep! m first (.node candidate))
+                                    0)
+                                (set! candidate-at
+                                      (al-get (.memory-owner-read-next u)
+                                              (load candidate-at)))))))))
+                  0))
+            (set! at (+ (load at) 1))
+            0)))
     0))
 
 (defn ms-find-node-inst-after [(owner i64) (node i64) (after i64)] (-> i64)
   (let [u (machine-unit)
         nodes (n-count)
-        key (+ (* owner nodes) node)
         (mut at) (if (or (< owner 0) (or (< node 0)
-                                          (>= key (al-len [i64] (.node-inst-head u)))))
+                                          (>= node (al-len [i64] (.node-inst-head u)))))
                      -1
-                     (al-get [i64] (.node-inst-head u) key))
+                     (al-get [i64] (.node-inst-head u) node))
         (mut found) -1]
     ;; The cached list is newest instruction first. Stop as soon as
     ;; it reaches `after`; the last greater entry was the nearest producer.
@@ -4255,7 +4829,8 @@
                 (if (<= (load at) after)
                     (set! at -1)
                     (do
-                      (set! found (load at))
+                      (if (= (ms-inst-owner (load at)) owner)
+                          (set! found (load at)) 0)
                       (set! at (al-get [i64] (.node-inst-next u) (load at)))
                       0)))))
     (load found)))
@@ -4576,6 +5151,101 @@
           (ms-cache-def-insts!)
           (load ok)))))
 
+(defn ms-build-call-bundles! [] (-> bool)
+  (let [u (mcall-bundles) n (be-inst-count) (mut at) 0 (mut ok) true]
+    (al-clear! [MCallBundle] (field u bundles))
+    (al-clear! [i64] (field u inst-bundle))
+    (loop (if (>= (load at) n) (break)
+              (do
+                (al-push! [i64] (field u inst-bundle) -1)
+                (set! at (+ (load at) 1)))))
+    (set! at 0)
+    (loop (if (or (>= (load at) n) (not (load ok))) (break)
+              (let [m (be-inst (load at))]
+                (if (= (.op m) MI-CALL)
+                    (let [results (if (>= (.node m) 0)
+                                      (be-call-result-count (.node m)) 1)
+                          ;; Scalar and aggregate calls use one result protocol. Every declared
+                          ;; slot is snapshotted explicitly; the Call instruction's anchor is not
+                          ;; a second scalar-result representation.
+                          captures results
+                          first (if (> captures 0) (+ (load at) 1) -1)
+                          bundle (mu-call-bundle-count)
+                          (mut slot) 0]
+                      (if (> (+ first captures) n) (set! ok false) 0)
+                      (loop (if (or (>= (load slot) captures) (not (load ok))) (break)
+                                (let [capture (be-inst (+ first (load slot)))]
+                                  (if (or (!= (.op capture) MI-CALL-RESULT)
+                                          (or (!= (.owner capture) (.owner m))
+                                              (or (!= (.block-id capture) (.block-id m))
+                                                  (or (!= (.a capture) (.dst m))
+                                                      (!= (.imm capture) (load slot))))))
+                                      (set! ok false) 0)
+                                  (set! slot (+ (load slot) 1)))))
+                      (if (load ok)
+                          (do
+                            (al-push! [MCallBundle] (field u bundles)
+                              (mcall-bundle-new (.owner m) (.block-id m) (load at) (.dst m)
+                                first captures results
+                                (if (>= (.node m) 0)
+                                    (be-call-result-area-size (.node m)) 0)
+                                (if (< (.imm m) 0)
+                                    true
+                                    (let [fun (mu-function-ideal (.imm m))]
+                                      (and (!= fun NO-NODE)
+                                           (n-fun-abi-can-throw? fun))))))
+                            (al-set! [i64] (field u inst-bundle) (load at) bundle)
+                            (set! slot 0)
+                            (loop (if (>= (load slot) captures) (break)
+                                      (do
+                                        (al-set! [i64] (field u inst-bundle)
+                                                 (+ first (load slot)) bundle)
+                                        (set! slot (+ (load slot) 1))))))
+                          0))
+                    (if (= (.op m) MI-CALL-RESULT)
+                        (if (< (mu-inst-call-bundle (load at)) 0) (set! ok false) 0) 0))
+                (set! at (+ (load at) 1)))))
+    (load ok)))
+
+(defn ms-call-bundles-valid? [] (-> bool)
+  (let [n (be-inst-count) bundles (mu-call-bundle-count)
+        (mut at) 0 (mut seen) 0 (mut ok) true]
+    (if (!= (al-len [i64] (.inst-bundle (mcall-bundles))) n) (set! ok false) 0)
+    (loop (if (or (>= (load at) n) (not (load ok))) (break)
+              (let [m (be-inst (load at)) b (mu-inst-call-bundle (load at))]
+                (if (or (= (.op m) MI-CALL) (= (.op m) MI-CALL-RESULT))
+                    (if (or (< b 0) (>= b bundles)) (set! ok false)
+                        (let [bundle (mu-call-bundle b)]
+                          (if (= (.op m) MI-CALL)
+                              (do
+                                (set! seen (+ (load seen) 1))
+                                (if (or (!= (.call-inst bundle) (load at))
+                                        (or (!= (.owner bundle) (.owner m))
+                                            (or (!= (.block-id bundle) (.block-id m))
+                                                (or (!= (.anchor bundle) (.dst m))
+                                                    (!= (.release-after bundle)
+                                                        (if (> (.capture-count bundle) 0)
+                                                            (+ (.capture-first bundle)
+                                                               (- (.capture-count bundle) 1))
+                                                            (load at)))))))
+                                    (set! ok false) 0)
+                                (let [expected
+                                        (if (< (.imm m) 0)
+                                            true
+                                            (let [fun (mu-function-ideal (.imm m))]
+                                              (and (!= fun NO-NODE)
+                                                   (n-fun-abi-can-throw? fun))))]
+                                  (if (!= (.can-throw bundle) expected)
+                                      (set! ok false) 0)))
+                              (let [slot (- (load at) (.capture-first bundle))]
+                                (if (or (< slot 0) (>= slot (.capture-count bundle))
+                                        (or (!= (.a m) (.anchor bundle))
+                                            (!= (.imm m) slot)))
+                                    (set! ok false) 0)))))
+                    (if (!= b -1) (set! ok false) 0))
+                (set! at (+ (load at) 1)))))
+    (and (load ok) (= (load seen) bundles))))
+
 (defn be-select-machine-program-core! [(verified bool)] (-> bool)
   (if (not (if verified (ms-select-verified-program!) (ms-select-program!)))
       (let [code
@@ -4590,7 +5260,11 @@
                   (ms-inst-node item)
                   item)]
         (be-fail! code node))
-      (if (ms-lower-encodable!) true (be-fail! BER-ENCODING NO-NODE))))
+      (if (ms-lower-encodable!)
+          (if (and (ms-finalize-machine-values!)
+                   (and (ms-build-call-bundles!) (ms-call-bundles-valid?)))
+              true (be-fail! BER-ENCODING NO-NODE))
+          (be-fail! BER-ENCODING NO-NODE))))
 
 (defn be-select-machine-program! [] (-> bool)
   (be-select-machine-program-core! false))
@@ -4608,6 +5282,8 @@
   (.dst (be-inst i)))
 (defn ms-inst-a [(i i64)] (-> i64)
   (.a (be-inst i)))
+(defn ms-inst-b [(i i64)] (-> i64)
+  (.b (be-inst i)))
 (defn ms-inst-imm [(i i64)] (-> i64)
   (.imm (be-inst i)))
 (defn ms-inst-earliest [(i i64)] (-> i64)
@@ -4636,25 +5312,11 @@
             (+ (.arg-first m) which))))
 
 (defn ms-def-inst [(vreg i64)] (-> i64)
-  (let [defs (.vreg-def-inst (machine-unit))]
+  (let [u (machine-unit)
+        defs (.vreg-def-inst u)]
     (if (and (>= vreg 0) (< vreg (al-len [i64] defs)))
-        (let [cached (al-get [i64] defs vreg)]
-          (if (>= cached 0)
-              cached
-              (let [n (be-inst-count) (mut i) 0 (mut found) -1]
-                (loop (if (or (>= (load i) n) (>= (load found) 0)) (break)
-                          (do
-                            (if (= (.dst (be-inst (load i))) vreg)
-                                (set! found (load i)) 0)
-                            (set! i (+ (load i) 1)))))
-                (load found))))
-        (let [n (be-inst-count) (mut i) 0 (mut found) -1]
-          (loop (if (or (>= (load i) n) (>= (load found) 0)) (break)
-                    (do
-                      (if (= (.dst (be-inst (load i))) vreg)
-                          (set! found (load i)) 0)
-                      (set! i (+ (load i) 1)))))
-          (load found)))))
+        (al-get [i64] defs vreg)
+        -1)))
 
 (defn ms-phi-vreg? [(owner i64) (vreg i64)] (-> bool)
   (>= (ms-phi-vreg-block owner vreg) 0))
@@ -4680,19 +5342,19 @@
                           def-bid (.block-id producer)]
                       (and (= owner def-owner)
                            (or (= def-bid (ms-entry-block owner))
-                               (or (= def-bid bid) (ms-block-dominates? def-bid bid)))))))))))
+                               (or (= def-bid bid)
+                                   (ms-block-dominates? def-bid bid)))))))))))
 
 (defn ms-verifier-node-inst-head [(owner i64) (node i64)] (-> i64)
   (let [u (machine-unit)
-        nodes (n-count)
-        key (+ (* owner nodes) node)]
+        nodes (n-count)]
     (if (or (< owner 0)
             (or (>= owner (mu-function-count))
                 (or (< node 0)
                     (or (>= node nodes)
-                        (>= key (al-len [i64] (.verify-node-inst-head u)))))))
+                        (>= node (al-len [i64] (.verify-node-inst-head u)))))))
         -1
-        (al-get [i64] (.verify-node-inst-head u) key))))
+        (al-get [i64] (.verify-node-inst-head u) node))))
 
 (defn ms-node-inst-before [(owner i64) (node i64) (before i64)] (-> i64)
   (let [u (machine-unit)
@@ -4703,7 +5365,8 @@
     (loop (if (or (< (load i) 0) (>= (load found) 0))
               (break)
               (do
-                (if (< (load i) before) (set! found (load i)) 0)
+                (if (and (= (ms-inst-owner (load i)) owner) (< (load i) before))
+                    (set! found (load i)) 0)
                 (set! i (al-get [i64] (.verify-node-inst-next u) (load i)))
                 0)))
     (load found)))
@@ -4719,7 +5382,7 @@
               true)))
     (Parm [index] true)
     (Proj [slot]
-      (let [parent (n-in node 0)]
+      (let [parent (n-proj-source node)]
         (if (and (!= parent NO-NODE)
                  (match (n-op parent) (New [shape] true) (_ false)))
             (>= (ms-node-inst-before owner parent at) 0)
@@ -4737,6 +5400,12 @@
     (ArrayCopy [] (>= (ms-node-inst-before owner node at) 0))
     (StringSplit [] (>= (ms-node-inst-before owner node at) 0))
     (New [shape] (>= (ms-node-inst-before owner node at) 0))
+    (Effect []
+      ;; Effect has no machine instruction of its own. Its memory predecessor must be available and
+      ;; the selected value that establishes the new ordering must dominate this consumer.
+      (let [value (ms-vget owner (n-in node 2))]
+        (and (ms-memory-node-before? owner (n-in node 1) at)
+             (and (>= value 0) (ms-input-valid? at value)))))
     (MemMerge []
       (let [len (n-nins node)
               (mut i) 1
@@ -4750,8 +5419,19 @@
                       (set! i (+ (load i) 1))
                       0)))
           (load ok)))
-    (Phi [declared] (and (ty-mem? declared) (>= (ms-phi-block owner node) 0)))
-    (_ false)))
+    (Phi [declared]
+      ;; A memory Phi is a state edge and is validated by CFG ownership. A DATA Phi may appear as
+      ;; an Effect's ordering value; it is an ordinary selected dependency and must dominate the
+      ;; consumer like any other value. Rejecting every non-memory Phi here made an otherwise valid
+      ;; accessor call fail solely because the observable operation it followed joined two values.
+      (if (ty-mem? declared)
+          (>= (ms-phi-block owner node) 0)
+          (let [value (ms-vget owner node)]
+            (and (>= value 0) (ms-input-valid? at value)))))
+    ;; An Effect's ordering value is recorded beside its memory predecessor. Ordinary value nodes
+    ;; therefore participate in the same scheduling proof through their selected producer.
+    (_ (let [value (ms-vget owner node)]
+         (and (>= value 0) (ms-input-valid? at value))))))
 
 (defn ms-memory-node-on-incoming-edge? [(owner i64) (node i64) (at i64)] (-> bool)
   (let [u (machine-unit)
@@ -4762,6 +5442,7 @@
               (break)
               (do
                 (let [m (be-inst (load producer))]
+                  (if (= (.owner m) owner)
                   (let [(mut edge) 0]
                     (loop (if (or (>= (load edge) (mu-edge-count)) (load found))
                               (break)
@@ -4770,7 +5451,7 @@
                                          (= (mu-edge-target (load edge)) consumer-block))
                                     (set! found true)
                                     0)
-                                (set! edge (+ (load edge) 1)))))))
+                                (set! edge (+ (load edge) 1)))))) 0))
                 (set! producer
                       (al-get [i64] (.verify-node-inst-next u) (load producer))))))
     (load found)))
@@ -4815,10 +5496,11 @@
               (do
                 (let [m (be-inst (load producer))
                       producer-block (.block-id m)]
-                  (if (and (!= producer-block consumer-block)
+                  (if (and (= (.owner m) owner)
+                           (and (!= producer-block consumer-block)
                            (or (= (ms-memory-block owner node) consumer-block)
                                (and (mu-dominates? consumer-block producer-block)
-                                    (ms-block-reaches? producer-block consumer-block))))
+                                    (ms-block-reaches? producer-block consumer-block)))))
                       (set! found true)
                       0))
                 (set! producer
@@ -4942,6 +5624,8 @@
           true MI-STACKARG
           true MI-ABI-COPY
           (ms-input-valid? at a) MI-NEW
+          (ms-input-valid? at a) MI-CALL-RESULT
+          (ms-input-valid? at a) MI-RESULT-MATERIALIZE
           (and (and (ms-input-valid? at a) (ms-input-valid? at b))
                (ms-call-args-valid? at)) MI-JSPROP
           (and (ms-input-valid? at a) (ms-input-valid? at b)) MI-JSARRAY
@@ -5003,30 +5687,43 @@
 
 (defn ms-call-target-valid? [(at i64)] (-> bool)
   (let [m (be-inst at)
-        owner (.owner m)
         target (.imm m)
-        node (.node m)]
-    (if (>= target 0)
-        (and (< target (mu-function-count))
-             (= (mu-function-ideal target) (mu-direct-callee node)))
-        (let [targets (^ target -1)
-              expected (be-call-target-summary (n-ty (n-in node 1)))]
-          ;; Polymorphic emission deliberately dispatches over every function in the machine unit:
-          ;; the type summary can retain dead function ids after reachability, and requiring those
-          ;; ids to have machine owners rejects sound calls even though no runtime value can name a
-          ;; dead function. Validate that selection faithfully recorded the summary; unit coverage
-          ;; is defined by mu-build-program! and checked by the emitted all-owner dispatch itself.
-          (= targets expected)))))
+        contract (.call-contract m)]
+    (and (= target contract)
+         (or (< target 0) (< target (mu-function-count))))))
 
 (defn ms-call-args-valid? [(at i64)] (-> bool)
   (let [m (be-inst at)
         first (.arg-first m)
         count (.arg-count m)
-        total (al-len [i64] (.call-args (machine-unit)))]
-    (and (>= count 0)
-         (and (<= count 16)
-              (and (if (= count 0) (= first -1) (>= first 0))
-                   (or (= count 0) (<= (+ first count) total)))))))
+        total (al-len [i64] (.call-args (machine-unit)))
+        class-total (al-len [i64] (.call-arg-classes (machine-unit)))
+        (mut valid)
+          (and (= total class-total)
+               (and (>= count 0)
+                    (and (<= count M-CALL-MAX-ARGS)
+                         (and (if (= count 0) (= first -1) (>= first 0))
+                              (or (= count 0) (<= (+ first count) total))))))]
+    (if (and (load valid) (and (= (.op m) MI-CALL) (>= (.imm m) 0)))
+        (let [fun (mu-function-ideal (.imm m))]
+          (if (and (!= fun NO-NODE) (n-fun-abi-declared? fun))
+              (if (!= count (n-fun-abi-param-count fun))
+                  (set! valid false)
+                  (let [(mut which) 0]
+                    (loop (if (or (>= (load which) count) (not (load valid))) (break)
+                              (do
+                                (let [expected
+                                        (if (= (ty-kinds
+                                                 (n-fun-abi-param-type fun (load which)))
+                                               VK-FLT)
+                                            MRC-FPR
+                                            MRC-GPR)]
+                                  (if (!= (ms-call-arg-class m (load which)) expected)
+                                      (set! valid false) 0))
+                                (set! which (+ (load which) 1)))))))
+              0))
+        0)
+    (load valid)))
 
 (defn ms-vreg-used-after? [(owner i64) (vreg i64) (at i64)] (-> bool)
   (let [n (be-inst-count)
@@ -5093,6 +5790,19 @@
                         (Return [] (and (= succ 0) (= (load last-op) MI-RET)))
                         (_ false))))))))
 
+(defn ms-verifier-node-definition-count [(owner i64) (node i64)] (-> i64)
+  (let [u (machine-unit)
+        (mut at) (ms-verifier-node-inst-head owner node)
+        (mut count) 0]
+    (loop (if (< (load at) 0) (break)
+              (do
+                (let [m (be-inst (load at))]
+                  (if (and (= (.owner m) owner)
+                           (and (>= (.dst m) 0) (!= (.op m) MI-LOAD)))
+                      (set! count (+ (load count) 1)) 0))
+                (set! at (al-get (.verify-node-inst-next u) (load at))))))
+    (load count)))
+
 (defn ms-definition-unique? [(at i64)] (-> bool)
   (let [m (be-inst at)
         dst (.dst m)
@@ -5102,10 +5812,10 @@
     (if (or (< dst 0) (= (.op m) MI-COPY))
         true
         (let [defs (al-get [i64] (.verify-def-count u) dst)
-              nodes (if (or (< node 0) (= (.op m) MI-LOAD))
+              nodes (if (or (or (< node 0) (= (.op m) MI-LOAD))
+                            (or (= (.op m) MI-CALL) (= (.op m) MI-CALL-RESULT)))
                         1
-                        (al-get [i64] (.verify-node-def-count u)
-                                (+ (* owner (n-count)) node)))]
+                        (ms-verifier-node-definition-count owner node))]
           ; Materialized closure environments may reload the same logical capture at distinct call
           ; sites. Those are distinct machine definitions but intentionally share the capture node
           ; so GC kind classification remains exact.
@@ -5129,7 +5839,6 @@
         blocks (mu-block-count)
         (mut i) 0]
     (al-clear! [i64] (field u verify-def-count))
-    (al-clear! [i64] (field u verify-node-def-count))
     (al-clear! [i64] (field u verify-node-inst-head))
     (al-clear! [i64] (field u verify-node-inst-next))
     (al-clear! [i64] (field u verify-membership))
@@ -5141,9 +5850,8 @@
               (do (al-push! [i64] (field u verify-def-count) 0)
                   (set! i (+ (load i) 1)))))
     (set! i 0)
-    (loop (if (>= (load i) (* funcs nodes)) (break)
-              (do (al-push! [i64] (field u verify-node-def-count) 0)
-                  (al-push! [i64] (field u verify-node-inst-head) -1)
+    (loop (if (>= (load i) nodes) (break)
+              (do (al-push! [i64] (field u verify-node-inst-head) -1)
                   (set! i (+ (load i) 1)))))
     (set! i 0)
     (loop (if (>= (load i) blocks) (break)
@@ -5186,7 +5894,7 @@
                       node (.node m)]
                   (if (and (>= node 0)
                            (and (< node nodes) (and (>= owner 0) (< owner funcs))))
-                      (let [key (+ (* owner nodes) node)]
+                      (let [key node]
                         (al-set! [i64] (field u verify-node-inst-next) (load i)
                                  (al-get [i64] (.verify-node-inst-head u) key))
                         (al-set! [i64] (field u verify-node-inst-head) key (load i)))
@@ -5203,12 +5911,7 @@
                       (do
                         (al-set! [i64] (field u verify-def-count) dst
                                  (+ (al-get [i64] (.verify-def-count u) dst) 1))
-                        (if (and (!= (.op m) MI-LOAD)
-                                 (and (>= node 0) (and (>= owner 0) (< owner funcs))))
-                            (let [key (+ (* owner nodes) node)]
-                              (al-set! [i64] (field u verify-node-def-count) key
-                                       (+ (al-get [i64] (.verify-node-def-count u) key) 1)))
-                            0))
+                        0)
                       0))
                 (set! i (+ (load i) 1)))))
     (set! i 0)
@@ -5273,6 +5976,7 @@
           ; verification below validate that derived placement.
           true
             MI-JSSTRING
+          true MI-RESULT-MATERIALIZE
           true MI-COPY
           (= (mu-edge-source (load (field m imm))) bid) MI-CALL
           (= bid (ms-node-block owner node)) MI-JMP
@@ -5381,6 +6085,15 @@
         slot (.target-slot e)
         target (.target e)
         owner (.owner e)
+        ;; Edge copies execute immediately before the source terminator. The block range is
+        ;; half-open, so `first + count` names the first instruction of some later block, not a
+        ;; position in this source block. Passing that exclusive end to `ms-input-valid?` made an
+        ;; Effect-backed memory input prove dominance against the unrelated later block and reject
+        ;; valid catch/closure joins. Every machine block has a terminator by this verification
+        ;; phase; use its instruction index as the exact availability point.
+        source-terminator (- (+ (mu-block-inst-first (.source e))
+                                (mu-block-inst-count (.source e)))
+                             1)
         total (al-len [MCopy] (.edge-copies u))
         (mut i) 0
         (mut ok) true]
@@ -5405,8 +6118,7 @@
                                             (or (!= (.src c) (n-in phi slot))
                                                 (not (ms-memory-node-before? owner
                                                                              (.src c)
-                                                                             (+ (mu-block-inst-first (.source e))
-                                                                                (mu-block-inst-count (.source e))))))))
+                                                                             source-terminator)))))
                                     (set! ok false)
                                     0)
                                 (if (or (!= kind MCOPY-VALUE)
@@ -5620,8 +6332,8 @@
         "LE" MI-LABEL
         "LABEL" MI-CBZ
         "CBZ" MI-CSEL
-        "CSEL" MI-MOV
-        "MOV" MI-B
+        "CSEL" MI-RESULT-MATERIALIZE
+        "RESULT-MATERIALIZE" MI-B
         "B" MI-NEW
         "NEW" MI-LOAD
         "LOAD" MI-STORE
@@ -5630,7 +6342,12 @@
         "JMP" MI-COPY
         "COPY" MI-CALL
         "CALL" MI-ABI-COPY
-        "ABI-COPY" MI-FMOVI
+        "ABI-COPY" MI-CALL-RESULT
+        "CALL-RESULT" MI-STACKARG
+        "STACKARG" MI-JSBOX
+        "JSBOX" MI-JSUNBOX
+        "JSUNBOX" MI-JSTEST
+        "JSTEST" MI-FMOVI
         "FMOVI" MI-SCVTF
         "SCVTF" MI-FADD
         "FADD" MI-FSUB
@@ -5692,6 +6409,39 @@
                             (set! owner (+ (load owner) 1))
                             0)))
                 (ps w "\n")
+                (let [(mut argument) 0]
+                  (loop (if (>= (load argument) (ms-inst-arg-count at))
+                            (break)
+                            (do
+                              (let [vreg (ms-inst-arg at (load argument))
+                                    def (ms-owner-def-inst (.owner m) vreg)]
+                                (fmt w "  arg[{d}] vreg={d} valid={d} def={d}"
+                                     (load argument) vreg
+                                     (if (ms-input-valid? at vreg) 1 0) def)
+                                (if (>= def 0)
+                                    (let [producer (be-inst def)]
+                                      (do
+                                        (fmt w " op={s} block={d} node={d}\n"
+                                             (mi-op-name (.op producer)) (.block-id producer)
+                                             (.node producer))
+                                        0))
+                                    (do (ps w "\n") 0)))
+                              (set! argument (+ (load argument) 1))))))
+                (let [(mut dependency) 0]
+                  (loop (if (>= (load dependency) (ms-inst-memory-dep-count at))
+                            (break)
+                            (do
+                              (let [node (ms-inst-memory-dep-node at (load dependency))]
+                                (let [vreg (ms-vget (.owner m) node)]
+                                (fmt w "  memory[{d}] node={d} before={d} edge={d} backedge={d} vreg={d} valid={d} phi-block={d}\n"
+                                     (load dependency) node
+                                     (if (ms-memory-node-before? (.owner m) node at) 1 0)
+                                     (if (ms-memory-node-on-incoming-edge? (.owner m) node at) 1 0)
+                                     (if (ms-memory-node-on-loop-backedge? (.owner m) node at) 1 0)
+                                     vreg (if (ms-input-valid? at vreg) 1 0)
+                                     (if (op-is? node Phi [_]) (ms-phi-block (.owner m) node) -1))
+                                (n-print-flat w node)))
+                              (set! dependency (+ (load dependency) 1))))))
                 0)
               0))))
   0)
@@ -5915,93 +6665,147 @@
               0)
           answer))))
 
-(defn ml-kind-for-vreg-direct [(vreg i64)] (-> i64)
-  (let [u (machine-unit)
-        candidate (if (and (>= vreg 0) (< vreg (al-len [i64] (.vreg-node u))))
-                      (al-get [i64] (.vreg-node u) vreg)
-                      -1)
-        candidate-owner (if (< candidate 0)
-                            -1
-                            (al-get [i64] (.vreg-node-owner u) vreg))]
-    (if (and (and (>= candidate 0) (not (n-dead? candidate)))
-             (= (ms-vget candidate-owner candidate) vreg))
-        (ml-kind-for-node candidate)
+(defn ml-kind-for-vreg [(vreg i64)] (-> i64)
+  (let [u (machine-unit)]
+    (if (and (>= vreg 0)
+             (and (< vreg (al-len [i64] (.value-kind u)))
+                  (= (al-get (.vreg-state u) vreg) MV-STATE-DEFINED)))
+        (do
+          (set! (.work-kind-direct u) (+ (.work-kind-direct u) 1))
+          (al-get (.value-kind u) vreg))
         -1)))
 
-;; The reverse map answers most queries directly; a vreg whose recorded node has since died or
-;; been reassigned falls back to the scan, so the answer is always the one the scan would give
-;; (the verifier already requires every definition of a vreg to agree on its kind).
-(defn ml-kind-for-vreg [(vreg i64)] (-> i64)
-  (let [direct (ml-kind-for-vreg-direct vreg)]
-    (if (>= direct 0) direct (ml-kind-for-vreg-scan vreg))))
+(defn ms-copy-value-op? [(op i64)] (-> bool)
+  (or (= op MI-COPY) (or (= op MI-ABI-COPY) (= op MI-RESULT-MATERIALIZE))))
 
-(defn ml-kind-for-vreg-scan [(vreg i64)] (-> i64)
-  (let [funcs (mu-function-count)
-        (mut owner) 0
-        (mut found) MLK-SCALAR
-        (mut done) false]
-    (loop (if (or (>= (load owner) funcs) (load done))
-              (break)
-              (do
-                (let [(mut node) 0]
-                  (loop (if (or (>= (load node) (n-count)) (load done))
-                            (break)
-                            (do
-                              (if (and (not (n-dead? (load node)))
-                                       (= (ms-vget (load owner) (load node)) vreg))
-                                  (do
-                                    (set! found (ml-kind-for-node (load node)))
-                                    (set! done true))
-                                  0)
-                              (set! node (+ (load node) 1))
-                              0))))
-                (set! owner (+ (load owner) 1))
-                0)))
-    (load found)))
-
-(defn ml-kind-for-inst [(at i64)] (-> i64)
-  (let [m (be-inst at)
-        op (.op m)
-        node (.node m)
+(defn ms-inst-result-kind-contract-valid? [(at i64)] (-> bool)
+  (let [u (machine-unit)
+        m (be-inst at)
+        desc (mi-desc (.op m))
+        outputs (mi-desc-outputs desc)
         dst (.dst m)]
-    (if (= (ml-class-for-inst at) MRC-FPR)
-        MLK-SCALAR
-        (if (= op MI-NEW)
-            MLK-RAW-MANAGED
-            ;; Preserve a destination's graph representation when it has one. A synthetic copy
-            ;; destination has none; asking for its kind used to scan every graph node for every
-            ;; copy only to discover no definition, so inherit the source in that case.
-            (if (and (or (= op MI-COPY) (= op MI-ABI-COPY)) (>= (.a m) 0))
-                (let [direct (ml-kind-for-vreg-direct dst)]
-                  (if (>= direct 0) direct (ml-kind-for-vreg (.a m))))
-                (if (or (< node 0) (>= node (n-count)))
-                    MLK-SCALAR
-                    (ml-kind-for-node node)))))))
+    (if (= outputs 0)
+        (= dst -1)
+        (if (or (!= outputs 1)
+                (or (< dst 0) (>= dst (.next-vreg u))))
+            false
+            (let [kind (al-get (.value-kind u) dst)
+                  kind-mask (mi-desc-result-kind-mask desc)
+                  base (!= (& kind-mask (<< 1 kind)) 0)]
+              ;; Copy-like operations move one machine word. GC policy is attached to the logical
+              ;; destination and may legitimately differ at Phi/ABI/materialization boundaries;
+              ;; physical register class, checked below, must remain identical.
+              base)))))
 
-(defn ml-fp-producing-op? [(op i64)] (-> bool)
-  (or (or (= op MI-FMOVI) (= op MI-SCVTF))
-      (or (or (= op MI-FADD) (= op MI-FSUB))
-          (or (or (= op MI-FMUL) (= op MI-FDIV))
-              (or (= op MI-FNEG) (= op MI-FMOD))))))
+(defn ms-inst-result-class-contract-valid? [(at i64)] (-> bool)
+  (let [u (machine-unit)
+        m (be-inst at)
+        desc (mi-desc (.op m))
+        outputs (mi-desc-outputs desc)
+        dst (.dst m)]
+    (if (= outputs 0)
+        (= dst -1)
+        (if (or (!= outputs 1)
+                (or (< dst 0) (>= dst (.next-vreg u))))
+            false
+            (let [class (al-get (.register-class u) dst)
+                  class-mask (mi-desc-result-class-mask desc)
+                  base (!= (& class-mask (<< 1 class)) 0)]
+              (if (and base (ms-copy-value-op? (.op m)))
+                  (and (>= (.a m) 0)
+                       (and (< (.a m) (.next-vreg u))
+                            (= class (al-get (.register-class u) (.a m)))))
+                  base))))))
 
-(defn ml-class-for-inst [(at i64)] (-> i64)
-  (let [m (be-inst at)
-        op (.op m)
-        a (.a m)
-        node (.node m)]
-    (if (or (= op MI-FTRUTH) (= op MI-I32FROMFP))
-        MRC-GPR
-        ;; Unboxing to a NUMBER writes a double, whatever the tagged payload was, so it lands in an
-        ;; FPR the way SCVTF does. Every other tag unboxes to a machine word. The op alone does not
-        ;; say which; only the tag does, which is why this is not in `ml-fp-producing-op?`.
-        (if (or (ml-fp-producing-op? op)
-                (and (= op MI-JSUNBOX) (= (.imm m) 0)))
-            MRC-FPR
-            (if (and (or (= op MI-COPY) (= op MI-ABI-COPY)) (>= a 0))
-                (al-get (.register-class (machine-unit)) a)
-                (if (and (>= node 0) (and (< node (n-count)) (be-node-fp-value? node)))
-                    MRC-FPR
-                    MRC-GPR))))))
+(defn ms-inst-result-contract-valid? [(at i64)] (-> bool)
+  (and (ms-inst-result-kind-contract-valid? at)
+       (ms-inst-result-class-contract-valid? at)))
+
+(defn ms-machine-value-provenance-valid? [(vreg i64)] (-> bool)
+  (let [u (machine-unit)
+        definition (al-get (.vreg-definition-kind u) vreg)
+        a (al-get (.vreg-origin-a u) vreg)
+        b (al-get (.vreg-origin-b u) vreg)
+        abi (al-get (.vreg-abi-kind u) vreg)
+        abi-index (al-get (.vreg-abi-index u) vreg)]
+    (if (or (< definition MV-DEF-INSTRUCTION) (> definition MV-DEF-TEMPORARY))
+        false
+        (case definition
+          MV-DEF-INSTRUCTION (and (>= a 0) (= abi MV-ABI-NONE))
+          MV-DEF-PHI (and (>= a 0)
+                          (and (>= b 0)
+                               (and (= b (al-get (.vreg-phi-block u) vreg))
+                                    (= abi MV-ABI-NONE))))
+          MV-DEF-CALL-RESULT (and (>= a 0)
+                                  (and (>= b 0)
+                                       (and (= abi MV-ABI-CALL-RESULT)
+                                            (= abi-index b))))
+          MV-DEF-COPY (and (>= a 0)
+                           (and (< a (.next-vreg u)) (= abi MV-ABI-NONE)))
+          MV-DEF-ABI (and (>= a 0)
+                          (and (or (= abi MV-ABI-ARGUMENT)
+                                   (= abi MV-ABI-PARAMETER))
+                               (and (>= abi-index 0) (= abi-index b))))
+          MV-DEF-TEMPORARY (and (= abi MV-ABI-NONE) (= abi-index -1))
+          false))))
+
+;; Close the MachineValue table once, at the selection boundary. Later phases consume these rows;
+;; they do not infer representation, class, owner, or origin from scheduled instructions.
+(defn ms-finalize-machine-values! [] (-> bool)
+  (let [u (machine-unit) values (.next-vreg u) insts (be-inst-count)
+        (mut at) 0 (mut ok) true]
+    ;; Construction owns metadata. This pass is deliberately read-only: if any producer omitted
+    ;; or misclassified a value, selection fails instead of repairing the row from instructions.
+    (loop (if (or (>= (load at) insts) (not (load ok))) (break)
+              (do
+                (let [m (be-inst (load at)) dst (.dst m)]
+                  (if (< dst 0) 0
+                      (if (or (>= dst values)
+                              (or (!= (al-get (.vreg-owner u) dst) (.owner m))
+                                  (not (ms-inst-result-contract-valid? (load at)))))
+                          (do
+                            (fmt (stderr)
+                              "machine-value-construction inst={d} op={d} dst={d} owner={d}/{d} kind={d} kind_mask={d} class={d} class_mask={d}\n"
+                              (load at) (.op m) dst
+                              (if (and (>= dst 0) (< dst values))
+                                  (al-get (.vreg-owner u) dst) -1)
+                              (.owner m)
+                              (if (and (>= dst 0) (< dst values))
+                                  (al-get (.value-kind u) dst) -1)
+                              (mi-desc-result-kind-mask (mi-desc (.op m)))
+                              (if (and (>= dst 0) (< dst values))
+                                  (al-get (.register-class u) dst) -1)
+                              (mi-desc-result-class-mask (mi-desc (.op m))))
+                            (if (>= (.a m) 0)
+                                (do
+                                  (fmt (stderr)
+                                    "machine-value-source vreg={d} kind={d} class={d} origin={d} def={d} a={d} b={d}\n"
+                                    (.a m) (al-get (.value-kind u) (.a m))
+                                    (al-get (.register-class u) (.a m))
+                                    (al-get (.vreg-origin-kind u) (.a m))
+                                    (al-get (.vreg-definition-kind u) (.a m))
+                                    (al-get (.vreg-origin-a u) (.a m))
+                                    (al-get (.vreg-origin-b u) (.a m)))
+                                  0) 0)
+                            (ms-fail! MSEL-OWNER (load at))
+                            (set! ok false)) 0)))
+                (set! at (+ (load at) 1)))))
+    (let [(mut value) 0]
+      (loop (if (or (>= (load value) values) (not (load ok))) (break)
+                (do
+                  (if (or (!= (al-get (.vreg-state u) (load value)) MV-STATE-DEFINED)
+                          (or (< (al-get (.vreg-owner u) (load value)) 0)
+                              (or (or (< (al-get (.value-kind u) (load value)) MLK-SCALAR)
+                                      (> (al-get (.value-kind u) (load value)) MLK-NONMOVING))
+                                  (or (or (< (al-get (.register-class u) (load value)) MRC-GPR)
+                                          (> (al-get (.register-class u) (load value)) MRC-FPR))
+                                      (or (= (al-get (.vreg-origin-kind u) (load value))
+                                             MV-ORIGIN-UNKNOWN)
+                                          (not (ms-machine-value-provenance-valid?
+                                                 (load value))))))))
+                      (do (ms-fail! MSEL-OWNER (load value)) (set! ok false)) 0)
+                  (set! value (+ (load value) 1))))))
+    (load ok)))
 
 ;; Placement invokes this legality scheduler before liveness is available, so it belongs to the
 ;; selected-machine-IR phase rather than the later interval/liveness orchestration layer.
@@ -6112,7 +6916,7 @@
                         (or (= pop MI-LABEL)
                             (or (and (or (= pop MI-ARG) (= pop MI-STACKARG))
                                      (or (and (!= cop MI-LABEL)
-                                              (and (not (= cop MI-ARG)) (not (= cop MI-STACKARG))))
+                                              (and (!= cop MI-ARG) (!= cop MI-STACKARG)))
                                          before))
                                 (or (and (= cop MI-COPY)
                                          (and (not (mi-op-terminator? pop))
@@ -6180,15 +6984,16 @@
         nodes (n-count)
         (mut producer)
           (if (and (>= node 0) (< node nodes))
-              (al-get [i64] (.node-inst-head u) (+ (* owner nodes) node))
+              (al-get [i64] (.node-inst-head u) node)
               -1)]
     (loop (if (< (load producer) 0) (break)
               (do
-                (if (and (>= (load producer) first)
-                         (and (< (load producer) (+ first count))
-                              (or (not anti)
-                                  (ms-memory-operands-may-alias?
-                                    (be-inst (load producer)) (be-inst consumer)))))
+                (if (and (= (ms-inst-owner (load producer)) owner)
+                         (and (>= (load producer) first)
+                              (and (< (load producer) (+ first count))
+                                   (or (not anti)
+                                       (ms-memory-operands-may-alias?
+                                         (be-inst (load producer)) (be-inst consumer))))))
                     (ms-schedule-add-edge! first count (load producer) consumer)
                     0)
                 (set! producer (al-get [i64] (.node-inst-next u) (load producer))))))
@@ -6230,6 +7035,17 @@
               (do
                 (let [memory (ms-inst-memory-dep-node consumer (load k))]
                   (ms-schedule-add-node-edges! first count consumer memory false)
+                  ;; Structural values (Cast, Closure, projections, and similar nodes) may select
+                  ;; to another node's vreg and therefore have no machine instruction under their
+                  ;; own ideal-node id. Order the actual selected producer as well as any
+                  ;; instruction directly attributed to the dependency node.
+                  (let [value (ms-vget (.owner m) memory)]
+                    (if (>= value 0)
+                        (let [def (ms-def-inst value)]
+                          (if (>= def 0)
+                              (ms-schedule-add-edge! first count def consumer)
+                              0))
+                        0))
                   (if (and (>= memory 0) (and (op-is? memory Arg [_]) (> (n-nins memory) 0)))
                       (let [ctrl (n-in memory 0)]
                         (if (and (op-is? ctrl CallEnd []) (> (n-nins ctrl) 1))
@@ -6261,13 +7077,35 @@
         (mut first-term) -1
         (mut last-term) -1
         (mut last-store) -1
-        (mut last-call) -1]
+        (mut last-call) -1
+        (mut last-call-result) -1]
     ;; `sched-ready` is scratch until readiness is initialized below.
     (al-clear! [i64] (field u sched-ready))
     (loop (if (>= (load at) end)
               (break)
               (do
                 (let [m (be-inst (load at)) op (.op m)]
+                  (if (= op MI-CALL-RESULT)
+                      (let [bundle (mu-call-bundle (mu-inst-call-bundle (load at)))
+                            slot (.imm m)]
+                        (ms-schedule-add-edge!
+                          first count
+                          (if (= slot 0) (.call-inst bundle)
+                              (+ (.capture-first bundle) (- slot 1)))
+                          (load at))
+                        (set! last-call-result (.release-after bundle)))
+                      (if (and (>= (load last-call-result) 0)
+                               ;; Demand selection can discover another entry argument after this
+                               ;; call bundle in instruction order. Prologue classes have the
+                               ;; stronger invariant that they lead every executable instruction;
+                               ;; adding release -> prologue here closes the real cycle
+                               ;; prologue -> call -> capture -> release -> prologue.
+                               (and (!= op MI-LABEL)
+                                    (and (!= op MI-ARG)
+                                         (and (!= op MI-STACKARG)
+                                              (!= op MI-ABI-COPY)))))
+                          (ms-schedule-add-edge!
+                            first count (load last-call-result) (load at)) 0))
                   (if (= op MI-LABEL) (set! label (load at)) 0)
                   (if (or (= op MI-ARG) (= op MI-STACKARG))
                       (do
@@ -6317,7 +7155,8 @@
                                         (al-get [i64] (.sched-ready u) (load i)) (load at))
                                       (set! i (+ (load i) 1))))))
                         (al-clear! [i64] (field u sched-ready))
-                        (set! last-call (load at)))
+                        (set! last-call (load at))
+                        (set! last-call-result -1))
                       (if (> (mi-op-effects op) 0)
                           (do
                             (if (>= (load last-call) 0)
@@ -6363,15 +7202,16 @@
         nodes (n-count)
         (mut producer)
           (if (and (>= node 0) (< node nodes))
-              (al-get [i64] (.verify-node-inst-head u) (+ (* owner nodes) node))
+              (al-get [i64] (.verify-node-inst-head u) node)
               -1)
         (mut ok) true]
     (loop (if (or (< (load producer) 0) (not (load ok))) (break)
               (do
                 (let [p (be-inst (load producer))]
-                  (if (and (!= (load producer) consumer)
+                  (if (and (= (.owner p) owner)
+                           (and (!= (load producer) consumer)
                            (and (= (.block-id p) bid)
-                                (or (not anti) (ms-memory-operands-may-alias? p c))))
+                                (or (not anti) (ms-memory-operands-may-alias? p c)))))
                       (if (< (load producer) consumer) 0 (set! ok false))
                       0))
                 (set! producer (al-get [i64] (.verify-node-inst-next u) (load producer))))))
@@ -6468,11 +7308,15 @@
     (loop (if (or (>= (load at) end) (not (load ok)))
               (break)
               (do
-                (let [m (be-inst (load at))
+                  (let [m (be-inst (load at))
                       op (.op m)
                       order (.schedule-order m)
                       arg (or (= op MI-ARG) (= op MI-STACKARG))
                       term (mi-op-terminator? op)]
+                  (if (or (= op MI-CALL) (= op MI-CALL-RESULT))
+                      (let [bundle (mu-inst-call-bundle (load at))]
+                        (if (or (< bundle 0) (>= bundle (mu-call-bundle-count)))
+                            (set! ok false) 0)) 0)
                   ;; A label leads every other instruction (and two labels would lead each other).
                   (if (= op MI-LABEL)
                       (do
@@ -6882,7 +7726,6 @@
         (mut bid) 0
         (mut owner) 0
         (mut max-block) 0
-        (mut pairs) 0
         (mut profile-start) (ms-profile-now)]
     (set! (.schedule-result u) MSCHED-OK)
     (set! (.schedule-item u) -1)
@@ -6890,11 +7733,14 @@
     (loop (if (>= (load bid) blocks) (break)
               (do
                 (let [count (mu-block-inst-count (load bid))]
-                  (if (> count (load max-block)) (set! max-block count) 0)
-                  (set! pairs (+ (load pairs) (* count count))))
+                  (if (> count (load max-block)) (set! max-block count) 0))
                 (set! bid (+ (load bid) 1)))))
-    (fmt (stderr) "AOTK_PROFILE phase=schedule_shape insts={d} blocks={d} max_block={d} pair_queries={d}\n"
-         n blocks (load max-block) (load pairs))
+    (if (be-profiling?)
+        (do
+          (fmt (stderr) "AOTK_PROFILE phase=schedule_shape insts={d} blocks={d} max_block={d}\n"
+               n blocks (load max-block))
+          0)
+        0)
     (set! bid 0)
     (al-clear! [MInst] (field u schedule-work))
     (loop (if (>= (load at) n)
@@ -6956,7 +7802,10 @@
                           (set! k (+ (load k) 1))
                           0))))
           (ms-cache-def-insts!)
-          (let [ok (if (be-verification?) (ms-verify-schedule!) true)]
+          (let [bundles-ok (ms-build-call-bundles!)
+                ok (and bundles-ok
+                        (and (ms-call-bundles-valid?)
+                             (if (be-verification?) (ms-verify-schedule!) true)))]
             (ms-profile-note! "schedule_verify" (load profile-start))
             ok)))))
 

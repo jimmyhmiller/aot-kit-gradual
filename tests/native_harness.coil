@@ -31,6 +31,7 @@
 (import "backend_cfg" :use *)
 (import "backend_select" :use *)
 (import "backend_schedule" :use *)
+(import "backend_liveness" :use *)
 (import "backend_allocate" :use *)
 (import "backend_aarch64" :use *)
 (import "backend_macho" :use *)
@@ -534,7 +535,8 @@
                 ;; GCM/placement already reports machine instruction indices while construction's
                 ;; phase marker still names the ideal domain. Show the in-range candidate as well;
                 ;; the ideal-node diagnostic below remains available when the item really is one.
-                (if (and (= (ms-result) MSEL-DEPENDENCY)
+                (if (and (or (= (ms-result) MSEL-DEPENDENCY)
+                             (= (ms-result) MSEL-OWNER))
                          (and (>= (ms-result-item) 0)
                               (< (ms-result-item) (be-inst-count))))
                     (do
@@ -571,8 +573,68 @@
                 0)
             (return-from :done false))
         0))
-    (be-schedule!)
-    (set! phase-start (nh-timing! "scheduling" (load phase-start)))
+    (let [scheduled (be-local-schedule!)
+          _ (set! phase-start (nh-timing! "local_scheduling" (load phase-start)))
+          lived (if (< scheduled 0) -1 (be-liveness!))
+          _ (set! phase-start (nh-timing! "liveness" (load phase-start)))]
+      (if (< lived 0)
+          (do
+            (fmt (stderr) "native-harness: scheduling code={d} item={d} liveness={d}/{d}\n"
+                 (ms-schedule-result) (ms-schedule-item) (ml-result) (ml-result-item))
+            (if (and (>= (ml-result-item) 0)
+                     (>= (ms-def-inst (ml-result-item)) 0))
+                (let [def (ms-def-inst (ml-result-item))]
+                  (fmt (stderr) "native-harness: failed vreg class actual={d} allowed_mask={d}\n"
+                       (ml-register-class (ml-result-item))
+                       (mi-desc-result-class-mask (mi-desc (ms-inst-op def))))
+                  (ms-print-inst (stderr) def))
+                0)
+            (if (and (>= (ml-result-item) 0) (< (ml-result-item) (be-inst-count)))
+                (let [failed-at (ml-result-item)
+                      source-at (ms-def-inst (ms-inst-a failed-at))]
+                  (ms-print-inst (stderr) failed-at)
+                  (if (>= (ms-inst-node failed-at) 0)
+                      (let [failed-node (ms-inst-node failed-at)]
+                        (n-print-flat (stderr) failed-node)
+                        (let [(mut input-index) 1]
+                          (loop (if (>= (load input-index) (n-nins failed-node)) (break)
+                                    (do
+                                      (n-print-flat (stderr) (n-in failed-node (load input-index)))
+                                      (set! input-index (+ (load input-index) 1))))))) 0)
+                  (fmt (stderr) "native-harness: operand classes dst={d} a={d}\n"
+                       (ml-register-class (ms-inst-dst failed-at))
+                       (ml-register-class (ms-inst-a failed-at)))
+                  (if (>= source-at 0) (ms-print-inst (stderr) source-at) 0)
+                  (let [b-at (ms-def-inst (ms-inst-b failed-at))]
+                    (if (>= b-at 0)
+                        (do
+                          (ms-print-inst (stderr) b-at)
+                          (if (>= (ms-inst-node b-at) 0)
+                              (n-print-flat (stderr) (ms-inst-node b-at)) 0))
+                        0)))
+                0)
+            (if (and (>= (ms-schedule-item) 0)
+                     (< (ms-schedule-item) (mu-block-count)))
+                (let [bid (ms-schedule-item)
+                      first (mu-block-inst-first bid)
+                      count (mu-block-inst-count bid)
+                      (mut local) 0]
+                  (fmt (stderr) "native-harness: failed schedule block={d} first={d} count={d}\n"
+                       bid first count)
+                  (loop (if (>= (load local) count) (break)
+                            (do (ms-print-inst (stderr) (+ first (load local)))
+                                (let [mn (ms-inst-node (+ first (load local)))]
+                                  (if (and (>= mn 0) (< mn (n-count)))
+                                      (do
+                                        (n-print-flat (stderr) mn)
+                                        (if (> (n-nins mn) 0)
+                                            (let [parent (n-in mn 0)]
+                                              (if (and (>= parent 0) (< parent (n-count)))
+                                                  (n-print-flat (stderr) parent) 0)) 0)
+                                        0) 0))
+                                (set! local (+ (load local) 1)))))) 0)
+            (return-from :done false))
+          0))
     (let [colored (be-color! 10)]
     (set! phase-start (nh-timing! "allocation" (load phase-start)))
     (if (< colored 0)
@@ -678,7 +740,8 @@
                 true))))))
 
 (defn nh-save-jsl-seed-artifact? [(path (slice u8))] (-> bool)
-  (and (nh-ensure-jsl-seed-cache?) (mfts-save-artifact! path)))
+  (and (nh-ensure-jsl-seed-cache?)
+       (mfts-save-artifact! path (jl-library-identity-unit))))
 
 (defn nh-load-jsl-seed-artifact? [(path (slice u8))] (-> bool)
   (block :load
@@ -694,7 +757,13 @@
       ;; parameter metadata store type ids, so replacing the table afterwards leaves those ids
       ;; bound to a different numbering even though the graph itself is later discarded.
       (if (not (mfts-load-artifact! path)) (return-from :load false) 0)
-      (if (!= (jsl-load-index! "lib/index") JSL-OK) (return-from :load false) 0)
+      (if (!= (jsl-load-index! "lib/index") JSL-OK)
+          (do (mfts-clear!) (return-from :load false)) 0)
+      ;; Only the artifact may restore the type/shape prefix, but the freshly parsed library is
+      ;; authoritative for semantic identity. Validate after parsing and before publishing imports.
+      (if (!= (mfts-loaded-artifact-context)
+              (mfts-artifact-context (jl-library-identity-unit)))
+          (do (mfts-clear!) (return-from :load false)) 0)
       (let [prefix (mfts-count)]
         (if (<= prefix 0) (return-from :load false) 0)
         (mfts-publish-import-catalog!)
@@ -968,8 +1037,25 @@
         (do (fmt (stderr) "native-harness: selection code={d} node={d} machine={d}/{d} cfg={d}/{d}\n"
                  (be-result) (be-result-node) (ms-result) (ms-result-item)
                  (mu-verify-result) (mu-verify-item))
-            (mu-dump (stderr))
-            (g-print-flat (stderr))
+            ;; A whole-unit dump can contain hundreds of thousands of nodes and used to bury the
+            ;; one instruction that failed. Selection reports both domains; print the compact
+            ;; machine instruction and its ideal producer/input chain.
+            (if (and (>= (ms-result-item) 0) (< (ms-result-item) (be-inst-count)))
+                (ms-print-inst (stderr) (ms-result-item))
+                0)
+            (if (and (>= (be-result-node) 0) (< (be-result-node) (n-count)))
+                (let [failed (be-result-node)]
+                  (n-print-flat (stderr) failed)
+                  (let [(mut input) 0]
+                    (loop (if (>= (load input) (n-nins failed))
+                              (break)
+                              (do
+                                (let [value (n-in failed (load input))]
+                                  (if (and (>= value 0) (< value (n-count)))
+                                      (n-print-flat (stderr) value)
+                                      0))
+                                (set! input (+ (load input) 1)))))))
+                0)
             0)
         0)
     (assert selected))

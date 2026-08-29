@@ -24,11 +24,20 @@
 (import "jsstring"  :use *)
 (import "jsvalue"   :use *)
 (import "verify"    :use *)
+(import "backend_select" :use *)
+(import "backend_core" :use *)
+(import "backend_schedule" :use *)
+(import "backend_allocate" :use *)
+(import "backend_aarch64" :use *)
+(import "backend_x64" :use *)
 (import "coil.assert" :use *)
 (import "coil.control" :use *)
 (import "coil.slice"  :use *)
+(import "coil.arraylist" :use *)
 (import "coil.alloc"  :use * :as alloc)
 (import "coil.str"    :use *)
+(import "coil.fmt"    :use *)
+(import "coil.io"     :use *)
 
 ; ---------------------------------------------------------------------------
 ; Harness
@@ -51,7 +60,7 @@
 ;; Load, check and lower a unit, asserting each stage. Returns nothing useful; the assertions are
 ;; the content.
 (defn build! [(src (slice u8))] (-> i64)
-  (assert (= (jsl-load! src) JSL-OK))
+  (assert-eq (jsl-load! src) JSL-OK)
   (assert (= (jsl-lower!) JSL-OK))
   0)
 
@@ -100,6 +109,16 @@
      :params [(fn dyn) (receiver dyn) (value dyn)] :ret dyn
      (call-with-receiver fn receiver value))")
 
+(const SRC-CALL-WITH-REST
+  "(macro InvokeList :transitioning true
+       :params [(fn dyn) (receiver dyn) (argumentsList (rest dyn))] :ret dyn
+       (call-dynamic-with-receiver-rest fn receiver argumentsList))
+   (builtin invoke0 :transitioning true :params [(fn dyn) (receiver dyn)] :ret dyn
+     (InvokeList fn receiver))
+   (builtin invoke2 :transitioning true
+     :params [(fn dyn) (receiver dyn) (a dyn) (b dyn)] :ret dyn
+     (InvokeList fn receiver a b))")
+
 (const SRC-CALLABLE
   "(callable receiver-plus :params [(value dyn)] :ret dyn (%Add this value))")
 
@@ -134,6 +153,53 @@
                      (store! i (+ (load i) 1)))))
            (assert (load found))))
 
+(deftest get_prototype_retains_its_runtime_operation_discriminator
+         (fresh! 10068)
+         (build! "(builtin get-prototype :params [(x dyn)] :ret dyn
+                    (%GetPrototype x (%Box null)))")
+         (let [(mut node) 0 (mut found) false]
+           (loop (if (>= (load node) (n-count)) (break)
+                   (do
+                     (if (and (not (n-dead? (load node)))
+                              (match (n-op (load node))
+                                (PropLoadKey [operation] (= operation 24))
+                                (_ false)))
+                         (store! found true)
+                         0)
+                     (store! node (+ (load node) 1)))))
+           (assert (load found))))
+
+;; The lowering cursor is an owner just like a lexical binding: an effectful tail call's normal
+;; CProj has no graph user until the enclosing Return is built when the call result is unused.
+(deftest an_unused_effectful_tail_call_keeps_its_normal_control_until_return
+         (fresh! 100681)
+         (build! "(builtin write :transitioning true :params [(object dyn)] :ret dyn
+                    (%DefinePropertyValue object (%Box \"x\") (%Box 1)))
+                  (builtin retained :transitioning true :params [(object dyn)] :ret dyn
+                    (let [(ignored (write object))] object))"))
+
+(deftest object_integrity_primitives_retain_their_runtime_operation_discriminators
+         (fresh! 10069)
+         (build! "(builtin integrity :params [(x dyn)] :ret dyn
+                    (let [(before (%ObjectIsExtensible x 0))
+                          (stopped (%ObjectPreventExtensions x 0 (%Box undefined)))
+                          (after (%ObjectIsExtensible x 0))]
+                      (%Box after)))")
+         (let [(mut node) 0 (mut foundRead) false (mut foundWrite) false]
+           (loop (if (>= (load node) (n-count)) (break)
+                   (do
+                     (if (not (n-dead? (load node)))
+                         (match (n-op (load node))
+                           (PropLoadKey [operation]
+                             (if (= operation 22) (store! foundRead true) 0))
+                           (PropStoreKey [operation]
+                             (if (= operation 23) (store! foundWrite true) 0))
+                           (_ 0))
+                         0)
+                     (store! node (+ (load node) 1)))))
+           (assert (load foundRead))
+           (assert (load foundWrite))))
+
 (deftest an_explicit_receiver_is_part_of_the_javascript_call_abi
          (fresh! 90109)
          (build! SRC-CALL-WITH-RECEIVER)
@@ -146,6 +212,43 @@
          (refuses 90110
                   "(builtin bad :params [(fn dyn)] :ret dyn (call-with-receiver fn))"
                   JSL-ERR-ARITY))
+
+(deftest a_rest_parameter_is_a_compile_away_specification_list
+         (fresh! 901101)
+         (build! SRC-CALL-WITH-REST)
+         (assert (jsl-decl-rest? 0))
+         (assert (jsl-param-rest? 0 2))
+         (let [(mut node) 0 (mut zero-arity) 0 (mut two-arity) 0]
+           (loop (if (>= (load node) (n-count)) (break)
+                     (do (if (and (not (n-dead? (load node)))
+                                  (op-is? (load node) Call [_]))
+                             (let [argc (n-in (load node) 4)]
+                               (if (= (n-ty argc) (t-int-con 0))
+                                   (store! zero-arity (+ (load zero-arity) 1))
+                                   (if (= (n-ty argc) (t-int-con 2))
+                                       (store! two-arity (+ (load two-arity) 1)) 0)))
+                             0)
+                         (store! node (+ (load node) 1)))))
+           (assert (= (load zero-arity) 1))
+           (assert (= (load two-arity) 1)))
+         (refuses 901102
+                  "(builtin bad :params [(xs (rest dyn))] :ret dyn 0)"
+                  JSL-ERR-BAD-REST)
+         (refuses 901103
+                  "(macro bad :params [(xs (rest dyn)) (x dyn)] :ret dyn x)"
+                  JSL-ERR-BAD-REST)
+         (refuses 901104
+                  "(macro bad :params [(xs (rest dyn))] :ret dyn xs)"
+                  JSL-ERR-BAD-REST)
+         (refuses 901105
+                  "(macro bad :params [(x dyn)] :ret dyn
+                     (call-dynamic-with-receiver-rest x x x))"
+                  JSL-ERR-BAD-REST)
+         (refuses 901106
+                  "(macro many :params [(xs (rest dyn))] :ret dyn 0)
+                   (builtin bad :params [] :ret dyn
+                     (many 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16))"
+                  JSL-ERR-TOO-MANY-PARAMS))
 
 (deftest a_callable_uses_the_javascript_receiver_abi
          (fresh! 90111)
@@ -219,7 +322,29 @@
          ; ArrayLike length, index-presence and indexed-Get operations.
          ; 316: host-side uncaught completion classification, callable names, and unresolvable
          ; assignment semantics.
-  (assert (= (jsl-decl-count) 368))
+         ; 379: receiver-aware ordinary [[Get]] composition and the canonical GetV operation add
+         ; two declarations while replacing the earlier receiver-conflating helper. 382 adds
+         ; canonical GetMethod, targeted Symbol.replace publication, and StringReplaceValue. 384
+         ; adds canonical ToPrimitive and targeted Symbol.toPrimitive publication. 385 adds the
+         ; object-only called continuation that keeps primitive coercions compile-time-small. 409
+         ; adds canonical RequireInternalSlot, sixteen named represented-slot identities, and the
+         ; centralized family-to-runtime-kind representation predicates it composes. 433 adds the
+         ; private Property Descriptor record surface, canonical ToPropertyDescriptor, and the
+         ; record-consuming DefineProperty continuation. 436 replaces the old handwritten
+         ; redefinition predicate with canonical ValidateAndApplyPropertyDescriptor and its
+         ; current-descriptor/application helpers. 437 adds canonical OrdinaryDefineOwnProperty
+         ; while promoting the current-descriptor helper to OrdinaryGetOwnProperty. 439 adds the
+         ; canonical IsExtensible and OrdinaryIsExtensible layers above the runtime slot query.
+         ; 440 adds canonical OrdinaryPreventExtensions above the matching runtime slot write.
+         ; 471 adds four typed MaybePropertyDescriptor helpers. 484 replaces two targeted Symbol
+         ; macros with the generated fifteen-entry well-known-symbol root table. 486 adds the
+         ; generated Symbol.for and Symbol.keyFor method roots. 489 adds generated Symbol.prototype
+         ; valueOf/toString method roots and the description accessor root. 495 adds the general
+         ; generated data-property roots plus the Symbol prototype's well-known-keyed
+         ; @@toPrimitive method and @@toStringTag data property. Internal builtins
+         ; flatten typed Record parameters into ordinary ABI leaves, so no declaration-kind
+         ; workaround is needed.
+  (assert (= (jsl-decl-count) 495))
          ; A builtin has a Fun and a macro does not, and every declaration is one or the other.
          (let [(mut i) 0 (mut funs) 0 (mut macros) 0]
            (loop (if (>= (load i) (jsl-decl-count)) (break)
@@ -230,12 +355,15 @@
                                (store! funs (+ (load funs) 1)) 0))
                        (store! i (+ (load i) 1))
                        0)))
-  (assert (= (+ (load funs) (load macros)) 368))
+  (assert (= (+ (load funs) (load macros)) 495))
            ; Most existing heap definitions remain macros for graph visibility and historical
            ; stability; called builtins can now carry an implicit heap effect when recursion or
            ; code sharing requires one. BuiltinConstructorValue and BuiltinMethodValue are shared
            ; because each is identity initialization, not caller-specific JavaScript control.
-           (assert (= (load macros) 271)))
+           ; ValidateAndApplyPropertyDescriptor is likewise a called boundary now that its two
+           ; specification Records use the canonical flattened internal ABI.
+           (assert (= (load macros) 367))
+           (assert (not (jsl-macro? (jsl-find "ValidateAndApplyPropertyDescriptor")))))
          (assert (>= (jsl-find "Clamp") 0))
          (assert (>= (jsl-find "StringIndexOfFrom") 0))
          (assert (>= (jsl-find "StringStartsWith") 0))
@@ -282,6 +410,73 @@
                   "(builtin f :params [(x dyn)] x) (builtin f :params [(y dyn)] y)"
                   JSL-ERR-DUP-NAME))
 
+(deftest structured_spec_provenance_is_retained_on_the_declaration
+         (fresh! 90206)
+         (assert (= (jsl-load!
+                      "(macro f
+                         :spec \"ecma262@1111111111111111111111111111111111111111#sec-f\"
+                         :spec-name \"F\" :status complete
+                         :params [(x dyn)] x)")
+                    JSL-OK))
+         (let [d (jsl-find "f")]
+           (assert (= (jsl-decl-spec d)
+                      "ecma262@1111111111111111111111111111111111111111#sec-f"))
+           (assert (= (jsl-decl-spec-name d) "F"))
+           (assert (= (jsl-decl-spec-status d) JSL-SPEC-COMPLETE))
+           (assert (= (jsl-decl-specializes d) ""))
+           (assert (= (jsl-decl-deviation d) ""))))
+
+(deftest specialized_spec_metadata_is_retained_without_creating_a_claim
+         (fresh! 902060)
+         (assert (= (jsl-load!
+                      "(macro f
+                         :specializes \"ecma262@1111111111111111111111111111111111111111#sec-f\"
+                         :deviation \"Handles only the machine-index result domain.\"
+                         :params [(x dyn)] x)")
+                    JSL-OK))
+         (let [d (jsl-find "f")]
+           (assert (= (jsl-decl-spec d) ""))
+           (assert (= (jsl-decl-specializes d)
+                      "ecma262@1111111111111111111111111111111111111111#sec-f"))
+           (assert (= (jsl-decl-deviation d)
+                      "Handles only the machine-index result domain."))))
+
+(deftest incomplete_or_dishonest_spec_metadata_is_refused_by_name
+         (refuses 902061
+                  "(macro f :spec \"ecma262@1111111111111111111111111111111111111111#sec-f\"
+                     :spec-name \"F\" :params [(x dyn)] x)"
+                  JSL-ERR-BAD-SPEC-METADATA)
+         (refuses 902062
+                  "(macro f :spec \"ecma262@1111111111111111111111111111111111111111#sec-f\"
+                     :spec-name \"F\" :status complete :deviation \"missing arm\"
+                     :params [(x dyn)] x)"
+                  JSL-ERR-BAD-SPEC-METADATA)
+         (refuses 902063
+                  "(macro f :spec \"ecma262@1111111111111111111111111111111111111111#sec-f\"
+                     :spec-name \"F\" :status partial :params [(x dyn)] x)"
+                  JSL-ERR-BAD-SPEC-METADATA)
+         (refuses 902065
+                  "(macro f :specializes \"ecma262@1111111111111111111111111111111111111111#sec-f\"
+                     :params [(x dyn)] x)"
+                  JSL-ERR-BAD-SPEC-METADATA)
+         (refuses 902066
+                  "(macro f :deviation \"narrow\" :params [(x dyn)] x)"
+                  JSL-ERR-BAD-SPEC-METADATA)
+         (refuses 902067
+                  "(macro f :spec \"ecma262@1111111111111111111111111111111111111111#sec-f\"
+                     :spec-name \"F\" :status partial
+                     :specializes \"ecma262@1111111111111111111111111111111111111111#sec-f\"
+                     :deviation \"narrow\" :params [(x dyn)] x)"
+                  JSL-ERR-BAD-SPEC-METADATA))
+
+(deftest one_canonical_spec_item_has_one_jsl_claim
+         (refuses 902064
+                  "(macro f :spec \"ecma262@1111111111111111111111111111111111111111#sec-f\"
+                     :spec-name \"F\" :status complete :params [(x dyn)] x)
+                   (macro g :spec \"ecma262@1111111111111111111111111111111111111111#sec-f\"
+                     :spec-name \"F\" :status complete :params [(x dyn)] x)"
+                  JSL-ERR-DUP-SPEC-CLAIM))
+
 ;; The same definition as a `macro` is accepted, because a macro is lowered into its caller's graph
 ;; and so reads its caller's memory.
 (deftest a_heap_reading_macro_is_accepted
@@ -298,6 +493,41 @@
          (assert (= (jsl-load! "(macro m :params [(a dyn)] :ret int (let [(n (%ArrayLen a))] n))")
                     JSL-OK))
          (assert (jsl-decl-uses-memory? (jsl-find "m"))))
+
+;; `%UnboxNumber` is a checked representation conversion even though it accepts both tagged
+;; integers and IEEE doubles. Preserve the branch that proved Number-ness so scheduling cannot
+;; hoist it above `%IsNumber` and trap on a dynamically loaded String.
+(deftest a_numeric_jsl_unbox_stays_below_its_representation_guard
+         (fresh! 91205)
+         (assert (= (jsl-load!
+                      "(macro guarded :params [(v dyn)] :ret flt
+                         (if (%IsNumber v) (%UnboxNumber v) 0.0))")
+                    JSL-OK))
+         (let [ctrl (primitive/alloc-stack (array i64 1))
+               mem (primitive/alloc-stack (array i64 1))
+               argv (primitive/alloc-stack (array i64 1))
+               cp (cast (ptr i64) ctrl)
+               mp (cast (ptr i64) mem)
+               ap (cast (ptr i64) argv)]
+           (store! (index cp 0) (g-start))
+           (store! (index mp 0) NO-NODE)
+           (store! (index ap 0) (n-new1 (Arg (t-dyn)) (g-start)))
+           (let [value (jsl-inline! cp mp (g-start) "guarded" (slice-new [i64] ap 1))
+                 ret (n-new2 (Return) (load (index cp 0)) value)
+                 (mut at) 0
+                 (mut found) false]
+             (n-add-def! (g-stop) ret)
+             (loop (if (>= (load at) (n-count))
+                       (break)
+                       (do (if (op-is? (load at) Unbox [_])
+                               (do (set! found true)
+                                   (assert (!= (n-in (load at) 0) NO-NODE)))
+                               0)
+                           (set! at (+ (load at) 1)))))
+             (assert (load found))
+             (iterate!)
+             (g-analyze!)
+             (assert (= (g-verify) 0)))))
 
 ;; Both arms publish a distinct ArrayStore into one memory Phi. This is the ordinary shape of
 ;; JavaScript `[[Set]]` when one arm grows an array and the other only writes the existing slot;
@@ -411,6 +641,19 @@
          (refuses 91060 "(builtin f :params [(x dyn)] (%Add x 1)" JSL-ERR-PARSE)
          (refuses 91061 "(builtin f :params [(x dyn)] \"unterminated)" JSL-ERR-PARSE))
 
+(deftest a_multifile_reader_diagnostic_names_the_file_that_failed
+         (fresh! 91062)
+         (let [first (jsl-source-add! "first.jsl")
+               second (jsl-source-add! "second.jsl")]
+           (assert (= (jsl-read-source! "(macro First :params [] :ret int 1)" first) JSL-OK))
+           ;; Before the reader Diag range was stamped explicitly, this failure inherited the
+           ;; cursor of `First` and convincingly blamed first.jsl.
+           (assert (= (jsl-read-source! "(macro Broken :params [] :ret int 2" second)
+                      JSL-ERR-PARSE))
+           (assert (= (jsl-err-src) second))
+           (assert (= (jsl-source-path (jsl-err-src)) "second.jsl")))
+         0)
+
 ; ---------------------------------------------------------------------------
 ; Loops
 ; ---------------------------------------------------------------------------
@@ -474,6 +717,24 @@
          ; An initialiser is checked in the ENCLOSING scope, so a binding cannot see itself.
          (refuses 91123 "(builtin f :params [(x dyn)] (loop [(i i)] (recur i)))" JSL-ERR-UNBOUND))
 
+;; A recur destination lives in compiler storage until the Loop is closed, so its control needs the
+;; same explicit ownership as its parked values. The unused throwing-call result is collected at
+;; scope exit; without the parked-control pin that cascade deletes the proven-normal CProj which is
+;; also the pending back edge, and the Loop is then closed over a dead input.
+(deftest a_recur_parks_its_normal_control_until_the_loop_closes
+         (fresh! 91124)
+         (build!
+           "(builtin MaybeValue :transitioning true :params [(fail bool)] :ret dyn
+              (if fail (%Throw (%Box 1)) (%Box 7)))
+            (builtin Advance :transitioning true :params [(n int)] :ret int
+              (loop [(i 0)]
+                (if (%Le n i)
+                    i
+                    (let [(unused (MaybeValue false))]
+                      (recur (%Add i 1))))))")
+         (g-analyze!)
+         (assert (= (g-verify) 0)))
+
 ; ---------------------------------------------------------------------------
 ; Macros
 ; ---------------------------------------------------------------------------
@@ -497,6 +758,589 @@
                       (return-from :found (load i)) 0)
                   (store! i (+ (load i) 1)) 0)))
       NO-NODE)))
+
+(const SRC-SPEC-RECORD
+  "(record Pair [(left dyn) (right dyn)])
+   (macro MakePair :params [(left dyn) (right dyn)] :ret (record Pair)
+     (record-new Pair [(left left) (right right)]))
+   (macro ReplaceRight :params [(pair (record Pair)) (right dyn)] :ret (record Pair)
+     (record-with pair right right))
+   (builtin choose-left :params [(selector dyn) (a dyn) (b dyn)] :ret dyn
+     (record-get
+       (if (%Lt selector 0)
+           (ReplaceRight (MakePair a a) b)
+           (MakePair b a))
+       left))")
+
+(deftest specification_records_compile_away_into_one_phi_per_field
+         (fresh! 91500)
+         (build! SRC-SPEC-RECORD)
+         (assert (= (jsl-record-count) 1))
+         (assert (= (jsl-record-nfields 0) 2))
+         ;; Both fields differ across a genuinely dynamic branch, so the bundle becomes exactly
+         ;; two ordinary SSA Phis. There is no record node and no heap object to count.
+         (assert (= (count-op OPTAG-PHI) 2))
+         (assert (= (count-op OPTAG-NEW) 0)))
+
+(deftest public_inline_boundary_accepts_and_returns_logical_record_values
+  (fresh! 915001)
+  (assert (= (jsl-load! SRC-SPEC-RECORD) JSL-OK))
+  (let [pair (jsl-record-find "Pair")
+        ctrl (primitive/alloc-stack (array i64 1))
+        mem (primitive/alloc-stack (array i64 1))
+        cp (cast (ptr i64) ctrl)
+        mp (cast (ptr i64) mem)
+        (mut leaves) (al-new [i64] (malloc-allocator))
+        (mut arguments) (al-new [JslLoweredValue] (malloc-allocator))]
+    (store! (index cp 0) (g-start))
+    (store! (index mp 0) NO-NODE)
+    (al-push! [i64] (mut leaves) (n-box! (kconst (t-int-con 20))))
+    (al-push! [i64] (mut leaves) (n-box! (kconst (t-int-con 1))))
+    (al-push! [JslLoweredValue] (mut arguments)
+              (jl-lowered-record-from-slots!
+                pair (slice-data (al-slice [i64] (load leaves)))))
+    (al-push! [JslLoweredValue] (mut arguments)
+              (jl-lowered-scalar! (n-box! (kconst (t-int-con 22))) (t-dyn)))
+    (let [result
+            (jsl-inline-lowered! cp mp (g-start) "ReplaceRight"
+                                 (al-slice [JslLoweredValue] (load arguments)))
+          answer (n-peephole
+                   (n-new3 (Add) NO-NODE
+                           (n-unbox! (jl-lowered-slot result 0) (t-int))
+                           (n-unbox! (jl-lowered-slot result 1) (t-int))))]
+      (assert (= (.kind result) JLV-RECORD))
+      (assert (= (.logical result) pair))
+      (assert (= (.slots-len result) 2))
+      (n-add-def! (g-stop) (n-new2 (Return) (load (index cp 0)) answer))
+      (g-analyze!)
+      (assert (= (g-verify) 0))
+      (assert (= (count-op OPTAG-NEW) 0)))
+    (al-free! [JslLoweredValue] (mut arguments))
+    (al-free! [i64] (mut leaves))))
+
+(deftest malformed_or_escaping_specification_records_are_refused_by_name
+         (refuses 91501
+           "(record Pair [(x dyn) (x dyn)])" JSL-ERR-BAD-RECORD-FIELD)
+         (refuses 91502
+           "(record Pair [(x dyn)])
+            (macro m :params [] :ret (record Pair) (record-new Pair []))"
+           JSL-ERR-BAD-RECORD-FIELD)
+         (refuses 91503
+           "(record Pair [(x dyn)])
+            (callable f :params [(p (record Pair))] :ret dyn 0)"
+           JSL-ERR-RECORD-ESCAPE)
+         (refuses 91504
+           "(record Pair [(x dyn)])
+            (macro m :params [] :ret (record Pair) (record-new Pair [(x 1)]))
+            (builtin f :params [] :ret dyn (%Add (m) 1))"
+           JSL-ERR-RECORD-ESCAPE))
+
+(const SRC-LOOP-SPEC-RECORD
+  "(record Counter [(value dyn) (mirror dyn)])
+   (macro Count :params [(limit dyn)] :ret (record Counter)
+     (loop [(i 0)
+            (state (record-new Counter [(value 0) (mirror 100)]) (record Counter))]
+       (if (%Lt i limit)
+           (recur (%Add i 1)
+                  (record-with
+                    (record-with state value (%Add (record-get state value) 1))
+                    mirror (%Sub (record-get state mirror) 1)))
+           state)))
+   (builtin count-value :params [(limit dyn)] :ret dyn
+     (record-get (Count limit) value))")
+
+(deftest loop_carried_specification_records_flatten_to_field_phis
+         (fresh! 91505)
+         (build! SRC-LOOP-SPEC-RECORD)
+         ;; One scalar loop binding plus the two fields of Counter. The record itself has no Phi
+         ;; and no allocation; only its independently evolving SSA fields cross the back edge.
+         (assert (= (count-op OPTAG-PHI) 3))
+         (assert (= (count-op OPTAG-NEW) 0)))
+
+(deftest recur_must_preserve_the_loop_bindings_record_schema
+         (refuses 91506
+           "(record A [(x dyn)]) (record B [(x dyn)])
+            (macro bad :params [] :ret (record A)
+              (loop [(state (record-new A [(x 0)]) (record A))]
+                (if true (recur (record-new B [(x 1)])) state)))"
+           JSL-ERR-BAD-RECORD))
+
+(deftest nested_specification_records_recursively_flatten_without_allocation
+         (fresh! 91507)
+         (build!
+           "(record Inner [(x dyn) (y dyn)])
+            (record Outer [(tag dyn) (inner (record Inner))])
+            (macro MakeOuter :params [(tag dyn) (x dyn) (y dyn)] :ret (record Outer)
+              (record-new Outer
+                [(tag tag) (inner (record-new Inner [(x x) (y y)]))]))
+            (builtin nested :params [(selector dyn) (a dyn) (b dyn)] :ret dyn
+              (record-get
+                (record-get
+                  (if (%Lt selector 0) (MakeOuter a a b) (MakeOuter b b a))
+                  inner)
+                x))")
+         ;; Outer has one scalar leaf plus Inner's two leaves.
+         (assert (= (count-op OPTAG-PHI) 3))
+         (assert (= (count-op OPTAG-NEW) 0)))
+
+(deftest lowered_record_values_own_explicit_canonical_slot_ranges
+         (fresh! 915070)
+         (assert (= (jsl-load!
+                      "(record Inner [(x dyn) (y bool)])
+                       (record Outer [(tag int) (inner (record Inner))])")
+                    JSL-OK))
+         (jl-reset!)
+         (let [x (iconst 11)
+               y (bconst true)
+               tag (iconst 7)
+               (mut inner-fields) (al-new [JslLoweredValue] (malloc-allocator))]
+           (al-push! [JslLoweredValue] (mut inner-fields)
+                     (jl-lowered-scalar! x (n-ty x)))
+           (al-push! [JslLoweredValue] (mut inner-fields)
+                     (jl-lowered-scalar! y (n-ty y)))
+           (let [inner (jl-lowered-record-value!
+                         0 (slice-data (al-slice [JslLoweredValue] (load inner-fields))))
+                 (mut outer-fields) (al-new [JslLoweredValue] (malloc-allocator))]
+             (al-push! [JslLoweredValue] (mut outer-fields)
+                       (jl-lowered-scalar! tag (n-ty tag)))
+             (al-push! [JslLoweredValue] (mut outer-fields) inner)
+             (let [outer (jl-lowered-record-value!
+                           1 (slice-data (al-slice [JslLoweredValue] (load outer-fields))))
+                   carrier (iconst 99)
+                   records (jl-lowered-record-list-value! 1 carrier)
+                   inner-view (jl-lowered-record-field outer 1)]
+               (assert (= (.kind inner) JLV-RECORD))
+               (assert (= (.kind outer) JLV-RECORD))
+               (assert (= (.kind records) JLV-RECORD-LIST))
+               (assert (= (.logical outer) 1))
+               (assert (= (.slots-len outer) 3))
+               (assert (= (.slots-len inner-view) 2))
+               (assert (= (jl-lowered-scalar-node
+                            (jl-lowered-record-field outer 0)) tag))
+               (let [boxed-x (jl-lowered-scalar-node
+                               (jl-lowered-record-field inner-view 0))]
+                 ;; Record construction establishes the schema's physical representation. `x`
+                 ;; is raw int input to a dyn field, so the retained leaf is its canonical box.
+                 (assert (op-is? boxed-x Box [_]))
+                 (assert (= (n-in boxed-x 1) x)))
+               (assert (= (jl-lowered-scalar-node
+                            (jl-lowered-record-field inner-view 1)) y))
+               (assert (= (jl-lowered-record-list-node records) carrier))
+               (let [scalar (jl-lowered-scalar! tag (t-int))]
+                 (assert (= (.kind scalar) JLV-SCALAR))
+                 (assert (= (jl-lowered-scalar-node scalar) tag)))
+               ;; Lexical bindings retain the descriptor itself; no node/aggregate numeric union
+               ;; exists at the expression or environment boundary.
+               (jl-bind-lowered! "record" outer)
+               (assert (= (.kind (.value (jl-bind-p 0))) JLV-RECORD))
+               (assert (= (.slots-len (.value (jl-bind-p 0))) 3))
+               (assert (= (count-op OPTAG-NEW) 0))
+               (al-free! [JslLoweredValue] (mut outer-fields))))
+           (al-free! [JslLoweredValue] (mut inner-fields))))
+
+(deftest record_layouts_are_cached_and_part_of_library_identity
+         (fresh! 915071)
+         (assert (= (jsl-load!
+                      "(record Inner [(x dyn) (enabled bool)])
+                       (record Outer [(tag int) (inner (record Inner))])
+                       (builtin use :params [(value (record Outer))] :ret dyn
+                         (record-get (record-get value inner) x))")
+                    JSL-OK))
+         (assert (= (jsl-record-flat-width 0) 2))
+         (assert (= (jsl-record-flat-width 1) 3))
+         (assert (= (jsl-record-field-flat-off 1 0) 0))
+         (assert (= (jsl-record-field-flat-width 1 0) 1))
+         (assert (= (jsl-record-field-flat-off 1 1) 1))
+         (assert (= (jsl-record-field-flat-width 1 1) 2))
+         (assert (= (jsl-record-flat-field-ty 1 0) (t-int)))
+         (assert (= (jsl-record-flat-field-ty 1 1) (t-dyn)))
+         (assert (= (jsl-record-flat-field-ty 1 2) (t-bool)))
+         (jl-reset!)
+         (let [first (jl-library-identity-unit)]
+           (fresh! 915072)
+           (assert (= (jsl-load!
+                        "(record Inner [(enabled bool) (x dyn)])
+                         (record Outer [(tag int) (inner (record Inner))])
+                         (builtin use :params [(value (record Outer))] :ret dyn
+                           (record-get (record-get value inner) x))")
+                      JSL-OK))
+           (jl-reset!)
+           (assert (!= first (jl-library-identity-unit))))
+         (refuses 915073 "(record Empty [])" JSL-ERR-BAD-RECORD)
+         (refuses 915074
+           "(record R0 [(x dyn)])
+            (record R1 [(a (record R0)) (b (record R0))])
+            (record R2 [(a (record R1)) (b (record R1))])
+            (record R3 [(a (record R2)) (b (record R2))])
+            (record R4 [(a (record R3)) (b (record R3))])
+            (record R5 [(a (record R4)) (b (record R4))])
+            (record R6 [(a (record R5)) (b (record R5))])
+            (record R7 [(a (record R6)) (b (record R6))])
+            (record R8 [(a (record R7)) (b (record R7))])
+            (record R9 [(a (record R8)) (b (record R8))])"
+           JSL-ERR-BAD-RECORD))
+
+(deftest dynamic_record_lists_are_explicit_typed_materialization_boundaries
+         (fresh! 91508)
+         (build!
+           "(record Inner [(x dyn) (y dyn)])
+            (record Outer [(tag dyn) (inner (record Inner))])
+            (macro MakeOuter :params [(tag dyn) (x dyn) (y dyn)] :ret (record Outer)
+              (record-new Outer
+                [(tag tag) (inner (record-new Inner [(x x) (y y)]))]))
+            (builtin retained :params [(index dyn) (a dyn) (b dyn)] :ret dyn
+              (let [(records (record-list-new Outer))
+                    (first (record-list-store records 0 (MakeOuter a a b)))
+                    (second (record-list-store first 1 (MakeOuter b b a)))
+                    (loaded (record-list-load second index))]
+                (%Add (record-get loaded tag)
+                  (%Add (record-get (record-get loaded inner) x)
+                        (record-get (record-get loaded inner) y)))))")
+         ;; Two three-leaf records are explicitly materialized and one is reconstructed. This is
+         ;; the only test in the record family that SHOULD allocate.
+         (assert (= (count-op OPTAG-NEW) 1))
+         (assert (= (count-op OPTAG-ARRAYSTORE) 6))
+         (assert (= (count-op OPTAG-ARRAYLOAD) 3)))
+
+(deftest loop_carried_record_lists_preserve_their_typed_capability
+         (fresh! 915081)
+         (build!
+           "(record Item [(value dyn)])
+            (builtin retained-through-loop :params [(input dyn)] :ret dyn
+              (loop [(i 0)
+                     (records (record-list-new Item))]
+                (if (%Lt i 1)
+                    (recur (%Add i 1)
+                           (record-list-store records i
+                             (record-new Item [(value input)])))
+                    (record-get (record-list-load records 0) value))))")
+         ;; The loop carries one scalar and one typed storage capability. Its runtime carrier is
+         ;; one physical Phi; the Record payload still materializes only at the explicit boundary.
+         (assert (= (count-op OPTAG-PHI) 2))
+         (assert (= (count-op OPTAG-NEW) 1))
+         (assert (= (count-op OPTAG-ARRAYSTORE) 1))
+         (assert (= (count-op OPTAG-ARRAYLOAD) 1)))
+
+(deftest record_list_carriers_and_schema_mismatches_cannot_escape_the_checker
+         (refuses 91509
+           "(record A [(x dyn)]) (record B [(x dyn)])
+            (builtin bad :params [] :ret dyn
+              (let [(records (record-list-new A))]
+                (record-list-store records 0 (record-new B [(x 1)]))))"
+           JSL-ERR-BAD-RECORD-LIST)
+         (refuses 91510
+           "(record A [(x dyn)])
+            (builtin bad :params [] :ret dyn (record-list-new A))"
+           JSL-ERR-RECORD-ESCAPE)
+         (refuses 91511
+           "(record A [(x dyn)])
+            (builtin bad :params [] :ret dyn
+              (let [(records (record-list-new A))] (%Box records)))"
+           JSL-ERR-RECORD-ESCAPE)
+         (refuses 91512
+           "(record A [(x dyn)]) (record B [(x dyn)])
+            (builtin bad :params [] :ret dyn
+              (loop [(i 0) (records (record-list-new A))]
+                (if (%Lt i 1)
+                    (recur (%Add i 1) (record-list-new B))
+                    0)))"
+           JSL-ERR-BAD-RECORD-LIST))
+
+(deftest internal_builtin_record_parameters_flatten_into_the_declared_call_abi
+         (fresh! 91512)
+         (build!
+           "(record Inner [(x dyn)])
+            (record Pair [(inner (record Inner)) (enabled bool)])
+            (builtin Consume :params [(pair (record Pair)) (fallback int)] :ret dyn
+              (if (record-get pair enabled)
+                  (record-get (record-get pair inner) x)
+                  fallback))
+            (builtin Entry :transitioning true
+              :params [(x dyn) (enabled bool) (fallback int)] :ret dyn
+              (Consume
+                (record-new Pair
+                  [(inner (record-new Inner [(x x)])) (enabled enabled)])
+                fallback))")
+         (let [consume (jsl-find "Consume") fun (jsl-decl-fun consume)]
+           (assert (jsl-signature-valid? consume))
+           (assert (= (jsl-decl-nparams consume) 2))
+           (assert (= (jsl-decl-lowered-nparams consume) 3))
+           (assert (= (jsl-decl-runtime-nparams consume) 3))
+           (assert (= (jsl-param-lowered-off consume 0) 0))
+           (assert (= (jsl-param-lowered-width consume 0) 2))
+           (assert (= (jsl-param-lowered-off consume 1) 2))
+           (assert (= (jsl-param-lowered-width consume 1) 1))
+           (assert (= (jsl-param-lowered-type consume 0 0) (t-dyn)))
+           (assert (= (jsl-param-lowered-type consume 0 1) (t-bool)))
+           (assert (= (jsl-param-lowered-type consume 1 0) (t-int)))
+           (assert (= (jsl-decl-lowered-param-type consume 0) (t-dyn)))
+           (assert (= (jsl-decl-lowered-param-type consume 1) (t-bool)))
+           (assert (= (jsl-decl-lowered-param-type consume 2) (t-int)))
+           (assert (= (n-fun-abi-param-count fun) 3))
+           (assert (= (n-fun-abi-param-type fun 0) (t-dyn)))
+           (assert (= (n-fun-abi-param-type fun 1) (t-bool)))
+           (assert (= (n-fun-abi-param-type fun 2) (t-int)))
+           ;; The retained signature is an invariant, not a cache that consumers may silently
+           ;; reinterpret. Deliberately damage one dimension and prove the validator catches the
+           ;; disagreement, then restore it so the rest of this witness uses valid state.
+           (let [signature (jsl-decl-signature consume)
+                 saved (.lowered-nparams signature)]
+             (set! (.lowered-nparams signature) (+ saved 1))
+             (assert (= (jsl-signature-valid? consume) false))
+             (set! (.lowered-nparams signature) saved)
+             (assert (jsl-signature-valid? consume)))
+           ;; A canonical dyn Record leaf crosses the flattened call unchanged. In particular, a
+           ;; dyn Parm must not acquire a second Box merely because the destination is also dyn.
+           (let [(mut node) 0 (mut calls) 0]
+             (loop (if (>= (load node) (n-count)) (break)
+                       (do
+                         (if (and (not (n-dead? (load node)))
+                                  (and (op-is? (load node) Call [_])
+                                       (= (n-in (load node) 1) fun)))
+                             (do
+                               (assert (not (op-is? (n-in (load node) 2) Box [_])))
+                               (set! calls (+ (load calls) 1)))
+                             0)
+                         (set! node (+ (load node) 1)))))
+             (assert (> (load calls) 0))))
+         (assert (= (count-op OPTAG-NEW) 0))
+         ;; Exercise the public logical-value boundary, not just the syntax-driven internal call.
+         ;; One Record descriptor plus one scalar descriptor must become the same three ABI slots.
+         (let [inner (jsl-record-find "Inner") pair (jsl-record-find "Pair")
+               (mut leaves) (al-new [i64] (malloc-allocator))
+               (mut arguments) (al-new [JslLoweredValue] (malloc-allocator))]
+           (al-push! [i64] (mut leaves) (n-box! (kconst (t-int-con 41))))
+           (al-push! [i64] (mut leaves) (kconst (t-bool-con true)))
+           (assert (= (jsl-record-flat-width inner) 1))
+           (al-push! [JslLoweredValue] (mut arguments)
+                     (jl-lowered-record-from-slots!
+                       pair (slice-data (al-slice [i64] (load leaves)))))
+           (al-push! [JslLoweredValue] (mut arguments)
+                     (jl-lowered-scalar! (kconst (t-int-con 7)) (t-int)))
+           (let [call (jsl-call-lowered-with-memory!
+                        (g-start) "Consume"
+                        (al-slice [JslLoweredValue] (load arguments)) NO-NODE)
+                 ret (n-new2 (Return) (call-end call) (call-value call))]
+             (n-add-def! (g-stop) ret)
+             (g-analyze!)
+             (assert (= (g-verify) 0))
+             (let [selected (ms-select!)]
+               (if (not selected)
+                   (do (ps (stderr) "record-parameter selection code=")
+                       (fmt (stderr) "{d}" (ms-result))
+                       (ps (stderr) " item=")
+                       (fmt (stderr) "{d}" (ms-result-item))
+                       (if (ms-result-item-is-machine?)
+                           (do
+                             (fmt (stderr) " op={d} owner={d} block={d} node={d} dst={d} a={d}"
+                               (ms-inst-op (ms-result-item))
+                               (ms-inst-owner (ms-result-item))
+                               (ms-inst-block (ms-result-item))
+                               (ms-inst-node (ms-result-item))
+                               (ms-inst-dst (ms-result-item))
+                               (ms-inst-a (ms-result-item)))
+                             0) 0)
+                       (ps (stderr) "\n")) 0)
+               (assert selected)))
+           (al-free! [JslLoweredValue] (mut arguments))
+           (al-free! [i64] (mut leaves))))
+
+(deftest internal_builtin_record_results_use_the_generic_multi_result_call_model
+  (fresh! 91513)
+  (build!
+    "(record Inner [(x int)])
+     (record Pair [(inner (record Inner)) (y int)])
+     (builtin MakePair :params [(x int) (y int)] :ret (record Pair)
+       (record-new Pair [(inner (record-new Inner [(x x)])) (y y)]))
+     (builtin SumPair :transitioning true :params [(x int) (y int)] :ret int
+       (let [(pair (MakePair x y))]
+         (%Add (record-get (record-get pair inner) x) (record-get pair y))))")
+  (let [(mut arguments) (al-new [JslLoweredValue] (malloc-allocator))]
+    (al-push! [JslLoweredValue] (mut arguments)
+              (jl-lowered-scalar! (kconst (t-int-con 20)) (t-int)))
+    (al-push! [JslLoweredValue] (mut arguments)
+              (jl-lowered-scalar! (kconst (t-int-con 22)) (t-int)))
+    (let [call (jsl-call-lowered-with-memory!
+                 (g-start) "SumPair"
+                 (al-slice [JslLoweredValue] (load arguments)) NO-NODE)]
+      (n-add-def! (g-stop) (n-new2 (Return) (call-end call) (call-value call))))
+    (al-free! [JslLoweredValue] (mut arguments)))
+  (let [make (jsl-find "MakePair") fun (jsl-decl-fun make)]
+    (assert (>= (jsl-decl-ret-record make) 0))
+    (assert (= (jsl-decl-lowered-nresults make) 2))
+    (assert (= (jsl-decl-lowered-result-type make 0) (t-int)))
+    (assert (= (jsl-decl-lowered-result-type make 1) (t-int)))
+    (assert (= (n-fun-abi-result-count fun) 2))
+    (assert (= (n-fun-abi-result-type fun 0) (t-int)))
+    (assert (= (n-fun-abi-result-type fun 1) (t-int))))
+    ;; Two MakePair leaves plus the uniform scalar projection of SumPair itself.
+    (assert (= (count-op OPTAG-PROJ) 3))
+  (assert (= (count-op OPTAG-NEW) 0))
+  (g-analyze!)
+  (assert (= (g-verify) 0))
+  (let [selected (be-select-machine-program!)]
+    (if selected 0
+        (do (ms-dump (stderr))
+            (fmt (stderr) "multi-result selection failed ms={d}/{d} mu={d}/{d}\n"
+                 (ms-result) (ms-result-item) (mu-verify-result) (mu-verify-item)) 0))
+    (assert selected))
+  (let [(mut at) 0 (mut results) 0 (mut slots) 0 (mut multi-ret) false]
+    (loop (if (>= (load at) (be-inst-count)) (break)
+              (do
+                (if (= (ms-inst-op (load at)) MI-CALL-RESULT)
+                    (do (set! results (+ (load results) 1))
+                        (set! slots (| (load slots) (<< 1 (ms-inst-imm (load at)))))) 0)
+                (if (and (= (ms-inst-op (load at)) MI-RET)
+                         (= (ms-inst-imm (load at)) 2))
+                    (do (assert (= (ms-inst-arg-count (load at)) 1))
+                        (set! multi-ret true)) 0)
+                (set! at (+ (load at) 1)))))
+    ;; Two MakePair slots and the uniform scalar SumPair snapshot.
+    (assert (= (load results) 3))
+    (assert (= (load slots) 3))
+    (assert (load multi-ret)))
+  (let [scheduled (be-schedule!)]
+    (if (>= scheduled 0) 0
+        (do (fmt (stderr) "multi-result scheduling failed {d}/{d}\n"
+                 (ms-schedule-result) (ms-schedule-item)) 0))
+    (assert (>= scheduled 0)))
+  (assert (>= (be-color! 8) 0))
+  ;; Descriptor rows are keyed, not positional prose. Pin both neighboring entries so adding a
+  ;; new opcode cannot silently turn every ABI ingress copy into an effect and cycle scheduling.
+  (assert (= (mi-desc-effects (mi-desc MI-ABI-COPY)) 0))
+  (assert (mi-desc-pinned? (mi-desc MI-ABI-COPY)))
+  (assert (= (mi-desc-effects (mi-desc MI-CALL-RESULT)) 1))
+  (assert (mi-desc-pinned? (mi-desc MI-CALL-RESULT)))
+  (assert (mi-desc-encodable? (mi-desc MI-CALL-RESULT)))
+  ;; Boxing only tags an existing word. It is unlike checked unboxing: it cannot trap and must be
+  ;; free to dominate sibling uses of a shared constant rather than pinning itself to first demand.
+  (assert (= (mi-desc-effects (mi-desc MI-JSBOX)) 0))
+  (assert (not (mi-desc-pinned? (mi-desc MI-JSBOX))))
+  (assert (= (mi-desc-effects (mi-desc MI-JSUNBOX)) 1))
+  (assert (mi-desc-pinned? (mi-desc MI-JSUNBOX)))
+  (assert (= (mi-desc-inputs (mi-desc MI-RESULT-MATERIALIZE)) 1))
+  (assert (= (mi-desc-effects (mi-desc MI-RESULT-MATERIALIZE)) 1))
+  (assert (mi-desc-pinned? (mi-desc MI-RESULT-MATERIALIZE)))
+  (if (!= (be-result) BER-OK)
+      (do (fmt (stderr) "before multi-result encoding be={d}/{d}\n"
+               (be-result) (be-result-node)) 0) 0)
+  (let [encoded (be-encode-checked!)]
+    (if encoded 0
+        (do (ms-dump (stderr))
+            (let [(mut bad-at) 0]
+              (loop (if (>= (load bad-at) (be-inst-count)) (break)
+                        (do
+                          (if (not (mi-desc-encodable?
+                                     (mi-desc (ms-inst-op (load bad-at)))))
+                              (do (fmt (stderr) "unencodable at={d} op={d} node={d}\n"
+                                       (load bad-at) (ms-inst-op (load bad-at))
+                                       (ms-inst-node (load bad-at))) 0) 0)
+                          (set! bad-at (+ (load bad-at) 1))))))
+            (fmt (stderr) "multi-result encoding failed be={d}/{d}\n"
+                 (be-result) (be-result-node)) 0))
+    (assert encoded))
+  ;; The compiler's internal multi-result ABI is target-neutral: result color i maps to xi/di on
+  ;; AArch64 and the corresponding private compiler-ABI register on x86-64. Keep both encoders as
+  ;; bounded witnesses even though only the host encoder can be executed in this process.
+  (assert (be-x64-encode-checked!)))
+
+(deftest public_lowered_call_returns_one_canonical_record_descriptor
+  (fresh! 915131)
+  (build!
+    "(record Pair [(x int) (y int)])
+     (builtin MakePair :params [(x int) (y int)] :ret (record Pair)
+       (record-new Pair [(x x) (y y)]))")
+  (let [pair (jsl-record-find "Pair")
+        (mut arguments) (al-new [JslLoweredValue] (malloc-allocator))]
+    (al-push! [JslLoweredValue] (mut arguments)
+              (jl-lowered-scalar! (kconst (t-int-con 20)) (t-int)))
+    (al-push! [JslLoweredValue] (mut arguments)
+              (jl-lowered-scalar! (kconst (t-int-con 22)) (t-int)))
+    (let [lowered-call
+            (jsl-call-lowered-value-with-memory!
+              (g-start) "MakePair"
+              (al-slice [JslLoweredValue] (load arguments)) NO-NODE)
+          site (.site lowered-call)
+          result (.result lowered-call)
+          sum (n-peephole
+                (n-new3 (Add) NO-NODE
+                        (jl-lowered-slot result 0) (jl-lowered-slot result 1)))]
+      (assert (= (.kind result) JLV-RECORD))
+      (assert (= (.logical result) pair))
+      (assert (= (.slots-len result) 2))
+      (n-add-def! (g-stop) (n-new2 (Return) (call-end site) sum))
+      (g-analyze!)
+      (assert (= (g-verify) 0))
+      (assert (= (count-op OPTAG-PROJ) 2))
+      (assert (= (count-op OPTAG-NEW) 0)))
+    (al-free! [JslLoweredValue] (mut arguments))))
+
+(deftest multi_result_calls_keep_memory_outside_the_result_vector
+  (fresh! 91514)
+  (build!
+    "(record Lengths [(first int) (second int)])
+     (builtin ReadLengths :params [(array dyn)] :ret (record Lengths)
+       (let [(first (%ArrayLen array)) (second (%ArrayLen array))]
+         (record-new Lengths [(first first) (second second)])))
+     (builtin AddLengths :transitioning true :params [(array dyn)] :ret int
+       (let [(lengths (ReadLengths array))]
+         (%Add (record-get lengths first) (record-get lengths second))))")
+  (g-analyze!)
+  (let [decl (jsl-find "ReadLengths") fun (jsl-decl-fun decl)
+        (mut normal) NO-NODE (mut input) 1]
+    (assert (jsl-decl-uses-memory? decl))
+    (assert (= (n-fun-abi-result-count fun) 2))
+    (loop (if (>= (load input) (n-nins fun)) (break)
+              (do (if (and (op-is? (n-in fun (load input)) Return [])
+                           (not (be-exception-return? (n-in fun (load input)))))
+                      (set! normal (n-in fun (load input))) 0)
+                  (set! input (+ (load input) 1)))))
+    (assert (!= (load normal) NO-NODE))
+    ;; control + two logical result leaves + one independently typed memory result.
+    (assert (= (n-nins (load normal)) 4))
+    (assert (ty-mem? (n-ty (n-in (load normal) 3)))))
+  (assert (= (count-op OPTAG-PROJ) 2))
+  (assert (= (g-verify) 0)))
+
+(deftest abrupt_multi_result_returns_publish_abi_shaped_poison_slots
+  (fresh! 91515)
+  (build!
+    "(record Pair [(x int) (y int)])
+     (builtin MaybePair :params [(fail bool) (error dyn) (x int) (y int)]
+       :ret (record Pair)
+       (if fail (%Throw error) (record-new Pair [(x x) (y y)])))
+     (builtin SumMaybePair :transitioning true
+       :params [(fail bool) (error dyn) (x int) (y int)] :ret int
+       (let [(pair (MaybePair fail error x y))]
+         (%Add (record-get pair x) (record-get pair y))))")
+  (g-analyze!)
+  (let [decl (jsl-find "MaybePair") fun (jsl-decl-fun decl)
+        (mut normal) 0 (mut abrupt) 0 (mut input) 1]
+    (assert (jsl-decl-can-throw? decl))
+    (assert (n-fun-abi-can-throw? fun))
+    (assert (= (n-fun-abi-result-count fun) 2))
+    (loop (if (>= (load input) (n-nins fun)) (break)
+              (let [ret (n-in fun (load input))]
+                (if (be-exception-return? ret)
+                    (do
+                      (set! abrupt (+ (load abrupt) 1))
+                      ;; Pending transport returns through the native ABI rather than unwinding.
+                      ;; Slot zero is the marker and every remaining declared slot is a physical,
+                      ;; representation-correct poison value; none is a normal Call projection.
+                      (assert (or (= (n-nins ret) 3) (= (n-nins ret) 4)))
+                      (assert (not (op-is? (n-in ret 1) Proj [_])))
+                      (assert (not (op-is? (n-in ret 2) Proj [_])))
+                      (assert (ty-int-only? (n-ty (n-in ret 2))))
+                      (if (= (n-nins ret) 4)
+                          (assert (ty-mem? (n-ty (n-in ret 3)))) 0))
+                    (do
+                      (set! normal (+ (load normal) 1))
+                      (assert (= (n-nins ret) 3))))
+                (set! input (+ (load input) 1)))))
+    (assert (= (load normal) 1))
+  (assert (= (load abrupt) 1)))
+  (assert (= (count-op OPTAG-PROJ) 2))
+  (assert (= (g-verify) 0)))
 
 ;; `useTwice` is NOT declared `:transitioning`, and that is the assertion. A macro is expanded into
 ;; the caller's graph, so if `Twice` had lowered to a call instead the transition check would see an
@@ -608,10 +1452,10 @@
 
 (deftest every_failure_code_has_a_distinct_name
          (let [(mut c) 0 (mut named) 0]
-           (loop (if (> (load c) JSL-ERR-UNEXPECTED-OTHERWISE) (break)
+           (loop (if (> (load c) JSL-ERR-BAD-RECORD-LIST) (break)
                    (do
                      (assert (not (= (jsl-err-name (load c)) "<unknown jsl code>")))
                      (store! named (+ (load named) 1))
                      (store! c (+ (load c) 1))
                      0)))
-           (assert (= (load named) (+ JSL-ERR-UNEXPECTED-OTHERWISE 1)))))
+           (assert (= (load named) (+ JSL-ERR-BAD-RECORD-LIST 1)))))

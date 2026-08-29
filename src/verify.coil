@@ -303,6 +303,36 @@
 ; ============================================================================
 ; Arity
 ; ============================================================================
+(defn v-return-owner-fun [(ret i64)] (-> i64)
+  (let [(mut node) 0 (mut found) NO-NODE]
+    (loop (if (or (>= (load node) (n-count)) (!= (load found) NO-NODE)) (break)
+              (do (if (and (not (n-dead? (load node))) (op-is? (load node) Fun [_]))
+                      (let [(mut input) 1]
+                        (loop (if (or (>= (load input) (n-nins (load node)))
+                                      (!= (load found) NO-NODE))
+                                  (break)
+                                  (do (if (= (n-in (load node) (load input)) ret)
+                                          (set! found (load node)) 0)
+                                      (set! input (+ (load input) 1)))))) 0)
+                  (set! node (+ (load node) 1)))))
+    (load found)))
+
+(const V-EXCEPTION-RETURN-DESCRIPTOR i64 104)
+(defn v-exception-return? [(ret i64)] (-> bool)
+  ;; Slot zero carries the pending-exception marker. Wide functions still carry their complete
+  ;; physical result vector after it: pending transport returns through the native ABI rather than
+  ;; unwinding, so every Return must have the declaration's exact machine shape.
+  (and (and (op-is? ret Return []) (>= (n-nins ret) 2))
+       (match (n-op (n-in ret 1))
+         (JsBuiltin [descriptor] (= descriptor V-EXCEPTION-RETURN-DESCRIPTOR))
+         (_ false))))
+
+(defn v-return-result-count [(ret i64)] (-> i64)
+  (let [fun (v-return-owner-fun ret)]
+    (if (and (!= fun NO-NODE) (n-fun-abi-declared? fun))
+        (n-fun-abi-result-count fun)
+        1)))
+
 ;; The per-op input contract. `Stop` is the only genuinely variable one (it collects Returns and
 ;; may end up with none), and `Region`/`Phi` are variable above a floor because a merge's path
 ;; count is the program's, not the op's.
@@ -315,12 +345,15 @@
       (Start [] (v-need (= k 0) VERR-ARITY n))
       (XCtrl [] (v-need (= k 0) VERR-ARITY n))
       (Stop [] 0)
-      (Return [] (v-need (or (= k 2) (= k 3)) VERR-ARITY n))
+      (Return [] (let [base (+ 1 (v-return-result-count n))]
+                   (v-need (or (= k base) (= k (+ base 1))) VERR-ARITY n)))
       (If [] (v-need (= k 2) VERR-ARITY n))
       (Region [] (v-need (>= k 2) VERR-ARITY n))
       (Loop [] (v-need (= k 3) VERR-ARITY n))
       (CProj [slot] (v-need (= k 1) VERR-ARITY n))
-      (Proj [slot] (v-need (= k 1) VERR-ARITY n))
+      ;; Allocation projections have one data input. Call-result projections additionally name
+      ;; the proven-normal control under which the raw result may become a logical value.
+      (Proj [slot] (v-need (or (= k 1) (= k 2)) VERR-ARITY n))
       (Const [ty] (v-need (= k 1) VERR-ARITY n))
       (Arg [ty] (v-need (= k 1) VERR-ARITY n))
       (Phi [declared] (v-need (>= k 2) VERR-ARITY n))
@@ -452,6 +485,11 @@
   (match (n-op n)
     (If [] 2)
     (Return [] (n-nins n))
+    (Call [abi]
+      (let [fun (if (> (n-nins n) 1) (v-direct-callee-fun (n-in n 1)) NO-NODE)]
+        (if (and (!= fun NO-NODE) (n-fun-abi-declared? fun))
+            (n-fun-abi-result-count fun)
+            1)))
     (New [shape]
         (if (shape-defined? shape)
             (+ 1 (shape-field-count shape))
@@ -496,7 +534,7 @@
   (match (n-op d)
     (Proj [slot]
       (and (>= (n-nins d) 1)
-           (let [parent (n-in d 0)]
+           (let [parent (n-proj-source d)]
              (and (!= parent NO-NODE)
                   (match (n-op parent) (New [shape] (>= slot 1)) (_ false))))))
     (Store [alias] true)
@@ -613,11 +651,26 @@
 ;; has to exist. `aux` is the slot index, and an out-of-range one would have `proj-compute`
 ;; reporting ALL, which reads as "anything at all" rather than as the error it is.
 (defn v-check-proj [(n i64)] (-> i64)
-  (let [m (if (>= (n-nins n) 1) (n-in n 0) NO-NODE)
+  (let [m (if (>= (n-nins n) 1)
+              (if (and (op-is? n Proj [_]) (= (n-nins n) 2))
+                  (n-in n 1) (n-in n 0))
+              NO-NODE)
         idx (match (n-op n) (CProj [slot] slot) (Proj [slot] slot) (_ -1))]
-    (if (or (= m NO-NODE) (not (op-multi? (n-op m))))
-        (v-fail! VERR-PROJ-SLOT n)
-        (v-need (and (>= idx 0) (< idx (v-multi-arity m))) VERR-PROJ-SLOT n))))
+    (if (and (op-is? n Proj [_]) (= (n-nins n) 2))
+        (do
+          (v-need-ctrl n 0)
+          (v-need (v-call-node? m) VERR-DATA-SLOT n))
+        0)
+    (if (and (op-is? n Proj [_])
+             (and (= (n-nins n) 2) (v-call-node? m)))
+        (let [fun (infer-direct-callee-fun m)]
+          (v-need (if (and (!= fun NO-NODE) (n-fun-abi-declared? fun))
+                      (and (>= idx 0) (< idx (n-fun-abi-result-count fun)))
+                      (= idx 0))
+                  VERR-PROJ-SLOT n))
+        (if (or (= m NO-NODE) (not (op-multi? (n-op m))))
+            (v-fail! VERR-PROJ-SLOT n)
+            (v-need (and (>= idx 0) (< idx (v-multi-arity m))) VERR-PROJ-SLOT n)))))
 
 ;; Stop collects Returns and nothing else. Anything else in there means some rewrite pointed the
 ;; program's exit at a node that does not end a path.
@@ -655,8 +708,11 @@
     (Stop [] (v-check-stop n))
     (Return [] (do
             (v-need-ctrl n 0)
-            (v-need-value n 1)
-            (if (>= (n-nins n) 3) (v-need-mem n 2) 0)
+            (let [results (v-return-result-count n) (mut result) 0]
+              (loop (if (>= (load result) results) (break)
+                        (do (v-need-value n (+ 1 (load result)))
+                            (set! result (+ (load result) 1)))))
+              (if (= (n-nins n) (+ 2 results)) (v-need-mem n (+ 1 results)) 0))
             0))
     (If [] (do (v-need-ctrl n 0) (v-need-value n 1) 0))
     (Region [] (v-check-merge n))
@@ -971,31 +1027,15 @@
                     n)
             (if (or (= abi CALL-ABI-RECEIVER) (= abi CALL-ABI-DYNAMIC-RECEIVER))
                 (do
-                  ;; Input 2 is the hidden closure environment, input 3 the receiver: every
-                  ;; callable reserves exactly one environment slot, which is what lets generic
-                  ;; dispatch use one descriptor. Explicit capture-prefix aux forms above
-                  ;; DYNAMIC are hand-built positional graphs (tests) and are judged by the
-                  ;; arity relation alone.
+                  ;; Input 2 is the hidden closure environment and input 3 is the receiver. Strict
+                  ;; calls preserve primitive receivers and sloppy calls perform
+                  ;; OrdinaryCallBindThis later, so a semantic object-kind restriction is wrong.
+                  ;; `v-rep-slot-required` enforces the actual representation contract below:
+                  ;; tagged for a general ECMAScript value, with raw pointers admitted only for
+                  ;; exact Object specialization.
                   (let [receiver-slot 3]
-                  (v-need (> (n-nins n) receiver-slot) VERR-CALL-RECEIVER n)
-                  (if (> (n-nins n) receiver-slot)
-                      (let [receiver-type (n-ty (n-in n receiver-slot))]
-                        (if (ty-high? receiver-type)
-                            0
-                            ;; A STRING IS A LEGITIMATE RECEIVER. `"abc".charCodeAt(0)` through a
-                            ;; dynamic dispatch already works -- the runtime finds the method on a
-                            ;; string-tagged word -- and it only reached this check once `s[i]`
-                            ;; started answering `str|undefined` instead of `dyn`, at which point a
-                            ;; program as ordinary as `s[i].charCodeAt(0)` in a loop was refused.
-                            ;; `dyn` was accepted the whole time and includes VK-STR; what was
-                            ;; missing is that a NARROWER type must not lose the capability.
-                            (v-need (or (= (ty-kinds receiver-type) VK-UNDEF)
-                                        (or (!= (& (ty-kinds receiver-type) VK-OBJ) 0)
-                                            (or (!= (& (ty-kinds receiver-type) VK-FUN) 0)
-                                                (!= (& (ty-kinds receiver-type) VK-STR) 0))))
-                                    VERR-CALL-RECEIVER-TAG
-                                    n)))
-                      0)))
+                    (v-need (> (n-nins n) receiver-slot) VERR-CALL-RECEIVER n))
+                  0)
                 0)
             (v-need (!= (& (ty-kinds (n-ty callee)) VK-FUN) 0) VERR-CALL-TAG n)
             (let [direct (v-direct-callee-fun callee)
@@ -1142,9 +1182,19 @@
     (PropStoreKey [operation]
       (if (= slot 4) (if (= operation 15) REP-RAW-NUM REP-TAGGED) REP-UNKNOWN))
     (Call [abi]
-      (if (and (= slot 2)
-               (or (= abi CALL-ABI-RECEIVER) (= abi CALL-ABI-DYNAMIC-RECEIVER)))
-          REP-TAGGED REP-UNKNOWN))
+      (if (and (or (= abi CALL-ABI-RECEIVER) (= abi CALL-ABI-DYNAMIC-RECEIVER))
+               (or (= slot 2) (= slot 3)))
+          (if (= slot 2)
+              REP-TAGGED
+              ;; Exact calls may specialize an Object receiver to its raw shaped pointer; strict
+              ;; primitive receivers cannot use that representation and must remain tagged until
+              ;; OrdinaryCallBindThis. Express that two-member receiver contract here: a proven
+              ;; raw pointer is accepted as such, while every other known representation is
+              ;; required to be tagged. In particular, a raw machine Number still fails.
+              (if (= (n-rep-of (n-in n slot) 8) REP-RAW-PTR)
+                  REP-RAW-PTR
+                  REP-TAGGED))
+          REP-UNKNOWN))
           ;; Numeric arithmetic and bitwise ops consume MACHINE NUMBERS. A tagged word in one of
           ;; these slots makes the op compute on the NaN-box bits themselves — unary minus on an
           ;; ArrayLoad negated the box bits and zeroed the cell (repros/negload.js). The frontend's

@@ -238,6 +238,8 @@
              (assert (= (count-mi MI-JMP) 4))
              (assert (= (count-mi MI-RET) 1))
              (let [buf (primitive/alloc-stack (array i8 4096))]
+               ;; Bool-only graph values are already normalized machine predicates. The exact
+               ;; dump pins the typed path: no dynamic truthiness helper may be inserted.
                (assert (= (ms-render (cast (ptr i8) buf) 4096)
                           "function 0\n  b0: ARG ABI-COPY ARG ABI-COPY CBR\n  b1: JMP\n  b2: CBR\n  b3: JMP\n  b4: JMP\n  b5: JMP\n  b6: MOVI RET\n")))
              (assert-owned-instructions))))
@@ -291,6 +293,43 @@
          (assert (< (find-mi MI-STORE) (find-mi MI-LOAD)))
          (assert (< (find-mi MI-LOAD) (find-mi MI-RET)))
          (assert-owned-instructions))
+
+(deftest effect_ordering_accepts_a_dominating_data_phi
+         (graph-reset! 2091)
+         (shape-reset!)
+         (let [pred (n-new1 (Arg (t-bool)) (g-start))
+               arms (n-if-arms! (n-peephole (n-new2 (If) (g-start) pred)))
+               region (n-new (Region))]
+           (n-add-def! region NO-NODE)
+           (n-add-def! region (arms-t arms))
+           (n-add-def! region (arms-f arms))
+           (let [ordering (n-new (Phi (t-int)))]
+             (n-add-def! ordering region)
+             (n-add-def! ordering (sel-const 1))
+             (n-add-def! ordering (sel-const 2))
+             (let [memory (n-new1 (Arg (t-mem-alias JS-PROPERTY-ALIAS (t-undef))) (g-start))
+                   effect (n-effect! region memory ordering)
+                   object (n-new1 (Arg (t-obj)) region)
+                   loaded (n-prop-load-at! region effect object "value")
+                   ret (n-new2 (Return) region loaded)]
+               (n-add-def! (g-stop) ret)
+               (g-analyze!)
+               (assert (= (g-verify) 0))
+               (assert (ms-select!))
+               (assert (= (ms-result) MSEL-OK))
+               (let [load-at (find-mi MI-JSPROP)
+                     (mut dependency) 0
+                     (mut phis) 0]
+                 (assert (>= load-at 0))
+                 (loop (if (>= (load dependency) (ms-inst-memory-dep-count load-at))
+                           (break)
+                           (do
+                             (if (op-is? (ms-inst-memory-dep-node load-at (load dependency))
+                                         Phi [_])
+                                 (set! phis (+ (load phis) 1))
+                                 0)
+                             (set! dependency (+ (load dependency) 1)))))
+                 (assert (= (load phis) 1)))))))
 
 (deftest branch_pinned_allocation_and_memory_stay_in_the_taken_arm_block
          (graph-reset! 210)

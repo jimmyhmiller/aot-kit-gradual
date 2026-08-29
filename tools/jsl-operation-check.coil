@@ -1,0 +1,103 @@
+;; Lower exactly one JSL declaration and its transitive JSL callees, then verify the resulting
+;; graph. This is Level 1 of the ECMA-262 workbench: it does not run the entire library or Test262.
+(module jsloperationcheck)
+
+(import "coil.primitive" :as primitive)
+(import "coil.args" :use *)
+(import "coil.io" :use *)
+(import "coil.fmt" :use *)
+(import "coil.slice" :use *)
+(import "coil.alloc" :use * :as alloc)
+(import "coil.arraylist" :use *)
+(import "node" :use *)
+(import "ty" :use *)
+(import "shape" :use *)
+(import "jsstring" :use *)
+(import "jsl" :use *)
+(import "jsl_lower" :use *)
+(import "verify" :use *)
+
+(defn fail [(message (slice u8))] (-> i64)
+  (fmt (stderr) "jsl-operation-check: {s}\n" message)
+  2)
+
+(defn fail-jsl [(code i64)] (-> i64)
+  (let [source (jsl-err-src)]
+    (if (>= source 0)
+        (fmt (stderr) "jsl-operation-check: {s} at {s}:{d}-{d} ({s})\n"
+             (jsl-err-name code) (jsl-source-path source)
+             (jsl-err-lo) (jsl-err-hi) (jsl-where))
+        (fmt (stderr) "jsl-operation-check: {s} ({s})\n"
+             (jsl-err-name code) (jsl-where)))
+    2))
+
+(defn check-macro [(d i64) (name (slice u8))] (-> i64)
+  (block :done
+  (let [required (jsl-require-body-only! name)
+        fun (n-fun-open-identity! 1 FUN-IDENTITY-SOURCE 0 0)
+        entry (n-fun-entry fun)
+        ctrl (primitive/alloc-stack (array i64 1))
+        mem (primitive/alloc-stack (array i64 1))
+        argv (primitive/alloc-stack (array i64 10))
+        cp (cast (ptr i64) ctrl)
+        mp (cast (ptr i64) mem)
+        ap (cast (ptr i64) argv)
+        declared (jsl-decl-nparams d)
+        n (- declared (if (jsl-decl-rest? d) 1 0))
+        (mut types) (al-new [i64] (malloc-allocator))
+        (mut i) 0]
+    (if (!= required JSL-OK) (return-from :done required) 0)
+    ;; Give the synthetic source caller the real JavaScript-call ABI so callback-bearing macros
+    ;; see one valid closed-world target instead of a structurally incomplete fake function.
+    (al-push! [i64] (mut types) (t-dyn))
+    (al-push! [i64] (mut types) (t-dyn))
+    (al-push! [i64] (mut types) (t-int))
+    (loop (if (>= (load i) n) (break)
+            (do (al-push! [i64] (mut types) (jsl-param-ty d (load i)))
+                (set! i (+ (load i) 1)))))
+    (n-fun-declare-abi! fun (al-slice [i64] (load types)) (jsl-decl-ret d))
+    (al-free! [i64] (mut types))
+    (n-parm! fun 0) (n-parm! fun 1) (n-parm! fun 2)
+    (set! i 0)
+    (store! (index cp 0) entry)
+    (store! (index mp 0)
+            (if (jsl-decl-uses-memory? d)
+                (n-new1 (Arg (t-mem-alias JS-PROPERTY-ALIAS (t-dyn))) entry)
+                NO-NODE))
+    (loop (if (>= (load i) n) (break)
+            (do (store! (index ap (load i)) (n-parm! fun (+ (load i) 3)))
+                (set! i (+ (load i) 1)))))
+    (let [value (jsl-inline! cp mp entry name (slice-new [i64] ap n))
+          ret (if (jsl-decl-uses-memory? d)
+                  (n-new3 (Return) (load (index cp 0)) value (load (index mp 0)))
+                  (n-new2 (Return) (load (index cp 0)) value))]
+      (n-fun-close! fun ret)
+      JSL-OK))))
+
+(defn main [(argc i32) (argv (ptr (ptr i8)))] (-> i64)
+  (args-set! argc argv)
+  (if (!= (args-count) 2) (fail "usage: jsl-operation-check OPERATION")
+    (let [name (args-nth 1)]
+      (graph-reset! 26201)
+      (shape-reset!)
+      (jss-reset!)
+      (jsl-reset!)
+      ;; Function one is the synthetic workbench caller; keep JSL identities disjoint.
+      (jsl-set-fidx-base! 2)
+      (jl-reset!)
+      (let [loaded (jsl-load-index! "lib/index")]
+        (if (!= loaded JSL-OK) (fail-jsl loaded)
+          (let [d (jsl-find name)]
+            (if (< d 0) (fail "unknown JSL declaration")
+              (let [lowered (if (jsl-macro? d) (check-macro d name) (jsl-require! name))]
+                (if (!= lowered JSL-OK) (fail (jsl-err-name lowered))
+                  (do
+                    (g-analyze!)
+                    (let [verified (g-verify)]
+                      (if (!= verified 0) (fail "graph verification failed")
+                        (do
+                          (fmt (stdout)
+                               "operation={s} kind={s} nodes={d} live={d} status=verified\n"
+                               name (if (jsl-macro? d) "macro" "callable")
+                               (n-count) (g-live-count))
+                          0)))))))))))))

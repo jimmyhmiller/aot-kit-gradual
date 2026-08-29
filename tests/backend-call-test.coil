@@ -4,17 +4,26 @@
 (import "ty" :use *)
 (import "node" :use *)
 (import "backend_core" :use *)
+(import "backend_cfg" :use *)
 (import "backend_select" :use *)
 (import "backend_schedule" :use *)
 (import "backend_allocate" :use *)
 (import "backend_aarch64" :use *)
+(import "backend_x64" :use *)
+(import "backend_function_text" :use *)
+(import "backend_macho" :use *)
 (import "native_code_test_support" :use *)
+(import "nativeharness" :use *)
 (import "verify" :use *)
 (import "shape" :use *)
 (import "jsvalue" :use *)
+(import "jsstring" :use *)
+(import "jsl" :use *)
+(import "jsl_lower" :use *)
 (import "coil.assert" :use *)
 (import "coil.alloc" :use * :as alloc)
 (import "coil.slice" :use *)
+(import "coil.arraylist" :use *)
 (import "coil.primitive" :as primitive)
 (import "coil.io" :use *)
 (import "coil.fmt" :use *)
@@ -23,9 +32,13 @@
 (extern mprotect :cc c [(ptr u8) i64 i32] (-> i32))
 (extern munmap :cc c [(ptr u8) i64] (-> i32))
 (extern sys_icache_invalidate :cc c [(ptr u8) i64] (-> void))
+(extern malloc :cc c [i64] (-> (ptr u8)))
+(extern free :cc c [(ptr u8)] (-> void))
 
 (defn cc [(v i64)] (-> i64)
   (n-new1 (Const (t-int-con v)) (g-start)))
+(defn cf [(v f64)] (-> i64)
+  (n-new1 (Const (t-flt-con v)) (g-start)))
 (defn cb [(op Op) (a i64) (b i64)] (-> i64)
   (n-new3 op NO-NODE a b))
 
@@ -123,8 +136,8 @@
       ;; A top-level graph is represented by a machine function whose ideal node is NO-NODE.
       ;; Return-representation discovery must skip that pseudo-function while inspecting callees.
       (assert (be-select-machine-program!))
-      (assert (= (be-call-return-kind (call-value site)) MLK-SCALAR))
-      (assert (= (be-call-return-tag (call-value site)) JSV-INTEGER)))))
+      (assert (= (be-call-return-kind (call-node site)) MLK-SCALAR))
+      (assert (= (be-call-return-tag (call-node site)) JSV-INTEGER)))))
 
 (deftest call_return_discovery_does_not_alias_function_indices_above_the_target_mask
   (graph-reset! 421)
@@ -142,9 +155,9 @@
       (g-analyze!)
       ;; Shifting by 64 must not make fidx 64 look like fidx 0 in the i64 target mask.
       (assert (be-select-machine-program!))
-      (assert (= (be-call-return-kind (call-value decoy-site)) MLK-BOXED))
-      (assert (= (be-call-return-kind (call-value site)) MLK-SCALAR))
-      (assert (= (be-call-return-tag (call-value site)) JSV-INTEGER)))))
+      (assert (= (be-call-return-kind (call-node decoy-site)) MLK-BOXED))
+      (assert (= (be-call-return-kind (call-node site)) MLK-SCALAR))
+      (assert (= (be-call-return-tag (call-node site)) JSV-INTEGER)))))
 
 (deftest a_dead_middle_parameter_does_not_compact_the_native_argument_abi
   (graph-reset! 422)
@@ -163,6 +176,86 @@
         (assert (= (g-verify) 0))
         (compile-machine!)
         (assert (= (native0) 33))))))
+
+(deftest a_declared_call_abi_is_not_rewritten_by_the_source_register_class
+  (graph-reset! 424)
+  (let [callee (n-fun-open! 0)
+        pbuf (primitive/alloc-stack (array i64 1))
+        params (cast (ptr i64) pbuf)]
+    ;; The type intentionally describes the physical contract, not the optimized producer. The
+    ;; double's bits begin in an FPR, but the declared integer slot belongs in the GPR argument
+    ;; sequence. This is the exact cross-class move flattened dyn Record fields require.
+    (store! (index params 0) (t-int))
+    (n-fun-declare-abi! callee (slice-new [i64] params 1) (t-int))
+    (let [value (n-parm! callee 0)]
+      (n-fun-close! callee (n-new2 (Return) (n-fun-entry callee) value)))
+    (let [raw (primitive/alloc-stack (array i64 1))
+          args (cast (ptr i64) raw)]
+      (store! (index args 0) (cf 7.0))
+      (let [site (n-call! (g-start) callee (slice-new [i64] args 1))]
+        (n-add-def! (g-stop) (n-new2 (Return) (call-end site) (call-value site)))
+        (g-analyze!)
+        (assert (= (g-verify) 0))
+        (compile-machine!)
+        (assert (= (native0) (f64-bits 7.0)))))))
+
+(deftest a_wide_direct_call_uses_the_shared_selector_and_verifier_argument_bound
+  (graph-reset! 423)
+  (let [callee (n-fun-open! 0)
+        descriptor-has-configurable (n-parm! callee 5)
+        descriptor-configurable (n-parm! callee 6)
+        descriptor-has-value (n-parm! callee 7)
+        descriptor-value (n-parm! callee 8)
+        current-has-configurable (n-parm! callee 18)
+        current-configurable (n-parm! callee 19)
+        last (n-parm! callee 27)
+        callee-ret (n-new2 (Return) (n-fun-entry callee)
+                           (cb (Add) descriptor-has-configurable
+                               (cb (Add) descriptor-configurable
+                                   (cb (Add) descriptor-has-value
+                                       (cb (Add) descriptor-value
+                                           (cb (Add) current-has-configurable
+                                               (cb (Add) current-configurable last)))))))
+        raw (primitive/alloc-stack (array i64 28))
+        args (cast (ptr i64) raw)
+        second-raw (primitive/alloc-stack (array i64 28))
+        second-args (cast (ptr i64) second-raw)
+        (mut index) 0]
+    (n-fun-close! callee callee-ret)
+    (loop (if (>= (load index) 28) (break)
+              (do (store! (index args (load index)) (cc (load index)))
+                  (store! (index second-args (load index)) (cc (+ 100 (load index))))
+                  (set! index (+ (load index) 1)))))
+    (let [first-site (n-call! (g-start) callee (slice-new [i64] args 28))
+          second-site (n-call! (call-end first-site) callee
+                               (slice-new [i64] second-args 28))]
+      (n-add-def! (g-stop)
+                  (n-new2 (Return) (call-end second-site)
+                          (cb (Add) (call-value first-site) (call-value second-site))))
+      (g-analyze!)
+      (assert (= (g-verify) 0))
+      (assert (ms-select-program!))
+      (let [call-at (find-call-mi)]
+        (assert (= (ms-inst-arg-count call-at) 28))
+        (assert (ms-verify!)))
+      (let [(mut at) 0 (mut found) false]
+        (loop (if (>= (load at) (be-inst-count)) (break)
+                  (do (if (and (= (ms-inst-op (load at)) MI-STACKARG)
+                               (= (ms-inst-node (load at)) last))
+                          (do (assert (= (ms-inst-imm (load at)) 19))
+                              (set! found true)) 0)
+                      (set! at (+ (load at) 1)))))
+        (assert (load found)))
+      ;; Structural agreement is insufficient for a call ABI: execute the last overflow slot so
+      ;; caller packing, callee frame addressing, allocation, and encoding are one bounded proof.
+      (assert (be-select-machine-program!))
+      (assert (>= (be-schedule!) 0))
+      (assert (>= (be-color! 10) 0))
+      (assert (host-native-encode-checked!))
+      (let [got (native0)]
+        (if (!= got 880)
+            (do (fmt (stderr) "wide direct call result={d}, expected=880\n" got) 0) 0)
+        (assert (= got 880))))))
 
 (deftest callend_effect_chain_keeps_recursive_fields_before_parent_allocation
   (graph-reset! 403)
@@ -295,7 +388,7 @@
           ret (n-new2 (Return) (call-end site) (call-value site))]
       (n-add-def! (g-stop) ret)
       (g-analyze!)
-      (call-value site))))
+      (call-node site))))
 
 (defn build-chained-calls! [] (-> i64)
   (graph-reset! 402)
@@ -498,11 +591,411 @@
                          (n-new2 (Return) (call-end site) (call-value site)))
              (g-analyze!)
              (assert (be-select-machine-program!))
-             (assert (= (be-call-return-kind (call-value site)) MLK-SCALAR))
+             (assert (= (be-call-return-kind (call-node site)) MLK-SCALAR))
              (be-schedule!)
              (assert (>= (be-color! 10) 0))
              (assert (host-native-encode-checked!))
              (assert (= (native0) 10)))))
+
+(deftest canonical_jsl_record_parameter_ranges_execute_through_the_native_call_abi
+  (graph-reset! 428)
+  (shape-reset!)
+  (jss-reset!)
+  (jsl-reset!)
+  (assert (= (jsl-load!
+               "(record Pair [(x int) (y int)])
+                (builtin SumScaled
+                  :params [(pair (record Pair)) (scale int)] :ret int
+                  (%Mul (%Add (record-get pair x) (record-get pair y)) scale))")
+             JSL-OK))
+  (assert (= (jsl-lower!) JSL-OK))
+  (let [pair (jsl-record-find "Pair")
+        (mut leaves) (al-new [i64] (malloc-allocator))
+        (mut arguments) (al-new [JslLoweredValue] (malloc-allocator))]
+    (al-push! [i64] (mut leaves) (cc 20))
+    (al-push! [i64] (mut leaves) (cc 1))
+    (al-push! [JslLoweredValue] (mut arguments)
+              (jl-lowered-record-from-slots!
+                pair (slice-data (al-slice [i64] (load leaves)))))
+    (al-push! [JslLoweredValue] (mut arguments)
+              (jl-lowered-scalar! (cc 2) (t-int)))
+    (let [site (jsl-call-lowered-with-memory!
+                 (g-start) "SumScaled"
+                 (al-slice [JslLoweredValue] (load arguments)) NO-NODE)]
+      (n-add-def! (g-stop) (n-new2 (Return) (call-end site) (call-value site)))
+      (g-analyze!)
+      (assert (= (g-verify) 0))
+      (compile-machine!)
+      (assert (= (mu-function-count) 2))
+      (assert (= (native0) 42)))
+    (al-free! [JslLoweredValue] (mut arguments))
+    (al-free! [i64] (mut leaves))))
+
+(deftest canonical_jsl_record_results_execute_through_the_native_multi_result_abi
+  (graph-reset! 429)
+  (shape-reset!)
+  (jss-reset!)
+  (jsl-reset!)
+  (assert (= (jsl-load!
+               "(record Pair [(x int) (y int)])
+                (builtin MakePair :params [(x int) (y int)] :ret (record Pair)
+                  (record-new Pair [(x x) (y y)]))")
+             JSL-OK))
+  (assert (= (jsl-lower!) JSL-OK))
+  ;; Invoke the lowered JSL function through the generic ideal call API. This isolates the native
+  ;; multi-result ABI itself from the exception-runtime helpers used by transitioning JSL calls;
+  ;; raw mmap witnesses intentionally have no external relocations to those helpers.
+  (let [make-pair (jsl-find "MakePair")
+        site (n-call2! (g-start) (jsl-decl-fun make-pair) (cc 20) (cc 22))
+        total (cb (Add) (call-result site 0) (call-result site 1))]
+    (n-add-def! (g-stop) (n-new2 (Return) (call-end site) total))
+    (g-analyze!)
+    (assert (= (g-verify) 0))
+    (assert (be-select-machine-program!))
+    (assert (= (mu-call-bundle-count) 1))
+    (let [bundle (mu-call-bundle 0)]
+      (assert (= (.call-inst bundle) (find-call-mi)))
+      (assert (= (.capture-count bundle) 2))
+      (assert (= (.result-count bundle) 2))
+      (assert (= (.result-area-size bundle) 0))
+      (assert (ms-call-bundles-valid?)))
+    (assert (>= (be-schedule!) 0))
+    (assert (ms-call-bundles-valid?))
+    (assert (>= (be-color! 10) 0))
+    (let [(mut move) 0 (mut temporary) 0]
+      (loop (if (>= (load move) (mu-abi-move-total)) (break)
+                (do
+                  (if (.temporary (mu-abi-move-at (load move)))
+                      (set! temporary (+ (load temporary) 1)) 0)
+                  (set! move (+ (load move) 1)))))
+      ;; With unrestricted allocation this witness produces a real raw-result register cycle.
+      ;; The shared resolver must preserve one source in its typed scratch location.
+      (assert (> (mu-abi-move-total) 0))
+      (assert (> (load temporary) 0)))
+    (assert (host-native-encode-checked!))
+    (assert (= (mu-function-count) 2))
+    (let [got (native0)]
+      (if (!= got 42)
+          (do (fmt (stderr) "native multi-result got={d}\n" got)
+              (ms-dump (stderr))
+              (let [(mut at) 0]
+                (loop (if (>= (load at) (be-inst-count)) (break)
+                          (do (ms-print-inst (stderr) (load at))
+                              (set! at (+ (load at) 1)))))) 0) 0)
+      (assert (= got 42)))))
+
+(deftest canonical_result_locations_are_indexed_within_their_register_class
+  (graph-reset! 430)
+  (let [fun (n-fun-open! 0)
+        rbuf (primitive/alloc-stack (array i64 4))
+        results (cast (ptr i64) rbuf)]
+    (store! (index results 0) (t-int))
+    (store! (index results 1) (t-flt))
+    (store! (index results 2) (t-bool))
+    (store! (index results 3) (t-flt))
+    (n-fun-declare-abi-results!
+      fun (slice-new [i64] (cast (ptr i64) 0) 0) (slice-new [i64] results 4))
+    (let [site (n-call! (g-start) fun (slice-new [i64] (cast (ptr i64) 0) 0))
+          call (call-node site)]
+      ;; The logical vector `[int, float, bool, float]` maps to `[x0, d0, x1, d1]`.
+      ;; No backend may reinterpret logical slot number as register number.
+      (assert (not (be-call-result-fp? call 0)))
+      (assert (be-call-result-fp? call 1))
+      (assert (not (be-call-result-fp? call 2)))
+      (assert (be-call-result-fp? call 3))
+      (assert (= (be-call-result-register-index call 0) 0))
+      (assert (= (be-call-result-register-index call 1) 0))
+      (assert (= (be-call-result-register-index call 2) 1))
+      (assert (= (be-call-result-register-index call 3) 1))
+      (assert (= (be-call-result-location-kind call 0) MABI-RESULT-REGISTER))
+      (assert (= (be-call-result-location-kind call 3) MABI-RESULT-REGISTER))
+      (assert (= (be-call-result-area-size call) 0)))))
+
+(deftest wide_result_locations_use_one_aligned_logical_order_overflow_area
+  (graph-reset! 431)
+  (let [fun (n-fun-open! 0)
+        rbuf (primitive/alloc-stack (array i64 20))
+        results (cast (ptr i64) rbuf)
+        (mut slot) 0]
+    ;; Ten GPR leaves followed by ten FPR leaves use eight registers of each class. The remaining
+    ;; four leaves occupy one caller-owned result area in logical order at offsets 0, 8, 16, 24.
+    (loop (if (>= (load slot) 20) (break)
+              (do
+                (store! (index results (load slot))
+                        (if (< (load slot) 10) (t-int) (t-flt)))
+                (set! slot (+ (load slot) 1)))))
+    (n-fun-declare-abi-results!
+      fun (slice-new [i64] (cast (ptr i64) 0) 0) (slice-new [i64] results 20))
+    (let [site (n-call! (g-start) fun (slice-new [i64] (cast (ptr i64) 0) 0))
+          call (call-node site)]
+      (assert (= (be-call-result-location-kind call 7) MABI-RESULT-REGISTER))
+      (assert (= (be-call-result-location-kind call 8) MABI-RESULT-AREA))
+      (assert (= (be-call-result-area-offset call 8) 0))
+      (assert (= (be-call-result-area-offset call 9) 8))
+      (assert (= (be-call-result-location-kind call 17) MABI-RESULT-REGISTER))
+      (assert (= (be-call-result-location-kind call 18) MABI-RESULT-AREA))
+      (assert (= (be-call-result-area-offset call 18) 16))
+      (assert (= (be-call-result-area-offset call 19) 24))
+      (assert (= (be-call-result-area-size call) 32)))))
+
+(deftest caller_owned_overflow_result_area_executes_natively
+  (graph-reset! 432)
+  (let [fun (n-fun-open! 0)
+        tbuf (primitive/alloc-stack (array i64 10))
+        types (cast (ptr i64) tbuf)
+        vbuf (primitive/alloc-stack (array i64 10))
+        values (cast (ptr i64) vbuf)
+        (mut slot) 0]
+    (loop (if (>= (load slot) 10) (break)
+              (do
+                (store! (index types (load slot))
+                        (if (< (load slot) 8) (t-int) (t-dyn)))
+                (store! (index values (load slot))
+                        (if (< (load slot) 8)
+                            (cc 0)
+                            (n-box! (cc (if (= (load slot) 8) 40 2)))))
+                (set! slot (+ (load slot) 1)))))
+    (n-fun-declare-abi-results!
+      fun (slice-new [i64] (cast (ptr i64) 0) 0) (slice-new [i64] types 10))
+    (n-fun-close! fun
+      (n-return-values! (n-fun-entry fun) (slice-new [i64] values 10) NO-NODE))
+    (let [site (n-call! (g-start) fun (slice-new [i64] (cast (ptr i64) 0) 0))
+          (mut total) (call-result site 0)
+          (mut result) 1]
+      (loop (if (>= (load result) 10) (break)
+                (do
+                  (let [value (call-result site (load result))]
+                    (set! total
+                          (cb (Add) (load total)
+                              (if (< (load result) 8) value
+                                  (n-unbox! value (t-int))))))
+                  (set! result (+ (load result) 1)))))
+      (n-add-def! (g-stop) (n-new2 (Return) (call-end site) (load total)))
+      (g-analyze!)
+      (assert (= (g-verify) 0))
+      (assert (be-select-machine-program!))
+      (assert (= (mu-call-bundle-count) 1))
+      (let [bundle (mu-call-bundle 0)]
+        (assert (= (.capture-count bundle) 10))
+        (assert (= (.result-count bundle) 10))
+        (assert (= (.result-area-size bundle) 16))
+        (assert (ms-call-bundles-valid?)))
+      (assert (>= (be-schedule!) 0))
+      (assert (ms-call-bundles-valid?))
+      (assert (>= (be-color! 10) 0))
+      (assert (= (be-call-result-area-size (call-node site)) 16))
+      (assert (= (mu-function-result-area-size 1) 16))
+      (assert (>= (mu-function-result-pointer-offset 1) 0))
+      (assert (host-native-encode-checked!))
+      (assert (mft-extract! 0))
+      (assert (= (mft-site-count) 1))
+      (assert (= (mft-site-root-count 0) 2))
+      (assert (= (al-get [i64] (.root-kind (mft)) 0) MLK-BOXED))
+      (assert (= (al-get [i64] (.root-kind (mft)) 1) MLK-BOXED))
+      (assert (= (al-get [i64] (.root-reg (mft)) 0) -2))
+      (assert (= (al-get [i64] (.root-reg (mft)) 1) -2))
+      ;; The standalone object path must publish and independently verify the same two typed
+      ;; indirect roots, not merely the retained function-text path used by the native harness.
+      (assert (be-macho-checked!))
+      (let [stackoff (mobj-u32 232)]
+        (assert (= (mobj-u32 (+ stackoff 4)) 5))
+        (assert (= (mobj-u32 (+ stackoff 12)) 2))
+        (assert (mobj-verify-bytes!)))
+      (assert (be-x64-encode-checked!))
+      (assert (> (be-x64-code-len) 0))
+      (assert (= (native0) 42)))))
+
+(deftest multi_result_call_preserves_its_separate_memory_channel_natively
+  (graph-reset! 433)
+  (shape-reset!)
+  (let [layout (shape-transition SHAPE-ROOT "value" (t-int))
+        alias (shape-field-alias layout 0)
+        fun (n-fun-open! 0)
+        pbuf (primitive/alloc-stack (array i64 1))
+        params (cast (ptr i64) pbuf)
+        tbuf (primitive/alloc-stack (array i64 2))
+        types (cast (ptr i64) tbuf)
+        vbuf (primitive/alloc-stack (array i64 2))
+        values (cast (ptr i64) vbuf)]
+    (store! (index params 0) (t-dyn))
+    (store! (index types 0) (t-int))
+    (store! (index types 1) (t-int))
+    (store! (index values 0) (cc 39))
+    (store! (index values 1) (cc 2))
+    (n-fun-declare-abi-results!
+      fun (slice-new [i64] params 1) (slice-new [i64] types 2))
+    (let [object (n-unbox! (n-parm! fun 0) (t-obj))
+          callee-memory (n-new1 (Arg (t-mem-alias alias (t-undef))) (n-fun-entry fun))
+          stored (n-store! callee-memory object (cc 1) alias)]
+      (n-fun-close! fun
+        (n-return-values! (n-fun-entry fun) (slice-new [i64] values 2) stored)))
+    (let [caller-value (n-new1 (Arg (t-dyn)) (g-start))
+          caller-object (n-unbox! caller-value (t-obj))
+          abuf (primitive/alloc-stack (array i64 1))
+          args (cast (ptr i64) abuf)]
+      (store! (index args 0) caller-value)
+      (let [site (n-call! (g-start) fun (slice-new [i64] args 1))
+            post-memory (n-new1 (Arg (t-mem-alias alias (t-undef))) (call-end site))
+            loaded (n-new3 (Load alias) NO-NODE post-memory caller-object)
+            sum (cb (Add) (cb (Add) (call-result site 0) (call-result site 1)) loaded)]
+        (n-add-def! (g-stop) (n-new3 (Return) (call-end site) sum post-memory))
+        (g-analyze!)
+        (let [verified (g-verify)]
+          (if (!= verified 0)
+              (do
+                (fmt (stderr) "memory-result graph verify={d} code={d} node={d}\n"
+                     verified (g-verify-code) (g-verify-node))
+                (n-print-flat (stderr) (g-verify-node))
+                (n-print-flat (stderr) (n-in (g-verify-node) 2))
+                (g-verify-print (stderr)) 0) 0)
+          (assert (= verified 0)))
+        (assert (be-select-machine-program!))
+        (assert (= (mu-call-bundle-count) 1))
+        (assert (= (.result-count (mu-call-bundle 0)) 2))
+        (assert (>= (be-schedule!) 0))
+        (assert (>= (be-color! 10) 0))
+        (assert (host-native-encode-checked!))
+        (let [memory (malloc 64)]
+          (assert (!= (cast i64 memory) 0))
+          (let [boxed (| JSV-OBJECT (& (cast i64 memory) JSV-PAYLOAD-MASK))
+                got (native1 boxed)]
+            (free memory)
+            (assert (= got 42))))))))
+
+(deftest throwing_multi_result_target_executes_its_normal_path_natively
+  (graph-reset! 434)
+  (shape-reset!)
+  (let [layout (shape-transition SHAPE-ROOT "fail" (t-int))
+        alias (shape-field-alias layout 0)
+        offset (shape-field-offset layout 0)
+        fun (n-fun-open! 0)
+        pbuf (primitive/alloc-stack (array i64 1))
+        params (cast (ptr i64) pbuf)
+        tbuf (primitive/alloc-stack (array i64 2))
+        types (cast (ptr i64) tbuf)]
+    (store! (index params 0) (t-dyn))
+    (store! (index types 0) (t-int))
+    (store! (index types 1) (t-int))
+    (n-fun-declare-abi-results!
+      fun (slice-new [i64] params 1) (slice-new [i64] types 2))
+    (n-fun-abi-set-can-throw! fun true)
+    (let [object (n-unbox! (n-parm! fun 0) (t-obj))
+          memory (n-new1 (Arg (t-mem-alias alias (t-undef))) (n-fun-entry fun))
+          fail (n-load! memory object alias)
+          arms (n-if-arms! (n-peephole (n-new2 (If) (n-fun-entry fun) fail)))
+          values-buf (primitive/alloc-stack (array i64 2))
+          values (cast (ptr i64) values-buf)
+          marked (n-peephole
+                   (n-new3 (JsBuiltin BE-EXCEPTION-RETURN-DESCRIPTOR)
+                           (arms-t arms) (n-box! (cc 7)) (cc 0)))]
+      (store! (index values 0) (cc 40))
+      (store! (index values 1) (cc 2))
+      (n-fun-close! fun
+        (n-return-values! (arms-f arms) (slice-new [i64] values 2) memory))
+      (store! (index values 0) marked)
+      (store! (index values 1) (cc 0))
+      (n-fun-add-return! fun
+        (n-return-values! (arms-t arms) (slice-new [i64] values 2) memory)))
+    (let [caller-value (n-new1 (Arg (t-dyn)) (g-start))
+          abuf (primitive/alloc-stack (array i64 1))
+          args (cast (ptr i64) abuf)]
+      (store! (index args 0) caller-value)
+      (let [site (n-call! (g-start) fun (slice-new [i64] args 1))
+            sum (cb (Add) (call-result site 0) (call-result site 1))]
+        (n-add-def! (g-stop) (n-new2 (Return) (call-end site) sum))))
+    (g-analyze!)
+    (let [verified (g-verify)]
+      (if (!= verified 0)
+          (do (fmt (stderr) "throwing-target verify={d} code={d} node={d}\n"
+                   verified (g-verify-code) (g-verify-node))
+              (g-verify-print (stderr)) 0) 0)
+      (assert (= verified 0)))
+    (assert (be-select-machine-program!))
+    (let [(mut r) 0 (mut abrupt-rets) 0]
+      (loop (if (>= (load r) (mu-function-return-count 1)) (break)
+                (let [term (mu-block-terminator (mu-function-return-block 1 (load r)))]
+                  (if (and (!= term NO-NODE) (be-exception-return? term))
+                      (set! abrupt-rets (+ (load abrupt-rets) 1)) 0)
+                  (set! r (+ (load r) 1)))))
+      (assert (= (load abrupt-rets) 1)))
+    (assert (>= (be-schedule!) 0))
+    (assert (>= (be-color! 10) 0))
+    (assert (host-native-encode-checked!))
+    (let [memory (malloc 64)]
+      (assert (!= (cast i64 memory) 0))
+      (store! (cast (ptr i64) (+ (cast i64 memory) offset)) 0)
+      (let [boxed (| JSV-OBJECT (& (cast i64 memory) JSV-PAYLOAD-MASK))
+            got (native1 boxed)]
+        (free memory)
+        (assert (= got 42))))))
+
+(deftest throwing_multi_result_call_executes_its_abrupt_caller_path_natively
+  (graph-reset! 435)
+  (shape-reset!)
+  (let [fun (n-fun-open! 0)
+        pbuf (primitive/alloc-stack (array i64 1))
+        params (cast (ptr i64) pbuf)
+        tbuf (primitive/alloc-stack (array i64 2))
+        types (cast (ptr i64) tbuf)]
+    (store! (index params 0) (t-int))
+    (store! (index types 0) (t-int))
+    (store! (index types 1) (t-int))
+    (n-fun-declare-abi-results!
+      fun (slice-new [i64] params 1) (slice-new [i64] types 2))
+    (n-fun-abi-set-can-throw! fun true)
+    (let [fail (n-parm! fun 0)
+          arms (n-if-arms! (n-peephole (n-new2 (If) (n-fun-entry fun) fail)))
+          values-buf (primitive/alloc-stack (array i64 2))
+          values (cast (ptr i64) values-buf)
+          raised (n-peephole (n-new2 (JsThrow) (arms-t arms) (n-box! (cc 40))))
+          marked (n-peephole
+                   (n-new3 (JsBuiltin BE-EXCEPTION-RETURN-DESCRIPTOR)
+                           (arms-t arms) raised (cc 0)))]
+      (store! (index values 0) (cc 40))
+      (store! (index values 1) (cc 2))
+      (n-fun-close! fun
+        (n-return-values! (arms-f arms) (slice-new [i64] values 2) NO-NODE))
+      (store! (index values 0) marked)
+      (store! (index values 1) (cc 0))
+      (n-fun-add-return! fun
+        (n-return-values! (arms-t arms) (slice-new [i64] values 2) NO-NODE)))
+    (let [fail (n-new1 (Arg (t-int)) (g-start))
+          abuf (primitive/alloc-stack (array i64 1))
+          args (cast (ptr i64) abuf)]
+      (store! (index args 0) fail)
+      (let [site (n-call! (g-start) fun (slice-new [i64] args 1))
+            dependency (call-result site 0)
+            tagged-pending
+              (n-peephole
+                (n-new3 (JsBuiltin 101) (call-end site) dependency (cc 0)))
+            pending (n-unbox! tagged-pending (t-bool))
+            arms (n-if-arms!
+                   (n-peephole (n-new2 (If) (call-end site) pending)))
+            thrown (n-peephole (n-new3 (JsBuiltin 102) (arms-t arms) pending (cc 0)))
+            abrupt-answer (cb (Add) (n-unbox! thrown (t-int)) (cc 2))
+            normal-answer (cb (Add) (call-result site 0) (call-result site 1))]
+        (n-add-def! (g-stop) (n-new2 (Return) (arms-t arms) abrupt-answer))
+        (n-add-def! (g-stop) (n-new2 (Return) (arms-f arms) normal-answer))))
+    (g-analyze!)
+    (assert (= (g-verify) 0))
+    (assert (be-select-machine-program!))
+    (assert (= (mu-call-bundle-count) 1))
+    (assert (= (.result-count (mu-call-bundle 0)) 2))
+    (assert (.can-throw (mu-call-bundle 0)))
+    (assert (>= (be-schedule!) 0))
+    (assert (>= (be-color! 10) 0))
+    (assert (be-encode-checked!))
+    (assert (be-macho-checked!))
+    (let [ok (primitive/alloc-stack bool)
+          got (nh-exec-memory-checked! 1 ok)]
+      (assert (load ok))
+      (assert (= got 42))
+      ;; The pending value was consumed and cleared by descriptor 102. Re-enter the identical
+      ;; image through its normal result projections to prove that abrupt transport neither leaks
+      ;; process state nor changes the two-result ABI.
+      (let [normal (nh-exec-memory-checked! 0 ok)]
+        (assert (load ok))
+        (assert (= normal 42))))))
 
 (deftest recursive_direct_call_restores_lr_and_sp_from_each_frame
          (graph-reset! 406)

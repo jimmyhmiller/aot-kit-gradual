@@ -29,7 +29,7 @@
 (const MI-LABEL i64 11)
 (const MI-CBZ i64 12)
 (const MI-CSEL i64 13)
-(const MI-MOV i64 14)
+(const MI-RESULT-MATERIALIZE i64 14) ; normal-edge logical value <- raw call snapshot
 (const MI-B i64 15)
 (const MI-NEW i64 16)
 (const MI-LOAD i64 17)
@@ -67,7 +67,11 @@
 (const MI-JSPROP i64 49)  ; external named-property runtime: a=owner, b=value/prototype, imm=operation
 (const MI-JSARRAY i64 50)  ; external dense-array runtime: a=owner, b=index, arg0=boxed value, imm=operation
 (const MI-JSSTRING i64 51)  ; external immutable UTF-16 runtime: a,b,arg0 plus operation
-(const MI-OPCODE-COUNT i64 52)
+(const MI-CALL-RESULT i64 52) ; fixed ABI result register after a call; imm=result index
+(const MI-OPCODE-COUNT i64 53)
+;; One shared bound for the selector's temporary argument vector and the verifier. Calls spill
+;; beyond the register prefix, so this is a compiler construction bound, not a register-ABI bound.
+(const M-CALL-MAX-ARGS i64 32)
 (const JSSOP-NEW i64 0)
 (const JSSOP-SET-UNIT i64 1)
 (const JSSOP-LENGTH i64 2)
@@ -162,12 +166,33 @@
 (const MLK-RAW-MANAGED i64 1)
 (const MLK-BOXED i64 2)
 (const MLK-NONMOVING i64 3)
+(const MV-ORIGIN-UNKNOWN i64 0)
+(const MV-ORIGIN-IDEAL i64 1)
+(const MV-ORIGIN-PHI i64 2)
+(const MV-ORIGIN-CALL-RESULT i64 3)
+(const MV-ORIGIN-COPY i64 4)
+(const MV-ORIGIN-ABI i64 5)
+(const MV-ORIGIN-TEMPORARY i64 6)
+(const MV-DEF-INSTRUCTION i64 0)
+(const MV-DEF-PHI i64 1)
+(const MV-DEF-CALL-RESULT i64 2)
+(const MV-DEF-COPY i64 3)
+(const MV-DEF-ABI i64 4)
+(const MV-DEF-TEMPORARY i64 5)
+(const MV-ABI-NONE i64 0)
+(const MV-ABI-ARGUMENT i64 1)
+(const MV-ABI-PARAMETER i64 2)
+(const MV-ABI-CALL-RESULT i64 3)
+(const MV-STATE-RESERVED i64 0)
+(const MV-STATE-DEFINED i64 1)
 (const JSV-RAW-NULLABLE-OBJECT i64 -2)
 
 ;; Register classes are independent of GC kinds: an f64 is a scalar for stack-map purposes but
 ;; cannot share a physical register or an interference color with an integer scalar.
 (const MRC-GPR i64 0)
 (const MRC-FPR i64 1)
+(const MV-KIND-MASK-ALL i64 15)
+(const MV-CLASS-MASK-ALL i64 3)
 
 (const MRA-OK i64 0)
 (const MRA-INTERFERENCE i64 1)
@@ -192,6 +217,10 @@
    (b i64)
    (imm i64)
    (node i64)
+   ;; Immutable selection-time call-target contract. For MI-CALL this is the exact encoded direct
+   ;; owner or complemented polymorphic summary; object publication verifies `imm` against it
+   ;; without traversing the ideal graph again. Non-calls carry -1.
+   (call-contract i64)
    (owner i64)
    (block-id i64)
    (mem-first i64)
@@ -217,7 +246,11 @@
    (pinned bool)
    (memory bool)
    (terminator bool)
-   (encodable bool)])
+   (encodable bool)
+   ;; Allowed destination MachineValue contracts. Zero means the opcode has no result. These
+   ;; masks are part of the opcode descriptor, not inferred from an ideal node after selection.
+   (result-kind-mask i64)
+   (result-class-mask i64)])
 
 ; These records intentionally use indexes into unit-owned tables. Stable indexes survive later
 ; edge splitting and avoid pointers becoming stale when an ArrayList grows.
@@ -230,6 +263,9 @@
    (block-count i64)
    (return-first i64)
    (return-count i64)
+   (result-area-size i64)
+   (result-pointer-offset i64)
+   (outgoing-result-pointer-offset i64)
    (frame-size i64)
    (callee-mask i64)
    (callee-count i64)
@@ -271,6 +307,26 @@
 (defstruct MMove
   [(edge i64) (dst i64) (src i64) (temporary bool)])
 
+(const MLOC-REGISTER i64 0)
+(const MLOC-SPILL i64 1)
+(const MLOC-SCRATCH i64 2)
+(const MLOC-RESULT-AREA i64 3)
+
+(defstruct MLocation [(kind i64) (class i64) (index i64)])
+(defstruct MParallelMove
+  [(owner i64) (inst i64)
+   (dst-kind i64) (dst-class i64) (dst-index i64)
+   (src-kind i64) (src-class i64) (src-index i64)
+   (temporary bool)])
+
+;; One machine call owns its complete lowered result capture. Instruction indexes are rebuilt
+;; whenever scheduling republishes the instruction stream; consumers never rediscover a bundle by
+;; scanning for adjacent MI-CALL-RESULT instructions.
+(defstruct MCallBundle
+  [(owner i64) (block-id i64) (call-inst i64) (anchor i64)
+   (capture-first i64) (capture-count i64) (release-after i64)
+   (result-count i64) (result-area-size i64) (can-throw bool)])
+
 (defstruct MachineUnit
   [(functions (ArrayList MFunction))
    (blocks (ArrayList MBlock))
@@ -284,6 +340,14 @@
    (succ-edges (ArrayList i64))
    (edge-copies (ArrayList MCopy))
    (edge-moves (ArrayList MMove))
+   ;; Post-allocation ABI parallel moves. Per-instruction ranges name resolved, sequential moves;
+   ;; call-result groups publish their entire range on the first capture instruction.
+   (abi-moves (ArrayList MParallelMove))
+   (abi-move-first (ArrayList i64))
+   (abi-move-count (ArrayList i64))
+   (abi-work-dst (ArrayList MLocation))
+   (abi-work-src (ArrayList MLocation))
+   (abi-work-live (ArrayList i64))
    (copy-work-dst (ArrayList i64))
    (copy-work-src (ArrayList i64))
    (copy-work-live (ArrayList i64))
@@ -323,6 +387,10 @@
    (selected-value-owners (ArrayList i64))
    (selected-node-owners (ArrayList i64))
    (selected-block-owners (ArrayList i64))
+   ;; Raw ABI result snapshots are distinct from logical selected values. They are captured in the
+   ;; call bundle and may only feed a normal-edge materialization (or explicit outcome inspection).
+   (call-result-snapshots (ArrayList i64))
+   (call-result-snapshot-owners (ArrayList i64))
    ;; Live Phi nodes grouped by target block in ideal-node order. Selection consumes this index
    ;; for reservation and edge copies instead of scanning the whole ideal graph per function/edge.
    (block-phi-head (ArrayList i64))
@@ -337,7 +405,13 @@
    (memory-anti-deps (ArrayList i64))
    (memory-read-head (ArrayList i64))
    (memory-read-next (ArrayList i64))
+   (memory-owner-read-head (ArrayList i64))
+   (memory-owner-read-next (ArrayList i64))
    (call-args (ArrayList i64))
+   ;; The callee declaration owns argument placement. This is deliberately separate from the
+   ;; source vreg's register class: representation refinement may produce (for example) an FPR
+   ;; value for a declared dyn/GPR parameter, and that refinement must not rewrite the call ABI.
+   (call-arg-classes (ArrayList i64))
    (schedule-work (ArrayList MInst))
    (schedule-done (ArrayList i64))
    (vreg-new-def (ArrayList i64))
@@ -376,6 +450,18 @@
    ;; made kind classification quadratic on large programs. -1 when no node claimed the vreg.
    (vreg-node (ArrayList i64))
    (vreg-node-owner (ArrayList i64))
+   ;; Authoritative MachineValue row columns. These are populated at construction/finalization,
+   ;; before scheduling or liveness, and are never reconstructed by a later phase.
+   (vreg-owner (ArrayList i64))
+   (vreg-origin-kind (ArrayList i64))
+   ;; Closed provenance and ABI contract. `origin-a/b` are interpreted by definition kind:
+   ;; ideal node, phi block, source vreg, or call/slot. Later phases never rediscover these.
+   (vreg-definition-kind (ArrayList i64))
+   (vreg-origin-a (ArrayList i64))
+   (vreg-origin-b (ArrayList i64))
+   (vreg-abi-kind (ArrayList i64))
+   (vreg-abi-index (ArrayList i64))
+   (vreg-state (ArrayList i64))
    ;; vreg -> linked list of its uses, rebuilt at the start of each pass that asks
    ;; ms-gcm-latest-use-block. An entry is an instruction index, or -(block+2) for an edge
    ;; copy's source-block use. Deriving this by rescanning every instruction and every edge
@@ -422,24 +508,32 @@
    (new-index (ArrayList i64))
    (kind-known (ArrayList bool))
    (kind-value (ArrayList i64))
-   (alloc-interference (ArrayList i64))
-   (alloc-row-first (ArrayList i64))
-   (alloc-expected (ArrayList i64))
-   (alloc-verify-seen (ArrayList i64))
    (alloc-live (ArrayList i64))
    (alloc-live-list (ArrayList i64))
    (alloc-live-pos (ArrayList i64))
    (alloc-owner-head (ArrayList i64))
    (alloc-owner-next (ArrayList i64))
-   (alloc-adj-head (ArrayList i64))
-   (alloc-adj-other (ArrayList i64))
-   (alloc-adj-next (ArrayList i64))
    (alloc-copy-peer (ArrayList i64))
    (alloc-reg (ArrayList i64))
    (alloc-spill (ArrayList i64))
    (alloc-owner (ArrayList i64))
    (alloc-forbidden (ArrayList i64))
    (alloc-spill-kind (ArrayList i64))
+   ;; Frozen linear-scan product. Intervals are keyed by MachineValue id; event heads are keyed by
+   ;; final instruction position. Allocation consumes these directly and never materializes the
+   ;; pairwise interference graph implied by overlapping intervals.
+   (alloc-interval-start (ArrayList i64))
+   (alloc-interval-end (ArrayList i64))
+   (alloc-start-head (ArrayList i64))
+   (alloc-start-next (ArrayList i64))
+   (alloc-end-head (ArrayList i64))
+   (alloc-end-next (ArrayList i64))
+   ;; OR segment trees over final instruction positions. One publishes call-clobber masks; the
+   ;; other publishes fixed ABI definitions. Interval allocation answers each constraint query in
+   ;; logarithmic work without replaying all live sets.
+   (alloc-clobber-tree (ArrayList i64))
+   (alloc-fixed-tree (ArrayList i64))
+   (alloc-tree-capacity i64)
    (phase i64)
    (next-vreg i64)
    (verify-result i64)
@@ -458,6 +552,11 @@
    (allocation-result i64)
    (allocation-item i64)
    (allocation-seed i64)
+   ;; Always-on structural work counters. These count algorithmic work, not formatted profiling,
+   ;; so focused scaling tests can reject a fallback without relying on wall-clock noise.
+   (work-kind-direct i64)
+   (work-memory-alias-candidates i64)
+   (work-memory-antidep-duplicate-probes i64)
    (inited bool)])
 
 (defn machine-unit [] (-> (ptr MachineUnit))
@@ -475,6 +574,12 @@
           (set! (.succ-edges u) (al-new [i64] (malloc-allocator)))
           (set! (.edge-copies u) (al-new [MCopy] (malloc-allocator)))
           (set! (.edge-moves u) (al-new [MMove] (malloc-allocator)))
+          (set! (.abi-moves u) (al-new [MParallelMove] (malloc-allocator)))
+          (set! (.abi-move-first u) (al-new [i64] (malloc-allocator)))
+          (set! (.abi-move-count u) (al-new [i64] (malloc-allocator)))
+          (set! (.abi-work-dst u) (al-new [MLocation] (malloc-allocator)))
+          (set! (.abi-work-src u) (al-new [MLocation] (malloc-allocator)))
+          (set! (.abi-work-live u) (al-new [i64] (malloc-allocator)))
           (set! (.copy-work-dst u) (al-new [i64] (malloc-allocator)))
           (set! (.copy-work-src u) (al-new [i64] (malloc-allocator)))
           (set! (.copy-work-live u) (al-new [i64] (malloc-allocator)))
@@ -503,6 +608,8 @@
           (set! (.selected-value-owners u) (al-new [i64] (malloc-allocator)))
           (set! (.selected-node-owners u) (al-new [i64] (malloc-allocator)))
           (set! (.selected-block-owners u) (al-new [i64] (malloc-allocator)))
+          (set! (.call-result-snapshots u) (al-new [i64] (malloc-allocator)))
+          (set! (.call-result-snapshot-owners u) (al-new [i64] (malloc-allocator)))
           (set! (.block-phi-head u) (al-new [i64] (malloc-allocator)))
           (set! (.node-phi-next u) (al-new [i64] (malloc-allocator)))
           (set! (.packed-insts u) (al-new [MInst] (malloc-allocator)))
@@ -513,7 +620,10 @@
           (set! (.memory-anti-deps u) (al-new [i64] (malloc-allocator)))
           (set! (.memory-read-head u) (al-new [i64] (malloc-allocator)))
           (set! (.memory-read-next u) (al-new [i64] (malloc-allocator)))
+          (set! (.memory-owner-read-head u) (al-new [i64] (malloc-allocator)))
+          (set! (.memory-owner-read-next u) (al-new [i64] (malloc-allocator)))
           (set! (.call-args u) (al-new [i64] (malloc-allocator)))
+          (set! (.call-arg-classes u) (al-new [i64] (malloc-allocator)))
           (set! (.schedule-work u) (al-new [MInst] (malloc-allocator)))
           (set! (.schedule-done u) (al-new [i64] (malloc-allocator)))
           (set! (.vreg-new-def u) (al-new [i64] (malloc-allocator)))
@@ -536,6 +646,14 @@
           (set! (.vreg-phi-block u) (al-new [i64] (malloc-allocator)))
           (set! (.vreg-node u) (al-new [i64] (malloc-allocator)))
           (set! (.vreg-node-owner u) (al-new [i64] (malloc-allocator)))
+          (set! (.vreg-owner u) (al-new [i64] (malloc-allocator)))
+          (set! (.vreg-origin-kind u) (al-new [i64] (malloc-allocator)))
+          (set! (.vreg-definition-kind u) (al-new [i64] (malloc-allocator)))
+          (set! (.vreg-origin-a u) (al-new [i64] (malloc-allocator)))
+          (set! (.vreg-origin-b u) (al-new [i64] (malloc-allocator)))
+          (set! (.vreg-abi-kind u) (al-new [i64] (malloc-allocator)))
+          (set! (.vreg-abi-index u) (al-new [i64] (malloc-allocator)))
+          (set! (.vreg-state u) (al-new [i64] (malloc-allocator)))
           (set! (.vreg-use-head u) (al-new [i64] (malloc-allocator)))
           (set! (.vreg-use-entry u) (al-new [i64] (malloc-allocator)))
           (set! (.vreg-use-next u) (al-new [i64] (malloc-allocator)))
@@ -568,24 +686,25 @@
           (set! (.new-index u) (al-new [i64] (malloc-allocator)))
           (set! (.kind-known u) (al-new [bool] (malloc-allocator)))
           (set! (.kind-value u) (al-new [i64] (malloc-allocator)))
-          (set! (.alloc-interference u) (al-new [i64] (malloc-allocator)))
-          (set! (.alloc-row-first u) (al-new [i64] (malloc-allocator)))
-          (set! (.alloc-expected u) (al-new [i64] (malloc-allocator)))
-          (set! (.alloc-verify-seen u) (al-new [i64] (malloc-allocator)))
           (set! (.alloc-live u) (al-new [i64] (malloc-allocator)))
           (set! (.alloc-live-list u) (al-new [i64] (malloc-allocator)))
           (set! (.alloc-live-pos u) (al-new [i64] (malloc-allocator)))
           (set! (.alloc-owner-head u) (al-new [i64] (malloc-allocator)))
           (set! (.alloc-owner-next u) (al-new [i64] (malloc-allocator)))
-          (set! (.alloc-adj-head u) (al-new [i64] (malloc-allocator)))
-          (set! (.alloc-adj-other u) (al-new [i64] (malloc-allocator)))
-          (set! (.alloc-adj-next u) (al-new [i64] (malloc-allocator)))
           (set! (.alloc-copy-peer u) (al-new [i64] (malloc-allocator)))
           (set! (.alloc-reg u) (al-new [i64] (malloc-allocator)))
           (set! (.alloc-spill u) (al-new [i64] (malloc-allocator)))
           (set! (.alloc-owner u) (al-new [i64] (malloc-allocator)))
           (set! (.alloc-forbidden u) (al-new [i64] (malloc-allocator)))
           (set! (.alloc-spill-kind u) (al-new [i64] (malloc-allocator)))
+          (set! (.alloc-interval-start u) (al-new [i64] (malloc-allocator)))
+          (set! (.alloc-interval-end u) (al-new [i64] (malloc-allocator)))
+          (set! (.alloc-start-head u) (al-new [i64] (malloc-allocator)))
+          (set! (.alloc-start-next u) (al-new [i64] (malloc-allocator)))
+          (set! (.alloc-end-head u) (al-new [i64] (malloc-allocator)))
+          (set! (.alloc-end-next u) (al-new [i64] (malloc-allocator)))
+          (set! (.alloc-clobber-tree u) (al-new [i64] (malloc-allocator)))
+          (set! (.alloc-fixed-tree u) (al-new [i64] (malloc-allocator)))
           (set! (.inited u) true)
           0))
     u))
@@ -602,6 +721,12 @@
     (al-clear! [i64] (field u succ-edges))
     (al-clear! [MCopy] (field u edge-copies))
     (al-clear! [MMove] (field u edge-moves))
+    (al-clear! [MParallelMove] (field u abi-moves))
+    (al-clear! [i64] (field u abi-move-first))
+    (al-clear! [i64] (field u abi-move-count))
+    (al-clear! [MLocation] (field u abi-work-dst))
+    (al-clear! [MLocation] (field u abi-work-src))
+    (al-clear! [i64] (field u abi-work-live))
     (al-clear! [i64] (field u copy-work-dst))
     (al-clear! [i64] (field u copy-work-src))
     (al-clear! [i64] (field u copy-work-live))
@@ -635,7 +760,10 @@
     (al-clear! [i64] (field u memory-anti-deps))
     (al-clear! [i64] (field u memory-read-head))
     (al-clear! [i64] (field u memory-read-next))
+    (al-clear! [i64] (field u memory-owner-read-head))
+    (al-clear! [i64] (field u memory-owner-read-next))
     (al-clear! [i64] (field u call-args))
+    (al-clear! [i64] (field u call-arg-classes))
     (al-clear! [MInst] (field u schedule-work))
     (al-clear! [i64] (field u schedule-done))
     (al-clear! [i64] (field u vreg-new-def))
@@ -658,6 +786,14 @@
     (al-clear! [i64] (field u vreg-phi-block))
     (al-clear! [i64] (field u vreg-node))
     (al-clear! [i64] (field u vreg-node-owner))
+    (al-clear! [i64] (field u vreg-owner))
+    (al-clear! [i64] (field u vreg-origin-kind))
+    (al-clear! [i64] (field u vreg-definition-kind))
+    (al-clear! [i64] (field u vreg-origin-a))
+    (al-clear! [i64] (field u vreg-origin-b))
+    (al-clear! [i64] (field u vreg-abi-kind))
+    (al-clear! [i64] (field u vreg-abi-index))
+    (al-clear! [i64] (field u vreg-state))
     (al-clear! [i64] (field u vreg-use-head))
     (al-clear! [i64] (field u vreg-use-entry))
     (al-clear! [i64] (field u vreg-use-next))
@@ -690,24 +826,26 @@
     (al-clear! [i64] (field u new-index))
     (al-clear! [bool] (field u kind-known))
     (al-clear! [i64] (field u kind-value))
-    (al-clear! [i64] (field u alloc-interference))
-    (al-clear! [i64] (field u alloc-row-first))
-    (al-clear! [i64] (field u alloc-expected))
-    (al-clear! [i64] (field u alloc-verify-seen))
     (al-clear! [i64] (field u alloc-live))
     (al-clear! [i64] (field u alloc-live-list))
     (al-clear! [i64] (field u alloc-live-pos))
     (al-clear! [i64] (field u alloc-owner-head))
     (al-clear! [i64] (field u alloc-owner-next))
-    (al-clear! [i64] (field u alloc-adj-head))
-    (al-clear! [i64] (field u alloc-adj-other))
-    (al-clear! [i64] (field u alloc-adj-next))
     (al-clear! [i64] (field u alloc-copy-peer))
     (al-clear! [i64] (field u alloc-reg))
     (al-clear! [i64] (field u alloc-spill))
     (al-clear! [i64] (field u alloc-owner))
     (al-clear! [i64] (field u alloc-forbidden))
     (al-clear! [i64] (field u alloc-spill-kind))
+    (al-clear! [i64] (field u alloc-interval-start))
+    (al-clear! [i64] (field u alloc-interval-end))
+    (al-clear! [i64] (field u alloc-start-head))
+    (al-clear! [i64] (field u alloc-start-next))
+    (al-clear! [i64] (field u alloc-end-head))
+    (al-clear! [i64] (field u alloc-end-next))
+    (al-clear! [i64] (field u alloc-clobber-tree))
+    (al-clear! [i64] (field u alloc-fixed-tree))
+    (set! (.alloc-tree-capacity u) 0)
     (let [(mut i) 0]
       (loop (if (>= (load i) (n-count))
                 (break)
@@ -734,7 +872,16 @@
     (set! (.allocation-result u) MRA-OK)
     (set! (.allocation-item u) -1)
     (set! (.allocation-seed u) 0)
+    (set! (.work-kind-direct u) 0)
+    (set! (.work-memory-alias-candidates u) 0)
+    (set! (.work-memory-antidep-duplicate-probes u) 0)
     0))
+
+(defn mu-work-kind-direct [] (-> i64) (.work-kind-direct (machine-unit)))
+(defn mu-work-memory-alias-candidates [] (-> i64)
+  (.work-memory-alias-candidates (machine-unit)))
+(defn mu-work-memory-antidep-duplicate-probes [] (-> i64)
+  (.work-memory-antidep-duplicate-probes (machine-unit)))
 
 (defn mu-function-count [] (-> i64)
   (al-len [MFunction] (.functions (machine-unit))))
@@ -757,6 +904,9 @@
     (set! (.block-count p) 0)
     (set! (.return-first p) -1)
     (set! (.return-count p) 0)
+    (set! (.result-area-size p) 0)
+    (set! (.result-pointer-offset p) -1)
+    (set! (.outgoing-result-pointer-offset p) -1)
     (set! (.frame-size p) -1)
     (set! (.callee-mask p) 0)
     (set! (.callee-count p) 0)
@@ -809,6 +959,71 @@
     (set! (.temporary p) temporary)
     (load p)))
 
+(defn mloc-new [(kind i64) (class i64) (index i64)] (-> MLocation)
+  (let [p (primitive/alloc-stack MLocation)]
+    (set! (.kind p) kind)
+    (set! (.class p) class)
+    (set! (.index p) index)
+    (load p)))
+
+(defn mpm-new [(owner i64) (inst i64) (dst MLocation) (src MLocation)
+               (temporary bool)] (-> MParallelMove)
+  (let [p (primitive/alloc-stack MParallelMove)]
+    (set! (.owner p) owner)
+    (set! (.inst p) inst)
+    (set! (.dst-kind p) (.kind dst))
+    (set! (.dst-class p) (.class dst))
+    (set! (.dst-index p) (.index dst))
+    (set! (.src-kind p) (.kind src))
+    (set! (.src-class p) (.class src))
+    (set! (.src-index p) (.index src))
+    (set! (.temporary p) temporary)
+    (load p)))
+
+(defn mcall-bundle-new [(owner i64) (block-id i64) (call-inst i64) (anchor i64)
+                        (capture-first i64) (capture-count i64) (result-count i64)
+                        (result-area-size i64) (can-throw bool)] (-> MCallBundle)
+  (let [p (primitive/alloc-stack MCallBundle)]
+    (set! (.owner p) owner)
+    (set! (.block-id p) block-id)
+    (set! (.call-inst p) call-inst)
+    (set! (.anchor p) anchor)
+    (set! (.capture-first p) capture-first)
+    (set! (.capture-count p) capture-count)
+    (set! (.release-after p)
+          (if (> capture-count 0) (+ capture-first (- capture-count 1)) call-inst))
+    (set! (.result-count p) result-count)
+    (set! (.result-area-size p) result-area-size)
+    (set! (.can-throw p) can-throw)
+    (load p)))
+
+(defstruct MCallBundleTable
+  [(bundles (ArrayList MCallBundle)) (inst-bundle (ArrayList i64)) (inited bool)])
+(defn mcall-bundles [] (-> (ptr MCallBundleTable))
+  (let [p (primitive/alloc-static MCallBundleTable)]
+    (if (.inited p) 0
+        (do
+          (set! (.bundles p) (al-new [MCallBundle] (malloc-allocator)))
+          (set! (.inst-bundle p) (al-new [i64] (malloc-allocator)))
+          (set! (.inited p) true) 0))
+    p))
+(defn mu-call-bundle-count [] (-> i64)
+  (al-len [MCallBundle] (.bundles (mcall-bundles))))
+(defn mu-call-bundle [(which i64)] (-> (ptr MCallBundle))
+  (be-al-elem [MCallBundle] (field (mcall-bundles) bundles) which))
+(defn mu-inst-call-bundle [(inst i64)] (-> i64)
+  (al-get [i64] (.inst-bundle (mcall-bundles)) inst))
+
+(defn mu-abi-move-count [(inst i64)] (-> i64)
+  (al-get [i64] (.abi-move-count (machine-unit)) inst))
+(defn mu-abi-move [(inst i64) (which i64)] (-> (ptr MParallelMove))
+  (let [u (machine-unit) first (al-get [i64] (.abi-move-first u) inst)]
+    (be-al-elem [MParallelMove] (field u abi-moves) (+ first which))))
+(defn mu-abi-move-total [] (-> i64)
+  (al-len [MParallelMove] (.abi-moves (machine-unit))))
+(defn mu-abi-move-at [(which i64)] (-> (ptr MParallelMove))
+  (be-al-elem [MParallelMove] (field (machine-unit) abi-moves) which))
+
 (defn mu-function [(i i64)] (-> (ptr MFunction))
   (be-al-elem [MFunction] (field (machine-unit) functions) i))
 (defn mu-block [(i i64)] (-> (ptr MBlock))
@@ -860,6 +1075,12 @@
   (.block-count (mu-function i)))
 (defn mu-function-frame-size [(i i64)] (-> i64)
   (.frame-size (mu-function i)))
+(defn mu-function-result-area-size [(i i64)] (-> i64)
+  (.result-area-size (mu-function i)))
+(defn mu-function-result-pointer-offset [(i i64)] (-> i64)
+  (.result-pointer-offset (mu-function i)))
+(defn mu-function-outgoing-result-pointer-offset [(i i64)] (-> i64)
+  (.outgoing-result-pointer-offset (mu-function i)))
 (defn mu-function-code-start [(i i64)] (-> i64)
   (.code-start (mu-function i)))
 (defn mu-function-code-size [(i i64)] (-> i64)
@@ -1058,6 +1279,7 @@
     (set! (.b p) b)
     (set! (.imm p) imm)
     (set! (.node p) node)
+    (set! (.call-contract p) -1)
     (set! (.owner p) -1)
     (set! (.block-id p) -1)
     (set! (.mem-first p) -1)
@@ -1092,10 +1314,48 @@
     (set! (.memory p) memory)
     (set! (.terminator p) terminator)
     (set! (.encodable p) encodable)
+    (set! (.result-kind-mask p) 0)
+    (set! (.result-class-mask p) 0)
     (load p)))
 
+(defn mi-fixed-scalar-op? [(op i64)] (-> bool)
+  (case op MI-NEG true MI-ADD true MI-SUB true MI-MUL true MI-SDIV true
+        MI-EQ true MI-LT true MI-LE true MI-FMOVI true MI-SCVTF true
+        MI-FADD true MI-FSUB true MI-FMUL true MI-FDIV true MI-FNEG true
+        MI-FEQ true MI-FLT true MI-FLE true MI-FTRUTH true MI-MOD true
+        MI-BITAND true MI-BITOR true MI-BITXOR true MI-SHL true MI-SHR true
+        MI-USHR true MI-BITNOT true MI-I32FROMFP true MI-FMOD true MI-JSTEST true
+        false))
+
+(defn mi-fixed-fpr-result? [(op i64)] (-> bool)
+  (case op MI-FMOVI true MI-SCVTF true MI-FADD true MI-FSUB true
+        MI-FMUL true MI-FDIV true MI-FNEG true MI-FMOD true false))
+
+(defn mi-result-kind-mask-compute [(op i64) (outputs i64)] (-> i64)
+  (if (= outputs 0) 0
+      (if (= op MI-NEW) (<< 1 MLK-RAW-MANAGED)
+          (if (= op MI-JSBOX) (<< 1 MLK-BOXED)
+              (if (mi-fixed-scalar-op? op) (<< 1 MLK-SCALAR)
+                  MV-KIND-MASK-ALL)))))
+
+(defn mi-result-class-mask-compute [(op i64) (outputs i64)] (-> i64)
+  (if (= outputs 0) 0
+      (if (mi-fixed-fpr-result? op) (<< 1 MRC-FPR)
+          (if (or (= op MI-JSUNBOX)
+                  (or (= op MI-LOAD)
+                      (or (= op MI-COPY)
+                      (or (= op MI-ABI-COPY)
+                          (or (= op MI-ARG)
+                              (or (= op MI-STACKARG)
+                                  (or (= op MI-CALL)
+                                      (or (= op MI-CALL-RESULT)
+                                          (= op MI-RESULT-MATERIALIZE)))))))))
+              MV-CLASS-MASK-ALL
+              (<< 1 MRC-GPR)))))
+
 (defn mi-desc-compute [(op i64)] (-> MOpcodeDesc)
-  (case op MI-MOVI
+  (let [p (primitive/alloc-stack MOpcodeDesc)]
+    (store! p (case op MI-MOVI
         (mi-desc-new 0 1 0 false false false true) MI-ARG
         (mi-desc-new 0 1 0 true false false true) MI-NEG
         (mi-desc-new 1 1 0 false false false true) MI-ADD
@@ -1115,14 +1375,18 @@
         (mi-desc-new 1 0 1 true false true true) MI-B
         (mi-desc-new 0 0 1 true false true true) MI-LABEL
         (mi-desc-new 0 0 1 true false false true) MI-CSEL
-        (mi-desc-new 3 1 0 false false false true) MI-MOV
-        (mi-desc-new 1 1 0 false false false true) MI-COPY
+        (mi-desc-new 3 1 0 false false false true) MI-RESULT-MATERIALIZE
+        (mi-desc-new 1 1 1 true false false true) MI-COPY
         (mi-desc-new 1 1 0 true false false true) MI-CALL
         (mi-desc-new 1 1 3 true true false true) MI-STACKARG
         (mi-desc-new 0 1 0 true false false true) MI-ABI-COPY
-        (mi-desc-new 1 1 0 true false false true) MI-JSBOX
+        (mi-desc-new 0 1 0 true false false true) MI-CALL-RESULT
+        (mi-desc-new 1 1 1 true false false true) MI-JSBOX
+        ;; Boxing is a pure representation conversion: it applies a tag to an already produced
+        ;; word and cannot allocate, trap, or mutate runtime state. Pinning it to the first demand
+        ;; block makes shared constants branch-local and breaks dominance at later joins.
         (mi-desc-new 1 1 0 false false false true) MI-JSUNBOX
-        (mi-desc-new 1 1 0 false false false true) MI-JSTEST
+        (mi-desc-new 1 1 1 true false false true) MI-JSTEST
         (mi-desc-new 1 1 0 false false false true) MI-FMOVI
         (mi-desc-new 0 1 0 false false false true) MI-SCVTF
         (mi-desc-new 1 1 0 false false false true) MI-FADD
@@ -1147,10 +1411,18 @@
         (mi-desc-new 2 1 3 false false false true) MI-JSPROP
         (mi-desc-new 2 1 3 true true false true) MI-JSARRAY
         (mi-desc-new 2 1 3 false false false true) MI-JSSTRING
-        (mi-desc-new 2 1 3 false false false true) (mi-desc-new -1 -1 0 false false false false)))
+        (mi-desc-new 2 1 3 false false false true)
+        (mi-desc-new -1 -1 0 false false false false)))
+    (set! (.result-kind-mask p)
+          (mi-result-kind-mask-compute op (.outputs p)))
+    (set! (.result-class-mask p)
+          (mi-result-class-mask-compute op (.outputs p)))
+    (load p)))
 
 (defstruct MDescCache
-  [(descs (array MOpcodeDesc 52))
+  ;; Opcode growth must not require a second hand-maintained array extent. A dynamic table also
+  ;; avoids asking Coil to synthesize a larger aggregate static initializer for struct values.
+  [(descs (ArrayList MOpcodeDesc))
    (inited bool)])
 
 ;; mi-desc sits inside the per-instruction scans of selection, liveness, and the verifiers;
@@ -1160,20 +1432,26 @@
     (if (.inited c)
         0
         (let [(mut i) 0]
+          (set! (.descs c) (al-new [MOpcodeDesc] (malloc-allocator)))
           (loop (if (>= (load i) MI-OPCODE-COUNT)
                     (break)
                     (do
-                      (set! (index (field c descs) (load i)) (mi-desc-compute (load i)))
+                      (al-push! [MOpcodeDesc]
+                                (field c descs)
+                                (mi-desc-compute (load i)))
                       (set! i (+ (load i) 1))
                       0)))
           (set! (.inited c) true)
           0))
     (if (or (< op 0) (>= op MI-OPCODE-COUNT))
         (mi-desc-compute op)
-        (load (index (field c descs) op)))))
+        (load (be-al-elem [MOpcodeDesc] (field c descs) op)))))
 
 (defstruct MInputsCache
-  [(inputs (array i64 52))
+  ;; This table used to be a fixed array whose extent silently lagged
+  ;; MI-OPCODE-COUNT.  Keep it dynamically sized so adding or repurposing an
+  ;; opcode cannot turn descriptor lookup into an out-of-bounds write.
+  [(inputs (ArrayList i64))
    (inited bool)])
 
 ;; The input-operand count alone, as a raw table. Operand-membership queries in the scheduler's
@@ -1184,22 +1462,29 @@
     (if (.inited c)
         0
         (let [(mut i) 0]
+          (set! (.inputs c) (al-new [i64] (malloc-allocator)))
           (loop (if (>= (load i) MI-OPCODE-COUNT)
                     (break)
                     (do
-                      (set! (index (field c inputs) (load i)) (mi-desc-inputs (mi-desc-compute (load i))))
+                      (al-push! [i64]
+                                (field c inputs)
+                                (mi-desc-inputs (mi-desc-compute (load i))))
                       (set! i (+ (load i) 1))
                       0)))
           (set! (.inited c) true)
           0))
     (if (or (< op 0) (>= op MI-OPCODE-COUNT))
         (mi-desc-inputs (mi-desc-compute op))
-        (load (index (field c inputs) op)))))
+        (al-get (.inputs c) op))))
 
 (defn mi-desc-inputs [(d MOpcodeDesc)] (-> i64)
   (.inputs d))
 (defn mi-desc-outputs [(d MOpcodeDesc)] (-> i64)
   (.outputs d))
+(defn mi-desc-result-kind-mask [(d MOpcodeDesc)] (-> i64)
+  (.result-kind-mask d))
+(defn mi-desc-result-class-mask [(d MOpcodeDesc)] (-> i64)
+  (.result-class-mask d))
 (defn mi-desc-temporaries [(d MOpcodeDesc)] (-> i64)
   (.temporaries d))
 (defn mi-desc-clobbers [(d MOpcodeDesc)] (-> i64)

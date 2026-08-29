@@ -3,6 +3,8 @@ import fs from "node:fs";
 const input = process.argv[2] ?? "test262-results-observed-full-2026-08-24.jsonl";
 const output = process.argv[3] ?? "test262-full-breakdown-2026-08-24.json";
 const rows = fs.readFileSync(input, "utf8").trim().split("\n").filter(Boolean).map(JSON.parse);
+const summaryPath = `${input}.summary.json`;
+const runSummary = fs.existsSync(summaryPath) ? JSON.parse(fs.readFileSync(summaryPath, "utf8")) : null;
 const increment = (object, key) => object[key] = (object[key] ?? 0) + 1;
 const sorted = object => Object.fromEntries(Object.entries(object).sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0])));
 const relativePath = path => {
@@ -62,7 +64,13 @@ function reason(row) {
 }
 
 const report = {
-  metadata: { input, totalRecords: rows.length, runTimingMs: { build: 7072, execution: 939302, total: 946374 }, executedVariants: 81927 },
+  metadata: {
+    input,
+    totalRecords: rows.length,
+    ...(runSummary?.metadata?.timingMs ? { runTimingMs: runSummary.metadata.timingMs } : {}),
+    ...(Number.isInteger(runSummary?.metadata?.executedVariants) ?
+      { executedVariants: runSummary.metadata.executedVariants } : {}),
+  },
   outcomes: {}, variants: {}, statusByArea: {}, failureReasons: {}, failureReasonsByArea: {},
   pathPrefix2Failures: {}, pathPrefix3Failures: {}, throwNames: {}, referenceErrorBindings: {},
   assertionMessages: {}, opaqueThrowPaths: {},

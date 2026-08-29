@@ -1,3 +1,1637 @@
+# 2026-08-28: the backend is a closed product and retained JSL links by source reachability
+
+- Final allocator hardening records both CFG boundaries in conservative intervals: live-in at
+  block entry and live-out at the exclusive block exit. Exact reverse-CFG verification now rejects
+  any destination write that clobbers a different live-after value. Allocation-phase failures stop
+  publication and cannot be reset by the verifier.
+- The final bounded gate is green at **81/81**. The 129-function / 74,975-block / 98,389-edge seed
+  reports selection **0.429 s**, scheduling **0.187 s**, liveness **0.849 s**, allocation
+  **1.008 s**, encoding **0.086 s**, and publication **0.776 s**. The warm nine-block allocation is
+  **0.027 ms**. The frontier remains honestly red at **0/1** for
+  `for-await-has-no-bridge-kind.js`.
+- Exhaustive validation was not green: it reached nine named failures, none an allocation-verifier
+  failure, and was stopped when one exhaustive case ran for 22 minutes without output. The log is
+  `/tmp/aotk-full-coherent.log`; this result is recorded explicitly rather than claimed as a pass.
+
+- MachineValue rows are now authoritative at construction: definition kind, provenance payload,
+  representation, register class, Phi block, call result slot, and ABI constraints are verified
+  before later phases consume them. Late kind/class reconstruction was replaced by opcode result
+  contracts and an independent verifier.
+- Scheduling and memory dependencies use owner-local sparse indexes. Liveness and allocation use
+  frozen owner-local products; allocation no longer constructs an interference graph. Encoding
+  reads dense allocation and function-range tables. The AArch64 instruction-scan compatibility
+  path and its dead fallback counters are deleted.
+- Retained artifacts are schema/compiler/runtime/target/options/JSL-identity keyed and protected by
+  a final digest. The linker constructs one open-addressed semantic identity index and traverses
+  CALL, ADDRESS, and CALLABLE_ID relocations from the current entry. Only reachable functions,
+  symbols, stack maps, roots, and external relocations enter the executable image.
+- `tests/backend-object-test.coil` is green at 27/27 and explicitly distinguishes a reusable
+  cache-only archive from an executable rooted image. The seed gate proves a full retained library
+  links to a smaller reachable image and still executes `main(7) == 8`.
+- Required validation: `coil test` is green at **81/81**. The final measurements and exhaustive
+  status are recorded above. The required frontier is honestly red at **0/1**, solely
+  `for-await-has-no-bridge-kind.js`.
+
+# 2026-08-28: frozen liveness/allocation and linear encoder publication meet the backend budget
+
+- The large immutable-seed witness now reports liveness **0.849 s**, allocation **0.599 s**, and
+  AArch64 encoding **0.083 s** for 129 functions, 74,975 blocks, and 98,389 CFG edges. Liveness and
+  allocation are therefore below the one-second cold-phase ceiling; a warm nine-block program
+  remains in tens of microseconds.
+- Allocation's obsolete interference graph, corruption hooks, and expected-edge verifier product
+  are gone. Production constraints are frozen OR-range indexes over instruction clobbers and fixed
+  ABI definitions; the independent verifier replays exact register liveness and call clobbers.
+- Liveness edge verification applies each edge copy once, and verifier scratch is allocated once
+  at the maximum owner-local word width instead of being rebuilt per block and edge.
+- x64 label and entry-owner queries now require their dense encoder tables. x64 and AArch64 publish
+  exact function text ranges with one pass over the scheduled instruction stream instead of a
+  quadratic function-start comparison.
+- The bounded gate is green at **81/81**. The required frontier remains honestly red at **0/1** for
+  `for-await-has-no-bridge-kind.js`. The overall refactor is not complete: creation-time typed
+  MachineValues, removal of the AArch64 legacy fixture adapter/default class, and content-addressed
+  reachable JSL artifact keys remain explicit work.
+
+# 2026-08-28: backend scaling refactor removes the provenance and dense-interference cliffs
+
+- `docs/BACKEND-SCALING-REFACTOR.md` is now the active implementation contract. Backend timing is
+  split into exclusive local-scheduling and liveness phases, and always-on counters expose kind,
+  definition, and memory rediscovery work.
+- Machine-value provenance is persistent metadata. It is no longer invalidated when the mutable
+  node-selection cache is overwritten or an ideal node dies. Logical call-result materialization
+  takes its representation from its projection, not from the raw ABI snapshot. The Symbol witness
+  that previously spent more than twelve minutes in `ml-kind-for-vreg-scan` no longer enters that
+  scan; focused liveness is green at 17/17.
+- Allocation no longer allocates owner-local quadratic packed interference rows. Exact sparse
+  adjacency is deduplicated in destination batches with generation marks, avoiding a general hash
+  lookup for every live-overlap candidate. Its independent verifier rebuild remains sparse and
+  detects deliberate corruption. Focused allocation is green at 10/10.
+- The exact `generated_symbol_constructor_data_descriptors_are_exact` native differential passes
+  in 30.79 seconds and its generated program reaches first output in 16.6 ms. This is a large
+  reduction, not the finish line: it still builds 238,048 ideal nodes, 59,127 blocks, and 6,015,012
+  code bytes for tiny source.
+- The required bounded gate is green at 81/81. Its 129-function / 74,975-block seed reports
+  selection 7.416 s, local scheduling 0.385 s, liveness 1.417 s, allocation 17.125 s, AArch64
+  encoding 0.095 s, and seed compilation 34.305 s. The required frontier is honestly red at 0/1
+  for only `for-await-has-no-bridge-kind.js`. These measurements make typed MachineValue closure,
+  sparse liveness/allocation work, and the reachable immutable JSL artifact the remaining work;
+  none of those costs is accepted as complete.
+
+# 2026-08-28: generated Symbol prototype publication proves the general method/accessor model
+
+- The intrinsic property schema now supports constructor and prototype targets plus three checked
+  property kinds: well-known-symbol values, methods, and accessors. Accessors declare a named
+  getter, an optional named setter, and exact enumerable/configurable attributes; generated roots
+  create stable closures and explicitly install `undefined` when the setter is absent.
+- `%Symbol.prototype%.valueOf`, `%Symbol.prototype%.toString`, and
+  `%Symbol.prototype%.description` now join `%Symbol%.for`, `%Symbol%.keyFor`, and the fifteen
+  well-known symbols in generated publication. The support manifest therefore claims exactly 20
+  migrated properties. Their algorithms remain in `lib/symbol/core.jsl`; the manifest owns
+  publication identity and descriptors.
+- The frontend now preserves general semantic owner kinds for callable values and Property
+  Descriptor objects, including through local variables and call results. Their observable
+  properties use JSL property semantics and cannot be redirected to an unrelated compatible
+  shaped field. Focused native differentials prove function name/length metadata, method and
+  accessor attributes, getter name/length, absent setter behavior, and a decoy ordinary
+  `{set: 123}` object.
+- The absent-setter witness exposed a fundamental GVN defect: `PropLoadKey` and `PropStoreKey`
+  omitted their property-component operation number from `op-encode-payload`, allowing an
+  otherwise identical `.get` and `.set` load (or two descriptor stores) to merge. The operation is
+  now part of node identity, with a low-level regression proving equal operations deduplicate while
+  different component operations remain distinct. No Symbol- or accessor-specific optimizer path
+  was added.
+- Subsequent isolation disproved the prior shaped-field diagnosis for the frontier disagreement.
+  Callable property reads passed independently, and regenerating the frontier after the GVN fix
+  proved that the complete combined logical-OR interaction now agrees with Node too. Its exact
+  source is retained in `tests/native-execution-test.coil`; the open repro and frontier registration
+  were removed only after that permanent differential was in place. The frontier therefore returns
+  to the sole genuine `for await` refusal. The older entry immediately below is superseded on both
+  diagnosis and current status. Ledger generation and its gate are green. The regenerated frontier
+  report is current and `coil test --suite frontier` is intentionally red at exactly 0/1 for the
+  named `for await` refusal. The bounded `coil test` gate is green at 80/80; its immutable seed
+  retained/restored 122 records and completed the native execution witness after roughly 537
+  seconds of seed compilation.
+
+# 2026-08-28: generated intrinsic publication now includes callable method roots
+
+- The intrinsic property schema now supports validated `method` descriptors in addition to
+  well-known-symbol values. A method descriptor names its constructor/prototype target, callable,
+  independently demand-loadable root, observable function name and length, and exact writable,
+  enumerable, and configurable attributes.
+- `%Symbol%.for` and `%Symbol%.keyFor` are the first migrated methods. Generated
+  `SymbolForValue`/`SymbolKeyForValue` roots create stable closures, install their function
+  metadata and `5` (`writable`, non-enumerable, configurable) property mask, and provide generated
+  frontend routing. `SymbolConstructorValue` composes those roots; its duplicated handwritten
+  method installation is gone. The support report now counts 17 deliberately migrated properties.
+- Generator validation is 9/9 green, the exact 486-declaration whole-library load/lower witness is
+  green, and independent native differentials agree with Node for Symbol registry identity and
+  method/function descriptor metadata. The provenance/coverage chain and
+  `npm run spec:ledger:gate` are green.
+- A combined witness initially appeared to expose shaped-field contamination of callable
+  properties. The newer entry above records the isolating evidence and corrected diagnosis:
+  callable and Property Descriptor semantic boundaries are independently green, while the retained
+  combined failure belongs to logical-OR control flow.
+- Post-tranche `coil test` is green at 80/80. The immutable seed retained/restored 119 callable
+  records, completed its native witness, and spent about 491 seconds in scheduling. The required
+  frontier was intentionally red at exactly 0/2: the then-misdiagnosed combined disagreement
+  (`ours=104`, Node=`7`) and the existing named `for await` refusal. The newer entry supersedes its
+  bug name and diagnosis.
+
+# 2026-08-28: the first intrinsic property family is generated end to end
+
+- `%Symbol%`'s fifteen standard well-known-symbol data properties now live in
+  `spec/intrinsics.json`, including description, implementation root, and exact writable,
+  enumerable, and configurable attributes. The support report counts exactly those fifteen—not an
+  inferred or aspirational property surface.
+- The generator now emits `lib/generated/intrinsic-publication.jsl`. Each property gets one
+  independently demand-loadable builtin that obtains the stable root and installs its descriptor
+  attributes. It also emits frontend `(intrinsic, property) -> JSL root` routing, replacing the
+  handwritten `Symbol.replace` and `Symbol.toPrimitive` cases and covering all fifteen entries.
+- `SymbolConstructorValue` composes the same generated roots, so whole-constructor and focused
+  publication share identity instead of maintaining two implementations. ArrayBuffer and
+  TypedArray continue to request only the roots they need.
+- Generator/schema tests cover duplicate keys, complete attributes, deterministic generated JSL,
+  generated routing, and exact support counts. The 484-declaration whole-library lowering witness
+  is green. Focused native tests prove repeated root identity, distinct roots, exact `species`
+  descriptor attributes, ArrayBuffer caught RangeErrors, and TypedArray backing-buffer accessors.
+- The regenerated provenance/coverage chain and `npm run spec:ledger:gate` are green. The bounded
+  gate after this value-property slice was green at 80/80; its frontier was exactly the one
+  `for-await-has-no-bridge-kind.js` refusal. The newer method tranche above supersedes that evidence.
+
+# 2026-08-28: declarative intrinsic lowering begins at Torque-style root granularity
+
+- `spec/intrinsics.json` now owns the exact 25 currently published global identities plus one
+  lowering record for each: lowering family, runtime constructor kind, callability, and
+  constructability. `tools/intrinsic-manifest.mjs` validates the one-to-one relation and generates
+  the compiler constants/queries and `spec/generated/intrinsic-support.json` deterministically.
+- Error subclasses no longer collapse to the `%Error%` frontend symbol. `%Error%`, `%EvalError%`,
+  `%RangeError%`, `%ReferenceError%`, `%SyntaxError%`, `%TypeError%`, and `%URIError%` have distinct
+  generated identities and runtime kinds while selecting one generated `error` lowering family.
+  Error construction no longer derives kind from AST spelling.
+- ArrayBuffer's invalid-length regression initially looked like an exception-routing failure. A
+  focused direct-catch witness and runtime transport tracing proved the throw had not occurred:
+  ArrayBuffer publication invoked the entire `SymbolConstructorValue` merely to obtain
+  `Symbol.species` and `Symbol.toStringTag`, and that unrelated initializer reached a missing
+  Symbol internal-slot read. ArrayBuffer and TypedArray now request independent
+  `SymbolSpeciesValue` and `SymbolToStringTagValue` roots. This is the Torque-style root-table
+  boundary, not an ArrayBuffer exception workaround.
+- The original loop/catch/`instanceof RangeError` regression, an exception-routing-only variant,
+  a single invalid-length catch, Error identity, and TypedArray backing-buffer publication all
+  compile, execute natively, and agree with Node. The focused ArrayBuffer graph fell from roughly
+  157k nodes/31 functions to 73k nodes/26 functions because unrelated `%Symbol%` publication is no
+  longer in its dependency closure.
+- Runtime fatal diagnostics now distinguish frozen mutation, missing internal-slot access, and
+  invalid direct array-length mutation. This made the actual failing primitive observable without
+  changing exception behavior.
+- `npm run spec:ledger:gate` is green after deterministic provenance/coverage regeneration.
+  `coil test` is green at 80/80; the immutable seed retained/restored 104 records and executed its
+  native witness. `coil test --suite frontier` remains intentionally red for exactly
+  `for-await-has-no-bridge-kind.js`.
+- The manifest still deliberately claims zero published properties. Static/prototype property
+  descriptors, well-known-symbol entries, callable adapters, and the rest of the standard
+  intrinsic inventory are the next Phase 3 work; this tranche does not claim that exit gate.
+
+# 2026-08-28: the full Torque-style model clears the bounded exit gate
+
+- Throwing calls now use the full Torque-style outcome model already specified in
+  `docs/TORQUE-STYLE-LOWERED-VALUES.md`: unconditional raw ABI snapshots, explicit normal and
+  exceptional continuations, and logical result materialization restricted to the normal edge.
+  PropertyDescriptor Records remain typed and flattened across the 28-slot internal call.
+- Global code motion now resolves earliest placement recursively from actual producers rather
+  than repeatedly rescanning the whole machine unit. Pure boxed-value tagging is movable, string
+  constants are anchored in their function entry block, and sibling inputs may meet only at a
+  selected block that both definitions dominate.
+- The focused native regression
+  `configurable_data_property_can_become_an_accessor_after_a_wide_throwing_descriptor_call`
+  compiles 190,956 machine instructions across 21 functions, links a 5 MB Mach-O image, executes
+  `main(7)`, and agrees with Node at 9. This is the previously blocked descriptor-kind transition,
+  not a reduced mock operation.
+- That witness exposed a general AArch64 size-model mismatch. Polymorphic-call sizing counted two
+  fixed words that emission does not produce, while ABI parallel-move sizing counted register and
+  scratch no-ops that emission omits. The sizing functions now mirror the shared emitter exactly;
+  no descriptor-specific encoder path was added.
+- The seed's dead Loop backedge was a lowering ownership bug, not an optimizer repair problem.
+  `recur` parked its values and memory with explicit pins but left its control only in a Coil-side
+  array; scope collection could therefore delete a normal CProj before the Loop acquired it as a
+  backedge. Parked control now owns the matching pin, `n-add-def!` and `n-set-def!` reject dead
+  definitions at the mutation boundary, and
+  `a_recur_parks_its_normal_control_until_the_loop_closes` is the focused regression.
+- Controlled call projections now remain the ideal identity of `MI-RESULT-MATERIALIZE`, whose GCM
+  anchor is the projection's proven-normal continuation. Raw `MI-CALL-RESULT` captures remain
+  unconditional beside the call. Structural projection shape—not fallible direct-target
+  inference—prevents indirect throwing calls from also publishing an unchecked materialization.
+- The newly reachable whole-library path exposed two independent backend invariants. Call-bundle
+  release ordering now excludes prologue instructions, avoiding the real cycle
+  `Parm -> call -> capture -> Parm`; and float Unbox elision now requires a physically raw numeric
+  representation, not merely a graph type whose consumers happen to be floating point.
+- The reusable JSL seed compiles, selects, schedules, allocates, encodes, serializes, restores in a
+  clean compiler process, and executes its native witness. The small throwing multi-result witness
+  is green. `coil test` is green at 79/79. `coil test --suite frontier` remains intentionally red
+  for exactly `for-await-has-no-bridge-kind.js`.
+- The whole-library seed currently spends about 533 seconds in scheduling and about 33 seconds in
+  allocation on this machine. That is acceptable as an exit witness but reinforces the plan's
+  focused-test ladder: per-operation work must use bounded graph/selection/native witnesses rather
+  than recompiling the entire immutable library.
+
+# 2026-08-28: Stage 7 groundwork makes effects and conversions signature-owned
+
+- `JslSignature` now owns the declaration's effect facts (`transitioning`, `cold`, heap use,
+  callback use, and `canthrow`) beside its logical and physical type vectors. Library identity
+  hashes all five facts. The outcome ABI can therefore be derived from retained compatibility
+  metadata rather than body scans or poison-tuple recognition.
+- Ideal Fun ABI metadata now carries an explicit `canthrow` bit. JSL function opening publishes it,
+  and focused node/JSL tests pin both the default non-throwing contract and a transitive throwing
+  Record-returning builtin.
+- Canonical value conversion is enforced at internal calls as well as Record construction. Exact
+  Record schema matches pass their already-normalized leaves unchanged; scalar `dyn -> dyn` also
+  remains unchanged. Only a raw logical scalar crossing into `dyn` is boxed. A graph assertion
+  pins that a flattened dyn Parm does not become `Box(Parm dyn)`.
+- `ValidateAndApplyPropertyDescriptor` still reaches the intended throw and currently loses it at
+  the pending-outcome/catch boundary. Stage 7 remains open: the new effect bit must next propagate
+  through retained function artifacts and machine call bundles, then drive normal-edge-only result
+  materialization.
+
+# 2026-08-28: full Torque-style ABI ownership fixes value transport; Stage 7 remains explicit
+
+- Machine IR now retains one declaration-authoritative class beside every call argument. The
+  source vreg still determines how its bits are snapshotted, but the callee's lowered signature
+  determines the GPR/FPR ordinal and overflow location. Representation refinement can therefore
+  never rewrite a declared calling convention.
+- Both AArch64 and x86-64 consume that retained class vector. The selector verifies the argument
+  and class tables have identical extent. A native regression starts with a double in an FPR,
+  passes its exact bits through a declared GPR parameter, and observes them unchanged.
+- Canonical Record construction is now source- and destination-aware. A raw scalar leaf entering a
+  `dyn` field is boxed once; an already-`dyn` parameter is already tagged and remains unchanged.
+  The former unconditional rule produced `Box(Parm dyn)` and replaced PropertyDescriptor values
+  with `undefined` at runtime.
+- `ValidateAndApplyPropertyDescriptor` now stores the requested fixed value and raises the intended
+  TypeError for its illegal redefinition. That throw currently escapes rather than reaching the
+  source catch, independently confirming the remaining Stage 7 requirement: model normal and
+  exceptional call outcomes explicitly and materialize normal result projections only on the
+  normal edge.
+- Focused Record and cross-class ABI witnesses pass. Bounded gate: 78/78. Frontier remains the
+  exact intentional failure `for-await-has-no-bridge-kind.js`.
+
+# 2026-08-28: Stage 7 defines abrupt wide-call invariants and exposes the missing outcome split
+
+- `ValidateAndApplyPropertyDescriptor` is now a called internal builtin instead of a macro. Its
+  28 physical arguments are the canonical flattening of three scalar inputs, one 12-leaf
+  `PropertyDescriptor`, and one 13-leaf `MaybePropertyDescriptor`; no runtime descriptor Object or
+  macro-only workaround crosses the boundary.
+- This turns the previous four mapped Test262 timeouts into bounded compiler/runtime evidence. The
+  first compiler defect was a stale verifier cap: selector construction supports 32 call arguments
+  while `ms-call-args-valid?` rejected more than 16. `M-CALL-MAX-ARGS` now names the shared limit,
+  and a direct 28-argument selection/verifier witness pins it.
+- Exception jump targets now declare captured-cell memory before lowering their bodies. The focused
+  regression proves a caught throw preserves `n` for a closure created afterward; previously
+  `main(7)` returned 2 instead of 9. The phi-copy verifier also validates availability at the
+  source terminator rather than the half-open block end, which belongs to an unrelated block.
+- Every Return from a multi-result builtin now conforms to its canonical physical signature.
+  Exceptional pending-flag Returns carry the marker in slot zero and representation-correct poison
+  in the remaining slots; a focused two-result test pins the exact arity and graph verification.
+- The complete descriptor witness now builds, selects, allocates, encodes, and links. Its remaining
+  runtime failure is narrower and architectural: normal-result capture still executes immediately
+  after an abrupt wide call, before the caller branches on pending status, and can clobber state
+  live only on the catch edge. Stage 7 therefore requires an explicit normal/exceptional call
+  outcome in the machine model, with wide result materialization owned by the normal edge.
+- A separate raw AArch64 forward-call encoding issue was exposed by an exploratory native micro-
+  witness, recorded in the project pad, and deliberately not coupled to this change. Exploratory
+  encoder edits were reverted.
+- Bounded gate: 78/78. Frontier remains intentionally red for exactly
+  `for-await-has-no-bridge-kind.js`.
+
+# 2026-08-28: Stage 6 closes on one retained canonical signature
+
+- `JslDecl` no longer stores parallel parameter-count, lowered-count, return-type, and Record-return
+  fields. It owns one `JslSignature` containing the logical source signature and exact offsets into
+  retained physical parameter and result type vectors.
+- Every existing declaration accessor is now a view over that object. Function ABI opening reads
+  the flat retained parameter vector directly; calls and function entry validate the signature;
+  result capture and Return lowering consume its retained result vector. Immutable library identity
+  fingerprints both physical vectors.
+- `jsl-signature-valid?` proves logical parameter ranges, physical offsets and widths, Record leaf
+  types, result shape, and vector bounds agree. The focused ABI witness deliberately damages the
+  physical arity, observes rejection, restores it, and then completes normal lowering.
+- Together with generic branch/loop transport, this removes the provisional Record-only lowering
+  paths required by Stage 6. Scalar public frontend APIs remain explicit checked adapters, not an
+  alternate JSL value model. Bounded gate: 78/78. Frontier remains intentionally red for exactly
+  `for-await-has-no-bridge-kind.js`.
+
+# 2026-08-28: control flow now transports lowered values generically
+
+- Branch joins now validate and transport `JslLoweredValue` descriptors as physical slot ranges.
+  The old Record join recursion and the separate Record-List/scalar reconstruction branches are
+  deleted. One generic join emits one Phi per descriptor slot and reconstructs the result from its
+  prototype descriptor.
+- Loop headers obtain aggregate Phi types through the same checked slot-type query, and loop
+  bindings reconstruct scalar, Record, and Record-List values through one
+  `jl-lowered-from-slots-like!` operation. Concrete-kind knowledge remains only at legitimate
+  construction, field-access, and storage-materialization boundaries.
+- Focused control-flow witnesses: 5/5. Bounded gate: 78/78. Frontier remains intentionally red for
+  exactly `for-await-has-no-bridge-kind.js`.
+
+# 2026-08-28: Stage 5 closes with an executed abrupt multi-result caller
+
+- A runtime-linked native witness now executes the exceptional half of a two-result internal call.
+  The callee raises boxed `40`, returns through descriptor 104, and the caller checks descriptor
+  101 before consuming normal projections, takes and clears the thrown value through descriptor
+  102, and returns 42.
+- The same compiled image is re-entered on its normal path and consumes `[40, 2]` to return 42,
+  proving that the pending exception was cleared and that both outcomes share one exact lowered
+  signature and machine call bundle.
+- Focused multi-result transport: 4/4; backend object: 26/26; native GC: 9/9. Stage 5 of the
+  accepted fully Torque-style design is complete; Stage 6 now owns removal of the remaining
+  Record-specific and numeric-handle lowering paths.
+- Stage 6 has started at the public inline seam. `jsl-inline-lowered!` now accepts and returns
+  `JslLoweredValue` descriptors, validates Record schema identity, and preserves every result leaf
+  across scope teardown. The old `jsl-inline!` is only a checked scalar frontend adapter.
+- A focused witness passes a two-leaf Record through `ReplaceRight`, consumes the returned Record,
+  and verifies zero `New` nodes. Bounded gate: 77/77. Frontier remains intentionally red with
+  exactly `for-await-has-no-bridge-kind.js`.
+- The internal call seam now returns `JslLoweredCall`, pairing the effect/control `CallSite` with
+  its canonical `JslLoweredValue`. Record projections are constructed exactly once inside the
+  call boundary; `jl-builtin-call` no longer re-reads return metadata and reconstructs them.
+  `jsl-call-lowered-with-memory!` remains a checked site-only adapter for graph clients.
+- A second public-boundary witness calls `MakePair`, receives one exact two-slot Record descriptor,
+  consumes both leaves, and proves two projections with zero allocation. Bounded gate: 78/78;
+  frontier is unchanged and honest.
+- Function entry and return now use the same convention. `jl-lowered-parameter!` reconstructs
+  scalar or nested-Record parameters from the declaration's canonical slot range; one indexed
+  lowered-result API drives function ABI opening, call capture, result validation, and Return
+  flattening. The old scalar-vs-Record return construction branch is deleted.
+- Successful lowering must now match that exact declared result descriptor. A separately recorded
+  lowering diagnostic is intentionally not relabelled corruption; the bounded negative loop test
+  caught and pinned that distinction. Bounded gate remains 78/78, with the exact one-bug frontier.
+
+# 2026-08-28: first-class call bundles and native memory-channel transport
+
+- `MCallBundle` now owns each call's instruction, anchor, exact capture range, outgoing-frame
+  release boundary, logical result count, and result-area size. Selection constructs and verifies
+  the table, scheduling rebuilds it after repacking, and every call/capture instruction has one
+  reverse-mapped bundle owner.
+- Scheduling, post-allocation parallel-copy construction, and both target encoders consume bundle
+  boundaries instead of rediscovering multi-result groups by adjacent opcodes.
+- Seeded function layout is also an instruction-publication boundary: it now rebuilds and verifies
+  bundle indices after reordering function text. The three-function multi-seed object witness
+  catches stale descriptor maps before allocation or encoding can consume them.
+- A real native memory witness calls a two-result function which stores `1` through a caller-owned
+  object address, returns `[39, 2]` plus memory, and requires a post-call load to produce 42. A
+  throwing two-result target also retains one descriptor-104 exceptional Return while its normal
+  path executes natively to 42. Actual native execution of the abrupt path remains open.
+- Backend object: 26/26; native GC: 9/9; focused native multi-result/memory/throwing-normal:
+  3/3; bounded gate: 76/76. Frontier remains intentionally red with exactly
+  `for-await-has-no-bridge-kind.js`.
+- One separate open harness gap is recorded in the project pad: the raw mmap branch-call witness
+  cannot resolve the correctly selected `ValueTruthy` external runtime operation. It must gain the
+  real runtime-symbol linking contract; truthiness normalization and test assertions must remain.
+
+# 2026-08-28: caller-owned overflow results execute and are typed GC roots
+
+- Both AArch64 and x86-64 now implement the wide-result ABI from the accepted Torque-style design:
+  the caller owns an aligned overflow area, passes an explicit hidden pointer, retains the outgoing
+  frame through result capture, and the callee stores overflow leaves through its saved pointer.
+- Stackmap version 5 adds typed indirect result-area roots. Direct Mach-O publication and retained
+  function-text linking derive the same roots, serialize them per call site, and independently
+  verify them; the runtime relocator follows the caller's stable pointer slot to each result word.
+- A ten-result witness returns eight register values plus two boxed overflow values, checks both
+  typed roots in both metadata paths, encodes on x86-64, and executes natively to 42. The object
+  witness also removed a scalar-assumption leak: multi-result internal functions now have an
+  explicit non-JavaScript-dispatch code instead of being queried for one scalar return type.
+- Focused backend-object: 26/26; native GC: 9/9; bounded gate: 76/76. Frontier remains
+  intentionally red with exactly `for-await-has-no-bridge-kind.js`.
+
+# 2026-08-28: one post-allocation parallel-copy phase owns multi-result transport
+
+- Multi-result captures and returns now become typed post-allocation moves among fixed registers,
+  allocated registers, spill slots, and a class-compatible reserved scratch location. One
+  target-independent resolver removes identities, emits acyclic leaves, and breaks cycles.
+- Per-instruction resolved ranges are verified independently for exact owner/instruction identity,
+  bounds, matching register class, and valid register/spill/scratch locations. AArch64's exact word
+  model and both AArch64/x86-64 encoders consume the resolved table rather than implementing their
+  own slot loops.
+- Result-specific allocator exclusion masks are deleted. Unrestricted coloring makes the native
+  `Pair<int, int>` witness exercise a real raw-result cycle; the test requires a temporary scratch
+  move and the generated native code still returns 42.
+- The 101-function retained JSL clean-process witness remains green. Bounded gate: 76/76.
+  Frontier: intentionally red with exactly `for-await-has-no-bridge-kind.js`.
+
+# 2026-08-28: result locations are class-indexed and artifact-exact
+
+- Machine result location derivation no longer treats logical result slot number as a register
+  number. Mixed vectors allocate GPR and FPR ordinals independently; the focused
+  `[int, float, bool, float]` witness proves `[x0, d0, x1, d1]`.
+- The canonical API now distinguishes bounded `Register` locations from aligned `ResultArea`
+  locations. A 20-leaf signature uses eight registers in each class and assigns its four overflow
+  leaves offsets 0, 8, 16, and 24 in one 32-byte caller-owned area.
+- Artifact format version 5 retains result register classes beside machine value kinds for every
+  function and relocation target. Save/load, truncation, compaction, ABI compatibility, and
+  dependency closure preserve and compare both vectors. A same-kind GPR/FPR mismatch is now an
+  explicit ABI mismatch.
+- The complete backend-object suite is green at 26/26, and the 101-function retained JSL artifact
+  passes clean-process compilation and native execution with the new metadata.
+- Bounded gate: 76/76. Frontier: intentionally red with exactly
+  `for-await-has-no-bridge-kind.js`.
+
+# 2026-08-28: native two-result transport works; the full result-location cutover is specified
+
+- A real JSL `MakePair` builtin returning `Pair<int, int>` now lowers to one generic machine call
+  plus two ordered `MI-CALL-RESULT` captures. A host-native caller consumes both projections and
+  returns 42. This is the first executable proof that compile-away JSL Records cross an internal
+  call boundary without allocation.
+- Calls and their raw-result captures are structurally indivisible in scheduling, and the
+  independent verifier checks exact anchor and slot order. Allocation prevents the temporary
+  sequential result moves from destroying another raw result; the retained 101-function JSL seed
+  artifact passes selection, scheduling, allocation, encoding, reload, and native execution.
+- The earlier retained-library crash was not evidence against result bundles. `MI-CALL-RESULT` had
+  been inserted on the wrong side of the descriptor case chain, accidentally giving ordinary
+  `MI-ABI-COPY` an effect. That produced a real call/effect scheduling cycle. The descriptors are
+  corrected and pinned by focused assertions. Sparse abandoned vreg ids are also handled without
+  asking for an owner at `-1`.
+- `docs/TORQUE-STYLE-LOWERED-VALUES.md` specifies the accepted full model: canonical per-target
+  result-location vectors, class-indexed registers, caller-owned overflow result areas with an
+  explicit hidden pointer, first-class call bundles, typed GC roots, and one shared parallel-copy
+  resolver. The current allocator masks and encoder loops are explicitly temporary and have a
+  named deletion stage.
+- Focused JSL shape, host-native multi-result, and retained-artifact witnesses pass. Bounded gate:
+  76/76. Frontier: intentionally red with exactly `for-await-has-no-bridge-kind.js`.
+
+# 2026-08-28: Stage 4 result vectors now survive retained artifacts and exact dependency checks
+
+- Retained machine-function metadata no longer collapses a function ABI or a call relocation to
+  one return kind. Both now own canonical flattened `first/count/kinds` result vectors, including
+  zero, one, and multiple results.
+- Snapshotting, suffix truncation, stable cache compaction, artifact version 4 save/load, cache
+  identity lookup, dependency-closure filtering, and final relocation compatibility all preserve
+  and compare every indexed result kind. Scalar return-kind accessors remain checked one-result
+  compatibility shims and reject multi-result records.
+- `retained_artifact_round_trips_indexed_multi_result_abi_metadata` upgrades an ordinary retained
+  record and its caller relocation to `[scalar, boxed]`, saves it, reloads it in a cleared store,
+  and proves both exact vectors survived. This is a bounded metadata witness; Stage 5 still owns
+  actual machine production and transport of both values.
+- Function indices are now single-owner by construction. A second `n-fun-open-identity!` for an
+  occupied index is a named corruption instead of silently replacing the first function's
+  identity/ABI metadata; the two retained-JSL tests now use distinct callable indices for their
+  distinct functions.
+- Bounded gate: 74/74. Frontier: intentionally red only for
+  `for-await-has-no-bridge-kind.js`. Stage 4 remains open only for explicit memory/abrupt-channel
+  witnesses and the native return-consumption exit witness, whose transport belongs to Stage 5.
+
+# 2026-08-28: Stage 4 establishes ideal multi-result calls and JSL Record returns
+
+- Function ABI metadata no longer has a scalar return cell. Every Fun retains a canonical result
+  range (`first/count/types`); the scalar declaration API is exactly a one-element vector wrapper,
+  and indexed access is mandatory for multi-result signatures.
+- A declared multi-result `Call` computes a tuple in ordinary analysis, `call-result` creates typed
+  `Proj` consumers, and `n-return-values!` emits `[control, results..., optional-memory]`. The
+  verifier derives the result range from the owning Fun, checks every value slot and the separate
+  trailing memory channel, and accepts Call projections only within the declared result count.
+- Internal JSL builtins may now return Specification Records. Function opening uses the cached
+  Record leaf vector as its result signature, declaration lowering returns the physical leaf range,
+  and internal calls reconstruct one `JslLoweredValue` from generic call projections. JavaScript
+  callable linkage still rejects Record parameters and results.
+- `internal_builtin_record_results_use_the_generic_multi_result_call_model` proves a nested Record
+  return with two exact `int` result types, two generic `Proj` nodes, zero `New` nodes, and a clean
+  verifier result. Node tests prove raw two-result Return/Call behavior. Focused suites: node 33/33,
+  JSL 61/61. Bounded gate: 74/74. Frontier: only the intentional `for-await` refusal.
+- Stage 4 remains open pending explicit memory/abrupt-channel witnesses. Serialization/import now
+  preserves exact result vectors; Stage 5 backend result locations and native transport have not
+  begun.
+- Tooling note: `coil balance --write` placed a missing closer immediately after `(block :call)`,
+  creating an empty block instead of closing its indented body. The exact reproducer is filed in
+  the `coil-bugs` pad; the source was repaired manually at the correct function boundary.
+
+# 2026-08-28: Stage 3 completes canonical lowered signatures
+
+- Every checked `JslParam` now retains its canonical `lowered-off` and `lowered-width`, and every
+  declaration separately retains logical source arity and total physical ABI arity. Nested Record
+  layout is therefore computed once rather than independently at function opening, entry binding,
+  and internal call sites.
+- Function ABI opening, declaration-entry Record reconstruction, and direct internal builtin calls
+  consume those ranges and their exact lowered types. Calls validate the argument's logical Record
+  identity, physical width, and expected starting offset before emitting any ABI slots.
+- Immutable library identity fingerprints the complete lowered signature. The source-facing
+  `jsl-call-with-memory!` boundary now explicitly rejects Record parameters because its input is one
+  graph node per JavaScript argument; it can no longer silently confuse logical and physical arity.
+- The focused nested-Record-plus-scalar witness proves logical arity 2, physical arity 3, ranges
+  `[0,2)` and `[2,3)`, exact leaf types, matching Fun ABI metadata, and zero `New` nodes. The JSL
+  suite is green at 60/60; `coil test` is green at 73/73; the frontier remains intentionally red
+  only for `for-await-has-no-bridge-kind.js`.
+- `jsl-call-lowered-with-memory!` is now the one explicit logical-value call boundary. It validates
+  logical arity, consumes the retained ranges, checks physical arity, and emits the call. Both
+  syntax-driven JSL calls and the scalar source-facing adapter route through it; the latter rejects
+  Records by name instead of pretending one graph node can carry an aggregate.
+- The focused graph witness invokes that API directly and passes selection. A host-native witness
+  passes `(Pair<int,int>, int)` as three ABI words to a real JSL builtin and executes the answer
+  `(20 + 1) * 2 = 42`; two machine functions are present and no Record object is materialized.
+- Stage 3's graph, selector, and native exit condition is complete. Stage 4 is now the active work:
+  result vectors, normal Return ranges, and call-result projections.
+
+# 2026-08-28: Stage 2 completes the explicit lowered-value cutover
+
+- `jl-expr-lowered` is now the only JSL expression result model. Bindings, Record operations,
+  typed Record Lists, branch joins, loops/recur, macro expansion/`otherwise`, declaration entry,
+  and internal-call arguments carry `JslLoweredValue` directly.
+- The numeric descriptor arena and every negative-handle, parity, node-or-aggregate, and temporary
+  adapter helper are deleted. Node ids reach graph builders only through checked scalar or physical
+  slot projection. Ordinary node keep/unkeep/collection no longer has aggregate dispatch.
+- Loop lowering stores logical kind/schema plus physical width per binding, reconstructs scalar,
+  Record, and Record-list values from its Phi vector, and parks recur arguments as physical slots.
+  Fixed 16-value temporary arrays were replaced with dynamically sized owned vectors.
+- The checker had the same missing dimension: loop scope and recur metadata retained Record schema
+  but discarded Record-list schema. It now carries both, accepts a loop-carried typed capability,
+  and rejects a recur that changes its element schema with `JSL-ERR-BAD-RECORD-LIST`.
+- `loop_carried_record_lists_preserve_their_typed_capability` proves one carrier Phi, one explicit
+  materialization, one store, and one load. The focused JSL suite is green at 60/60.
+- The first bounded gate exposed an ownership-transfer bug the focused shape tests could not:
+  unused macro arguments retained their outer temporary pin after the macro binding disappeared,
+  leaving 2,353 unreachable nodes in the immutable-library graph. Macro cleanup now protects the
+  result, releases each argument's final owner, and collects only arguments with no graph users.
+  The seed-artifact witness retains and reloads all 101 verified library functions.
+- Final gates: `coil test` is green at 73/73. `coil test --suite frontier` remains intentionally
+  red with exactly `for-await-has-no-bridge-kind.js`.
+
+# 2026-08-28: expressions and branch joins begin carrying lowered values end-to-end
+
+- `jl-expr-lowered` now carries explicit descriptors through literals, lookup, sequential `let`,
+  Record construction/get/with, Record-list materialization, primitive operands, JavaScript call
+  operands, and both dynamic branch arms.
+- Record construction and reconstruction consume `JslLoweredValue` fields or canonical physical
+  leaves directly. Typed Record-list store/load validate descriptor kinds and schemas and move the
+  Record's physical range without recreating logical field trees.
+- `jl-lowered-value-join` validates kind/schema compatibility and builds one Phi per cached
+  physical leaf. Nested Records no longer use a recursive Record-specific join path; scalar and
+  Record-list joins use the same logical dispatcher and checked projections.
+- The focused JSL suite is green at 59/59 and the bounded gate is green at 72/72. The frontier is
+  still exactly the intentional `for-await-has-no-bridge-kind.js` refusal. Remaining adapter sites
+  are loops/recur, macro expansion/`otherwise`, and declaration/internal-call result boundaries.
+
+# 2026-08-27: lexical bindings now retain explicit lowered values
+
+- `JslBind` no longer stores an ambiguous integer. Every non-rest lexical binding retains a
+  `JslLoweredValue` descriptor by value, so scalar and aggregate bindings have the same lifetime,
+  slot-range, and ownership representation.
+- `jl-lowered-scalar-node` is the checked scalar projection: it accepts exactly a scalar
+  one-slot descriptor. Binding pin/unpin/collection and declaration cleanup walk complete physical
+  ranges rather than branching on integer encodings.
+- The focused lowered-value witness now checks scalar projection and verifies that an aggregate
+  binding retains a three-slot Record descriptor. The JSL suite remains green at 59/59 and the
+  bounded gate remains green at 72/72. The frontier is still exactly the intentional
+  `for-await-has-no-bridge-kind.js` refusal.
+- The remaining temporary integer adapter is confined to `jl-expr` and selected call/CFG helpers;
+  migrating those is the next Stage 2 cut.
+
+# 2026-08-27: Stage 2 begins with one logical-value and physical-slot arena
+
+- Records and typed Record Lists now use one `JslLoweredValue` descriptor containing explicit
+  kind, logical schema, and contiguous physical-slot range. The previous three side tables and the
+  even/odd aggregate-handle encoding are deleted.
+- Nested Record fields are cached-layout subrange views. Flattening copies the descriptor's leaf
+  range directly, reconstruction creates a descriptor over the canonical leaf vector, and pinning
+  and collection operate on physical slots rather than recursively rediscovering logical fields.
+- `lowered_record_values_own_explicit_canonical_slot_ranges` directly verifies descriptor kinds,
+  nested range widths, leaf identity, the typed Record-list carrier, and zero runtime allocation.
+  The focused JSL suite is green at 59/59 and the bounded gate is green at 72/72. The frontier
+  remains exactly the intentional `for-await-has-no-bridge-kind.js` refusal.
+- This is deliberately recorded as partial Stage 2. `jl-expr` and `JslBind` still use a temporary
+  integer descriptor-index adapter. Stage 2 completes only after they traffic in explicit values
+  and graph builders accept scalars through a checked one-slot projection.
+
+# 2026-08-27: the migration target is the full Torque-style value model
+
+- The accepted end state is one uniform `LoweredValue` abstraction for scalar and aggregate JSL
+  values. Tagged/parity-coded integer handles are migration debris, not an ABI or a supported
+  alternate representation.
+- Expression lowering, bindings, branch/loop joins, arguments, and returns will traffic in logical
+  values backed by explicit physical slot ranges. Graph-node ids cross into graph builders only
+  through a checked one-scalar-slot projection; divergence remains control state.
+- Record Lists are explicit typed storage capabilities rather than odd integer handles. Any
+  temporary scalar compatibility adapter is confined to the external frontend boundary and has a
+  mandatory deletion point when ideal multi-result calls land.
+- `docs/TORQUE-STYLE-LOWERED-VALUES.md` records these choices and the Stage 2 exit condition. This
+  decision intentionally commits the later work to canonical lowered signatures and true
+  multi-result calls/returns; stopping at Record-only flattening would not complete the design.
+
+# 2026-08-27: Stage 1 caches canonical Record layouts and fingerprints their complete ABI
+
+- Every checked Record schema now owns one cached recursive physical leaf-type vector. Each logical
+  field retains a contiguous offset/width range into that vector, so function opening, calls,
+  branches, loops, and materialization no longer rediscover width and leaf types through separate
+  recursive walks.
+- Empty schemas and layouts wider than 256 physical leaves fail as malformed Records before
+  lowering. The focused witness pins scalar and nested field ranges/types and a recursively doubled
+  excessive-width refusal.
+- Immutable JSL library identity now includes ordered schema names/fields, nested schema identity,
+  the complete cached physical vector, and Record-valued parameter and return annotations. A
+  same-width field reorder therefore changes artifact identity; the focused test proves it.
+- All 58 JSL tests, the recursive Phi-box test, the data-Phi Effect dependency test, and the native
+  accessor witness are green. The bounded gate is green at 71/71. The frontier remains exactly one
+  intentional `for-await-has-no-bridge-kind.js` refusal.
+
+# 2026-08-27: graph-owned Phi boxing and data-Phi effect ordering restore native descriptors
+
+- Standalone JSL seed compilation exposed `Box(Phi(undefined|bool))`. A raw union has lost the
+  discriminator needed to select one JavaScript tag; the existing correct repair boxed each Phi
+  edge, but lived in the JavaScript frontend and stopped at the graph's original node count.
+  `g-distribute-deferred-phi-boxes!` now belongs to `node.coil`, follows newly created nested Phi
+  boxes to a fixed graph frontier, and is called by both JSL-library and frontend finalization.
+- The native accessor witness then exposed a separate `MSEL-DEPENDENCY`: an `Effect` carried a
+  data Phi as its observable ordering value. Selection had already assigned a valid dominating
+  vreg, but `ms-memory-node-before?`'s Phi arm accepted only memory Phis and rejected the data Phi
+  before the ordinary value rule. Memory Phis now use CFG validation; data Phis use the selected
+  dependency/dominance check.
+- Focused tests retain recursive mixed-raw Phi boxing and a selected property read whose Effect
+  dependency is a data Phi. The immutable complete-library seed artifact compiles, saves, reloads,
+  links, and executes. `object_literal_accessors_use_descriptor_semantics` now compiles and runs
+  natively. The bounded gate is green at 70/70; the frontier remains exactly the intentional
+  `for-await-has-no-bridge-kind.js` refusal.
+- Selection failure output now prints the failed machine instruction, every call argument and its
+  producer validity, memory-dependency status, and the corresponding ideal-node inputs instead of
+  dumping an unusably large whole graph. This diagnostic directly identified both invariants.
+
+# 2026-08-27: full Torque-style lowered-value architecture is the accepted Record model
+
+- `docs/TORQUE-STYLE-LOWERED-VALUES.md` now defines one compiler-wide recursive lowering from a
+  logical scalar/Record type to ordered physical slots. It covers explicit compiler values,
+  cached field layouts, lowered signature identity, internal parameters, true multi-result calls
+  and returns, branch/loop joins, effects, GC leaves, dynamic Record-list materialization, and
+  ideal/machine verification. This replaces further growth of Record-specific ABI exceptions.
+- The implementation plan has eight independently gated stages. It begins by diagnosing the
+  existing Property Descriptor native ownership failure, then centralizes layouts and compiler
+  values, introduces lowered signatures and multi-result ideal/backend ABIs, removes provisional
+  JSL paths, and only then completes the descriptor vertical slice and migrates other ECMA-262
+  Record families.
+- The design explicitly forbids the tempting shortcuts: no hidden descriptor Objects, automatic
+  boxing, forced macro expansion, verifier weakening, or JavaScript-visible specification
+  Records. Runtime-length Lists remain explicit typed materialization boundaries.
+- `docs/JSL.md`, `docs/ECMA262-JSL-COMPLETION-PLAN.md`, and the README now point to the accepted
+  architecture and accurately distinguish the implemented parameter-only bridge from the planned
+  internal Record-return ABI.
+- Documentation validation and all 57 focused JSL tests are green inside the bounded run, but the
+  bounded gate is not green: 69/70 passed. Seed-artifact creation reaches selection and refuses
+  `Box : undefined|bool` at node 68982 (`MSEL-UNSUPPORTED`). This is pre-existing in the active
+  descriptor migration and must be handled by the staged architecture/diagnosis, not hidden by the
+  documentation change. The frontier remains exactly one intentional failure,
+  `for-await-has-no-bridge-kind.js`.
+
+# 2026-08-27: specification Records have a checked compile-away SSA representation
+
+- JSL now declares named schemas with `(record Name [(field type) ...])` and admits record types
+  only on macro parameters and returns. Named construction, access, and immutable update are
+  `(record-new ...)`, `(record-get ...)`, and `(record-with ...)`; missing, duplicate, unknown, and
+  ABI-escaping records fail with stable diagnostics before lowering.
+- Records are compiler-only bundles, encoded in the JSL lowerer's side table. They recursively own
+  the pins of their ordinary SSA fields and never introduce a record opcode, heap object, object
+  shape, or backend case. A dynamic branch over equal schemas emits one ordinary typed Phi per
+  differing field. The focused witness forces both fields to differ and proves exactly two Phis and
+  zero `New` nodes.
+- Loop bindings flatten Records into one header Phi per scalar leaf, validate every `recur` against
+  the binding schema, and reconstruct only compiler-side handles. Nested Records recursively
+  flatten through both diamonds and loops; the focused nested witness proves a three-leaf outer/
+  inner structure produces exactly three Phis and no allocation.
+- Runtime callable/JavaScript boundaries reject these bundles instead of guessing a materialized
+  representation. The bounded gate is green at 67/67 and the focused JSL suite is green at 54/54.
+- This does not complete Phase 4. Auditing Property Descriptor migration exposed a real controlled-
+  materialization dependency: `DefineProperties` must retain normalized descriptors across a
+  dynamic List before mutating its target. Nested Records now support the required Maybe/Completion
+  structure, but explicit runtime List materialization and the descriptor migration remain.
+
+# 2026-08-27: radix-10 Number strings use shortest round-tripping binary64 digits
+
+- The unchanged `shortest-round-trip-digits.js` frontier program now compiles, executes, and agrees
+  with Node: `String(1 / 3)` is `"0.3333333333333333"`, not the 17-significant-digit noise emitted
+  by `%.17g`. It was moved into permanent native coverage before the repro and failing frontier test
+  were removed.
+- `aot_js_shortest_double` searches the complete binary64 round-trip bound from 1 through 17
+  significant digits. Each correctly rounded decimal candidate is parsed and compared by exact
+  IEEE-754 bits; the first match is therefore minimal-k. The candidate is normalized to the spec's
+  `(s, n, k)` representation and rendered using ECMAScript's fixed interval `-5 <= n <= 21`, rather
+  than C `%g`'s incompatible presentation threshold.
+- The focused native matrix pins `1/3`, `0.1 + 0.2`, both fixed/scientific boundaries, minimum
+  subnormal, both sides of the normal boundary, maximum finite, signed zero, and negative
+  recursion. The directly affected `CanonicalNumericIndexString` graph and native workbench also
+  verify and agree with Node.
+- This behavioral closure is not overstated as completion of the canonical JSL operation. The
+  generated ledger still classifies `Number::toString` as blocked on the JSL internal-method
+  protocol because the present representation primitive owns more formatting policy than the final
+  architecture permits. `CanonicalNumericIndexString` remains honestly partial for unrepresented
+  BigInt and integer-indexed exotic families, but no longer cites a fixed digit-formatting gap.
+- Generated reports now contain 96 native witnesses and one honest frontier refusal (`for await`),
+  down from two open bugs.
+
+# 2026-08-27: observable coercion effects survive scheduling into later JSL calls
+
+- The unchanged `String.prototype.startsWith` object-position frontier program now compiles,
+  executes natively, and answers 7 for `main(7)`, matching Node. It is pinned as
+  `object_position_coercion_is_scheduled_before_string_starts_with` before the open repro and its
+  failing frontier case were removed.
+- The reported call-target mismatch was downstream noise: target discovery, direct-target
+  selection, and call arguments were all valid. The actual rejected invariant was the pre-call
+  heap. `Effect` wrappers beneath a `MemMerge` carried observable coercion values, but the memory
+  dependency collector discarded those value edges, allowing global scheduling to place them
+  after the later call.
+- `ms-push-memory-dep-tree!` now lowers structural memory nodes into schedulable facts: an `Effect`
+  contributes both predecessor memory and ordering value, and a `MemMerge` contributes its leaves
+  instead of an unschedulable aggregate. Scheduling additionally orders the selected vreg producer,
+  so structural values such as closures and casts retain the same dependency as direct machine
+  nodes. Verification checks that selected producer through the ordinary input-validity contract.
+- Dynamic JavaScript calls are also born with `CALL-ABI-DYNAMIC-RECEIVER` before their first
+  peephole. This removes the invalid intermediate state in which devirtualization could replace a
+  heap callable before the call was relabelled dynamic; the focused JSL ABI suite pins the result.
+- Fast evidence is green: the focused native regression, all 49 JSL tests, and the isolated
+  `ToClampedIndex` graph/native workbench. Its four mapped Test262 variants remain 30-second
+  timeouts (0 pass / 4 timeout), matching the retained scale limitation rather than contradicting
+  the focused semantic witness. The bounded gate is green at 62/62. The generated reports now show
+  95 native witnesses and two honest frontier bugs, down from three.
+
+# 2026-08-27: TypedArray backing buffers initialize their ArrayBuffer accessor surface
+
+- The unchanged `signed.buffer.byteLength` frontier program now compiles, executes natively, and
+  answers 11 for `main(7)`, matching Node. Its regression covers a direct TypedArray getter, an
+  intermediate buffer binding, and the original nested accessor chain.
+- The failure had two structural causes. The frontend did not retain ArrayBuffer/TypedArray value
+  provenance through constructor results and `.buffer`, so a nested spec property name could be
+  mistaken for an unrelated closed-world shape slot. Dedicated value categories now keep those
+  accesses on the DSL-owned `GetV` path.
+- More importantly, `NewArrayBuffer` assumed its caller had initialized the ArrayBuffer intrinsic.
+  Direct construction did, but TypedArray backing-buffer allocation did not. The operation now
+  establishes `ArrayBufferConstructorValue` itself before installing its prototype, so every
+  allocation path has the inherited `byteLength` accessor it depends on.
+- The focused native regression and frontend graph suite are green. The bounded gate is green at
+  62/62. The fixed repro is removed only after being pinned in `tests/native-execution-test.coil`;
+  the generated frontier and derived index now report three open bugs and 94 native witnesses.
+
+# 2026-08-27: fixed TypedArray state has canonical witness, bounds, length, and element operations
+
+- Seven pinned partial JSL operations now own the represented fixed Int8Array/Uint8Array seam:
+  `TypedArrayElementType`, `TypedArrayElementSize`, `IsUnsignedElementType`,
+  `MakeTypedArrayWithBufferWitnessRecord`, `IsTypedArrayOutOfBounds`, `TypedArrayLength`, and
+  `TypedArrayByteLength`. Getter and indexed-read implementations compose those operations instead
+  of decoding internal kinds and lengths independently.
+- The witness-record encoding is explicit: for fixed, attached buffers the TypedArray object is
+  sufficient because the cached backing byte length cannot change. Resizable, length-tracking,
+  detached, nonzero-offset, wider-element, and BigInt views remain precise deviations. The
+  ownership gate rejected `ValidateTypedArray` and `ValidateTypedArrayBounds` because no current
+  public consumer reaches them; those premature declarations were removed rather than kept alive
+  artificially.
+- All seven direct operation graphs verify. One focused ordinary-JavaScript program constructs
+  both represented element kinds over a shared buffer, checks length/byteLength/byteOffset,
+  backing-buffer identity, and indexed zero reads; every operation compiles it, executes natively,
+  and agrees with Node.
+- A latent representation defect in `TypedArrayName` was fixed properly: its string alternatives
+  are now explicitly boxed before their phi reaches property publication. This removed a
+  `PropStoreKey` raw-pointer verifier violation instead of bypassing verification.
+- Exact mappings retain twelve new Test262 variants. All remain timeouts in the broad TypedArray
+  constructor harness, so the focused witness is the bounded feedback lane and the retained
+  failures remain honest publication/harness debt. Coverage is zero-gap at 2,655/2,655:
+  122 complete, 55 partial, and 2,478 blocked. Fifty-eight mappings cover 547 variants
+  (135 pass, 411 fail, one refused).
+- Chaining `signed.buffer.byteLength` still computes 0 where Node computes 4, although direct
+  TypedArray getters, backing-buffer identity, and standalone ArrayBuffer byteLength work. The
+  unchanged program is now the executable `typed-array-buffer-chained-byte-length.js` frontier
+  repro; the frontier therefore contains four honest open bugs.
+
+# 2026-08-27: fixed ArrayBuffer state is expressed by five canonical operations
+
+- `IsSharedArrayBuffer`, `IsDetachedBuffer`, `IsGrowableSharedArrayBuffer`,
+  `IsFixedLengthArrayBuffer`, and `ArrayBufferByteLength` are now pinned partial JSL operations.
+  ArrayBuffer getters compose them instead of reading representation fields or restating state
+  predicates. The internal-slot table now correctly says represented kind 105 has
+  `[[ArrayBufferData]]` and `[[ArrayBufferByteLength]]`, but not the resizable-only
+  `[[ArrayBufferMaxByteLength]]` slot.
+- The supported domain is explicit: represented ArrayBuffers are allocated, non-shared, and
+  fixed-length. The five operations therefore return the specification answers for that domain;
+  shared data blocks, detachment, and resizable/growable buffers remain named deviations rather
+  than fabricated runtime states.
+- One small focused program checks zero- and nonzero-length buffers through `byteLength`,
+  `maxByteLength`, `resizable`, and `detached`. All five operation checks compile that witness,
+  execute it natively, and agree with Node. Their direct JSL graphs also verify.
+- Exact Test262 mappings retain twelve variants. They currently expose broader missing
+  publication/state support (399 mapped failures total), and the shared/detached cohorts time out;
+  they are not suitable for the bounded feedback loop yet. The focused native witness is the fast
+  correctness lane for the represented domain.
+- Coverage remains zero-gap at 2,655/2,655 and moves five clauses from blocked to partial:
+  122 complete, 48 partial, and 2,485 blocked. Fifty-three operation mappings cover 535 variants
+  (135 pass, 399 fail, one refused).
+- The unchanged `for-of-catch-arraybuffer-invalid-phi.js` frontier program now compiles, executes,
+  and agrees with Node. Its exact source is pinned in `tests/native-execution-test.coil`, the stale
+  open repro is removed, and the generated frontier is down from four open bugs to three.
+- A direct workbench graph for `HasInternalSlot(buffer,
+  [[ArrayBufferMaxByteLength]])` fails verification without a diagnostic, although the only
+  represented ArrayBuffer kind provably lacks that slot. `IsFixedLengthArrayBuffer` consequently
+  returns the canonical constant `true` for the explicitly fixed-only representation. The
+  diagnostic gap is recorded in the project pad; it must be resolved before adding resizable
+  buffer kinds.
+
+# 2026-08-27: absolute and clamped index conversion are canonical Number-domain operations
+
+- `ToAbsoluteIndex` and `ToClampedIndex` are now pinned partial JSL operations. The former performs
+  `ToIntegerOrInfinity` and adjusts only finite negative indices relative to the supplied length;
+  the latter clamps that Number result to `[0, length]`. Both preserve the specification's boxed
+  Number domain, including infinities at the absolute-index boundary.
+- `RelativeIndex` and `ClampedIndex` are now explicit machine adapters over those canonical
+  operations. `AddNumericValues` preserves the immediate-integer representation when both inputs
+  are represented integers, so indexing consumers erase boxing without pushing their storage
+  representation back into the abstract operations.
+- The canonical graphs verify at 59,446/50,224 total/live nodes for `ToAbsoluteIndex` and
+  59,536/50,309 for `ToClampedIndex`. Focused native programs cover positive/negative fractions,
+  in-range and out-of-range relative indices, both infinities, clamping at both bounds, and one
+  observable object coercion through the absolute path; both compile, execute, and agree with Node.
+- Four direct Array `at` and String `startsWith` Test262 files retain eight variants. Coverage is
+  zero-gap at 2,655/2,655: 122 complete, 43 partial, and 2,490 blocked. Forty-eight mappings cover
+  523 variants (135 pass, 387 fail, one refused).
+- Object-valued `startsWith` position coercion exposes a distinct closed-world call-target selection
+  failure (`decoded=2`, `expected=8`) even though the graph verifies and the same `valueOf` works
+  through `ToAbsoluteIndex`. It is retained as the executable frontier repro
+  `starts-with-object-position-wrong-call-target.js`; the focused clamped-index witness keeps all
+  non-object conversion/clamping branches and does not claim that open composition.
+- The ledger gate and bounded gate (62/62) are green. The generated frontier now honestly contains
+  four failures: three named refusals and the shortest-round-trip digit disagreement.
+
+# 2026-08-27: `ToIndex` is canonical; ArrayBuffer keeps only its storage-range policy
+
+- `ToIndex` is now a pinned partial canonical JSL operation. It owns absent/undefined zero,
+  `ToIntegerOrInfinity`, negative rejection, `ToLength`, SameValueZero overflow validation, and
+  RangeError construction. `ToArrayBufferLength` now composes it and owns only the represented
+  fixed-buffer `2^31 - 1` allocation cap plus raw machine-index conversion.
+- The 59,247-node / 50,018-live-node operation closure verifies. A focused native witness covers
+  absent and explicit undefined, fractional Number and String lengths, single `valueOf` coercion,
+  negative values, both infinities, and the greater-than-MaxSafeInteger boundary; it compiles,
+  executes, and agrees with Node.
+- Four direct ArrayBuffer Test262 files retain eight exact variants (all currently failing at
+  broader harness/publication paths). Coverage remains zero-gap at 2,655/2,655 and moves ToIndex
+  from blocked to partial: 122 complete, 41 partial, and 2,492 blocked. Forty-six mappings cover
+  515 variants (135 pass, 379 fail, one refused).
+- The first witness composed the four caught RangeErrors inside `for...of`. Its graph verified but
+  machine selection refused an invalid loop-exit phi edge. The same cases agree with Node when
+  called individually, proving the defect is iterator/abrupt-control composition rather than
+  ToIndex. It is now an executable frontier case at
+  `repros/open/for-of-catch-arraybuffer-invalid-phi.js`, with the correct-answer failing test and
+  generated frontier entry required by the project rules.
+- The ledger gate and bounded gate (62/62) are green. The opt-in frontier now honestly contains
+  three failures: the new phi-selection refusal, the existing `for await` refusal, and the existing
+  shortest-round-trip digit disagreement.
+
+# 2026-08-27: `ToLength` and `LengthOfArrayLike` separate Number semantics from storage bounds
+
+- `ToLength` is now a pinned partial canonical JSL operation returning a boxed ECMAScript Number
+  in `[0, 2^53 - 1]`. The previous two-argument helper was renamed `ToMachineLength`: its explicit
+  storage cap remains a checked specialization and can no longer be mistaken for the abstract
+  operation. Array-like and `String.raw` indexing apply that representation conversion only after
+  the canonical Number-domain operation.
+- `LengthOfArrayLike` is now a pinned partial canonical JSL operation that performs the observable
+  `Get(obj, "length")` exactly once and delegates coercion to `ToLength`. Existing generic Array
+  consumers reach it through their storage-bound `ArrayLikeLength` adapter, so one named operation
+  now owns the spec semantics without forcing machine indices into its public result type.
+- The focused native witness proves string/fraction length coercion, a single accessor read,
+  negative clamping, and no indexed getter observation after a zero result. Both operation graphs
+  verify (`ToLength` 58,847/49,655 total/live nodes and `LengthOfArrayLike` 62,778/53,017), and the
+  focused JavaScript program compiles, executes, and agrees with Node.
+- Exact mappings retain eight Test262 variants across object-coercion, positive-fraction, and
+  negative-fraction cases. All eight remain honest failures at broader harness/publication paths.
+  Coverage is zero-gap at 2,655/2,655: 122 complete, 40 partial, and 2,493 blocked; 45 mappings
+  cover 507 variants (135 pass, 371 fail, one refused).
+
+# 2026-08-27: three property-definition operations share one internal-method seam
+
+- `CreateDataProperty`, `CreateDataPropertyOrThrow`, and `DefinePropertyOrThrow` are now pinned
+  partial JSL operations. They construct the specification Property Descriptor record, preserve
+  the all-true data-property attributes, return the internal method's boolean where required, and
+  turn false results into `TypeError` at the two `OrThrow` boundaries.
+- `DefineOwnPropertyRecord` is the single represented `[[DefineOwnProperty]]` dispatch seam:
+  String exotic receivers use `StringDefineOwnProperty` and every other represented receiver uses
+  `OrdinaryDefineOwnProperty`. `Object.defineProperty` and iterator-result construction now consume
+  the canonical operations instead of duplicating their policy. The precise retained deviation is
+  Proxy and receiver families whose exotic internal methods do not yet have representations.
+- All three transitive operation graphs verify. Their focused native witnesses compile, execute,
+  and agree with Node: iterator results expose own writable/enumerable/configurable `value` and
+  `done` properties, while String definition covers successful ordinary fallback and abrupt
+  incompatible indexed updates.
+- Generated coverage remains zero-gap at 2,655/2,655 and moves three clauses from blocked to
+  partial: 122 complete, 38 partial, and 2,495 blocked. Forty-three mapped operations cover 499
+  variants (135 pass, 363 fail, one refused); the six new retained variants are honest failures at
+  broader harness/publication prerequisites, not operation contradictions.
+
+# 2026-08-27: String exotic definition is canonical; guarded numeric unboxes retain control
+
+- `IsCompatiblePropertyDescriptor` and the String exotic `[[DefineOwnProperty]]` internal method
+  are now pinned complete JSL operations. The latter composes `StringGetOwnProperty`, the canonical
+  compatibility predicate, and `OrdinaryDefineOwnProperty`; the focused witness proves empty and
+  same-value indexed updates succeed, incompatible value/writable changes throw `TypeError`, and
+  non-index properties retain ordinary definition behavior.
+- The initially reported String-definition “value/effect defect” had two parts. Returning
+  `0x7ffc000000000007` was only the diagnostic returning boxed dynamic `7` without its required
+  native `| 0` result coercion. The real SIGTRAP was broader: `%UnboxNumber` carried no control
+  anchor, so scheduling hoisted its checked conversion above `IsNumber` and tried to numerically
+  unbox a tagged String loaded from a property. Numeric JSL unboxing now retains current control;
+  a graph regression requires that edge, and the strengthened `SameValue` witness covers dynamic
+  String, Number, and Object property loads.
+- Isolated operation checks verify 1,192/1,071 total/live nodes for
+  `IsCompatiblePropertyDescriptor`, 3,381/2,920 for the called String internal method, and
+  187/162 for `StringGetOwnProperty`; all focused programs compile, execute, and agree with Node.
+  Generated coverage is zero-gap at 2,655/2,655: 122 complete, 34 partial, and 2,499 blocked.
+  Thirty-nine mapped operations cover 491 variants (135 pass, 355 fail, one refused).
+- The ledger gate and bounded gate (62/62) are green. The opt-in frontier remains exactly the two
+  intentional failures: `for-await-has-no-bridge-kind.js` and `shortest-round-trip-digits.js`.
+
+# 2026-08-27: String exotic reads and descriptors are JSL-owned; numeric keys canonicalize once
+
+- `StringGetOwnProperty` is now a pinned complete JSL operation. `NewStringObject` carries
+  `[[StringData]]` and installs the real non-writable/non-enumerable/non-configurable `length`
+  property; JSL constructs indexed code-unit descriptors and routes ordinary reads,
+  `Object.getOwnPropertyDescriptor`, `hasOwnProperty`, and `propertyIsEnumerable` through one
+  String-exotic descriptor path. The runtime resolves wrapper representation but no longer
+  supplies indexed descriptor/read policy for String objects.
+- The focused witness first exposed a broader structural bug: computed numeric property loads and
+  stores passed raw numbers to `GetV`/lvalue property operations even though those paths require a
+  PropertyKey. The frontend now inserts the canonical JSL `ToPropertyKey` call at computed-key
+  structural boundaries, including compound lvalues where conversion must occur exactly once.
+  Both the String-wrapper witness and the strengthened ordinary numeric/string key witness compile,
+  execute, and agree with Node; DSL ownership remains 4/4 green.
+- String exotic `[[DefineOwnProperty]]` is deliberately not claimed yet. A minimal compatible
+  `Object.defineProperty(Object("abc"), "1", {})` returns a tagged String word instead of the
+  integer result, while a same-value descriptor traps with SIGTRAP. That is an unresolved
+  compiler value/effect representation defect, not a case to bypass with runtime policy.
+- Generated coverage remains zero-gap at 2,655/2,655: 120 complete, 34 partial, and 2,501 blocked.
+  Thirty-seven mapped operations cover 485 variants (135 pass, 349 fail, one refused). The new
+  mapped Test262 variants are four honest failures because those legacy cases depend on unsupported
+  `new String(...)` publication/harness paths. The ledger gate and bounded gate (61/61) are green;
+  the opt-in frontier remains exactly the two intentional failures.
+
+# 2026-08-27: the extensibility write side and both Object built-ins are canonical
+
+- `OrdinaryPreventExtensions` is now a pinned complete JSL operation over the represented
+  `[[Extensible]]` slot. `Object.isExtensible` and `Object.preventExtensions` are pinned partial
+  built-in algorithms: primitive behavior and every represented non-Proxy Object path are
+  canonical, while their metadata names Proxy internal-method dispatch/revocation (and the
+  unrepresented false exotic `[[PreventExtensions]]` result) precisely.
+- The frontend now delegates the two Object static methods to the canonical built-in declarations,
+  which compose `IsExtensible` or `OrdinaryPreventExtensions`; it no longer names private
+  `*Value` helpers. The focused prevention witness proves identity return, a false extensibility
+  state, rejection of a new property, and continued mutation of an existing writable property.
+  Primitive identity/false cases are covered separately by the two built-in witnesses.
+- The three operation graphs verify at 16/15 total/live nodes for
+  `OrdinaryPreventExtensions`, 41/38 for `Object.isExtensible`, and 49/42 for
+  `Object.preventExtensions`. All focused native programs agree with Node. Their exact six-file
+  mappings expand to twelve variants and compare as twelve `failed->failed`, with identical
+  cohorts and zero pass regressions.
+- Generated coverage remains zero-gap at 2,655/2,655: 119 complete, 34 partial, and 2,502 blocked.
+  Public closure status moved from 523 blocked / 3 partial to 521 blocked / 5 partial. Thirty-six
+  mapped operations cover 481 variants (135 pass, 345 fail, one refused). The ledger gate,
+  bounded gate (61/61), native frontier-document gate (3/3), DSL ownership, and diff check are
+  green; the opt-in frontier remains exactly the two intentional failures.
+
+# 2026-08-27: ordinary property definition and extensibility are canonical; operations 22/23 survive lowering
+
+- `OrdinaryGetOwnProperty`, `OrdinaryDefineOwnProperty`, and `OrdinaryIsExtensible` are now pinned
+  complete JSL operations. `IsExtensible` is a pinned partial operation whose only named gap is
+  Proxy exotic dispatch/revocation. Production `Object.defineProperty` reaches the ordinary
+  definition operation, which composes canonical current-descriptor reconstruction,
+  `IsExtensible`, and `ValidateAndApplyPropertyDescriptor` rather than a parallel policy path.
+- The first ordinary-definition focused witness found a real compiler/runtime ABI break:
+  `Object.preventExtensions(target)` was followed by `Object.isExtensible(target) === true`, and a
+  new property could still be added. Generic JSL memory lowering discarded the declared
+  `PropLoadKey(22)` and `PropStoreKey(23)` discriminators and emitted ordinary property operations
+  0 and 1. The general load/store fallback now retains every `jsp-aux` operation discriminator;
+  the earlier operation-24 prototype special case remains correct, and a graph regression pins
+  operations 22 and 23 together.
+- All four focused native witnesses agree with Node. Verified operation graphs are 213/156
+  total/live nodes for `OrdinaryGetOwnProperty`, 2,197/1,864 for
+  `OrdinaryDefineOwnProperty`, and 14/13 each for `OrdinaryIsExtensible` and `IsExtensible`.
+  Each exact two-file Test262 cohort expands to four variants and compares as four
+  `failed->failed`, with identical cohorts and zero pass regressions.
+- Generated coverage remains zero-gap at 2,655/2,655: 118 complete, 32 partial, and 2,505 blocked.
+  Thirty-three mapped operations cover 469 variants (135 pass, 333 fail, one refused). The ledger
+  gate, bounded gate (61/61), DSL ownership (4/4), native frontier-document gate (3/3), and diff
+  check are green. The opt-in frontier remains exactly the two intentional failures.
+
+# 2026-08-27: `ValidateAndApplyPropertyDescriptor` is the canonical ordinary-property validator
+
+- `ValidateAndApplyPropertyDescriptor ( object, propertyKey, extensible, propertyDesc, current )`
+  is now a pinned partial JSL macro. It owns absent-property extensibility checks, empty-descriptor
+  acceptance, non-configurable Enumerable/Configurable/kind restrictions, accessor identity
+  checks, non-writable data restrictions, validation-only calls, and application for represented
+  ordinary Objects, Arrays, and Functions. Its remaining deviation is explicit: Proxy and
+  unrepresented exotic `[[DefineOwnProperty]]` protocols do not exist yet.
+- `DefinePropertyRecord` now constructs the current private Property Descriptor record and calls
+  this canonical operation. The old handwritten `ValidPropertyRedefinition` duplicate is gone.
+  Application composes the existing `WritableAttribute`, `EnumerableAttribute`, and
+  `ConfigurableAttribute` helpers, preserving the DSL ownership gate with no dead semantic path.
+- The canonical graph verifies at 1,993 nodes / 1,719 live nodes. A focused native witness covers
+  same-value acceptance on a non-configurable/non-writable property, different-value rejection,
+  and configurable data-to-accessor transition; compiled `main(7)` agrees with Node. The exact
+  two-file Test262 cohort remains four `failed->failed` variants with no cohort drift and zero pass
+  regression; those failures remain outside the focused operation witness.
+- Generated coverage remains zero-gap at 2,655/2,655: 115 complete, 31 partial, and 2,509 blocked.
+  The ledger gate, bounded gate (60/60), DSL ownership (4/4), and native frontier-document gate
+  (3/3) are green. The opt-in frontier remains exactly the two intentional failures:
+  `for-await-has-no-bridge-kind.js` is refused and `shortest-round-trip-digits.js` disagrees.
+
+# 2026-08-27: `CompletePropertyDescriptor` supplies canonical default fields for new properties
+
+- `CompletePropertyDescriptor ( propertyDesc )` is now a pinned complete JSL macro over the private
+  descriptor record. It selects data completion for generic/data descriptors, accessor completion
+  otherwise, and fills every absent kind-specific, Enumerable, and Configurable field with the
+  specification default while retaining field presence independently from value.
+- `DefinePropertyRecord` calls completion only for a newly created property. Existing-property
+  validation deliberately retains the original partial descriptor because field absence is
+  semantically significant there. The canonical graph verifies at 146 nodes / 107 live nodes; a
+  focused witness covers both partial data and partial accessor descriptors and agrees with Node.
+- The exact new-generic-property Test262 file retains the identical two default/strict variants as
+  two `failed->failed`, with no cohort drift or pass regression. The baseline for the next
+  `ValidateAndApplyPropertyDescriptor` tranche is also retained before its implementation: four
+  variants across non-configurable rejection and configurable data-to-accessor replacement.
+- Generated coverage remains zero-gap at 2,655/2,655: 115 complete, 30 partial, and 2,510 blocked.
+  Twenty-nine staged/mapped operations cover 453 variants (135 passed, 317 failed, one refused);
+  the validation/application mapping is staged with its baseline but has no implementation claim
+  yet. The ledger gate, bounded gate (60/60), native frontier-document gate (3/3), DSL ownership,
+  and diff checks are green; the opt-in frontier is exactly the two known intentional failures.
+
+# 2026-08-27: descriptor classifiers are complete canonical operations and the old duplicate is gone
+
+- `IsAccessorDescriptor`, `IsDataDescriptor`, and `IsGenericDescriptor` are pinned complete JSL
+  macros over the private Property Descriptor record representation. Their canonical graphs are
+  respectively 20/18, 20/18, and 43/37 total/live nodes, and dedicated native witnesses for
+  accessor creation, data creation, and a generic update that preserves the existing data kind all
+  agree with Node for `main(7)`.
+- Production descriptor validation/application now calls these operations instead of spelling the
+  field tests locally. The bounded gate initially rejected dead `IsGenericDescriptor`; migrating
+  the exact generic-kind comparison removed that duplicate semantic copy and restored the DSL
+  ownership invariant rather than exempting the declaration.
+- Each exact one-file Test262 cohort expands to two default/strict variants. All three retain the
+  identical before/after cohort with two `failed->failed` transitions, no newly passing variant,
+  and zero pass regressions. The failures remain at the broader Test262 helper publication surface.
+- Generated coverage is zero-gap at 2,655/2,655: 114 complete, 30 partial, and 2,511 blocked.
+  Twenty-seven mappings retain 447 variants (135 passed, 311 failed, one refused). The ledger gate,
+  bounded gate (60/60), DSL ownership gate (4/4), native frontier-document gate (3/3), and diff
+  check are green. The opt-in frontier remains exactly the two intentional failures.
+- These three direct moves are deliberately the front of a larger cut: the generated graph assigns
+  343 dependent normative items / 142 public algorithms to
+  `ValidateAndApplyPropertyDescriptor`, whose classifier prerequisites are now canonical.
+
+# 2026-08-27: `ToPropertyDescriptor` is canonical and dynamic prototype reads retain operation 24
+
+- `ToPropertyDescriptor ( object )` is now one pinned partial canonical JSL macro in
+  `lib/abstract/property-descriptor.jsl`. A private Property Descriptor record preserves field
+  presence independently from field values, and conversion performs inherited `HasProperty`/`Get`
+  observation in specification order, boolean conversion, callable Getter/Setter validation, and
+  the accessor/data exclusion. `Object.defineProperty` and the two-pass `Object.defineProperties`
+  path now convert user descriptor Objects once and apply the resulting specification records.
+- The focused native witness observes inherited `enumerable` and `configurable` getters in the
+  required order, applies the resulting data descriptor, and agrees with Node for `main(7)`. The
+  canonical operation graph verifies at 61,177 nodes / 52,111 live nodes.
+- That witness exposed a compiler-contract defect rather than a descriptor workaround opportunity:
+  `jl-prim-mem` collapsed `%GetPrototype`'s `PropLoadKey(24)` into the ordinary operation-0
+  constructor. Dynamic missing-property walks therefore evaluated `object[null]`, recurred on
+  `undefined`, and never terminated. `n-get-prototype-at!` now retains runtime operation 24, and
+  `get_prototype_retains_its_runtime_operation_discriminator` pins the graph invariant. The
+  pre-existing accessor/`Object.defineProperty` native regression is green again.
+- The exact four-file Test262 mapping expands to the same eight default/strict variants before and
+  after: eight `failed->failed`, zero pass regressions, and no cohort drift. All currently stop at
+  the broader missing Test262 `assert` harness publication rather than contradicting the focused
+  descriptor result. Evidence is digest-bound in
+  `spec/evidence/to-property-descriptor-test262.json`.
+- Generated coverage remains zero-gap at 2,655/2,655 classified: 111 complete, 30 partial, and
+  2,514 blocked. Twenty-four mappings retain 441 Test262 variants (135 passed, 305 failed, one
+  refused). The complete ledger gate, JSL suite (47/47), DSL ownership suite (4/4), bounded gate
+  (60/60), native frontier-document gate (3/3), and `git diff --check` are green. The opt-in
+  frontier remains honestly red with exactly the two known bugs: `for-await-has-no-bridge-kind.js`
+  is refused and `shortest-round-trip-digits.js` disagrees.
+
+# 2026-08-27: `RequireInternalSlot` is canonical and represented brands share one slot-name seam
+
+- `RequireInternalSlot ( obj, internalSlot )` is now one pinned partial canonical JSL macro. JSL
+  has explicit identities for all sixteen internal slots currently represented by Number,
+  Boolean, String, Symbol, ArrayBuffer, TypedArray, and Array Iterator objects. `HasInternalSlot`
+  is the single bridge from those specification names to the opaque `%InternalKind` layout query;
+  only the representation mapping knows numeric runtime brands, while the canonical operation owns
+  the Object/slot validation and TypeError policy.
+- Existing represented consumers now use that seam: ArrayBuffer and TypedArray receiver predicates
+  and accessors, Symbol wrapper receivers, Array Iterator `next`, and primitive-wrapper extraction
+  in `ToPrimitiveObject`. This removes the repeated private brand-check policy without adding a
+  frontend semantic arm or a new machine primitive. The declaration remains partial because the
+  runtime has no representations for the specification's other internal-slot families yet.
+- The focused witness reads a real ArrayBuffer byte length and proves that an ordinary object
+  inheriting `ArrayBuffer.prototype` is rejected by the inherited getter. The 356-node canonical
+  operation closure verifies, and native `main(7)` agrees with Node. The direct five-file Test262
+  cohort expands to ten default/strict variants and compares exactly as ten `failed->failed`, with
+  identical cohorts and no pass regression. The retained failures are two existing SIGABRT cases
+  and eight compile-budget timeouts, not newly claimed passes.
+- Level-1 feedback now reports the actual JSL file, byte range, and diagnostic context. The loader
+  previously copied a reader error through the last successfully inspected declaration, so a
+  malformed `symbol/core.jsl` form was falsely attributed to the final form in `property.jsl`.
+  `jsl-read-source!` now stamps the reader `Diag` source/range before recording the failure, the
+  operation checker prints it, and a two-source regression proves the second file is named.
+- Generated coverage remains zero-gap at 2,655/2,655 classified: 111 complete, 29 partial, and
+  2,515 blocked. Twenty-three mappings retain 433 Test262 variants (135 passed, 297 failed, one
+  refused). The complete ledger gate, bounded gate (59/59), native frontier-document gate (3/3),
+  and exact cohort comparison are green. The frontier remains exactly two honest failures.
+
+# 2026-08-27: `ToPrimitive` owns `@@toPrimitive` and addition uses the default hint
+
+- `ToPrimitive ( input [ , preferredType ] )` is now one pinned partial canonical JSL macro with
+  the exact `GetMethod`, `Call`, and `OrdinaryToPrimitive` dependencies. An omitted preferred type
+  is represented internally by `undefined` and produces the required `"default"` hint. The
+  `@@toPrimitive` method receives the original object and a one-element argument List; primitive
+  results return and Object results throw TypeError before ordinary fallback can run.
+- `SymbolToPrimitiveValue` publishes only the required well-known-symbol identity, sharing the
+  stable `Symbol` constructor property with full publication without retaining that constructor's
+  entire closure. The frontend recognizes only structural `Symbol.toPrimitive` selection and
+  calls this JSL entry; symbol identity and all lookup/call policy stay in the library.
+- `JsAdd` now performs `ToPrimitive` on both operands with the omitted/default hint before deciding
+  String concatenation versus numeric addition. This is required observable behavior: routing an
+  object directly through `ToNumber` passed `"number"` and made a nominal ToPrimitive definition
+  ineffective for `+`.
+- The first correct implementation made `ToPrimitive` one large called builtin. The bounded gate
+  exposed that this retained the complete heap/callback closure even for statically numeric
+  `n + 1`, overflowing the graph-text oracle and timing out seed execution. The fundamental fix is
+  a canonical macro primitive guard plus one specialized object-only called continuation. Numeric
+  fast paths erase the continuation; object semantics remain implemented once. No buffer or
+  timeout was loosened. Both original gate tests pass unchanged.
+- The focused witness assigns one `Symbol.toPrimitive` method and proves stable symbol identity,
+  receiver identity, exactly one `"default"` argument, one invocation, and the primitive result
+  through addition. The 42,116-node canonical closure verifies and native `main(7)` agrees with
+  Node. The exact five-file Test262 cohort expands to ten default/strict variants and compares as
+  ten `failed->failed`, identical cohorts, zero new passes, and zero pass regression; its broad
+  multi-callback cases still exceed the retained Test262 execution budget.
+- Generated coverage remains zero-gap at 2,655/2,655 classified: 111 complete, 28 partial, and
+  2,516 blocked. Twenty-two mappings retain 423 Test262 variants (135 passed, 287 failed, one
+  refused). The complete ledger gate, bounded gate (58/58), native frontier-document gate (3/3),
+  and `git diff --check` are green. The frontier remains exactly two honest failures.
+
+# 2026-08-27: `OrdinaryToPrimitive` is canonical for both hint orders
+
+- The Number-only `OrdinaryToPrimitiveNumber` specialization has been replaced by one pinned
+  partial `OrdinaryToPrimitive ( obj, hint )` JSL operation. Its exact dependencies are canonical
+  `Get`, `IsCallable`, and `Call`. String hint reads `toString` then `valueOf`; Number hint reads
+  `valueOf` then `toString`; non-callables are skipped, Object results advance to the second
+  method, abrupt completions propagate, and exhaustion throws TypeError.
+- `ToPrimitiveNumber` now delegates its ordinary-object arm to the canonical operation, and
+  `ToStringValue` reaches the String-hint arm for represented ordinary objects. Existing Array and
+  primitive-wrapper paths remain explicit partial paths until the intrinsic manifest publishes
+  every inherited default `valueOf`/`toString` method; Proxy exotics and BigInt are also still
+  named deviations. No synthetic fallback result was retained inside the canonical algorithm.
+- The exact pre-change focused witness, containing separate Number- and String-hint callbacks,
+  was refused by the known large callback/Phi graph defect. The retained focused witness isolates
+  the newly implemented String-hint route with one callback and proves custom `toString`, exact
+  single invocation, and the resulting String; native `main(7)` agrees with Node. The canonical
+  closure lowers and verifies at 36,388 nodes. Existing number-hint callback coverage remains in
+  the focused `ToIntegerOrInfinity` witness.
+- The direct addition Test262 file expands to two default/strict variants. Its exact retained
+  comparison is two `failed->failed`, identical cohorts, zero newly passing variants, and zero
+  pass regression. It remains nonpassing because its broad sequence stacks callback/object-result
+  cases beyond the focused compiler surface. Evidence is
+  `spec/evidence/ordinary-to-primitive-test262.json` and the paired
+  `results/ecma262-ordinary-to-primitive-{baseline,after-mapping}-2026-08-27.jsonl` files.
+- Generated coverage remains zero-gap at 2,655/2,655 classified: 111 complete, 27 partial, and
+  2,517 blocked. Twenty-one mappings retain 413 Test262 variants (135 passed, 277 failed, one
+  refused). The complete ledger gate, bounded gate (58/58), native frontier-document gate (3/3),
+  and `git diff --check` are green. The frontier remains exactly the two known honest failures.
+
+# 2026-08-27: `GetMethod` owns method lookup and `String.prototype.replace` reaches it
+
+- `GetMethod` is now one pinned partial JSL operation with the exact `GetV` and `IsCallable`
+  dependencies. It returns `undefined` for nullish property values, preserves callable identity,
+  and throws a TypeError for represented non-callables. Its named deviation is limited to callable
+  Proxy exotics and the unrepresented BigInt family.
+- The represented `String.prototype.replace` prefix now follows the specification boundary: it
+  performs `GetMethod(searchValue, @@replace)` in JSL and invokes the result through canonical
+  `Call` with the search object as receiver and the original string receiver and replacement as
+  arguments. The frontend passes boxed source values and no longer open-codes coercion policy.
+- `SymbolReplaceValue` publishes only the required well-known-symbol identity instead of retaining
+  the entire `Symbol` constructor closure. This keeps intrinsic identity in JSL while giving the
+  compiler a structurally targeted entry point; it is not a second implementation of Symbol
+  semantics.
+- `npm run spec:operation -- GetMethod` verifies a 29,450-node operation closure and compiles the
+  focused witness. Native execution proves one property lookup/invocation, exact receiver and
+  argument forwarding, and one call; `main(7)` agrees with Node. A larger stacked negative witness
+  encountered the already-known large-graph Phi allocation defect, so the focused claim was not
+  inflated: null fallback, abrupt getter completion, and non-callable behavior remain represented
+  in the mapped Test262 evidence.
+- The exact three-file Test262 cohort expands to six default/strict variants. Baseline and after
+  are the identical cohort with six `failed->failed`, zero newly passing variants, and zero pass
+  regressions. Evidence is `spec/evidence/get-method-test262.json` and the paired
+  `results/ecma262-get-method-{baseline,after-mapping}-2026-08-27.jsonl` files.
+- Generated coverage remains zero-gap at 2,655/2,655 classified: 111 complete, 26 partial, and
+  2,518 blocked. Twenty mappings retain 411 Test262 variants (135 passed, 275 failed, one refused).
+  The complete ledger gate, bounded gate (58/58), native frontier-document gate (3/3), and
+  `git diff --check` are green. The required frontier remains exactly two honest failures:
+  for-await bridge lowering and shortest-round-trip digits.
+
+# 2026-08-27: `GetV` preserves the original primitive receiver
+
+- `GetV` is now one pinned partial JSL operation with its exact `ToObject` dependency. Ordinary
+  `[[Get]]` composition no longer conflates the lookup object with the receiver: the shared
+  receiver-aware path finds the property on the object/exotic representation but invokes an
+  accessor through `Call` with the separately supplied receiver. Canonical `Get` passes the object
+  for both roles; `GetV` passes `ToObject(value)` for lookup and the original value for receiver.
+- Primitive-capable source MemberExpression reads now route structurally through `GetV`; statically
+  shaped raw field loads remain compiler structure, and known built-in Object reads continue to use
+  canonical `Get`. No ToObject, accessor, or receiver policy was added to the frontend.
+- The focused falsification installs a strict inherited String getter and proves that its `this`
+  is the primitive string rather than the temporary wrapper. It also covers inherited Boolean data
+  and the null/undefined TypeError boundary. `npm run spec:operation -- GetV` lowers a verified
+  29,399-node closure, compiles the source witness, runs it natively, and agrees with Node.
+- The exact five-file property-accessor Test262 cohort expands to ten default/strict variants. Its
+  retained comparison is ten `failed->failed`, identical cohorts, zero newly passing variants, and
+  zero pass regression. Evidence is `spec/evidence/get-v-test262.json` and the paired
+  `results/ecma262-get-v-{baseline,after-mapping}-2026-08-27.jsonl` files.
+- A broader first focused witness with three distinct accessor callbacks exposed the existing
+  large-graph Phi allocation defect; the decisive one-accessor receiver falsification compiles.
+  This is not hidden by the GetV claim: broader Proxy/BigInt/String-exotic receiver families remain
+  its named deviation and the retained Test262 files remain nonpassing.
+- Generated coverage remains zero-gap at 2,655/2,655 classified: 111 complete, 25 partial, and
+  2,519 blocked. Nineteen mappings retain 405 Test262 variants (135 passed, 269 failed, one
+  refused). The complete ledger gate, bounded gate (58/58), native frontier-document gate (3/3),
+  and `git diff --check` are green.
+
+# 2026-08-27: `ToObject` is canonical and callback representation gaps are fixed
+
+- `ToObject` is now one pinned partial JSL operation in `lib/abstract/coercions.jsl`. It performs
+  the nullish TypeError boundary, preserves existing Object identity, and allocates the represented
+  Boolean, Number, String, and Symbol wrapper families. `Object(value)` delegates to it for every
+  non-nullish value while retaining its distinct nullish-create behavior. The competing
+  `ToObjectValue` helper was removed; sloppy receiver binding, Object.assign targets, destructuring,
+  String.raw, Object rest, and enumeration now call the canonical operation.
+- Wrapper construction now links `%Number.prototype%`, `%Boolean.prototype%`, and
+  `%String.prototype%` instead of installing an incorrect own `constructor` property. Numeric- and
+  String-hint coercion reads the represented String wrapper's internal data slot. BigInt wrappers
+  and String exotic indexed/`length` own properties remain named deviations owned by their proper
+  representation/internal-method work rather than being approximated inside ToObject.
+- `npm run spec:operation -- ToObject` lowers a verified 26,459-node closure. Its focused source
+  witness compiles and runs natively, covering ordinary identity, all four represented primitive
+  wrapper families, internal data observed through coercion, and both nullish throws; it agrees
+  with Node for `main(7)`. The retained 12-variant Test262 comparison is exactly 12
+  `failed->failed`, with identical cohorts and zero pass regression. Evidence is
+  `spec/evidence/to-object-test262.json` and the paired
+  `results/ecma262-to-object-{baseline,after-mapping}-2026-08-27.jsonl` files.
+- The callback work beneath `Call` is now proved beyond the earlier partial note: callback outer
+  memory remains ordered through `Effect`, captured Object identity and integer/float fields pass
+  native execution, dynamic callback returns preserve their full 64-bit JavaScript tag through
+  stackmap format version 4, and callback throws cross the DSL and are caught. The obsolete reduce
+  callback frontier repro was retired only after its existing test turned green. The frontier is
+  now exactly two honest bugs: for-await bridge lowering and shortest-round-trip digits.
+- Generated coverage is zero-gap at 2,655/2,655 classified: 111 complete, 24 partial, and 2,520
+  blocked. Eighteen mappings retain 395 Test262 variants (135 passed, 259 failed, one refused).
+  The complete ledger gate, `git diff --check`, native frontier-document gate, focused callback
+  witnesses, and bounded gate (58/58) are green.
+
+# 2026-08-27: `Call` owns invocation and specification Lists compile away
+
+- The pinned `Call ( func, thisValue [ , argList ] )` abstract operation is now one canonical
+  partial JSL macro in `lib/abstract/call.jsl`. Every semantic library invocation routes through
+  it; `call-dynamic-with-receiver-rest` remains only the representation form inside `Call` itself.
+  The frontend continues to own syntax and call-graph structure, while `Call` owns callable
+  validation, TypeError completion, receiver forwarding, and argument-List invocation.
+- JSL now represents ECMA-262 specification Lists directly with a final macro-only `(rest T)`
+  parameter. Rest arguments lower once into a compiler-owned SSA slice, never a JavaScript Array,
+  and expand into the receiver ABI with the exact argc. The checker refuses non-final, non-macro,
+  scalar, invalid-spread, and over-16 forms. Scope teardown releases element pins and truncates the
+  compile-time slice; `jsl-inline!` and the one-operation workbench both support zero-or-more rest
+  actuals. The focused JSL suite is green at 45/45.
+- Establishing the receiver ABI fixed the primitive-receiver frontier bug fundamentally. Receiver
+  calls now box raw primitive specializations but retain exact raw Object-pointer specialization;
+  the representation verifier accepts exactly tagged values or proven raw pointers and rejects a
+  raw machine Number. The fixed `Function.prototype.call` primitive receiver case is promoted into
+  `tests/native-execution-test.coil`; the frontier is reduced from four bugs to three.
+- `npm run spec:operation -- Call` lowers a verified 240-node operation graph, compiles the focused
+  direct/strict/sloppy receiver and argument-count witness, runs it natively, and agrees with Node.
+  The exact Function.prototype.call cohort contains seven variants and compares as seven
+  `failed->failed`, with identical cohorts and no pass regression. Object-heavy falsification
+  probes exposed two separately recorded representation gaps (captured Object identity and boxing
+  a dynamically reached numeric field Load), so the partial deviation names them instead of
+  inflating support.
+- Generated coverage remains zero-gap at 2,655/2,655 classified: 111 complete, 23 partial, and
+  2,521 blocked. Seventeen mappings retain 383 Test262 variants (135 passed, 247 failed, one
+  refused). The complete ledger gate, `git diff --check`, focused native operation, and bounded
+  gate (57/57) are green.
+
+## 2026-08-27: Number equality methods are canonical JSL operations
+
+- `Number::equal` and `Number::sameValueZero` are now pinned complete JSL macros rather than
+  anonymous logic embedded in their callers. `IsStrictlyEqual` delegates its Number arm to
+  `NumberEqual`; `SameValueZero` delegates its Number arm to `NumberSameValueZero`, which in turn
+  adds only NaN-pair equality to `NumberEqual`. This follows the spec's operation boundaries while
+  keeping the frontend structural. Their generated dependency scores are respectively 462
+  normative dependents/196 public algorithms and 9 normative dependents/3 public algorithms.
+- Dedicated focused witnesses cover NaN, both signed-zero orders, equal and unequal finite values,
+  fractions, and both infinities; the SameValueZero witness exercises the distinction through
+  `Array.prototype.includes`. Both transitive closures verify, compile to native code, execute
+  `main(7)`, and agree with Node.
+- The exact mapped Test262 cohorts retain eight `Number::equal` variants and two
+  `Number::sameValueZero` variants. Baseline-to-after comparisons are respectively eight and two
+  `failed->failed`, with identical cohorts and no pass regression. These are retained as honest
+  evidence of broader harness/runtime gaps, not treated as proof against the focused native
+  semantic witnesses.
+- The ledger is 2,655/2,655 classified: 111 complete, 22 partial, and 2,522 blocked. Sixteen mapped
+  operations retain 376 Test262 variants (135 passed, 240 failed, one refused). The ledger gate,
+  `git diff --check`, and bounded gate (56/56) are green. The required frontier rerun remains the
+  same four open bugs: for-await bridge kind, shortest-round-trip digits, reduce callback invalid
+  Phi edge, and primitive receiver tagging.
+
+## 2026-08-27: Number::sameValue is a complete numeric-method claim
+
+- `Number::sameValue` was extracted from the numeric arm of `SameValue` and pinned as a complete
+  JSL numeric method. It directly implements NaN-pair equality, signed-zero distinction, finite
+  equality, and infinity equality; `SameValue` now delegates its Number arm to this one operation.
+  The generated dependency score is 462 normative dependents and 196 public algorithms.
+- Its dedicated focused witness covers NaN, both zero signs in both orders, finite integers and
+  fractions, unequal Numbers, and both infinities. The operation lowers to a verified 134-node
+  graph and native `main(7)` agrees with Node.
+- Direct uses of the public global `Infinity` binding exposed a separate graph verifier refusal
+  (`VERR-DEAD-INPUT`, 12 dead `TypeTest` inputs) in both shared and dedicated witnesses. Constructing
+  the same IEEE values as `1 / 0` and `-1 / 0` is green, isolating the defect to global intrinsic
+  binding/publication rather than numeric comparison. The issue is recorded in the project pad.
+- The exact Number-only `Object.is` cohort retains four default/strict variants. The comparison is
+  four `failed->failed`, with no drift or pass regression; their end-to-end failure remains in the
+  broader Test262 harness/publication path. Evidence is `spec/evidence/number-same-value-test262.json`.
+- The ledger is 2,655/2,655 classified: 109 complete, 22 partial, and 2,524 blocked. Fourteen mapped
+  operations retain 366 Test262 variants (135 passed, 230 failed, one refused). The ledger gate,
+  `git diff --check`, and bounded gate (56/56) are green; frontier remains the same four open bugs.
+
+## 2026-08-27: SameValueNonNumber is shared by all represented equality families
+
+- `SameValueNonNumber` was the next represented high-reach prerequisite: 461 normative dependents
+  and 196 public algorithms. Its logic was previously embedded separately in equality operations.
+- It is now a pinned partial canonical macro. After callers establish `SameType` and exclude Number,
+  it compares String UTF-16 contents and uses canonical tagged identity for undefined, null,
+  Boolean, Symbol, and all represented Object kinds. BigInt is the only named missing type.
+  `SameValue`, `SameValueZero`, and `IsStrictlyEqual` now share this one implementation.
+- The focused witness now covers Boolean/null/undefined distinctions, String content, and identity
+  versus nonidentity for ordinary Objects, Arrays, and Functions in addition to the existing Number
+  cases. The operation itself lowers to 18 verified nodes and native `main(7)` agrees with Node.
+- Its exact non-Number `Object.is` cohort contains 20 default/strict variants. The comparison is 20
+  `failed->failed`, with no cohort drift or pass regression; broader Test262 harness/publication
+  paths remain the blocker. Evidence is `spec/evidence/same-value-non-number-test262.json`.
+- The generated ledger is 2,655/2,655 classified: 108 complete, 22 partial, and 2,525 blocked.
+  Thirteen mapped operations retain 362 Test262 variants (135 passed, 226 failed, one refused).
+  `spec:ledger:gate`, `git diff --check`, and `coil test` (56/56) are green; the required frontier
+  remains red at the same four honestly open bugs.
+
+## 2026-08-27: ToIntegerOrInfinity is one canonical JSL operation
+
+- The dependency queue selected `ToIntegerOrInfinity`: 249 normative items and 175 public
+  algorithms transitively depend on it. The runtime already exposed numeric truncation, but
+  arbitrary-value callers invoked that representation primitive directly and therefore did not
+  consistently own the observable ToPrimitive/ToNumber protocol in JSL.
+- `ToIntegerOrInfinity` is now a pinned partial canonical macro: it calls `ToNumberValue` once and
+  then the numeric `%ToInteger` capability. Its deviation names BigInt and the incomplete object
+  ToPrimitive surface. Arbitrary-value consumers in relative indexing, clamping, Array methods,
+  ArrayBuffer length conversion, and `toFixed` now call it. The only remaining direct primitive
+  uses are the canonical operation and two already-number-proven algorithms (`Math.trunc` and JSON
+  gap formatting).
+- The focused native witness reaches the operation through `Array.prototype.at` and covers
+  fractional positive/negative values, NaN, both infinities, strings, booleans, null, undefined,
+  Array coercion, and a custom `valueOf` whose single invocation is observed. Its transitive JSL
+  closure verifies and native `main(7)` agrees with Node.
+- The exact mapped Test262 cohort contains six default/strict variants for numeric, nonnumeric,
+  object, and Symbol index conversion. The comparison is six `failed->failed`, with no cohort
+  drift or pass regression; broader Test262 harness/publication paths still prevent completion.
+  Digest-bound evidence is `spec/evidence/to-integer-or-infinity-test262.json`.
+- The generated ledger remains 2,655/2,655 classified: 108 complete, 21 partial, and 2,526 blocked.
+  Twelve mapped operations retain 342 Test262 variants (135 passed, 206 failed, one refused).
+  `spec:ledger:gate`, `git diff --check`, and `coil test` (56/56) are green. The required frontier
+  rerun remains honestly red at the same four open bugs.
+
+## 2026-08-27: IsArray recognizes the real `%Array.prototype%` Array exotic
+
+- The canonical `IsArray` claim is now pinned as partial. Its represented non-Proxy algorithm is
+  the existing Array tag test; the remaining deviation is exactly Proxy target recursion and the
+  revoked-Proxy TypeError path.
+- This tranche fixed the representation beneath that operation rather than special-casing the
+  intrinsic in `IsArray`. Runtime descriptor 21 now materializes intrinsic kind 17 as one stable
+  Array-tagged identity backed by dense-array state. `BuiltinPrototypeValue` initializes that
+  Array exotic's `[[Prototype]]` to `%Object.prototype%` in JSL, where JavaScript semantics live.
+- The focused differential covers primitives, ordinary objects, arrays, `%Array.prototype%`, and
+  the prototype impostor `Object.create([])`. The latter exposed an adjacent genuine defect:
+  `ObjectCreate` accepted only the ordinary-object runtime tag. It now accepts ordinary, Array,
+  and Function Object values while still creating an ordinary result. Native `main(7)` agrees
+  with Node, including `Array.isArray(Array.prototype) === true` and
+  `Array.isArray(Object.create([])) === false`.
+- The exact direct Test262 cohort remains 58 variants. The comparison is 57 `failed->failed` and
+  one `refused->failed`: no cohort drift, no pass regression, and no newly passing variant. Those
+  complete files remain blocked by broader harness/publication paths even though the focused
+  semantic witness now executes. Digest-bound evidence is `spec/evidence/is-array-test262.json`.
+- `coil test` is green at 56/56. The required frontier rerun remains honestly red at the same four
+  open bugs: for-await bridge kind, shortest round-trip digits, reduce callback invalid Phi edge,
+  and primitive receiver tagging.
+
+## 2026-08-27: ToPropertyKey has executable primitive, Symbol, and Array-key evidence
+
+- The dependency ranking selected `ToPropertyKey` at 141 normative dependents and 20 public
+  algorithms. The existing JSL helper already preserves represented Symbol identity and delegates
+  all other keys to `ToStringValue`; no semantic rewrite was needed for that supported surface.
+- It now carries a pinned partial claim. The deviation names BigInt and the complete String-hint
+  object `ToPrimitive` protocol (`@@toPrimitive`, custom `toString`, then custom `valueOf`) rather
+  than treating primitive success as the whole algorithm.
+- The focused native differential covers Number, Boolean, null, undefined, Array-to-string keys,
+  Symbol identity, and the separation between a Symbol key and its descriptive string. Its
+  transitive JSL closure lowers to a verified graph and native `main(7)` agrees with Node.
+- The direct Test262 mapping deliberately includes object-coercion evaluation order, a primitive
+  Symbol key, and object conversion returning a Symbol. All six exact default/strict variants
+  remain failed on the named prerequisite and broader harness paths; the comparison is six
+  `failed->failed`, with no cohort drift or pass regression. Digest-bound evidence is
+  `spec/evidence/to-property-key-test262.json`.
+- The generated ledger is 2,655/2,655 classified: 108 complete, 19 partial, and 2,528 blocked.
+  Ten mapped operations retain 278 Test262 variants (135 passed, 142 failed, one refused).
+  `spec:ledger:gate`, `git diff --check`, and `coil test` (56/56) are green.
+
+## 2026-08-27: HasProperty now walks the represented prototype chain
+
+- The dependency ranking selected `HasProperty` at 41 normative dependents and 31 public
+  algorithms. Its prior JSL definition stopped after receiver-specific own-property checks, so an
+  inherited property incorrectly answered false even though the pinned algorithm delegates through
+  `[[HasProperty]]` along the prototype chain.
+- `HasProperty` now canonicalizes the key once, loops through `[[Prototype]]`, and applies the
+  existing ordinary Object, dense Array, and fixed TypedArray own-property rules at every level.
+  The frontend remains only the structural `in`-expression caller. The checked partial deviation
+  names Proxy traps and exotic receiver families outside those represented kinds.
+- The focused witness distinguishes own `undefined` from absence, exercises a custom inherited
+  property and own-versus-inherited identity, and pins dense Array index, hole, and `length`
+  behavior. `npm run spec:operation -- HasProperty` lowers the closure, verifies the graph, and its
+  native `main(7)` agrees with Node.
+- Two direct Test262 `[[HasProperty]]` files retain four exact default/strict variants. All remain
+  failed because their broader harness/intrinsic and constructor paths are not yet executable; the
+  comparison is four `failed->failed`, zero cohort drift, and zero pass regression. Evidence is
+  `spec/evidence/has-property-test262.json`.
+- A larger first focused shape mixing the same cases with `new Int8Array([n])` exposed a separate
+  `PropStoreKey` representation refusal (`raw-ptr` String phi where a tagged value is required).
+  Removing only that unrelated constructor path leaves the complete ordinary/Array HasProperty
+  witness green; the TypedArray interaction is recorded in the project pad for follow-up rather
+  than hidden as support evidence.
+- The generated ledger is 2,655/2,655 classified: 108 complete, 18 partial, and 2,529 blocked.
+  Nine mapped operations retain 272 Test262 variants (135 passed, 136 failed, one refused).
+  `spec:ledger:gate`, `git diff --check`, and `coil test` (56/56) are green.
+
+## 2026-08-27: CreateIteratorResultObject now creates an ordinary result object
+
+- The dependency ranking selected `CreateIteratorResultObject` next: its canonical clause reaches
+  60 normative dependents and 31 public algorithms. The prior helper allocated raw `%NewObject`
+  storage and assigned with ordinary `Set`, omitting the spec-required `%Object.prototype%` link
+  and own-data-property creation semantics.
+- The JSL implementation now initializes the fresh ordinary object and defines own `value` then
+  `done` data properties through `DefineField`, the existing fresh-object equivalent of
+  `CreateDataPropertyOrThrow`. It carries a pinned partial claim because BigInt values remain
+  outside the represented frontend/runtime value surface.
+- The focused differential proves successive and exhausted array iterator results, the same
+  intrinsic prototype as an ordinary object, inherited `hasOwnProperty`, own
+  writable/enumerable/configurable descriptors, and writable `value`. Its transitive JSL closure
+  lowers to a verified graph and native `main(7)` agrees with Node.
+- The direct Array iterator `next` Test262 test retains both default and strict variants. Both
+  remain failed by timeout at the existing `Symbol.iterator` publication prerequisite; the exact
+  comparison is two `failed->failed`, with no cohort drift or pass regression. Digest-bound
+  evidence is `spec/evidence/create-iterator-result-object-test262.json`.
+- The generated ledger remains 2,655/2,655 classified: 108 complete, 17 partial, and 2,530 blocked.
+  Eight mapped operations retain 268 Test262 variants (135 passed, 132 failed, one refused).
+  `spec:ledger:gate`, `git diff --check`, and `coil test` (56/56) are green.
+- Audit note: comparing the result prototype directly with the public `Object.prototype` value
+  disagreed natively even though it equals the prototype of an ordinary object and inherits the
+  expected intrinsic methods. That broader intrinsic-publication identity needs a separate audit;
+  it is not hidden inside this operation claim.
+
+## 2026-08-27: IteratorComplete and IteratorValue are executable partial claims
+
+- The corrected canonical-candidate ranking selected `IteratorComplete` and `IteratorValue` as
+  adjacent high-reach prerequisites: they affect 97/96 normative dependents and 40 public
+  algorithms apiece. Both now carry pinned canonical provenance and precise partial deviations in
+  `lib/array/iterator.jsl`; their supported ordinary-object behavior remains implemented through
+  `GetProperty` and `ToBoolean`, not open-coded by the frontend.
+- Their shared focused witness covers array `for...of`, direct `values().next()` extraction, and
+  exhausted iterator results. `npm run spec:operation -- IteratorComplete` and
+  `npm run spec:operation -- IteratorValue` both lower the transitive JSL closure, verify the
+  graph, execute natively, and agree with Node.
+- Each direct Test262 algorithm-step mapping retains both default and strict variants. All four
+  remain failed because the custom `Symbol.iterator` setup exceeds the current array-only
+  `GetIterator` product profile. Exact before/after comparisons retain the same variant identities,
+  contain no pass regression or cohort drift, and do not manufacture a green subset. The
+  digest-bound records are `spec/evidence/iterator-complete-test262.json` and
+  `spec/evidence/iterator-value-test262.json`.
+- The generated ledger is zero-gap at 2,655/2,655: 108 complete, 16 partial, and 2,531 blocked.
+  Seven mapped operations retain 266 Test262 variants (135 passed, 130 failed, one refused).
+  `spec:ledger:gate` is green, `coil test` is green at 56/56, and the frontier remains the same
+  four honest open bugs.
+
+## 2026-08-27: specialized JSL helpers cannot masquerade as canonical spec claims
+
+- Added checked `:specializes` metadata for deliberately narrower helpers. It is mutually exclusive
+  with canonical `:spec`/`:spec-name`/`:status`, requires a pinned normative clause plus a non-empty
+  narrowing description, and is retained directly on `JslDecl`. The checker refuses missing
+  descriptions and mixed claim/specialization forms by name.
+- Offline provenance independently rejects stale, unknown, or informative specialization targets.
+  Provenance schema 2 emits a separate `specializations` collection and excludes those declarations
+  from canonical candidates. Coverage validates that schema, republishes the records, and reports
+  `specializedJslHelpers` as a separate measurement rather than coverage.
+- Annotated four genuine narrowings: machine-index `ToLength`, Number-hint
+  `OrdinaryToPrimitiveNumber`, String/String `StringEquals`, and String/String `StringCompare`.
+  None can now be promoted accidentally from an exact name or nearby spec link. The unrelated
+  `IsPrimitiveValue` false association was fixed by attaching the ToNumber link to the actual
+  `ToNumberValue` declaration instead of silencing the helper.
+- The generated state has 371 JSL declarations, 14 canonical partial claims, four specialized
+  helpers, 62 unique review candidates, three ambiguous candidates, and 292 declarations with no
+  name candidate. Coverage remains zero-gap at 2,655/2,655; specialization does not change a
+  normative item's status.
+- Six offline provenance tests and the new JSL parser/checker cases cover the accepted and refused
+  forms. `spec:ledger:gate` is green, and `coil test` is green at 56/56.
+
+## 2026-08-27: RequireObjectCoercible has one canonical JSL owner
+
+- Replaced the duplicate `ObjectCoercible` and string-specific `RequireObjectCoercible`
+  implementations with one canonical definition in `lib/abstract/coercions.jsl`. Array methods,
+  object built-ins, string indexOf, `ToObjectValue`, and empty object destructuring all delegate to
+  it. The frontend changed only the name of its structural destructuring call; semantics remain in
+  `lib/`.
+- The canonical operation returns every represented non-nullish value unchanged and creates a real
+  `TypeError` object for `null` or `undefined`. Its pinned claim is partial only because BigInt is
+  outside the represented frontend/runtime surface. `npm run spec:operation --
+  RequireObjectCoercible` passes dependency lowering, graph verification, and a source witness that
+  catches its TypeError path and agrees with Node.
+- The two direct String Includes Test262 algorithm-step tests for null and undefined receivers are
+  retained at the pinned revision. All four default/strict variants remain failed with execution
+  signal 5 because the existing function-call receiver bridge is still open; the exact comparison
+  has four `failed->failed`, zero drift, and zero pass regressions. Evidence is
+  `spec/evidence/require-object-coercible-test262.json` rather than a manufactured green subset.
+- The generated ledger remains 2,655/2,655 classified: 108 complete, 14 partial, and 2,533 blocked.
+  Five mapped Test262 operations now account for 262 exact variants. `spec:ledger:gate` is green,
+  and `coil test` is green at 55/55.
+
+## 2026-08-27: SameValueZero and Array.prototype.includes are executable partial claims
+
+- `SameValueZero` and `ArrayIncludes` now carry pinned canonical ECMA-262 provenance, explicit
+  partial deviations, focused native differential mappings, and reviewed classification overrides.
+  The generated ledger remains zero-gap at 2,655/2,655 classified; 108 are complete, 13 partial,
+  and 2,534 blocked. Four mapped Test262 operations now account for 258 exact variants.
+- `npm run spec:operation -- SameValueZero` and `npm run spec:operation -- ArrayIncludes` both pass
+  provenance freshness, dependency closure lowering, graph verification, and native execution.
+  Their shared focused witness covers NaN, both signed-zero directions, equal/unequal strings,
+  positive and negative `fromIndex`, omitted arguments, `undefined`, and object identity.
+- The complete pinned `test/built-ins/Array/prototype/includes` cohort is retained rather than
+  narrowed: 6 passed, 53 failed, and one refused across 60 variants. A second exact-identity run
+  preserved all 60 outcomes with six `passed->passed`, 53 `failed->failed`, one
+  `refused->refused`, zero drift, and zero pass regressions. Digest-bound evidence is
+  `spec/evidence/array-includes-test262.json`.
+- The cohort exposes honest next prerequisites: generic primitive receivers, complete
+  `ToIntegerOrInfinity`/large-index behavior, abrupt indexed access, built-in descriptor metadata,
+  resizable buffers, harness-global publication in large programs, and one large SameValueZero
+  selection refusal. These are not hidden by the partial claim.
+- The focused ArrayIncludes program initially exposed unsorted Mach-O stackmap roots. Root pairs
+  are now explicitly sorted by instruction site and vreg before lower-bound lookup/serialization;
+  the 12-assertion native witness executes and agrees with Node. `coil test` is green at 55/55,
+  and `spec:ledger:gate` is fully green.
+
+## 2026-08-27: pinned Level 5 evidence and reviewed ownership families are executable
+
+- `npm run spec:test262 -- NAME` resolves deterministic repository-relative cohort mappings,
+  refuses any Test262 checkout except pinned commit `d86b2294e…`, retains expanded variants, and
+  can compare them against an exact prior JSONL even when the cohort contains failures.
+- The first authoritative `ToBoolean` cohort contains 38 logical-not variants: 30 pass and eight
+  fail. A separate after run preserved the exact 38-variant cohort with 30 `passed->passed`, eight
+  `failed->failed`, zero pass regressions, and no drift. Digest-bound evidence is retained in
+  `spec/evidence/toboolean-test262.json`; coverage verifies its commit, mapping, JSONL digest,
+  identities, and totals offline.
+- The cohort disproved the earlier complete claim: two direct BigInt variants fail because BigInt
+  is outside the represented frontend/runtime surface. `ToBoolean` is now honestly partial with
+  that explicit deviation. The other six failures expose `eval` and constructor/runtime
+  prerequisites and remain visible; the mapping was not narrowed to manufacture green evidence.
+- Classification rules now cover 387 normative productions, 149 grammar-enclosing clauses, 94
+  static-semantics operations, 132 runtime-semantics SDOs, 18 reviewed evaluation/instantiation
+  operations, 525 unreviewed built-in algorithms, 143 semantic method protocols, and 20 host or
+  implementation-defined operations. Coverage is 1,453/2,655 classified; all 1,450 blocked items
+  reference validated capability records, three reviewed JSL claims are partial, and 1,202 clauses
+  remain in a generated non-claim review queue.
+- `tools/analyze-test262-results.mjs` no longer inserts unrelated full-run timing and variant
+  constants into focused reports. New runner summaries retain actual timing/variant metadata;
+  analysis without a summary omits those fields rather than inventing them.
+
+## 2026-08-27: Test262 comparisons use exact expanded-variant identities
+
+- `tools/compare-test262-results.mjs` compares retained JSONL by canonical `test/...` path plus
+  expanded variant, so different checkout roots do not manufacture cohort changes.
+- The comparator rejects duplicate identities and unknown statuses, reports added/removed variants
+  separately from shared-result transitions, and exits nonzero for either cohort drift or any
+  shared `passed` to non-passing transition. Improvements remain visible as exact identities.
+- Three focused tests cover cross-checkout identity, regressions versus cohort drift, duplicate
+  rows, and invalid outcomes. A real retained 44-variant artifact compared to itself with 44 shared
+  variants, no drift, and no pass regression. `npm run test262:compare -- BEFORE AFTER` is the
+  retained comparison command; the focused tests are part of `spec:ledger:gate`.
+
+## 2026-08-27: coverage overlay and one-operation workbench are executable
+
+- `spec/generated/ecma262-coverage.json` merges generated JSL claims with the reviewed
+  `spec/ecma262-classifications.json` overlay. It accounts for all 2,655 normative items, resolves
+  4,449 abstract-operation dependency edges, computes public-builtin closure status and transitive
+  unlock scores, and rejects invalid owners/statuses, missing evidence, dishonest partial/complete
+  combinations, duplicate claims, and blocked entries without prerequisites.
+- `npm run spec:operation -- NAME` checks manifest freshness, lowers only the selected JSL
+  declaration and its transitive callees, verifies the graph, and runs a retained native-versus-
+  Node witness when mapped. `ToBoolean` is complete and passes the focused command; `SetProperty`
+  is explicitly partial and passes its represented ordinary-data-property witness. Coverage is
+  3/2,655 classified: one complete, two partial, and 2,652 unclassified.
+- The callback/abrupt `ArrayReduce` representative exposed a real regression: its graph verifies,
+  but selection builds a phi copy whose destination is the phi itself. It is now the executable
+  `repros/open/reduce-callback-throw-invalid-phi-edge.js` frontier case, with node's answer 9. The
+  frontier is honestly three bugs; generated frontier and what-works reports were refreshed.
+- Complete JSL claims are rejected by coverage generation unless
+  `spec/ecma262-operations.json` names a retained focused native differential witness. A source
+  citation alone cannot create complete status.
+
 ## 2026-08-27: descendant self captures and parameter environments stop corrupting graphs
 
 - Resolver capture classification now distinguishes a named expression's private function-ID
@@ -239,6 +1873,23 @@
   collided with `OrdinaryToPrimitiveNumber`. The structural witness now reserves 512 and 1024;
   verifier experiments were fully reverted. `coil test` is green 52/52. The frontier remains the
   expected two red bugs: `for-await-has-no-bridge-kind` and `shortest-round-trip-digits`.
+
+## 2026-08-27: JSL provenance is checked data, not a spec-link comment
+
+- JSL declarations now retain `:spec`, `:spec-name`, `:status`, and `:deviation`. The reader rejects
+  incomplete metadata, a complete claim with a deviation, a partial claim without one, and two
+  declarations claiming the same canonical clause. All failures have dedicated JSL error codes
+  and focused positive/falsification tests.
+- `ToBoolean` is the first end-to-end witness, pinned to
+  `ecma262@ed463bc10dbeaad0410ce67e541a77ea8e9900a5#sec-toboolean` as a complete claim.
+  `tools/jsl-provenance.mjs` independently checks the pin, clause existence, normative status,
+  canonical name, status/deviation consistency, and uniqueness against the raw ledger.
+- `spec/generated/jsl-provenance.json` is a deterministic support report. It currently states one
+  verified complete claim and 367 declarations without provenance. Existing exact names and
+  preceding spec-link comments produce 68 unique and four ambiguous review candidates, but never
+  create implementation claims. `npm run spec:ledger:gate` checks the report offline.
+- `docs/JSL.md` and `docs/ECMA262-LEDGER.md` document the declaration surface, review boundary, and
+  regeneration commands. Focused JSL tests are 43/43 green; provenance tests are 4/4 green.
 
 ## 2026-08-27: pinned ECMA-262 source is an executable zero-claim ledger
 
@@ -4488,3 +6139,106 @@ open bugs: `for-await-has-no-bridge-kind` and `shortest-round-trip-digits`.
 - The next isolated defect is abrupt callback-result consumption in `flatMap`: direct calls, `every`, and `map` propagate the same thrown callback value, while `flatMap` signals 5 when its append-or-spread branch consumes that exceptional call result.
 - Authoritative results: `results/test262-conditional-array-return-reduction-2026-08-27.jsonl`, `results/test262-conditional-array-return-final-2026-08-27.jsonl`, and `results/test262-array-flatmap-box-transparent-2026-08-27.jsonl`, with summaries.
 - `coil test` is green at 52/52. `coil test --suite frontier` remains intentionally red at exactly `for-await-has-no-bridge-kind` and `shortest-round-trip-digits`.
+## 2026-08-27: SameType, SameValue, and Object.is are JSL-owned and executable
+
+- `SameType` now treats ordinary objects, arrays, and callables as the single ECMAScript Object
+  type while preserving the represented primitive type boundaries. `SameValue` implements string
+  value equality, object/symbol identity, NaN equality, and reciprocal-based `+0`/`-0` distinction
+  in JSL. `IsStrictlyEqual` now delegates its type boundary to `SameType`.
+- `Object.is` routes structurally from the frontend to the canonical JSL built-in; the frontend
+  contains no comparison policy. Its focused witness falsifies the common signed-zero mistake and
+  covers NaN, numbers, strings, and object identity in native-vs-Node execution.
+- The complete 21-file Object.is Test262 directory retains 42 variants: 22 pass and 20 fail. Exact
+  before/after comparison preserved all 22 passes and all 20 failures with no cohort drift or pass
+  regression. Publication metadata/constructor checks, unsupported harness helpers, and Symbol
+  execution remain named limitations rather than filtered tests.
+- Coverage is 2,655/2,655 classified: 2,536 blocked, 11 partial, and 108 complete. Mapped evidence
+  is 129/198 passing, and public-algorithm closure improves from 525 blocked + 1 partial to 524
+  blocked + 2 partial.
+- `coil balance --no-typecheck --strict --write` repaired the delimiter-only nesting error in the
+  new comparison forms after the normal typechecked repair correctly refused the mid-edit file.
+
+## 2026-08-27: foundational coercion/equality claims have focused and pinned evidence
+
+- `Get`, `ToString`, `ToNumber`, and `IsStrictlyEqual` now have canonical pinned JSL provenance,
+  explicit partial deviations, verified per-operation lowering, and focused real-source native-vs-
+  Node witnesses. Together with `IsCallable`, these turn five high-unlock items from opaque blocked
+  classifications into exact supported slices without claiming their missing receiver/value kinds.
+- The direct `===`/`!==` Test262 cohort retains 118 expanded variants: 77 pass and 41 fail. The
+  exact before/after comparison reports 77 `passed->passed`, 41 `failed->failed`, no cohort drift,
+  and zero pass regressions. BigInt, `eval`, and one separate execution failure remain visible.
+- Mapped evidence now totals 156 variants across ToBoolean and IsStrictlyEqual: 107 pass and 49
+  fail. Coverage is still zero-gap, with 2,539 blocked, eight partial, and 108 complete items.
+- A primitive receiver through `Function.prototype.call` exposed
+  `VERR-CALL-RECEIVER-TAG`. It is filed as the executable
+  `function-call-primitive-receiver-tag.js` frontier bug because it blocks an honest public
+  ToObject witness. The frontier now contains four genuine failures.
+
+## 2026-08-27: the pinned normative ledger has zero classification gaps
+
+- The schema-2 raw ledger records clause hierarchy (`parentId`, `ancestorIds`, `topLevelId`) and
+  direct prose counts, so reviewed rules can classify semantic families without title guessing or
+  generated-signature noise.
+- Exact-count, dependency-backed rules now classify all 2,655 normative items: 1,140 JSL, 626
+  frontend, 88 runtime, 21 host, and 780 composite. The candidate queue is empty. This does not
+  claim implementation: at that milestone 2,543 remained blocked, four were partial, and 108 were
+  complete.
+- `IsCallable` is now a named partial JSL operation with pinned provenance, an explicit callable-
+  Proxy deviation, verified dependency-closure lowering, and a focused native-versus-Node source
+  witness. Attempts to claim ToObject and Get were withdrawn when their public witnesses failed;
+  no failing witness was converted into evidence.
+- Coverage still reports 525 of 526 public algorithms blocked and one partial. The next work is
+  dependency-ordered implementation, not more classification.
+# 2026-08-28: Stage 5 begins with ordered machine result captures on both targets
+
+- Multi-result ideal calls now lower to one `MI-CALL` anchor followed by one
+  `MI-CALL-RESULT` per declared slot. Selection publishes the complete projection group at the
+  call site. AArch64 and x86-64 encode the same private compiler ABI: result slot
+  `i` occupies canonical GPR/FPR color `i` for multi-result linkage, while scalar external linkage
+  retains its platform ABI.
+- Multi-result calls no longer perform scalar return normalization, which could overwrite a later
+  result before capture. Both target encoders accept the bounded two-leaf Record witness.
+- A host-native execution attempt did not return and was stopped. It is deliberately not claimed
+  as passing or left in the green suite; diagnosing that generated control/ABI failure is the next
+  Stage 5 task before the native exit condition can be met.
+- Attempts to impose capture/parallel-copy constraints in the existing scheduler and allocator
+  made the retained-library gate crash after scheduling. Those unproven constraints were removed;
+  the bounded two-result witness remains green, but the mandatory project gate is currently red
+  (75/76) at `an_immutable_jsl_seed_artifact_restores_a_clean_compiler_process`. Stage 5 therefore
+  needs a first-class result-location/parallel-copy phase, not more allocator masks.
+# 2026-08-28: backend scaling refactor is now a closed-pipeline contract
+
+- `docs/BACKEND-SCALING-REFACTOR.md` records the full refactor required by the 864-second
+  mislabelled scheduling/liveness cliff. The earlier `vreg-node` reverse-map work was an optional
+  cache over partial vregs and retained `ml-kind-for-vreg-scan`; it did not make provenance total.
+- An independent `gpt-5.6-sol` xhigh audit corrected the initial scheduler diagnosis: active local
+  scheduling already uses adjacency and a ready heap. The remaining inventory includes global
+  memory anti-dependency scans, reorder/repack repair, function×node indexes, per-query liveness
+  scans, dense quadratic interference, encoder fallbacks/cross-products, quadratic root sorting,
+  and per-function instruction rescans in retained-text extraction.
+- The plan requires typed complete MachineValue construction, table-driven opcode constraints,
+  frozen phase products, deletion of all production rediscovery/default paths, explicit dependency
+  tokens, bounded liveness, sparse/hybrid allocation, closed encoding/publication, and reachable
+  content-addressed JSL artifacts. Warm tiny compilation must complete through publication below
+  750 ms and spawn/first result below one second, with structural work counters and zero fallbacks.
+## 2026-08-28 — memory anti-dependencies and allocation are closed indexed products
+
+- Replaced selection's per-write whole-machine scan with ideal-memory and owner-local read
+  adjacency. On the 517,309-instruction seed, `selection_antideps_final` is about 11 ms and the
+  candidate count is 179,493, down from 4.207 s and 934,201,044 candidates.
+- Replaced the sparse interference graph with a Torque-style conservative interval sweep. The
+  allocator now stores zero interference edges/adjacency entries; allocation tests independently
+  replay exact CFG liveness against published registers and spills.
+- Fixed ABI-register exclusion is derived from exact liveness at fixed definitions, so holes in a
+  conservative interval cannot invent conflicts between mutually exclusive ABI values.
+- Replaced the per-function whole-unit scan for outgoing result-pointer slots with one instruction
+  pass plus a dense function flag table. Allocation publication fell from roughly 0.45 s to 4 ms.
+- The new spill shape exposed an AArch64 size-model bug: polymorphic calls emitted captured-result
+  parallel moves but did not count them. `be-inst-words` now includes those moves; the large seed
+  encodes, saves, reloads, and executes.
+- Witnesses: allocator 10/10 green; bounded gate 81/81 green. Large cold seed: selection ~0.53 s,
+  local scheduling ~0.18 s, liveness ~1.07 s, allocation ~1.48 s, AArch64 encoding ~0.08 s.
+  Allocation previously measured 8.45 s with 143,806,380 directed adjacency entries. Warm tiny
+  backend phases are microseconds. The remaining cold work is explicit: allocation constraint
+  construction and independent verification each replay call liveness, and liveness verification
+  remains about 0.43 s.

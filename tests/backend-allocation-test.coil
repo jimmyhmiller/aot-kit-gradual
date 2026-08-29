@@ -60,21 +60,27 @@
   (let [result (build-ra-pressure!) left (n-in result 1) right (n-in result 2)]
     (ra-compile! 4 0)
     (let [a (ms-vget 0 left) b (ms-vget 0 right)]
-      (assert (mra-interferes? a b))
+      (assert (mra-intervals-overlap? a b))
       (assert (or (!= (mra-reg a) (mra-reg b))
                   (or (>= (mra-spill a) 0) (>= (mra-spill b) 0))))
       (assert (mra-verify!)))))
 
-(deftest interference_verifier_snapshot_is_sparse
+(deftest interval_verifier_replays_without_an_interference_graph
   (build-ra-pressure!)
   (ra-compile! 4 0)
   (let [u (machine-unit)
-        expected (al-len [i64] (.alloc-expected u))
-        seen (al-len [i64] (.alloc-verify-seen u))
-        directed-edges (al-len [i64] (.alloc-adj-other u))]
-    (assert (= expected seen))
-    (assert (>= expected directed-edges))
-    (assert (< expected (* (ml-vreg-count) (ml-vreg-count))))))
+        (mut intervals) 0
+        (mut vr) 0]
+    ;; Production sweeps conservative intervals and verification independently replays exact CFG
+    ;; liveness. Neither side materializes the pairwise interference graph.
+    (loop (if (>= (load vr) (ml-vreg-count)) (break)
+              (do
+                (if (>= (al-get (.alloc-interval-start u) (load vr)) 0)
+                    (set! intervals (+ (load intervals) 1)) 0)
+                (set! vr (+ (load vr) 1)))))
+    (assert (= (al-len [i64] (.alloc-interval-start u)) (ml-vreg-count)))
+    (assert (= (al-len [i64] (.alloc-interval-end u)) (ml-vreg-count)))
+    (assert (> (load intervals) 0))))
 
 (deftest tiny_register_budget_spills_and_executes_natively
   (build-ra-pressure!)
@@ -123,13 +129,8 @@
       (assert (not (mra-verify!)))
       (assert (= (mra-result) MRA-FIXED)))))
 
-(deftest interference_and_illegal_coalesce_corruptions_are_named
+(deftest illegal_live_range_coalesce_corruption_is_named
   (let [result (build-ra-pressure!) left (n-in result 1) right (n-in result 2)]
-    (ra-compile! 4 0)
-    (let [a (ms-vget 0 left) b (ms-vget 0 right)]
-      (mra-corrupt-interference! a b false)
-      (assert (not (mra-verify!)))
-      (assert (= (mra-result) MRA-INTERFERENCE)))
     (ra-compile! 4 0)
     (let [a (ms-vget 0 left) b (ms-vget 0 right)]
       (mra-corrupt-reg! b (mra-reg a))

@@ -4,16 +4,60 @@
 ;; array is opaque and never represented by JavaScript properties.
 
 (macro IsArrayBuffer :params [(value dyn)] :ret bool
-  (if (%IsObject value) (%Eq (%InternalKind value) 105) false))
+  (HasInternalSlot value (InternalSlotArrayBufferData)))
 
-;; ToIndex for the fixed-length implementation. `%ToInteger` is ToIntegerOrInfinity and returns a
-;; tagged machine integer for every representable allocation length. Infinity, negative values,
-;; and lengths outside the implementation's addressable storage range are RangeErrors rather than
-;; silently clamped lengths.
+(macro IsSharedArrayBuffer
+  :spec "ecma262@ed463bc10dbeaad0410ce67e541a77ea8e9900a5#sec-issharedarraybuffer"
+  :spec-name "IsSharedArrayBuffer"
+  :status partial
+  :deviation "Shared Data Blocks and SharedArrayBuffer objects are not represented; every represented fixed ArrayBuffer correctly returns false."
+  :params [(object dyn)] :ret bool
+  false)
+
+(macro IsDetachedBuffer
+  :spec "ecma262@ed463bc10dbeaad0410ce67e541a77ea8e9900a5#sec-isdetachedbuffer"
+  :spec-name "IsDetachedBuffer"
+  :status partial
+  :deviation "ArrayBuffer detachment is not yet implemented; represented allocated ArrayBuffers retain a non-null [[ArrayBufferData]] target and correctly return false."
+  :params [(arrayBuffer dyn)] :ret bool
+  (%IsNull (%InternalTarget arrayBuffer)))
+
+(macro IsGrowableSharedArrayBuffer
+  :spec "ecma262@ed463bc10dbeaad0410ce67e541a77ea8e9900a5#sec-isgrowablesharedarraybuffer"
+  :spec-name "IsGrowableSharedArrayBuffer"
+  :status partial
+  :deviation "SharedArrayBuffer and [[ArrayBufferByteLengthData]] representations are not implemented; represented fixed ArrayBuffers correctly return false."
+  :params [(arrayBuffer dyn)] :ret bool
+  (if (IsSharedArrayBuffer arrayBuffer)
+      (HasInternalSlot arrayBuffer (InternalSlotArrayBufferByteLengthData))
+      false))
+
+(macro IsFixedLengthArrayBuffer
+  :spec "ecma262@ed463bc10dbeaad0410ce67e541a77ea8e9900a5#sec-isfixedlengtharraybuffer"
+  :spec-name "IsFixedLengthArrayBuffer"
+  :status partial
+  :deviation "Resizable and growable ArrayBuffer representations with [[ArrayBufferMaxByteLength]] are not implemented; represented fixed ArrayBuffers correctly return true."
+  :params [(arrayBuffer dyn)] :ret bool
+  true)
+
+(macro ArrayBufferByteLength
+  :spec "ecma262@ed463bc10dbeaad0410ce67e541a77ea8e9900a5#sec-arraybufferbytelength"
+  :spec-name "ArrayBufferByteLength"
+  :status partial
+  :deviation "The growable SharedArrayBuffer atomic-length path and detached buffers are not represented; fixed non-shared ArrayBuffers return their canonical [[ArrayBufferByteLength]]."
+  :params [(arrayBuffer dyn) (order int)] :ret dyn
+  (if (IsGrowableSharedArrayBuffer arrayBuffer)
+      (ThrowTypeError "Growable SharedArrayBuffer byte length is not represented")
+      (if (IsDetachedBuffer arrayBuffer)
+          (ThrowTypeError "ArrayBuffer is detached")
+          (%Box (%InternalIndex arrayBuffer)))))
+
+;; ToIndex owns ECMAScript conversion and validation. This helper owns only the fixed-length
+;; implementation's smaller addressable storage range and raw machine-index representation.
 (macro ToArrayBufferLength :transitioning true :params [(value dyn)] :ret int
-  (let [(integer (%ToInteger value))]
-    (if (%IsInt integer)
-        (let [(length (%UnboxInt integer))]
+  (let [(index (ToIndex value))]
+    (if (%IsInt index)
+        (let [(length (%UnboxInt index))]
           (if (%Lt length 0)
               (ThrowRangeError "Invalid array buffer length")
               (if (%Le length 2147483647)
@@ -22,7 +66,13 @@
         (ThrowRangeError "Invalid array buffer length"))))
 
 (macro NewArrayBuffer :transitioning true :params [(length int)] :ret dyn
-  (let [(object (%Box (%NewObject)))
+  ;; Every allocation path must establish the realm intrinsic whose prototype it installs.
+  ;; ConstructArrayBuffer already reaches ArrayBufferConstructorValue directly, but TypedArray
+  ;; construction also allocates backing buffers through this operation. Without this dependency
+  ;; those buffers carried the right internal slots and an uninitialized %ArrayBuffer.prototype%,
+  ;; so an inherited `byteLength` read observed an absent data property instead of the accessor.
+  (let [(intrinsics (ArrayBufferConstructorValue))
+        (object (%Box (%NewObject)))
         (bytes (%BoxArray (%NewArray)))
         (sized (%ArrayResize bytes length object))
         (initialized (%InternalInit object bytes 105))
@@ -32,31 +82,27 @@
 
 (macro ConstructArrayBuffer :transitioning true :params [(lengthValue dyn)] :ret dyn
   (let [(initialized (ArrayBufferConstructorValue))
-        (length (if (%IsUndefined lengthValue) 0 (ToArrayBufferLength lengthValue)))]
+        (length (ToArrayBufferLength lengthValue))]
     (NewArrayBuffer length)))
 
 (callable ArrayBufferByteLengthGetter0 :transitioning true :params [] :ret dyn
-  (if (IsArrayBuffer this)
-      (%Box (%InternalIndex this))
-      (ThrowTypeError "ArrayBuffer.prototype.byteLength called on incompatible receiver")))
+  (let [(required (RequireInternalSlot this (InternalSlotArrayBufferData)))]
+    (ArrayBufferByteLength this 0)))
 
 (callable ArrayBufferIsView1 :params [(value dyn)] :ret dyn
   (%Box (IsTypedArray value)))
 
 (callable ArrayBufferResizableGetter0 :transitioning true :params [] :ret dyn
-  (if (IsArrayBuffer this)
-      (%Box false)
-      (ThrowTypeError "ArrayBuffer.prototype.resizable called on incompatible receiver")))
+  (let [(required (RequireInternalSlot this (InternalSlotArrayBufferData)))]
+    (%Box (%Not (IsFixedLengthArrayBuffer this)))))
 
 (callable ArrayBufferMaxByteLengthGetter0 :transitioning true :params [] :ret dyn
-  (if (IsArrayBuffer this)
-      (%Box (%InternalIndex this))
-      (ThrowTypeError "ArrayBuffer.prototype.maxByteLength called on incompatible receiver")))
+  (let [(required (RequireInternalSlot this (InternalSlotArrayBufferData)))]
+    (ArrayBufferByteLength this 0)))
 
 (callable ArrayBufferDetachedGetter0 :transitioning true :params [] :ret dyn
-  (if (IsArrayBuffer this)
-      (%Box false)
-      (ThrowTypeError "ArrayBuffer.prototype.detached called on incompatible receiver")))
+  (let [(required (RequireInternalSlot this (InternalSlotArrayBufferData)))]
+    (%Box (IsDetachedBuffer this))))
 
 (callable ArrayBufferSpeciesGetter0 :params [] :ret dyn this)
 
@@ -99,13 +145,12 @@
         (isViewNameMarked (%SetPropertyAttributes isView (ToPropertyKey "name") 4))
         (isViewStored (%DefinePropertyValue constructor (ToPropertyKey "isView") isView))
         (isViewMarked (%SetPropertyAttributes constructor (ToPropertyKey "isView") 5))
-        (symbolConstructor (SymbolConstructorValue))
-        (speciesKey (GetProperty symbolConstructor "species"))
+        (speciesKey (SymbolSpeciesValue))
         (speciesGetter (%Box (closure ArrayBufferSpeciesGetter0)))
         (speciesInstalled
           (InstallBuiltinGetter constructor speciesKey speciesGetter
                                     (%Box "get [Symbol.species]")))
-        (toStringTagKey (GetProperty symbolConstructor "toStringTag"))
+        (toStringTagKey (SymbolToStringTagValue))
         (toStringTag (%DefinePropertyValue prototype toStringTagKey (%Box "ArrayBuffer")))
         (toStringTagMarked (%SetPropertyAttributes prototype toStringTagKey 4))]
     constructor))

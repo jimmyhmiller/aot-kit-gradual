@@ -108,6 +108,16 @@ function main(n) {
   return (n + caught * 10) | 0;
 }" 7)))
 
+;; Exception targets are created before the try body is lowered, so their fixed memory snapshot
+;; must include the closure-cell alias even when its first later use is a closure created after the
+;; catch. Otherwise the caught edge silently discards the parameter cell and `read()` observes 0.
+(deftest a_caught_throw_preserves_a_parameter_captured_after_the_catch
+  (assert (agrees-with-node? "function main(n) {
+  try { throw 1; } catch (error) {}
+  const read = function () { return n + 2; };
+  return read() | 0;
+}" 7)))
+
 (deftest a_catch_can_rethrow_to_an_outer_catch
   (assert (agrees-with-node? "function main(n) {
   try {
@@ -224,6 +234,28 @@ function main(n) {
   function explicitFunction() { return this === functionReceiver; }
   return ([1].every(sloppy) && [1].every(strictCallback) && [1].every(explicit, receiver) && [1].map(explicit, receiver)[0] && [1].map(explicitFunction, functionReceiver)[0] && Array.from([1], explicit, receiver)[0] ? 1 : 0) | 0;
 }" 0)))
+
+;; Runtime-polymorphic calls return through per-function metadata. The return code carries the full
+;; 64-bit NaN-box tag: truncating it into the old 32-bit reserved slot made every integer callback
+;; look like an untagged double, so map stored the raw payload `9` instead of a JavaScript Number.
+(deftest a_dynamic_callback_preserves_its_integer_return_tag
+  (assert (agrees-with-node? "function main(n) {
+  var mapped = [3, 4].map(function () { return 9; });
+  if (mapped[0] !== 9 || mapped[1] !== 9) return 101;
+  return n | 0;
+}" 7)))
+
+;; `Function.prototype.call` forwards any ECMAScript value through the receiver ABI. A JSL `dyn`
+;; parameter may specialize to a raw machine number at an exact outer call, so the
+;; `call-with-receiver` lowering boundary must restore the tagged JavaScript representation before
+;; the inner call. Sloppy OrdinaryCallBindThis then boxes the Number; a verifier policy that only
+;; admitted object-shaped semantic types rejected this before native selection.
+(deftest function_call_forwards_a_primitive_receiver_through_the_tagged_abi
+  (assert (agrees-with-node? "function main(n) {
+  function kind() { return typeof this; }
+  if (kind.call(n) !== 'object') return 101;
+  return n | 0;
+}" 7)))
 
 (deftest a_constructor_checked_throws_helper_runs_natively
   (assert (agrees-with-node? "function check(expected: any, callback: any): number {
@@ -682,6 +714,23 @@ function main(n: number): number {
   return acc | 0;
 }
 " 7)))
+
+(deftest configurable_data_property_can_become_an_accessor_after_a_wide_throwing_descriptor_call
+  ;; This is the Stage 7 vertical witness. The second definition reaches the wide
+  ;; ValidateAndApplyPropertyDescriptor builtin, changes descriptor kind, and consumes the getter
+  ;; only on the call's proven-normal continuation. A pending exception or an eagerly exposed raw
+  ;; ABI result makes the native answer disagree with node.
+  (assert (agrees-with-node? "function main(n) {
+  const target = {};
+  Object.defineProperty(target, 'changing', {
+    value: n,
+    configurable: true
+  });
+  Object.defineProperty(target, 'changing', {
+    get: function () { return n + 2; }
+  });
+  return target.changing | 0;
+}" 7)))
 
 (deftest object_descriptor_arguments_remain_tagged_across_source_parameters
   (assert (agrees-with-node? "function descriptorValue(object, key) {
@@ -1146,9 +1195,8 @@ function main(n: number): number {
 ;; the paragraphs stayed. `tests/native-frontier-test.coil` runs it now and would have said so.
 ;;
 ;; `String(1e21)` switches to exponential notation, which
-;; `repros/open/large-double-tostring-not-exponential.js` said it did not. The half that IS still
-;; owed is the shortest-round-trip digit generator -- `String(1/3)` is 19 characters against node's
-;; 18 -- and that half is `repros/open/shortest-round-trip-digits.js` now.
+;; `repros/open/large-double-tostring-not-exponential.js` said it did not. Shortest-round-trip
+;; digit generation is pinned separately below across the binary64 and presentation boundaries.
 ;;
 ;; Unary `+` on a string, `JSON.stringify`, and a `forEach` callback mutating an enclosing local
 ;; were `repros/open/undefined-for-these-values.js`, three constructs filed together because the
@@ -1166,6 +1214,238 @@ function main(n: number): number {
 }
 " 7)))
 
+;; Number::toString chooses the smallest decimal significand that round-trips to the same binary64,
+;; then applies ECMAScript's -5..21 fixed-notation window. This deliberately spans ordinary
+;; fractions, the two presentation boundaries, subnormal/normal edges, the maximum finite value,
+;; signed zero, and negative recursion; a fixed `%.17g` formatter fails the first assertion.
+(deftest number_to_string_uses_shortest_round_trip_digits_and_ecmascript_layout
+  (assert (agrees-with-node? "function main(n) {
+  if (String(1 / 3) !== \"0.3333333333333333\") return 101;
+  if (String(0.1 + 0.2) !== \"0.30000000000000004\") return 102;
+  if (String(1e-6) !== \"0.000001\") return 103;
+  if (String(1e-7) !== \"1e-7\") return 104;
+  if (String(1e20) !== \"100000000000000000000\") return 105;
+  if (String(1e21) !== \"1e+21\") return 106;
+  if (String(5e-324) !== \"5e-324\") return 107;
+  if (String(1.7976931348623157e308) !== \"1.7976931348623157e+308\") return 108;
+  if (String(2.2250738585072014e-308) !== \"2.2250738585072014e-308\") return 109;
+  if (String(2.225073858507201e-308) !== \"2.225073858507201e-308\") return 110;
+  if (String(-0) !== \"0\") return 111;
+  if (String(-1 / 3) !== \"-0.3333333333333333\") return 112;
+  return n | 0;
+}" 7)))
+
+;; This exact program was the `for-of-catch-arraybuffer-invalid-phi.js` frontier case. Canonical
+;; ArrayBuffer construction/state lowering removed its invalid loop-exit phi without changing the
+;; program or its expected result, so it lives here permanently as the regression witness.
+(deftest for_of_can_catch_each_invalid_arraybuffer_length
+  (assert (agrees-with-node? "function main(n) {
+  const invalid = [-1, -Infinity, Infinity, 9007199254740992];
+  for (const value of invalid) {
+    let rejected = false;
+    try {
+      new ArrayBuffer(value);
+    } catch (error) {
+      rejected = error instanceof RangeError;
+    }
+    if (!rejected) return 101;
+  }
+  return n | 0;
+}
+" 7)))
+
+;; Keep exception routing and Error identity independently observable. If this passes while the
+;; identity-bearing witness above fails, the defect is after catch entry rather than in the
+;; throwing ArrayBuffer operation or its loop-carried exceptional control.
+(deftest for_of_catches_each_invalid_arraybuffer_length_before_inspecting_the_error
+  (assert (agrees-with-node? "function main(n) {
+  const invalid = [-1, -Infinity, Infinity, 9007199254740992];
+  for (const value of invalid) {
+    let rejected = false;
+    try {
+      new ArrayBuffer(value);
+    } catch (error) {
+      rejected = true;
+    }
+    if (!rejected) return 101;
+  }
+  return n | 0;
+}
+" 7)))
+
+(deftest one_invalid_arraybuffer_length_reaches_its_source_catch
+  (assert (agrees-with-node? "function main(n) {
+  try { new ArrayBuffer(-1); }
+  catch (error) { return n | 0; }
+  return 101;
+}
+" 7)))
+
+;; These two properties are generated publication roots. Reading one must not initialize the full
+;; Symbol surface, repeated reads must preserve identity, and the descriptor installed by the
+;; focused root must already carry the standard all-false attributes.
+(deftest generated_well_known_symbol_roots_are_stable_and_descriptor_exact
+  (assert (agrees-with-node? "function main(n) {
+  const species = Symbol.species;
+  const tag = Symbol.toStringTag;
+  if (species !== Symbol.species) return 101;
+  if (tag !== Symbol.toStringTag) return 102;
+  if (species === tag) return 103;
+  const descriptor = Object.getOwnPropertyDescriptor(Symbol, 'species');
+  if (descriptor.value !== species) return 104;
+  if (descriptor.writable || descriptor.enumerable || descriptor.configurable) return 105;
+  return n | 0;
+}
+" 7)))
+
+;; Static methods are generated roots too. This focused witness keeps registry behavior separate
+;; from descriptor-object field traffic so each semantic boundary has an independent witness.
+(deftest generated_symbol_static_methods_preserve_registry_identity
+  (assert (agrees-with-node? "function main(n) {
+  const first = Symbol.for('generated-root');
+  if (first !== Symbol.for('generated-root')) return 101;
+  if (Symbol.keyFor(first) !== 'generated-root') return 102;
+  if (Symbol.for !== Symbol.for) return 103;
+  return n | 0;
+}
+" 7)))
+
+;; The publication descriptor creates the callable, observable function metadata, and exact
+;; writable/enumerable/configurable attributes without needing a registry operation.
+(deftest generated_symbol_static_method_descriptors_are_exact
+  (assert (agrees-with-node? "function main(n) {
+  const method = Symbol.for;
+  if (method.name !== 'for') return 108;
+  const nameDescriptor = Object.getOwnPropertyDescriptor(method, 'name');
+  if (nameDescriptor.value !== 'for') return 104;
+  const lengthDescriptor = Object.getOwnPropertyDescriptor(method, 'length');
+  if (lengthDescriptor.value !== 1) return 107;
+  const descriptor = Object.getOwnPropertyDescriptor(Symbol, 'for');
+  if (descriptor.value !== method) return 105;
+  if (!descriptor.writable) return 106;
+  if (descriptor.enumerable) return 109;
+  if (!descriptor.configurable) return 110;
+  return n | 0;
+}
+" 7)))
+
+;; Keep the complete interaction that originally entered the frontier. Distinct descriptor
+;; component operations must not merge during GVN, even when a later three-way logical OR expands
+;; the control graph around earlier callable metadata and registry checks.
+(deftest generated_symbol_descriptor_components_survive_combined_logical_or_control
+  (assert (agrees-with-node? "function main(n) {
+  const first = Symbol.for('generated-root');
+  if (first !== Symbol.for('generated-root')) return 101;
+  if (Symbol.keyFor(first) !== 'generated-root') return 102;
+  if (Symbol.for !== Symbol.for) return 103;
+  if (Symbol.for.name !== 'for') return 104;
+  if (Symbol.for.length !== 1) return 107;
+  const descriptor = Object.getOwnPropertyDescriptor(Symbol, 'for');
+  if (descriptor.value !== Symbol.for) return 105;
+  if (!descriptor.writable || descriptor.enumerable || !descriptor.configurable) return 106;
+  return n | 0;
+}
+" 7)))
+
+;; Prototype-targeted method and accessor descriptors are generated roots. This checks their
+;; behavior and their descriptors independently, without relying on whole-constructor duplication.
+(deftest generated_symbol_prototype_methods_and_description_accessor_behave
+  (assert (agrees-with-node? "function main(n) {
+  const symbol = Symbol('generated-prototype');
+  if (symbol.valueOf() !== symbol) return 101;
+  if (symbol.toString() !== 'Symbol(generated-prototype)') return 102;
+  if (symbol.description !== 'generated-prototype') return 103;
+  return n | 0;
+}
+" 7)))
+
+(deftest generated_symbol_prototype_method_and_accessor_descriptors_are_exact
+  (assert (agrees-with-node? "function main(n) {
+  const prototype = Symbol.prototype;
+  const valueOfDescriptor = Object.getOwnPropertyDescriptor(prototype, 'valueOf');
+  if (valueOfDescriptor.value.name !== 'valueOf') return 104;
+  if (valueOfDescriptor.value.length !== 0) return 105;
+  if (!valueOfDescriptor.writable) return 106;
+  if (valueOfDescriptor.enumerable) return 107;
+  if (!valueOfDescriptor.configurable) return 108;
+  const descriptionDescriptor = Object.getOwnPropertyDescriptor(prototype, 'description');
+  if (descriptionDescriptor.get.name !== 'get description') return 109;
+  if (descriptionDescriptor.get.length !== 0) return 110;
+  if (descriptionDescriptor.set !== undefined) return 111;
+  if (descriptionDescriptor.enumerable) return 112;
+  if (!descriptionDescriptor.configurable) return 113;
+  return n | 0;
+}
+" 7)))
+
+(deftest generated_symbol_description_accessor_has_no_setter
+  (assert (agrees-with-node? "function main(n) {
+  const decoy = {set: 123};
+  if (decoy.set !== 123) return 110;
+  const descriptor = Object.getOwnPropertyDescriptor(Symbol.prototype, 'description');
+  if (descriptor.set !== undefined) return 111;
+  return n | 0;
+}
+" 7)))
+
+;; Data descriptors and well-known-symbol keys complete the declarative Symbol surface. This
+;; reaches every new root through public JavaScript and compares exact observable metadata.
+(deftest generated_symbol_constructor_length_data_root_is_public
+  (assert (agrees-with-node? "function main(n) {
+  return (Symbol.length + n) | 0;
+}
+" 7)))
+
+(deftest generated_symbol_complete_constructor_root_is_public
+  (assert (agrees-with-node? "function main(n) {
+  const constructor = Symbol;
+  if (constructor !== constructor) return 101;
+  return n | 0;
+}
+" 7)))
+
+(deftest generated_symbol_constructor_data_descriptors_are_exact
+  (assert (agrees-with-node? "function main(n) {
+  const lengthDescriptor = Object.getOwnPropertyDescriptor(Symbol, 'length');
+  if (lengthDescriptor.value !== 0) return 101;
+  if (lengthDescriptor.writable) return 102;
+  if (lengthDescriptor.enumerable) return 103;
+  if (!lengthDescriptor.configurable) return 104;
+  const nameDescriptor = Object.getOwnPropertyDescriptor(Symbol, 'name');
+  if (nameDescriptor.value !== 'Symbol') return 105;
+  const prototypeDescriptor = Object.getOwnPropertyDescriptor(Symbol, 'prototype');
+  if (prototypeDescriptor.value !== Symbol.prototype) return 106;
+  return n | 0;
+}
+" 7)))
+
+(deftest generated_symbol_constructor_and_well_known_prototype_descriptors_are_exact
+  (assert (agrees-with-node? "function main(n) {
+  const lengthDescriptor = Object.getOwnPropertyDescriptor(Symbol, 'length');
+  if (lengthDescriptor.value !== 0) return 101;
+  if (lengthDescriptor.writable || lengthDescriptor.enumerable || !lengthDescriptor.configurable) return 102;
+  const nameDescriptor = Object.getOwnPropertyDescriptor(Symbol, 'name');
+  if (nameDescriptor.value !== 'Symbol') return 103;
+  if (nameDescriptor.writable || nameDescriptor.enumerable || !nameDescriptor.configurable) return 104;
+  const prototypeDescriptor = Object.getOwnPropertyDescriptor(Symbol, 'prototype');
+  if (prototypeDescriptor.value !== Symbol.prototype) return 105;
+  if (prototypeDescriptor.writable || prototypeDescriptor.enumerable || prototypeDescriptor.configurable) return 106;
+  const constructorDescriptor = Object.getOwnPropertyDescriptor(Symbol.prototype, 'constructor');
+  if (constructorDescriptor.value !== Symbol) return 107;
+  if (!constructorDescriptor.writable || constructorDescriptor.enumerable || !constructorDescriptor.configurable) return 108;
+  const primitiveDescriptor = Object.getOwnPropertyDescriptor(Symbol.prototype, Symbol.toPrimitive);
+  if (primitiveDescriptor.value.name !== '[Symbol.toPrimitive]') return 109;
+  if (primitiveDescriptor.value.length !== 1) return 110;
+  if (primitiveDescriptor.writable || primitiveDescriptor.enumerable || !primitiveDescriptor.configurable) return 111;
+  const tagDescriptor = Object.getOwnPropertyDescriptor(Symbol.prototype, Symbol.toStringTag);
+  if (tagDescriptor.value !== 'Symbol') return 112;
+  if (tagDescriptor.writable || tagDescriptor.enumerable || !tagDescriptor.configurable) return 113;
+  const symbol = Symbol('complete-surface');
+  if (symbol[Symbol.toPrimitive]('string') !== symbol) return 114;
+  return n | 0;
+}
+" 7)))
+
 ;; A Call's lattice type is not its native return representation. A helper returning a raw Boolean
 ;; can still have `dyn` graph type; tagged VALUE-TRUTHY then interpreted raw 0/1 as a boxed value.
 (deftest a_raw_direct_call_result_drives_the_following_if
@@ -1180,12 +1460,12 @@ function same(actual: any, expected: any): void {
 function main(n: number): number {
   let object: any = {value: 1};
   same(object.value, 1);
-  if (helper(1, "not one")) return 100;
+  if (helper(1, \"not one\")) return 100;
   let absent: any = undefined;
-  let selected = absent || "value";
-  if (selected !== "value" || object[selected] !== 1) return 200;
-  if (("" || "value") !== "value") return 300;
-  if (("" && "value") !== "") return 400;
+  let selected = absent || \"value\";
+  if (selected !== \"value\" || object[selected] !== 1) return 200;
+  if ((\"\" || \"value\") !== \"value\") return 300;
+  if ((\"\" && \"value\") !== \"\") return 400;
   if (1 / (-0 && -1) !== -Infinity) return 500;
   if (1 / (-0 || 0) !== Infinity) return 600;
   return n | 0;
@@ -1415,6 +1695,37 @@ function main(n) { return new Counter(n).read() | 0; }
   if (u[0] !== 255 || u[1] !== 1 || i[0] !== -1 || i[1] !== 1 || i[3] !== n) return 4000;
   if (!ArrayBuffer.isView(u) || !ArrayBuffer.isView(i) || ArrayBuffer.isView(u.buffer)) return 5000;
   return n;
+}" 7)))
+
+;; A backing buffer allocated through TypedArray construction must initialize the ArrayBuffer
+;; intrinsic just as direct `new ArrayBuffer` does. Exercise all three feedback-sized shapes:
+;; direct TypedArray state, an intermediate buffer binding, and a nested accessor chain.
+(deftest typed_array_backing_buffer_accessors_are_initialized_on_every_allocation_path
+  (assert (agrees-with-node? "function main(n) {
+  const unsigned = new Uint8Array(4);
+  const signed = new Int8Array(unsigned.buffer);
+  const intermediate = signed.buffer;
+  if (signed.byteLength !== 4) return 1000;
+  if (intermediate.byteLength !== 4) return 2000;
+  return (signed.buffer.byteLength + n) | 0;
+}" 7)))
+
+;; A coercion result published through Effect participates in the pre-call heap ordering even when
+;; the result is a structural value or is produced on a loop/backedge path. This startsWith case
+;; reaches ToClampedIndex -> ToNumber -> OrdinaryToPrimitive and then performs the string operation;
+;; scheduling the observable valueOf result after that later call used to make selection refuse.
+(deftest object_position_coercion_is_scheduled_before_string_starts_with
+  (assert (agrees-with-node? "function main(n) {
+  let calls = 0;
+  const position = {
+    valueOf: function () {
+      calls = (calls + 1) | 0;
+      return 4.8;
+    }
+  };
+  if (!\"abcdef\".startsWith(\"ef\", position)) return 101;
+  if (calls !== 1) return 102;
+  return n | 0;
 }" 7)))
 
 ;; Concrete typed-array intrinsics share the standard `%TypedArray%` constructor/prototype spine,
