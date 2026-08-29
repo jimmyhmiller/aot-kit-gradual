@@ -14,7 +14,7 @@ const owners = new Set(["jsl", "frontend", "runtime", "host", "composite"]);
 const propertyKinds = new Set(["well-known-symbol", "data", "method", "accessor"]);
 const propertyTargets = new Set(["constructor", "prototype"]);
 const propertyKeyKinds = new Set(["string", "well-known-symbol"]);
-const dataValueKinds = new Set(["constructor", "prototype", "string", "number"]);
+const dataValueKinds = new Set(["constructor", "prototype", "string", "number", "jsl"]);
 
 export function validateIntrinsicManifest(manifest) {
   const errors = [];
@@ -59,6 +59,10 @@ export function validateIntrinsicManifest(manifest) {
     if (typeof intrinsic.implementation !== "string" || intrinsic.implementation.length === 0) {
       errors.push(`${where}.implementation must name its current owner entry`);
     }
+    if (intrinsic.initializer !== undefined &&
+        !/^[A-Za-z][A-Za-z0-9]*$/.test(intrinsic.initializer)) {
+      errors.push(`${where}.initializer must name a JSL declaration`);
+    }
     if (!Array.isArray(intrinsic.properties)) errors.push(`${where}.properties must be an array`);
     else {
       const propertyKeys = new Set();
@@ -97,11 +101,14 @@ export function validateIntrinsicManifest(manifest) {
         }
         if (property.kind === "data") {
           if (!dataValueKinds.has(property.value?.kind)) {
-            errors.push(`${propertyWhere}.value.kind must be constructor, prototype, string, or number`);
+            errors.push(`${propertyWhere}.value.kind must be constructor, prototype, string, number, or jsl`);
           } else if (property.value.kind === "string" && typeof property.value.value !== "string") {
             errors.push(`${propertyWhere}.value.value must be a string`);
           } else if (property.value.kind === "number" && !Number.isSafeInteger(property.value.value)) {
             errors.push(`${propertyWhere}.value.value must be a safe integer`);
+          } else if (property.value.kind === "jsl" &&
+                     !/^[A-Za-z][A-Za-z0-9]*$/.test(property.value.root ?? "")) {
+            errors.push(`${propertyWhere}.value.root must name a zero-argument JSL declaration`);
           }
         }
         if (property.kind === "method") {
@@ -239,6 +246,14 @@ export function renderIntrinsicCoil(manifest) {
     }
   }
   lines.push("    :else \"\"))",
+    "", "(defn fe-intrinsic-initializer [(symbol i64)] (-> (slice u8))",
+    "  (cond");
+  for (const entry of entries) {
+    if (entry.initializer !== undefined) {
+      lines.push(`    (= symbol ${entry.constant}) ${coilString(entry.initializer)}`);
+    }
+  }
+  lines.push("    :else \"\"))",
     "", "(defn fe-intrinsic-property-callable? [(symbol i64) (name (slice u8))] (-> bool)",
     "  (cond");
   for (const entry of entries) {
@@ -248,6 +263,16 @@ export function renderIntrinsicCoil(manifest) {
     }
   }
   lines.push("    :else false))",
+    "", "(defn fe-intrinsic-property-value-root [(symbol i64) (name (slice u8))] (-> (slice u8))",
+    "  (cond");
+  for (const entry of entries) {
+    for (const property of entry.properties) {
+      if ((property.target ?? "constructor") !== "constructor" ||
+          property.kind !== "data" || property.value.kind !== "jsl") continue;
+      lines.push(`    (and (= symbol ${entry.constant}) (= name ${coilString(property.key)})) ${coilString(property.value.root)}`);
+    }
+  }
+  lines.push("    :else \"\"))",
     "", "(defn fe-error-intrinsic? [(symbol i64)] (-> bool)",
     "  (= (fe-intrinsic-family symbol) FE-INTRINSIC-FAMILY-ERROR))");
   lines.push("");
@@ -291,7 +316,9 @@ export function renderIntrinsicPublicationJsl(manifest) {
         ? "constructor"
         : property.value.kind === "prototype"
           ? "prototype"
-          : `(%Box ${coilString(property.value.value)})`;
+          : property.value.kind === "jsl"
+            ? `(%Box (${property.value.root}))`
+            : `(%Box ${coilString(property.value.value)})`;
       lines.push(
         `(builtin ${property.implementation} :transitioning true :params [] :ret dyn`,
         `  (let [(constructor (BuiltinConstructorValue ${lowering.runtimeKind}))`,
@@ -352,6 +379,20 @@ export function renderIntrinsicPublicationJsl(manifest) {
       );
     }
   }
+  for (const intrinsic of manifest.intrinsics) {
+    if (intrinsic.initializer === undefined) continue;
+    const lowering = manifest.lowering.find(entry => entry.id === intrinsic.id);
+    if (lowering?.runtimeKind === null) continue;
+    const roots = intrinsic.properties.map(property => property.implementation);
+    lines.push(
+      `(builtin ${intrinsic.initializer} :transitioning true :params [] :ret dyn`,
+      `  (let [(constructor (BuiltinConstructorValue ${lowering.runtimeKind}))`,
+      ...roots.map((root, index) => `        (property${index} (${root}))`),
+      "        ]",
+      "    constructor))",
+      "",
+    );
+  }
   return `${lines.join("\n")}\n`;
 }
 
@@ -370,6 +411,7 @@ export function renderIntrinsicSupport(manifest, sourceText = `${JSON.stringify(
       prototype: entry.prototype,
       owner: entry.owner,
       implementation: entry.implementation,
+      initializer: entry.initializer ?? null,
       loweringFamily: loweringById.get(entry.id).family,
       runtimeKind: loweringById.get(entry.id).runtimeKind,
       publishedProperties: entry.properties.length,

@@ -36,7 +36,7 @@ test("the support report is deterministic and counts only migrated property publ
   assert.equal(report.summary.intrinsicIdentities, manifest.intrinsics.length);
   assert.equal(report.summary.globalBindings,
     manifest.intrinsics.reduce((sum, entry) => sum + entry.globals.length, 0));
-  assert.equal(report.summary.publishedProperties, 26);
+  assert.equal(report.summary.publishedProperties, 37);
   assert.equal(report.entries.find(entry => entry.id === "%TypeError%").owner, "composite");
   assert.equal(report.entries.find(entry => entry.id === "%TypeError%").loweringFamily, "error");
   assert.equal(report.entries.find(entry => entry.id === "%TypeError%").runtimeKind, 5);
@@ -168,8 +168,40 @@ test("data descriptors and well-known Symbol keys require explicit valid shapes"
   const method = symbol.properties.find(property => property.key === "@@toPrimitive");
   method.keyRoot = "not a root";
   const errors = validateIntrinsicManifest(manifest).join("\n");
-  assert.match(errors, /value.kind must be constructor, prototype, string, or number/);
+  assert.match(errors, /value.kind must be constructor, prototype, string, number, or jsl/);
   assert.match(errors, /keyRoot must name the well-known Symbol root/);
+});
+
+test("JSL-valued data roots publish specification constants through named declarations", () => {
+  const manifest = loadIntrinsicManifest();
+  const number = manifest.intrinsics.find(entry => entry.id === "%Number%");
+  const nan = number.properties.find(property => property.key === "NaN");
+  assert.deepEqual(nan.value, {kind: "jsl", root: "NumberNaN"});
+  const generated = renderIntrinsicPublicationJsl(manifest);
+  assert.match(generated, /\(builtin NumberNaNValue :transitioning true/);
+  assert.match(generated, /\(value \(%Box \(NumberNaN\)\)\)/);
+  const compiler = renderIntrinsicCoil(manifest);
+  assert.match(compiler,
+    /\(and \(= symbol FE-INTRINSIC-NUMBER\) \(= name "NaN"\)\) "NumberNaN"/);
+
+  nan.value.root = "not a declaration";
+  assert.match(validateIntrinsicManifest(manifest).join("\n"),
+    /value\.root must name a zero-argument JSL declaration/);
+});
+
+test("constructor initializers compose all declared roots behind one shared JSL boundary", () => {
+  const manifest = loadIntrinsicManifest();
+  const generated = renderIntrinsicPublicationJsl(manifest);
+  const compiler = renderIntrinsicCoil(manifest);
+  assert.match(generated, /\(builtin NumberConstructorValue :transitioning true/);
+  assert.match(generated, /\(property0 \(NumberConstructorLengthValue\)\)/);
+  assert.match(generated, /\(property10 \(NumberPositiveInfinityValue\)\)/);
+  assert.match(compiler,
+    /\(= symbol FE-INTRINSIC-NUMBER\) "NumberConstructorValue"/);
+
+  manifest.intrinsics.find(entry => entry.id === "%Number%").initializer = "not valid";
+  assert.match(validateIntrinsicManifest(manifest).join("\n"),
+    /initializer must name a JSL declaration/);
 });
 
 test("every intrinsic has exactly one valid lowering description", () => {

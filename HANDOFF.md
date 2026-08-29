@@ -1,3 +1,27 @@
+# 2026-08-28: declarative Number roots publish through one generated constructor initializer
+
+- The intrinsic manifest now supports `jsl`-valued data properties: a checked zero-argument JSL
+  declaration supplies values such as NaN and infinities that cannot be represented as JSON
+  literals. Generated compiler metadata exposes the same root for representation-specialized
+  lowering, so the manifest remains the single selector of both publication and raw numeric use.
+- `%Number%` now declaratively publishes `length`, `name`, `prototype`, and all eight standard
+  numeric constants with exact attributes. Generated intrinsic support grows from 26 to 37
+  properties, and the checked JSL surface from 495 to 507 declarations. The ownership gate now
+  treats `src/generated_intrinsics.coil` as compiler wiring rather than misclassifying generated
+  publication roots as dead semantics.
+- Constructor initialization is itself manifest metadata. The generator emits one aggregate JSL
+  initializer, and every frontend request for `%Number%` crosses that same boundary. This removed
+  the order-sensitive multi-root native failure without moving Number semantics into the frontend;
+  the exact former repro is now retained in `tests/native-execution-test.coil`.
+- Focused native witnesses prove both one demand-loaded `Number.EPSILON` root and the complete
+  eight-constant interaction execute and agree with Node. The intrinsic manifest tests,
+  generated-artifact checks, full spec-ledger gate, and bounded `coil test` gate are green.
+- One newly exposed failure remains preserved honestly: the ordinary descriptor read for a
+  published Number data root throws. It is
+  `repros/open/generated-number-data-descriptor-throws.js`; the required frontier is red at
+  **0/2** alongside `for-await-has-no-bridge-kind.js`. `docs/NATIVE-FRONTIER.md` is the generated
+  status table.
+
 # 2026-08-28: the backend is a closed product and retained JSL links by source reachability
 
 - Final allocator hardening records both CFG boundaries in conservative intervals: live-in at

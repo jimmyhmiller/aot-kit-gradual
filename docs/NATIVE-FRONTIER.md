@@ -13,6 +13,7 @@ diff here rather than as a paragraph nobody rechecked.
 | repro | status |
 |---|---|
 | `for-await-has-no-bridge-kind.js` | refused |
+| `generated-number-data-descriptor-throws.js` | crashes |
 
 `refused` means the frontend declines the program by name. `crashes` means it compiled
 and the binary did not answer. `disagrees` means it compiled, ran, and computed something
