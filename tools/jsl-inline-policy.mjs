@@ -13,9 +13,17 @@
 //
 //   * a `(rest ...)` parameter is a compile-away specification list and cannot cross a call;
 //   * a `(slot-list)` parameter or return is compile-time only, for the same reason;
-//   * a `(record ...)` RETURN cannot cross a call -- the result-area ABI has a hidden result
-//     pointer and a flat result vector and a record's fields are not in it. Record ARGUMENTS are
-//     fine and three builtins already take one;
+//   * a `(record ...)` in the signature at all, argument or return. A record RETURN cannot cross
+//     the result-area ABI, which has a hidden result pointer and a flat result vector with no
+//     place for a record's fields. A record ARGUMENT is accepted by three long-standing builtins,
+//     but turning a record-taking MACRO into a builtin breaks its callers: with the callee inlined
+//     the record is a compile-time bundle that folds away, and once it is a call
+//     `ToPropertyDescriptor` fails to check with JSL-ERR-BAD-RECORD. Records stay inside macros;
+//   * a body that DIVERGES -- one whose whole body is `%Throw` -- cannot become a builtin. Inlined,
+//     it lowers to an expression with no normal value, so `(if c (ThrowTypeError ...) <record>)`
+//     types as the record. Called, it returns its declared `:ret`, the two arms disagree, and
+//     `ToPropertyDescriptor` fails to check with JSL-ERR-BAD-RECORD. Divergence at a call boundary
+//     is a real feature the checker does not have yet; until it does, throwers stay macros;
 //   * a definition that passes one of its OWN PARAMETERS as the key of `%PropLoadNamed`,
 //     `%PropStoreNamed`, `%PropHasNamed` or `%PropDeleteNamed` cannot cross a call. Named-property
 //     IR carries the interned name in the node's aux field, not as a data input, so the key has to
@@ -67,6 +75,13 @@ function jslFiles(root = "lib") {
 }
 
 const HEAD = /^\((macro|builtin|callable)\s+(\S+)/gm;
+
+// The body with the declaration header (name, :params, :ret and friends) removed, so a match is
+// about what the definition DOES rather than how it is declared.
+function stripHeader(code) {
+  const ret = /:ret\s+\S+/.exec(code);
+  return ret ? code.slice(ret.index + ret[0].length) : code;
+}
 const NAMED_KEY_PRIMS = ["%PropLoadNamed", "%PropStoreNamed", "%PropHasNamed", "%PropDeleteNamed"];
 
 // True when the key operand of a named-property primitive is one of this declaration's parameters,
@@ -102,6 +117,8 @@ function read() {
         rest: /\(rest\s/.test(params),
         slotList: code.includes("(slot-list)"),
         recordReturn: /:ret\s*\(record\s/.test(code),
+        recordParam: /\(record\s/.test(params),
+        diverges: /\(%Throw\b/.test(stripHeader(code)),
         staticKey: staticKeyParameter(code, params),
       });
     }
@@ -109,13 +126,15 @@ function read() {
   return declarations;
 }
 
-const eligible = (d) => !d.rest && !d.slotList && !d.recordReturn && !d.staticKey;
+const eligible = (d) =>
+  !d.rest && !d.slotList && !d.recordReturn && !d.recordParam && !d.staticKey && !d.diverges;
 const violation = (d) => {
   if (d.kind === "macro") return null;
   if (d.rest) return "a rest parameter cannot cross a call";
   if (d.slotList) return "a slot list cannot cross a call";
   if (d.recordReturn) return "a record return cannot cross a call";
   if (d.staticKey) return "a parameter used as a named-property key cannot cross a call";
+  if (d.diverges) return "a diverging body cannot cross a call";
   return null;
 };
 
