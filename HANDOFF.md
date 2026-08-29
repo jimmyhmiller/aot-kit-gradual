@@ -1,3 +1,26 @@
+# 2026-08-28: the ECMA-262 dependency graph exposes concrete work instead of umbrella blockers
+
+- `tools/ecma262-dependency-plan.mjs` now generates the complete fine-grained planning graph from
+  the pinned ledger and coverage report: 2,670 nodes and 6,927 edges, including all 4,449 extracted
+  specification-operation dependencies and all 2,478 reviewed capability prerequisites.
+- Concrete semantic dependencies and aggregate milestone capabilities are separate edge kinds.
+  Recursive operation dependencies are condensed into strongly connected work units, so recursion
+  cannot make an operation appear blocked on itself. The generated report currently identifies
+  1,317 concrete-ready incomplete work units and 1,306 items hidden only by aggregate capability
+  debt.
+- The complete machine graph is `spec/generated/ecma262-dependency-plan.json`; the complete
+  Graphviz graph is `spec/generated/ecma262-dependency-graph.dot`; the readable ranked view is
+  `docs/ECMA262-DEPENDENCY-GRAPH.md`. Deterministic regeneration and three focused analysis tests
+  are part of `spec:ledger:gate`, which is green.
+- The first ranked semantic tranche is `RequireInternalSlot`: no incomplete concrete or aggregate
+  prerequisite remains, it is the last concrete dependency for 13 direct dependents, and 201
+  public built-ins are downstream. Its honest remaining deviation is the incomplete internal-slot
+  identity/representation universe; its retained Test262 evidence is currently 0/10 and must move
+  before the tranche is called complete.
+- Required validation: `coil test` is green at **81/81**. The required frontier remains honestly
+  red at **0/2**: `for-await-has-no-bridge-kind.js` is refused and
+  `generated-number-data-descriptor-throws.js` crashes.
+
 # 2026-08-28: explicit transitioning-call outcomes and checked large-frame AArch64 access
 
 - Transitioning JSL calls now publish an explicit unconditional outcome projection. Pending-

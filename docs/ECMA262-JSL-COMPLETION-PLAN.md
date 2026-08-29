@@ -150,6 +150,12 @@ unresolved dependencies, and `complete` declarations carrying deviations.
 Declaration count is not a progress metric. One foundational operation can unlock hundreds of
 public algorithms, while many representation helpers can add no observable support.
 
+The generated fine-grained planning view is [ECMA-262 Fine-Grained Dependency Graph](ECMA262-DEPENDENCY-GRAPH.md).
+Its JSON and Graphviz forms retain every normative item, specification-operation edge, reviewed
+prerequisite, aggregate capability, recursive dependency component, and ranked actionable work
+unit. Aggregate capabilities remain visible as milestone debt, but they do not replace or obscure
+the concrete operation dependencies used to choose the next tranche.
+
 The generated report must show:
 
 - normative items classified / total;
