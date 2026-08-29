@@ -877,6 +877,13 @@
    (callee-first (ArrayList i64))
    (callee-count (ArrayList i64))
    (callee-entry (ArrayList i64))
+   ;; The same edges inverted. jsl-resolve-heap-params! propagates a BITMASK through argument
+   ;; positions rather than a bool, so it cannot use the callee substitution the effect fixpoints
+   ;; use -- but it can stop re-walking every body every round. A declaration only needs revisiting
+   ;; when one of its callees changed, and these are the callers to wake.
+   (caller-first (ArrayList i64))
+   (caller-count (ArrayList i64))
+   (caller-entry (ArrayList i64))
    (decls   (ArrayList JslDecl))
    (params  (ArrayList JslParam))
    (signaturetypes (ArrayList i64)) ; retained physical parameter/result vectors
@@ -919,6 +926,9 @@
           (set! (.callee-first p) (al-new [i64] (malloc-allocator)))
           (set! (.callee-count p) (al-new [i64] (malloc-allocator)))
           (set! (.callee-entry p) (al-new [i64] (malloc-allocator)))
+          (set! (.caller-first p) (al-new [i64] (malloc-allocator)))
+          (set! (.caller-count p) (al-new [i64] (malloc-allocator)))
+          (set! (.caller-entry p) (al-new [i64] (malloc-allocator)))
           (set! (.decls p) (al-new [JslDecl] (malloc-allocator)))
           (set! (.params p) (al-new [JslParam] (malloc-allocator)))
           (set! (.signaturetypes p) (al-new [i64] (malloc-allocator)))
@@ -952,6 +962,9 @@
     (al-clear! [i64]         (field p callee-first))
     (al-clear! [i64]         (field p callee-count))
     (al-clear! [i64]         (field p callee-entry))
+    (al-clear! [i64]         (field p caller-first))
+    (al-clear! [i64]         (field p caller-count))
+    (al-clear! [i64]         (field p caller-entry))
     (al-clear! [JslDecl]     (field p decls))
     (al-clear! [JslParam]    (field p params))
     (al-clear! [i64]         (field p signaturetypes))
@@ -2385,23 +2398,49 @@
       0)))
 
 (defn jsl-resolve-heap-params! [] (-> i64)
-  (let [n (jsl-decl-count) (mut changed) true (mut rounds) 0]
-    (loop (if (not (load changed)) (break)
-            (do (set! changed false)
-                (let [(mut i) 0]
-                  (loop (if (>= (load i) n) (break)
-                          (let [(mut acc) (jsl-decl-heap-params (load i))]
-                            (jsl-heap-walk (jsl-decl-body (load i)) (load i) (mut acc))
-                            (if (!= (load acc) (jsl-decl-heap-params (load i)))
-                                (do (jsl-decl-set-heap-params! (load i) (load acc))
-                                    (set! changed true) 0)
-                                0)
-                            (set! i (+ (load i) 1))
-                            0))))
-                (set! rounds (+ (load rounds) 1))
-                (if (> (load rounds) (+ n 2))
-                    (do (jsl-fail! JSL-ERR-MACRO-RECURSION "heap-parameter fixpoint") 0) 0)
-                0)))
+  ;; Worklist rather than rounds. The mask a declaration computes depends only on its own body and
+  ;; on its callees' masks, so once a declaration is stable it can only move again when a callee
+  ;; moves -- and then only its callers need revisiting. Re-walking the whole library on every round
+  ;; was 12.8 ms of a 44 ms library check.
+  (let [n (jsl-decl-count)
+        (mut queue) (al-new [i64] (malloc-allocator))
+        (mut queued) (al-new [i64] (malloc-allocator))
+        (mut steps) 0
+        (mut i) 0]
+    (jsl-build-caller-graph!)
+    (loop (if (>= (load i) n) (break)
+            (do (al-push! [i64] (mut queue) (- n (+ (load i) 1)))
+                (al-push! [i64] (mut queued) 1)
+                (set! i (+ (load i) 1)))))
+    (loop (if (= (al-len [i64] (load queue)) 0) (break)
+            (let [last (- (al-len [i64] (load queue)) 1)
+                  d (al-get [i64] (load queue) last)]
+              (al-pop! [i64] (mut queue))
+              (al-set! [i64] (mut queued) d 0)
+              (let [(mut acc) (jsl-decl-heap-params d)]
+                (jsl-heap-walk (jsl-decl-body d) d (mut acc))
+                (if (!= (load acc) (jsl-decl-heap-params d))
+                    (do
+                      (jsl-decl-set-heap-params! d (load acc))
+                      (let [c (jsl-caller-count d) (mut k) 0]
+                        (loop (if (>= (load k) c) (break)
+                                (let [caller (jsl-caller d (load k))]
+                                  (if (= (al-get [i64] (load queued) caller) 0)
+                                      (do (al-set! [i64] (mut queued) caller 1)
+                                          (al-push! [i64] (mut queue) caller) 0)
+                                      0)
+                                  (set! k (+ (load k) 1))))))
+                      0)
+                    0))
+              (set! steps (+ (load steps) 1))
+              ; Each visit either widens a mask that never narrows or stops. The cap makes a
+              ; runaway a named failure rather than a hang.
+              (if (> (load steps) (* (+ n 2) (+ n 2)))
+                  (do (jsl-fail! JSL-ERR-MACRO-RECURSION "heap-parameter fixpoint")
+                      (al-clear! [i64] (mut queue)) 0)
+                  0))))
+    (al-free! [i64] (mut queue))
+    (al-free! [i64] (mut queued))
     JSL-OK))
 
 (defn jsl-check-heap-shape [] (-> i64)
@@ -2464,6 +2503,55 @@
                         (- (al-len [i64] (.callee-entry p)) first))
               (set! i (+ (load i) 1)))))
     0))
+
+;; Invert callee -> caller by counting sort, so a fixpoint can wake exactly the declarations whose
+;; inputs changed instead of rescanning the library.
+(defn jsl-build-caller-graph! [] (-> i64)
+  (let [p (jsl) n (jsl-decl-count) (mut i) 0 (mut cursor) 0]
+    (al-clear! [i64] (field p caller-first))
+    (al-clear! [i64] (field p caller-count))
+    (al-clear! [i64] (field p caller-entry))
+    (loop (if (>= (load i) n) (break)
+            (do (al-push! [i64] (field p caller-first) 0)
+                (al-push! [i64] (field p caller-count) 0)
+                (set! i (+ (load i) 1)))))
+    (set! i 0)
+    (loop (if (>= (load i) (al-len [i64] (.callee-entry p))) (break)
+            (let [callee (al-get [i64] (.callee-entry p) (load i))]
+              (al-set! [i64] (field p caller-count) callee
+                       (+ (al-get [i64] (.caller-count p) callee) 1))
+              (set! i (+ (load i) 1)))))
+    (set! i 0)
+    (loop (if (>= (load i) n) (break)
+            (do (al-set! [i64] (field p caller-first) (load i) (load cursor))
+                (set! cursor (+ (load cursor) (al-get [i64] (.caller-count p) (load i))))
+                (set! i (+ (load i) 1)))))
+    (set! i 0)
+    (loop (if (>= (load i) (load cursor)) (break)
+            (do (al-push! [i64] (field p caller-entry) -1) (set! i (+ (load i) 1)))))
+    (set! i 0)
+    (loop (if (>= (load i) n) (break)
+            (do (al-set! [i64] (field p caller-count) (load i) 0) (set! i (+ (load i) 1)))))
+    (set! i 0)
+    (loop (if (>= (load i) n) (break)
+            (let [c (jsl-callee-count-raw (load i)) (mut k) 0]
+              (loop (if (>= (load k) c) (break)
+                      (let [callee (al-get [i64] (.callee-entry p)
+                                           (+ (al-get [i64] (.callee-first p) (load i)) (load k)))
+                            fill (al-get [i64] (.caller-count p) callee)]
+                        (al-set! [i64] (field p caller-entry)
+                                 (+ (al-get [i64] (.caller-first p) callee) fill) (load i))
+                        (al-set! [i64] (field p caller-count) callee (+ fill 1))
+                        (set! k (+ (load k) 1)))))
+              (set! i (+ (load i) 1)))))
+    0))
+
+(defn jsl-callee-count-raw [(d i64)] (-> i64)
+  (al-get [i64] (.callee-count (jsl)) d))
+(defn jsl-caller-count [(d i64)] (-> i64)
+  (al-get [i64] (.caller-count (jsl)) d))
+(defn jsl-caller [(d i64) (which i64)] (-> i64)
+  (al-get [i64] (.caller-entry (jsl)) (+ (al-get [i64] (.caller-first (jsl)) d) which)))
 
 (defn jsl-callee-count [(d i64)] (-> i64)
   (al-get [i64] (.callee-count (jsl)) d))
