@@ -788,6 +788,78 @@
         0)
     (= (ml-result) MLIVE-OK)))
 
+
+;; WHY THE DENSE BIT MATRIX CANNOT SIMPLY BE MADE SPARSE.
+;;
+;; The obvious repair for a `blocks x owner_vregs` matrix is a sparse per-block live set, which is
+;; what Simple does (`IdentityHashMap<LRG,Node>` per block) and what every production allocator does.
+;; This counts whether that would actually help, by reporting how many bits are really set:
+;;
+;;   var x = 1;                     57 blocks,     5.5 values live per block boundary
+;;   3-line `for` loop            5,436 blocks,   739
+;;   [1,2,3].join("-")            6,986 blocks,   369
+;;   assert.js + sta.js          92,841 blocks,   890
+;;   + DataView getUint8 test   137,870 blocks, 1,965
+;;
+;; The floor case is healthy. Everything a JSL macro touches is not: with ~900 values live at every
+;; boundary of a 90,000-block function, a sparse set costs 4 bytes per live value where the dense
+;; matrix costs one bit, and the two land within a factor of ~6 of each other. That is not the
+;; hundredfold this needs. The size of the input is the problem, not the way it is stored.
+;;
+;; So this stays as a diagnostic, gated on profiling: it is the number that says whether the
+;; representation has become the bottleneck yet. It has not.
+(defn ml-measure-alphabet! [] (-> i64)
+  (let [u (machine-unit)
+        blocks (mu-block-count)
+        vregs (ml-vreg-count)
+        (mut seen) (al-new [i64] (malloc-allocator))
+        (mut i) 0
+        (mut bid) 0
+        (mut globals) 0
+        (mut in-bits) 0
+        (mut out-bits) 0
+        (mut max-out) 0]
+    (loop (if (>= (load i) vregs) (break)
+              (do (al-push! [i64] (mut seen) 0) (set! i (+ (load i) 1)))))
+    (loop (if (>= (load bid) blocks) (break)
+              (let [owner (mu-block-owner (load bid))
+                    words (ml-block-words (load bid))
+                    base (al-get (.live-block-first u) (load bid))
+                    (mut w) 0]
+                (loop (if (>= (load w) words) (break)
+                          (let [in-word (al-get (.live-in u) (+ base (load w)))
+                                out-word (al-get (.live-out u) (+ base (load w)))
+                                bits (| in-word out-word)
+                                (mut bit) 0]
+                            (if (!= bits 0)
+                                (loop (if (>= (load bit) 64) (break)
+                                          (do
+                                            (if (!= (& in-word (<< 1 (load bit))) 0)
+                                                (set! in-bits (+ (load in-bits) 1)) 0)
+                                            (if (!= (& out-word (<< 1 (load bit))) 0)
+                                                (set! out-bits (+ (load out-bits) 1)) 0)
+                                            (if (!= (& bits (<< 1 (load bit))) 0)
+                                                (let [local (+ (* (load w) 64) (load bit))]
+                                                  (if (< local (al-get (.live-owner-count u) owner))
+                                                      (al-set! [i64] (mut seen)
+                                                               (ml-owner-vreg owner local) 1)
+                                                      0))
+                                                0)
+                                            (set! bit (+ (load bit) 1)))))
+                                0)
+                            (set! w (+ (load w) 1)))))
+                (set! bid (+ (load bid) 1)))))
+    (set! i 0)
+    (loop (if (>= (load i) vregs) (break)
+              (do (if (!= (al-get [i64] (load seen) (load i)) 0)
+                      (set! globals (+ (load globals) 1)) 0)
+                  (set! i (+ (load i) 1)))))
+    (fmt (stderr)
+         "AOTK_PROFILE phase=liveness_alphabet total_vregs={d} boundary_vregs={d} live_in_bits={d} live_out_bits={d} dense_words={d}\n"
+         vregs (load globals) (load in-bits) (load out-bits) (ml-liveness-block-words))
+    (al-free! [i64] (mut seen))
+    0))
+
 (defn ml-compute! [(seed i64)] (-> bool)
   (let [u (machine-unit)
         (mut phase-start) (ms-profile-now)]
@@ -806,6 +878,7 @@
           (set! phase-start (ms-profile-note! "liveness_solve" (load phase-start)))
           (ml-compute-edge-live!)
           (set! phase-start (ms-profile-note! "liveness_edges" (load phase-start)))
+          (if (be-profiling?) (ml-measure-alphabet!) 0)
           (let [ok (if (be-verification?) (ml-verify!) true)]
             (ms-profile-note! "liveness_verify" (load phase-start))
             ok)))))
