@@ -4936,6 +4936,9 @@
         (mut owner) 0
         (mut profile-start) (ms-profile-now)
         (mut part-start) (ms-profile-now)
+        ;; A REAL clock, not ms-profile-now, which answers zero unless --profile is on. These three
+        ;; accumulators are reported unconditionally, and reading them through the profiling clock
+        ;; made them report 0.0 ms in exactly the configuration whose numbers are trustworthy.
         (mut preselect-ns) 0
         (mut copies-ns) 0
         (mut terminators-ns) 0]
@@ -4963,7 +4966,7 @@
               (break)
               (do
                 (let [base (be-inst-count)
-                      (mut started) (ms-profile-now)]
+                      (mut started) (monotonic/monotonic-now-ns)]
                   ;; The selection memo is node-dense and owner-tagged because owners are selected
                   ;; sequentially. Preallocating every owner's Phis up front violated that contract:
                   ;; selecting an earlier owner could overwrite a later owner's reservation, and a
@@ -4975,22 +4978,26 @@
                   ; be pinned to the backedge even when the branch condition consumes it in-header.
                   (ms-preselect-function! (load owner))
                   (set! preselect-ns (+ (load preselect-ns)
-                                        (- (ms-profile-now) (load started))))
-                  (set! started (ms-profile-now))
+                                        (- (monotonic/monotonic-now-ns) (load started))))
+                  (set! started (monotonic/monotonic-now-ns))
                   (ms-build-edge-copies! (load owner))
                   (set! copies-ns (+ (load copies-ns)
-                                     (- (ms-profile-now) (load started))))
-                  (set! started (ms-profile-now))
+                                     (- (monotonic/monotonic-now-ns) (load started))))
+                  (set! started (monotonic/monotonic-now-ns))
                   (ms-emit-function! (load owner) base)
                   (set! terminators-ns (+ (load terminators-ns)
-                                          (- (ms-profile-now) (load started)))))
+                                          (- (monotonic/monotonic-now-ns) (load started)))))
                 (set! owner (+ (load owner) 1))
                 0)))
+    ;; UNCONDITIONAL. These three are accumulated regardless, and --profile turns on enough other
+    ;; per-node bookkeeping that it inflated `selection` from 71 ms to 351 ms -- which sent three
+    ;; optimisation attempts at a phase that was never the bottleneck. A phase breakdown that is
+    ;; only visible in a distorted configuration is worse than none.
+    (fmt (stderr) "AOTK_TIMING phase=selection_emit_preselect ns={d}\n" (load preselect-ns))
+    (fmt (stderr) "AOTK_TIMING phase=selection_emit_copies ns={d}\n" (load copies-ns))
+    (fmt (stderr) "AOTK_TIMING phase=selection_emit_function ns={d}\n" (load terminators-ns))
     (if (be-profiling?)
         (do
-          (fmt (stderr) "AOTK_PROFILE phase=selection_emit_preselect ns={d}\n" (load preselect-ns))
-          (fmt (stderr) "AOTK_PROFILE phase=selection_emit_copies ns={d}\n" (load copies-ns))
-          (fmt (stderr) "AOTK_PROFILE phase=selection_emit_terminators ns={d}\n" (load terminators-ns))
           (let [(mut function) 0]
             (loop (if (>= (load function) funcs)
                       (break)
