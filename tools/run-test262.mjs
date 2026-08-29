@@ -100,7 +100,8 @@ const defaultResults = resolve(
 );
 const results = quick ? "" : resolve(explicitResults || defaultResults);
 const invocationStarted = performance.now();
-let buildMs = 0;
+let toolBuildMs = 0;
+let seedBuildMs = 0;
 if (paths.length === 0) {
   console.error(
     "usage: node tools/run-test262.mjs --test262 DIR [--start N] [--limit N] " +
@@ -133,7 +134,7 @@ if (!hasFlag("--no-build")) {
     ["build", "tools/test262-native.coil", "-o", native, "--meta-opt=1", "--quiet"],
     { cwd: process.cwd(), encoding: "utf8" },
   );
-  buildMs = performance.now() - buildStarted;
+  toolBuildMs = performance.now() - buildStarted;
   if (build.status !== 0) {
     process.stderr.write(build.stdout || "");
     process.stderr.write(build.stderr || "");
@@ -165,7 +166,7 @@ if (useSeedArtifact) {
     process.stderr.write(seed.stderr || "");
     process.exit(seed.status || 1);
   }
-  buildMs += performance.now() - seedStarted;
+  seedBuildMs = performance.now() - seedStarted;
 }
 
 function collect(path, out) {
@@ -358,15 +359,7 @@ function runNative(assembled, count = 0, requestPrefix = null) {
     let stdout = "";
     let stderr = "";
     let timedOut = false;
-    let peakRssKb = 0;
     let readyReceivedNs;
-    const monitor = setInterval(() => {
-      try {
-        const status = readFileSync(`/proc/${child.pid}/status`, "utf8");
-        const rss = Number(status.match(/^VmRSS:\s+(\d+)/m)?.[1] || 0);
-        peakRssKb = Math.max(peakRssKb, rss);
-      } catch {}
-    }, 20);
     const timer = setTimeout(() => {
       timedOut = true;
       try {
@@ -389,15 +382,13 @@ function runNative(assembled, count = 0, requestPrefix = null) {
     });
     child.on("error", (error) => {
       clearTimeout(timer);
-      clearInterval(monitor);
       resolveRun({ pid: child.pid, status: null, signal: "SPAWN", stdout,
-        stderr: error.message, spawnStartedNs, readyReceivedNs, peakRssKb });
+        stderr: error.message, spawnStartedNs, readyReceivedNs });
     });
     child.on("close", (status, signal) => {
       clearTimeout(timer);
-      clearInterval(monitor);
       resolveRun({ pid: child.pid, status, signal: timedOut ? "TIMEOUT" : signal, stdout, stderr,
-        spawnStartedNs, readyReceivedNs, peakRssKb });
+        spawnStartedNs, readyReceivedNs });
     });
   });
 }
@@ -420,8 +411,13 @@ function timingFields(run, assemblyMs, durationMs) {
     "graph_verify", "selection", "scheduling", "allocation", "aarch64_encoding",
     "macho_publication", "x86_encoding", "elf_publication"];
   const compileMs = compileNames.reduce((sum, name) => sum + (phases[name] || 0), 0);
+  // The compiler reports its own peak through getrusage; a run that never reached the backend
+  // (refused, timed out, crashed early) reports nothing, and the field is then absent rather than
+  // zero. A silent zero here is what hid a 28 GB compile: /proc/<pid>/status does not exist on
+  // Darwin, so the old poller caught ENOENT and recorded 0 for every row.
+  const footprintBytes = profile.compile_footprint?.peak_rss_bytes;
   return { phasesMs: phases, profile, compileMs, attemptWallMs: durationMs,
-    peakRssKb: run.peakRssKb };
+    ...(footprintBytes > 0 ? { peakRssKb: Math.round(footprintBytes / 1024) } : {}) };
 }
 
 function nativeDiagnostic(stderr) {
@@ -545,16 +541,11 @@ function nativeServer() {
   let stdout = "";
   let stdoutBuffer = "";
   let stderrBuffer = "";
-  let monitor = null;
   const appendOutput = (currentOutput, chunk) =>
     currentOutput.length >= nativeOutputLimit
       ? currentOutput
       : (currentOutput + chunk.toString()).slice(0, nativeOutputLimit);
 
-  const stopMonitor = () => {
-    if (monitor) clearInterval(monitor);
-    monitor = null;
-  };
   const maybeSettle = () => {
     if (!current || current.markerStatus === undefined || !current.stdoutComplete) return;
     settle(current.markerStatus, null);
@@ -568,8 +559,7 @@ function nativeServer() {
     const cleanStdout = stdout.replace(/^AOTK_CASE_END .*$/gm, "").trimEnd();
     const run = { pid: child?.pid, status, signal: request.forcedSignal || signal,
       stdout: cleanStdout, stderr,
-      spawnStartedNs: request.startedNs, readyReceivedNs: request.readyReceivedNs,
-      peakRssKb: request.peakRssKb };
+      spawnStartedNs: request.startedNs, readyReceivedNs: request.readyReceivedNs };
     stdout = "";
     stderr = "";
     stderrBuffer = "";
@@ -630,23 +620,14 @@ function nativeServer() {
       settle(null, "SPAWN");
     });
     child.on("close", (_status, signal) => {
-      stopMonitor();
       settle(null, current?.forcedSignal || signal || "SERVER-EXIT");
       child = null;
     });
-    monitor = setInterval(() => {
-      if (!current || !child) return;
-      try {
-        const status = readFileSync(`/proc/${child.pid}/status`, "utf8");
-        const rss = Number(status.match(/^VmRSS:\s+(\d+)/m)?.[1] || 0);
-        current.peakRssKb = Math.max(current.peakRssKb, rss);
-      } catch {}
-    }, 20);
   };
   const request = (line, expectedResults) => new Promise((resolveRun) => {
     if (!child) start();
     const startedNs = process.hrtime.bigint();
-    current = { resolve: resolveRun, startedNs, peakRssKb: 0, timer: null, requestPid: null,
+    current = { resolve: resolveRun, startedNs, timer: null, requestPid: null,
       expectedResults, stdoutResults: 0, stdoutComplete: false, markerStatus: undefined };
     current.timer = setTimeout(() => {
       if (!child) return;
@@ -671,7 +652,6 @@ function nativeServer() {
   const runBatch = (manifest, count) => request(`#${manifest}`, count);
   const close = () => {
     if (child) child.stdin.end();
-    stopMonitor();
   };
   return { run, runBatch, close };
 }
@@ -857,14 +837,16 @@ console.log(
 const executionMs = performance.now() - executionStarted;
 const invocationMs = performance.now() - invocationStarted;
 console.error(
-  `test262 timing: build=${buildMs.toFixed(0)}ms execution=${executionMs.toFixed(0)}ms ` +
+  `test262 timing: tool-build=${toolBuildMs.toFixed(0)}ms seed-build=${seedBuildMs.toFixed(0)}ms ` +
+  `execution=${executionMs.toFixed(0)}ms ` +
     `total=${invocationMs.toFixed(0)}ms variants=${work.length}`,
 );
 if (results) {
   const summary = { totals, categories, metadata: {
     expandedVariants: completed.size,
     executedVariants: work.length,
-    timingMs: { build: Math.round(buildMs), execution: Math.round(executionMs), total: Math.round(invocationMs) },
+    timingMs: { toolBuild: Math.round(toolBuildMs), seedBuild: Math.round(seedBuildMs),
+      execution: Math.round(executionMs), total: Math.round(invocationMs) },
   } };
   writeFileSync(`${results}.summary.json`, `${JSON.stringify(summary, null, 2)}\n`);
   console.error(`test262 results: ${results}`);

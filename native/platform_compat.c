@@ -1,3 +1,4 @@
+#include <sys/resource.h>
 #include <stddef.h>
 
 #if defined(__APPLE__)
@@ -28,5 +29,18 @@ int aot_host_is_x86_64(void) {
   return 1;
 #else
   return 0;
+#endif
+}
+
+// Peak resident set size of THIS process, in bytes, as the kernel has observed it so far.
+// `ru_maxrss` is monotonic, so a caller reading it after the largest phase reads that phase's
+// peak. The unit differs by host and is normalized here rather than at every call site.
+long aot_peak_rss_bytes(void) {
+  struct rusage usage;
+  if (getrusage(RUSAGE_SELF, &usage) != 0) return -1;
+#if defined(__APPLE__)
+  return (long)usage.ru_maxrss;
+#else
+  return (long)usage.ru_maxrss * 1024L;
 #endif
 }

@@ -1,0 +1,83 @@
+(module compilebudgetgate)
+
+;; WHAT ONE JAVASCRIPT OPERATION COSTS THE BACKEND, ASSERTED.
+;;
+;; The compiler took 87 seconds and 28.5 GB to compile a 253-line Test262 file, and nothing in the
+;; gate noticed, because every budget the project had was a phase time measured on ONE large
+;; immutable-library seed. A seed that meets its phase budgets says nothing about whether a small
+;; program stays small, and "small program stays small" is the property that was actually broken:
+;; `[1,2,3].join("-")` lowers to TWENTY-SIX THOUSAND basic blocks and a 495 MB liveness matrix,
+;; because `lib/` inlines its transitive macro closure into the caller.
+;;
+;; So these are structural, not temporal. `blocks`, `vregs` and `liveness_words` are exactly
+;; reproducible on any host, where wall time and RSS are not, and they are the numbers the expensive
+;; phases are actually a function of: liveness, allocation and GC-root discovery all walk a dense
+;; `blocks x owner-vregs` bit matrix, so `ml-liveness-words` IS the memory and IS the walk cost.
+;; At 590 million words the Test262 harness alone spends 4.7 GB on that one matrix.
+;;
+;; EVERY CEILING HERE IS A MEASURED NUMBER PLUS HEADROOM, NOT A TARGET. They are far too high to be
+;; acceptable and they are meant to come DOWN as the closure explosion is fixed. Raising one is
+;; never the fix for a failure: it means a change made some JavaScript operation expand further than
+;; it already does, and that is the regression this file exists to catch.
+
+(import "nativeharness" :use *)
+(import "backend_core" :use *)
+(import "backend_liveness" :use *)
+(import "coil.assert" :use *)
+(import "coil.fmt" :use *)
+(import "coil.io" :use * :as io)
+
+(defn budget! [(label (slice u8)) (source (slice u8))
+               (max-blocks i64) (max-vregs i64) (max-liveness-words i64)] (-> i64)
+  ;; Pin the compiler configuration rather than inheriting whatever the previously-run test left
+  ;; set. A budget that moves with test ordering is not a budget. This is the Test262 production
+  ;; configuration, but WITHOUT a warm JSL seed: every reachable JSL body is compiled into this
+  ;; unit, so these counts are the whole reachable closure of the program, inlined macros and
+  ;; called builtins alike. The seeded Test262 path reports roughly a quarter of these blocks
+  ;; because its builtin bodies come from the retained prefix instead.
+  (nh-use-direct-memory-execution! true)
+  (nh-use-graph-verification! false)
+  (assert (nh-try-compile? source))
+  (let [blocks (mu-block-count)
+        vregs (ml-vreg-count)
+        words (ml-liveness-words)]
+    ;; Printed on every run, pass or fail. The point of the gate is that the number is visible,
+    ;; not only that it is under a line.
+    (fmt (stderr) "COMPILE_BUDGET {s} blocks={d}/{d} vregs={d}/{d} liveness_words={d}/{d}\n"
+         label blocks max-blocks vregs max-vregs words max-liveness-words)
+    (assert (<= blocks max-blocks))
+    (assert (<= vregs max-vregs))
+    (assert (<= words max-liveness-words))
+    0))
+
+;; The floor. A declaration and a constant reach no JSL algorithm at all, so this is the fixed cost
+;; of a compiled Script: the entry, the Start bridge, and the global object. If THIS grows,
+;; something became unconditional that was not.
+(deftest a_declaration_of_a_constant_stays_at_the_script_floor
+  (budget! "var-const" "var x = 1;" 105 900 4200))
+
+;; Constant arithmetic folds, so this must stay at the floor too. It differs from the case above
+;; only in ideal nodes before folding.
+(deftest constant_arithmetic_folds_back_to_the_script_floor
+  (budget! "const-add" "var x = 1 + 2;" 105 900 4200))
+
+;; The first real cost. `x + i` on two `dyn` values reaches the coercion lattice, and because
+;; ToStringValue/ToPrimitive/ToNumber are `macro`s in `lib/`, the whole lattice is inlined into the
+;; loop body. Twenty-two thousand blocks for three lines of JavaScript is the bug, written down.
+(deftest a_three_line_loop_pays_for_the_inlined_coercion_lattice
+  (budget! "dyn-add-loop"
+           "var x = 0;
+for (var i = 0; i < 10; i++) { x = x + i; }
+if (x !== 45) { throw new Error(\"bad\"); }"
+           24700 114000 43500000))
+
+;; ONE method call. `Array.prototype.join` is a `macro` whose closure includes the array walk and
+;; ToStringValue, so calling it once expands 26,594 blocks and a 495 MB liveness matrix into the
+;; caller. This is the single most important number in the file: it is the case that proves the
+;; explosion has nothing to do with DataView, intrinsic publication, or the retained-image cache.
+(deftest one_array_method_call_expands_twenty_six_thousand_blocks
+  (budget! "array-join"
+           "var a = [1, 2, 3];
+var s = a.join(\"-\");
+if (s !== \"1-2-3\") { throw new Error(\"bad\"); }"
+           29300 134000 68000000))
