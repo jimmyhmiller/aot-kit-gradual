@@ -173,16 +173,21 @@
                 0)))
     0))
 
+;; THROUGH THE LIVE RANGE, not the raw vreg. A coalesced vreg has no register of its own -- the
+;; range it was merged into holds it -- so reading `alloc-reg` by vreg answers -1 for every value
+;; on the non-root side of a merge, and the encoder then emits a sentinel.
 (defn be-reg-of [(vr i64)] (-> i64)
-  (let [dense (.alloc-reg (machine-unit))]
-    (if (and (>= vr 0) (< vr (al-len [i64] dense)))
-        (al-get dense vr)
+  (let [dense (.alloc-reg (machine-unit))
+        root (mra-lrg vr)]
+    (if (and (>= root 0) (< root (al-len [i64] dense)))
+        (al-get dense root)
         -1)))
 
 (defn be-spill-of [(vr i64)] (-> i64)
-  (let [dense (.alloc-spill (machine-unit))]
-    (if (and (>= vr 0) (< vr (al-len [i64] dense)))
-        (al-get dense vr)
+  (let [dense (.alloc-spill (machine-unit))
+        root (mra-lrg vr)]
+    (if (and (>= root 0) (< root (al-len [i64] dense)))
+        (al-get dense root)
         -1)))
 
 (defn be-owner-of [(vr i64)] (-> i64)
@@ -266,6 +271,15 @@
         (be-stack-address! address base off)
         (be-u32! (a64-str-d source address 0))))
   0)
+
+(defn be-call-result-setup-words
+  [(owner i64) (area i64) (result-area i64)] (-> i64)
+  (if (> result-area 0)
+      (+ 1
+         (+ (be-stack-access-words
+              (+ area (mu-function-outgoing-result-pointer-offset owner)))
+            (/ result-area 8)))
+      0))
 
 ;; Legacy single-return selection predates machine liveness and therefore has no class table. Its
 ;; existing values are all GPRs; machine-program selection always publishes the explicit class.
@@ -688,7 +702,10 @@
                 0 MI-LABEL
                 (let [owner (be-entry-label-owner (load (field m imm)))]
                   (if (>= owner 0)
-                      (+ (+ 3 (if (> (mu-function-result-area-size owner) 0) 1 0))
+                      (+ (+ 3
+                            (if (> (mu-function-result-area-size owner) 0)
+                                (be-stack-access-words
+                                  (mu-function-result-pointer-offset owner)) 0))
                          (+ (be-sp-adjust-words (mu-function-frame-size owner))
                             (mu-function-callee-count owner)))
                       0))
@@ -761,7 +778,8 @@
                       result-area (if (be-poly-call? m) 0 (.result-area-size bundle))
                       area (+ base-area result-area)
                       result-setup-words
-                        (if (> result-area 0) (+ 2 (/ result-area 8)) 0)
+                        (be-call-result-setup-words
+                          (.owner m) area result-area)
                       capture-words
                         (if (> (.capture-count bundle) 0)
                             (be-abi-parallel-move-words (.capture-first bundle) area) 0)
@@ -846,7 +864,8 @@
                   (be-stack-access-words (be-spill-off-vreg b)) 0)
         pload (if (and (= op MI-CSEL) (< (be-reg-of (.imm m)) 0))
                   (be-stack-access-words (be-spill-off-vreg (.imm m))) 0)
-        dstore (if (and (and (>= dst 0) (< (be-reg-of dst) 0))
+        dstore (if (and (and (and (>= dst 0) (< (be-reg-of dst) 0))
+                             (!= op MI-CALL-RESULT))
                         (not (and (= op MI-CALL)
                                   (> (be-call-result-count (load (field m node))) 1))))
                    (be-stack-access-words (be-spill-off-vreg dst)) 0)]
@@ -1254,8 +1273,8 @@
                                   (be-u32! (a64-str 29 31 0))
                                   (be-u32! (a64-str 30 31 8))
                                   (if (> (mu-function-result-area-size owner) 0)
-                                      (be-u32! (a64-str 9 31
-                                                        (mu-function-result-pointer-offset owner))) 0)
+                                      (be-stack-store-gpr!
+                                        9 31 (mu-function-result-pointer-offset owner) 15) 0)
                                   (let [mask (mu-function-callee-mask owner)
                                         (mut reg) 19]
                                     (loop (if (> (load reg) 28)
@@ -1284,12 +1303,11 @@
                                   0)))
                             MI-CBZ
                           (let [target (be-label-off (load (field m imm)))
-                                ; A spilled predicate is reloaded before the branch. PC-relative
-                                ; displacements are based on the CBZ itself, not the beginning of
-                                ; this expanded machine instruction.
-                                here
-                                  (+ (load (field m first))
-                                     (if (< (be-reg-of (load (field m a))) 0) 4 0))]
+                                ; The eager operand read above has already emitted any variable-
+                                ; width spill reload. The current byte length is therefore the
+                                ; authoritative PC of the CBZ itself; deriving it again from spill
+                                ; metadata would duplicate the encoder's stack-access model.
+                                here (be-code-len)]
                             (if (or (< target 0) (>= target (load expected-size)))
                                 (do
                                   (fmt (stderr)
@@ -1345,10 +1363,12 @@
                             (if (> result-area 0)
                                 (do
                                   (be-u32! (a64-add-imm 9 31 base-area))
-                                  (be-u32! (a64-str 9 31
-                                                    (+ area
-                                                       (mu-function-outgoing-result-pointer-offset
-                                                         (load (field m owner))))))
+                                  (be-stack-store-gpr!
+                                    9 31
+                                    (+ area
+                                       (mu-function-outgoing-result-pointer-offset
+                                         (load (field m owner))))
+                                    15)
                                   (let [(mut clear) 0]
                                     (loop (if (>= (load clear) result-area) (break)
                                               (do
@@ -1501,7 +1521,8 @@
                                       register-loads (be-call-register-loads m)
                                       stack-moves (* 2 (be-call-stack-count m))
                                       hidden-pointer-words
-                                        (if (> result-area 0) (+ 2 (/ result-area 8)) 0)
+                                        (be-call-result-setup-words
+                                          (load (field m owner)) area result-area)
                                       bl-off
                                         (+ here
                                            (* 4
@@ -1762,7 +1783,10 @@
                               (be-u32! (a64-ret))
                               0)
                           0)
-                        (if (and (>= dst 0)
+                        ;; MI-CALL-RESULT names a snapshot already placed by the call's parallel
+                        ;; ABI capture. It emits no defining instruction here; a generic spill
+                        ;; store would overwrite that captured value with stale x14.
+                        (if (and (and (>= dst 0) (!= op MI-CALL-RESULT))
                                  (not (and (= op MI-CALL)
                                            (> (be-call-result-count
                                                 (load (field m node))) 1))))

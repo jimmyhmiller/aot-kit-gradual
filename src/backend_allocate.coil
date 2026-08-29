@@ -26,10 +26,36 @@
 
 (defn mra-result [] (-> i64)
   (.allocation-result (machine-unit)))
+;; The live range a vreg belongs to, with path compression. Every vreg starts as its own range;
+;; `mra-coalesce-copies!` merges a copy's source and destination when it can prove they do not
+;; overlap. See MachineUnit.alloc-lrg.
+(defn mra-lrg [(vreg i64)] (-> i64)
+  (let [u (machine-unit)]
+    (if (or (< vreg 0) (>= vreg (al-len [i64] (.alloc-lrg u))))
+        vreg
+        (let [(mut root) vreg]
+          (loop (if (= (al-get [i64] (.alloc-lrg u) (load root)) (load root)) (break)
+                    (set! root (al-get [i64] (.alloc-lrg u) (load root)))))
+          (let [(mut cursor) vreg]
+            (loop (if (= (load cursor) (load root)) (break)
+                      (let [next (al-get [i64] (.alloc-lrg u) (load cursor))]
+                        (al-set! [i64] (field u alloc-lrg) (load cursor) (load root))
+                        (set! cursor next)))))
+          (load root)))))
+
+(defn mra-lrg-union! [(a i64) (b i64)] (-> i64)
+  (let [u (machine-unit) ra (mra-lrg a) rb (mra-lrg b)]
+    (if (= ra rb) ra
+        ;; Lower id wins, so the root is stable across runs and independent of visit order.
+        (if (< ra rb)
+            (do (al-set! [i64] (field u alloc-lrg) rb ra) ra)
+            (do (al-set! [i64] (field u alloc-lrg) ra rb) rb)))))
+
+;; A vreg's register and spill slot are the RANGE's, not its own.
 (defn mra-reg [(vreg i64)] (-> i64)
-  (al-get (.alloc-reg (machine-unit)) vreg))
+  (al-get (.alloc-reg (machine-unit)) (mra-lrg vreg)))
 (defn mra-spill [(vreg i64)] (-> i64)
-  (al-get (.alloc-spill (machine-unit)) vreg))
+  (al-get (.alloc-spill (machine-unit)) (mra-lrg vreg)))
 (defn mra-owner [(vreg i64)] (-> i64)
   (al-get (.alloc-owner (machine-unit)) vreg))
 (defn mra-spill-kind [(vreg i64)] (-> i64)
@@ -97,6 +123,8 @@
                 (al-push! [i64] (field u alloc-live-pos) -1)
                 (al-push! [i64] (field u alloc-owner-next) -1)
                 (al-push! [i64] (field u alloc-copy-peer) -1)
+                ;; Every vreg starts as its own live range.
+                (al-push! [i64] (field u alloc-lrg) (al-len [i64] (.alloc-lrg u)))
                 (al-push! [i64] (field u alloc-reg) -1)
                 (al-push! [i64] (field u alloc-spill) -1)
                 (al-push! [i64] (field u alloc-owner) -1)
@@ -406,22 +434,28 @@
                   (mra-note-block-live-set! (load bid) (ml-block-set ML-SET-OUT (load bid))
                                             (+ first count))
                   (set! bid (+ (load bid) 1))))))
-    (let [(mut vr) 0]
-      (loop (if (>= (load vr) vregs)
-                (break)
-                (do
-                  (let [start (al-get (.alloc-interval-start u) (load vr))
-                        end (al-get (.alloc-interval-end u) (load vr))]
-                    (if (>= start 0)
-                        (do
-                          (al-set! [i64] (field u alloc-start-next) (load vr)
-                                   (al-get (.alloc-start-head u) start))
-                          (al-set! [i64] (field u alloc-start-head) start (load vr))
-                          (al-set! [i64] (field u alloc-end-next) (load vr)
-                                   (al-get (.alloc-end-head u) end))
-                          (al-set! [i64] (field u alloc-end-head) end (load vr)))
-                        0))
-                  (set! vr (+ (load vr) 1))))))
+    0))
+
+;; Bucket the intervals by start and end position for the linear scan. Split out of interval
+;; construction because coalescing runs between them: only a live range ROOT gets a bucket entry,
+;; since a merged range is allocated once and every vreg in it reads the root's register.
+(defn mra-build-interval-buckets! [] (-> i64)
+  (let [u (machine-unit) vregs (ml-vreg-count) (mut vr) 0]
+    (loop (if (>= (load vr) vregs)
+              (break)
+              (do
+                (let [start (al-get (.alloc-interval-start u) (load vr))
+                      end (al-get (.alloc-interval-end u) (load vr))]
+                  (if (and (>= start 0) (= (mra-lrg (load vr)) (load vr)))
+                      (do
+                        (al-set! [i64] (field u alloc-start-next) (load vr)
+                                 (al-get (.alloc-start-head u) start))
+                        (al-set! [i64] (field u alloc-start-head) start (load vr))
+                        (al-set! [i64] (field u alloc-end-next) (load vr)
+                                 (al-get (.alloc-end-head u) end))
+                        (al-set! [i64] (field u alloc-end-head) end (load vr)))
+                      0))
+                (set! vr (+ (load vr) 1)))))
     0))
 
 ;; Calls constrain every value live across them, but this is a unary property of the value. Do
@@ -536,6 +570,52 @@
 (defn mra-copy-preference [(vreg i64)] (-> i64)
   (let [peer (al-get [i64] (.alloc-copy-peer (machine-unit)) vreg)]
     (if (>= peer 0) (mra-reg peer) -1)))
+
+;; Merge a copy's source and destination into one live range when it is provably safe: same owner,
+;; same register class and value kind, neither already pinned to a physical register, and their
+;; conservative intervals do not overlap except at the copy itself. Then one register serves both
+;; and the copy is a self-move.
+;;
+;; This is `Coalesce.coalesce` with interval disjointness where Simple uses the interference graph.
+;; Simple can be more aggressive -- it unions every Phi with its inputs up front and repairs a
+;; self-conflict by SPLITTING the range -- but splitting is what we do not have, so a union we
+;; cannot prove safe is a union we must not make.
+(defn mra-coalesce-copies! [] (-> i64)
+  (let [u (machine-unit) (mut at) 0 (mut merged) 0]
+    (loop (if (>= (load at) (be-inst-count)) (break)
+              (do
+                (let [m (be-inst (load at))]
+                  (if (= (.op m) MI-COPY)
+                      (let [dst (mra-lrg (.dst m)) src (mra-lrg (.a m))]
+                        (if (and (>= dst 0)
+                                 (and (>= src 0)
+                                      (and (!= dst src)
+                                           (and (= (ml-value-kind dst) (ml-value-kind src))
+                                                (and (= (ml-register-class dst)
+                                                        (ml-register-class src))
+                                                     (and (= (mra-owner dst) (mra-owner src))
+                                                          (and (< (mra-reg dst) 0)
+                                                               (< (mra-reg src) 0))))))))
+                            (let [ds (al-get (.alloc-interval-start u) dst)
+                                  de (al-get (.alloc-interval-end u) dst)
+                                  ss (al-get (.alloc-interval-start u) src)
+                                  se (al-get (.alloc-interval-end u) src)]
+                              ;; Touching at a single point is the copy itself; overlapping anywhere
+                              ;; else means both values are live at once and must not share.
+                              (if (and (>= ds 0) (and (>= ss 0)
+                                                      (or (>= ds se) (>= ss de))))
+                                  (let [root (mra-lrg-union! dst src)]
+                                    (al-set! [i64] (field u alloc-interval-start) root
+                                             (if (< ds ss) ds ss))
+                                    (al-set! [i64] (field u alloc-interval-end) root
+                                             (if (> de se) de se))
+                                    (set! merged (+ (load merged) 1))
+                                    0)
+                                  0))
+                            0))
+                      0))
+                (set! at (+ (load at) 1)))))
+    (load merged)))
 
 (defn mra-build-copy-preferences! [] (-> i64)
   (let [u (machine-unit) (mut at) 0]
@@ -1180,6 +1260,11 @@
     (mra-init!)
     (set! profile-start (ms-profile-note! "allocation_init" (load profile-start)))
     (mra-build-intervals!)
+    (let [merged (mra-coalesce-copies!)]
+      (mra-build-interval-buckets!)
+      (if (be-profiling?)
+          (do (fmt (stderr) "AOTK_PROFILE phase=allocation_coalesce merged={d}\n" merged) 0)
+          0))
     (mra-build-clobber-constraints!)
     (set! profile-start (ms-profile-note! "allocation_intervals" (load profile-start)))
     (if (be-profiling?)
