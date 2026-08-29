@@ -1021,7 +1021,17 @@
    (provingctrl bool)
    (inited bool)])
 
-(defn graph [] (-> (ptr Graph))
+;; The lazy initialiser lives in its own function so the ACCESSOR can be inlined: inlined it is a
+;; static address plus a never-taken branch, and the initialiser it guards stays out of line so
+;; nothing is duplicated.
+;;
+;; MEASURED WORTH NOTHING, and kept anyway because it is the right shape. A main-thread sample put
+;; `graph`, `machine-unit` and `backend` at about a third of the compiler's frames, which reads as
+;; "these accessors are the bottleneck". They are not: they are simply the innermost frame of
+;; everything, so a cumulative sample attributes their callers' work to them. Inlining them --
+;; confirmed by their symbols disappearing from the binary -- moved the benchmark 297 ms to 299 ms.
+;; The lesson is about the sample, not the accessor.
+(defn graph-init! [] (-> (ptr Graph))
   (let [p (primitive/alloc-static Graph)]
     (if (.inited p)
         0
@@ -1091,6 +1101,11 @@
 ;; IR itself — raw Coil test graphs and the JSL DSL store raw pointers in dyn slots by design. So
 ;; the JS frontend opts in at its build entry and graph-reset! clears the flag, keeping every
 ;; other client advisory-only (g-rep-report still works for them).
+
+(defn graph :inline (Always) [] (-> (ptr Graph))
+  (let [p (primitive/alloc-static Graph)]
+    (if (.inited p) p (graph-init!))))
+
 (defn g-rep-strict-cell [] (-> (ptr i64))
   (primitive/alloc-static i64))
 (defn g-rep-strict? [] (-> i64) (load (g-rep-strict-cell)))
@@ -1210,10 +1225,10 @@
 ; ============================================================================
 ; Node accessors
 ; ============================================================================
-(defn nd [(n i64)] (-> (ptr Node))
+(defn nd :inline (Always) [(n i64)] (-> (ptr Node))
   (cast (ptr Node) (al-get (.nodes (graph)) n)))
 
-(defn n-op [(n i64)] (-> Op)
+(defn n-op :inline (Always) [(n i64)] (-> Op)
   (.op (nd n)))
 (def-op-payload-accessor n-cproj-label CProj "n-cproj-label: wrong Op variant")
 (def-op-payload-accessor n-const-type Const "n-const-type: wrong Op variant")
@@ -1258,14 +1273,23 @@
 ;; stale id that HAPPENED to be the right one on the flat fixture and the wrong one, a dead node,
 ;; on a nested branch. A plausible value is the worst possible answer here; the index being out of
 ;; range is a bug in the caller and has to say so.
+;; ONE `nd` PER CALL. These are the hottest reads in the compiler -- `ms-select-value-at!` and the
+;; peephole worklist walk inputs constantly -- and each `nd` is a `(graph)` singleton call, an
+;; `inited` branch and a bounds-checked list read. Fetching the node once and asking it for both
+;; its length and its element halves that, without weakening the bounds check the comment above
+;; argues for.
 (defn n-in [(n i64) (i i64)] (-> i64)
-  (if (or (< i 0) (>= i (n-nins n)))
-      (do (panic-corrupt "n-in: input index out of range") NO-NODE)
-      (al-get (.ins (nd n)) i)))
+  (let [p (nd n)]
+    (if (or (< i 0) (>= i (al-len [i64] (.ins p))))
+        (do (fmt (stderr) "graph corruption: n-in node={d} op={s} index={d} inputs={d} dead={d}\n"
+                 n (op-name (n-op n)) i (n-nins n) (if (n-dead? n) 1 0))
+            (panic-corrupt "n-in: input index out of range") NO-NODE)
+        (al-get (.ins p) i))))
 (defn n-out [(n i64) (i i64)] (-> i64)
-  (if (or (< i 0) (>= i (n-nouts n)))
-      (do (panic-corrupt "n-out: use index out of range") NO-NODE)
-      (al-get (.outs (nd n)) i)))
+  (let [p (nd n)]
+    (if (or (< i 0) (>= i (al-len [i64] (.outs p))))
+        (do (panic-corrupt "n-out: use index out of range") NO-NODE)
+        (al-get (.outs p) i))))
 
 (defn n-set-ty! [(n i64) (t i64)] (-> i64)
   (set! (.ty (nd n)) t)
@@ -1895,7 +1919,9 @@
     (PropDelete [name] (t-mem-alias JS-PROPERTY-ALIAS (t-dyn)))
     (ProtoHas [] (t-bool))
     (PropLoadKey [operation]
-      (if (or (= operation 14) (= operation 21)) (t-int-range -1 15) (t-dyn)))
+      (if (or (= operation 26) (or (= operation 29)
+              (or (= operation 30) (= operation 32)))) (t-bool)
+        (if (or (= operation 14) (= operation 21)) (t-int-range -1 15) (t-dyn))))
     (PropStoreKey [_] (t-mem-alias JS-PROPERTY-ALIAS (t-dyn)))
     (PropHasKey [] (t-bool))
     (PropDeleteKey [] (t-mem-alias JS-PROPERTY-ALIAS (t-dyn)))
@@ -3305,11 +3331,31 @@
   (if (or (< n 0) (or (<= fuel 0) (n-dead? n)))
       REP-UNKNOWN
       (match (n-op n)
+        ;; A declared ABI is the physical contract for a parameter.  Its logical lattice type can
+        ;; later widen to `dyn` (and backend liveness can classify it by a tagged use), but neither
+        ;; changes the word delivered by the caller.  Publishing that contract here prevents a
+        ;; Box around an `int` Parm from being deleted as though the incoming integer already
+        ;; carried a JavaScript tag.  Leave types without one proven raw form UNKNOWN: callers may
+        ;; still retain conversions, but no representation optimization may guess.
+        (Parm [index]
+          (let [fun (n-in n 0)]
+            (if (and (op-is? fun Fun [_])
+                     (and (n-fun-abi-declared? fun)
+                          (and (>= index 0) (< index (n-fun-abi-param-count fun)))))
+                (let [declared (n-fun-abi-param-type fun index)
+                      kinds (ty-kinds declared)]
+                  (cond (or (= kinds VK-OBJ) (= kinds VK-STR)) REP-RAW-PTR
+                        (or (= kinds VK-INT)
+                            (or (= kinds VK-FLT) (= kinds VK-BOOL))) REP-RAW-NUM
+                        :else REP-UNKNOWN))
+                REP-UNKNOWN)))
         (Box [mode] REP-TAGGED)
         (ToNumber [] REP-TAGGED)
         (PropLoad [name] REP-TAGGED)
         (PropLoadKey [operation]
-          (if (or (= operation 14) (= operation 21)) REP-RAW-NUM REP-TAGGED))
+          (if (or (= operation 26) (or (= operation 29)
+                  (or (= operation 30) (= operation 32)))) REP-RAW-NUM
+            (if (or (= operation 14) (= operation 21)) REP-RAW-NUM REP-TAGGED)))
         (ArrayLoad [alias] REP-TAGGED)
         (JsBuiltin [descriptor] REP-TAGGED)
         (JsThrow [] REP-TAGGED)
@@ -3968,6 +4014,18 @@
 (defn box-idealize [(n i64)] (-> i64)
   (let [v (n-in n 1)]
     (if (match (n-op n) (Box [mode] (= mode 0)) (_ false))
+        ;; Box(Unbox<int>(tagged)) is the original tagged word. The Unbox can only reach its normal
+        ;; value after the upstream Cast/tag check, so this retains the check while removing two
+        ;; inverse representation moves. Besides being canonical, this matters to scheduling: the
+        ;; re-box is otherwise a floating definition after a controlled Unbox and can acquire a
+        ;; use earlier than the only block in which its input exists in large shared JSL graphs.
+        (if (and (and (!= v NO-NODE) (not (n-dead? v)))
+                 (match (n-op v)
+                   (Unbox [target]
+                     (and (ty-int-only? target)
+                          (= (n-rep-of (n-in v 1) 8) REP-TAGGED)))
+                   (_ false)))
+            (n-in v 1)
         (if (n-plain-box? v)
             v
             ;; BOXING A TAGGED WORD IS THE IDENTITY, and `Box(Box(x))` above is only its easiest
@@ -3980,7 +4038,7 @@
             (if (and (and (!= v NO-NODE) (not (n-dead? v)))
                      (= (n-rep-of v 8) REP-TAGGED))
                 v
-                NO-NODE))
+                NO-NODE)))
         NO-NODE)))
 
 ;; A dynamic boundary can be built while a loop Phi is still open. Its missing backedge makes the
