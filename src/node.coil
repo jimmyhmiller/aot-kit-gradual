@@ -993,6 +993,7 @@
    (prof-proof-max i64)
    (prof-idealize-ns i64)
    (prof-gvn-ns i64)
+   (prof-deluse-calls i64)
    (prof-analyze-pops i64)
    (prof-fold-scans i64)
    (prof-fold-candidates i64)
@@ -1082,6 +1083,7 @@
           (set! (.prof-proof-max p) 0)
           (set! (.prof-idealize-ns p) 0)
           (set! (.prof-gvn-ns p) 0)
+          (set! (.prof-deluse-calls p) 0)
           (set! (.prof-analyze-pops p) 0)
           (set! (.prof-fold-scans p) 0)
           (set! (.prof-fold-candidates p) 0)
@@ -1378,22 +1380,52 @@
     n))
 
 ;; Remove one use edge d->u. Unordered, so a swap-remove is fine.
+;; SCANS FROM THE END. Removal is already swap-with-last, but the FIND was a forward scan, so
+;; deleting a def's uses one at a time cost O(uses^2) -- and a GVN-shared constant or a memory token
+;; in a real program has thousands of uses. This was 94% of samples in a compile of lodash's core
+;; build that had not finished after five minutes.
+;;
+;; Backwards is not a heuristic here: a use is appended when it is created and the graph is torn
+;; down newest-first, so the entry being removed is usually the last one. When it is not, this is no
+;; worse than the forward scan was. Duplicate uses (`a + a`) remove a different but equal entry,
+;; which leaves the same multiset -- and the list is already unordered, because swap-with-last has
+;; always reordered it.
 (defn n-del-use! [(d i64) (u i64)] (-> bool)
   (let [outs (field (nd d) outs)
-        len (al-len [i64] (load outs))
-        (mut i) 0
+        (mut i) (al-len [i64] (load outs))
         (mut found) false]
-    (loop (if (or (>= (load i) len) (load found))
+    (loop (if (or (<= (load i) 0) (load found))
               (break)
               (do
+                (set! i (- (load i) 1))
                 (if (= (al-get (load outs) (load i)) u)
                     (do
-                      (al-set! [i64] outs (load i) (al-get (load outs) (- len 1)))
+                      (al-set! [i64] outs (load i)
+                               (al-get (load outs) (- (al-len [i64] (load outs)) 1)))
                       (al-pop! [i64] outs)
                       (set! found true)
                       0)
-                    (set! i (+ (load i) 1)))
+                    0)
                 0)))
+;; A REWRITE CYCLE IS A NAMED FAILURE, NOT A HANG.
+    ;;
+    ;; Compiling lodash's core build did not finish in five minutes at 3.7 GB, and 94% of its
+    ;; samples were in this function. It is not slow: 106 MILLION calls took 6,778 loop steps
+    ;; between them and missed zero times, so every call is O(1). It was called that many times
+    ;; because the frontend was building a fresh `Box` over the same `BitAnd` for ever -- the `use`
+    ;; id climbed by ~295,000 every 262,144 calls while the `def` never moved.
+    ;;
+    ;; The budget is far above any real program (compiling the whole Test262 harness plus a test
+    ;; does not reach one million) and its only purpose is to name the two nodes in the cycle
+    ;; instead of consuming the machine. Raising it is not the fix for hitting it.
+    (let [g (graph)]
+      (set! (.prof-deluse-calls g) (+ (.prof-deluse-calls g) 1))
+      (if (> (.prof-deluse-calls g) 50000000)
+          (do (fmt (stderr)
+                   "graph corruption: rewrite cycle after {d} use deletions: def={d} {s} use={d} {s}\n"
+                   (.prof-deluse-calls g) d (op-name (n-op d)) u (op-name (n-op u)))
+              (panic-corrupt "n-del-use!: rewrite cycle -- the graph is not converging") 0)
+          0))
     (and (= (al-len [i64] (load outs)) 0) (= (.keeps (nd d)) 0))))
 
 (defn n-find-in [(n i64) (d i64)] (-> i64)
