@@ -3691,11 +3691,24 @@
             (and (op-is? ctrl FunStart [])
                  (= (mu-find-function (n-in ctrl 0)) owner))))))
 
+;; The owner whose block this node's control maps to, decided without asking a particular function:
+;; -2 when every function must consider it (a control-less node, or Start, maps to the ASKING
+;; function's entry block), -1 when no function can take it, else the owner.
+(defn ms-control-owner-of [(node i64)] (-> i64)
+  (if (< node 0) -1
+    (let [ctrl (if (> (n-nins node) 0) (n-in node 0) NO-NODE)]
+      (if (= ctrl NO-NODE) -2
+          (if (op-is? ctrl Start []) -2
+              (let [mapped (al-get (.ctrl-block (machine-unit)) ctrl)]
+                (if (< mapped 0) -1 (mu-block-owner mapped))))))))
+
 (defn ms-build-preselect-candidates! [] (-> i64)
   (let [u (machine-unit) (mut node) 0]
     (al-clear! [i64] (field u selection-ingress-candidates))
     (al-clear! [i64] (field u selection-effect-candidates))
     (al-clear! [i64] (field u selection-effect-chain-owner))
+    (al-clear! [i64] (field u selection-effect-owner-a))
+    (al-clear! [i64] (field u selection-effect-owner-b))
     (loop (if (>= (load node) (n-count))
               (break)
               (do
@@ -3719,6 +3732,12 @@
                             (al-push! [i64] (field u selection-effect-chain-block)
                                       (if (op-is? (load node) Call [_]) -1
                                           (ms-memory-chain-terminal (load node))))
+                            (al-push! [i64] (field u selection-effect-owner-a)
+                                      (ms-control-owner-of (load node)))
+                            (al-push! [i64] (field u selection-effect-owner-b)
+                                      (if (op-is? (load node) Call [_]) -1
+                                          (ms-control-owner-of
+                                            (ms-memory-chain-terminal (load node)))))
                             0)
                           0))
                     0)
@@ -3867,6 +3886,10 @@
                   (!= (ms-result) MSEL-OK))
               (break)
               (do
+                (let [oa (al-get [i64] (.selection-effect-owner-a (machine-unit)) (load node))
+                      ob (al-get [i64] (.selection-effect-owner-b (machine-unit)) (load node))]
+                  ;; Neither possible adopter is this function, and neither is undecidable.
+                  (if (and (>= oa -1) (!= oa owner) (>= ob -1) (!= ob owner)) 0
                 (let [candidate (al-get [i64]
                                         (.selection-effect-candidates (machine-unit))
                                         (load node))]
@@ -3899,7 +3922,7 @@
                                             (or (< chain-owner 0) (= chain-owner owner))))
                                   (do (ms-select-memory-at! owner candidate bid) 0)
                                   0))
-                            0)))
+                            0)))))
                 (set! node (+ (load node) 1)))))
     0))
 
