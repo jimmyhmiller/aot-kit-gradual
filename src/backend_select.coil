@@ -606,7 +606,14 @@
             ;; arithmetic selected onto FP registers is an untagged IEEE double (tag zero in the
             ;; JavaScript ABI). Derive this case from selection representation rather than rejecting
             ;; a sound numeric join as unboxable.
-            (if (and (= tag -1) (ty-numeric? (n-ty node)))
+            ;; The declared TYPE is not the only witness for this. A separately compiled JSL builtin
+            ;; can take a `dyn` parameter whose analysed representation is nonetheless a raw number,
+            ;; and boxing it arrives here with the full union type and no tag. The representation is
+            ;; the same evidence the numeric-join case above trusts, so accept it directly; without
+            ;; this, selection refused the whole program with BER-UNSUPPORTED-OPCODE the moment the
+            ;; library stopped being inlined into its callers.
+            (if (and (= tag -1)
+                     (or (ty-numeric? (n-ty node)) (= (n-rep-of node 32) REP-RAW-NUM)))
                 (if (be-node-fp-value? node) 0 JSV-INTEGER)
                 tag))))))))
 
@@ -3011,7 +3018,17 @@
                                 (be-box-input-already-tagged? (n-in node 1)))))
                       (set! vr a)
                       (if (or (< a 0) (= tag -1))
-                          (do (ms-fail! MSEL-UNSUPPORTED node) 0)
+                          (do
+                            (if (be-profiling?)
+                                (do (fmt (stderr)
+                                     "AOTK_PROFILE phase=box_miss node={d} input={d} mode={d} a={d} tag={d} rep={d} kind={d} fp={d} tagged={d}\n"
+                                     node (n-in node 1) mode a tag
+                                     (n-rep-of (n-in node 1) 32)
+                                     (ml-kind-for-node (n-in node 1))
+                                     (if (be-node-fp-value? (n-in node 1)) 1 0)
+                                     (if (be-box-input-already-tagged? (n-in node 1)) 1 0)) 0)
+                                0)
+                            (ms-fail! MSEL-UNSUPPORTED node) 0)
                           (let [fresh (ms-new-node-vreg! owner node)]
                             (ms-emit! owner bid (mi-new MI-JSBOX fresh a -1 tag node))
                             (set! vr fresh))))))
