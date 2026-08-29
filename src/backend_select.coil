@@ -1130,29 +1130,42 @@
                             (n-fun-abi-can-throw? target)))
         (mut slot) 0]
     (loop (if (>= (load slot) count) (break)
-              (let [(mut output) 0 (mut projection) NO-NODE]
-                (loop (if (or (>= (load output) (n-nouts call))
-                              (!= (load projection) NO-NODE))
+              (let [(mut output) 0 (mut snapshot) -1]
+                ;; A throwing call deliberately has more than one ideal view of a logical slot:
+                ;; an unconditional outcome projection for exception ordering and a controlled
+                ;; projection for the normal JavaScript value. Snapshot identity belongs to the
+                ;; `(call, slot)` ABI outcome, not to whichever Proj happens to be visited first.
+                (loop (if (or (>= (load output) (n-nouts call)) (>= (load snapshot) 0))
                           (break)
                           (let [user (n-out call (load output))]
                             (if (and (match (n-op user)
                                        (Proj [which] (= which (load slot))) (_ false))
                                      (= (n-proj-source user) call))
-                                (set! projection user) 0)
+                                (set! snapshot (ms-call-result-snapshot owner user)) 0)
                             (set! output (+ (load output) 1)))))
-                (if (or (= (load projection) NO-NODE)
-                        (< (ms-call-result-snapshot owner (load projection)) 0))
-                    (let [fresh (ms-new-call-result-vreg! owner call (load slot))]
+                (if (< (load snapshot) 0)
+                    (do
+                      (set! snapshot (ms-new-call-result-vreg! owner call (load slot)))
                       ;; The raw snapshot belongs to the call outcome. It exists even when the
                       ;; logical result is unused, so the physical protocol never depends on use
                       ;; count or on which successor is selected first.
                       (ms-emit! owner bid
-                                (mi-new MI-CALL-RESULT fresh anchor -1
-                                        (load slot) call))
-                      (if (!= (load projection) NO-NODE)
-                          (ms-set-call-result-snapshot!
-                            owner (load projection) fresh) 0))
+                                (mi-new MI-CALL-RESULT (load snapshot) anchor -1
+                                        (load slot) call)))
                     0)
+                ;; Publish the canonical capture through every ideal projection view of this
+                ;; logical slot. This makes selection order irrelevant without duplicating an ABI
+                ;; capture or permitting a normal-edge projection on the abrupt path.
+                (set! output 0)
+                (loop (if (>= (load output) (n-nouts call)) (break)
+                          (do
+                            (let [user (n-out call (load output))]
+                              (if (and (match (n-op user)
+                                         (Proj [which] (= which (load slot))) (_ false))
+                                       (= (n-proj-source user) call))
+                                  (ms-set-call-result-snapshot! owner user (load snapshot)) 0))
+                            (set! output (+ (load output) 1))
+                            0)))
                 (set! slot (+ (load slot) 1)))))
     ;; A non-throwing call's CallEnd is its only continuation, so publish logical values directly
     ;; after the complete raw capture bundle. This is semantically required, not an optimization:

@@ -234,13 +234,17 @@
   ;; Runtime MI-NEW is a fixed 39-word sequence; the external slow-path BL is word 37.
   (+ (.first (be-inst at)) (* 37 4)))
 
+(defn mobj-spill-load-words [(vr i64)] (-> i64)
+  (if (and (>= vr 0) (< (be-reg-of vr) 0))
+      (be-stack-access-words (be-spill-off-vreg vr)) 0))
+
 (defn mobj-jsprop-branch-pc [(at i64)] (-> i64)
   (let [m (be-inst at)
         key (ms-inst-arg at 0)
         spill-loads
-          (+ (if (< (be-reg-of (.a m)) 0) 1 0)
-             (+ (if (< (be-reg-of (.b m)) 0) 1 0)
-                (if (< (be-reg-of key) 0) 1 0)))]
+          (+ (mobj-spill-load-words (.a m))
+             (+ (mobj-spill-load-words (.b m))
+                (mobj-spill-load-words key)))]
     (+ (.first m)
        (* 4
           (+ spill-loads
@@ -250,9 +254,9 @@
   (let [m (be-inst at)
         value (ms-inst-arg at 0)
         spill-loads
-          (+ (if (< (be-reg-of (.a m)) 0) 1 0)
-             (+ (if (< (be-reg-of (.b m)) 0) 1 0)
-                (if (< (be-reg-of value) 0) 1 0)))]
+          (+ (mobj-spill-load-words (.a m))
+             (+ (mobj-spill-load-words (.b m))
+                (mobj-spill-load-words value)))]
     (+ (.first m)
        (* 4 (+ spill-loads (+ 6 (be-mov-words (.imm m))))))))
 
@@ -276,16 +280,22 @@
             MI-CALL
           (let [argc (load (field m arg-count))
                 here (load (field m first))
+                base-area (be-call-area (if (be-poly-call? m) (+ (* argc 2) 2) argc))
+                bundle (mu-call-bundle (mu-inst-call-bundle at))
+                result-area (if (be-poly-call? m) 0 (.result-area-size bundle))
+                area (+ base-area result-area)
                 common
                   (+ argc
-                     (+ (be-call-spill-loads m)
+                     (+ (be-call-spill-load-words m area)
                         (+ (be-call-register-loads m)
                            (* 2 (be-call-stack-count m)))))
                 setup
                   (if (be-poly-call? m)
                       (+ 12
                          (+ common
-                            (+ (if (< (be-reg-of (load (field m a))) 0) 1 0)
+                            (+ (if (< (be-reg-of (load (field m a))) 0)
+                                   (be-stack-access-words
+                                     (be-spill-off-vreg (load (field m a)))) 0)
                                (+ (be-mov-words JSV-TAG-MASK)
                                   (+ (be-mov-words JSV-FUNCTION)
                                      (+ (be-mov-words JSV-PAYLOAD-MASK)

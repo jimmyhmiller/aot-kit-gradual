@@ -87,6 +87,9 @@
   (| 2483027968 (& delta-words 67108863)))
 (defn a64-add-imm [(rd i64) (rn i64) (imm i64)] (-> i64)
   (| (<< 1 31) (| (<< 17 24) (| (<< (& imm 4095) 10) (| (<< rn 5) rd)))))
+(defn a64-add-imm-shift12 [(rd i64) (rn i64) (imm i64)] (-> i64)
+  (| (<< 1 31)
+     (| (<< 17 24) (| (<< 1 22) (| (<< (& imm 4095) 10) (| (<< rn 5) rd))))))
 (defn a64-sub-imm [(rd i64) (rn i64) (imm i64)] (-> i64)
   (| (<< 1 31) (| (<< 1 30) (| (<< 17 24) (| (<< (& imm 4095) 10) (| (<< rn 5) rd))))))
 (defn a64-ldr [(rt i64) (rn i64) (off i64)] (-> i64)
@@ -200,6 +203,70 @@
         (+ 16 (* (+ (mu-function-callee-count owner) slot) 8))
         (be-spill-off slot))))
 
+;; AArch64's unsigned 64-bit LDR/STR immediate is scaled by eight and only twelve bits wide.
+;; Large generated JSL functions routinely exceed its 32,760-byte ceiling. Encoding the low bits
+;; of a larger frame offset aliases unrelated spill slots, so every stack access goes through this
+;; checked seam and materializes an address when the direct form cannot represent it.
+(defn be-stack-offset-direct? [(off i64)] (-> bool)
+  (and (>= off 0) (and (= (& off 7) 0) (<= off 32760))))
+
+(defn be-stack-access-words [(off i64)] (-> i64)
+  (if (be-stack-offset-direct? off) 1
+      (let [pages (/ off 4096) tail (& off 4095)]
+        (+ 1 (+ (/ (+ pages 4094) 4095) (if (> tail 0) 1 0))))))
+
+(defn be-stack-address! [(target i64) (base i64) (off i64)] (-> i64)
+  (let [(mut pages) (/ off 4096)
+        tail (& off 4095)
+        (mut first) true]
+    (loop (if (<= (load pages) 0) (break)
+              (let [chunk (if (> (load pages) 4095) 4095 (load pages))]
+                (be-u32! (a64-add-imm-shift12 target
+                            (if (load first) base target) chunk))
+                (set! first false)
+                (set! pages (- (load pages) chunk))
+                0)))
+    (if (> tail 0)
+        (be-u32! (a64-add-imm target (if (load first) base target) tail)) 0)
+    0))
+
+(defn be-stack-load-gpr! [(target i64) (base i64) (off i64)] (-> i64)
+  (if (be-stack-offset-direct? off)
+      (be-u32! (a64-ldr target base off))
+      (do
+        ;; `target` may also be the address scratch: the address is consumed by the load before
+        ;; the loaded word replaces it. ADD (immediate), unlike ADD (shifted register), permits SP
+        ;; as its base register.
+        (be-stack-address! target base off)
+        (be-u32! (a64-ldr target target 0))))
+  0)
+
+(defn be-stack-load-fpr! [(target i64) (base i64) (off i64) (address i64)] (-> i64)
+  (if (be-stack-offset-direct? off)
+      (be-u32! (a64-ldr-d target base off))
+      (do
+        (be-stack-address! address base off)
+        (be-u32! (a64-ldr-d target address 0))))
+  0)
+
+(defn be-stack-store-gpr! [(source i64) (base i64) (off i64) (address i64)] (-> i64)
+  (if (be-stack-offset-direct? off)
+      (be-u32! (a64-str source base off))
+      (do
+        (if (= source address)
+            (panic-corrupt "large stack store aliases its address scratch") 0)
+        (be-stack-address! address base off)
+        (be-u32! (a64-str source address 0))))
+  0)
+
+(defn be-stack-store-fpr! [(source i64) (base i64) (off i64) (address i64)] (-> i64)
+  (if (be-stack-offset-direct? off)
+      (be-u32! (a64-str-d source base off))
+      (do
+        (be-stack-address! address base off)
+        (be-u32! (a64-str-d source address 0))))
+  0)
+
 ;; Legacy single-return selection predates machine liveness and therefore has no class table. Its
 ;; existing values are all GPRs; machine-program selection always publishes the explicit class.
 (defn be-register-class [(vr i64)] (-> i64)
@@ -227,7 +294,8 @@
         (if (>= r 0)
             r
             (let [s (be-spill-of vr)]
-              (if (< s 0) -1 (do (be-u32! (a64-ldr scratch 31 (be-spill-off-vreg vr))) scratch)))))))
+              (if (< s 0) -1
+                  (do (be-stack-load-gpr! scratch 31 (be-spill-off-vreg vr)) scratch)))))))
 
 (defn be-read-value! [(vr i64) (scratch i64)] (-> i64)
   (if (or (< vr 0) (= (be-register-class vr) MRC-GPR))
@@ -239,7 +307,7 @@
                   ds (if (= scratch 15) 30 31)]
               (if (< s 0)
                   -1
-                  (do (be-u32! (a64-ldr-d ds 31 (be-spill-off-vreg vr))) (+ ds 32))))))))
+                  (do (be-stack-load-fpr! ds 31 (be-spill-off-vreg vr) scratch) (+ ds 32))))))))
 
 (defn be-read-reg-delta! [(vr i64) (scratch i64) (sp-delta i64)] (-> i64)
   (if (< vr 0)
@@ -250,7 +318,7 @@
             (let [s (be-spill-of vr)]
               (if (< s 0)
                   -1
-                  (do (be-u32! (a64-ldr scratch 31 (+ sp-delta (be-spill-off-vreg vr)))) scratch)))))))
+                  (do (be-stack-load-gpr! scratch 31 (+ sp-delta (be-spill-off-vreg vr))) scratch)))))))
 
 (defn be-read-value-delta! [(vr i64) (scratch i64) (sp-delta i64)] (-> i64)
   (if (= (be-register-class vr) MRC-GPR)
@@ -263,7 +331,7 @@
               (if (< s 0)
                   -1
                   (do
-                    (be-u32! (a64-ldr-d ds 31 (+ sp-delta (be-spill-off-vreg vr))))
+                    (be-stack-load-fpr! ds 31 (+ sp-delta (be-spill-off-vreg vr)) scratch)
                     (+ ds 32))))))))
 
 (defn be-write-reg [(vr i64)] (-> i64)
@@ -275,8 +343,9 @@
     (if (< s 0)
         0
         (if (= (be-register-class vr) MRC-FPR)
-            (be-u32! (a64-str-d (- from 32) 31 (be-spill-off-vreg vr)))
-            (be-u32! (a64-str from 31 (be-spill-off-vreg vr)))))))
+            (be-stack-store-fpr! (- from 32) 31 (be-spill-off-vreg vr) 15)
+            (be-stack-store-gpr! from 31 (be-spill-off-vreg vr)
+                                 (if (= from 15) 16 15))))))
 
 (defn be-abi-spill-off [(owner i64) (slot i64)] (-> i64)
   (+ 16 (* (+ (mu-function-callee-count owner) slot) 8)))
@@ -293,12 +362,15 @@
                             MLOC-SPILL
                               (do
                                 (if fp
-                                    (be-u32! (a64-ldr-d 30 31
-                                                        (+ sp-delta (be-abi-spill-off
-                                                          (.owner p) (.src-index p)))))
-                                    (be-u32! (a64-ldr 15 31
-                                                      (+ sp-delta (be-abi-spill-off
-                                                        (.owner p) (.src-index p))))))
+                                    (be-stack-load-fpr!
+                                      30 31
+                                      (+ sp-delta (be-abi-spill-off
+                                        (.owner p) (.src-index p)))
+                                      15)
+                                    (be-stack-load-gpr!
+                                      15 31
+                                      (+ sp-delta (be-abi-spill-off
+                                        (.owner p) (.src-index p)))))
                                 scratch)
                             MLOC-RESULT-AREA
                               (do
@@ -321,16 +393,18 @@
                               (be-u32! (a64-add-reg 15 source 31))))
                       MLOC-SPILL
                       (if fp
-                          (be-u32! (a64-str-d (- source 32) 31
-                                              (+ sp-delta (be-abi-spill-off
-                                                (.owner p) (.dst-index p)))))
-                          (be-u32! (a64-str source 31
-                                            (+ sp-delta (be-abi-spill-off
-                                              (.owner p) (.dst-index p))))))
+                          (be-stack-store-fpr!
+                            (- source 32) 31
+                            (+ sp-delta (be-abi-spill-off (.owner p) (.dst-index p)))
+                            15)
+                          (be-stack-store-gpr!
+                            source 31
+                            (+ sp-delta (be-abi-spill-off (.owner p) (.dst-index p)))
+                            (if (= source 15) 16 15)))
                       MLOC-RESULT-AREA
                       (do
-                        (be-u32! (a64-ldr 14 31
-                                          (mu-function-result-pointer-offset (.owner p))))
+                        (be-stack-load-gpr!
+                          14 31 (mu-function-result-pointer-offset (.owner p)))
                         (if fp
                             (be-u32! (a64-str-d (- source 32) 14 (.dst-index p)))
                             (be-u32! (a64-str source 14 (.dst-index p))))
@@ -355,7 +429,7 @@
   (& (+ n 15) -16))
 (defn be-call-area [(argc i64)] (-> i64)
   (be-align16 (* argc 8)))
-(defn be-call-spill-loads [(m (ptr MInst))] (-> i64)
+(defn be-call-spill-load-words [(m (ptr MInst)) (sp-delta i64)] (-> i64)
   (let [count (.arg-count m)
         first (.arg-first m)
         (mut i) 0
@@ -364,7 +438,12 @@
               (break)
               (do
                 (let [vr (al-get (.call-args (machine-unit)) (+ first (load i)))]
-                  (if (< (be-reg-of vr) 0) (set! loads (+ (load loads) 1)) 0))
+                  (if (< (be-reg-of vr) 0)
+                      (set! loads
+                            (+ (load loads)
+                               (be-stack-access-words
+                                 (+ sp-delta (be-spill-off-vreg vr)))))
+                      0))
                 (set! i (+ (load i) 1))
                 0)))
     (load loads)))
@@ -558,7 +637,7 @@
                 (set! result (+ (load result) 1)))))
     (load words)))
 
-(defn be-abi-parallel-move-words [(at i64)] (-> i64)
+(defn be-abi-parallel-move-words [(at i64) (sp-delta i64)] (-> i64)
   (let [count (mu-abi-move-count at) (mut move) 0 (mut words) 0]
     (loop (if (>= (load move) count) (break)
               (let [p (mu-abi-move at (load move))]
@@ -574,14 +653,24 @@
                               MLOC-RESULT-AREA scratch
                               -1)
                       source-load
-                        (if (or (= (.src-kind p) MLOC-SPILL)
-                                (= (.src-kind p) MLOC-RESULT-AREA)) 1 0)
+                        (case (.src-kind p)
+                          MLOC-SPILL
+                            (be-stack-access-words
+                              (+ sp-delta
+                                 (be-abi-spill-off (.owner p) (.src-index p))))
+                          MLOC-RESULT-AREA 1
+                          0)
                       destination
                         (case (.dst-kind p) MLOC-REGISTER
                               (if (= source (.dst-index p)) 0 1)
                               MLOC-SCRATCH (if (= source scratch) 0 1)
-                              MLOC-SPILL 1
-                              MLOC-RESULT-AREA 2
+                              MLOC-SPILL
+                                (be-stack-access-words
+                                  (+ sp-delta
+                                     (be-abi-spill-off (.owner p) (.dst-index p))))
+                              MLOC-RESULT-AREA
+                                (+ (be-stack-access-words
+                                     (mu-function-result-pointer-offset (.owner p))) 1)
                               0)]
                   (set! words (+ (load words) (+ source-load destination))))
                 (set! move (+ (load move) 1)))))
@@ -675,7 +764,7 @@
                         (if (> result-area 0) (+ 2 (/ result-area 8)) 0)
                       capture-words
                         (if (> (.capture-count bundle) 0)
-                            (be-abi-parallel-move-words (.capture-first bundle)) 0)
+                            (be-abi-parallel-move-words (.capture-first bundle) area) 0)
                       poly-words
                         (if (be-poly-call? m)
                             ; Fixed-size runtime dispatch preserves register arguments across the
@@ -687,7 +776,9 @@
                             ;; adjustment chunks are added below.
                             (+ 33
                                (+ capture-words
-                                  (+ (if (< (be-reg-of (load (field m a))) 0) 1 0)
+                                  (+ (if (< (be-reg-of (load (field m a))) 0)
+                                         (be-stack-access-words
+                                           (be-spill-off-vreg (load (field m a)))) 0)
                                   (+ (* 2 (be-call-register-loads m))
                                      (+ (be-mov-words JSV-TAG-MASK)
                                         (+ (be-mov-words JSV-FUNCTION)
@@ -702,7 +793,7 @@
                         (* 2 (- (be-sp-adjust-words area) 1)))
                      (+ (load (field m arg-count))
                         (+ (be-call-register-loads m)
-                           (+ (be-call-spill-loads m)
+                           (+ (be-call-spill-load-words m area)
                               (* 2 (be-call-stack-count m)))))))
                   MI-JSPROP
                 (+ 11
@@ -710,14 +801,16 @@
                       (let [key
                               (al-get (load (field (machine-unit) call-args))
                                       (load (field m arg-first)))]
-                        (if (< (be-reg-of key) 0) 1 0))))
+                        (if (< (be-reg-of key) 0)
+                            (be-stack-access-words (be-spill-off-vreg key)) 0))))
                   MI-JSARRAY
                 (+ 9
                    (+ (be-mov-words (load (field m imm)))
                       (let [value
                               (al-get (load (field (machine-unit) call-args))
                                       (load (field m arg-first)))]
-                        (if (< (be-reg-of value) 0) 1 0))))
+                        (if (< (be-reg-of value) 0)
+                            (be-stack-access-words (be-spill-off-vreg value)) 0))))
                   MI-JSSTRING
                 (+ 11
                    (+ (if (= (load (field m imm)) JSSOP-FROM-DOUBLE-BITS) 1 0)
@@ -725,15 +818,18 @@
                          (let [value
                                  (al-get (load (field (machine-unit) call-args))
                                          (load (field m arg-first)))]
-                           (if (< (be-reg-of value) 0) 1 0)))))
+                           (if (< (be-reg-of value) 0)
+                               (be-stack-access-words (be-spill-off-vreg value)) 0)))))
                   MI-STACKARG
-                1 MI-STORE
+                (be-stack-access-words
+                  (+ (mu-function-frame-size (load (field m owner)))
+                     (* (load (field m imm)) 8))) MI-STORE
                 (case (be-store-barrier-kind m) MLK-RAW-MANAGED
                       18 MLK-BOXED
                       12 1)
                   MI-RET
                 (+ (if (> (load (field m imm)) 1)
-                       (be-abi-parallel-move-words at)
+                       (be-abi-parallel-move-words at 0)
                        (if (= (be-reg-of a)
                               (if (= (be-register-class a) MRC-FPR) 32 0)) 0 1))
                    (if (< (load (field m owner)) 0)
@@ -744,13 +840,16 @@
                              (mu-function-callee-count (load (field m owner)))))))
                   1)
         aload (if (and (and (!= op MI-CALL) (!= op MI-CALL-RESULT))
-                         (and (>= a 0) (< (be-reg-of a) 0))) 1 0)
-        bload (if (and (!= op MI-CALL) (and (>= b 0) (< (be-reg-of b) 0))) 1 0)
-        pload (if (and (= op MI-CSEL) (< (be-reg-of (.imm m)) 0)) 1 0)
+                         (and (>= a 0) (< (be-reg-of a) 0)))
+                  (be-stack-access-words (be-spill-off-vreg a)) 0)
+        bload (if (and (!= op MI-CALL) (and (>= b 0) (< (be-reg-of b) 0)))
+                  (be-stack-access-words (be-spill-off-vreg b)) 0)
+        pload (if (and (= op MI-CSEL) (< (be-reg-of (.imm m)) 0))
+                  (be-stack-access-words (be-spill-off-vreg (.imm m))) 0)
         dstore (if (and (and (>= dst 0) (< (be-reg-of dst) 0))
                         (not (and (= op MI-CALL)
                                   (> (be-call-result-count (load (field m node))) 1))))
-                   1 0)]
+                   (be-stack-access-words (be-spill-off-vreg dst)) 0)]
     (+ base (+ aload (+ bload (+ pload dstore))))))
 
 (defn be-label-off [(label i64)] (-> i64)
@@ -1139,12 +1238,10 @@
                           0 MI-STACKARG
                           (let [frame (mu-function-frame-size (load (field m owner)))]
                             (if (= (be-register-class dst) MRC-FPR)
-                                (be-u32! (a64-ldr-d (- rd 32)
-                                                    31
-                                                    (+ frame (* (load (field m imm)) 8))))
-                                (be-u32! (a64-ldr rd
-                                                  31
-                                                  (+ frame (* (load (field m imm)) 8))))))
+                                (be-stack-load-fpr! (- rd 32) 31
+                                  (+ frame (* (load (field m imm)) 8)) 15)
+                                (be-stack-load-gpr! rd 31
+                                  (+ frame (* (load (field m imm)) 8)))))
                             MI-EQ
                           (do (be-u32! (a64-cmp-reg ra rb)) (be-u32! (a64-cset rd 0)) 0) MI-LT
                           (do (be-u32! (a64-cmp-reg ra rb)) (be-u32! (a64-cset rd 11)) 0) MI-LE
@@ -1400,7 +1497,7 @@
                                   (be-mov-imm! 17 -4)
                                   (be-u32! (a64-cmp-reg 12 17))
                                   (be-u32! (a64-csel 0 0 15 0)))
-                                (let [spill-loads (be-call-spill-loads m)
+                                (let [spill-loads (be-call-spill-load-words m area)
                                       register-loads (be-call-register-loads m)
                                       stack-moves (* 2 (be-call-stack-count m))
                                       hidden-pointer-words

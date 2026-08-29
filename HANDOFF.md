@@ -1,3 +1,22 @@
+# 2026-08-28: explicit transitioning-call outcomes and checked large-frame AArch64 access
+
+- Transitioning JSL calls now publish an explicit unconditional outcome projection. Pending-
+  exception queries depend on that outcome rather than treating the raw call node as an allocated
+  value, while normal typed and record results remain control-dependent projections.
+- Machine selection canonicalizes call-result snapshots by `(call, logical slot)`. Multiple graph
+  projections of the same ABI result therefore share one `MI-CALL-RESULT` capture instead of
+  inventing competing machine definitions.
+- AArch64 stack accesses now check the scaled 12-bit `LDR`/`STR` limit. Large spill, capture,
+  stack-argument, and result-pointer offsets are materialized with legal `ADD (immediate)` chunks;
+  encoder and Mach-O word accounting use the same access-size model. This removes silent offset
+  truncation for generated JSL functions whose frames exceed 32,760 bytes.
+- Validation: `coil test` is green at **81/81** and `tests/jsl-test.coil` is green at **67/67**.
+  Two focused `backend-call-test` failures were reproduced unchanged at the prior commit and are
+  not regressions from this work. The required frontier remains honestly red at **0/2**:
+  `for-await-has-no-bridge-kind.js` is refused and
+  `generated-number-data-descriptor-throws.js` still crashes. The Number frontier is not claimed
+  fixed; this checkpoint establishes the call-result and large-frame invariants needed to continue.
+
 # 2026-08-28: declarative Number roots publish through one generated constructor initializer
 
 - The intrinsic manifest now supports `jsl`-valued data properties: a checked zero-argument JSL

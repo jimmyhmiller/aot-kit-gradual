@@ -64,7 +64,14 @@
 (const JLV-ABSENT i64 3)
 (defstruct JslLoweredValue
   [(kind i64) (logical i64) (slots-off i64) (slots-len i64)])
-(defstruct JslLoweredCall [(site CallSite) (result JslLoweredValue)])
+(defstruct JslLoweredCall
+  [(site CallSite)
+   ;; The unconditional slot-zero projection is the call-outcome ordering token. It exists on
+   ;; both normal and abrupt outcomes and is therefore safe for the pending-exception read to
+   ;; depend on. It is deliberately distinct from `result`, whose typed/record views may only be
+   ;; consumed after the normal-control split.
+   (outcome i64)
+   (result JslLoweredValue)])
 (defstruct JslBind
   [(name (slice u8))
    (value JslLoweredValue)
@@ -2230,6 +2237,7 @@
                         (do (al-push! [i64] (field (jl) slots)
                                       (call-result call (load result)))
                             (set! result (+ (load result) 1)))))
+              (set! (.outcome answer) (al-get [i64] (.slots (jl)) off))
               (set! (.result answer) (jl-lowered-view JLV-RECORD record off width)))
             (let [projected (call-result call 0)
                   value (if (or (= ret TY-NO-ID) (= ret (t-dyn))) projected
@@ -2238,6 +2246,7 @@
               ;; logical value. Scalar-only public adapters reconstruct their historical view at
               ;; the outer boundary.
               (set! (.site answer) call)
+              (set! (.outcome answer) projected)
               (set! (.result answer) (jl-lowered-scalar! value (n-ty value))))))
       (load answer))))
 
@@ -2301,9 +2310,10 @@
       (if uses-mem
           (jl-set-mem! (n-new1 (Arg (t-mem-alias JS-PROPERTY-ALIAS (t-undef))) end))
           0)
-      ;; The pending query orders from the call effect itself. It must not consume a normal result
-      ;; slot: doing so materializes poison on the exceptional edge before the split.
-      (jl-check-pending! (call-node cs))
+      ;; The pending query orders from the unconditional raw outcome projection. Selection maps
+      ;; that projection to the ABI capture bundle, so the dependency names a real machine value
+      ;; on both edges. The typed/record `initial-result` remains forbidden until normal control.
+      (jl-check-pending! (.outcome lowered-call))
       (if (jsl-decl-can-throw? callee)
           (do
             ;; The provisional CallEnd projections were needed only by the public unchecked-call
