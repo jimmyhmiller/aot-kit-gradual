@@ -874,6 +874,12 @@
    ;; per fixpoint, and it was 37 ms of a 350 ms cold compile. The FIRST round of each still walks
    ;; the bodies, because that is what computes the declaration's own bit; every round after it can
    ;; only add a flag by propagating from a callee, which is integer work over these edges.
+   ;; Which declarations have had their BODY type-checked. Checking all 576 at load time cost
+   ;; 15.5 ms of the 83 ms it takes to compile `var x = 1;`, which reaches 83 of them. A body is
+   ;; now checked the first time something requires or inlines it -- the same demand the frontend
+   ;; already lowers on. A declaration nobody uses is never checked, which is the point; the suite's
+   ;; whole-library test lowers everything and therefore still checks everything.
+   (decl-checked (ArrayList i64))
    (callee-first (ArrayList i64))
    (callee-count (ArrayList i64))
    (callee-entry (ArrayList i64))
@@ -923,6 +929,7 @@
   (let [p (primitive/alloc-static Jsl)]
     (if (.inited p) 0
       (do (set! (.inited p) true)   ; set FIRST: `jsl-reset!` re-enters through here
+          (set! (.decl-checked p) (al-new [i64] (malloc-allocator)))
           (set! (.callee-first p) (al-new [i64] (malloc-allocator)))
           (set! (.callee-count p) (al-new [i64] (malloc-allocator)))
           (set! (.callee-entry p) (al-new [i64] (malloc-allocator)))
@@ -959,6 +966,7 @@
 
 (defn jsl-reset! [] (-> i64)
   (let [p (jsl)]
+    (al-clear! [i64]         (field p decl-checked))
     (al-clear! [i64]         (field p callee-first))
     (al-clear! [i64]         (field p callee-count))
     (al-clear! [i64]         (field p callee-entry))
@@ -2724,8 +2732,38 @@
 ;; Check every declaration's body. Separate from `jsl-load!` because a body may call a definition
 ;; that appears LATER in the file: resolution has to see the whole table, so the table is built
 ;; first and walked second.
+;; One declaration's body, checked once. This is the loop body `jsl-check` used to run over every
+;; declaration; it now runs on demand. See Jsl.decl-checked.
+(defn jsl-check-decl! [(d i64)] (-> i64)
+  (let [p (jsl)]
+    (loop (if (> (al-len [i64] (.decl-checked p)) d) (break)
+              (do (al-push! [i64] (field p decl-checked) 0) 0)))
+    (if (!= (al-get [i64] (.decl-checked p) d) 0)
+        JSL-OK
+        (do
+          (al-set! [i64] (field p decl-checked) d 1)
+          (al-clear! [(slice u8)] (field p binds))
+          (al-clear! [i64] (field p bindrecords))
+          (al-clear! [i64] (field p bindlists))
+          (al-clear! [i64] (field p bindslotlists))
+          (let [(mut err) (jsl-check-expr (jsl-decl-body d) d)]
+            (if (!= (load err) JSL-OK)
+                (do (fmt (stderr) "jsl: {s} checking {s} ({s})\n"
+                         (jsl-err-name (load err)) (jsl-decl-name d) (jsl-where)) 0)
+                0)
+            (if (and (= (load err) JSL-OK)
+                     (!= (jsl-expr-record (jsl-decl-body d) d) (jsl-decl-ret-record d)))
+                (set! err (jsl-fail! JSL-ERR-RECORD-ESCAPE (jsl-decl-name d))) 0)
+            (if (and (= (load err) JSL-OK)
+                     (>= (jsl-expr-record-list (jsl-decl-body d) d) 0))
+                (set! err (jsl-fail! JSL-ERR-RECORD-ESCAPE (jsl-decl-name d))) 0)
+            (if (and (= (load err) JSL-OK)
+                     (!= (jsl-expr-slot-list (jsl-decl-body d) d) -1))
+                (set! err (jsl-fail! JSL-ERR-SLOT-LIST-ESCAPE (jsl-decl-name d))) 0)
+            (load err))))))
+
 (defn jsl-check [] (-> i64)
-  (let [n (jsl-decl-count) (mut i) 0 (mut err) JSL-OK (mut body-start) (jsl-profile-now)]
+  (let [n (jsl-decl-count) (mut i) n (mut err) JSL-OK (mut body-start) (jsl-profile-now)]
     (loop (if (or (>= (load i) n) (!= (load err) JSL-OK))
               (break)
               (do

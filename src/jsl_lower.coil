@@ -62,6 +62,7 @@
 (const JLV-RECORD i64 1)
 (const JLV-RECORD-LIST i64 2)
 (const JLV-ABSENT i64 3)
+(const JLV-SLOT-LIST i64 4)
 (defstruct JslLoweredValue
   [(kind i64) (logical i64) (slots-off i64) (slots-len i64)])
 (defstruct JslLoweredCall
@@ -320,6 +321,46 @@
                                                 (load record) (load leaf))))
                                       (set! leaf (+ (load leaf) 1))))))
                         (set! record (+ (load record) 1))))))
+          ;; Named internal slots define the ids and storage contracts consumed by generated
+          ;; layouts, so declaration order and storage are part of library identity.
+          (set! hash (hash-step (load hash) (jsl-internal-slot-count)))
+          (let [(mut slot) 0]
+            (loop (if (>= (load slot) (jsl-internal-slot-count)) (break)
+                      (do (jl-identity-hash-slice! (mut hash) 18
+                                                   (jsl-internal-slot-name (load slot)))
+                          (set! hash (hash-step (load hash)
+                                               (jsl-internal-slot-storage (load slot))))
+                          (set! slot (+ (load slot) 1))))))
+          ;; Method-family declaration order is the generated runtime dispatch identity.
+          (set! hash (hash-step (load hash) (jsl-method-family-count)))
+          (let [(mut family) 0]
+            (loop (if (>= (load family) (jsl-method-family-count)) (break)
+                      (do (jl-identity-hash-slice! (mut hash) 19
+                                                   (jsl-method-family-name (load family)))
+                          (set! family (+ (load family) 1))))))
+          (set! hash (hash-step (load hash) (jsl-internal-method-count)))
+          (let [(mut method) 0]
+            (loop (if (>= (load method) (jsl-internal-method-count)) (break)
+                      (do (jl-identity-hash-slice! (mut hash) 20
+                                                   (jsl-internal-method-name (load method)))
+                          (set! method (+ (load method) 1))))))
+          ;; Compile-time descriptors affect macro expansion even though they contribute zero ABI
+          ;; slots, so both their names and ordered members belong to library identity.
+          (set! hash (hash-step (load hash) (jsl-slot-list-count)))
+          (let [(mut list) 0]
+            (loop (if (>= (load list) (jsl-slot-list-count)) (break)
+                      (do
+                        (jl-identity-hash-slice! (mut hash) 16
+                                                 (jsl-slot-list-name (load list)))
+                        (set! hash (hash-step (load hash)
+                                             (jsl-slot-list-size (load list))))
+                        (let [(mut slot) 0]
+                          (loop (if (>= (load slot) (jsl-slot-list-size (load list))) (break)
+                                  (do (jl-identity-hash-slice!
+                                        (mut hash) 17
+                                        (jsl-slot-list-slot (load list) (load slot)))
+                                      (set! slot (+ (load slot) 1))))))
+                        (set! list (+ (load list) 1))))))
           (set! hash (hash-step (load hash) (jsl-decl-count)))
           (loop (if (>= (load decl) (jsl-decl-count)) (break)
                     (do
@@ -370,6 +411,12 @@
                                           (hash-step
                                             (load hash)
                                             (jsl-param-record (load decl) (load parameter))))
+                                    (set! hash
+                                          (hash-step
+                                            (load hash)
+                                            (if (jsl-param-slot-list? (load decl)
+                                                                      (load parameter))
+                                                1 0)))
                                     (set! hash
                                           (hash-step
                                             (load hash)
@@ -654,6 +701,8 @@
     (set! (.kind value) JLV-ABSENT)
     (set! (.logical value) TY-NO-ID)
     (load value)))
+(defn jl-lowered-slot-list [(identity i64)] (-> JslLoweredValue)
+  (jl-lowered-view JLV-SLOT-LIST identity (al-len [i64] (.slots (jl))) 0))
 (defn jl-lowered-scalar-node [(value JslLoweredValue)] (-> i64)
   (if (or (!= (.kind value) JLV-SCALAR) (!= (.slots-len value) 1))
       (do (panic-corrupt "jsl lowering: aggregate used where one scalar graph node is required")
@@ -765,9 +814,12 @@
               (do (al-push! [i64] (field (jl) slots)
                             (n-parm! fun (+ abi-base (load slot))))
                   (set! slot (+ (load slot) 1)))))
-    (if (>= record 0)
+    (if (jsl-param-slot-list? d source-index)
+        (do (panic-corrupt "jsl lowering: slot-list parameter reached a runtime function ABI")
+            (jl-lowered-absent))
+      (if (>= record 0)
         (jl-lowered-view JLV-RECORD record off width)
-        (jl-lowered-view JLV-SCALAR (jsl-param-ty d source-index) off width))))
+        (jl-lowered-view JLV-SCALAR (jsl-param-ty d source-index) off width)))))
 
 (defn jl-lowered-matches-decl-result? [(d i64) (value JslLoweredValue)] (-> bool)
   (let [record (jsl-decl-ret-record d)]
@@ -780,9 +832,11 @@
                                  (-> bool)
   (let [record (jsl-param-record d source-index)]
     (and (= (.slots-len value) (jsl-param-lowered-width d source-index))
-         (if (>= record 0)
+         (if (jsl-param-slot-list? d source-index)
+             (= (.kind value) JLV-SLOT-LIST)
+           (if (>= record 0)
              (and (= (.kind value) JLV-RECORD) (= (.logical value) record))
-             (= (.kind value) JLV-SCALAR)))))
+             (= (.kind value) JLV-SCALAR))))))
 
 (defn jl-keep! [(n i64)] (-> i64)
   (if (= n NO-NODE) 0 (n-keep! n)))
@@ -1097,7 +1151,10 @@
                       literal (jsl-literal-ty name)]
                   (if (!= literal TY-NO-ID)
                       (jl-lowered-scalar! (jl-const literal) literal)
-                      (jl-lookup-lowered name)))
+                      (let [bound (jl-lookup-lowered name)]
+                        (if (!= (.kind bound) JLV-ABSENT) bound
+                          (let [slotlist (jsl-slot-list-find name)]
+                            (if (>= slotlist 0) (jl-lowered-slot-list slotlist) bound))))))
                 (let [name (rd/sexp-sym (rd/sexp-nth x 0))]
                   (cond (= name "let") (jl-let x)
                         (= name "if") (jl-if x)
@@ -1110,6 +1167,13 @@
                         (= name "record-list-new") (jl-record-list-new x)
                         (= name "record-list-store") (jl-record-list-store x)
                         (= name "record-list-load") (jl-record-list-load x)
+                        (= name "object-layout-init") (jl-object-layout-init x)
+                        (= name "object-method-family-is") (jl-object-method-family-is x)
+                        (= name "object-method-family-set") (jl-object-method-family-set x)
+                        (= name "object-method-is-ordinary") (jl-object-method-is-ordinary x)
+                        (= name "internal-slot-has") (jl-internal-slot-read x true)
+                        (= name "internal-slot-load") (jl-internal-slot-read x false)
+                        (= name "internal-slot-store") (jl-internal-slot-store x)
                         (= name "call") (jl-lowered-node-result! (jl-js-call x))
                         (= name "call-with-receiver")
                           (jl-lowered-node-result! (jl-js-call-with-receiver x))
@@ -1121,6 +1185,67 @@
                         (jsl-prim-name? name)
                           (jl-lowered-node-result! (jl-prim-call x name))
                         :else (jl-call x name)))))))))
+
+(defn jl-object-layout-init [(x (ptr rd/Sexp))] (-> JslLoweredValue)
+  (let [object (jl-expr-lowered (rd/sexp-nth x 1))
+        descriptor (jl-expr-lowered (rd/sexp-nth x 2))]
+    (if (!= (.kind descriptor) JLV-SLOT-LIST)
+        (do (panic-corrupt "jsl lowering: object-layout-init requires a slot-list descriptor")
+            (jl-lowered-absent))
+      (let [owner (jl-lowered-scalar-node object)
+            layout (jl-const (t-int-con (+ (.logical descriptor) 1)))
+            ignored (jl-const (t-undef))]
+        (jl-set-mem! (n-prop-store-key-operation-at!
+                       (jl-ctrl) (jl-mem) owner layout ignored 25))
+        object))))
+
+(defn jl-object-method-family-is [(x (ptr rd/Sexp))] (-> JslLoweredValue)
+  (let [object (jl-expr-lowered (rd/sexp-nth x 1))
+        family (jsl-method-family-find (rd/sexp-sym (rd/sexp-nth x 2)))
+        key (jl-const (t-int-con (+ family 1)))
+        node (n-prop-load-key-operation-at! (jl-ctrl) (jl-mem)
+                                             (jl-lowered-scalar-node object) key 30)]
+    (jl-lowered-scalar! node (n-ty node))))
+
+(defn jl-object-method-family-set [(x (ptr rd/Sexp))] (-> JslLoweredValue)
+  (let [object (jl-expr-lowered (rd/sexp-nth x 1))
+        family (jsl-method-family-find (rd/sexp-sym (rd/sexp-nth x 2)))
+        key (jl-const (t-int-con (+ family 1)))
+        ignored (jl-const (t-undef))]
+    (jl-set-mem! (n-prop-store-key-operation-at!
+                   (jl-ctrl) (jl-mem) (jl-lowered-scalar-node object) key ignored 31))
+    object))
+
+(defn jl-object-method-is-ordinary [(x (ptr rd/Sexp))] (-> JslLoweredValue)
+  (let [object (jl-expr-lowered (rd/sexp-nth x 1))
+        method (jsl-internal-method-find (rd/sexp-sym (rd/sexp-nth x 2)))
+        key (jl-const (t-int-con (+ method 1)))
+        node (n-prop-load-key-operation-at! (jl-ctrl) (jl-mem)
+                                             (jl-lowered-scalar-node object) key 32)]
+    (jl-lowered-scalar! node (n-ty node))))
+
+(defn jl-internal-slot-read [(x (ptr rd/Sexp)) (presence bool)] (-> JslLoweredValue)
+  (let [object (jl-expr-lowered (rd/sexp-nth x 1))
+        slot (jsl-internal-slot-find (rd/sexp-sym (rd/sexp-nth x 2)))
+        operation (if presence 26
+                    (if (= (jsl-internal-slot-storage slot) JSL-SLOT-BOOLEAN) 29 27))
+        key (jl-const (t-int-con (+ slot 1)))
+        node (n-prop-load-key-operation-at! (jl-ctrl) (jl-mem)
+                                             (jl-lowered-scalar-node object) key operation)]
+    (jl-lowered-scalar! node (n-ty node))))
+
+(defn jl-internal-slot-store [(x (ptr rd/Sexp))] (-> JslLoweredValue)
+  (let [object (jl-expr-lowered (rd/sexp-nth x 1))
+        slot (jsl-internal-slot-find (rd/sexp-sym (rd/sexp-nth x 2)))
+        value (jl-expr-lowered (rd/sexp-nth x 3))
+        key (jl-const (t-int-con (+ slot 1)))
+        raw (jl-lowered-scalar-node value)
+        stored (if (= (jsl-internal-slot-storage slot) JSL-SLOT-BOOLEAN) raw
+                   (if (= (.logical value) (t-dyn)) raw (n-box! raw)))]
+    (jl-set-mem! (n-prop-store-key-operation-at!
+                   (jl-ctrl) (jl-mem) (jl-lowered-scalar-node object) key
+                   stored 28))
+    object))
 
 (defn jl-record-new [(x (ptr rd/Sexp))] (-> JslLoweredValue)
   (let [schema (jsl-record-find (rd/sexp-sym (rd/sexp-nth x 1)))
@@ -2638,6 +2763,10 @@
       (load err))))
 
 (defn jl-require-decl! [(d i64)] (-> i64)
+  ;; CHECK ON DEMAND. Bodies are no longer type-checked for the whole library at load time; this is
+  ;; where a definition is actually reached, so this is where its body is validated.
+  ;; See Jsl.decl-checked.
+  (if (!= (jsl-check-decl! d) JSL-OK) (jsl-err)
   ;; A macro is inlined at its call site, so it needs no Fun of its own — but whatever IT calls
   ;; still has to be lowered, or the expansion would reference a Fun that was never opened.
   (if (jsl-macro? d) (jl-require-body! (jsl-decl-body d))
@@ -2660,7 +2789,7 @@
                                                 (jl-library-identity-unit) d)
                     (do (n-fun-mark-imported! fun) JSL-OK)
                     (let [err (jl-require-body! (jsl-decl-body d))]
-                      (if (!= err JSL-OK) err (jl-lower-decl! d)))))))))))
+                      (if (!= err JSL-OK) err (jl-lower-decl! d))))))))))))
 
 ;; Lower everything a definition CALLS, without lowering the definition itself. That is exactly what
 ;; an inlined body needs: its own nodes go straight into the caller's graph, but a builtin it calls
