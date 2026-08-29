@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { buildEvidence, mappedPaths, validateOperationManifest, verifyEvidence, verifyPinnedCheckout } from "./ecma262-test262.mjs";
+import { buildEvidence, evidenceComparison, mappedPaths, validateOperationManifest, verifyEvidence, verifyPinnedCheckout } from "./ecma262-test262.mjs";
 
 const manifest = paths => ({ schemaVersion: 2, operations: { A: {
   focusedNativeDifferential: "tests/spec-operations/a.js",
@@ -39,4 +39,22 @@ test("builds digest-bound evidence and rejects results outside the mapping", () 
   assert.throws(() => buildEvidence("A", mapping, "abc", "results/a.jsonl",
     [{ path: "/checkout/test/b/x.js", variant: "default", status: "passed" }], Buffer.alloc(0)),
   /outside its mapped cohort/);
+});
+
+test("pass regressions cannot become retained evidence", () => {
+  const before = [
+    { path: "test/a.js", variant: "default", status: "passed" },
+    { path: "test/b.js", variant: "default", status: "failed" },
+  ];
+  const regressed = [
+    { path: "test/a.js", variant: "default", status: "failed" },
+    { path: "test/b.js", variant: "default", status: "passed" },
+  ];
+  const improved = [
+    { path: "test/a.js", variant: "default", status: "passed" },
+    { path: "test/b.js", variant: "default", status: "passed" },
+  ];
+  assert.equal(evidenceComparison(before, regressed).publishable, false);
+  assert.equal(evidenceComparison(before, improved).publishable, true);
+  assert.equal(evidenceComparison(null, improved).publishable, true);
 });

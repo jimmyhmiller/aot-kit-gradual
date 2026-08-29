@@ -149,6 +149,14 @@ function directProseCount(spec, clause) {
   return [...clause.node.children].filter(node => proseTags.has(node.tagName) && spec.locate(node)).length;
 }
 
+// Ecmarkup resolves operation names inside notes to the same `aoid`-bearing xrefs it creates in
+// normative algorithms. Notes are explanatory and cannot create specification prerequisites: for
+// example, MakeBasicObject's note names ArrayCreate as a consumer, while ArrayCreate normatively
+// calls MakeBasicObject. Treating both as dependencies invents a cycle and corrupts the work queue.
+function isNormativeOperationReference(xref) {
+  return !xref.closest("emu-note");
+}
+
 function sourceLocation(spec, node, sourceRoot) {
   const located = spec.locate(node);
   if (!located) return null;
@@ -167,6 +175,7 @@ function clauseEntry(spec, clause, sourceRoot, ancestorIds) {
     entry.type === "built-in function" && entry.clause === clause.id);
   const xrefs = directDescendants(clause, "emu-xref");
   const operationDependencies = [...new Set(xrefs
+    .filter(isNormativeOperationReference)
     .map(xref => xref.getAttribute("aoid"))
     .filter(Boolean))].sort();
   const clauseDependencies = [...new Set(xrefs

@@ -19,6 +19,8 @@
 (import "frontendnative" :use *)
 (import "frontendnativegraph" :use *)
 (import "generated_intrinsics" :use *)
+(import "backend_macho" :use *)
+(import "backend_cfg" :use *)
 (import "typescriptnative" :use *)
 (import "gtext" :use *)
 (import "shape" :use *)
@@ -95,6 +97,13 @@ n6: Return <- n0 n5 n4 : [ctrl,num,mem#-9223372036854775808 undefined]
   (assert (fe-intrinsic-property-callable? (fe-intrinsic-name "Symbol") "for"))
   (assert (fe-intrinsic-property-callable? (fe-intrinsic-name "Symbol") "keyFor"))
   (assert (not (fe-intrinsic-property-callable? (fe-intrinsic-name "Symbol") "species")))
+  (assert (= (fe-intrinsic-prototype-property-implementation
+               (fe-intrinsic-name "Symbol") "valueOf")
+             "SymbolPrototypeValueOfValue"))
+  (assert (fe-intrinsic-prototype-property-callable?
+            (fe-intrinsic-name "Symbol") "valueOf"))
+  (assert (not (fe-intrinsic-prototype-property-callable?
+                 (fe-intrinsic-name "Symbol") "description")))
   (assert (= (fe-intrinsic-name "DefinitelyNotAnIntrinsic") -1)))
 (import "backend_core" :use *)
 (import "backend_select" :use *)
@@ -299,4 +308,183 @@ n6: Return <- n0 n5 n4 : [ctrl,num,mem#-9223372036854775808 undefined]
       (assert (= (ts-node-script ast (ts-child ast (ts-child ast root 1) 0)) 1))
       (assert (= (ts-text ast (ts-child ast root 1)) "\"use strict\";"))
       (ts-close! (mut ast))))
+  0)
+
+(defn assert-array-buffer-resolutions-in-subtree! [(frontend (ptr NativeFrontend))
+                                                    (node i64)
+                                                    (seen (ptr i64))] (-> i64)
+  (let [ast (field frontend ast)]
+    (if (and (= (ts-kind ast node) TSK-IDENTIFIER)
+             (= (ts-text ast node) "ArrayBuffer"))
+        (do
+          (assert (= (fe-resolution-symbol frontend node) FE-INTRINSIC-ARRAYBUFFER))
+          (store! seen (+ (load seen) 1)))
+        0)
+    (let [(mut child) 0]
+      (loop (if (>= (load child) (ts-child-count ast node))
+                (break)
+                (do
+                  (assert-array-buffer-resolutions-in-subtree!
+                    frontend (ts-child ast node (load child)) seen)
+                  (set! child (+ (load child) 1))))))
+    0))
+
+;; Name resolution is per lexical environment, but generated intrinsic identities are Realm-wide.
+;; A later Test262 Script record must not silently turn a known intrinsic into an unbound global.
+(deftest intrinsic_resolution_is_stable_across_script_records
+  (let [harness "var first = ArrayBuffer.prototype;"
+        test "var second = ArrayBuffer.prototype;"
+        source "var first = ArrayBuffer.prototype;var second = ArrayBuffer.prototype;"
+        raw-lengths (primitive/alloc-stack (array i32 2))]
+    (store! (index raw-lengths 0) (cast i32 (slice-len harness)))
+    (store! (index raw-lengths 1) (cast i32 (slice-len test)))
+    (let [lengths (slice-new [i32] (cast (ptr i32) (index raw-lengths 0)) 2)
+          (mut ast) (ts-open-scripts source lengths TS-SCRIPT-JS)
+          (mut frontend) (fe-native-new-ast ast)
+          seen (primitive/alloc-stack i64)]
+      (store! seen 0)
+      (assert (= (fe-native-index! (mut frontend)) FE-OK))
+      (assert-array-buffer-resolutions-in-subtree! (mut frontend) (ts-root ast) seen)
+      (assert (= (load seen) 2))
+      (fe-native-free! (mut frontend))))
+  0)
+
+;; A synthetic Script entry is an ordinary compiled function, not a license to constant-fold an
+;; opaque intrinsic constructor identity back to its integer kind argument. Keep the primitive in
+;; the optimized graph before asking the native backend to preserve it as a runtime call.
+(deftest dispatched_script_retains_intrinsic_constructor_primitive
+  (js-reset-world!)
+  (let [(mut frontend)
+          (fe-native-new "const descriptor = Object.getOwnPropertyDescriptor(TypeError, 'name');
+if (descriptor.value !== 'TypeError') throw 1;")
+        (mut constructor-function-owner) -1
+        (mut constructor-function-node) NO-NODE]
+    (assert (= (fe-native-index! (mut frontend)) FE-OK))
+    (frontend-native-build-dispatched-script! (mut frontend) 6201 true)
+    (let [declaration (jsl-find "BuiltinConstructorValue")
+          fun (jsl-decl-fun declaration)
+          (mut input) 1 (mut returns-constructor) false]
+      (assert (>= declaration 0))
+      (assert (op-is? fun Fun [_]))
+      (set! constructor-function-node fun)
+      (loop (if (>= (load input) (n-nins fun))
+                (break)
+                (let [ret (n-in fun (load input))]
+                  (if (and (op-is? ret Return [])
+                           (op-is? (n-in ret 1) JsBuiltin [_])
+                           (= (n-jsbuiltin-id (n-in ret 1)) 20))
+                      (set! returns-constructor true)
+                      0)
+                  (set! input (+ (load input) 1)))))
+      (assert (load returns-constructor)))
+    (let [(mut node) 0 (mut constructors) 0]
+      (loop (if (>= (load node) (n-count))
+                (break)
+                (do
+                  (if (and (not (n-dead? (load node)))
+                           (op-is? (load node) JsBuiltin [_]))
+                      (if (= (n-jsbuiltin-id (load node)) 20)
+                          (set! constructors (+ (load constructors) 1))
+                          0)
+                      0)
+                  (set! node (+ (load node) 1)))))
+      (assert (> (load constructors) 0)))
+    (assert (= (g-verify) 0))
+    (assert (be-select-verified-machine-program!))
+    (set! constructor-function-owner (mu-find-function (load constructor-function-node)))
+    (assert (>= (load constructor-function-owner) 0))
+    (let [(mut at) 0 (mut constructors) 0 (mut constructor-owner) -1
+          (mut constructor-vreg) -1]
+      (loop (if (>= (load at) (be-inst-count))
+                (break)
+                (do
+                  (if (and (= (ms-inst-op (load at)) MI-JSSTRING)
+                           (and (= (ms-inst-imm (load at)) 120)
+                                (= (ms-inst-owner (load at))
+                                   (load constructor-function-owner))))
+                      (do
+                        (set! constructors (+ (load constructors) 1))
+                        (set! constructor-owner (ms-inst-owner (load at)))
+                        (set! constructor-vreg (ms-inst-dst (load at))))
+                      0)
+                  (set! at (+ (load at) 1)))))
+      (assert (> (load constructors) 0))
+      (assert (>= (load constructor-owner) 0))
+      (assert (>= (load constructor-vreg) 0))
+      (set! at 0)
+      (let [(mut callers) 0]
+        (loop (if (>= (load at) (be-inst-count))
+                  (break)
+                  (do
+                    (if (and (= (ms-inst-op (load at)) MI-CALL)
+                             (= (ms-inst-imm (load at)) (load constructor-owner)))
+                        (set! callers (+ (load callers) 1))
+                        0)
+                    (set! at (+ (load at) 1)))))
+        (assert (> (load callers) 0)))
+      (set! at 0)
+      (let [(mut returns) 0]
+        (loop (if (>= (load at) (be-inst-count))
+                  (break)
+                  (do
+                    (if (and (= (ms-inst-owner (load at)) (load constructor-owner))
+                             (= (ms-inst-op (load at)) MI-RET))
+                        (set! returns (+ (load returns) 1))
+                        0)
+                    (set! at (+ (load at) 1)))))
+        (assert (> (load returns) 0))))
+    (assert (>= (be-schedule!) 0))
+    (assert (>= (be-color! 10) 0))
+    (assert (be-encode-checked!))
+    (let [(mut at) 0]
+      (loop (if (>= (load at) (be-inst-count))
+                (break)
+                (do
+                  ;; Branch immediates are relative to the actual encoded branch instruction, not
+                  ;; necessarily the beginning of an expanded machine instruction. A spilled CBZ
+                  ;; predicate can require a multiword stack-address materialization first.
+                  (if (= (ms-inst-op (load at)) MI-B)
+                      (let [site (load (field (be-inst (load at)) first))
+                            target (be-label-off (ms-inst-imm (load at)))]
+                        (assert (= (be-code-u32 site) (a64-b (/ (- target site) 4)))))
+                      0)
+                  (if (= (ms-inst-op (load at)) MI-CBZ)
+                      (let [predicate (ms-inst-a (load at))
+                            reg (be-reg-of predicate)
+                            reload-bytes
+                              (if (>= reg 0)
+                                  0
+                                  (* 4 (be-stack-access-words
+                                         (be-spill-off-vreg predicate))))
+                            site (+ (load (field (be-inst (load at)) first)) reload-bytes)
+                            target (be-label-off (ms-inst-imm (load at)))
+                            ;; `ra` uses x15 as its ordinary GPR spill scratch in the encoder.
+                            encoded-reg (if (>= reg 0) reg 15)
+                            expected (a64-cbz encoded-reg (/ (- target site) 4))]
+                        (assert (= (be-code-u32 site)
+                                   expected)))
+                      0)
+                  (if (and (= (ms-inst-op (load at)) MI-JSSTRING)
+                           (= (ms-inst-imm (load at)) 120))
+                      (let [owner (ms-inst-owner (load at))
+                            first (load (field (be-inst (load at)) first))
+                            branch (mobj-jsstring-branch-pc (load at))]
+                        (assert (>= first (mu-function-code-start owner)))
+                        (assert (< first (+ (mu-function-code-start owner)
+                                            (mu-function-code-size owner))))
+                        ;; Publication patches exactly this placeholder. If the relocation model
+                        ;; points at an adjacent instruction, the BL remains zero and operation 20
+                        ;; silently returns its raw input register instead of an intrinsic value.
+                        (assert (= (be-code-u32 branch) (a64-bl 0))))
+                      0)
+                  (set! at (+ (load at) 1))))))
+    (let [(mut reloc) 0]
+      (loop (if (>= (load reloc) (mu-internal-call-reloc-count))
+                (break)
+                (let [site (mu-internal-call-reloc-offset (load reloc))
+                      target (mu-function-code-start
+                               (mu-internal-call-reloc-target (load reloc)))]
+                  (assert (= (be-code-u32 site) (a64-bl (/ (- target site) 4))))
+                  (set! reloc (+ (load reloc) 1))))))
+    (fe-native-free! (mut frontend)))
   0)

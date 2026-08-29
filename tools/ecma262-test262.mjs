@@ -95,6 +95,15 @@ export function verifyEvidence(name, mapping, test262Commit, evidence, rows, byt
   return evidence;
 }
 
+export function evidenceComparison(beforeRows, afterRows) {
+  if (!beforeRows) return { report: null, publishable: true };
+  const report = compareResults(beforeRows, afterRows);
+  return {
+    report,
+    publishable: report.sameCohort && report.passToNonpass.length === 0,
+  };
+}
+
 function option(argv, name, fallback = "") {
   const equals = argv.find(arg => arg.startsWith(`${name}=`));
   if (equals) return equals.slice(name.length + 1);
@@ -127,19 +136,22 @@ function main() {
   runnerArgs.push(...paths);
   const run = spawnSync(process.execPath, runnerArgs, { cwd: projectRoot, stdio: "inherit" });
   const mapping = manifest.operations[name].test262;
-  if (results && existsSync(resolve(results)) && mapping.evidence) {
+  const resultExists = results && existsSync(resolve(results));
+  const afterRows = resultExists ? readJsonl(resolve(results)) : null;
+  const comparison = before
+    ? (afterRows
+        ? evidenceComparison(readJsonl(resolve(before)), afterRows)
+        : { report: null, publishable: false })
+    : evidenceComparison(null, afterRows);
+  if (resultExists && mapping.evidence && comparison.publishable) {
     const bytes = readFileSync(resolve(results));
     const evidence = buildEvidence(name, mapping, sources.test262.commit,
       resolve(results).startsWith(projectRoot + sep) ? resolve(results).slice(projectRoot.length + 1) : resolve(results),
-      readJsonl(resolve(results)), bytes);
+      afterRows, bytes);
     writeFileSync(join(projectRoot, mapping.evidence), `${JSON.stringify(evidence, null, 2)}\n`);
   }
-  let comparisonFailed = false;
-  if (before) {
-    const report = compareResults(readJsonl(resolve(before)), readJsonl(resolve(results)));
-    process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
-    comparisonFailed = !report.sameCohort || report.passToNonpass.length > 0;
-  }
+  if (comparison.report) process.stdout.write(`${JSON.stringify(comparison.report, null, 2)}\n`);
+  const comparisonFailed = !comparison.publishable;
   if ((run.status ?? 1) !== 0 || comparisonFailed) process.exitCode = run.status || 1;
 }
 

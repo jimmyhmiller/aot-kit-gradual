@@ -38,6 +38,8 @@ test("extracts imported normative structure, operation dependencies, built-ins, 
   const byId = new Map(ledger.clauses.map(clause => [clause.id, clause]));
   assert.equal(byId.get("sec-add-one").algorithmKind, "abstract operation");
   assert.deepEqual(byId.get("sec-add-two").operationDependencies, ["AddOne"]);
+  assert.ok(!byId.get("sec-add-two").operationDependencies.includes("WidgetRead"),
+    "an informative note must not create an operation dependency");
   assert.equal(byId.get("sec-widget.prototype.read").builtIn.name, "Widget.prototype.read");
   assert.equal(byId.get("sec-runtime-semantics-evaluation").algorithmKind, "syntax-directed operation");
   assert.equal(byId.get("sec-runtime-semantics-evaluation").parentId, "sec-widget-literal");

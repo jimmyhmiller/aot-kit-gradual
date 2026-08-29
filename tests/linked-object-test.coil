@@ -138,3 +138,57 @@
     ;; two allocations, so two calls into the collector -- and the field written to the FIRST
     ;; object is the one read back, across a second allocation that could have moved it.
     (assert (= (gc-run) 41))))
+
+(deftest a_generated_layout_slot_is_a_strong_traced_edge_of_a_weak_owner
+  (graph-reset! 1202) (shape-reset!)
+  (let [sx (shape-transition SHAPE-ROOT "x" (t-int)) ax (shape-field-alias sx 0)
+        owner-allocation (n-new-obj1! (g-start) sx (gc-mem ax))
+        owner (n-obj-ptr owner-allocation)
+        property-memory (gc-mem JS-PROPERTY-ALIAS)
+        layout-id (n-new1 (Const (t-int-con 1)) (g-start))
+        array-family-id (n-new1 (Const (t-int-con 2)) (g-start))
+        get-method-id (n-new1 (Const (t-int-con 8)) (g-start))
+        prototype-slot-id (n-new1 (Const (t-int-con 2)) (g-start))
+        undefined-value (n-new1 (Const (t-undef)) (g-start))
+        layout-memory (n-prop-store-key-operation-at!
+                        (g-start) property-memory owner layout-id undefined-value 25)
+        family-memory (n-prop-store-key-operation-at!
+                        (g-start) layout-memory owner array-family-id undefined-value 31)
+        target-allocation (n-new-obj1! (g-start) sx (n-obj-mem owner-allocation 0))
+        target (n-obj-ptr target-allocation)
+        target-memory (n-new4 (Store ax) NO-NODE (n-obj-mem target-allocation 0) target
+                              (n-new1 (Const (t-int-con 42)) (g-start)))
+        slot-memory (n-prop-store-key-operation-at!
+                      (g-start) family-memory owner prototype-slot-id (n-box! target) 28)
+        (mut allocation-memory) target-memory
+        (mut i) 0]
+    ;; 300 allocations exceed the 4 KiB test heap. `target` has no SSA use after its slot store, so
+    ;; surviving collection and returning its field depends on the generated side-table edge.
+    (loop (if (>= (load i) 300) (break)
+            (let [garbage (n-new-obj1! (g-start) sx (load allocation-memory))]
+              (set! allocation-memory (n-obj-mem garbage 0))
+              (n-kill! (n-obj-ptr garbage))
+              (set! i (+ (load i) 1)))))
+    (let [boxed-target (n-prop-load-key-operation-at!
+                         (g-start) slot-memory owner prototype-slot-id 27)
+          moved-target (n-unbox! boxed-target (t-obj))
+          value (n-new3 (Load ax) NO-NODE (load allocation-memory) moved-target)
+          matches (n-new3 (Eq) NO-NODE value
+                           (n-new1 (Const (t-int-con 42)) (g-start)))
+          installed-family (n-prop-load-key-operation-at!
+                            (g-start) slot-memory owner array-family-id 30)
+          ordinary-get (n-prop-load-key-operation-at!
+                         (g-start) slot-memory owner get-method-id 32)
+          retained-and-installed (n-new3 (BitAnd) NO-NODE matches installed-family)
+          result (n-new3 (BitAnd) NO-NODE retained-and-installed ordinary-get)
+          ret (n-new3 (Return) (g-start) result (load allocation-memory))]
+      (n-add-def! (g-stop) ret) (g-analyze!)
+      (if (!= (g-verify) 0) (g-verify-print (stderr)) 0)
+      (assert (= (g-verify) 0))
+      (assert (be-select-machine-program!))
+      (be-use-runtime-allocation! true)
+      (be-schedule!)
+      (assert (>= (be-color! 4) 0))
+      (assert (host-native-encode-checked!))
+      (assert (host-native-object-checked!))
+      (assert (= (gc-run) 1)))))

@@ -343,11 +343,27 @@
          ; generated data-property roots plus the Symbol prototype's well-known-keyed
          ; @@toPrimitive method and @@toStringTag data property. 506 adds eleven generated
          ; Number constructor data roots (metadata, prototype identity, and eight constants). 507
-         ; adds their generated shared constructor-initialization boundary.
+         ; adds their generated shared constructor-initialization boundary. Realm-stable
+         ; constructor identity reads use the primitive directly, separately from public
+         ; constructor-property publication, matching Torque's native-context model. 508 adds
+         ; canonical ThisSymbolValue and removes four duplicated Symbol receiver unwrap paths. 509
+         ; adds canonical SymbolDescriptiveString and makes Symbol.prototype.toString consume it.
+         ; 519 replaces the temporary shared inheritance predicate with nine active
+         ; manifest-generated per-essential-method predicates and adds the PreventExtensions
+         ; dispatch boundary. 523 activates OwnPropertyKeys and adds its ordinary, String-exotic,
+         ; and canonical snapshot boundaries. 532 activates the final SetPrototypeOf row and adds
+         ; ordinary/internal/public dispatch, validation, callable publication, and prototype-read
+         ; helpers while retaining a separate construction-time initialization operation.
+         ; 543 adds the pinned OrdinaryCreateFromConstructor DataView layout, fixed-buffer
+         ; constructor/accessor semantics, and its generated named internal-slot identities.
+         ; 546 adds the three DataView witness-record operations and routes both length accessors
+         ; through their shared fixed-buffer specification protocol.
+         ; 576 adds the fixed-buffer integer Get/SetValueInBuffer and Get/SetViewValue chain, six
+         ; getter and six setter callables, and twelve manifest-generated prototype method roots.
          ; Internal builtins
          ; flatten typed Record parameters into ordinary ABI leaves, so no declaration-kind
          ; workaround is needed.
-  (assert (= (jsl-decl-count) 507))
+         (assert (= (jsl-decl-count) 576))
          ; A builtin has a Fun and a macro does not, and every declaration is one or the other.
          (let [(mut i) 0 (mut funs) 0 (mut macros) 0]
            (loop (if (>= (load i) (jsl-decl-count)) (break)
@@ -358,14 +374,14 @@
                                (store! funs (+ (load funs) 1)) 0))
                        (store! i (+ (load i) 1))
                        0)))
-  (assert (= (+ (load funs) (load macros)) 507))
+           (assert (= (+ (load funs) (load macros)) 576))
            ; Most existing heap definitions remain macros for graph visibility and historical
            ; stability; called builtins can now carry an implicit heap effect when recursion or
            ; code sharing requires one. BuiltinConstructorValue and BuiltinMethodValue are shared
            ; because each is identity initialization, not caller-specific JavaScript control.
            ; ValidateAndApplyPropertyDescriptor is likewise a called boundary now that its two
            ; specification Records use the canonical flattened internal ABI.
-           (assert (= (load macros) 367))
+           (assert (= (load macros) 406))
            (assert (not (jsl-macro? (jsl-find "ValidateAndApplyPropertyDescriptor")))))
          (assert (>= (jsl-find "Clamp") 0))
          (assert (>= (jsl-find "StringIndexOfFrom") 0))
@@ -1049,6 +1065,129 @@
                     0)))"
            JSL-ERR-BAD-RECORD-LIST))
 
+(deftest internal_slot_lists_are_zero_width_compile_time_macro_values
+         (fresh! 915121)
+         (build!
+           "(internal-slot Prototype js-value)
+            (internal-slot Extensible boolean)
+            (internal-slot StringData js-value)
+            (slot-list OrdinarySlots [Prototype Extensible])
+            (slot-list StringSlots [Prototype Extensible StringData])
+            (macro ForwardSlots :params [(slots (slot-list)) (value dyn)] :ret dyn
+              (let [(same slots)] value))
+            (macro ThroughLoop :params [(slots (slot-list)) (value dyn)] :ret dyn
+              (loop [(i 0) (carried slots)]
+                (if (%Lt i 1)
+                    (recur (%Add i 1) carried)
+                    (ForwardSlots carried value))))
+            (builtin Entry :params [(value dyn)] :ret dyn
+              (%Add (ThroughLoop OrdinarySlots value)
+                    (ForwardSlots StringSlots 1)))")
+         (assert (= (jsl-slot-list-count) 2))
+         (assert (= (jsl-slot-list-size 0) 2))
+         (assert (= (jsl-slot-list-slot 0 0) "Prototype"))
+         (assert (= (jsl-slot-list-slot 0 1) "Extensible"))
+         (assert (jsl-param-slot-list? (jsl-find "ForwardSlots") 0))
+         (assert (= (jsl-param-lowered-width (jsl-find "ForwardSlots") 0) 0))
+         ;; The one runtime function has only its source value parameter. Neither descriptor nor
+         ;; its loop-carried copy produces a Parm or Phi.
+         (assert (= (jsl-decl-lowered-nparams (jsl-find "Entry")) 1))
+         (assert (= (count-op OPTAG-PHI) 1)))
+
+(deftest internal_slot_lists_have_named_declaration_and_escape_failures
+         (refuses 915122
+           "(internal-slot Prototype js-value) (slot-list Empty [])"
+           JSL-ERR-BAD-SLOT-LIST)
+         (refuses 915123
+           "(internal-slot Prototype js-value) (slot-list Bad [Prototype Prototype])"
+           JSL-ERR-BAD-SLOT-LIST)
+         (refuses 915124
+           "(builtin bad :params [(slots (slot-list))] :ret dyn 0)"
+           JSL-ERR-SLOT-LIST-ESCAPE)
+         (refuses 915125
+           "(internal-slot Prototype js-value) (slot-list Slots [Prototype])
+            (builtin bad :params [] :ret dyn (%Box Slots))"
+           JSL-ERR-SLOT-LIST-ESCAPE)
+         (refuses 915126
+           "(internal-slot Prototype js-value) (internal-slot Extensible boolean)
+            (slot-list A [Prototype]) (slot-list B [Extensible])
+            (macro M :params [(slots (slot-list)) (flag bool)] :ret dyn
+              (let [(chosen (if flag A B))] 0))
+            (builtin Entry :params [(flag bool)] :ret dyn (M A flag))"
+           JSL-ERR-BAD-RECORD)
+         (refuses 915127 "(internal-slot Broken pointer)" JSL-ERR-BAD-INTERNAL-SLOT)
+         (refuses 915128 "(slot-list Unknown [Missing])" JSL-ERR-BAD-INTERNAL-SLOT)
+         (refuses 915129 "(internal-method-family 1)" JSL-ERR-BAD-METHOD-FAMILY)
+         (refuses 915130
+           "(builtin bad :params [(object dyn)] :ret bool
+              (object-method-family-is object UnknownMethods))"
+           JSL-ERR-BAD-METHOD-FAMILY)
+         (refuses 915131
+           "(internal-method-family Family) (internal-slot Family js-value)"
+           JSL-ERR-DUP-NAME)
+         (refuses 915132 "(internal-method 1)" JSL-ERR-BAD-INTERNAL-METHOD)
+         (refuses 915133
+           "(internal-method Get)
+            (builtin bad :params [(object dyn)] :ret bool
+              (object-method-is-ordinary object Missing))"
+           JSL-ERR-BAD-INTERNAL-METHOD))
+
+(deftest generated_object_layout_forms_lower_to_named_runtime_operations
+         (fresh! 915134)
+         (build!
+           "(internal-method-family OrdinaryObjectMethods)
+            (internal-method-family ArrayExoticMethods)
+            (internal-method Get)
+            (internal-slot PrivateElements spec-list)
+            (internal-slot Prototype js-value)
+            (internal-slot Extensible boolean)
+            (slot-list Ordinary [Prototype Extensible])
+            (macro Initialize :params [(object dyn) (slots (slot-list))] :ret dyn
+              (let [(initialized (object-layout-init object slots))
+                    (prototype (internal-slot-store initialized Prototype null))
+                    (extensible (internal-slot-store prototype Extensible true))
+                    (exotic (object-method-family-set extensible ArrayExoticMethods))]
+                (if (object-method-family-is exotic ArrayExoticMethods)
+                    (if (object-method-is-ordinary exotic Get)
+                    (if (internal-slot-has exotic PrivateElements)
+                    (if (internal-slot-load exotic Extensible)
+                        (internal-slot-load exotic Prototype)
+                        undefined)
+                    undefined)
+                    undefined)
+                    undefined)))
+            (builtin Entry :params [(object dyn)] :ret dyn (Initialize object Ordinary))")
+         (let [(mut node) 0 (mut init) 0 (mut store) 0 (mut load) 0
+               (mut has) 0 (mut boolean-load) 0 (mut family) 0 (mut family-set) 0
+               (mut ordinary-method) 0]
+           (loop (if (>= (load node) (n-count)) (break)
+                   (do (if (not (n-dead? (load node)))
+                           (match (n-op (load node))
+                             (PropStoreKey [operation]
+                               (if (= operation 25) (set! init (+ (load init) 1))
+                                 (if (= operation 28) (set! store (+ (load store) 1))
+                                   (if (= operation 31)
+                                       (set! family-set (+ (load family-set) 1)) 0))))
+                             (PropLoadKey [operation]
+                               (if (= operation 26) (set! has (+ (load has) 1))
+                                 (if (= operation 27) (set! load (+ (load load) 1))
+                                   (if (= operation 29)
+                                       (set! boolean-load (+ (load boolean-load) 1))
+                                     (if (= operation 30)
+                                         (set! family (+ (load family) 1))
+                                       (if (= operation 32)
+                                           (set! ordinary-method (+ (load ordinary-method) 1)) 0))))))
+                             (_ 0)) 0)
+                       (set! node (+ (load node) 1)))))
+           (assert (= (load init) 1))
+           (assert (= (load store) 2))
+           (assert (= (load has) 1))
+           (assert (= (load load) 1))
+           (assert (= (load boolean-load) 1))
+           (assert (= (load family-set) 1))
+           (assert (= (load family) 1))
+           (assert (= (load ordinary-method) 1))))
+
 (deftest internal_builtin_record_parameters_flatten_into_the_declared_call_abi
          (fresh! 91512)
          (build!
@@ -1459,10 +1598,10 @@
 
 (deftest every_failure_code_has_a_distinct_name
          (let [(mut c) 0 (mut named) 0]
-           (loop (if (> (load c) JSL-ERR-BAD-RECORD-LIST) (break)
+           (loop (if (> (load c) JSL-ERR-BAD-INTERNAL-METHOD) (break)
                    (do
                      (assert (not (= (jsl-err-name (load c)) "<unknown jsl code>")))
                      (store! named (+ (load named) 1))
                      (store! c (+ (load c) 1))
                      0)))
-           (assert (= (load named) (+ JSL-ERR-BAD-RECORD-LIST 1)))))
+           (assert (= (load named) (+ JSL-ERR-BAD-INTERNAL-METHOD 1)))))

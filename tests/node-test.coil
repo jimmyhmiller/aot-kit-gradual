@@ -66,6 +66,23 @@
     (assert (= (n-fun-abi-result-type fun 0) (t-int)))
     (assert (= (n-fun-abi-return-type fun) (t-int)))))
 
+(deftest declared_parameter_representation_comes_from_the_physical_abi
+  (graph-reset! 91004)
+  (let [fun (n-fun-open! 0)
+        pbuf (primitive/alloc-stack (array i64 4))
+        params (cast (ptr i64) pbuf)]
+    (store! (index params 0) (t-dyn))
+    (store! (index params 1) (t-int))
+    (store! (index params 2) (t-str))
+    (store! (index params 3) (t-bool))
+    (n-fun-declare-abi! fun (slice-new [i64] params 4) (t-dyn))
+    ;; Receiver-aware calls may carry a dynamic parameter as a raw specialized object pointer, so
+    ;; the logical `dyn` declaration alone does not prove one physical representation.
+    (assert (= (n-rep-of (n-parm! fun 0) 8) REP-UNKNOWN))
+    (assert (= (n-rep-of (n-parm! fun 1) 8) REP-RAW-NUM))
+    (assert (= (n-rep-of (n-parm! fun 2) 8) REP-RAW-PTR))
+    (assert (= (n-rep-of (n-parm! fun 3) 8) REP-RAW-NUM))))
+
 (deftest declared_multi_result_calls_are_tuples_with_indexed_projections
   (graph-reset! 91003)
   (let [fun (n-fun-open! 0)
@@ -1005,6 +1022,22 @@
     (assert (= (n-ty b) (t-dyn)))
     (assert (= (n-ty u) (t-int)))
     (assert (= (g-leaked-count) 0))))
+
+(deftest integer_unbox_then_box_preserves_the_checked_tagged_word
+  (graph-reset! 1)
+  (let [tagged (n-new2 (Box 0) NO-NODE (mk-int 42))
+        checked (n-new2 (Cast (t-int)) (g-start) tagged)
+        raw (n-peephole (n-new2 (Unbox (t-int)) NO-NODE checked))
+        restored (n-box! raw)]
+    ;; The Cast remains the authority that proves the runtime tag. Only its inverse physical
+    ;; extraction/re-attachment pair disappears.
+    (assert (= restored checked))
+    (assert (not (n-dead? checked)))
+    (assert (= (count-live-op OPTAG-BOX) 1))
+    (assert (= (count-live-op OPTAG-UNBOX) 0))
+    (mk-ret restored)
+    (g-analyze!)
+    (assert (= (g-verify) 0))))
 
 (deftest typetest_folds_for_proof_and_stays_for_dynamic_input
   (graph-reset! 1)

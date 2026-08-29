@@ -246,6 +246,14 @@ export function renderIntrinsicCoil(manifest) {
     }
   }
   lines.push("    :else \"\"))",
+    "", "(defn fe-intrinsic-prototype-property-implementation [(symbol i64) (name (slice u8))] (-> (slice u8))", "  (cond");
+  for (const entry of entries) {
+    for (const property of entry.properties) {
+      if ((property.target ?? "constructor") !== "prototype") continue;
+      lines.push(`    (and (= symbol ${entry.constant}) (= name ${coilString(property.key)})) ${coilString(property.implementation)}`);
+    }
+  }
+  lines.push("    :else \"\"))",
     "", "(defn fe-intrinsic-initializer [(symbol i64)] (-> (slice u8))",
     "  (cond");
   for (const entry of entries) {
@@ -259,6 +267,15 @@ export function renderIntrinsicCoil(manifest) {
   for (const entry of entries) {
     for (const property of entry.properties) {
       if ((property.target ?? "constructor") !== "constructor" || property.kind !== "method") continue;
+      lines.push(`    (and (= symbol ${entry.constant}) (= name ${coilString(property.key)})) true`);
+    }
+  }
+  lines.push("    :else false))",
+    "", "(defn fe-intrinsic-prototype-property-callable? [(symbol i64) (name (slice u8))] (-> bool)",
+    "  (cond");
+  for (const entry of entries) {
+    for (const property of entry.properties) {
+      if ((property.target ?? "constructor") !== "prototype" || property.kind !== "method") continue;
       lines.push(`    (and (= symbol ${entry.constant}) (= name ${coilString(property.key)})) true`);
     }
   }

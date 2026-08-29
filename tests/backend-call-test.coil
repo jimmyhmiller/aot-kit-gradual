@@ -139,6 +139,69 @@
       (assert (= (be-call-return-kind (call-node site)) MLK-SCALAR))
       (assert (= (be-call-return-tag (call-node site)) JSV-INTEGER)))))
 
+;; Synthetic Script evaluation is a declared zero-parameter internal function. Its direct calls
+;; must use the same tagged result ABI as calls from ordinary parameterized functions; a caller's
+;; empty incoming ABI cannot make the callee appear to return its argument unchanged.
+(deftest zero_parameter_internal_caller_executes_a_tagged_direct_call_result
+  (graph-reset! 420)
+  (let [clobber (n-fun-open! 3)
+        clobber-param-types (primitive/alloc-stack (array i64 1))]
+    (store! (index clobber-param-types 0) (t-dyn))
+    (n-fun-declare-abi!
+      clobber
+      (slice-new [i64] (cast (ptr i64) (index clobber-param-types 0)) 1)
+      (t-int))
+    (n-parm! clobber 0)
+    (n-fun-close! clobber (n-new2 (Return) (n-fun-entry clobber) (cc 99)))
+  (let [callee (n-fun-open! 2)
+        callee-param-types (primitive/alloc-stack (array i64 1))
+        (mut boxed-return) NO-NODE]
+    (store! (index callee-param-types 0) (t-int))
+    (n-fun-declare-abi!
+      callee
+      (slice-new [i64] (cast (ptr i64) (index callee-param-types 0)) 1)
+      (t-dyn))
+    (n-fun-abi-set-can-throw! callee true)
+    (let [parameter (n-parm! callee 0)]
+      (set! boxed-return (n-box! parameter))
+      ;; Passing the value through another internal call makes the boxed word genuinely live
+      ;; across a call before it is returned; this is the preservation shape used by intrinsic
+      ;; construction, without importing the frontend or runtime.
+      (let [fails (n-peephole (n-new3 (Eq) NO-NODE parameter (cc 0)))
+            arms (n-if-arms! (n-peephole (n-new2 (If) (n-fun-entry callee) fails)))
+            site (n-call1! (arms-f arms) clobber (load boxed-return))
+            marked (n-peephole
+                     (n-new3 (JsBuiltin BE-EXCEPTION-RETURN-DESCRIPTOR)
+                             (arms-t arms) (load boxed-return) (cc 0)))]
+        (n-fun-close! callee
+          (n-new2 (Return) (call-end site) (load boxed-return)))
+        (n-fun-add-return! callee
+          (n-new2 (Return) (arms-t arms) marked))))
+    (let [caller (n-fun-open! 1)]
+      (n-fun-declare-abi!
+        caller (slice-new [i64] (cast (ptr i64) 0) 0) (t-dyn))
+      (let [inner (n-call1! (n-fun-entry caller) callee (cc 5))]
+        (n-fun-close! caller
+          (n-new2 (Return) (call-end inner) (call-value inner))))
+      (let [outer (n-call! (g-start) caller (slice-new [i64] (cast (ptr i64) 0) 0))
+            answer (n-unbox! (call-value outer) (t-int))]
+        (n-add-def! (g-stop) (n-new2 (Return) (call-end outer) answer))))
+    (g-analyze!)
+    (assert (= (g-verify) 0))
+    (assert (be-select-machine-program!))
+    (assert (>= (be-schedule!) 0))
+    (assert (>= (be-color! 10) 0))
+    ;; The real synthetic-Script caller keeps intrinsic constructor identities in spill slots.
+    ;; Exercise the same return path in this bounded witness so encoding cannot be validated only
+    ;; for the easy register-resident form.
+    (let [owner (mu-find-function callee)
+          vreg (ms-vget owner (load boxed-return))]
+      (assert (>= owner 0))
+      (assert (>= vreg 0))
+      (be-force-spill-vreg! vreg 0))
+    (assert (host-native-encode-checked!))
+    (assert (= (native0) 5)))))
+
 (deftest call_return_discovery_does_not_alias_function_indices_above_the_target_mask
   (graph-reset! 421)
   (let [callee (n-fun-open! 0)

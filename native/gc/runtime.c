@@ -13,6 +13,7 @@
 #include <unistd.h>
 #endif
 #include "js-value.h"
+#include "generated-object-layouts.h"
 
 #ifdef __APPLE__
 extern const uint8_t aot_text_start[] __asm("section$start$__TEXT$__text") __attribute__((weak_import));
@@ -119,6 +120,7 @@ static void aot_maybe_install_native_crash_trace(void) {
   action.sa_flags = SA_SIGINFO;
   sigemptyset(&action.sa_mask);
   sigaction(SIGILL, &action, NULL);
+  sigaction(SIGTRAP, &action, NULL);
   sigaction(SIGSEGV, &action, NULL);
   sigaction(SIGBUS, &action, NULL);
   sigaction(SIGABRT, &action, NULL);
@@ -213,6 +215,9 @@ typedef struct {
   int internal_kind;
   AotJsValue internal_target;
   int64_t internal_index;
+  uint16_t layout_id;
+  uint16_t method_family_id;
+  AotJsValue *layout_slots;
 } JsObjectRec;
 typedef struct {
   uintptr_t owner;
@@ -362,8 +367,9 @@ static JsObjectRec *js_object(uintptr_t owner, int create) {
                        js_objects_len + 1, sizeof(*js_objects))) return NULL;
   int state = side_index_reserve(&js_object_index, js_objects_len + 1);
   if (!state) return NULL;
-  js_objects[js_objects_len] =
-      (JsObjectRec){owner, 0, AOT_JS_NULL, 0, 1, -1, AOT_JS_UNDEFINED, 0};
+  js_objects[js_objects_len] = (JsObjectRec){
+      .owner = owner, .prototype_value = AOT_JS_NULL, .extensible = 1,
+      .internal_kind = -1, .internal_target = AOT_JS_UNDEFINED};
   ++js_objects_len;
   if (state == 2) {
     if (!js_object_index_rebuild()) return NULL;
@@ -371,6 +377,19 @@ static JsObjectRec *js_object(uintptr_t owner, int create) {
     side_index_put(&js_object_index, owner >> 3, (uint32_t)js_objects_len);
   }
   return &js_objects[js_objects_len - 1];
+}
+
+static const AotObjectLayoutDesc *js_layout(uint64_t id) {
+  if (!id || id > aot_object_layout_count) return NULL;
+  const AotObjectLayoutDesc *layout = &aot_object_layouts[id - 1];
+  return layout->id == id ? layout : NULL;
+}
+
+static int js_layout_slot(const AotObjectLayoutDesc *layout, uint64_t slot_id) {
+  if (!layout || !slot_id) return -1;
+  for (uint16_t i = 0; i < layout->slot_count; ++i)
+    if (layout->slot_ids[i] == slot_id) return (int)i;
+  return -1;
 }
 
 /* A property receiver can be either a raw String value or the distinct Object allocated by
@@ -670,6 +689,11 @@ static AotJsValue js_builtin_bits(double number) {
 }
 
 AotJsValue aot_js_builtin(AotJsValue a, AotJsValue b, uint64_t operation) {
+  if (getenv("AOT_TRACE_INTRINSIC"))
+    fprintf(stderr,
+            "intrinsic builtin operation=%" PRIu64 " a=0x%016" PRIx64
+            " b=0x%016" PRIx64 "\n",
+            operation, (uint64_t)a, (uint64_t)b);
   if (operation == 20)
     return AOT_JS_FUNCTION | (UINT64_C(0x10000) + (a & UINT64_C(0xff)));
   if (operation == 21) {
@@ -1656,8 +1680,11 @@ static void js_throw_frozen_mutation(void) {
 static size_t js_own_key_count(uintptr_t owner) {
   size_t count = 0;
   JsArrayRec *array = js_array(owner, 0);
-  if (array)
+  if (array) {
     for (size_t i = 0; i < array->length; ++i) count += array->present[i] != 0;
+    /* Array [[OwnPropertyKeys]] includes its non-enumerable own "length" property. */
+    ++count;
+  }
   for (size_t i = 0; i < js_properties_len; ++i)
     if (js_properties[i].owner == owner) ++count;
   return count;
@@ -1704,6 +1731,13 @@ static AotJsValue js_own_key_at(uintptr_t owner, size_t ordinal) {
     return AOT_JS_UNDEFINED;
   }
   ordinal -= numeric_count;
+  if (array) {
+    if (!ordinal) {
+      JsStringRec *length_key = js_string_ascii("length");
+      return length_key ? (AOT_JS_STRING | (uintptr_t)length_key) : AOT_JS_UNDEFINED;
+    }
+    --ordinal;
+  }
   for (size_t i = 0; i < js_properties_len; ++i) {
     int64_t ignored = 0;
     if (js_properties[i].owner != owner ||
@@ -1727,11 +1761,27 @@ AotJsValue aot_js_property(uintptr_t owner, uint64_t name,
   int receiver_is_string_object = receiver_object && receiver_object->internal_kind == 102;
   JsStringRec *receiver_string = js_string_property_data(owner);
   if (receiver_string) {
-    if (operation == 6) return (AotJsValue)receiver_string->length;
+    /* String exotic own keys are the virtual character indices, then the non-enumerable
+       virtual "length" property, then ordinary named properties in creation order.  Keep this
+       primitive representation-only: JSL chooses the internal-method family and snapshots the
+       returned ordinal view into a specification List surrogate. */
+    if (operation == 6)
+      return (AotJsValue)(receiver_string->length + js_own_key_count(owner) +
+                          (receiver_is_string_object ? 0 : 1));
     if (operation == 7) {
-      if ((int64_t)name < 0 || (size_t)name >= receiver_string->length) return AOT_JS_UNDEFINED;
-      AotJsValue raw = aot_js_string((uintptr_t)(int64_t)name, 0, 0, AOT_JS_STRING_FROM_INT);
-      return js_box_string_key(raw);
+      if ((int64_t)name < 0) return AOT_JS_UNDEFINED;
+      size_t ordinal = (size_t)name;
+      if (ordinal < receiver_string->length) {
+        AotJsValue raw = aot_js_string((uintptr_t)(int64_t)ordinal, 0, 0,
+                                       AOT_JS_STRING_FROM_INT);
+        return js_box_string_key(raw);
+      }
+      ordinal -= receiver_string->length;
+      if (!receiver_is_string_object && !ordinal) {
+        JsStringRec *length_key = js_string_ascii("length");
+        return length_key ? (AOT_JS_STRING | (uintptr_t)length_key) : AOT_JS_UNDEFINED;
+      }
+      return js_own_key_at(owner, ordinal - (receiver_is_string_object ? 0 : 1));
     }
     if (!receiver_is_string_object && operation == 14) {
       if (js_property_key_ascii_equal((AotJsValue)name, "length")) return 0;
@@ -1757,6 +1807,62 @@ AotJsValue aot_js_property(uintptr_t owner, uint64_t name,
       aot_js_tag((AotJsValue)owner) == AOT_JS_FUNCTION)
     owner = aot_js_payload((AotJsValue)owner);
   if (!owner) return AOT_JS_UNDEFINED;
+  /* Generated object-layout ABI. Layout and slot ids come from the manifest-generated header;
+     handwritten JSL names descriptors and slots, and lowering resolves those names to ids. */
+  if (operation == 25) {
+    const AotObjectLayoutDesc *layout = js_layout(name);
+    JsObjectRec *object = js_object(owner, 1);
+    if (!layout || !object || object->layout_id) return AOT_JS_UNDEFINED;
+    object->layout_slots = calloc(layout->slot_count, sizeof(*object->layout_slots));
+    if (!object->layout_slots) return AOT_JS_UNDEFINED;
+    object->layout_id = layout->id;
+    object->method_family_id = layout->method_family_id;
+    for (uint16_t i = 0; i < layout->slot_count; ++i)
+      object->layout_slots[i] = layout->storage[i] == AOT_SLOT_BOOLEAN ? 0 : AOT_JS_UNDEFINED;
+    return (AotJsValue)owner;
+  }
+  if (operation == 30) {
+    JsObjectRec *object = js_object(owner, 0);
+    const AotObjectLayoutDesc *layout = object ? js_layout(object->layout_id) : NULL;
+    return layout && object->method_family_id == name;
+  }
+  if (operation == 31) {
+    JsObjectRec *object = js_object(owner, 0);
+    if (!object || !object->layout_id || !name || name > AOT_METHOD_FAMILY_COUNT)
+      return AOT_JS_UNDEFINED;
+    object->method_family_id = (uint16_t)name;
+    return (AotJsValue)owner;
+  }
+  if (operation == 32) {
+    JsObjectRec *object = js_object(owner, 0);
+    /* During migration, an object with no generated layout retains the ordinary compatibility
+       path. Once a family exists, absence/invalid identity is corruption rather than inheritance. */
+    if (!object || !object->layout_id) return 1;
+    if (!object->method_family_id || object->method_family_id > AOT_METHOD_FAMILY_COUNT ||
+        !name || name > AOT_INTERNAL_METHOD_COUNT) return 0;
+    uint64_t overrides = aot_method_family_override_masks[object->method_family_id - 1];
+    return (overrides & (UINT64_C(1) << (name - 1))) == 0;
+  }
+  if (operation >= 26 && operation <= 29) {
+    JsObjectRec *object = js_object(owner, 0);
+    const AotObjectLayoutDesc *layout = object ? js_layout(object->layout_id) : NULL;
+    int index = js_layout_slot(layout, name);
+    if (operation == 26) return index >= 0;
+    if (index < 0) {
+      fprintf(stderr, "uncaught JavaScript throw: missing generated internal slot id=%" PRIu64
+                      " owner=0x%" PRIxPTR "\n", name, owner);
+      exit(70);
+    }
+    if (operation == 27 || operation == 29) return object->layout_slots[index];
+    uint8_t storage = layout->storage[index];
+    AotJsValue stored = storage == AOT_SLOT_BOOLEAN ? value : js_canonical_stored_value(value);
+    if ((storage == AOT_SLOT_BOOLEAN && stored > 1) ||
+        (storage != AOT_SLOT_BOOLEAN && !aot_js_well_formed(stored))) return AOT_JS_UNDEFINED;
+    object->layout_slots[index] = stored;
+    if (storage != AOT_SLOT_BOOLEAN && aot_js_managed(stored))
+      js_write_barrier(owner, aot_js_payload(stored));
+    return (AotJsValue)owner;
+  }
   /* Generic internal-slot ABI. These slots are deliberately outside the property table. Operations
      9..13 initialize and access the array-iterator slots used by JSL; later Torque-style extern
      classes can share the same representation seam without exposing their state as JS properties. */
@@ -2092,7 +2198,10 @@ AotJsValue aot_js_property(uintptr_t owner, uint64_t name,
     }
     object->prototype = prototype;
     object->prototype_value = prototype ? js_canonical_stored_value(value) : AOT_JS_NULL;
-    js_write_barrier(owner, prototype);
+    /* A generated Prototype slot is the canonical traced edge once a layout exists. The legacy
+       field remains a lookup mirror during method-protocol migration, but must not create a second
+       remembered-set ownership path that could mask a missing generated-slot barrier. */
+    if (!object->layout_id) js_write_barrier(owner, prototype);
     return (AotJsValue)prototype;
   }
   return AOT_JS_UNDEFINED;
@@ -2394,6 +2503,21 @@ static int relocate_side_edges(int scan_old_side, int *next_remembered_dirty) {
           target >= (uintptr_t)to_start && target < (uintptr_t)(to_start + capacity))
         *next_remembered_dirty = 1;
     }
+    const AotObjectLayoutDesc *layout = js_layout(object->layout_id);
+    if (object->layout_id && (!layout || !object->layout_slots)) return 0;
+    if (layout) {
+      for (uint16_t slot = 0; slot < layout->slot_count; ++slot) {
+        if (layout->storage[slot] == AOT_SLOT_BOOLEAN) continue;
+        if (!relocate_boxed((uintptr_t *)&object->layout_slots[slot])) return 0;
+        if (aot_js_managed(object->layout_slots[slot])) {
+          uintptr_t target = aot_js_payload(object->layout_slots[slot]);
+          if (object->owner >= (uintptr_t)old_space &&
+              object->owner < (uintptr_t)(old_space + old_used) &&
+              target >= (uintptr_t)to_start && target < (uintptr_t)(to_start + capacity))
+            *next_remembered_dirty = 1;
+        }
+      }
+    }
   }
   for (size_t i = 0; i < js_properties_len; ++i) {
     JsPropertyRec *property = &js_properties[i];
@@ -2436,7 +2560,10 @@ static int relocate_side_edges(int scan_old_side, int *next_remembered_dirty) {
 static void discard_dead_side_records(void) {
   size_t out = 0;
   for (size_t i = 0; i < js_objects_len; ++i) {
-    if (!side_owner_live(&js_objects[i].owner)) continue;
+    if (!side_owner_live(&js_objects[i].owner)) {
+      free(js_objects[i].layout_slots);
+      continue;
+    }
     js_objects[out++] = js_objects[i];
   }
   js_objects_len = out;
@@ -2541,6 +2668,45 @@ static int verify_heap(void) {
       if (!young && !old) {
         fprintf(stderr, "object verify stale internal_target i=%zu ref=%p\n", i, (void *)ref);
         return 0;
+      }
+    }
+    const AotObjectLayoutDesc *layout = js_layout(js_objects[i].layout_id);
+    if (js_objects[i].layout_id && (!layout || !js_objects[i].layout_slots)) {
+      fprintf(stderr, "object verify malformed generated layout i=%zu id=%u\n", i,
+              js_objects[i].layout_id);
+      return 0;
+    }
+    if (layout && (!js_objects[i].method_family_id ||
+                   js_objects[i].method_family_id > AOT_METHOD_FAMILY_COUNT)) {
+      fprintf(stderr, "object verify malformed method family i=%zu id=%u\n", i,
+              js_objects[i].method_family_id);
+      return 0;
+    }
+    if (layout) for (uint16_t slot = 0; slot < layout->slot_count; ++slot) {
+      AotJsValue value = js_objects[i].layout_slots[slot];
+      if (layout->storage[slot] == AOT_SLOT_BOOLEAN) {
+        if (value > 1) {
+          fprintf(stderr, "object verify malformed boolean slot i=%zu slot=%u value=%llu\n",
+                  i, slot, (unsigned long long)value);
+          return 0;
+        }
+        continue;
+      }
+      if (!aot_js_well_formed(value)) {
+        fprintf(stderr, "object verify malformed boxed slot i=%zu slot=%u value=%llx\n",
+                i, slot, (unsigned long long)value);
+        return 0;
+      }
+      if (aot_js_managed(value)) {
+        uintptr_t ref = aot_js_payload(value);
+        int young = ref >= (uintptr_t)spaces[active_space] &&
+                    ref < (uintptr_t)(spaces[active_space] + used);
+        int old = ref >= (uintptr_t)old_space && ref < (uintptr_t)(old_space + old_used);
+        if (!young && !old) {
+          fprintf(stderr, "object verify stale generated slot i=%zu slot=%u ref=%p\n",
+                  i, slot, (void *)ref);
+          return 0;
+        }
       }
     }
   }
@@ -2775,6 +2941,7 @@ int aot_gc_configure(size_t bytes, int stress) {
   for (size_t i = 0; i < js_arrays_len; ++i) {
     free(js_arrays[i].elements);
   }
+  for (size_t i = 0; i < js_objects_len; ++i) free(js_objects[i].layout_slots);
   for (size_t i = 0; i < js_strings_len; ++i) {
     free(js_strings[i]->units); free(js_strings[i]);
   }

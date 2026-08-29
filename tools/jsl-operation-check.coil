@@ -38,13 +38,13 @@
         entry (n-fun-entry fun)
         ctrl (primitive/alloc-stack (array i64 1))
         mem (primitive/alloc-stack (array i64 1))
-        argv (primitive/alloc-stack (array i64 10))
         cp (cast (ptr i64) ctrl)
         mp (cast (ptr i64) mem)
-        ap (cast (ptr i64) argv)
         declared (jsl-decl-nparams d)
         n (- declared (if (jsl-decl-rest? d) 1 0))
         (mut types) (al-new [i64] (malloc-allocator))
+        (mut results) (al-new [i64] (malloc-allocator))
+        (mut arguments) (al-new [JslLoweredValue] (malloc-allocator))
         (mut i) 0]
     (if (!= required JSL-OK) (return-from :done required) 0)
     ;; Give the synthetic source caller the real JavaScript-call ABI so callback-bearing macros
@@ -52,11 +52,25 @@
     (al-push! [i64] (mut types) (t-dyn))
     (al-push! [i64] (mut types) (t-dyn))
     (al-push! [i64] (mut types) (t-int))
+    ;; The workbench's synthetic function has the declaration's real PHYSICAL ABI. Specification
+    ;; Records are logical arguments/results, but each leaf travels in an ordinary machine slot;
+    ;; using the old one-parameter/one-result shortcut made the checker itself the last scalar-only
+    ;; boundary in the JSL toolchain.
     (loop (if (>= (load i) n) (break)
-            (do (al-push! [i64] (mut types) (jsl-param-ty d (load i)))
+            (let [(mut slot) 0]
+              (loop (if (>= (load slot) (jsl-param-lowered-width d (load i))) (break)
+                        (do (al-push! [i64] (mut types)
+                                      (jsl-param-lowered-type d (load i) (load slot)))
+                            (set! slot (+ (load slot) 1)))))
+              (set! i (+ (load i) 1)))))
+    (set! i 0)
+    (loop (if (>= (load i) (jsl-decl-lowered-nresults d)) (break)
+            (do (al-push! [i64] (mut results) (jsl-decl-lowered-result-type d (load i)))
                 (set! i (+ (load i) 1)))))
-    (n-fun-declare-abi! fun (al-slice [i64] (load types)) (jsl-decl-ret d))
+    (n-fun-declare-abi-results! fun (al-slice [i64] (load types))
+                                (al-slice [i64] (load results)))
     (al-free! [i64] (mut types))
+    (al-free! [i64] (mut results))
     (n-parm! fun 0) (n-parm! fun 1) (n-parm! fun 2)
     (set! i 0)
     (store! (index cp 0) entry)
@@ -65,13 +79,19 @@
                 (n-new1 (Arg (t-mem-alias JS-PROPERTY-ALIAS (t-dyn))) entry)
                 NO-NODE))
     (loop (if (>= (load i) n) (break)
-            (do (store! (index ap (load i)) (n-parm! fun (+ (load i) 3)))
+            (do (al-push! [JslLoweredValue] (mut arguments)
+                          (jl-lowered-parameter! d (load i) fun 3))
                 (set! i (+ (load i) 1)))))
-    (let [value (jsl-inline! cp mp entry name (slice-new [i64] ap n))
-          ret (if (jsl-decl-uses-memory? d)
-                  (n-new3 (Return) (load (index cp 0)) value (load (index mp 0)))
-                  (n-new2 (Return) (load (index cp 0)) value))]
+    (let [value (jsl-inline-lowered! cp mp entry name
+                                     (al-slice [JslLoweredValue] (load arguments)))
+          (mut leaves) (al-new [i64] (malloc-allocator))]
+      (jl-flatten-lowered! (mut leaves) value)
+      (let [ret (n-return-values! (load (index cp 0)) (al-slice [i64] (load leaves))
+                                  (if (jsl-decl-uses-memory? d)
+                                      (load (index mp 0)) NO-NODE))]
       (n-fun-close! fun ret)
+      (al-free! [i64] (mut leaves)))
+      (al-free! [JslLoweredValue] (mut arguments))
       JSL-OK))))
 
 (defn main [(argc i32) (argv (ptr (ptr i8)))] (-> i64)

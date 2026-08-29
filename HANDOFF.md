@@ -1,3 +1,342 @@
+# 2026-08-29: DataView establishes pinned OrdinaryCreateFromConstructor layouts
+
+- `DataView` is now a real constructable intrinsic whose fixed-buffer algorithm, prototype
+  accessors, bounds checks, and `ArrayBuffer.isView` behavior live in `lib/data-view/core.jsl`.
+  Instances use the generated Torque-style layout for named `[[DataView]]`,
+  `[[ViewedArrayBuffer]]`, `[[ByteLength]]`, and `[[ByteOffset]]` slots; no new legacy
+  target/index/kind encoding was introduced.
+- The object-layout generator now distinguishes pinned `MakeBasicObject` inputs from pinned
+  `OrdinaryCreateFromConstructor` additional-slot shapes. A manifest row must name its creation
+  operation and match the exact ECMA-262 source shape, so DataView support extends rather than
+  weakens the provenance check.
+- The exact `RequireInternalSlot` cohort moves **8/10 → 10/10**: both DataView wrong-family
+  variants are newly passing and all eight ArrayBuffer/Symbol variants remain passing. Focused
+  graph checks and native differentials verify the constructor and all three accessors against
+  Node. Coverage moves four public algorithms from blocked to represented: one complete buffer
+  getter and three explicitly partial fixed-buffer algorithms.
+- The first parallel cohort attempt timed out all ten compiler workers; a serialized rerun proved
+  this was resource contention. It also reconfirmed the filed Coil C-dependency-cache defect:
+  Test262 initially linked a stale generated layout table until the exact cached `runtime.c`
+  object was moved aside and rebuilt. Accepted evidence is
+  `results/ecma262-require-internal-slot-after-data-view-layout-2026-08-29.jsonl`.
+- A separate compiler follow-up is recorded in the project pad: a DataView getter called with a
+  statically shaped object-literal wrong-brand receiver escapes a surrounding source `catch`,
+  while real non-DataView object receivers reject and catch correctly. No JSL brand rule was
+  weakened or specialized around that compiler path. The complete specification ledger gate and
+  bounded **86/86** compiler gate are green; the frontier remains honestly red only for
+  `for-await-has-no-bridge-kind.js`.
+
+# 2026-08-29: generated prototype routing unlocks all ThisSymbolValue variants
+
+- `spec/intrinsics.json` already distinguished constructor-owned and prototype-owned properties,
+  but the manifest generator emitted frontend routing only for `target: "constructor"` and silently
+  dropped every prototype route. Consequently `Symbol.prototype.valueOf` performed an ordinary
+  read before the lazily published method existed, stored `undefined` in the Script global, and
+  later trapped while dynamic dispatch correctly reported callable id zero.
+- The generator now emits exact prototype-property implementation and callable tables. The
+  frontend recognizes only the structural `%Intrinsic%.prototype` receiver, invokes the generated
+  publisher, and then performs ordinary `[[Get]]` on the evaluated receiver. That ordering keeps
+  descriptors and semantics in JSL, preserves an observable replacement receiver, and makes
+  accessors invoke their getter rather than exposing the generated getter closure.
+- The retained three-Script direct-memory witness is green. The complete `ThisSymbolValue` cohort
+  moves **0/6 → 6/6**, with all six exact variants `failed → passed` and no regressions. The shared
+  `RequireInternalSlot` cohort moves **4/10 → 8/10**; only the two DataView variants remain, both
+  failing honestly because the `DataView` global is not implemented.
+- Evidence is retained in
+  `results/ecma262-this-symbol-value-after-prototype-routing-2026-08-29.jsonl` and
+  `results/ecma262-require-internal-slot-after-prototype-routing-2026-08-29.jsonl`. The bounded
+  gate is **86/86 green**, the complete ledger gate is green, and the frontier remains honestly red
+  only for `for-await-has-no-bridge-kind.js`.
+
+# 2026-08-29: retained dispatch ABI restores the ArrayBuffer internal-slot baseline
+
+- Retained direct-memory stackmaps now serialize both halves of the signed dynamic-dispatch
+  return code. The linked-image writer had hardcoded the high half to zero, turning `-4` (the
+  "already boxed" convention) into the JavaScript payload `0x00000000fffffffc`. The exact pinned
+  Test262 ArrayBuffer harness now compiles, links, and executes successfully on the direct-memory
+  path, and the focused metadata test checks both halves of every linked function row.
+- The ten-variant `RequireInternalSlot` cohort is monotonic at **4 passed / 6 failed**: both
+  ArrayBuffer byte-length cases remain passing, both primitive/wrong-brand receiver cases newly
+  pass, and there are no pass-to-nonpass transitions. Evidence now points at
+  `results/ecma262-require-internal-slot-after-dispatch-sign-extension-2026-08-29.jsonl`.
+- The remaining Symbol variants exposed a distinct cross-Script retained-image defect. A reduced
+  three-record native witness shows the retained intrinsic initializer first publishing
+  `Symbol.prototype.valueOf` on builtin prototype kind 23 with callable id zero; a later fresh
+  initialization correctly uses kind 22 and callable id 174, but cannot replace the constructor's
+  already-published prototype. Callable relocation bytes themselves verify after linking, so the
+  active investigation is the retained constant/call ABI path, not `ThisSymbolValue` semantics.
+- Source closure environments now store semantic `CallableId` nodes rather than graph-local
+  function indexes, callable relocations can retain ideal function identity/ABI after inlining
+  removes a machine owner, and linked images reject zero as a current callable symbol. These are
+  reusable separate-compilation invariants; the new cross-Script Symbol witness remains red until
+  the retained kind-22-to-23 corruption is fixed. The bounded gate is **86/86 green**.
+
+# 2026-08-29: frontend lexical SSA ownership fixes repeated JSL-result compilation
+
+- Frontend `values[]` entries are compiler-side lexical owners, not graph def-use edges. A local
+  whose current use folded away could therefore retain the id of a collected Phi until a later
+  source statement tried to use it. Function-scoped lexical roots now retain inherited and newly
+  published values during graph construction and release every ownership count before whole-graph
+  analysis; binary-expression operands are likewise pinned across sibling evaluation.
+- The exact former abort now compiles and runs natively: two `Object.setPrototypeOf` result
+  comparisons separated by `Object.preventExtensions` return `main(7) == 7` and agree with Node.
+  A second focused witness proves ArrayBuffer byte lengths survive the compact SameValue harness
+  shape. Frontend graph tests, all focused prototype witnesses, and the bounded 86-test gate pass.
+- The ranked next operation remains `RequireInternalSlot` (201 downstream public algorithms, no
+  unfinished prerequisite). Its sequential ten-variant retained cohort exposed a mixed transition:
+  two wrong-brand exception variants newly pass, while two previously passing top-level
+  ArrayBuffer byte-length variants fail only in the larger multi-Script harness. The accepted
+  evidence remains the prior 2/10 file; no pass-regressing result was promoted.
+- `ecma262-test262 --compare` previously rewrote the retained evidence file before checking that
+  comparison. Evidence publication now occurs only when cohorts match and there is no
+  pass-to-nonpass transition, with a focused regression test. The larger-harness representation
+  mismatch remains the immediate compiler work before expanding the internal-slot identity
+  universe.
+
+# 2026-08-29: all eleven essential internal-method dispatch rows are active
+
+- `[[SetPrototypeOf]]` is the final activated row. `OrdinarySetPrototypeOf` implements same-value
+  success, extensibility rejection, ordinary-chain cycle detection, generated Prototype-slot
+  update, and the legacy lookup mirror update. Generated Proxy layouts refuse their unimplemented
+  override instead of silently inheriting ordinary behavior.
+- Construction now uses the separately named `InitializeObjectPrototype`; no constructor
+  accidentally applies observable mutation policy. `Object.setPrototypeOf` is a real JSL builtin,
+  has first-class callable publication, and the frontend contributes only static routing.
+- Focused native witnesses cover mutation/inherited lookup, null, cycle refusal, non-extensible
+  refusal, primitive preservation, and same-value success after preventing extensions. The
+  operation workbench verifies both `OrdinarySetPrototypeOf` and `ObjectSetPrototypeOf` against
+  Node.
+- Boxing a structurally Boolean `Not`/comparison now derives its tag from the IR operation contract,
+  not provisional TOP analysis. This fixes the `Box(Not ANY)` selection failure exposed by the new
+  refusal witnesses.
+- A separate graph-lifetime bug is recorded in the project pad: consuming `Object.setPrototypeOf`
+  results around an intervening `Object.preventExtensions` call can revisit a collected data Phi.
+  It cannot enter the current in-process frontier corpus because its compiler abort also aborts the
+  reporter before status generation. Checked `n-in` diagnostics now include node id, operation,
+  input count, and dead state instead of only the generic bounds message.
+
+# 2026-08-29: `[[OwnPropertyKeys]]` becomes the canonical enumeration boundary
+
+- Ten of eleven essential-method rows now have real JSL callers; only `SetPrototypeOf` remains
+  inactive. The generated method-family bitset selects ordinary versus String exotic key behavior,
+  and Proxy refuses by name instead of silently inheriting ordinary semantics.
+- `%OwnKeyCount` and `%OwnKeyAt` are now confined to `OrdinaryOwnPropertyKeys`, which snapshots the
+  representation view once. Object enumeration and copying, `DefineProperties`, JSON object
+  serialization, and Symbol registry lookup consume that canonical list.
+- The representation primitive now includes Array and String `length` keys in the correct position
+  and preserves later named properties. Generated Array/String native execution proves exact key
+  order (`indices`, `length`, then `extra`) and agrees with Node.
+- The JSL suite is 70/70 green and the complete specification ledger gate is green. Coverage moves
+  the ordinary `[[OwnPropertyKeys]]` clause from blocked to partial, retaining the exact Proxy
+  deviation rather than overstating completion.
+
+# 2026-08-29: `[[HasProperty]]`, `[[Set]]`, and `[[Delete]]` join generated dispatch
+
+- Nine of eleven essential-method rows now have real callers. `SetProperty`, `HasProperty`, and
+  `DeleteProperty` consult the same constant-time generated override bitset as `Get`; ordinary,
+  Array, and String families inherit those methods.
+- Generated mapped-arguments and Proxy families now refuse these unimplemented overrides instead
+  of silently using ordinary semantics. Objects not yet carrying a generated layout continue on
+  the migration compatibility path, which the runtime query treats as ordinary.
+- The Array/String native differential now writes named properties through `[[Set]]`, observes them
+  through both `[[Get]]` and `[[HasProperty]]`, deletes them, and proves absence afterward, in
+  addition to its layout/prototype/indexed-descriptor checks. It agrees with Node.
+- Only `SetPrototypeOf` and `OwnPropertyKeys` remain inactive in the eleven-method matrix.
+
+# 2026-08-29: `[[Get]]` activates through one typed method-bitset query
+
+- `Get` is the sixth active essential-method row. Generated Array, String, and ordinary layouts
+  enter the inherited ordinary method; generated mapped-arguments and Proxy layouts refuse instead
+  of silently running an implementation their matrix says they override. Unmigrated object families
+  retain the ordinary compatibility path until they gain generated layouts.
+- JSL now has a distinct `(internal-method Name)` namespace and the checked
+  `object-method-is-ordinary` form. This separation is required because `[[IsExtensible]]` and the
+  `IsExtensible` abstract operation legitimately share a spelling.
+- The generator emits a 64-bit override mask per family. One runtime query replaces nested
+  family-comparison expansion at every dispatch site. The first nested implementation increased the
+  focused Array/String witness from **96,311** to **110,775** frontend nodes; folding layout
+  compatibility into the constant-time bitset query brought it back to **97,056**, while retaining
+  exact family behavior.
+- Focused checker/lowering, native method-bitset, forced-GC, and Array/String differentials pass.
+  The remaining inactive rows are `SetPrototypeOf`, `HasProperty`, `Set`, `Delete`, and
+  `OwnPropertyKeys`.
+
+# 2026-08-29: the essential-method inheritance matrix is generated and incrementally activated
+
+- `spec/object-layouts.json` now records all eleven essential internal methods and the exact
+  override set for ordinary, Array, mapped arguments, String, and Proxy families. Array overrides
+  only `[[DefineOwnProperty]]`; String overrides `[[GetOwnProperty]]`,
+  `[[DefineOwnProperty]]`, and `[[OwnPropertyKeys]]`; mapped arguments override five property
+  methods; Proxy overrides all eleven.
+- The generator emits checked `UsesOrdinary*` JSL predicates from that matrix, so per-method
+  inheritance is no longer duplicated in handwritten code. Prototype lookup, extensibility,
+  prevention of extensions, own-property lookup, and property definition use the first five active
+  rows.
+- The first generator version emitted all eleven predicates. The DSL ownership gate rejected the
+  six rows with no callers. The proper model now separates the complete checked matrix from
+  `activeDispatchMethods`; executable JSL is emitted only when a dispatch path consumes it. This
+  keeps future debt visible without weakening the no-dead-definition invariant.
+- Array, mapped-arguments, and Proxy property overrides that lack implementations remain explicit
+  compatibility branches after the matrix says “not ordinary”; they are not mislabeled as ordinary
+  inheritance. Each can now be replaced independently and its row already exists.
+
+# 2026-08-29: Array and String construction adopt generated layouts and per-method inheritance
+
+- `InitializeArray` now installs `OrdinaryObjectBase`, initializes named `[[Extensible]]` and
+  `[[Prototype]]`, and transitions to `ArrayExoticMethods`. `NewStringObject` installs
+  `StringExoticBase`, stores named `[[StringData]]`, and transitions to `StringExoticMethods`.
+- The old Array tag and String `internal_target` remain representation mirrors for consumers not
+  yet migrated; they no longer stand alone as the object-model declaration. String exotic indexed
+  lookup now reads the generated `[[StringData]]` slot whenever the generated family is installed.
+- A first attempt treated family identity as an all-or-nothing vtable and the native witness caught
+  the error: String's family overrides selected property methods but inherits ordinary
+  `[[GetPrototypeOf]]` and extensibility methods. `UsesOrdinaryPrototypeMethods` now expresses that
+  per-method inheritance for ordinary, Array, mapped-arguments, and String families; Proxy remains
+  outside it because Proxy overrides the trio.
+- The focused native witness covers Array and String prototypes, extensibility, dense Array access,
+  String indexed descriptor value, and exact descriptor attributes in one compiled program. It
+  agrees with Node. The next step is to generate this per-method matrix from the manifest and route
+  the remaining essential methods through it.
+
+# 2026-08-29: internal-method families become typed JSL/runtime identities
+
+- `(internal-method-family Name)` is now a checked top-level JSL declaration. Generated family
+  order is part of immutable library identity, and malformed, unknown, or namespace-colliding names
+  have the dedicated `JSL-ERR-BAD-METHOD-FAMILY`/`JSL-ERR-DUP-NAME` refusals.
+- `object-method-family-is` and `object-method-family-set` lower named families to generic runtime
+  operations; handwritten JSL never embeds a manifest ID. The object-layout generator publishes
+  matching C identities for ordinary, Array, mapped-arguments, String, and Proxy method families.
+- Each object begins with its layout's ordinary family, matching MakeBasicObject step 5. Exotic
+  constructors can then install a generated family, matching the spec's subsequent method override
+  steps. Heap verification rejects missing or out-of-range family identities.
+- The graph witness checks exact query/transition operations. The native GC witness transitions an
+  object to `ArrayExoticMethods`, forces collection, and verifies the installed family and traced
+  slot afterward. Ordinary `Object.getPrototypeOf` and `IsExtensible` now enter through the family
+  seam and still agree with Node.
+- The bounded gate remains green at **86/86**, the ledger/generator gate is green, and the frontier
+  remains honestly red at **0/1**. The internal-method capability is **partial**: operation-table
+  generation and the complete ordinary/exotic dispatch matrix remain before canonical
+  `MakeBasicObject` can be claimed.
+
+# 2026-08-29: generated object layouts now own generic traced runtime slots
+
+- The object-layout manifest now generates one runtime descriptor containing stable layout, slot,
+  storage-kind, and internal-method-family identities. This closes the earlier split where method
+  family identity existed in JSON but disappeared at the runtime boundary.
+- JSL declares named internal slots and lowers layout initialization, presence, load, and store to
+  one generic ABI. `Object()` is the first product migration: `[[Prototype]]` and `[[Extensible]]`
+  use generated storage while the prototype lookup field remains an explicitly documented mirror
+  until internal-method dispatch lands.
+- Generated value slots are traced by the collector, invoke the existing write barrier, relocate in
+  the side-table fixed point, retain old-to-young remembered edges, are reclaimed with dead weak
+  owners, and are checked by heap verification. A forced 4 KiB collection returns a field from an
+  object reachable only through a generated slot, proving the edge is strong and relocatable.
+- Focused generator, lowering, native Object, and GC witnesses pass. The full bounded gate is green
+  at **86/86** and the frontier remains honestly red at **0/1** for the known `for await` bridge-kind
+  refusal. `capability:runtime-object-layout-contract` is now **partial**, not complete: the next
+  tranche must consume the generated method-family identity and then implement canonical
+  `MakeBasicObject`.
+
+# 2026-08-29: internal-slot Lists are real zero-width JSL values
+
+- JSL now supports named `(slot-list Name [...])` declarations and macro-only `(slot-list)`
+  parameters. These values are compiler descriptors, not ECMAScript Arrays: lowering assigns them
+  an explicit zero-width logical value kind and never emits a graph node or runtime ABI slot.
+- Descriptors retain identity through macro substitution, sequential `let`, equality-only branch
+  joins, and loop/recur. The focused loop witness proves only its scalar induction variable gets a
+  Phi. A dedicated sentinel separates an as-yet-unspecialized macro parameter from an unbound
+  value; conflating those states was found and fixed during the witness.
+- Runtime crossings are rejected by `JSL-ERR-SLOT-LIST-ESCAPE`; malformed or identity-changing
+  declarations/recur paths use `JSL-ERR-BAD-SLOT-LIST`. Slot-list declarations and parameter shape
+  are included in immutable JSL library identity despite contributing zero physical slots.
+- `tools/object-layouts.mjs` now emits `lib/generated/object-layouts.jsl` from the same validated
+  manifest as `spec/generated/object-layouts.json`. The shipped library therefore contains exactly
+  the four slot Lists extracted from the pinned MakeBasicObject call sites, and the ledger gate
+  checks both generated artifacts for drift.
+
+# 2026-08-29: MakeBasicObject now has a pinned Torque-style layout contract
+
+- `docs/TORQUE-STYLE-OBJECT-LAYOUTS.md` defines the full, non-compatibility target for
+  `MakeBasicObject`: compile-away slot Lists, declarative layouts, generic traced slot storage,
+  generated internal-method families, canonical JSL semantics, and deletion of the current
+  `internal_kind/target/index` tuple after migration.
+- The coverage graph no longer reports `MakeBasicObject` as generically transcription-ready. Its
+  exact classification now names both `capability:runtime-object-layout-contract` and
+  `capability:jsl-internal-method-protocol`; it still retains its measured reach of **142 public
+  algorithms** without pretending the current `%NewObject` subset is complete.
+- `spec/object-layouts.json` is the first executable stage of that contract. It declares seven
+  named slots, the ordinary internal-method family, and the four concrete slot Lists passed to
+  `MakeBasicObject` by the pinned spec. `tools/object-layouts.mjs` verifies the pinned source digest,
+  extracts those call shapes directly from `spec.html`, appends mandatory `PrivateElements`, and
+  emits deterministic IDs and SHA-256 layout fingerprints.
+- The generator rejects unknown/duplicate slots, caller-supplied `PrivateElements`, invalid storage
+  tracing, unknown method families, and manifest/spec call-shape drift. Its four focused tests and
+  generated-output check are part of `spec:ledger:gate`, which is green.
+
+# 2026-08-29: SymbolDescriptiveString closes a concrete dependency and note references stop inventing cycles
+
+- `lib/symbol/core.jsl` now contains the canonical complete `SymbolDescriptiveString` operation,
+  and `Symbol.prototype.toString` delegates to it after `ThisSymbolValue` validates and unwraps the
+  receiver. The focused native differential covers present, absent, and explicitly `undefined`
+  descriptions plus primitive and wrapped receivers, and agrees with Node.
+- The two-file mapped Test262 cohort is retained as **0 passed / 4 failed** rather than hidden.
+  `String(Symbol(...))` still exposes the broader partial `ToString` consumer; the isolated
+  descriptive-string branches are independently executable and verified.
+- The ledger extractor no longer treats operation references inside informative `emu-note`
+  elements as normative prerequisites. That bug made MakeBasicObject's prose mention of consumers
+  point back to ArrayCreate and BoundFunctionCreate, inventing a three-operation dependency cycle.
+  A fixture regression proves note references are excluded while algorithm references remain.
+- Regeneration removed **49 false specification-operation edges**, reduced incomplete recursive
+  components from **91 to 89**, and increased concrete-ready work units from **1,319 to 1,325**.
+  `MakeBasicObject` is now correctly a standalone ready prerequisite with **142 transitive public
+  algorithms**; `ArrayCreate` correctly depends on it in one direction.
+
+# 2026-08-29: spilled call-result snapshots unlock generated Number descriptors
+
+- AArch64 no longer applies its generic destination spill epilogue to `MI-CALL-RESULT`. The call's
+  parallel ABI capture is the sole definition of that snapshot; when allocation spilled the
+  zero-byte marker, the old epilogue overwrote the captured `x0` value with stale scratch `x14`.
+  This was allocation-sensitive: the exact program failed through 18 colors and passed at 19.
+- `tagged_external_result_survives_an_internal_function_return` now forces every
+  `MI-CALL-RESULT` marker into a high spill and executes the result. The exact synthetic Script
+  witness and the generated `Number.EPSILON` descriptor program both compile and agree with Node
+  at the required 10-color allocation.
+- The earlier constructor optimization remains semantic rather than structural: Error creation
+  reads the Realm-stable `%ErrorConstructor` identity directly and does not replay public
+  constructor-property publication at every possible throw site. The redundant private wrapper
+  was removed because the DSL ownership gate correctly rejected an entirely expanded dead
+  declaration.
+- The bounded gate is green at **83/83**. The Number descriptor frontier case turned green without
+  a test edit, was pinned in `tests/native-execution-test.coil`, and its open repro was removed.
+  The generated frontier is now honestly red at **0/1**: only
+  `for-await-has-no-bridge-kind.js` remains refused. `docs/WHAT-WORKS.md` now derives **120** native
+  whole-program comparisons.
+- Regenerated retained coverage records two additional mapped Test262 passes: **137 passed / 409
+  failed / 1 refused** across the current 547 mapped variants, with no pass-to-nonpass transition.
+
+# 2026-08-29: first RequireInternalSlot tranche moves retained Test262 from 0/10 to 2/10
+
+- The AArch64 `MI-CBZ` encoder now takes its PC from the emitted code length after any operand
+  reload. Large spills can require a multi-word stack-address sequence, so reconstructing that PC
+  from the old one-word assumption could branch into the middle of a load. A native ArrayBuffer
+  accessor-descriptor regression exercises the complete wide graph and agrees with Node.
+- Large caller-owned result-pointer setup now uses the same checked stack access helpers and word
+  model as every other AArch64 frame access. Mach-O safepoint placement consumes that shared model
+  instead of duplicating fixed instruction counts.
+- Function-text snapshotting reused the exhausted ABI-result loop index when copying code bytes.
+  A one-result function consequently lost its first byte while retaining its original advertised
+  length, shifting every later archive boundary. The byte loop now starts at zero and asserts the
+  exact post-copy extent for every record.
+- Exact retained evidence is
+  `results/ecma262-require-internal-slot-after-archive-2026-08-29.jsonl`: the same ten variants have
+  two `failed -> passed` transitions and no pass-to-nonpass regression. Both strict and default
+  `ArrayBuffer.prototype.byteLength` success cases now pass; eight exception/harness/DataView
+  cases remain open. Coverage and dependency artifacts record **2/10**, so `RequireInternalSlot`
+  remains honestly partial.
+- The fast focused operation witness still compiles and executes natively. Minimal reductions show
+  successful Symbol-wrapper `[[SymbolData]]` extraction agrees with Node; remaining failures are
+  in exception transport/harness paths and the absent DataView family, not that success branch.
+
 # 2026-08-28: the ECMA-262 dependency graph exposes concrete work instead of umbrella blockers
 
 - `tools/ecma262-dependency-plan.mjs` now generates the complete fine-grained planning graph from
@@ -6308,3 +6647,57 @@ open bugs: `for-await-has-no-bridge-kind` and `shortest-round-trip-digits`.
   backend phases are microseconds. The remaining cold work is explicit: allocation constraint
   construction and independent verification each replay call liveness, and liveness verification
   remains about 0.43 s.
+# 2026-08-29: source calls preserve dynamic primitive receivers through the shared ABI
+
+- `src/frontend_native_graph.coil` no longer applies the obsolete object/function-only receiver
+  refusal to source calls. Source and JSL call lowering now enforce the same representation
+  boundary: a proven managed Object pointer may remain raw, while every other ECMAScript value is
+  tagged. Sloppy primitive boxing remains exclusively in JSL's `OrdinaryCallBindThisSloppy`.
+- Caller-side lowering no longer unboxes a dynamic `Function.prototype.call` `thisArg` merely
+  because the statically known callee declares an Object receiver. That declaration is not proof
+  about the supplied runtime value; wrong-brand Objects and primitives must reach the callee's JSL
+  brand check so `RequireInternalSlot` can throw the specified TypeError.
+- Focused native regressions prove strict String, Boolean, Number, and Symbol receiver identity and
+  all seven primitive receiver cases for the `ArrayBuffer.prototype.byteLength` accessor through a
+  callback/catch helper. The latter also proves the thrown object's canonical TypeError constructor
+  identity. Both compile, execute on the shipped AArch64 path, and agree with Node.
+- The retained RequireInternalSlot cohort remains honestly 2 passed / 8 failed with zero
+  regressions. The former `bridge kind 214` SIGABRT now reaches compilation and execution, exposing
+  a separate full-Test262-harness large-graph defect: at roughly 488k frontend nodes an error
+  constructor result is observed as raw kind `5`; the Symbol cases still trap at roughly 396k
+  nodes. Compact 218k-node semantic witnesses pass, so no additional JSL semantic claim is made.
+  Evidence is `results/ecma262-require-internal-slot-after-receiver-2026-08-29.jsonl` and
+  `spec/evidence/require-internal-slot-test262.json`.
+- A second reduction reproduced Test262's complete `assert.throws` control shape at 237k frontend
+  nodes. Its `typeof thrown !== "object" || thrown === null` predicate was true even though each
+  comparison was false independently: JSL comparison calls return across the tagged ABI, while
+  frontend inference incorrectly treated the result as an already-raw Boolean when control read
+  it. All source control and logical short-circuit decisions now delegate through canonical JSL
+  `ToBoolean`; `&&`/`||` still return the original operand as required. The exact native reduction
+  now agrees with Node. The subsequent retained cohort
+  (`results/ecma262-require-internal-slot-after-to-boolean-2026-08-29.jsonl`) remains 2/10 with
+  eight failed-to-failed transitions, proving another unrelated-harness-sensitive defect remains.
+# 2026-08-29: integer DataView access unlocks twelve public algorithms
+
+- `GetValueFromBuffer`, `SetValueInBuffer`, `GetViewValue`, and `SetViewValue` now compose the
+  fixed, non-shared integer path directly from the ECMA-262 algorithms. Six public getters and six
+  setters cover Int8, Uint8, Int16, Uint16, Int32, and Uint32 with canonical byte storage, signed
+  two's-complement interpretation, both endian orders, conversion-before-bounds ordering, and
+  generated intrinsic method descriptors. Float, BigInt, shared, resizable, growable, and detached
+  behavior remains explicitly partial rather than approximated.
+- The focused operation checker now accepts specification-Record arguments and results through the
+  same flattened logical ABI used by JSL lowering. All seven DataView record/buffer/view operations
+  verify independently; the full integer native differential agrees with Node.
+- Dynamic JavaScript calls now pad against JSL `callable` formals as well as source FeFunctions.
+  Previously an omitted `littleEndian` argument to a generated DataView method read an
+  uninitialized register and became truthy. The actual source argc remains unchanged while every
+  potentially read formal slot receives the canonical JSL `undefined` value.
+- A larger Test262 harness exposed `Box(Unbox<int>(tagged))` as two inverse floating conversions
+  whose placement became impossible. The integer-tag round trip now canonicalizes to the original
+  checked tagged word while retaining its upstream Cast. The exact Uint8 return-value file moves
+  from one refused variant to **2/2 passing**. The broader six-file cohort is not retained yet: the
+  Int16 default variant timed out at 120 seconds, so performance remains work rather than evidence.
+- Coverage moves **blocked 2465 → 2449** and **partial 64 → 80**. Public closure coverage moves
+  **10 → 22 partial**, with blocked public algorithms falling **516 → 504**. The complete ledger
+  gate and bounded **86/86** compiler gate are green; the frontier remains honestly red only for
+  `for-await-has-no-bridge-kind.js`.

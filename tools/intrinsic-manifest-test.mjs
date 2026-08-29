@@ -36,7 +36,7 @@ test("the support report is deterministic and counts only migrated property publ
   assert.equal(report.summary.intrinsicIdentities, manifest.intrinsics.length);
   assert.equal(report.summary.globalBindings,
     manifest.intrinsics.reduce((sum, entry) => sum + entry.globals.length, 0));
-  assert.equal(report.summary.publishedProperties, 37);
+  assert.equal(report.summary.publishedProperties, 49);
   assert.equal(report.entries.find(entry => entry.id === "%TypeError%").owner, "composite");
   assert.equal(report.entries.find(entry => entry.id === "%TypeError%").loweringFamily, "error");
   assert.equal(report.entries.find(entry => entry.id === "%TypeError%").runtimeKind, 5);
@@ -72,7 +72,9 @@ test("method roots generate callable metadata, exact descriptors, and frontend r
 });
 
 test("prototype methods and accessors generate against the prototype target", () => {
-  const generated = renderIntrinsicPublicationJsl(loadIntrinsicManifest());
+  const manifest = loadIntrinsicManifest();
+  const generated = renderIntrinsicPublicationJsl(manifest);
+  const compiler = renderIntrinsicCoil(manifest);
   assert.match(generated, /\(builtin SymbolPrototypeValueOfValue :transitioning true/);
   assert.match(generated, /\(prototype \(BuiltinPrototypeValue 22\)\)/);
   assert.match(generated, /\(closure SymbolValueOf0\)/);
@@ -80,6 +82,11 @@ test("prototype methods and accessors generate against the prototype target", ()
   assert.match(generated, /\(closure SymbolDescriptionGetter0\)/);
   assert.match(generated, /\(%DefinePropertySetter prototype key \(%Box undefined\)\)/);
   assert.match(generated, /\(%SetPropertyAttributes prototype key 12\)/);
+  assert.match(compiler,
+    /\(and \(= symbol FE-INTRINSIC-SYMBOL\) \(= name "valueOf"\)\) "SymbolPrototypeValueOfValue"/);
+  assert.match(compiler, /\(defn fe-intrinsic-prototype-property-callable\?/);
+  assert.match(compiler,
+    /\(and \(= symbol FE-INTRINSIC-SYMBOL\) \(= name "valueOf"\)\) true/);
 });
 
 test("data roots and well-known Symbol keys generate exact values and descriptors", () => {

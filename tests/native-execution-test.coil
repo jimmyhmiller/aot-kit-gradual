@@ -17,11 +17,29 @@
 ;; `js-source-prop` (deleted) asked node for the answer the same way. This file is those three
 ;; joined into one claim: OUR COMPILED PROGRAM AGREES WITH NODE.
 (import "nativeharness" :use *)
+(import "backend_function_text" :use [mfti-callable-relocs-valid?])
 (import "coil.assert" :use *)
 (import "coil.io" :use *)
 (import "coil.fmt" :use *)
 (import "coil.slice" :use *)
 (import "coil.alloc" :use * :as alloc)
+(import "coil.arraylist" :use *)
+(import "coil.primitive" :as primitive)
+(import "typescriptnative" :use [TS-SCRIPT-JS])
+(import "node" :use *)
+(import "ty" :use *)
+(import "shape" :use *)
+(import "verify" :use *)
+(import "jsvalue" :use *)
+(import "backend_select" :use *)
+(import "backend_core" :use *)
+(import "backend_cfg" :use *)
+(import "backend_schedule" :use *)
+(import "backend_liveness" :use *)
+(import "backend_allocate" :use *)
+(import "backend_aarch64" :use *)
+(import "backend_macho" :use *)
+(import "test262harness" :use [t262-read t262-append!])
 
 ;; THE THREE LEGS LIVE IN `tests/native_harness.coil` NOW. They moved when
 ;; `tests/native-differential-test.coil` began asking the same question of every method the frontend
@@ -40,6 +58,125 @@
 ;; returns something that is not 0 and not the argument.
 (deftest a_compiled_program_computes_arithmetic_on_the_cpu
   (assert (agrees-with-node? "function main(n: number): number { return (n * 3 + 7) | 0; }" 5)))
+
+;; `Object()` is the first product path migrated to the generated layout side table. The two
+;; queries and intervening write use named [[Extensible]] access, while stress-capable native
+;; runtime linkage exercises the same weak-owner/traced-slot machinery as every compiled program.
+(deftest generated_ordinary_object_layout_executes_named_slot_reads_and_writes
+  (assert (agrees-with-node?
+    "function main(n) {
+       const object = Object();
+       const before = Object.isExtensible(object);
+       const prototype = Object.getPrototypeOf(object) === Object.prototype;
+       Object.preventExtensions(object);
+       const after = Object.isExtensible(object);
+       return ((before ? 10 : 0) + (prototype ? 20 : 0) + (after ? 100 : 0) + n) | 0;
+     }" 7)))
+
+(deftest generated_array_and_string_families_execute_layout_dispatch
+  (assert (agrees-with-node? "function main(n) {
+    const array = [n, n + 1];
+    const string = Object('abc');
+    const index = Object.getOwnPropertyDescriptor(string, '1');
+    if (Object.getPrototypeOf(array) !== Array.prototype) return 101;
+    if (Object.getPrototypeOf(string) !== String.prototype) return 102;
+    if (!Object.isExtensible(array) || !Object.isExtensible(string)) return 103;
+    if (array[1] !== n + 1 || index.value !== 'b') return 104;
+    if (index.writable || !index.enumerable || index.configurable) return 105;
+    array.extra = n;
+    string.extra = n + 2;
+    if (!('extra' in array) || !('extra' in string)) return 106;
+    if (array.extra !== n || string.extra !== n + 2) return 107;
+    const arrayKeys = Object.getOwnPropertyNames(array);
+    const stringKeys = Object.getOwnPropertyNames(string);
+    if (arrayKeys.length !== 4 || arrayKeys[0] !== '0' || arrayKeys[1] !== '1' ||
+        arrayKeys[2] !== 'length' || arrayKeys[3] !== 'extra') return 109;
+    if (stringKeys.length !== 5) return 110;
+    if (stringKeys[0] !== '0') return 111;
+    if (stringKeys[1] !== '1') return 112;
+    if (stringKeys[2] !== '2') return 113;
+    if (stringKeys[3] !== 'length') return 114;
+    if (stringKeys[4] !== 'extra') return 115;
+    delete array.extra;
+    delete string.extra;
+    if ('extra' in array || 'extra' in string) return 108;
+    return n | 0;
+  }" 7)))
+
+;; `Object.setPrototypeOf` is the observable final row of the generated essential-method matrix.
+;; Construction uses a separate initializer; this path exercises ordinary same-value success,
+;; mutation, inherited lookup, cycle refusal, and non-extensible refusal on generated layouts.
+(deftest ordinary_set_prototype_of_minimal_native_boundary
+  (assert (agrees-with-node? "function main(n) {
+    const object = Object();
+    Object.setPrototypeOf(object, null);
+    return (Object.getPrototypeOf(object) === null ? n : 101) | 0;
+  }" 7)))
+
+(deftest ordinary_set_prototype_of_mutation_and_identity_run_natively
+  (assert (agrees-with-node? "function main(n) {
+    const base: any = {value: n};
+    const object: any = Object();
+    if (Object.setPrototypeOf(object, base) !== object || object.value !== n) return 101;
+    return n | 0;
+  }" 7)))
+
+(deftest ordinary_set_prototype_of_refuses_a_cycle_natively
+  (assert (agrees-with-node? "function main(n) {
+    const base: any = Object();
+    const object: any = Object();
+    Object.setPrototypeOf(object, base);
+    try { Object.setPrototypeOf(base, object); return 103; } catch (error) {}
+    return (Object.getPrototypeOf(base) === object ? 104 : n) | 0;
+  }" 7)))
+
+(deftest ordinary_set_prototype_of_refuses_non_extensible_mutation_natively
+  (assert (agrees-with-node? "function main(n) {
+    const base: any = Object();
+    const sealed: any = Object();
+    Object.preventExtensions(sealed);
+    try { Object.setPrototypeOf(sealed, base); return 103; } catch (error) {}
+    return (Object.getPrototypeOf(sealed) === base ? 104 : n) | 0;
+  }" 7)))
+
+(deftest object_set_prototype_of_preserves_a_primitive_natively
+  (assert (agrees-with-node? "function main(n) {
+    return (Object.setPrototypeOf(n, null) === n ? n : 105) | 0;
+  }" 7)))
+
+(deftest ordinary_set_prototype_of_same_value_succeeds_when_non_extensible
+  (assert (agrees-with-node? "function main(n) {
+    const object: any = Object();
+    const base: any = Object.getPrototypeOf(object);
+    Object.preventExtensions(object);
+    return (Object.setPrototypeOf(object, base) === object ? n : 102) | 0;
+  }" 7)))
+
+;; A frontend-held JSL builtin result is an SSA owner even before the enclosing comparison installs
+;; its graph use.  The second call must not collect the first call's result Phi merely because that
+;; id is temporarily present only in compiler storage.
+(deftest repeated_jsl_builtin_results_survive_intervening_graph_construction
+  (assert (agrees-with-node? "function main(n) {
+    const base: any = Object();
+    const object: any = Object();
+    if (Object.setPrototypeOf(object, base) !== object) return 101;
+    Object.preventExtensions(object);
+    if (Object.setPrototypeOf(object, base) !== object) return 102;
+    return n | 0;
+  }" 7)))
+
+(deftest arraybuffer_byte_length_survives_same_value_harness_shape
+  (assert (agrees-with-node? "function sameValue(a, b) {
+    if (a === b) return a !== 0 || 1 / a === 1 / b;
+    return a !== a && b !== b;
+  }
+  function main(n) {
+    const zero = new ArrayBuffer(0);
+    const sized = new ArrayBuffer(42);
+    if (!sameValue(zero.byteLength, 0)) return 101;
+    if (!sameValue(sized.byteLength, 42)) return 102;
+    return n | 0;
+  }" 7)))
 
 (deftest arguments_length_uses_the_actual_source_call_arity
   (assert (agrees-with-node? "function count(a, b) { return arguments.length | 0; }
@@ -255,6 +392,19 @@ function main(n) {
   function kind() { return typeof this; }
   if (kind.call(n) !== 'object') return 101;
   return n | 0;
+}" 7)))
+
+;; Source calls and JSL calls share one receiver ABI. Strict functions must observe each primitive
+;; itself, while sloppy binding remains responsible for wrapper allocation. String, Boolean and
+;; Symbol constants previously hit a stale source-only object/function refusal before the callee.
+(deftest function_call_preserves_every_represented_strict_primitive_receiver
+  (assert (agrees-with-node? "function main(n) {
+  function strictReceiver() { 'use strict'; return this; }
+  var symbol = Symbol('receiver');
+  return (strictReceiver.call('text') === 'text' &&
+          strictReceiver.call(true) === true &&
+          strictReceiver.call(n) === n &&
+          strictReceiver.call(symbol) === symbol ? n : 101) | 0;
 }" 7)))
 
 (deftest a_constructor_checked_throws_helper_runs_natively
@@ -1705,6 +1855,439 @@ function main(n) { return new Counter(n).read() | 0; }
   if (buffer.resizable || buffer.detached) return 2000;
   return buffer.byteLength + buffer.maxByteLength;
 }" 7)))
+
+;; DataView is the first buffer view whose specification state is carried wholly by a generated
+;; Torque-style layout rather than the legacy target/index/kind tuple. Exercise construction,
+;; offset and length bounds, the three prototype accessors, ArrayBuffer.isView, and brand refusal.
+(deftest data_view_constructor_accepts_a_fixed_array_buffer
+  (assert (agrees-with-node? "function main(n) {
+  new DataView(new ArrayBuffer(n));
+  return n;
+}" 7)))
+
+(deftest data_view_generated_slots_feed_the_prototype_accessors
+  (assert (agrees-with-node? "function main(n) {
+  const buffer = new ArrayBuffer(n + 5);
+  const view = new DataView(buffer, 2, n);
+  if (view.buffer !== buffer || view.byteOffset !== 2 || view.byteLength !== n) return 101;
+  return n;
+}" 7)))
+
+(deftest array_buffer_is_view_recognizes_generated_data_views
+  (assert (agrees-with-node? "function main(n) {
+  if (!ArrayBuffer.isView(new DataView(new ArrayBuffer(n)))) return 101;
+  return n | 0;
+}" 7)))
+
+(deftest data_view_accessors_reject_unbranded_receivers
+  (assert (agrees-with-node? "function main(n) {
+  const getter = Object.getOwnPropertyDescriptor(DataView.prototype, 'byteLength').get;
+  try { getter.call(new ArrayBuffer(n)); } catch (error) { return n | 0; }
+  return 101;
+}" 7)))
+
+(deftest data_view_constructor_checks_fixed_buffer_bounds
+  (assert (agrees-with-node? "function main(n) {
+  const buffer = new ArrayBuffer(n);
+  try { new DataView(buffer, n + 1); } catch (error) { if (error instanceof RangeError) return n | 0; }
+  return 101;
+}" 7)))
+
+(deftest data_view_fixed_length_foundation_uses_generated_specification_slots
+  (assert (agrees-with-node? "function main(n) {
+  const buffer = new ArrayBuffer(n + 5);
+  const view = new DataView(buffer, 2, n);
+  if (view.buffer !== buffer || view.byteOffset !== 2 || view.byteLength !== n) return 101;
+  if (!ArrayBuffer.isView(view)) return 102;
+  const getter = Object.getOwnPropertyDescriptor(DataView.prototype, 'byteLength').get;
+  let rejected = false;
+  try { getter.call(new ArrayBuffer(n)); } catch (error) { rejected = error instanceof TypeError; }
+  if (!rejected) return 103;
+  let bounded = false;
+  try { new DataView(buffer, n + 6); } catch (error) { bounded = error instanceof RangeError; }
+  if (!bounded) return 104;
+  return n | 0;
+}" 7)))
+
+;; Integer DataView access composes through Get/SetViewValue and Get/SetValueInBuffer. Omitted
+;; littleEndian is part of this witness because dynamically loaded JSL callables must receive a
+;; real `undefined` in every unread source-argument slot while preserving the actual argc channel.
+(deftest data_view_integer_access_uses_canonical_bytes_and_dynamic_omitted_arguments
+  (assert (agrees-with-node? "function main(n) {
+  const view = new DataView(new ArrayBuffer(7));
+  view.setUint16(0, 0x1234);
+  if (view.getUint8(0) !== 0x12 || view.getUint8(1) !== 0x34) return 101;
+  if (view.getUint16(0) !== 0x1234 || view.getUint16(0, true) !== 0x3412) return 102;
+  view.setInt8(2, -1);
+  if (view.getInt8(2) !== -1 || view.getUint8(2) !== 255) return 103;
+  view.setInt32(3, -2, true);
+  if (view.getInt32(3, true) !== -2 || view.getUint32(3, true) !== 4294967294) return 104;
+  return n | 0;
+}" 7)))
+
+;; Accessor descriptor materialization produces a wide lowered graph. Its getter field used to
+;; leave the branch predicate in a spill beyond AArch64's direct stack-offset range; the encoder
+;; then calculated CBZ from a one-word reload even though the checked reload occupied three words,
+;; jumping into the middle of a later stack access. Keep the complete observable operation as the
+;; regression: this exercises descriptor publication, getter extraction, the indirect call, and
+;; ArrayBuffer's JSL-owned brand/state semantics on the shipped native path.
+(deftest array_buffer_accessor_descriptor_survives_large_spill_branch_expansion
+  (assert (agrees-with-node? "function main(n) {
+  const descriptor = Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, 'byteLength');
+  if (descriptor.enumerable || descriptor.configurable || descriptor.set !== undefined) return 101;
+  return descriptor.get.call(new ArrayBuffer(n)) | 0;
+}
+" 7)))
+
+;; A statically known accessor's declared Object receiver is not evidence about a dynamic
+;; Function.prototype.call thisArg. The tagged primitive must reach RequireInternalSlot, whose
+;; TypeError must remain catchable and retain the canonical intrinsic constructor identity.
+(deftest array_buffer_accessor_rejects_a_primitive_at_the_jsl_brand_check
+  (assert (agrees-with-node? "function main(n) {
+  const getter = Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, 'byteLength').get;
+  function HarnessFailure(message) { this.message = message; }
+  function catchesTypeError(expectedErrorConstructor, callback, message) {
+    var expectedName, actualName;
+    if (typeof callback !== 'function') {
+      return false;
+    }
+    if (message === undefined) message = '';
+    else message += ' ';
+    try {
+      callback();
+    } catch (thrown) {
+      if (typeof thrown !== 'object' || thrown === null) {
+        throw new HarnessFailure(message + 'non-object');
+      } else if (thrown.constructor !== expectedErrorConstructor) {
+        expectedName = expectedErrorConstructor.name;
+        actualName = thrown.constructor.name;
+        if (expectedName === actualName) message += 'same name';
+        else message += 'wrong name';
+        throw new HarnessFailure(message);
+      }
+      return true;
+    }
+    throw new HarnessFailure(message + expectedErrorConstructor.name);
+  }
+  const symbol = Symbol('receiver');
+  return (catchesTypeError(TypeError, function() { getter.call(undefined); }, 'undefined') &&
+          catchesTypeError(TypeError, function() { getter.call(null); }, 'null') &&
+          catchesTypeError(TypeError, function() { getter.call(42); }, 'number') &&
+          catchesTypeError(TypeError, function() { getter.call('1'); }, 'string') &&
+          catchesTypeError(TypeError, function() { getter.call(true); }, 'true') &&
+          catchesTypeError(TypeError, function() { getter.call(false); }, 'false') &&
+          catchesTypeError(TypeError, function() { getter.call(symbol); }, 'symbol') ? n : 102) | 0;
+}" 7)))
+
+;; Test262 evaluates its assertion harness and test as distinct Script records in one Realm. Keep
+;; the brand-check/catch interaction independently executable across that exact structural seam.
+(deftest tagged_external_result_survives_an_internal_function_return
+  (graph-reset! 6199)
+  (shape-reset!)
+  (let [consumer (n-fun-open! 135)
+        consumer-types-raw (primitive/alloc-stack (array i64 1))
+        consumer-types (cast (ptr i64) consumer-types-raw)
+        callee (n-fun-open! 134)
+        raw-types (primitive/alloc-stack (array i64 1))
+        types (cast (ptr i64) raw-types)
+        wrapper (n-fun-open! 136)
+        wrapper-types-raw (primitive/alloc-stack (array i64 1))
+        wrapper-types (cast (ptr i64) wrapper-types-raw)
+        (mut consumer-test-node) NO-NODE
+        (mut dependency-node) NO-NODE
+        (mut constructor-node) NO-NODE
+        (mut input-node) NO-NODE]
+    (store! (index consumer-types 0) (t-dyn))
+    (n-fun-declare-abi! consumer (slice-new [i64] consumer-types 1) (t-int))
+    (let [value (n-parm! consumer 0)]
+      (let [tested (n-peephole (n-new2 (TypeTest (t-fun)) NO-NODE value))
+            arms (n-if-arms! (n-peephole (n-new2 (If) (n-fun-entry consumer) tested)))]
+        (set! consumer-test-node tested)
+        (n-fun-close! consumer
+          (n-new2 (Return) (arms-t arms) (n-const (t-int-con 1))))
+        (n-fun-add-return! consumer
+          (n-new2 (Return) (arms-f arms) (n-const (t-int-con 0))))))
+    (store! (index types 0) (t-int))
+    (n-fun-declare-abi! callee (slice-new [i64] types 1) (t-dyn))
+    (n-fun-abi-set-can-throw! callee true)
+    (let [kind (n-parm! callee 0)
+          memory (n-new1 (Arg (t-mem-alias JS-PROPERTY-ALIAS (t-undef)))
+                         (n-fun-entry callee))
+          constructor (n-peephole (n-new3 (JsBuiltin 20) NO-NODE kind kind))
+          clobber-args-raw (primitive/alloc-stack (array i64 2))
+          clobber-args (cast (ptr i64) clobber-args-raw)]
+      (store! (index clobber-args 0) constructor)
+      (store! (index clobber-args 1) memory)
+      (let [clobber (n-call! (n-fun-entry callee) consumer
+                             (slice-new [i64] clobber-args 2))
+            post-memory
+              (n-new1 (Arg (t-mem-alias JS-PROPERTY-ALIAS (t-undef))) (call-end clobber))
+            return-values-raw (primitive/alloc-stack (array i64 1))
+            return-values (cast (ptr i64) return-values-raw)]
+        (store! (index return-values 0) constructor)
+        (set! constructor-node constructor)
+        (n-fun-close! callee
+          (n-return-values! (call-end clobber) (slice-new [i64] return-values 1) post-memory))))
+    (store! (index wrapper-types 0) (t-int))
+    (n-fun-declare-abi! wrapper (slice-new [i64] wrapper-types 1) (t-dyn))
+    (n-fun-abi-set-can-throw! wrapper true)
+    (let [kind (n-parm! wrapper 0)
+          memory (n-new1 (Arg (t-mem-alias JS-PROPERTY-ALIAS (t-undef)))
+                         (n-fun-entry wrapper))
+          wrapped-args-raw (primitive/alloc-stack (array i64 2))
+          wrapped-args (cast (ptr i64) wrapped-args-raw)]
+      (store! (index wrapped-args 0) kind)
+      (store! (index wrapped-args 1) memory)
+      (let [wrapped (n-call! (n-fun-entry wrapper) callee
+                             (slice-new [i64] wrapped-args 2))
+            post-memory
+              (n-new1 (Arg (t-mem-alias JS-PROPERTY-ALIAS (t-undef))) (call-end wrapped))
+            return-values-raw (primitive/alloc-stack (array i64 1))
+            return-values (cast (ptr i64) return-values-raw)]
+        (store! (index return-values 0) (call-value wrapped))
+        (n-fun-close! wrapper
+          (n-return-values! (call-end wrapped) (slice-new [i64] return-values 1) post-memory))))
+    (let [input (n-const (t-int-con 5))
+          memory (n-new1 (Arg (t-mem-alias JS-PROPERTY-ALIAS (t-undef))) (g-start))
+          site-args-raw (primitive/alloc-stack (array i64 2))
+          site-args (cast (ptr i64) site-args-raw)]
+      (store! (index site-args 0) input)
+      (store! (index site-args 1) memory)
+      (let [site (n-call! (g-start) wrapper (slice-new [i64] site-args 2))
+          dependency (call-value site)
+          narrowed (n-peephole (n-new2 (Cast (t-fun)) (call-end site) dependency))
+          tagged-pending
+            (n-peephole (n-new3 (JsBuiltin 101) (call-end site) dependency (n-const (t-int-con 0))))
+          pending (n-unbox! tagged-pending (t-bool))
+          arms (n-if-arms! (n-peephole (n-new2 (If) (call-end site) pending)))
+          consumed (n-call1! (arms-f arms) consumer narrowed)]
+      (set! dependency-node narrowed)
+      (set! input-node input)
+      (n-add-def! (g-stop) (n-new2 (Return) (arms-t arms) (n-const (t-int-con 0))))
+      (n-add-def! (g-stop) (n-new2 (Return) (call-end consumed) (call-value consumed)))))
+    (g-analyze!)
+    (assert (= (g-verify) 0))
+    (be-use-runtime-allocation! true)
+    (assert (be-select-verified-machine-program!))
+    (assert (>= (be-local-schedule!) 0))
+    (assert (>= (be-liveness!) 0))
+    (assert (>= (be-color! 10) 0))
+    ;; A call-result snapshot is defined by the call's parallel ABI capture, not by the zero-byte
+    ;; MI-CALL-RESULT marker. Force every marker into a spill so the encoder cannot silently
+    ;; overwrite the captured x0 value with its ordinary destination scratch.
+    (let [(mut at) 0 (mut slot) 6100 (mut snapshots) 0]
+      (loop (if (>= (load at) (be-inst-count))
+                (break)
+                (do
+                  (if (= (ms-inst-op (load at)) MI-CALL-RESULT)
+                      (let [vreg (ms-inst-dst (load at))]
+                        (assert (>= vreg 0))
+                        (be-force-spill-vreg! vreg (load slot))
+                        (set! slot (+ (load slot) 1))
+                        (set! snapshots (+ (load snapshots) 1)))
+                      0)
+                  (set! at (+ (load at) 1)))))
+      (assert (> (load snapshots) 0)))
+    (let [vreg (ms-vget 0 (load dependency-node))]
+      (assert (>= vreg 0))
+      (be-force-spill-vreg! vreg 5000))
+    (let [vreg (ms-vget 0 (load input-node))]
+      (assert (>= vreg 0))
+      (be-force-spill-vreg! vreg 5000))
+    (let [owner (mu-find-function callee)
+          vreg (ms-vget owner (load constructor-node))]
+      (assert (>= owner 0))
+      (assert (>= vreg 0))
+      (be-force-spill-vreg! vreg 5001))
+    ;; Reproduce the high-pressure RequireObjectValue path without needing its enormous generated
+    ;; graph: both callable-tag tests, their OR, and the branch predicate must work when every
+    ;; machine result is spilled.
+    (let [owner (mu-find-function consumer) (mut at) 0 (mut slot) 6000]
+      (assert (>= owner 0))
+      (loop (if (>= (load at) (be-inst-count))
+                (break)
+                (do
+                  (if (and (= (ms-inst-owner (load at)) owner)
+                           (and (>= (ms-inst-dst (load at)) 0)
+                                (or (= (ms-inst-op (load at)) MI-JSTEST)
+                                    (and (= (ms-inst-op (load at)) MI-BITOR)
+                                         (= (ms-inst-node (load at))
+                                            (load consumer-test-node))))))
+                      (do
+                        (be-force-spill-vreg! (ms-inst-dst (load at)) (load slot))
+                        (set! slot (+ (load slot) 1)))
+                      0)
+                  (set! at (+ (load at) 1)))))
+      (assert (= (load slot) 6003)))
+    (assert (be-encode-checked!))
+    (assert (be-macho-checked!))
+    (let [ok (primitive/alloc-stack bool)]
+      (store! ok true)
+      (let [got (nh-exec-memory-checked! 0 ok)]
+        (assert (load ok))
+        (assert (= got 1)))))
+  (nh-cleanup!))
+
+(deftest synthetic_script_entry_executes_intrinsic_constructor_primitives
+  (let [source "const descriptor = Object.getOwnPropertyDescriptor(TypeError, 'name');
+if (descriptor.value !== 'TypeError') throw 1;
+"
+        raw-lengths (primitive/alloc-stack (array i32 1))]
+    (store! (index raw-lengths 0) (cast i32 (slice-len source)))
+    (let [lengths (slice-new [i32] (cast (ptr i32) (index raw-lengths 0)) 1)]
+      (assert (nh-try-compile-scripts? source lengths TS-SCRIPT-JS))
+      (assert (= (nh-prepare-isolated-execution!) 0))
+      (let [ok (primitive/alloc-stack bool)]
+        (store! ok true)
+        (nh-exec-isolated-checked-timeout! 0 2 ok)
+        (assert (load ok)))
+      (nh-cleanup!))))
+
+;; Generated intrinsic data properties exercise an internal multi-result descriptor call. Its
+;; logical result must survive a spilled MI-CALL-RESULT snapshot; the call's ABI capture owns that
+;; location, and the zero-byte marker must not overwrite it with an encoder scratch register.
+(deftest generated_number_data_descriptor_survives_a_spilled_call_result_snapshot
+  (assert (agrees-with-node? "function main(n) {
+  const value = Number.EPSILON;
+  const descriptor = Object.getOwnPropertyDescriptor(Number, 'EPSILON');
+  if (descriptor.value !== value) return 101;
+  if (descriptor.writable || descriptor.enumerable || descriptor.configurable) return 102;
+  return n | 0;
+}" 7)))
+
+(deftest array_buffer_brand_check_is_caught_across_test262_script_records
+  (let [harness "function HarnessFailure(message) { this.message = message; }
+function catchesTypeError(expectedErrorConstructor, callback, message) {
+  try { callback(); }
+  catch (thrown) {
+    return;
+  }
+  throw new HarnessFailure(message);
+}
+"
+        test "const getter = Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, 'byteLength').get;
+catchesTypeError(TypeError, function() { getter.call(undefined); }, 'missing throw');
+"
+        source "function HarnessFailure(message) { this.message = message; }
+function catchesTypeError(expectedErrorConstructor, callback, message) {
+  try { callback(); }
+  catch (thrown) {
+    return;
+  }
+  throw new HarnessFailure(message);
+}
+const getter = Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, 'byteLength').get;
+catchesTypeError(TypeError, function() { getter.call(undefined); }, 'missing throw');
+"
+        raw-lengths (primitive/alloc-stack (array i32 2))]
+    (store! (index raw-lengths 0) (cast i32 (slice-len harness)))
+    (store! (index raw-lengths 1) (cast i32 (slice-len test)))
+    (let [lengths (slice-new [i32] (cast (ptr i32) (index raw-lengths 0)) 2)]
+      (assert (nh-try-compile-scripts? source lengths TS-SCRIPT-JS))
+      (assert (= (nh-prepare-isolated-execution!) 0))
+      (let [ok (primitive/alloc-stack bool)]
+        (store! ok true)
+        (nh-exec-isolated-checked-timeout! 0 2 ok)
+        (assert (load ok)))
+      (nh-cleanup!))))
+
+;; Keep the Test262 distinction that the assertion helper and test body are separate Script
+;; records in one Realm. This is the smallest witness for the retained-cohort representation
+;; mismatch; a one-function/main-shaped differential is intentionally not equivalent.
+(deftest array_buffer_byte_length_same_value_crosses_script_records
+  (let [harness "function sameValue(a, b) {
+  if (a === b) return a !== 0 || 1 / a === 1 / b;
+  return a !== a && b !== b;
+}
+"
+        test "var ab1 = new ArrayBuffer(0);
+if (!sameValue(ab1.byteLength, 0)) throw 101;
+var ab2 = new ArrayBuffer(42);
+if (!sameValue(ab2.byteLength, 42)) throw 102;
+"
+        source "function sameValue(a, b) {
+  if (a === b) return a !== 0 || 1 / a === 1 / b;
+  return a !== a && b !== b;
+}
+var ab1 = new ArrayBuffer(0);
+if (!sameValue(ab1.byteLength, 0)) throw 101;
+var ab2 = new ArrayBuffer(42);
+if (!sameValue(ab2.byteLength, 42)) throw 102;
+"
+        raw-lengths (primitive/alloc-stack (array i32 2))]
+    (store! (index raw-lengths 0) (cast i32 (slice-len harness)))
+    (store! (index raw-lengths 1) (cast i32 (slice-len test)))
+    (let [lengths (slice-new [i32] (cast (ptr i32) (index raw-lengths 0)) 2)]
+      (assert (nh-try-compile-scripts? source lengths TS-SCRIPT-JS))
+      (assert (= (nh-prepare-isolated-execution!) 0))
+      (let [ok (primitive/alloc-stack bool)]
+        (store! ok true)
+        (nh-exec-isolated-checked-timeout! 0 2 ok)
+        (assert (load ok)))
+      (nh-cleanup!))))
+
+(deftest array_buffer_byte_length_survives_the_pinned_test262_harness_records
+  ;; Test262 executes the published code image directly from memory. Keep this witness on that
+  ;; same path so representation/relocation differences cannot hide behind Mach-O publication.
+  (nh-use-direct-memory-execution! true)
+  (let [allocator (malloc-allocator)
+        assertion (t262-read allocator ".spec-cache/test262/harness/assert.js")
+        sta (t262-read allocator ".spec-cache/test262/harness/sta.js")
+        test "var ab1 = new ArrayBuffer(0);
+if (ab1.byteLength !== 0) throw ab1.byteLength;
+assert.sameValue(ab1.byteLength, 0);
+var ab2 = new ArrayBuffer(42);
+if (ab2.byteLength !== 42) throw ab2.byteLength;
+assert.sameValue(ab2.byteLength, 42);
+"
+        (mut source) (al-new [u8] allocator)
+        raw-lengths (primitive/alloc-stack (array i32 3))]
+    (t262-append! (mut source) assertion)
+    (t262-append! (mut source) sta)
+    (t262-append! (mut source) test)
+    (store! (index raw-lengths 0) (cast i32 (slice-len assertion)))
+    (store! (index raw-lengths 1) (cast i32 (slice-len sta)))
+    (store! (index raw-lengths 2) (cast i32 (slice-len test)))
+    (let [lengths (slice-new [i32] (cast (ptr i32) (index raw-lengths 0)) 3)]
+      (assert (nh-try-compile-scripts? (al-slice [u8] (load source)) lengths TS-SCRIPT-JS))
+      (assert (= (nh-prepare-isolated-execution!) 0))
+      (let [ok (primitive/alloc-stack bool)]
+        (store! ok true)
+        (nh-exec-isolated-checked-timeout! 0 2 ok)
+        (assert (load ok)))
+      (nh-cleanup!))
+    (al-free! [u8] (mut source))))
+
+;; Test262's retained image must preserve a boxed Symbol result across Function.prototype.call.
+;; The ordinary Mach-O workbench covers the same operation, but cannot expose retained-linker ABI
+;; or relocation defects.
+(deftest symbol_value_of_survives_retained_direct_memory_dispatch
+  (nh-use-direct-memory-execution! true)
+  (let [allocator (malloc-allocator)
+        assertion (t262-read allocator ".spec-cache/test262/harness/assert.js")
+        sta (t262-read allocator ".spec-cache/test262/harness/sta.js")
+        test "var valueOf = Symbol.prototype.valueOf;
+var subject = Symbol('s');
+assert.sameValue(valueOf.call(subject), subject);
+"
+        (mut source) (al-new [u8] allocator)
+        raw-lengths (primitive/alloc-stack (array i32 3))]
+    (t262-append! (mut source) assertion)
+    (t262-append! (mut source) sta)
+    (t262-append! (mut source) test)
+    (store! (index raw-lengths 0) (cast i32 (slice-len assertion)))
+    (store! (index raw-lengths 1) (cast i32 (slice-len sta)))
+    (store! (index raw-lengths 2) (cast i32 (slice-len test)))
+    (let [lengths (slice-new [i32] (cast (ptr i32) (index raw-lengths 0)) 3)]
+      (assert (nh-try-compile-scripts? (al-slice [u8] (load source)) lengths TS-SCRIPT-JS))
+      (assert (mfti-callable-relocs-valid?))
+      (assert (= (nh-prepare-isolated-execution!) 0))
+      (let [ok (primitive/alloc-stack bool)]
+        (store! ok true)
+        (nh-exec-isolated-checked-timeout! 0 2 ok)
+        (assert (load ok)))
+      (nh-cleanup!))
+    (al-free! [u8] (mut source))))
 
 ;; Numeric-index routing, byte conversion, and shared backing-buffer identity remain DSL
 ;; semantics. The frontend recognizes constructor syntax but does not implement any element rule.
